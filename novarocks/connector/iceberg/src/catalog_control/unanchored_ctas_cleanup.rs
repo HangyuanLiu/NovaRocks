@@ -83,7 +83,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         if !matches!(parsed.scheme(), FsScheme::Local) {
             let access = crate::fs_io::resolve_access_for_location(
                 warehouse,
-                runtime.control_state().object_store_config(),
+                runtime.resources().planning_binding(),
             )
             .map_err(unavailable)?;
             let capability = access.operator().info().full_capability();
@@ -148,7 +148,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     fn file_io(&self) -> crate::iceberg::io::FileIO {
         crate::fs_io::build_file_io_for_location(
             self.warehouse_root(),
-            self.runtime.control_state().object_store_config(),
+            self.runtime.resources().planning_binding().clone(),
         )
     }
 
@@ -238,7 +238,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
             FsScheme::ObjectStore | FsScheme::Hdfs => {
                 let access = crate::fs_io::resolve_access_for_location(
                     &root,
-                    self.runtime.control_state().object_store_config(),
+                    self.runtime.resources().planning_binding(),
                 )
                 .map_err(unavailable)?;
                 let path = access

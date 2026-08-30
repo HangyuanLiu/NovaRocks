@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::access_binding::IcebergReadBinding;
 use crate::commit::{
     FileSet, compute_live_snapshot_set, enumerate_files_for_snapshots,
     puffin_half_reference_protection,
@@ -30,7 +31,7 @@ use crate::fs_io;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::TableMetadata;
 use crate::iceberg::table::Table;
-use novarocks_fs::{FsLocation, FsScheme, ObjectStoreConfig};
+use novarocks_fs::{FsLocation, FsScheme};
 
 #[derive(Clone, Debug)]
 pub(super) struct ScannedFile {
@@ -44,7 +45,7 @@ pub(super) struct ScannedFile {
 pub(super) async fn collect_orphan_candidates(
     table: &Table,
     older_than_ms: i64,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<Vec<ScannedFile>, String> {
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -87,7 +88,7 @@ pub(super) async fn collect_orphan_candidates(
             ));
         }
     }
-    let scanned = list_files(location, object_store_config).await?;
+    let scanned = list_files(location, binding).await?;
     let mut candidate_paths = scanned
         .iter()
         .filter(|file| {
@@ -112,7 +113,7 @@ pub(super) async fn collect_orphan_candidates(
 
 async fn list_files(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<Vec<ScannedFile>, String> {
     let parsed = FsLocation::parse(location)
         .map_err(|error| format!("parse orphan cleanup location `{location}`: {error}"))?;
@@ -132,9 +133,7 @@ async fn list_files(
             }
             Ok(files)
         }
-        FsScheme::ObjectStore | FsScheme::Hdfs => {
-            list_opendal(parsed.original(), object_store_config).await
-        }
+        FsScheme::ObjectStore | FsScheme::Hdfs => list_opendal(parsed.original(), binding).await,
     }
 }
 
@@ -174,9 +173,9 @@ fn walk_local(
 
 async fn list_opendal(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<Vec<ScannedFile>, String> {
-    let access = fs_io::resolve_access_for_location(location, object_store_config)
+    let access = fs_io::resolve_access_for_location(location, binding)
         .map_err(|error| format!("resolve orphan cleanup location: {error}"))?;
     let operator = access.operator();
     let root = access

@@ -34,9 +34,9 @@ use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::access_binding::IcebergReadBinding;
 use crate::fs_io;
 use crate::resources::IcebergCatalogRuntime;
-use novarocks_fs::ObjectStoreConfig;
 use novarocks_spi::connector::{
     ConnectorDataMutationAddFilesDomain, ConnectorDataMutationSourceScope,
     MAX_CONNECTOR_DATA_MUTATION_FILE_LOCATION_BYTES, MAX_CONNECTOR_DATA_MUTATION_FILES,
@@ -100,7 +100,7 @@ impl AddFilesManifest {
 pub(crate) fn plan_manifest_for_table(
     table: &Table,
     source_directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<AddFilesManifest, String> {
     if !table.metadata().default_partition_spec().is_unpartitioned() {
@@ -119,7 +119,7 @@ pub(crate) fn plan_manifest_for_table(
     let default_ids = initial_default_ids(table.metadata().current_schema().as_struct());
     plan_manifest(
         source_directory,
-        object_store_config,
+        binding,
         &target_schema,
         &default_ids,
         canonical_name_mapping,
@@ -130,11 +130,11 @@ pub(crate) fn plan_manifest_for_table(
 pub(crate) fn revalidate_manifest_for_table(
     table: &Table,
     source_directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
     expected: &AddFilesManifest,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<AddFilesManifest, String> {
-    let actual = plan_manifest_for_table(table, source_directory, object_store_config, runtime)?;
+    let actual = plan_manifest_for_table(table, source_directory, binding, runtime)?;
     if actual.digest != expected.digest || actual.source_scope != expected.source_scope {
         return Err(
             "ADD FILES source manifest or physical scope changed after planning".to_string(),
@@ -145,7 +145,7 @@ pub(crate) fn revalidate_manifest_for_table(
 
 fn plan_manifest(
     source_directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
     target_schema: &SchemaRef,
     initial_default_ids: &HashSet<i32>,
     canonical_name_mapping: Option<String>,
@@ -159,8 +159,8 @@ fn plan_manifest(
     if let Some(mapping) = mapping.as_ref() {
         validate_name_mapping_for_target(mapping, target_schema)?;
     }
-    let source_scope = canonical_directory_source_scope(source_directory, object_store_config)?;
-    let files = list_direct_files(source_directory, object_store_config, runtime)?;
+    let source_scope = canonical_directory_source_scope(source_directory, binding)?;
+    let files = list_direct_files(source_directory, binding, runtime)?;
     if files.is_empty() {
         return Err(format!(
             "ADD FILES: no visible Parquet files found under {source_directory}"
@@ -170,7 +170,7 @@ fn plan_manifest(
     let mut expected_mode = None;
     let mut total_footer_bytes = 0u64;
     for file in files {
-        let footer = read_parquet_footer(&file.location, file.size, object_store_config, runtime)?;
+        let footer = read_parquet_footer(&file.location, file.size, binding, runtime)?;
         total_footer_bytes = total_footer_bytes
             .checked_add(footer.footer_bytes)
             .ok_or_else(|| "ADD FILES footer byte total overflow".to_string())?;
@@ -246,9 +246,9 @@ fn plan_manifest(
 /// per-operation fact; it is only a stable filesystem location identity.
 pub(crate) fn canonical_directory_source_scope(
     source_directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<ConnectorDataMutationSourceScope, String> {
-    let identity = canonical_directory_identity(source_directory, object_store_config)?;
+    let identity = canonical_directory_identity(source_directory, binding)?;
     let mut hasher = Sha256::new();
     hasher.update(SOURCE_SCOPE_DIGEST_DOMAIN);
     digest_bytes(&mut hasher, identity.authority.as_bytes());
@@ -266,7 +266,7 @@ pub(crate) fn preflight_caller_managed_source_domain(
     source_directory: &str,
     warehouse_uri: &str,
     target_table_location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<ConnectorDataMutationAddFilesDomain, String> {
     if warehouse_uri.trim().is_empty() {
         return Err(
@@ -274,10 +274,10 @@ pub(crate) fn preflight_caller_managed_source_domain(
                 .to_string(),
         );
     }
-    let source = canonical_directory_identity(source_directory, object_store_config)?;
+    let source = canonical_directory_identity(source_directory, binding)?;
     let mut protected_roots = vec![
-        canonical_directory_identity(warehouse_uri, object_store_config)?,
-        canonical_directory_identity(target_table_location, object_store_config)?,
+        canonical_directory_identity(warehouse_uri, binding)?,
+        canonical_directory_identity(target_table_location, binding)?,
     ];
     protected_roots.sort_by(|left, right| {
         left.authority
@@ -314,9 +314,9 @@ struct CanonicalDirectoryIdentity {
 
 fn canonical_directory_identity(
     directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> Result<CanonicalDirectoryIdentity, String> {
-    let access = fs_io::resolve_access_for_location(directory, object_store_config)
+    let access = fs_io::resolve_access_for_location(directory, binding)
         .map_err(|error| format!("resolve ADD FILES source scope {directory}: {error}"))?;
     let handle = access.handle();
     let relative_path = access.single_relative_path()?;
@@ -335,16 +335,19 @@ fn canonical_directory_identity(
             })
         }
         novarocks_fs::FsScheme::ObjectStore => {
-            let config = object_store_config.ok_or_else(|| {
-                "object-store ADD FILES source scope is missing object store config".to_string()
-            })?;
+            let object_store = binding
+                .object_store_binding_for_location(directory)?
+                .ok_or_else(|| {
+                    "object-store ADD FILES source scope is missing an exact credential binding"
+                        .to_string()
+                })?;
             let bucket = handle.authority().ok_or_else(|| {
                 "object-store ADD FILES source scope is missing bucket".to_string()
             })?;
             Ok(CanonicalDirectoryIdentity {
                 authority: format!(
                     "object-store\\0{}\\0{}",
-                    normalized_object_store_endpoint(&config.endpoint)?,
+                    normalized_object_store_endpoint(&object_store.config().endpoint)?,
                     bucket.trim().to_ascii_lowercase(),
                 ),
                 path: canonical_nonlocal_directory_path(relative_path)?,
@@ -494,10 +497,10 @@ struct ListedFile {
 
 fn list_direct_files(
     directory: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<Vec<ListedFile>, String> {
-    let access = fs_io::resolve_access_for_location(directory, object_store_config)
+    let access = fs_io::resolve_access_for_location(directory, binding)
         .map_err(|error| format!("resolve ADD FILES directory {directory}: {error}"))?;
     let relative_directory = access.single_relative_path()?;
     let prefix = if relative_directory.ends_with('/') {
@@ -594,10 +597,10 @@ struct ParquetFooterFacts {
 fn read_parquet_footer(
     location: &str,
     file_size: u64,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
     runtime: &IcebergCatalogRuntime,
 ) -> Result<ParquetFooterFacts, String> {
-    let access = fs_io::resolve_access_for_location(location, object_store_config)
+    let access = fs_io::resolve_access_for_location(location, binding)
         .map_err(|error| format!("resolve ADD FILES Parquet file {location}: {error}"))?;
     let key = access.single_relative_path()?.to_string();
     let operator = access.operator();
@@ -896,8 +899,10 @@ mod tests {
         preflight_caller_managed_source_domain, read_parquet_footer, read_type_compatible,
         validate_name_mapping_for_target, validate_schema,
     };
+    use crate::access_binding::IcebergReadBinding;
     use crate::resources::IcebergCatalogRuntime;
     use crate::schema_mapping::canonical_name_mapping;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     fn catalog_runtime() -> (tokio::runtime::Runtime, IcebergCatalogRuntime) {
         let owner = tokio::runtime::Runtime::new().expect("runtime");
@@ -925,6 +930,18 @@ mod tests {
         }
     }
 
+    fn binding(
+        owner: &tokio::runtime::Runtime,
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+    ) -> IcebergReadBinding {
+        IcebergReadBinding::new(
+            object_store_config,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(owner.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(owner.handle().clone())),
+        )
+    }
+
     fn field_with_id(name: &str, id: i32, data_type: DataType, nullable: bool) -> Field {
         Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
             PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -938,13 +955,14 @@ mod tests {
         std::fs::write(dir.path().join("a.parquet"), b"data").expect("file");
         std::fs::write(dir.path().join("_hidden.txt"), b"hidden").expect("hidden");
         let directory = format!("file://{}", dir.path().display());
-        let (_owner, runtime) = catalog_runtime();
-        let files = list_direct_files(&directory, None, &runtime).expect("listing");
+        let (owner, runtime) = catalog_runtime();
+        let binding = binding(&owner, None);
+        let files = list_direct_files(&directory, &binding, &runtime).expect("listing");
         assert_eq!(files.len(), 1);
 
         std::fs::write(dir.path().join("visible.txt"), b"visible").expect("visible");
         assert!(
-            list_direct_files(&directory, None, &runtime)
+            list_direct_files(&directory, &binding, &runtime)
                 .expect_err("visible non-Parquet must fail")
                 .contains("not a Parquet")
         );
@@ -955,9 +973,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let raw_path = dir.path().to_string_lossy();
         let file_uri = format!("file://{}", dir.path().display());
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = binding(&owner, None);
 
-        let raw = canonical_directory_source_scope(&raw_path, None).expect("raw scope");
-        let uri = canonical_directory_source_scope(&file_uri, None).expect("URI scope");
+        let raw = canonical_directory_source_scope(&raw_path, &binding).expect("raw scope");
+        let uri = canonical_directory_source_scope(&file_uri, &binding).expect("URI scope");
         assert_eq!(raw, uri);
     }
 
@@ -965,23 +985,28 @@ mod tests {
     fn source_scope_is_secret_free_and_stable_across_object_store_config_instances() {
         let first = object_store_config("localhost:9000/", "first-key", "first-secret");
         let second = object_store_config("http://LOCALHOST:9000", "second-key", "second-secret");
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let first_binding = binding(&owner, Some(first));
+        let second_binding = binding(&owner, Some(second));
 
         let first_scope = canonical_directory_source_scope(
             "s3://source-bucket/warehouse/./incoming",
-            Some(&first),
+            &first_binding,
         )
         .expect("first scope");
         let second_scope = canonical_directory_source_scope(
             "s3a://SOURCE-BUCKET/warehouse/incoming/",
-            Some(&second),
+            &second_binding,
         )
         .expect("second scope");
         let different_path =
-            canonical_directory_source_scope("s3://source-bucket/warehouse/other", Some(&first))
+            canonical_directory_source_scope("s3://source-bucket/warehouse/other", &first_binding)
                 .expect("different path scope");
-        let different_bucket =
-            canonical_directory_source_scope("s3://other-bucket/warehouse/incoming", Some(&first))
-                .expect("different bucket scope");
+        let different_bucket = canonical_directory_source_scope(
+            "s3://other-bucket/warehouse/incoming",
+            &first_binding,
+        )
+        .expect("different bucket scope");
 
         assert_eq!(first_scope, second_scope);
         assert_ne!(first_scope, different_path);
@@ -991,8 +1016,10 @@ mod tests {
     #[test]
     fn source_scope_rejects_credentials_in_endpoint_identity() {
         let config = object_store_config("http://access:secret@localhost:9000", "ak", "sk");
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = binding(&owner, Some(config));
         assert!(
-            canonical_directory_source_scope("s3://bucket/incoming", Some(&config))
+            canonical_directory_source_scope("s3://bucket/incoming", &binding)
                 .expect_err("endpoint credentials must not enter scope")
                 .contains("credentials")
         );
@@ -1003,11 +1030,13 @@ mod tests {
         let warehouse = tempfile::tempdir().expect("warehouse");
         let source = warehouse.path().join("incoming");
         std::fs::create_dir(&source).expect("source");
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = binding(&owner, None);
         let error = preflight_caller_managed_source_domain(
             &format!("file://{}", source.display()),
             &format!("file://{}", warehouse.path().display()),
             &format!("file://{}", warehouse.path().display()),
-            None,
+            &binding,
         )
         .expect_err("warehouse-owned source must be rejected before listing");
         assert!(error.contains("overlaps"));
@@ -1017,11 +1046,13 @@ mod tests {
     fn caller_managed_source_outside_warehouse_has_typed_domain_proof() {
         let warehouse = tempfile::tempdir().expect("warehouse");
         let source = tempfile::tempdir().expect("source");
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = binding(&owner, None);
         let domain = preflight_caller_managed_source_domain(
             &format!("file://{}", source.path().display()),
             &format!("file://{}", warehouse.path().display()),
             &format!("file://{}", warehouse.path().display()),
-            None,
+            &binding,
         )
         .expect("caller-managed source proof");
         assert_ne!(domain.target_cleanup_root_digest(), [0; 32]);
@@ -1033,12 +1064,14 @@ mod tests {
         let external_target = tempfile::tempdir().expect("external target");
         let source = external_target.path().join("data");
         std::fs::create_dir(&source).expect("source");
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = binding(&owner, None);
 
         let error = preflight_caller_managed_source_domain(
             &format!("file://{}", source.display()),
             &format!("file://{}", warehouse.path().display()),
             &format!("file://{}", external_target.path().display()),
-            None,
+            &binding,
         )
         .expect_err("target-table-owned source must be rejected before listing");
         assert!(error.contains("target table"));
@@ -1060,10 +1093,15 @@ mod tests {
         writer.write(&batch).expect("write");
         writer.close().expect("close");
         let size = std::fs::metadata(&path).expect("metadata").len();
-        let (_owner, runtime) = catalog_runtime();
-        let footer =
-            read_parquet_footer(&format!("file://{}", path.display()), size, None, &runtime)
-                .expect("footer");
+        let (owner, runtime) = catalog_runtime();
+        let binding = binding(&owner, None);
+        let footer = read_parquet_footer(
+            &format!("file://{}", path.display()),
+            size,
+            &binding,
+            &runtime,
+        )
+        .expect("footer");
         assert_eq!(footer.row_count, 3);
         assert_ne!(footer.footer_digest, [0; 32]);
     }

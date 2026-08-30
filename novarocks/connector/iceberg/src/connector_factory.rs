@@ -141,7 +141,8 @@ impl IcebergConnectorFactory {
             .find(|(key, _)| key == "iceberg.catalog.warehouse" || key == "warehouse")
             .map(|(_, location)| planning_binding.object_store_binding_for_location(location))
             .transpose()
-            .map_err(invalid)?;
+            .map_err(invalid)?
+            .flatten();
         let configuration = parse_catalog_configuration_with_object_store_binding(
             request.instance_id().as_str(),
             &properties,

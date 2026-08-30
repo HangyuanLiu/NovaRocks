@@ -481,18 +481,13 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                 (CleanupPhase::OwnedRefRetire, owned_ref_records)
             } else if owned_ref_records.is_empty() {
                 let table_for_scan = table.clone();
-                let object_store = physical.object_store_config.clone();
+                let binding = self.runtime.resources().planning_binding().clone();
                 let scanned = self
                     .runtime
                     .resources()
                     .catalog_runtime()
                     .block_on(async move {
-                        collect_orphan_candidates(
-                            &table_for_scan,
-                            older_than_ms,
-                            object_store.as_ref(),
-                        )
-                        .await
+                        collect_orphan_candidates(&table_for_scan, older_than_ms, &binding).await
                     })
                     .map_err(unavailable)?
                     .map_err(unavailable)?;
@@ -501,7 +496,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                     records_from_candidates(
                         &scanned,
                         &table,
-                        physical.object_store_config.as_ref(),
+                        self.runtime.resources().planning_binding(),
                     )?,
                 )
             } else {
@@ -622,8 +617,12 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         if let Some(receipt) = self.existing_receipt(&request.plan, &request.prepared, &payload)? {
             return Ok(receipt);
         }
-        let config = self.runtime.control_state().object_store_config();
-        let outcomes = execute_frozen_batch(&self.runtime, &payload, &batch, config)?;
+        let outcomes = execute_frozen_batch(
+            &self.runtime,
+            &payload,
+            &batch,
+            self.runtime.resources().planning_binding(),
+        )?;
         self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
     }
 
@@ -668,10 +667,10 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
 fn records_from_candidates(
     files: &[ScannedFile],
     table: &crate::iceberg::table::Table,
-    config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
 ) -> Result<Vec<ManifestRecord>, ConnectorError> {
     let supports_version =
-        crate::fs_io::resolve_access_for_location(table.metadata().location(), config)
+        crate::fs_io::resolve_access_for_location(table.metadata().location(), binding)
             .map_err(unavailable)?
             .operator()
             .info()
@@ -804,7 +803,7 @@ fn execute_frozen_batch(
     runtime: &IcebergMetadataContext,
     payload: &PlanPayload,
     batch: &[ManifestRecord],
-    config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
 ) -> Result<Vec<ReceiptRecord>, ConnectorError> {
     batch
         .iter()
@@ -827,7 +826,7 @@ fn execute_frozen_batch(
                 *created_at_ms,
             ),
             ManifestCandidate::Object { location, identity } => {
-                let access = crate::fs_io::resolve_access_for_location(location, config)
+                let access = crate::fs_io::resolve_access_for_location(location, binding)
                     .map_err(unavailable)?;
                 let path = access.single_relative_path().map_err(invalid)?.to_string();
                 let operator = access.operator();

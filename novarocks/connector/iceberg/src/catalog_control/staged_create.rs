@@ -373,7 +373,7 @@ fn write_unanchored_ctas_provenance(
     let location = unanchored_ctas_provenance_location(table_location)?;
     let file_io = crate::fs_io::build_file_io_for_location(
         table_location,
-        runtime.control_state().object_store_config(),
+        runtime.resources().planning_binding().clone(),
     );
     let output = file_io
         .new_output(&location)

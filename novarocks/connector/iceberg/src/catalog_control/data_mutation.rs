@@ -259,13 +259,13 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     source_location,
                     &self.runtime.control_state().configuration().warehouse_uri,
                     table.metadata().location(),
-                    self.runtime.control_state().object_store_config(),
+                    self.runtime.resources().planning_binding(),
                 )
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
                 let manifest = plan_manifest_for_table(
                     &table,
                     source_location,
-                    self.runtime.control_state().object_store_config(),
+                    self.runtime.resources().planning_binding(),
                     self.runtime.resources().catalog_runtime(),
                 )
                 .map_err(map_provider_error)?;
@@ -419,7 +419,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 revalidate_manifest_for_table(
                     current,
                     &source_location,
-                    runtime.control_state().object_store_config(),
+                    runtime.resources().planning_binding(),
                     &expected_manifest,
                     runtime.resources().catalog_runtime(),
                 )
