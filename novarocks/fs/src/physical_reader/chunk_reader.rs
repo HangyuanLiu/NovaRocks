@@ -156,14 +156,19 @@ impl BoundChunkReader {
         }
 
         let cache_key = self.cache_key(start, length);
-        if let Some(key) = cache_key.as_ref()
+        let cache_read_enabled = self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.io_options().enable_datacache);
+        if cache_read_enabled
+            && let Some(key) = cache_key.as_ref()
             && let Some(cache) = DataCacheManager::instance().page_cache()
             && let Some(bytes) = cache.lookup_bytes(key)
         {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return Ok(bytes);
         }
-        if cache_key.is_some() {
+        if cache_read_enabled && cache_key.is_some() {
             self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -186,7 +191,12 @@ impl BoundChunkReader {
             .io_time_ns
             .fetch_add(clamp_u128(began.elapsed().as_nanos()), Ordering::Relaxed);
 
-        if let Some(key) = cache_key
+        let cache_population_enabled = self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.io_options().enable_populate_datacache);
+        if cache_population_enabled
+            && let Some(key) = cache_key
             && let Some(cache) = DataCacheManager::instance().page_cache()
         {
             let _ = cache.insert_bytes(key, bytes.clone(), bytes.len(), Some(100));

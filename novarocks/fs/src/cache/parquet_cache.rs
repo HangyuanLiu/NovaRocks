@@ -15,13 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::mem::size_of;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::StorageAccessDomainId;
 use parquet::arrow::arrow_reader::ArrowReaderMetadata;
 
-use crate::{DataCacheManager, DataCachePageKey, FileIdentity};
+use crate::{DataCacheManager, DataCachePageCache, DataCachePageKey, FileIdentity};
 
 const PARQUET_METADATA_CACHE_NAMESPACE: &str = "physical.parquet.metadata";
 
@@ -46,6 +47,48 @@ impl Default for ParquetCacheOptions {
 struct TimedArrowReaderMetadata {
     metadata: ArrowReaderMetadata,
     expire_at: Instant,
+}
+
+/// Returns a conservative byte charge for one cached Arrow reader metadata
+/// value. `ParquetMetaData::memory_size` accounts for the decoded footer,
+/// including page indexes, while the Arrow schema is separately allocated by
+/// `ArrowReaderMetadata::try_new`.
+fn metadata_cache_charge(metadata: &ArrowReaderMetadata) -> usize {
+    let schema = metadata.schema();
+    let schema_bytes = size_of_val(schema.as_ref())
+        .saturating_add(schema.fields.size())
+        .saturating_add(size_of::<(String, String)>().saturating_mul(schema.metadata.capacity()))
+        .saturating_add(
+            schema
+                .metadata
+                .iter()
+                .map(|(key, value)| key.capacity().saturating_add(value.capacity()))
+                .sum::<usize>(),
+        );
+    metadata
+        .metadata()
+        .memory_size()
+        .saturating_add(schema_bytes)
+        .saturating_add(size_of::<TimedArrowReaderMetadata>())
+        .max(1)
+}
+
+fn insert_metadata(
+    cache: &DataCachePageCache,
+    key: DataCachePageKey,
+    metadata: ArrowReaderMetadata,
+    expire_at: Instant,
+) -> bool {
+    let charge = metadata_cache_charge(&metadata);
+    cache.insert(
+        key,
+        Arc::new(TimedArrowReaderMetadata {
+            metadata,
+            expire_at,
+        }),
+        charge,
+        None,
+    )
 }
 
 static PARQUET_CACHE_OPTIONS: OnceLock<ParquetCacheOptions> = OnceLock::new();
@@ -96,17 +139,14 @@ pub(crate) fn metadata_put(
     let Some(cache) = DataCacheManager::instance().page_cache() else {
         return;
     };
-    let value = TimedArrowReaderMetadata {
-        metadata,
-        expire_at: Instant::now()
-            .checked_add(options().metadata_ttl)
-            .unwrap_or_else(Instant::now),
-    };
-    let _ = cache.insert(
+    let expire_at = Instant::now()
+        .checked_add(options().metadata_ttl)
+        .unwrap_or_else(Instant::now);
+    let _ = insert_metadata(
+        &cache,
         metadata_key(access_domain, identity),
-        Arc::new(value),
-        1,
-        None,
+        metadata,
+        expire_at,
     );
 }
 
@@ -134,7 +174,40 @@ fn metadata_key(access_domain: StorageAccessDomainId, identity: &FileIdentity) -
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use parquet::arrow::ArrowWriter;
+    use parquet::arrow::arrow_reader::ArrowReaderOptions;
+
     use super::*;
+
+    fn sample_metadata() -> ArrowReaderMetadata {
+        let file = tempfile::NamedTempFile::new().expect("create Parquet metadata fixture");
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("create Parquet metadata batch");
+        let mut writer = ArrowWriter::try_new(
+            file.reopen().expect("reopen Parquet metadata fixture"),
+            schema,
+            None,
+        )
+        .expect("create Parquet metadata writer");
+        writer.write(&batch).expect("write Parquet metadata batch");
+        writer.close().expect("close Parquet metadata writer");
+        let reader = File::open(file.path()).expect("open Parquet metadata fixture");
+        ArrowReaderMetadata::load(&reader, ArrowReaderOptions::new())
+            .expect("load Parquet metadata fixture")
+    }
 
     #[test]
     fn metadata_key_is_scoped_before_physical_identity() {
@@ -144,5 +217,46 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(first.namespace(), second.namespace());
         assert_eq!(first.key(), second.key());
+    }
+
+    #[test]
+    fn metadata_entries_charge_their_decoded_footer_and_evict_at_byte_capacity() {
+        let metadata = sample_metadata();
+        let charge = metadata_cache_charge(&metadata);
+        assert!(
+            charge > 1,
+            "metadata entries must not consume one cache byte"
+        );
+
+        let cache = DataCachePageCache::new(crate::DataCachePageCacheOptions {
+            capacity: charge,
+            evict_probability: 100,
+        });
+        let first = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            PARQUET_METADATA_CACHE_NAMESPACE,
+            b"first".to_vec(),
+        );
+        let second = DataCachePageKey::new(
+            StorageAccessDomainId::from_bytes([1; 32]),
+            PARQUET_METADATA_CACHE_NAMESPACE,
+            b"second".to_vec(),
+        );
+        let expires = Instant::now() + Duration::from_secs(60);
+
+        assert!(insert_metadata(
+            &cache,
+            first.clone(),
+            metadata.clone(),
+            expires,
+        ));
+        assert_eq!(cache.stats().size, charge);
+        assert!(insert_metadata(&cache, second.clone(), metadata, expires));
+        assert!(
+            cache.lookup::<TimedArrowReaderMetadata>(&first).is_none(),
+            "the second footer must evict the first when the byte budget holds one"
+        );
+        assert!(cache.lookup::<TimedArrowReaderMetadata>(&second).is_some());
+        assert_eq!(cache.stats().size, charge);
     }
 }
