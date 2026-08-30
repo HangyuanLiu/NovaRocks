@@ -49,12 +49,10 @@ pub mod conformance;
 pub mod read_stack;
 
 pub use catalog::{
-    CATALOG_VERSION_BYTES, CatalogCredentialReference, CatalogHandle, CatalogProperties,
-    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorControlRuntimeId,
-    MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES, MAX_CATALOG_CREDENTIAL_REFERENCES,
-    MAX_CATALOG_PROPERTIES, MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES,
-    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
-    MAX_REACHABLE_CATALOGS_PER_PRUNE,
+    CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind,
+    CatalogVersion, ConnectorControlRuntimeId, MAX_CATALOG_PROPERTIES,
+    MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES, MAX_CATALOG_SET_BYTES,
+    MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
 pub use catalog_runtime::{
     CatalogRuntime, CatalogRuntimeMaterializer, CatalogWriteExecution, CatalogWriteExecutionBundle,
@@ -83,8 +81,7 @@ pub use control::{
 pub use credential::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
-    CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS,
-    MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES, MAX_CATALOG_NON_SECRET_PROPERTIES,
+    CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_NON_SECRET_PROPERTIES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES, StaticCredentialReference, StorageAccessDomainId,
     StorageCredentialScopePrefix, canonical_catalog_credential_binding_bytes,
     canonicalize_catalog_credential_bindings,

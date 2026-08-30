@@ -22,10 +22,11 @@ use prost::Message;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::catalog as wire;
 use novarocks_spi::connector::{
-    CATALOG_VERSION_BYTES, CatalogCredentialReference, CatalogHandle, CatalogProperties,
-    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+    CATALOG_VERSION_BYTES, CatalogCredentialBinding, CatalogCredentialMode,
+    CatalogCredentialPurpose, CatalogHandle, CatalogProperties, CatalogProperty,
+    CatalogProviderKind, CatalogVersion, ConnectorInstanceId, CredentialConsumerRole,
     MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
-    MAX_REACHABLE_CATALOGS_PER_PRUNE,
+    MAX_REACHABLE_CATALOGS_PER_PRUNE, StaticCredentialReference,
 };
 
 /// One exact, validated query-wide catalog contribution.
@@ -352,13 +353,11 @@ pub fn encode_catalog_properties(properties: CatalogProperties) -> wire::Catalog
                 value: property.value().to_owned(),
             })
             .collect(),
-        credential_references: properties
-            .credential_references()
+        credential_bindings: properties
+            .credential_bindings()
             .iter()
-            .map(|reference| wire::CatalogCredentialReference {
-                name: reference.name().to_owned(),
-                revision: reference.revision().map(str::to_owned),
-            })
+            .cloned()
+            .map(encode_catalog_credential_binding)
             .collect(),
     }
 }
@@ -392,35 +391,124 @@ pub fn decode_catalog_properties(
         }
         properties.push(decoded);
     }
-    let mut references = Vec::with_capacity(raw.credential_references.len());
-    for (index, reference) in raw.credential_references.into_iter().enumerate() {
-        let decoded =
-            CatalogCredentialReference::new(&reference.name, reference.revision.as_deref())
-                .map_err(|error| {
-                    invalid(
-                        root.clone().field("credential_references").index(index),
-                        error.to_string(),
-                    )
-                })?;
-        if references
-            .last()
-            .is_some_and(|previous| previous >= &decoded)
-        {
+    let mut bindings = Vec::with_capacity(raw.credential_bindings.len());
+    for (index, binding) in raw.credential_bindings.into_iter().enumerate() {
+        let path = root.clone().field("credential_bindings").index(index);
+        let decoded = decode_catalog_credential_binding(binding, path.clone())?;
+        if bindings.last().is_some_and(|previous| previous >= &decoded) {
             return Err(invalid(
-                root.clone().field("credential_references").index(index),
-                "catalog credential references must be strictly sorted with no duplicate",
+                path,
+                "catalog credential bindings must be strictly sorted with no duplicate purpose",
             ));
         }
-        references.push(decoded);
+        bindings.push(decoded);
     }
     CatalogProperties::new(
         handle,
         provider_kind,
         raw.config_format_version,
         properties,
-        references,
+        bindings,
     )
     .map_err(|error| invalid(root, error.to_string()))
+}
+
+fn encode_catalog_credential_binding(
+    binding: CatalogCredentialBinding,
+) -> wire::CatalogCredentialBinding {
+    let mode = match binding.mode() {
+        CatalogCredentialMode::Static(reference) => {
+            wire::catalog_credential_binding::Mode::StaticCredential(
+                wire::StaticCredentialReference {
+                    name: reference.name().to_owned(),
+                    generation: reference.generation().to_owned(),
+                },
+            )
+        }
+        CatalogCredentialMode::Vended => {
+            wire::catalog_credential_binding::Mode::VendedCredential(wire::VendedCredential {})
+        }
+    };
+    wire::CatalogCredentialBinding {
+        purpose: encode_credential_purpose(binding.purpose()) as i32,
+        consumer_role: encode_consumer_role(binding.consumer_role()) as i32,
+        mode: Some(mode),
+    }
+}
+
+fn decode_catalog_credential_binding(
+    raw: wire::CatalogCredentialBinding,
+    root: FieldPath,
+) -> Result<CatalogCredentialBinding, ProtocolError> {
+    let purpose = decode_credential_purpose(raw.purpose, root.clone().field("purpose"))?;
+    let consumer_role =
+        decode_consumer_role(raw.consumer_role, root.clone().field("consumer_role"))?;
+    let mode = match raw
+        .mode
+        .ok_or_else(|| missing(root.clone().field("mode"), "credential mode is required"))?
+    {
+        wire::catalog_credential_binding::Mode::StaticCredential(reference) => {
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new(&reference.name, &reference.generation)
+                    .map_err(|error| {
+                        invalid(root.clone().field("static_credential"), error.to_string())
+                    })?,
+            )
+        }
+        wire::catalog_credential_binding::Mode::VendedCredential(_) => {
+            CatalogCredentialMode::Vended
+        }
+    };
+    CatalogCredentialBinding::try_new(purpose, consumer_role, mode)
+        .map_err(|error| invalid(root, error.to_string()))
+}
+
+fn encode_credential_purpose(value: CatalogCredentialPurpose) -> wire::CatalogCredentialPurpose {
+    match value {
+        CatalogCredentialPurpose::CatalogControl => wire::CatalogCredentialPurpose::CatalogControl,
+        CatalogCredentialPurpose::ObjectStoreData => {
+            wire::CatalogCredentialPurpose::ObjectStoreData
+        }
+    }
+}
+
+fn decode_credential_purpose(
+    value: i32,
+    root: FieldPath,
+) -> Result<CatalogCredentialPurpose, ProtocolError> {
+    match wire::CatalogCredentialPurpose::try_from(value) {
+        Ok(wire::CatalogCredentialPurpose::CatalogControl) => {
+            Ok(CatalogCredentialPurpose::CatalogControl)
+        }
+        Ok(wire::CatalogCredentialPurpose::ObjectStoreData) => {
+            Ok(CatalogCredentialPurpose::ObjectStoreData)
+        }
+        _ => Err(invalid(root, "catalog credential purpose is invalid")),
+    }
+}
+
+fn encode_consumer_role(value: CredentialConsumerRole) -> wire::CredentialConsumerRole {
+    match value {
+        CredentialConsumerRole::Frontend => wire::CredentialConsumerRole::Frontend,
+        CredentialConsumerRole::Backend => wire::CredentialConsumerRole::Backend,
+        CredentialConsumerRole::FrontendAndBackend => {
+            wire::CredentialConsumerRole::FrontendAndBackend
+        }
+    }
+}
+
+fn decode_consumer_role(
+    value: i32,
+    root: FieldPath,
+) -> Result<CredentialConsumerRole, ProtocolError> {
+    match wire::CredentialConsumerRole::try_from(value) {
+        Ok(wire::CredentialConsumerRole::Frontend) => Ok(CredentialConsumerRole::Frontend),
+        Ok(wire::CredentialConsumerRole::Backend) => Ok(CredentialConsumerRole::Backend),
+        Ok(wire::CredentialConsumerRole::FrontendAndBackend) => {
+            Ok(CredentialConsumerRole::FrontendAndBackend)
+        }
+        _ => Err(invalid(root, "catalog credential consumer role is invalid")),
+    }
 }
 
 fn encode_provider_kind(value: CatalogProviderKind) -> wire::CatalogProviderKind {
@@ -479,7 +567,16 @@ mod tests {
             CatalogProviderKind::Iceberg,
             1,
             vec![CatalogProperty::new("warehouse", "s3://warehouse").unwrap()],
-            vec![CatalogCredentialReference::new("object_store", Some("v1")).unwrap()],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Static(
+                        StaticCredentialReference::try_new("object_store", "v1").unwrap(),
+                    ),
+                )
+                .unwrap(),
+            ],
         )
         .unwrap()
     }

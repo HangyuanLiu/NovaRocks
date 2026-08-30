@@ -102,11 +102,11 @@ impl std::fmt::Debug for CatalogWriteExecutionBundle {
 /// Provider-owned constructor for a catalog-scoped writer unit.
 ///
 /// Server composition seals one factory per catalog provider kind. The
-/// `CatalogManager` invokes the factory only for an immutable handle that its
+/// `CatalogManager` invokes the factory only for immutable properties that its
 /// matching materializer has already accepted.
 pub trait CatalogWriteExecutionBundleFactory: Send + Sync {
     fn build(
         &self,
-        catalog_handle: &CatalogHandle,
+        properties: &CatalogProperties,
     ) -> Result<CatalogWriteExecutionBundle, ConnectorError>;
 }

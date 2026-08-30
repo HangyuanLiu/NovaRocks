@@ -30,7 +30,7 @@ use std::time::Instant;
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogWriteExecution, CatalogWriteExecutionBundle,
+    CatalogHandle, CatalogProperties, CatalogWriteExecution, CatalogWriteExecutionBundle,
     CatalogWriteExecutionBundleFactory, ConnectorBatchWriter, ConnectorError, ConnectorErrorKind,
     ConnectorOpenWriterRequest, ConnectorStagedReport, ConnectorStagedReportSummary,
     ConnectorWriteExecution, ConnectorWriterTerminalState,
@@ -139,8 +139,9 @@ impl IcebergCatalogWriteExecutionFactory {
 impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory {
     fn build(
         &self,
-        catalog_handle: &CatalogHandle,
+        properties: &CatalogProperties,
     ) -> Result<CatalogWriteExecutionBundle, ConnectorError> {
+        let catalog_handle = properties.handle();
         Ok(CatalogWriteExecutionBundle::new(Arc::new(
             IcebergCatalogWriteExecution::new(
                 catalog_handle.clone(),

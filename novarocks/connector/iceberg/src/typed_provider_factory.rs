@@ -33,8 +33,8 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorProviderId,
-    ConnectorRequestContext,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorProviderId, ConnectorRequestContext,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -181,8 +181,9 @@ mod tests {
 impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
     fn build(
         &self,
-        catalog_handle: &CatalogHandle,
+        properties: &CatalogProperties,
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError> {
+        let catalog_handle = properties.handle();
         let runtime = IcebergExecutionReadRuntime::new(
             iceberg_descriptor(catalog_handle),
             catalog_handle.clone(),

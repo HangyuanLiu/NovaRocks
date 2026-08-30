@@ -156,28 +156,6 @@ pub enum CatalogSqlMutationAdmission {
     Rejected,
 }
 
-/// A named reference to a credential, never the credential itself.
-///
-/// The dynamic StateStore mode produces none: the attachment record refuses
-/// credential-like durable properties outright, so there is nothing under that
-/// mode to reference yet.  The field exists on
-/// [`CatalogLogicalConfig`] because the logical config is one contract shared
-/// by all three modes, and a file or controller source names credentials by
-/// reference — a snapshot must be able to carry that without a second snapshot
-/// type appearing beside this one.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct CatalogCredentialReference(String);
-
-impl CatalogCredentialReference {
-    pub fn new(reference: impl Into<String>) -> Self {
-        Self(reference.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// One catalog's logical configuration, exactly as its source declares it.
 ///
 /// The field set is closed and deliberately narrow.  A resolved secret, the
@@ -207,7 +185,9 @@ impl CatalogLogicalConfig {
         config_format_version: u8,
     ) -> Result<Self, CatalogApplicationError> {
         if config_format_version == 0 {
-            return Err(invalid_logical_config("config format version must be non-zero"));
+            return Err(invalid_logical_config(
+                "config format version must be non-zero",
+            ));
         }
         if durable_properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
             return Err(invalid_logical_config(format!(
@@ -223,11 +203,18 @@ impl CatalogLogicalConfig {
             })
             .collect::<Result<Vec<_>, CatalogApplicationError>>()?;
         durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
-        if durable_properties.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(invalid_logical_config("duplicate catalog non-secret property key"));
+        if durable_properties
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(invalid_logical_config(
+                "duplicate catalog non-secret property key",
+            ));
         }
         let credential_bindings = canonicalize_catalog_credential_bindings(credential_bindings)
-            .map_err(|error| invalid_logical_config(format!("invalid catalog credential bindings: {error}")))?;
+            .map_err(|error| {
+                invalid_logical_config(format!("invalid catalog credential bindings: {error}"))
+            })?;
         Ok(Self {
             instance_id,
             provider_id,
@@ -279,7 +266,9 @@ impl CatalogLogicalConfig {
             update_framed(hasher, value.as_bytes());
         }
         let binding_bytes = canonical_catalog_credential_binding_bytes(&self.credential_bindings)
-            .map_err(|error| invalid_logical_config(format!("invalid catalog credential bindings: {error}")))?;
+            .map_err(|error| {
+            invalid_logical_config(format!("invalid catalog credential bindings: {error}"))
+        })?;
         update_framed(hasher, &binding_bytes);
         hasher.update([self.config_format_version]);
         Ok(())
@@ -383,8 +372,9 @@ impl CatalogDesiredStateEntry {
             .map_err(|error| projection_error(config, error))?;
         execution_properties.sort_by(|left, right| left.key().cmp(right.key()));
 
-        let binding_bytes = canonical_catalog_credential_binding_bytes(config.credential_bindings())
-            .map_err(|error| projection_error(config, error))?;
+        let binding_bytes =
+            canonical_catalog_credential_binding_bytes(config.credential_bindings())
+                .map_err(|error| projection_error(config, error))?;
 
         let version = CatalogVersion::from_bytes(self.execution_definition_digest(
             mode,
@@ -398,7 +388,7 @@ impl CatalogDesiredStateEntry {
             provider_kind,
             u32::from(config.config_format_version()),
             execution_properties,
-            Vec::new(),
+            config.credential_bindings().to_vec(),
         )
         .map_err(|error| projection_error(config, error))
     }
@@ -750,7 +740,7 @@ impl CatalogDesiredStateSource {
                         .map(|versioned| {
                             CatalogDesiredStateEntry::from_attachment(&versioned.attachment)
                         })
-                        .collect::<Vec<_>>(),
+                        .collect::<Result<Vec<_>, _>>()?,
                 )
             }
             CatalogDesiredStateAuthority::StaticFile(snapshot) => Ok(snapshot.clone()),
@@ -773,11 +763,12 @@ impl CatalogDesiredStateSource {
         instance_id: &ConnectorInstanceId,
     ) -> Result<Option<CatalogDesiredStateEntry>, CatalogApplicationError> {
         match &self.authority {
-            CatalogDesiredStateAuthority::DynamicStateStore(attachments) => Ok(attachments
+            CatalogDesiredStateAuthority::DynamicStateStore(attachments) => attachments
                 .get(instance_id)
                 .await
                 .map_err(|error| untrustworthy_enumeration(self.mode, error))?
-                .map(|versioned| CatalogDesiredStateEntry::from_attachment(&versioned.attachment))),
+                .map(|versioned| CatalogDesiredStateEntry::from_attachment(&versioned.attachment))
+                .transpose(),
             CatalogDesiredStateAuthority::StaticFile(snapshot) => Ok(snapshot.locate(instance_id)),
             CatalogDesiredStateAuthority::Unimplemented => {
                 Err(unsupported_mode(self.mode, "locate a catalog"))
@@ -881,13 +872,20 @@ fn projection_error(
     )
 }
 
+fn invalid_logical_config(detail: impl std::fmt::Display) -> CatalogApplicationError {
+    CatalogApplicationError::new(
+        CatalogApplicationErrorKind::InvalidRequest,
+        format!("invalid catalog logical configuration: {detail}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog_attachment::CatalogAttachment;
 
     fn config(name: &str, display: &str) -> CatalogLogicalConfig {
-        CatalogLogicalConfig::new(
+        CatalogLogicalConfig::try_new(
             ConnectorInstanceId::parse(name).expect("instance ID"),
             ConnectorProviderId::parse("iceberg").expect("provider ID"),
             display,
@@ -895,6 +893,7 @@ mod tests {
             Vec::new(),
             DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
         )
+        .expect("valid logical config")
     }
 
     fn entry(name: &str, display: &str) -> CatalogDesiredStateEntry {
@@ -910,14 +909,15 @@ mod tests {
     ) -> CatalogDesiredStateEntry {
         CatalogDesiredStateEntry::new(
             CatalogSourceEntryIdentity::new(identity),
-            CatalogLogicalConfig::new(
+            CatalogLogicalConfig::try_new(
                 ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
                 ConnectorProviderId::parse("iceberg").expect("provider ID"),
                 "analytics",
                 properties,
-                vec![CatalogCredentialReference::new("connector.object_store")],
+                Vec::new(),
                 DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
-            ),
+            )
+            .expect("valid logical config"),
         )
     }
 
@@ -1113,14 +1113,15 @@ mod tests {
 
         let unsupported = CatalogDesiredStateEntry::new(
             CatalogSourceEntryIdentity::new(Uuid::from_bytes([6; 16])),
-            CatalogLogicalConfig::new(
+            CatalogLogicalConfig::try_new(
                 ConnectorInstanceId::parse("catalog.fixture").expect("instance ID"),
                 ConnectorProviderId::parse("fixture").expect("provider ID"),
                 "fixture",
                 vec![("endpoint".to_string(), "http://fixture".to_string())],
                 Vec::new(),
                 DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
-            ),
+            )
+            .expect("valid unsupported-provider logical config"),
         );
         assert_eq!(
             unsupported

@@ -29,13 +29,14 @@
 //! A registration failure therefore leaves the source's truth intact and is
 //! reported as `Unavailable`; reconciliation can retry installation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::desired_state::{
     CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
+    CatalogDesiredStateSourceMode,
 };
 use super::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
@@ -44,7 +45,7 @@ use super::{
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{
-    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
     ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
     canonicalize_catalog_credential_bindings,
@@ -111,6 +112,7 @@ pub struct FrontendCatalogApplicationPort {
     runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
     runtime: Handle,
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
+    complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
 }
 
@@ -126,6 +128,7 @@ impl FrontendCatalogApplicationPort {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
         }
     }
@@ -142,6 +145,7 @@ impl FrontendCatalogApplicationPort {
             runtime_publisher,
             runtime,
             projections: Mutex::new(BTreeMap::new()),
+            complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
         }
     }
@@ -153,6 +157,15 @@ impl FrontendCatalogApplicationPort {
                 "this frontend has no configured catalog desired-state source",
             )
         })
+    }
+
+    /// A complete desired-state projection plus every still-draining local
+    /// control generation. `None` means this frontend has not completed a
+    /// source enumeration, so pruning must skip the round.
+    pub(crate) fn reachable_catalog_handles(&self) -> Option<BTreeSet<CatalogHandle>> {
+        let mut reachable = self.complete_reachable_catalogs.lock().ok()?.clone()?;
+        reachable.extend(self.control.reachable_catalog_handles().ok()?);
+        Some(reachable)
     }
 
     /// The authority a SQL `CREATE`/`DROP CATALOG` writes through.
@@ -377,16 +390,28 @@ impl FrontendCatalogApplicationPort {
         }
         let source = self.source()?;
         let snapshot = source.enumerate(page_size).await?;
+        let reachable = snapshot
+            .catalog_properties()?
+            .into_iter()
+            .map(|properties| properties.handle().clone())
+            .collect::<BTreeSet<_>>();
         tracing::debug!(
             source_mode = snapshot.mode().as_str(),
             snapshot = snapshot.identity().short_digest(),
             catalogs = snapshot.identity().catalog_count(),
             "catalog desired-state snapshot enumerated"
         );
+        *self.complete_reachable_catalogs.lock().map_err(|_| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog reachable snapshot lock is poisoned",
+            )
+        })? = Some(reachable);
         self.retire_projections_absent_from(source, &snapshot)
             .await?;
 
         let mut workers = tokio::task::JoinSet::new();
+        let mode = snapshot.mode();
         for entry in snapshot.clone().into_entries() {
             if workers.len() >= worker_count {
                 let completed = workers.join_next().await.ok_or_else(|| {
@@ -403,7 +428,7 @@ impl FrontendCatalogApplicationPort {
                 })?;
             }
             let projection = Arc::clone(self);
-            workers.spawn_blocking(move || projection.materialize_entry(entry));
+            workers.spawn_blocking(move || projection.materialize_entry(entry, mode));
         }
         while let Some(completed) = workers.join_next().await {
             completed.map_err(|error| {
@@ -474,7 +499,11 @@ impl FrontendCatalogApplicationPort {
     /// snapshot; giving this function a `Result` would let one broken catalog
     /// abort the reconcile of every healthy one, which is the failure scope
     /// this design exists to keep separate.
-    fn materialize_entry(&self, entry: CatalogDesiredStateEntry) {
+    fn materialize_entry(
+        &self,
+        entry: CatalogDesiredStateEntry,
+        mode: CatalogDesiredStateSourceMode,
+    ) {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id().clone();
         let provider_id = entry.config().provider_id().clone();
@@ -514,6 +543,9 @@ impl FrontendCatalogApplicationPort {
                 .create_control(request)
                 .map_err(connector_error)?;
             let (binding, _) = creation.into_parts();
+            let binding = binding
+                .with_catalog_properties(entry.catalog_properties(mode)?)
+                .map_err(connector_error)?;
             self.install_created(&entry, binding).map(|_| ())
         })();
         if let Err(error) = installed {
@@ -670,6 +702,11 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             entry.config().provider_id(),
             "catalog desired-state runtime is being installed",
         );
+        let binding = binding
+            .with_catalog_properties(
+                entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?,
+            )
+            .map_err(connector_error)?;
         self.install_created(&entry, binding)
     }
 

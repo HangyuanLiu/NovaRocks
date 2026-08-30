@@ -26,7 +26,10 @@ use std::{fmt::Write, sync::Arc};
 
 use uuid::Uuid;
 
-use super::{ConnectorError, ConnectorErrorKind, ConnectorInstanceId};
+use super::{
+    CatalogCredentialBinding, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    canonicalize_catalog_credential_bindings,
+};
 
 pub const CATALOG_VERSION_BYTES: usize = 32;
 pub const MAX_CATALOGS_PER_QUERY: usize = 256;
@@ -38,8 +41,6 @@ pub const MAX_PRUNE_CATALOG_SET_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_PROPERTIES: usize = 128;
 pub const MAX_CATALOG_PROPERTY_KEY_BYTES: usize = 256;
 pub const MAX_CATALOG_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
-pub const MAX_CATALOG_CREDENTIAL_REFERENCES: usize = 64;
-pub const MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES: usize = 256;
 
 /// The closed provider family used to materialize a catalog runtime.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -106,36 +107,6 @@ impl CatalogHandle {
     }
 }
 
-/// A credential reference understood by role-local startup composition.
-///
-/// The referenced secret value never belongs in this type or in native wire.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CatalogCredentialReference {
-    name: Arc<str>,
-    revision: Option<Arc<str>>,
-}
-
-impl CatalogCredentialReference {
-    pub fn new(
-        name: impl AsRef<str>,
-        revision: Option<impl AsRef<str>>,
-    ) -> Result<Self, ConnectorError> {
-        let name = bounded_ascii("catalog credential reference", name.as_ref())?;
-        let revision = revision
-            .map(|value| bounded_ascii("catalog credential reference revision", value.as_ref()))
-            .transpose()?;
-        Ok(Self { name, revision })
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn revision(&self) -> Option<&str> {
-        self.revision.as_deref()
-    }
-}
-
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CatalogProperty {
     key: Arc<str>,
@@ -174,7 +145,7 @@ pub struct CatalogProperties {
     provider_kind: CatalogProviderKind,
     config_format_version: u32,
     execution_properties: Vec<CatalogProperty>,
-    credential_references: Vec<CatalogCredentialReference>,
+    credential_bindings: Vec<CatalogCredentialBinding>,
 }
 
 impl CatalogProperties {
@@ -183,14 +154,12 @@ impl CatalogProperties {
         provider_kind: CatalogProviderKind,
         config_format_version: u32,
         mut execution_properties: Vec<CatalogProperty>,
-        mut credential_references: Vec<CatalogCredentialReference>,
+        credential_bindings: Vec<CatalogCredentialBinding>,
     ) -> Result<Self, ConnectorError> {
         if config_format_version == 0 {
             return Err(invalid("catalog config format version"));
         }
-        if execution_properties.len() > MAX_CATALOG_PROPERTIES
-            || credential_references.len() > MAX_CATALOG_CREDENTIAL_REFERENCES
-        {
+        if execution_properties.len() > MAX_CATALOG_PROPERTIES {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "catalog properties exceed configured bounds",
@@ -203,19 +172,13 @@ impl CatalogProperties {
         {
             return Err(invalid("duplicate catalog property key"));
         }
-        credential_references.sort();
-        if credential_references
-            .windows(2)
-            .any(|pair| pair[0] == pair[1])
-        {
-            return Err(invalid("duplicate catalog credential reference"));
-        }
+        let credential_bindings = canonicalize_catalog_credential_bindings(credential_bindings)?;
         Ok(Self {
             handle,
             provider_kind,
             config_format_version,
             execution_properties,
-            credential_references,
+            credential_bindings,
         })
     }
 
@@ -235,8 +198,8 @@ impl CatalogProperties {
         &self.execution_properties
     }
 
-    pub fn credential_references(&self) -> &[CatalogCredentialReference] {
-        &self.credential_references
+    pub fn credential_bindings(&self) -> &[CatalogCredentialBinding] {
+        &self.credential_bindings
     }
 }
 
@@ -262,14 +225,6 @@ impl Default for ConnectorControlRuntimeId {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn bounded_ascii(subject: &str, value: &str) -> Result<Arc<str>, ConnectorError> {
-    if value.is_empty() || value.len() > MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES || !value.is_ascii()
-    {
-        return Err(invalid(subject));
-    }
-    Ok(Arc::from(value))
 }
 
 fn is_property_key(value: &str) -> bool {
