@@ -669,6 +669,19 @@ pub fn puffin_path_for_statistics_operation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     fn make_sketch_with_values(start: i64, count: i64) -> ThetaSketchHandle {
         let mut sketch = ThetaSketchHandle::new(12);
@@ -817,7 +830,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("rt.puffin");
         let path_str = format!("file://{}", path.display());
-        let file_io = crate::fs_io::build_file_io_for_location(&path_str, None);
+        let file_io = crate::fs_io::build_file_io_for_location(&path_str, local_test_binding());
 
         let mut sketch = ThetaSketchHandle::new(12);
         for i in 0..500_i64 {
@@ -853,7 +866,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("provider-stats.puffin");
         let path_str = format!("file://{}", path.display());
-        let file_io = crate::fs_io::build_file_io_for_location(&path_str, None);
+        let file_io = crate::fs_io::build_file_io_for_location(&path_str, local_test_binding());
         let mut sketches = HashMap::new();
         sketches.insert(3_i32, make_sketch_with_values(0, 10));
         let payload = br#"{\"version\":1,\"data_version\":[1],\"metrics\":[]}"#;

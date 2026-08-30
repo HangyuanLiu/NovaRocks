@@ -459,10 +459,20 @@ pub async fn read_deletion_vector_puffin_with_range_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::iceberg::io::FileIO;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     fn local_file_io(location: &str) -> FileIO {
-        crate::fs_io::build_file_io_for_location(location, None)
+        let runtime = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        crate::fs_io::build_file_io_for_location(location, binding)
     }
 
     fn bitmap_with(values: &[u32]) -> RoaringBitmap {

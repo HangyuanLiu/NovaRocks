@@ -3281,7 +3281,8 @@ mod tests {
         // manifests must declare the same id or they would name a spec the
         // metadata does not have.
         let spec = identity_spec(&schema, 0, "region");
-        let file_io = crate::fs_io::build_file_io_for_location(&location, None);
+        let (_runtime, binding, _context) = runtime_and_binding();
+        let file_io = crate::fs_io::build_file_io_for_location(&location, binding);
 
         let mut manifests = Vec::new();
         let live_path = format!("{location}/metadata/live.avro");

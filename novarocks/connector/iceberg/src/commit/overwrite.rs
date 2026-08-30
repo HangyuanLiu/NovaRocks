@@ -795,6 +795,7 @@ fn _check_status_variant_referenced() {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use super::*;
     use crate::commit::CommitOpKind;
@@ -803,6 +804,17 @@ mod tests {
         FormatVersion, NestedField, PrimitiveType, Schema, Type as IcebergType,
     };
     use crate::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     struct LocalTableFixture {
         catalog: Arc<dyn Catalog>,
@@ -815,7 +827,7 @@ mod tests {
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
         let catalog: Arc<dyn Catalog> =
             Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
-                crate::fs_io::build_file_io_for_location(&warehouse_uri, None),
+                crate::fs_io::build_file_io_for_location(&warehouse_uri, local_test_binding()),
                 warehouse_uri,
             ));
         let namespace = NamespaceIdent::new("db".to_string());

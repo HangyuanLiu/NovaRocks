@@ -127,10 +127,22 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::Arc;
 
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use crate::iceberg::spec::{
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
         SortOrder, StatisticsFile, Summary, TableMetadataBuilder, Type,
     };
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
     use crate::stats_assembler::{StatisticsCoverageMark, write_puffin_with_provider_statistics};
     use crate::theta_sketch::ThetaSketchHandle;
 
@@ -199,7 +211,7 @@ mod tests {
             "file://{}",
             dir.join(format!("s{snapshot_id}.puffin")).display()
         );
-        let file_io = crate::fs_io::build_file_io_for_location(&path, None);
+        let file_io = crate::fs_io::build_file_io_for_location(&path, local_test_binding());
         let sketches: HashMap<i32, ThetaSketchHandle> = fields
             .iter()
             .map(|(field_id, distinct)| (*field_id, sketch_of(*distinct)))
@@ -221,7 +233,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_request_reads_nothing() {
         let metadata = chain(3, Vec::new());
-        let file_io = crate::fs_io::build_file_io_for_location("file:///tmp", None);
+        let file_io = crate::fs_io::build_file_io_for_location("file:///tmp", local_test_binding());
         assert!(
             resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::new())
                 .await
@@ -232,7 +244,7 @@ mod tests {
     #[tokio::test]
     async fn a_chain_without_statistics_files_resolves_nothing() {
         let metadata = chain(3, Vec::new());
-        let file_io = crate::fs_io::build_file_io_for_location("file:///tmp", None);
+        let file_io = crate::fs_io::build_file_io_for_location("file:///tmp", local_test_binding());
         assert!(
             resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::from([1, 2]))
                 .await
@@ -252,7 +264,7 @@ mod tests {
         let metadata = chain(3, vec![older, newer]);
         let file_io = crate::fs_io::build_file_io_for_location(
             &format!("file://{}", dir.path().display()),
-            None,
+            local_test_binding(),
         );
 
         let resolved = resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::from([5, 7])).await;
@@ -280,7 +292,7 @@ mod tests {
         let metadata = chain(3, vec![only]);
         let file_io = crate::fs_io::build_file_io_for_location(
             &format!("file://{}", dir.path().display()),
-            None,
+            local_test_binding(),
         );
 
         let resolved = resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::from([5, 9])).await;
@@ -303,7 +315,7 @@ mod tests {
         let metadata = chain(3, vec![reachable, vanished]);
         let file_io = crate::fs_io::build_file_io_for_location(
             &format!("file://{}", dir.path().display()),
-            None,
+            local_test_binding(),
         );
 
         let resolved = resolve_ancestor_ndv(&metadata, &file_io, 3, &BTreeSet::from([5, 7])).await;

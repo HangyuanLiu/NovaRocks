@@ -474,11 +474,26 @@ pub fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String,
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::{
         build_file_io_for_location, format_resolved_location, resolve_access_for_location,
         resolve_access_for_locations,
     };
+
+    fn local_test_binding(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        runtime: tokio::runtime::Handle,
+    ) -> crate::access_binding::IcebergReadBinding {
+        crate::access_binding::IcebergReadBinding::new(
+            object_store_config,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {
         novarocks_fs::ObjectStoreConfig {
@@ -502,7 +517,10 @@ mod tests {
         let file_path = dir.path().join("metadata.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let output = file_io.new_output(&location).expect("output file");
         output
             .write(Bytes::from_static(b"iceberg metadata"))
@@ -520,7 +538,10 @@ mod tests {
         let file_path = dir.path().join("metadata").join("00000.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         file_io
             .new_output(&location)
             .expect("output file")
@@ -545,7 +566,10 @@ mod tests {
         let file_path = dir.path().join("writer").join("00000.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let mut writer = file_io
             .new_output(&location)
             .expect("output file")
@@ -576,7 +600,10 @@ mod tests {
         std::fs::write(&file_path, b"0123456789").expect("write data");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let reader = file_io
             .new_input(&location)
             .expect("input file")
@@ -594,7 +621,10 @@ mod tests {
         std::fs::write(&file_path, b"0123456789").expect("write data");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let reader = file_io
             .new_input(&location)
             .expect("input file")
@@ -618,7 +648,10 @@ mod tests {
     #[tokio::test]
     async fn s3_file_io_without_credentials_fails_on_first_io() {
         let location = "s3://bucket/table/metadata.json";
-        let file_io = build_file_io_for_location(location, None);
+        let file_io = build_file_io_for_location(
+            location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let input = file_io.new_input(location).expect("input file");
 
         let err = input
@@ -652,8 +685,10 @@ mod tests {
                 "oss://bucket/warehouse/table/data/a.parquet",
             ),
         ] {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            let binding = local_test_binding(Some(cfg.clone()), runtime.handle().clone());
             let access =
-                resolve_access_for_location(location, Some(&cfg)).expect("resolve object store");
+                resolve_access_for_location(location, &binding).expect("resolve object store");
             let formatted =
                 format_resolved_location(access.handle(), "warehouse/table/data/a.parquet")
                     .expect("format location");
@@ -674,7 +709,9 @@ mod tests {
             format!("file://{}", second.display()),
         ];
 
-        let access = resolve_access_for_locations(locations.iter().map(String::as_str), None)
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = local_test_binding(None, runtime.handle().clone());
+        let access = resolve_access_for_locations(locations.iter().map(String::as_str), &binding)
             .expect("access");
 
         assert_eq!(
@@ -685,7 +722,9 @@ mod tests {
 
     #[test]
     fn object_store_without_credentials_returns_resolver_error() {
-        let err = resolve_access_for_location("s3://bucket/table/metadata.json", None)
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = local_test_binding(None, runtime.handle().clone());
+        let err = resolve_access_for_location("s3://bucket/table/metadata.json", &binding)
             .expect_err("missing object-store config should fail");
 
         assert!(
