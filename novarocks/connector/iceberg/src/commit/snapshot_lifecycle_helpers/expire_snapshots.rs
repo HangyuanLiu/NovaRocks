@@ -368,6 +368,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use super::*;
     use novarocks_connector_iceberg::commit::compute_live_snapshot_set;
     use novarocks_connector_iceberg::iceberg::spec::{
@@ -382,6 +384,16 @@ mod tests {
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         _warehouse: tempfile::TempDir,
+    }
+
+    fn local_test_binding() -> novarocks_connector_iceberg::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
     }
 
     fn build_test_metadata_with_snapshots(
@@ -449,7 +461,7 @@ mod tests {
             novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
                 novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                     &warehouse_uri,
-                    None,
+                    local_test_binding(),
                 ),
                 warehouse_uri,
             ),

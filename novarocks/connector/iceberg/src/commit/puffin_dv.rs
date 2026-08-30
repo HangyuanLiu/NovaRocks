@@ -513,8 +513,15 @@ mod tests {
     }
 
     fn factory_for_dir(dir: &std::path::Path) -> novarocks_fs::FsAccessHandle {
-        novarocks_fs::FsAccessResolver::new()
-            .resolve_location(dir.join("__binding__").to_string_lossy(), None)
+        let runtime = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        binding
+            .resolve_access(&format!("file://{}", dir.join("__binding__").display()))
             .expect("access")
     }
 

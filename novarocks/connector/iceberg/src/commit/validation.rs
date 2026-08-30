@@ -439,7 +439,24 @@ fn arrow_iceberg_types_compatible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, OnceLock};
+
     use crate::commit::NOVAROCKS_UPDATE_MODE_MOR;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let runtime = RUNTIME
+            .get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"))
+            .handle()
+            .clone();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     #[test]
     fn default_sort_order_resolvable_ok_for_unsorted_table() {
@@ -603,7 +620,7 @@ mod tests {
             .identifier(crate::iceberg::TableIdent::from_strs(["d", "t"]).unwrap())
             .file_io(crate::fs_io::build_file_io_for_location(
                 "file:///tmp/x",
-                None,
+                local_test_binding(),
             ))
             .metadata(metadata)
             .build()

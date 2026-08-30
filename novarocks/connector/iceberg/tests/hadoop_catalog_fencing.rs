@@ -18,9 +18,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::catalog_config::{
     IcebergCatalogConfiguration, parse_catalog_configuration_with_object_store_binding,
 };
@@ -31,7 +32,9 @@ use novarocks_connector_iceberg::iceberg::spec::{
 use novarocks_connector_iceberg::iceberg::{
     Catalog, ErrorKind, NamespaceIdent, TableCreation, TableIdent,
 };
-use novarocks_connector_iceberg::novarocks_fs::{ObjectStoreConfig, SecretValue};
+use novarocks_connector_iceberg::novarocks_fs::{
+    FsAccessResolver, ObjectStoreConfig, SecretValue, TokioFileIoRuntime, TokioFileTaskSpawner,
+};
 use sha2::{Digest, Sha256};
 
 const CHILD_ENV: &str = "NR_HADOOP_FENCE_CHILD";
@@ -127,7 +130,8 @@ fn hadoop_fencing_child_process_entry() {
     let child_index = required_env(CHILD_INDEX_ENV);
 
     let config = catalog_configuration(&warehouse);
-    let catalog = build_hadoop_catalog(&config).expect("build child Hadoop catalog");
+    let catalog = build_hadoop_catalog(&config, catalog_binding(&config))
+        .expect("build child Hadoop catalog");
     let namespace_ident = NamespaceIdent::new(namespace.clone());
     let table_ident = TableIdent::new(namespace_ident.clone(), table_name.clone());
 
@@ -171,9 +175,10 @@ fn run_race(warehouse: &str, table_name: &str, policy: Policy) {
         table_name
     );
     let config = catalog_configuration(warehouse);
+    let binding = catalog_binding(&config);
     let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
         &metadata_location,
-        config.object_store_config.as_ref(),
+        &binding,
     )
     .expect("resolve v1 metadata access");
     assert!(
@@ -267,7 +272,8 @@ fn audit_prefix(
     namespace: &str,
     table_name: &str,
 ) -> PrefixAudit {
-    let catalog = build_hadoop_catalog(config).expect("build audit Hadoop catalog");
+    let catalog =
+        build_hadoop_catalog(config, catalog_binding(config)).expect("build audit Hadoop catalog");
     let ident = TableIdent::from_strs([namespace, table_name]).expect("audit table identity");
     let runtime = tokio::runtime::Runtime::new().expect("audit runtime");
     let table = runtime
@@ -277,11 +283,10 @@ fn audit_prefix(
         .metadata_location()
         .expect("audit table metadata location")
         .to_string();
-    let access = novarocks_connector_iceberg::fs_io::resolve_access_for_location(
-        &location,
-        config.object_store_config.as_ref(),
-    )
-    .expect("resolve audit metadata access");
+    let binding = catalog_binding(config);
+    let access =
+        novarocks_connector_iceberg::fs_io::resolve_access_for_location(&location, &binding)
+            .expect("resolve audit metadata access");
     let relative_path = access
         .single_relative_path()
         .expect("single audit metadata path")
@@ -383,6 +388,20 @@ fn catalog_configuration(warehouse: &str) -> IcebergCatalogConfiguration {
         object_store_config.as_ref(),
     )
     .expect("parse Hadoop catalog configuration")
+}
+
+fn catalog_binding(config: &IcebergCatalogConfiguration) -> IcebergReadBinding {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    let runtime = RUNTIME
+        .get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"))
+        .handle()
+        .clone();
+    IcebergReadBinding::new(
+        config.object_store_config.clone(),
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+        Arc::new(TokioFileTaskSpawner::new(runtime)),
+    )
 }
 
 fn object_store_config(warehouse: &str) -> Option<ObjectStoreConfig> {

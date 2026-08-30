@@ -1793,7 +1793,7 @@ mod tests {
     }
 
     /// A prepared aggregate with no writer bound, for state-machine tests.
-    fn prepared_operation(_runtime: &IcebergMetadataContext) -> PreparedOperation {
+    fn prepared_operation(runtime: &IcebergMetadataContext) -> PreparedOperation {
         let location = "file:///tmp/novarocks-staged-create/table";
         let schema = crate::iceberg::spec::Schema::builder()
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
@@ -1817,7 +1817,10 @@ mod tests {
         .metadata;
         let table = crate::iceberg::table::Table::builder()
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
-            .file_io(crate::fs_io::build_file_io_for_location(location, None))
+            .file_io(crate::fs_io::build_file_io_for_location(
+                location,
+                runtime.resources().planning_binding().clone(),
+            ))
             .metadata(metadata)
             .build()
             .expect("table");
