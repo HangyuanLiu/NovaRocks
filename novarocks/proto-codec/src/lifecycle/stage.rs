@@ -616,6 +616,22 @@ mod tests {
             .expect("valid participant")
     }
 
+    fn golden_participant() -> ParticipantAttemptRef {
+        ParticipantAttemptRef::new(
+            QueryExecutionId::new(
+                QueryId::new(0x0102_0304_0506_0708, 0x1112_1314_1516_1718),
+                AttemptId::new(7).expect("nonzero attempt"),
+            )
+            .expect("nonzero query id"),
+            novarocks_types::BackendProcessId::try_from_bytes([
+                0x01, 0x9c, 0x98, 0xa9, 0x33, 0x90, 0x75, 0x76, 0x97, 0x7b, 0x33, 0xd1, 0x88, 0xad,
+                0x1f, 0x06,
+            ])
+            .expect("fixed UUIDv7 backend process id"),
+        )
+        .expect("valid participant")
+    }
+
     fn fragment(lo: i64) -> StageFragment {
         StageFragment::new(
             plan::PlanFragment::default(),
@@ -722,6 +738,23 @@ mod tests {
             StageDigest::compute(participant.clone(), &[first.clone(), second.clone()])
                 .expect("digest"),
             StageDigest::compute(participant, &[second, first]).expect("digest")
+        );
+    }
+
+    #[test]
+    fn stage_digest_matches_fixed_canonical_golden() {
+        let digest = StageDigest::compute(
+            golden_participant(),
+            &[fragment_with_maps(3, false), fragment(9)],
+        )
+        .expect("digest");
+        assert_eq!(
+            digest
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "b70b8bc407f68fde43c4a25c67e6067f7596e3fd4759b7b6262dfe9ab4dcdbde"
         );
     }
 

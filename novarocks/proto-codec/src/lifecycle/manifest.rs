@@ -1048,6 +1048,20 @@ mod tests {
     }
 
     #[test]
+    fn manifest_digest_matches_fixed_canonical_golden() {
+        let manifest = ParticipantManifest::parse(manifest()).expect("valid manifest");
+        let digest = manifest.digest().expect("digest");
+        assert_eq!(
+            digest
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "da5916181193fe76e19ba26d713048062cb36a8570a81b8631e78059e4563656"
+        );
+    }
+
+    #[test]
     fn manifest_digest_requires_exactly_thirty_two_bytes() {
         assert_eq!(
             ParticipantManifestDigest::try_from_slice(&[7; 32])
