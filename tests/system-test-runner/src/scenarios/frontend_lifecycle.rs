@@ -46,6 +46,7 @@ impl Scenario for CatalogPartialReadiness {
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_healthy\"\n\
                  config_format_version = 3\n\
+                 credential_bindings = []\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n\
@@ -55,6 +56,7 @@ impl Scenario for CatalogPartialReadiness {
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_unavailable\"\n\
                  config_format_version = 3\n\
+                 credential_bindings = []\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n",
@@ -130,6 +132,7 @@ impl Scenario for StaticFileDisposableCarrier {
                  provider_id = \"iceberg\"\n\
                  display_name = \"lnp8_static\"\n\
                  config_format_version = 3\n\
+                 credential_bindings = []\n\
                  [catalogs.properties]\n\
                  type = \"iceberg\"\n\
                  \"iceberg.catalog.type\" = \"hadoop\"\n\
