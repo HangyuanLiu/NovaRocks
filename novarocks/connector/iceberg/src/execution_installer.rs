@@ -71,6 +71,10 @@ impl IcebergCatalogRuntimeMaterializer {
             binding: resources.binding().clone(),
         }
     }
+
+    pub fn from_binding(binding: IcebergReadBinding) -> Self {
+        Self { binding }
+    }
 }
 
 struct IcebergCatalogRuntime {
@@ -103,9 +107,10 @@ impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
                 "Iceberg catalog materializer received another provider kind",
             ));
         }
+        let binding = self.binding.bind_catalog(properties)?;
         Ok(Arc::new(IcebergCatalogRuntime {
             handle: properties.handle().clone(),
-            _binding: self.binding.clone(),
+            _binding: binding,
         }))
     }
 }
@@ -130,13 +135,11 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
         declaration: &ConnectorProviderBinding,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        let prepared = prepare_iceberg_execution_binding(declaration)?;
-        if prepared.access_binding() != self.resources.binding().access_binding() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg declaration access binding does not match BE startup binding",
-            ));
-        }
+        // Validate the legacy provider declaration's kind only. Production NID
+        // execution binds the role-local template from its immutable
+        // `CatalogProperties`; the old opaque access-binding label has no
+        // credential authority and must not select a BE configuration.
+        let _ = prepare_iceberg_execution_binding(declaration)?;
         let key = declaration.binding_key().clone();
         ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),

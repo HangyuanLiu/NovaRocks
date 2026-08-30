@@ -151,11 +151,8 @@ impl IcebergCatalogControlState {
     }
 
     pub fn is_s3(&self) -> bool {
-        self.configuration.object_store_config.is_some()
-    }
-
-    pub fn object_store_config(&self) -> Option<&novarocks_fs::ObjectStoreConfig> {
-        self.configuration.object_store_config.as_ref()
+        novarocks_fs::is_object_store_location_parse_only(&self.configuration.warehouse_uri)
+            .unwrap_or(false)
     }
 
     pub fn cloud_properties_map(&self) -> BTreeMap<String, String> {

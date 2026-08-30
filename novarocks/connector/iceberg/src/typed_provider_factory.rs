@@ -183,6 +183,7 @@ impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
         &self,
         properties: &CatalogProperties,
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError> {
+        let binding = self.binding.bind_catalog(properties)?;
         let catalog_handle = properties.handle();
         let runtime = IcebergExecutionReadRuntime::new(
             iceberg_descriptor(catalog_handle),
@@ -194,7 +195,10 @@ impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
         let codec = Arc::new(IcebergConnectorReadCodec::new(adapter.clone()));
         let provider_factory = Arc::new(ProviderReadFactoryAdapter::new(
             adapter,
-            Arc::new(self.clone()),
+            Arc::new(Self {
+                binding,
+                options: self.options,
+            }),
         ));
         Ok(ConnectorReadExecutionBundle::new(provider_factory, codec))
     }

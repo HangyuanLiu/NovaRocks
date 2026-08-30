@@ -148,7 +148,8 @@ impl IcebergConnectorFactory {
             &properties,
             object_store_config.as_ref().map(|binding| binding.config()),
         )
-        .map_err(invalid)?;
+        .map_err(invalid)?
+        .without_object_store_config();
         let durable_properties = sanitize_durable_properties(&configuration.properties);
         let runtime = Arc::new(
             IcebergMetadataContext::try_new(

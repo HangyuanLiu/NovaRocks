@@ -25,18 +25,11 @@ use novarocks_types::naming::normalize_identifier;
 #[derive(Clone, Debug)]
 pub struct IcebergPhysicalTable {
     pub table: crate::iceberg::table::Table,
-    pub object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
 }
 
 impl IcebergPhysicalTable {
-    pub fn new(
-        table: crate::iceberg::table::Table,
-        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
-    ) -> Self {
-        Self {
-            table,
-            object_store_config,
-        }
+    pub fn new(table: crate::iceberg::table::Table) -> Self {
+        Self { table }
     }
 
     pub fn into_table(self) -> crate::iceberg::table::Table {

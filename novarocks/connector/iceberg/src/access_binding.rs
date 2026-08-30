@@ -111,6 +111,19 @@ impl IcebergReadBinding {
         }
     }
 
+    /// Build a role-local template that can be rebound only to an admitted
+    /// immutable catalog definition.
+    pub fn with_static_credential_resolver(
+        resources: FsAccessResources,
+        credential_resolver: Arc<dyn IcebergStaticCredentialResolver>,
+    ) -> Self {
+        Self {
+            resources,
+            credential_resolver: Some(credential_resolver),
+            storage_access: None,
+        }
+    }
+
     /// Bind a catalog definition to its exact, role-local static credential
     /// resolver. The catalog carrier contains only non-secret facts. Vended
     /// credentials are intentionally rejected until their query-attempt lease
@@ -138,6 +151,16 @@ impl IcebergReadBinding {
             .iter()
             .find(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData);
 
+        let endpoint_config =
+            crate::catalog_config::object_store_endpoint_config_from_catalog_properties(
+                &properties
+                    .execution_properties()
+                    .iter()
+                    .map(|property| (property.key().to_string(), property.value().to_string()))
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(invalid)?;
+
         let storage_access = match object_store_binding {
             Some(binding) => {
                 let CatalogCredentialMode::Static(reference) = binding.mode() else {
@@ -145,20 +168,9 @@ impl IcebergReadBinding {
                         "Iceberg vended object-store credentials require M2 query leases",
                     ));
                 };
-                let endpoint_config =
-                    crate::catalog_config::object_store_endpoint_config_from_catalog_properties(
-                        &properties
-                            .execution_properties()
-                            .iter()
-                            .map(|property| {
-                                (property.key().to_string(), property.value().to_string())
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .map_err(invalid)?
-                    .ok_or_else(|| {
-                        invalid("static Iceberg object-store binding missing endpoint config")
-                    })?;
+                let endpoint_config = endpoint_config.ok_or_else(|| {
+                    invalid("static Iceberg object-store binding missing endpoint config")
+                })?;
                 let domain_input = CatalogStorageAccessDomainInput::try_new(
                     provider_id,
                     properties.handle().catalog_name().clone(),
@@ -173,18 +185,35 @@ impl IcebergReadBinding {
                     credential_reference: reference.clone(),
                 }
             }
-            None => IcebergStorageAccess::Uncredentialed {
-                provider_id,
-                catalog_name: properties.handle().catalog_name().clone(),
-                config_format_version: properties.config_format_version(),
-                non_secret_properties,
-            },
+            None => {
+                if endpoint_config.is_some() {
+                    return Err(invalid(
+                        "Iceberg object-store endpoint requires an exact object-store credential binding",
+                    ));
+                }
+                IcebergStorageAccess::Uncredentialed {
+                    provider_id,
+                    catalog_name: properties.handle().catalog_name().clone(),
+                    config_format_version: properties.config_format_version(),
+                    non_secret_properties,
+                }
+            }
         };
         Ok(Self {
             resources,
             credential_resolver: Some(credential_resolver),
             storage_access: Some(storage_access),
         })
+    }
+
+    /// Rebind this role-local template to one immutable catalog definition.
+    /// Templates without a credential resolver are deliberately unusable for
+    /// catalog I/O: production composition must supply an exact resolver.
+    pub fn bind_catalog(&self, properties: &CatalogProperties) -> Result<Self, ConnectorError> {
+        let resolver = self.credential_resolver.clone().ok_or_else(|| {
+            invalid("Iceberg catalog access binding has no role-local credential resolver")
+        })?;
+        Self::from_catalog_properties(self.resources.clone(), resolver, properties)
     }
 
     /// Explicit convenience constructor for composition roots that do not

@@ -48,6 +48,16 @@ pub struct IcebergCatalogConfiguration {
     pub warehouse_path: PathBuf,
 }
 
+impl IcebergCatalogConfiguration {
+    /// Discard the short-lived parser bridge used only to validate legacy
+    /// property syntax. Production catalog generations retain no object-store
+    /// secret material; their bound access capability stays role-local.
+    pub fn without_object_store_config(mut self) -> Self {
+        self.object_store_config = None;
+        self
+    }
+}
+
 impl Debug for IcebergCatalogConfiguration {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         formatter

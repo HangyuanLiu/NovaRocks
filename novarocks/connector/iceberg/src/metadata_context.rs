@@ -65,11 +65,12 @@ impl IcebergMetadataContext {
         resources: IcebergMetadataResources,
     ) -> Result<Self, String> {
         let configuration = control_state.configuration().clone();
+        let binding = resources.planning_binding().clone();
         let catalog = resources
             .catalog_runtime()
-            .block_on(
-                async move { crate::catalog_runtime::build_catalog_client(&configuration).await },
-            )?
+            .block_on(async move {
+                crate::catalog_runtime::build_catalog_client(&configuration, binding).await
+            })?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
         // Every handle below is derived from this one client. Building a second
         // one for the owner would give the generation two clients with separate
@@ -157,8 +158,7 @@ impl IcebergMetadataContext {
                     format!("load Iceberg table {namespace}.{table}: {error}"),
                 )
             })?;
-        let physical =
-            IcebergPhysicalTable::new(loaded, self.control_state.object_store_config().cloned());
+        let physical = IcebergPhysicalTable::new(loaded);
         self.control_state
             .physical_table_cache()
             .insert(&namespace, &table, physical.clone())

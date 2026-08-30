@@ -142,10 +142,11 @@ impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory 
         properties: &CatalogProperties,
     ) -> Result<CatalogWriteExecutionBundle, ConnectorError> {
         let catalog_handle = properties.handle();
+        let binding = self.binding.bind_catalog(properties)?;
         Ok(CatalogWriteExecutionBundle::new(Arc::new(
             IcebergCatalogWriteExecution::new(
                 catalog_handle.clone(),
-                self.binding.clone(),
+                binding,
                 self.runtime.clone(),
             ),
         )))

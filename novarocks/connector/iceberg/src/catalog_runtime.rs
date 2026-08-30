@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::access_binding::IcebergReadBinding;
 use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 
 /// One concrete catalog client with both its generic control view and the
@@ -52,6 +53,7 @@ impl IcebergCatalogClient {
 
 pub fn build_hadoop_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<crate::hadoop_catalog::HadoopFileSystemCatalog, String> {
     if configuration.kind != IcebergCatalogKind::Hadoop {
         return Err(format!(
@@ -59,21 +61,20 @@ pub fn build_hadoop_catalog(
             configuration.kind
         ));
     }
-    let file_io = crate::fs_io::build_file_io_for_location(
-        &configuration.warehouse_uri,
-        configuration.object_store_config.as_ref(),
-    );
+    let file_io =
+        crate::fs_io::build_file_io_for_location(&configuration.warehouse_uri, binding.clone());
     Ok(
-        crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_object_store_config(
+        crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
             file_io,
             configuration.warehouse_uri.clone(),
-            configuration.object_store_config.clone(),
+            binding,
         ),
     )
 }
 
 pub async fn build_rest_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_rest::{
@@ -104,7 +105,7 @@ pub async fn build_rest_catalog(
         );
     }
     RestCatalogBuilder::default()
-        .with_storage_factory(storage_factory(configuration))
+        .with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
         .load("rest".to_string(), properties)
         .await
         .map_err(|error| format!("build REST iceberg catalog: {error}"))
@@ -112,6 +113,7 @@ pub async fn build_rest_catalog(
 
 pub async fn build_hms_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<crate::iceberg_catalog_hms::HmsCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_hms::{
@@ -156,7 +158,7 @@ pub async fn build_hms_catalog(
         },
     );
     HmsCatalogBuilder::default()
-        .with_storage_factory(storage_factory(configuration))
+        .with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
         .load("hms".to_string(), properties)
         .await
         .map_err(|error| format!("build HMS iceberg catalog: {error}"))
@@ -165,10 +167,11 @@ pub async fn build_hms_catalog(
 /// Construct the single concrete client retained by one control generation.
 pub async fn build_catalog_client(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<IcebergCatalogClient, String> {
     match configuration.kind {
         IcebergCatalogKind::Hadoop => {
-            let hadoop = Arc::new(build_hadoop_catalog(configuration)?);
+            let hadoop = Arc::new(build_hadoop_catalog(configuration, binding)?);
             let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
             Ok(IcebergCatalogClient {
                 generic,
@@ -177,7 +180,7 @@ pub async fn build_catalog_client(
             })
         }
         IcebergCatalogKind::Rest => {
-            let rest = Arc::new(build_rest_catalog(configuration).await?);
+            let rest = Arc::new(build_rest_catalog(configuration, binding).await?);
             let generic: Arc<dyn crate::iceberg::Catalog> = rest.clone();
             Ok(IcebergCatalogClient {
                 generic,
@@ -186,7 +189,7 @@ pub async fn build_catalog_client(
             })
         }
         IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
-            generic: Arc::new(build_hms_catalog(configuration).await?),
+            generic: Arc::new(build_hms_catalog(configuration, binding).await?),
             hadoop: None,
             rest: None,
         }),
@@ -194,17 +197,29 @@ pub async fn build_catalog_client(
 }
 
 fn storage_factory(
-    configuration: &IcebergCatalogConfiguration,
+    warehouse_uri: &str,
+    binding: IcebergReadBinding,
 ) -> Arc<dyn crate::iceberg::io::StorageFactory> {
-    crate::fs_io::build_storage_factory_for_location(
-        &configuration.warehouse_uri,
-        configuration.object_store_config.as_ref(),
-    )
+    crate::fs_io::build_storage_factory_for_location(warehouse_uri, binding)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use super::*;
+
+    fn local_binding() -> IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     #[tokio::test]
     async fn dispatches_hadoop_catalog_from_provider_configuration() {
@@ -218,7 +233,7 @@ mod tests {
         )
         .expect("configuration");
 
-        let client = build_catalog_client(&configuration)
+        let client = build_catalog_client(&configuration, local_binding())
             .await
             .expect("provider catalog");
         assert!(client.rest().is_none());
