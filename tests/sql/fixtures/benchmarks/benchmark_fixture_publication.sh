@@ -117,7 +117,7 @@ fixture_publication_get() {
     rm -f "$config" "$headers" "$body"
     return 44
   fi
-  FIXTURE_PUBLICATION_ETAG="$(awk 'BEGIN{IGNORECASE=1} /^etag:/ {gsub("\\r", ""); sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\"/, ""); print; exit}' "$headers")"
+  FIXTURE_PUBLICATION_ETAG="$(awk 'tolower($1) == "etag:" {gsub("\\r", ""); sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\"/, ""); print; exit}' "$headers")"
   if [[ -z "$FIXTURE_PUBLICATION_ETAG" ]]; then
     rm -f "$config" "$headers" "$body"
     return 1
