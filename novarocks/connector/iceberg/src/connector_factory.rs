@@ -408,7 +408,9 @@ mod tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+        ConnectorInstanceId, CredentialConsumerRole, StaticCredentialReference,
     };
 
     use super::*;
@@ -429,6 +431,56 @@ mod tests {
         }
     }
 
+    fn catalog_properties(
+        instance_id: ConnectorInstanceId,
+        properties: &[(String, String)],
+        credential_bindings: Vec<CatalogCredentialBinding>,
+    ) -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(instance_id, CatalogVersion::from_bytes([0; 32])),
+            CatalogProviderKind::Iceberg,
+            1,
+            properties
+                .iter()
+                .map(|(key, value)| {
+                    CatalogProperty::new(key, value).expect("non-secret catalog property")
+                })
+                .collect(),
+            credential_bindings,
+        )
+        .expect("valid desired-state catalog properties")
+    }
+
+    fn factory_request_with_catalog_properties(
+        factory: &IcebergConnectorFactory,
+        instance_id: ConnectorInstanceId,
+        request_properties: Vec<(String, String)>,
+        catalog_properties: CatalogProperties,
+    ) -> ConnectorControlFactoryRequest {
+        ConnectorControlFactoryRequest::try_new(
+            factory.provider_id().clone(),
+            instance_id,
+            request_properties,
+        )
+        .and_then(|request| request.with_catalog_properties(catalog_properties))
+        .expect("factory request with typed catalog properties")
+    }
+
+    fn factory_request(
+        factory: &IcebergConnectorFactory,
+        instance_id: &str,
+        properties: Vec<(String, String)>,
+    ) -> ConnectorControlFactoryRequest {
+        let instance_id = ConnectorInstanceId::parse(instance_id).expect("instance ID");
+        let catalog_properties = catalog_properties(instance_id.clone(), &properties, Vec::new());
+        factory_request_with_catalog_properties(
+            factory,
+            instance_id,
+            properties,
+            catalog_properties,
+        )
+    }
+
     fn rest_factory_request(
         factory: &IcebergConnectorFactory,
         uri: String,
@@ -443,12 +495,7 @@ mod tests {
             ),
         ];
         properties.extend(extra);
-        ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
-            properties,
-        )
-        .expect("REST factory request")
+        factory_request(factory, "ice", properties)
     }
 
     struct TestReadRegistrationLease;
@@ -494,12 +541,11 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "ice",
             vec![("iceberg.catalog.type".to_string(), "unknown".to_string())],
-        )
-        .expect("factory request");
+        );
 
         let error = factory
             .prepare_unpublished(&request)
@@ -509,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn unpublished_generation_redacts_credentials_before_attachment_persistence() {
+    fn unpublished_generation_uses_only_typed_catalog_properties() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let warehouse = tempfile::tempdir().expect("warehouse");
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -522,20 +568,29 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
-            vec![
-                ("type".to_string(), "iceberg".to_string()),
-                (
-                    "iceberg.catalog.warehouse".to_string(),
-                    warehouse.path().display().to_string(),
-                ),
-                ("aws.s3.access_key".to_string(), "not-durable".to_string()),
-                ("aws.s3.secret_key".to_string(), "not-durable".to_string()),
-            ],
-        )
-        .expect("request");
+        let request_properties = vec![
+            ("type".to_string(), "iceberg".to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "not-durable".to_string()),
+            ("aws.s3.secret_key".to_string(), "not-durable".to_string()),
+        ];
+        let typed_properties = vec![
+            ("type".to_string(), "iceberg".to_string()),
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            ),
+        ];
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let request = factory_request_with_catalog_properties(
+            &factory,
+            instance_id.clone(),
+            request_properties,
+            catalog_properties(instance_id, &typed_properties, Vec::new()),
+        );
         let unpublished = factory.prepare_unpublished(&request).expect("runtime");
 
         assert!(
@@ -561,23 +616,30 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
-            vec![
-                (
-                    "iceberg.catalog.warehouse".to_string(),
-                    "s3://warehouse/iceberg".to_string(),
-                ),
-                (
-                    "aws.s3.endpoint".to_string(),
-                    "http://minio:9000".to_string(),
-                ),
-                ("aws.s3.access_key".to_string(), "request-only".to_string()),
-                ("aws.s3.secret_key".to_string(), "request-only".to_string()),
-            ],
-        )
-        .expect("request");
+        let request_properties = vec![
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                "s3://warehouse/iceberg".to_string(),
+            ),
+            (
+                "aws.s3.endpoint".to_string(),
+                "http://minio:9000".to_string(),
+            ),
+            ("aws.s3.access_key".to_string(), "request-only".to_string()),
+            ("aws.s3.secret_key".to_string(), "request-only".to_string()),
+        ];
+        let typed_properties = request_properties
+            .iter()
+            .filter(|(key, _)| !credential_like_property(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let request = factory_request_with_catalog_properties(
+            &factory,
+            instance_id.clone(),
+            request_properties,
+            catalog_properties(instance_id, &typed_properties, Vec::new()),
+        );
 
         let error = factory
             .prepare_unpublished(&request)
@@ -586,12 +648,12 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("server-composed credential binding")
+                .contains("exact object-store credential binding")
         );
     }
 
     #[test]
-    fn restore_reuses_server_credentials_after_durable_redaction() {
+    fn restore_reuses_server_credentials_from_typed_binding() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = object_store_config();
         let binding = crate::access_binding::IcebergReadBinding::new(
@@ -604,30 +666,39 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let typed_properties = vec![
+            (
+                "iceberg.catalog.warehouse".to_string(),
+                "s3://warehouse/iceberg".to_string(),
+            ),
+            ("aws.s3.endpoint".to_string(), config.endpoint.clone()),
+            (
+                "aws.s3.enable_path_style_access".to_string(),
+                "true".to_string(),
+            ),
+        ];
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let catalog_properties = catalog_properties(
+            instance_id.clone(),
+            &typed_properties,
             vec![
-                (
-                    "iceberg.catalog.warehouse".to_string(),
-                    "s3://warehouse/iceberg".to_string(),
-                ),
-                ("aws.s3.endpoint".to_string(), config.endpoint.clone()),
-                (
-                    "aws.s3.access_key".to_string(),
-                    config.access_key_id.expose_secret().to_string(),
-                ),
-                (
-                    "aws.s3.secret_key".to_string(),
-                    config.access_key_secret.expose_secret().to_string(),
-                ),
-                (
-                    "aws.s3.enable_path_style_access".to_string(),
-                    "true".to_string(),
-                ),
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Static(
+                        StaticCredentialReference::try_new("iceberg-test-object-store", "test")
+                            .expect("test credential reference"),
+                    ),
+                )
+                .expect("valid test credential binding"),
             ],
-        )
-        .expect("request");
+        );
+        let request = factory_request_with_catalog_properties(
+            &factory,
+            instance_id.clone(),
+            typed_properties,
+            catalog_properties.clone(),
+        );
         let first = factory.prepare_unpublished(&request).expect("create");
         let durable = first.durable_properties().to_vec();
         assert!(
@@ -637,12 +708,12 @@ mod tests {
         );
         drop(first);
 
-        let restored = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let restored = factory_request_with_catalog_properties(
+            &factory,
+            instance_id,
             durable,
-        )
-        .expect("restore request");
+            catalog_properties,
+        );
         factory
             .prepare_unpublished(&restored)
             .expect("restore with server credentials");
@@ -662,15 +733,14 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "ice",
             vec![(
                 "iceberg.catalog.warehouse".to_string(),
                 warehouse.path().display().to_string(),
             )],
-        )
-        .expect("request");
+        );
 
         let creation = factory.create_control(request).expect("control creation");
         let maintenance = creation
@@ -779,15 +849,14 @@ mod tests {
                 Ok(lease)
             },
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "ice",
             vec![(
                 "iceberg.catalog.warehouse".to_string(),
                 warehouse.path().display().to_string(),
             )],
-        )
-        .expect("request");
+        );
 
         let creation = factory.create_control(request).expect("control creation");
         assert!(observed_key.lock().expect("key lock").is_none());
@@ -846,15 +915,14 @@ mod tests {
                 "read-control registration rejected",
             ))
         }));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "ice",
             vec![(
                 "iceberg.catalog.warehouse".to_string(),
                 warehouse.path().display().to_string(),
             )],
-        )
-        .expect("request");
+        );
 
         let creation = factory.create_control(request).expect("control creation");
         let (binding, _) = creation.into_parts();
@@ -917,15 +985,14 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("ice").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "ice",
             vec![
                 ("iceberg.catalog.type".to_string(), "rest".to_string()),
                 ("uri".to_string(), "http://127.0.0.1:1".to_string()),
             ],
-        )
-        .expect("REST request");
+        );
 
         let creation = factory
             .create_control(request)
@@ -951,9 +1018,9 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ));
-        let request = ConnectorControlFactoryRequest::try_new(
-            factory.provider_id().clone(),
-            ConnectorInstanceId::parse("hive").expect("instance ID"),
+        let request = factory_request(
+            &factory,
+            "hive",
             vec![
                 ("iceberg.catalog.type".to_string(), "hive".to_string()),
                 (
@@ -965,8 +1032,7 @@ mod tests {
                     warehouse.path().display().to_string(),
                 ),
             ],
-        )
-        .expect("Hive factory request");
+        );
 
         let creation = factory.create_control(request).expect("Hive control");
         // Slot presence answers "does this provider implement staged creation",

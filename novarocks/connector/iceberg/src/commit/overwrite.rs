@@ -825,11 +825,14 @@ mod tests {
     async fn empty_local_table(format_version: FormatVersion) -> LocalTableFixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
-        let catalog: Arc<dyn Catalog> =
-            Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
-                crate::fs_io::build_file_io_for_location(&warehouse_uri, local_test_binding()),
+        let binding = local_test_binding();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
+                crate::fs_io::build_file_io_for_location(&warehouse_uri, binding.clone()),
                 warehouse_uri,
-            ));
+                binding,
+            ),
+        );
         let namespace = NamespaceIdent::new("db".to_string());
         catalog
             .create_namespace(&namespace, HashMap::new())

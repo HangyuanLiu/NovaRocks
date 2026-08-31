@@ -895,7 +895,7 @@ mod tests {
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
     use super::{
-        canonical_directory_source_scope, list_direct_files,
+        canonical_directory_source_scope, list_direct_files, normalized_object_store_endpoint,
         preflight_caller_managed_source_domain, read_parquet_footer, read_type_compatible,
         validate_name_mapping_for_target, validate_schema,
     };
@@ -1014,12 +1014,9 @@ mod tests {
     }
 
     #[test]
-    fn source_scope_rejects_credentials_in_endpoint_identity() {
-        let config = object_store_config("http://access:secret@localhost:9000", "ak", "sk");
-        let owner = tokio::runtime::Runtime::new().expect("runtime");
-        let binding = binding(&owner, Some(config));
+    fn object_store_endpoint_identity_rejects_credentials() {
         assert!(
-            canonical_directory_source_scope("s3://bucket/incoming", &binding)
+            normalized_object_store_endpoint("http://access:secret@localhost:9000")
                 .expect_err("endpoint credentials must not enter scope")
                 .contains("credentials")
         );

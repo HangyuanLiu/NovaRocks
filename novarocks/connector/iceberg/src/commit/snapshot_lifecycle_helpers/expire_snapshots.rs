@@ -473,13 +473,15 @@ mod tests {
     async fn empty_local_v3_table() -> LocalCatalogFixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let binding = local_test_binding();
         let catalog: Arc<dyn Catalog> = Arc::new(
-            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
                 novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                     &warehouse_uri,
-                    local_test_binding(),
+                    binding.clone(),
                 ),
                 warehouse_uri,
+                binding,
             ),
         );
         let namespace = NamespaceIdent::new("db".to_string());

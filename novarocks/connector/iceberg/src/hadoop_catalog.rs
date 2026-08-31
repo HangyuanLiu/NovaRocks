@@ -969,13 +969,20 @@ impl Catalog for HadoopFileSystemCatalog {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::OnceLock;
+
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::*;
 
     fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
-        let runtime = tokio::runtime::Runtime::new().expect("build local test runtime");
+        // The binding stores handles into this runtime. Keep its owner alive for
+        // the whole test process: constructing and immediately dropping a
+        // runtime is illegal from these `#[tokio::test]` bodies.
+        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+        let runtime = RUNTIME
+            .get_or_init(|| tokio::runtime::Runtime::new().expect("build local test runtime"));
         crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),

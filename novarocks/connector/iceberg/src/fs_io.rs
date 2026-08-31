@@ -666,7 +666,7 @@ mod tests {
         );
         assert!(
             err.to_string()
-                .contains("object-store location requires object store config"),
+                .contains("object-store location has no admitted exact credential binding"),
             "{err}"
         );
     }
@@ -728,7 +728,7 @@ mod tests {
             .expect_err("missing object-store config should fail");
 
         assert!(
-            err.ends_with("object-store location requires object store config"),
+            err.ends_with("object-store location has no admitted exact credential binding"),
             "unexpected resolver error: {err}"
         );
     }

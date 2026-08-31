@@ -3273,7 +3273,7 @@ mod tests {
     /// One snapshot with two manifests: the first holds two live data files and
     /// the second holds one file that has already been deleted, so `$files` and
     /// `$entries` must disagree about it.
-    async fn build_warehouse(dir: &Path) -> Warehouse {
+    async fn build_warehouse(dir: &Path, binding: IcebergReadBinding) -> Warehouse {
         let location = format!("file://{}", dir.display());
         std::fs::create_dir_all(dir.join("metadata")).expect("metadata dir");
         let schema = test_schema();
@@ -3281,7 +3281,6 @@ mod tests {
         // manifests must declare the same id or they would name a spec the
         // metadata does not have.
         let spec = identity_spec(&schema, 0, "region");
-        let (_runtime, binding, _context) = runtime_and_binding();
         let file_io = crate::fs_io::build_file_io_for_location(&location, binding);
 
         let mut manifests = Vec::new();
@@ -3487,7 +3486,7 @@ mod tests {
     fn refs_excludes_provider_private_refs() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let reference = reference(&warehouse, IcebergSystemTableType::Refs, None);
         let schema = system_relation_schema(
@@ -3517,7 +3516,7 @@ mod tests {
     fn snapshots_reports_a_zoned_commit_time_and_a_summary_map() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let reference = reference(&warehouse, IcebergSystemTableType::Snapshots, None);
         let schema = system_relation_schema(
@@ -3563,7 +3562,7 @@ mod tests {
     fn history_marks_the_current_ancestor() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let reference = reference(&warehouse, IcebergSystemTableType::History, None);
         let schema = system_relation_schema(
@@ -3590,7 +3589,7 @@ mod tests {
     fn manifests_reports_an_array_of_partition_summary_rows() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let reference = reference(
             &warehouse,
@@ -3641,7 +3640,7 @@ mod tests {
     fn files_skips_deleted_entries_while_entries_keeps_them() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
 
         let entries_reference = reference(
@@ -3717,7 +3716,7 @@ mod tests {
     fn files_materializes_one_manifest_split_with_typed_bounds() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
 
         let mut reader = FrozenMetadataReader::new(&binding, &context);
@@ -3807,7 +3806,7 @@ mod tests {
     fn partitions_aggregates_the_same_pinned_files() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
 
         let partitions = reference(
@@ -3860,7 +3859,7 @@ mod tests {
     fn a_uuid_or_snapshot_mismatch_fails_closed_before_any_row() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let schema = system_relation_schema(
             IcebergSystemTableType::Snapshots,
@@ -3925,7 +3924,7 @@ mod tests {
     fn a_distributed_relation_is_refused_by_the_direct_page_source() {
         let (runtime, binding, context) = runtime_and_binding();
         let dir = tempfile::tempdir().expect("tempdir");
-        let warehouse = runtime.block_on(build_warehouse(dir.path()));
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
         let provider = provider(&binding, &context);
         let reference = reference(&warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
         let error = refusal(provider.create_single_backend_page_source(&reference, &[]));
