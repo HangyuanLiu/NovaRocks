@@ -9,7 +9,8 @@
 use std::fmt;
 
 use super::credential_lease::{
-    CredentialLeaseSecretEnvelope, validate_initial_credential_lease_envelopes,
+    CredentialLeaseSecretEnvelope, decode_credential_lease_secret_envelope,
+    encode_credential_lease_secret_envelope, validate_initial_credential_lease_envelopes,
     validate_lease_epoch,
 };
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
@@ -66,7 +67,7 @@ impl QueryInitRequest {
     ) -> Result<Self, ProtocolError> {
         let mut credential_lease_envelopes = envelopes
             .into_iter()
-            .map(|envelope| envelope.to_proto())
+            .map(|envelope| encode_credential_lease_secret_envelope(&envelope))
             .collect::<Vec<_>>();
         credential_lease_envelopes.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
         Self::parse_tls(novarocks::InitQueryRequest {
@@ -126,7 +127,7 @@ impl QueryInitRequest {
             .cloned()
             .enumerate()
             .map(|(index, envelope)| {
-                CredentialLeaseSecretEnvelope::parse(
+                decode_credential_lease_secret_envelope(
                     envelope,
                     FieldPath::root("init_query_request")
                         .field("credential_lease_envelopes")
@@ -288,7 +289,7 @@ impl QueryControlCommand {
                         "credential lease prepare envelope is required",
                     )
                 })?;
-                CredentialLeaseSecretEnvelope::parse(
+                decode_credential_lease_secret_envelope(
                     envelope,
                     FieldPath::root("query_control_request")
                         .field("command")
@@ -349,7 +350,7 @@ impl QueryControlCommand {
                         "credential lease prepare envelope is required",
                     )
                 })?;
-                CredentialLeaseSecretEnvelope::parse(
+                decode_credential_lease_secret_envelope(
                     envelope,
                     FieldPath::root("query_control_request")
                         .field("command")

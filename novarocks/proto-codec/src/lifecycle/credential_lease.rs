@@ -17,14 +17,11 @@
 
 //! Confidential query-attempt credential lease protocol values.
 //!
-//! Only descriptor metadata is manifest/digest material. This module projects
-//! wire secret scalars into `SecretValue` immediately and implements manual
-//! debug output for every value that can contain a credential.
-
-use std::fmt;
+//! Only descriptor metadata is manifest/digest material. The SPI confidential
+//! envelope owns secret wrapping; this codec only validates and encodes the
+//! TLS-only wire carrier.
 
 use novarocks_proto_models::novarocks;
-use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CredentialConsumerRole,
     CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
@@ -36,6 +33,8 @@ use prost::Message;
 
 use crate::catalog::{CatalogSet, decode_catalog_handle, encode_catalog_handle};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
+
+pub use novarocks_spi::connector::CredentialLeaseSecretEnvelope;
 
 /// Parses and encodes only the descriptor portion of the credential contract.
 pub fn encode_credential_lease_descriptor(
@@ -189,158 +188,63 @@ pub fn validate_credential_lease_descriptors(
     Ok(())
 }
 
-/// A parsed secret envelope. It never derives `Debug`; values are rendered as
-/// a single redaction marker even when nested in another protocol wrapper.
-#[derive(Clone, Eq, PartialEq)]
-pub struct CredentialLeaseSecretEnvelope {
-    lease_id: CredentialLeaseId,
-    epoch: u64,
-    access_key_id: SecretValue,
-    secret_access_key: SecretValue,
-    session_token: SecretValue,
-    session_token_expires_at_unix_ms: u64,
-}
-
-impl fmt::Debug for CredentialLeaseSecretEnvelope {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CredentialLeaseSecretEnvelope")
-            .field("lease_id", &self.lease_id)
-            .field("epoch", &self.epoch)
-            .field("secret_scalar_count", &3)
-            .field(
-                "session_token_expires_at_unix_ms",
-                &self.session_token_expires_at_unix_ms,
-            )
-            .field("material", &"[REDACTED]")
-            .finish()
+/// Decodes one TLS-only confidential wire envelope. Validation happens before
+/// its scalar values are transferred to SPI's redacted secret wrapper.
+pub fn decode_credential_lease_secret_envelope(
+    raw: novarocks::CredentialLeaseSecretEnvelope,
+    root: FieldPath,
+) -> Result<CredentialLeaseSecretEnvelope, ProtocolError> {
+    if raw.encoded_len() > MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES {
+        return Err(resource_exhausted(
+            root,
+            "credential lease secret envelope exceeds 256 KiB",
+        ));
     }
-}
-
-impl CredentialLeaseSecretEnvelope {
-    pub fn try_new(
-        lease_id: CredentialLeaseId,
-        epoch: u64,
-        access_key_id: SecretValue,
-        secret_access_key: SecretValue,
-        session_token: SecretValue,
-        session_token_expires_at_unix_ms: u64,
-    ) -> Result<Self, ProtocolError> {
-        validate_secret_scalar(
-            access_key_id.expose_secret(),
-            FieldPath::root("credential_lease_secret_envelope")
-                .field("s3")
-                .field("access_key_id"),
-        )?;
-        validate_secret_scalar(
-            secret_access_key.expose_secret(),
-            FieldPath::root("credential_lease_secret_envelope")
-                .field("s3")
-                .field("secret_access_key"),
-        )?;
-        validate_secret_scalar(
-            session_token.expose_secret(),
-            FieldPath::root("credential_lease_secret_envelope")
-                .field("s3")
-                .field("session_token"),
-        )?;
-        if epoch == 0 || session_token_expires_at_unix_ms == 0 {
-            return Err(invalid(
-                FieldPath::root("credential_lease_secret_envelope"),
-                "credential lease epoch and expiration must be nonzero",
-            ));
-        }
-        Ok(Self {
-            lease_id,
-            epoch,
-            access_key_id,
-            secret_access_key,
-            session_token,
-            session_token_expires_at_unix_ms,
-        })
-    }
-
-    pub fn parse(
-        raw: novarocks::CredentialLeaseSecretEnvelope,
-        root: FieldPath,
-    ) -> Result<Self, ProtocolError> {
-        if raw.encoded_len() > MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES {
-            return Err(resource_exhausted(
-                root,
-                "credential lease secret envelope exceeds 256 KiB",
-            ));
-        }
-        let lease_id = decode_lease_id(&raw.lease_id, root.clone().field("lease_id"))?;
-        let material = raw.s3.ok_or_else(|| {
-            missing(
-                root.clone().field("s3"),
-                "credential lease S3 material is required",
-            )
-        })?;
-        validate_secret_scalar(
-            &material.access_key_id,
-            root.clone().field("s3").field("access_key_id"),
-        )?;
-        validate_secret_scalar(
-            &material.secret_access_key,
-            root.clone().field("s3").field("secret_access_key"),
-        )?;
-        validate_secret_scalar(
-            &material.session_token,
-            root.clone().field("s3").field("session_token"),
-        )?;
-        Self::try_new(
-            lease_id,
-            raw.epoch,
-            SecretValue::new(material.access_key_id),
-            SecretValue::new(material.secret_access_key),
-            SecretValue::new(material.session_token),
-            material.session_token_expires_at_unix_ms,
+    let lease_id = decode_lease_id(&raw.lease_id, root.clone().field("lease_id"))?;
+    let material = raw.s3.ok_or_else(|| {
+        missing(
+            root.clone().field("s3"),
+            "credential lease S3 material is required",
         )
-        .map_err(|error| prefix_path(root, error))
-    }
+    })?;
+    validate_secret_scalar(
+        &material.access_key_id,
+        root.clone().field("s3").field("access_key_id"),
+    )?;
+    validate_secret_scalar(
+        &material.secret_access_key,
+        root.clone().field("s3").field("secret_access_key"),
+    )?;
+    validate_secret_scalar(
+        &material.session_token,
+        root.clone().field("s3").field("session_token"),
+    )?;
+    CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+        lease_id,
+        raw.epoch,
+        material.access_key_id,
+        material.secret_access_key,
+        material.session_token,
+        material.session_token_expires_at_unix_ms,
+    )
+    .map_err(|error| invalid(root, error.to_string()))
+}
 
-    pub fn to_proto(&self) -> novarocks::CredentialLeaseSecretEnvelope {
-        novarocks::CredentialLeaseSecretEnvelope {
-            lease_id: self.lease_id.as_bytes().to_vec(),
-            epoch: self.epoch,
-            s3: Some(novarocks::CredentialLeaseS3SecretMaterial {
-                access_key_id: self.access_key_id.expose_secret().to_owned(),
-                secret_access_key: self.secret_access_key.expose_secret().to_owned(),
-                session_token: self.session_token.expose_secret().to_owned(),
-                session_token_expires_at_unix_ms: self.session_token_expires_at_unix_ms,
-            }),
-        }
-    }
-
-    pub const fn lease_id(&self) -> CredentialLeaseId {
-        self.lease_id
-    }
-
-    pub const fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    pub const fn session_token_expires_at_unix_ms(&self) -> u64 {
-        self.session_token_expires_at_unix_ms
-    }
-
-    pub const fn access_key_id(&self) -> &SecretValue {
-        &self.access_key_id
-    }
-
-    pub const fn secret_access_key(&self) -> &SecretValue {
-        &self.secret_access_key
-    }
-
-    pub const fn session_token(&self) -> &SecretValue {
-        &self.session_token
-    }
-
-    pub fn matches_descriptor(&self, descriptor: &CredentialLeaseDescriptor) -> bool {
-        self.lease_id == descriptor.lease_id()
-            && self.epoch == descriptor.epoch()
-            && self.session_token_expires_at_unix_ms == descriptor.not_after_unix_ms()
+/// Encodes one SPI-owned confidential envelope for a previously authenticated
+/// TLS lifecycle carrier.
+pub fn encode_credential_lease_secret_envelope(
+    envelope: &CredentialLeaseSecretEnvelope,
+) -> novarocks::CredentialLeaseSecretEnvelope {
+    let (access_key_id, secret_access_key, session_token) = envelope.s3_secret_scalars();
+    novarocks::CredentialLeaseSecretEnvelope {
+        lease_id: envelope.lease_id().as_bytes().to_vec(),
+        epoch: envelope.epoch(),
+        s3: Some(novarocks::CredentialLeaseS3SecretMaterial {
+            access_key_id: access_key_id.to_owned(),
+            secret_access_key: secret_access_key.to_owned(),
+            session_token: session_token.to_owned(),
+            session_token_expires_at_unix_ms: envelope.session_token_expires_at_unix_ms(),
+        }),
     }
 }
 
@@ -378,7 +282,7 @@ pub fn validate_initial_credential_lease_envelopes(
             .clone()
             .field("credential_lease_envelopes")
             .index(index);
-        let envelope = CredentialLeaseSecretEnvelope::parse(raw, path.clone())?;
+        let envelope = decode_credential_lease_secret_envelope(raw, path.clone())?;
         if previous.is_some_and(|previous: CredentialLeaseId| previous >= envelope.lease_id()) {
             return Err(invalid(
                 path.field("lease_id"),
@@ -453,23 +357,15 @@ fn resource_exhausted(path: FieldPath, detail: impl Into<String>) -> ProtocolErr
     ProtocolError::new(path, ProtocolErrorKind::Capacity, detail)
 }
 
-fn prefix_path(prefix: FieldPath, error: ProtocolError) -> ProtocolError {
-    ProtocolError::new(
-        prefix.append_segments(error.path().segments().iter().skip(1).cloned()),
-        error.kind(),
-        error.detail(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         CredentialLeaseSecretEnvelope, decode_credential_lease_descriptor,
-        encode_credential_lease_descriptor, validate_initial_credential_lease_envelopes,
+        decode_credential_lease_secret_envelope, encode_credential_lease_descriptor,
+        encode_credential_lease_secret_envelope, validate_initial_credential_lease_envelopes,
     };
     use crate::FieldPath;
     use novarocks_proto_models::novarocks;
-    use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
         CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
@@ -497,12 +393,12 @@ mod tests {
     }
 
     fn envelope(value: &str) -> CredentialLeaseSecretEnvelope {
-        CredentialLeaseSecretEnvelope::try_new(
+        CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
             CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
             3,
-            SecretValue::new("access-canary"),
-            SecretValue::new(value),
-            SecretValue::new("token-canary"),
+            "access-canary".to_owned(),
+            value.to_owned(),
+            "token-canary".to_owned(),
             99,
         )
         .expect("envelope")
@@ -529,11 +425,11 @@ mod tests {
         let encoded_descriptor = encode_credential_lease_descriptor(&descriptor());
         validate_initial_credential_lease_envelopes(
             &[encoded_descriptor],
-            &[first.to_proto()],
+            &[encode_credential_lease_secret_envelope(&first)],
             FieldPath::root("init_query_request"),
         )
         .expect("exact pairing");
-        let mut mismatched = second.to_proto();
+        let mut mismatched = encode_credential_lease_secret_envelope(&second);
         mismatched.epoch = 4;
         assert!(
             validate_initial_credential_lease_envelopes(
@@ -547,7 +443,7 @@ mod tests {
 
     #[test]
     fn envelope_rejects_missing_or_oversized_s3_scalars() {
-        let error = CredentialLeaseSecretEnvelope::parse(
+        let error = decode_credential_lease_secret_envelope(
             novarocks::CredentialLeaseSecretEnvelope {
                 lease_id: vec![1; 16],
                 epoch: 3,

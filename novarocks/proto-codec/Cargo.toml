@@ -14,7 +14,6 @@ sha2 = "0.10"
 novarocks-types = { path = "../types" }
 novarocks-proto-models = { path = "../proto-models" }
 novarocks-spi = { path = "../spi" }
-novarocks-secret = { path = "../secret" }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }

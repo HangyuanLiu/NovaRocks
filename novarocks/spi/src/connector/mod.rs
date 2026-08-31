@@ -93,10 +93,11 @@ pub use credential::{
 pub use credential_lease::{
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
     ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-    CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
-    MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
-    MAX_CREDENTIAL_LEASES_PER_QUERY, VendedS3CredentialLeaseContribution,
-    VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
+    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, MAX_CREDENTIAL_LEASE_ID_BYTES,
+    MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
+    MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
+    VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
+    VendedS3CredentialLeaseRefresh,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

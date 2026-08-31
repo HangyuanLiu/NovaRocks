@@ -3074,7 +3074,11 @@ fn credential_lease_prepare_command(
     tls_control_command(
         novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeasePrepare(
             novarocks_proto_models::novarocks::CredentialLeasePrepare {
-                envelope: Some(envelope.to_proto()),
+                envelope: Some(
+                    novarocks_proto_codec::lifecycle::encode_credential_lease_secret_envelope(
+                        envelope,
+                    ),
+                ),
             },
         ),
     )

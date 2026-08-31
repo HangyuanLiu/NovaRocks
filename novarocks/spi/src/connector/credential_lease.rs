@@ -282,6 +282,123 @@ pub struct ConnectorVendedCredentialLeaseCollectionPort {
     sink: Arc<dyn ConnectorVendedCredentialLeaseSink>,
 }
 
+/// Confidential, in-process material for one query-attempt credential lease.
+///
+/// This value deliberately belongs to SPI rather than a wire codec: it owns
+/// secret wrappers and exposes values only at the concrete protocol or storage
+/// consumer boundary. It is never manifest/digest material.
+#[derive(Clone, Eq, PartialEq)]
+pub struct CredentialLeaseSecretEnvelope {
+    lease_id: CredentialLeaseId,
+    epoch: u64,
+    access_key_id: SecretValue,
+    secret_access_key: SecretValue,
+    session_token: SecretValue,
+    session_token_expires_at_unix_ms: u64,
+}
+
+impl std::fmt::Debug for CredentialLeaseSecretEnvelope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialLeaseSecretEnvelope")
+            .field("lease_id", &self.lease_id)
+            .field("epoch", &self.epoch)
+            .field("secret_scalar_count", &3)
+            .field(
+                "session_token_expires_at_unix_ms",
+                &self.session_token_expires_at_unix_ms,
+            )
+            .field("material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl CredentialLeaseSecretEnvelope {
+    pub fn try_new(
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+        access_key_id: SecretValue,
+        secret_access_key: SecretValue,
+        session_token: SecretValue,
+        session_token_expires_at_unix_ms: u64,
+    ) -> Result<Self, ConnectorError> {
+        validate_secret_scalar(access_key_id.expose_secret())?;
+        validate_secret_scalar(secret_access_key.expose_secret())?;
+        validate_secret_scalar(session_token.expose_secret())?;
+        if epoch == 0 || session_token_expires_at_unix_ms == 0 {
+            return Err(invalid("credential lease epoch or expiration"));
+        }
+        Ok(Self {
+            lease_id,
+            epoch,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            session_token_expires_at_unix_ms,
+        })
+    }
+
+    /// Wraps decoded wire scalars before they can leave the confidential
+    /// protocol boundary as ordinary strings.
+    pub fn try_new_from_wire_scalars(
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: String,
+        session_token_expires_at_unix_ms: u64,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new(
+            lease_id,
+            epoch,
+            SecretValue::new(access_key_id),
+            SecretValue::new(secret_access_key),
+            SecretValue::new(session_token),
+            session_token_expires_at_unix_ms,
+        )
+    }
+
+    pub const fn lease_id(&self) -> CredentialLeaseId {
+        self.lease_id
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub const fn session_token_expires_at_unix_ms(&self) -> u64 {
+        self.session_token_expires_at_unix_ms
+    }
+
+    pub const fn access_key_id(&self) -> &SecretValue {
+        &self.access_key_id
+    }
+
+    pub const fn secret_access_key(&self) -> &SecretValue {
+        &self.secret_access_key
+    }
+
+    pub const fn session_token(&self) -> &SecretValue {
+        &self.session_token
+    }
+
+    /// Exposes the scalar values only to the codec that writes the TLS-only
+    /// confidential lifecycle carrier.
+    pub fn s3_secret_scalars(&self) -> (&str, &str, &str) {
+        (
+            self.access_key_id.expose_secret(),
+            self.secret_access_key.expose_secret(),
+            self.session_token.expose_secret(),
+        )
+    }
+
+    pub fn matches_descriptor(&self, descriptor: &CredentialLeaseDescriptor) -> bool {
+        self.lease_id == descriptor.lease_id()
+            && self.epoch == descriptor.epoch()
+            && self.session_token_expires_at_unix_ms == descriptor.not_after_unix_ms()
+    }
+}
+
 impl ConnectorVendedCredentialLeaseCollectionPort {
     pub fn new(
         catalog_properties: CatalogProperties,
@@ -415,6 +532,13 @@ fn exhausted(subject: &'static str) -> ConnectorError {
         ConnectorErrorKind::ResourceExhausted,
         format!("{subject} exceeds configured bounds"),
     )
+}
+
+fn validate_secret_scalar(value: &str) -> Result<(), ConnectorError> {
+    if value.is_empty() || value.len() > MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES {
+        return Err(invalid("credential lease secret scalar"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

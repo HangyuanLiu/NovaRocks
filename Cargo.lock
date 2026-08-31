@@ -3415,7 +3415,6 @@ name = "novarocks-proto-codec"
 version = "0.1.0"
 dependencies = [
  "novarocks-proto-models",
- "novarocks-secret",
  "novarocks-spi",
  "novarocks-types",
  "once_cell",
