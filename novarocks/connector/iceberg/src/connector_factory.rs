@@ -168,7 +168,11 @@ impl IcebergConnectorFactory {
         )
         .map_err(invalid)?
         .without_object_store_config();
-        let durable_properties = sanitize_durable_properties(&configuration.properties);
+        // CatalogProperties is the already-validated, credential-free durable
+        // definition supplied by the Frontend. Parsing may normalize aliases
+        // and add provider-private defaults for this runtime, but a factory
+        // must never turn that private representation into new desired state.
+        let durable_properties = properties.clone();
         let runtime = Arc::new(
             IcebergMetadataContext::try_new_with_rest_access_delegation(
                 IcebergCatalogControlState::new(configuration),
@@ -339,16 +343,7 @@ impl IcebergUnpublishedControl {
     }
 }
 
-fn sanitize_durable_properties(properties: &[(String, String)]) -> Vec<(String, String)> {
-    let mut durable = properties
-        .iter()
-        .filter(|(key, _)| !credential_like_property(key))
-        .cloned()
-        .collect::<Vec<_>>();
-    durable.sort_by(|left, right| left.0.cmp(&right.0));
-    durable
-}
-
+#[cfg(test)]
 fn credential_like_property(key: &str) -> bool {
     let normalized = key.to_ascii_lowercase();
     [
@@ -592,7 +587,14 @@ mod tests {
             catalog_properties(instance_id, &typed_properties, Vec::new()),
         );
         let unpublished = factory.prepare_unpublished(&request).expect("runtime");
+        let mut expected_durable_properties = typed_properties.clone();
+        expected_durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
 
+        assert_eq!(
+            unpublished.durable_properties(),
+            expected_durable_properties.as_slice(),
+            "provider runtime normalization must not rewrite the typed durable definition"
+        );
         assert!(
             unpublished
                 .durable_properties()
