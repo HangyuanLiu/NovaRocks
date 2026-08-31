@@ -3475,8 +3475,15 @@ fn table_snapshot_row_count(
     snapshot_id: i64,
     context: &ConnectorRequestContext,
 ) -> Result<Option<u64>, CommitServiceError> {
+    // The commit has just invalidated the generation-local table cache.  The
+    // admitted request scope may still retain the exact pre-commit table view,
+    // however, so it cannot prove facts about the newly committed snapshot.
+    // Keep the already-authorized storage resolver but drop the attempt's
+    // lease sink: this forces a metadata reload without admitting a late
+    // vended credential response after Init was frozen.
+    let terminal_context = context.clone().without_vended_credential_lease_sink();
     let table = runtime
-        .load_table_for_request(&target.namespace, &target.table, context)
+        .load_table_for_request(&target.namespace, &target.table, &terminal_context)
         .map(|physical| physical.into_table())
         .map_err(|error| {
             CommitServiceError::finalize_failed_known_committed(
