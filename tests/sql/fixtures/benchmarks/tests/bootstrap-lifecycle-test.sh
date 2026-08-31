@@ -158,6 +158,42 @@ python3 "$ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --sui
 # bootstrap must retain it (rather than treating ReadyInvalid as Absent), and
 # conditional repair cannot touch an unrelated sibling key.
 source "$BOOTSTRAP"
+
+# Cancellation must stop after cleanup.  A TERM delivered after fencing but
+# before publication cannot return to the caller and continue with READY PUT.
+term_continuation="$TMP/term-continuation"
+if bash -ceu '
+source "$1"
+fixture_contract_file="$3/fixture-contract"
+candidate="$3/ready-candidate"
+: > "$fixture_contract_file"
+: > "$candidate"
+lease_id=""
+owner_child_pid=""
+trap cleanup_owner EXIT
+trap '\''handle_owner_signal 143'\'' TERM
+kill -TERM "$BASHPID"
+touch "$2"
+' bash "$BOOTSTRAP" "$term_continuation" "$TMP"; then
+  fail 'TERM handler returned to publication path'
+fi
+[[ ! -e "$term_continuation" ]] || fail 'TERM handler continued after cleanup'
+[[ ! -e "$TMP/fixture-contract" && ! -e "$TMP/ready-candidate" ]] || fail 'TERM cleanup left publication files'
+
+# A Spark/docker descendant that ignores TERM must not survive cancellation.
+if ! bash -ceu '
+source "$1"
+( trap "" TERM; while :; do sleep 1; done ) &
+owner_child_pid="$!"
+stubborn_pid="$owner_child_pid"
+stop_owner_child
+if kill -0 "$stubborn_pid" 2>/dev/null; then
+  exit 1
+fi
+' bash "$BOOTSTRAP"; then
+  fail 'stubborn owner child survived cleanup'
+fi
+
 resolved_dataset_file="$resolved"
 ready_uri="$(python3 - "$resolved" <<'PY'
 import json, sys

@@ -705,10 +705,12 @@ run_with_lease() {
     sleep "$interval"
     now="$(fixture_lease_now)"
     if (( now - started > deadline )); then
-      kill "$owner_child_pid" 2>/dev/null || true; wait "$owner_child_pid" 2>/dev/null || true; return 124
+      stop_owner_child
+      return 124
     fi
     if ! lease_is_live; then
-      kill "$owner_child_pid" 2>/dev/null || true; wait "$owner_child_pid" 2>/dev/null || true; return 75
+      stop_owner_child
+      return 75
     fi
   done
   wait "$owner_child_pid"; child_status="$?"
@@ -716,10 +718,47 @@ run_with_lease() {
   return "$child_status"
 }
 
+collect_owner_process_tree() {
+  local pid="$1" child
+  while IFS= read -r child; do
+    [[ -n "$child" ]] || continue
+    collect_owner_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  printf '%s\n' "$pid"
+}
+
+stop_owner_child() {
+  local deadline pid
+  local -a owner_processes=()
+  [[ -n "${owner_child_pid:-}" ]] || return 0
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] && owner_processes+=("$pid")
+  done < <(collect_owner_process_tree "$owner_child_pid")
+  kill -TERM "${owner_processes[@]}" 2>/dev/null || true
+  deadline=$((SECONDS + 5))
+  while (( SECONDS < deadline )); do
+    for pid in "${owner_processes[@]}"; do
+      kill -0 "$pid" 2>/dev/null && { sleep 1; continue 2; }
+    done
+    break
+  done
+  for pid in "${owner_processes[@]}"; do
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  done
+  wait "$owner_child_pid" 2>/dev/null || true
+  owner_child_pid=""
+}
+
 cleanup_owner() {
-  [[ -z "${owner_child_pid:-}" ]] || kill "$owner_child_pid" 2>/dev/null || true
+  stop_owner_child
   [[ -z "${lease_id:-}" ]] || fixture_lease_release "$lease_id"
   [[ -z "${fixture_contract_file:-}" ]] || rm -f "$fixture_contract_file"
+  [[ -z "${candidate:-}" ]] || rm -f "$candidate"
+}
+
+handle_owner_signal() {
+  cleanup_owner
+  exit "$1"
 }
 
 publish_ready() {
@@ -779,6 +818,7 @@ main() {
   # including Docker/Spark diagnostics, belongs on stderr.
   exec 3>&1
   exec 1>&2
+  local candidate=""
   parse_args "$@"
   validate_suite_and_scale
   configure_suite
@@ -818,7 +858,9 @@ main() {
   lease_name="$(fixture_lease_name "$NOVA_ENV_BENCHMARK_LEASE_NAMESPACE" "$dataset_key_json")"
   lease_id=""
   fixture_contract_file="$(mktemp)"; chmod 600 "$fixture_contract_file"; cp "$resolved_dataset_file" "$fixture_contract_file"
-  trap cleanup_owner EXIT INT TERM
+  trap cleanup_owner EXIT
+  trap 'handle_owner_signal 130' INT
+  trap 'handle_owner_signal 143' TERM
   while [[ -z "$lease_id" ]]; do
     if lease_id="$(fixture_lease_acquire "$lease_name" "$dataset_key_json" "$owner_token" "$staging_identity" "$NOVA_ENV_BENCHMARK_LEASE_IMAGE")"; then
       break
@@ -856,7 +898,7 @@ main() {
   run_with_lease upload_raw_files || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during raw upload" || emit_error writer_failed "raw upload failed"; exit 1; }
   run_with_lease run_spark_loader || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during Spark load" || emit_error writer_failed "Spark loader failed"; exit 1; }
   fixture_publication_head "$manifest_uri/_SUCCESS" || { emit_error ready_invalid "candidate manifest is incomplete"; exit 1; }
-  candidate="$(mktemp)"; chmod 600 "$candidate"; trap 'rm -f "$candidate"; cleanup_owner' EXIT INT TERM
+  candidate="$(mktemp)"; chmod 600 "$candidate"
   write_ready_candidate "$candidate"
   if publish_ready "$candidate" "$( [[ "$rebuild" == 1 ]] && echo rebuild || echo absent )" "$observed_ready_etag"; then
     check_readiness || { emit_error publication_failed "published READY failed direct validation"; exit 1; }
