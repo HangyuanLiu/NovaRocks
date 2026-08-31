@@ -642,32 +642,28 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
         capacity: 1024 * 1024,
         evict_probability: 100,
     });
-    let read_write_cache = DataCacheManager::instance()
-        .external_context(CacheOptions {
-            enable_scan_datacache: true,
-            enable_populate_datacache: true,
-            enable_datacache_async_populate_mode: false,
-            enable_datacache_io_adaptor: false,
-            enable_cache_select: false,
-            datacache_evict_probability: 100,
-            datacache_priority: 0,
-            datacache_ttl_seconds: 0,
-            datacache_sharing_work_period: None,
-        })
-        .with_parquet_cache_request_policy(ParquetCacheRequestPolicy::enabled(true, true));
-    let read_only_cache = DataCacheManager::instance()
-        .external_context(CacheOptions {
-            enable_scan_datacache: true,
-            enable_populate_datacache: false,
-            enable_datacache_async_populate_mode: false,
-            enable_datacache_io_adaptor: false,
-            enable_cache_select: false,
-            datacache_evict_probability: 100,
-            datacache_priority: 0,
-            datacache_ttl_seconds: 0,
-            datacache_sharing_work_period: None,
-        })
-        .with_parquet_cache_request_policy(ParquetCacheRequestPolicy::enabled(true, true));
+    let read_write_cache = DataCacheManager::instance().external_context(CacheOptions {
+        enable_scan_datacache: true,
+        enable_populate_datacache: true,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
+    });
+    let read_only_cache = DataCacheManager::instance().external_context(CacheOptions {
+        enable_scan_datacache: true,
+        enable_populate_datacache: false,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
+    });
 
     let prewarmed = Fixture::parquet();
     let mut warm_request =
