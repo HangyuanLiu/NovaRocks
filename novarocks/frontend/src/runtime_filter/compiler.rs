@@ -957,7 +957,8 @@ fn membership_feedback_contract_digest(
             "runtime filter channel {} membership schema digest is missing from semantic encoding",
             channel.channel_id
         ))
-    }).map(Some)
+    })
+    .map(Some)
 }
 
 fn feedback_publishers(
@@ -2023,6 +2024,47 @@ mod tests {
                 scan_domain: None,
             },
         }
+    }
+
+    fn membership_channel(membership_schema_digest: Option<[u8; 32]>) -> ChannelSpec {
+        ChannelSpec {
+            channel_id: 7,
+            logical_domain: filter::RuntimeFilterLogicalDomain {
+                value_type: None,
+                contract: Some(plan::RuntimeFilterContract {
+                    kind: Some(plan::runtime_filter_contract::Kind::Membership(
+                        plan::RuntimeFilterMembershipContract::default(),
+                    )),
+                }),
+            },
+            membership_schema_digest,
+            lifecycle: filter::RuntimeFilterLifecycle::CompleteOnce as i32,
+            availability_coverage: filter::RuntimeFilterCoverage::default(),
+            terminal_coverage: filter::RuntimeFilterCoverage::default(),
+            reduction: plan::RuntimeFilterReductionContract::default(),
+            contribution_kinds: Vec::new(),
+            required_capabilities: BTreeSet::new(),
+            policy: filter::RuntimeFilterPolicyRequirement::default(),
+        }
+    }
+
+    #[test]
+    fn feedback_contract_digest_uses_the_semantic_encoding_digest() {
+        let expected = [7; 32];
+        let channel = membership_channel(Some(expected));
+        assert_eq!(
+            membership_feedback_contract_digest(&channel).expect("valid feedback contract"),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn feedback_contract_digest_rejects_missing_semantic_encoding_digest() {
+        let channel = membership_channel(None);
+
+        let error = membership_feedback_contract_digest(&channel)
+            .expect_err("feedback must require the semantic encoding digest");
+        assert!(error.to_string().contains("missing from semantic encoding"));
     }
 
     #[test]

@@ -3232,7 +3232,10 @@ mod tests {
         let temp = TempDir::new("post-readiness-log-marker");
         let mut process = ManagedProcess::spawn(
             "post-readiness log marker fixture".to_string(),
-            shell("printf 'READY\\n'; sleep 0.05; printf 'AFTER_READY\\n'; sleep 30"),
+            // This fixture only exercises post-readiness durable-log observation.
+            // Replace the shell with the final sleeper so cleanup does not depend on
+            // an intermediate shell child releasing the inherited stdout pipe.
+            shell("printf 'READY\\n'; sleep 0.05; printf 'AFTER_READY\\n'; exec sleep 30"),
             ReadyMarker::StdoutContains("READY".to_string()),
             Duration::from_secs(2),
             temp.path().join("fixture.log"),
@@ -3250,7 +3253,7 @@ mod tests {
         let temp = TempDir::new("post-readiness-log-timeout");
         let mut process = ManagedProcess::spawn(
             "post-readiness log timeout fixture".to_string(),
-            shell("printf 'READY\\n'; sleep 30"),
+            shell("printf 'READY\\n'; exec sleep 30"),
             ReadyMarker::StdoutContains("READY".to_string()),
             Duration::from_secs(2),
             temp.path().join("fixture.log"),

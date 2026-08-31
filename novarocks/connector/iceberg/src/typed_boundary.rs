@@ -554,8 +554,22 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 "iceberg pinned read was offered the same data file more than once",
             ));
         }
+        // A pinned file set freezes row visibility, not a spelling of stable
+        // Iceberg fields. When the current schema has exactly the same field
+        // identities as the pinned snapshot, project the frozen files through
+        // that current schema so a refresh rebind (for example `region` ->
+        // `area`) and the connector bindings name the same field. Any
+        // structural evolution remains on the historical schema and therefore
+        // cannot be silently reinterpreted by this compatibility path.
+        let schema = projection_schema_for_pinned_snapshot(metadata, snapshot_id)?;
         Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
-            pinned_table_handle_with_files(name, metadata, Some(snapshot_id), Some(files))?,
+            pinned_table_handle_with_schema(
+                name,
+                metadata,
+                Some(snapshot_id),
+                schema,
+                Some(files),
+            )?,
         )))
     }
 
@@ -1363,10 +1377,34 @@ fn table_handle_for_version(
         // snapshot.
         ConnectorReadRelationVersion::Current => metadata.current_schema().clone(),
         ConnectorReadRelationVersion::SnapshotId(_) | ConnectorReadRelationVersion::Reference => {
-            pinned_schema(metadata, snapshot_id)?
+            projection_schema_for_pinned_snapshot(
+                metadata,
+                snapshot_id.ok_or_else(|| corrupt("pinned table read has no snapshot ID"))?,
+            )?
         }
     };
     pinned_table_handle_with_schema(name, metadata, snapshot_id, schema, None)
+}
+
+/// Select the names a frozen snapshot projects without changing its field
+/// identity. A rename preserves the complete field-ID tree, so current SQL
+/// names remain safe for a historical read. Any structural change keeps the
+/// snapshot's own schema rather than guessing a correspondence.
+fn projection_schema_for_pinned_snapshot(
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+) -> Result<SchemaRef, ConnectorError> {
+    let snapshot_schema = pinned_schema(metadata, Some(snapshot_id))?;
+    Ok(
+        if struct_types_share_field_identities(
+            snapshot_schema.as_struct(),
+            metadata.current_schema().as_struct(),
+        ) {
+            metadata.current_schema().clone()
+        } else {
+            snapshot_schema
+        },
+    )
 }
 
 fn pinned_table_handle_with_files(

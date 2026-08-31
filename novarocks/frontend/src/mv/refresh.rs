@@ -188,6 +188,7 @@ pub(super) fn execute(
             refresh.finalize,
             intent,
             context,
+            false,
         ),
         PreparedMvRefreshWork::DataProducing { write } => execute_data(
             dependencies,
@@ -270,7 +271,7 @@ fn execute_data(
             format!("MV refresh distributed write aborted: {}", abort.reason()),
         ));
     }
-    let receipt = commit_known(
+    let (effect, receipt) = commit_known(
         &completion
             .ok_or_else(|| invalid("MV refresh write completed without connector reports"))?,
         context.clone(),
@@ -278,6 +279,22 @@ fn execute_data(
     let committed = dependencies
         .provider_activation
         .validate_write_commit(intent, &receipt)?;
+    if effect == novarocks_spi::connector::ExternalMutationEffect::NoOp {
+        // The writer has proved that the incremental window produced no
+        // materialized rows. Its staging branch still points at the old,
+        // unmarked target snapshot, so publishing that version would violate
+        // the publication guard. Materialize the refresh waterline on the
+        // existing branch through the metadata-only catalog operation instead.
+        return execute_metadata_only(
+            dependencies,
+            planning,
+            attempt,
+            finalize,
+            committed.intent().clone(),
+            context,
+            true,
+        );
+    }
     wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
     let publication_version = if committed.intent().partition_spec_replacement().is_some() {
         committed.committed_version().clone()
@@ -405,6 +422,7 @@ fn execute_metadata_only(
     finalize: novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
     intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
     context: ConnectorRequestContext,
+    staging_branch_exists: bool,
 ) -> Result<MvStatementResult, MvApplicationError> {
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
@@ -428,24 +446,26 @@ fn execute_metadata_only(
     let operation_id =
         ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
     let staging_branch: Arc<str> = attempt.staging_branch().into();
-    require_catalog_commit(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation,
-            operation_id,
-            ConnectorCatalogMutationOperation::AlterRef {
-                table: table.clone(),
-                action: ConnectorRefAction::Create {
-                    kind: ConnectorRefKind::Branch,
-                    name: Arc::clone(&staging_branch),
-                    snapshot_id: intent.expected_target_snapshot_id(),
-                    policy: CreateOrReplacePolicy::FailIfExists,
-                    expected_table_uuid: Some(expected_table_uuid.clone().into()),
+    if !staging_branch_exists {
+        require_catalog_commit(
+            crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+                &mutation,
+                operation_id,
+                ConnectorCatalogMutationOperation::AlterRef {
+                    table: table.clone(),
+                    action: ConnectorRefAction::Create {
+                        kind: ConnectorRefKind::Branch,
+                        name: Arc::clone(&staging_branch),
+                        snapshot_id: intent.expected_target_snapshot_id(),
+                        policy: CreateOrReplacePolicy::FailIfExists,
+                        expected_table_uuid: Some(expected_table_uuid.clone().into()),
+                    },
                 },
-            },
-            context.clone(),
-        ),
-        "create metadata-only MV staging branch",
-    )?;
+                context.clone(),
+            ),
+            "create metadata-only MV staging branch",
+        )?;
+    }
     let provenance = ConnectorMvMetadataOnlyProvenance {
         publication_id: attempt.publication_id,
         bases: intent
@@ -663,16 +683,22 @@ fn require_catalog_commit(
 fn commit_known(
     completion: &ConnectorWriteCompletion,
     context: ConnectorRequestContext,
-) -> Result<ConnectorWriteReceipt, MvApplicationError> {
+) -> Result<
+    (
+        novarocks_spi::connector::ExternalMutationEffect,
+        ConnectorWriteReceipt,
+    ),
+    MvApplicationError,
+> {
     match completion.session().commit(context).map_err(|error| {
         MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
     })? {
         ExternalMutationOutcome::KnownCommitted {
+            effect,
             receipt,
             finalization,
-            ..
         } => match finalization {
-            ExternalMutationFinalization::Complete => Ok(receipt),
+            ExternalMutationFinalization::Complete => Ok((effect, receipt)),
             ExternalMutationFinalization::Failed(error) => Err(MvApplicationError::new(
                 MvApplicationErrorKind::KnownCommittedFinalizeFailed,
                 error.to_string(),

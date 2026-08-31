@@ -246,6 +246,10 @@ pub(super) fn decode_scan_output_columns(
 pub(super) struct ConnectorVariantPathTransform {
     read_slot_ids: Vec<SlotId>,
     output_slot_ids: Vec<SlotId>,
+    /// The fragment's declared output fields. Connector pages carry generated
+    /// `slot_<id>` field names, so materialization must restore these names
+    /// before the chunk is checked against the scan-node contract.
+    output_fields: Vec<arrow::datatypes::Field>,
     specs: Vec<VariantPathSpec>,
     output_slot_kinds: Vec<ParquetSlotKind>,
 }
@@ -274,6 +278,11 @@ impl ConnectorVariantPathTransform {
         Self {
             read_slot_ids,
             output_slot_ids: output_schema.slot_ids().to_vec(),
+            output_fields: output_schema
+                .slots()
+                .iter()
+                .map(|slot| slot.field().clone())
+                .collect(),
             specs,
             output_slot_kinds,
         }
@@ -283,13 +292,18 @@ impl ConnectorVariantPathTransform {
         &self,
         batch: arrow::record_batch::RecordBatch,
     ) -> Result<arrow::record_batch::RecordBatch, String> {
-        materialize_variant_path_columns(
+        let batch = materialize_variant_path_columns(
             batch,
             &self.read_slot_ids,
             &self.output_slot_ids,
             &self.specs,
         )
-        .and_then(|batch| convert_variant_columns(&self.output_slot_kinds, batch))
+        .and_then(|batch| convert_variant_columns(&self.output_slot_kinds, batch))?;
+        arrow::record_batch::RecordBatch::try_new(
+            std::sync::Arc::new(arrow::datatypes::Schema::new(self.output_fields.clone())),
+            batch.columns().to_vec(),
+        )
+        .map_err(|error| format!("restore variant scan output schema failed: {error}"))
     }
 }
 

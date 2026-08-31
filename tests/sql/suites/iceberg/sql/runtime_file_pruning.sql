@@ -93,9 +93,8 @@ ORDER BY p.k1;
 -- @skip_result_check=true
 -- @result_contains=Profile: fragments=
 -- @result_not_contains=RuntimeFilterDormancy:
--- @result_contains=RuntimeFilterScanUnitsPruned=1
--- @result_contains=RuntimeFilterScanUnitsKept=1
--- @result_contains=ConnectorUnitReadersOpened=2
+-- @result_contains=ConnectorWholeFilesPruned=1
+-- @result_contains=TypedConnectorPageSourcesOpened=2
 -- @result_contains=HASH JOIN
 EXPLAIN ANALYZE
 SELECT p.k1, p.payload

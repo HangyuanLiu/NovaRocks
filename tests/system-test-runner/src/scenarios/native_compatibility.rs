@@ -28,7 +28,7 @@ use http::{Request, header};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
-use novarocks_proto_models::{common, novarocks as proto};
+use novarocks_proto_models::{catalog, common, novarocks as proto};
 use novarocks_types::BackendProcessId;
 use novarocks_version::{
     NativeCarrierDeclaration, derive_repository_native_compatibility_material,
@@ -356,6 +356,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
                 host: "127.0.0.1".to_string(),
                 port: 1,
             }),
+            catalog_set: Some(catalog::CatalogSet::default()),
             ..Default::default()
         }),
     };
@@ -447,6 +448,7 @@ fn raw_unary<M: Message, R: Message + Default>(
             "raw RPC returned HTTP {}",
             response.status()
         );
+        let header_status = grpc_status(response.headers());
         let mut body = response.into_body();
         let mut bytes = Vec::new();
         while let Some(chunk) = body.data().await {
@@ -454,12 +456,8 @@ fn raw_unary<M: Message, R: Message + Default>(
         }
         let trailers = body.trailers().await?;
         ensure!(
-            trailers
-                .as_ref()
-                .and_then(|headers| headers.get("grpc-status"))
-                .and_then(|value| value.to_str().ok())
-                == Some("0"),
-            "raw RPC returned non-OK trailers {trailers:?}"
+            header_status.or_else(|| trailers.as_ref().and_then(grpc_status)) == Some(0),
+            "raw RPC returned non-OK grpc-status header={header_status:?} trailers={trailers:?}"
         );
         driver.abort();
         let _ = driver.await;
@@ -475,6 +473,13 @@ fn raw_unary<M: Message, R: Message + Default>(
         );
         R::decode(&bytes[5..]).context("decode raw gRPC response")
     })
+}
+
+fn grpc_status(headers: &http::HeaderMap) -> Option<u16> {
+    headers
+        .get("grpc-status")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
@@ -559,4 +564,17 @@ fn run_distributed_queries(
             .assert_be_log(backend, "NOVAROCKS_QUERY_INIT_APPLIED")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_status_accepts_initial_response_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("grpc-status", http::HeaderValue::from_static("0"));
+
+        assert_eq!(grpc_status(&headers), Some(0));
+    }
 }

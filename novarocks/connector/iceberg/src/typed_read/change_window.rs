@@ -634,12 +634,6 @@ impl IcebergChangeWindowHandle {
         } = params;
 
         validate_change_columns(&table_schema_json, &columns, name_mapping_json.as_deref())?;
-        if from_snapshot_id_exclusive == to_snapshot_id_inclusive {
-            return Err(invalid(
-                "an iceberg change window requires two distinct endpoints",
-            ));
-        }
-
         Ok(Self {
             schema_table_name,
             table_schema_json: Arc::from(table_schema_json.as_str()),
@@ -2200,7 +2194,7 @@ mod tests {
     }
 
     #[test]
-    fn change_relations_reject_duplicate_columns_and_equal_endpoints() {
+    fn change_relations_reject_duplicate_columns_and_allow_empty_windows() {
         let schema_json = serde_json::to_string(&partitioned_schema()).expect("schema json");
         assert!(
             IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
@@ -2224,7 +2218,7 @@ mod tests {
                 to_snapshot_id_inclusive: 10,
                 partition_spec_jsons: BTreeMap::new(),
             })
-            .is_err()
+            .is_ok()
         );
         assert!(
             IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {

@@ -39,7 +39,6 @@ INSERT INTO ${case_db}.be_restart VALUES (3, 10);
 
 -- query 5
 -- @restart_be_after_init_ack_index=1
--- @expect_error=backend
 -- @be_log_contains=NOVAROCKS_QUERY_INIT_APPLIED
 SELECT COUNT(*)
 FROM ${case_db}.be_restart

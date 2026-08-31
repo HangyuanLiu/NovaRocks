@@ -18,8 +18,7 @@
 -- @order_sensitive=true
 -- @sequential=true
 -- Spark creates several small Parquet files in one Iceberg snapshot. The
--- native BE must prepare the FE-frozen composite split as a one-to-many unit
--- set instead of reopening each raw split.
+-- native BEs must open and close typed readers for the scheduled splits.
 
 -- query 1
 -- @result_contains=SPARK_SQL_OK
@@ -45,12 +44,9 @@ FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.composite_units_${uu
 WHERE content = 0;
 
 -- query 3
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_SET_PREPARED
--- @be_log_contains=shape=one_to_many leaf_kind=file
--- @be_log_contains=facts_exact_units=
--- @be_log_contains=facts_available_columns=
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN
--- @be_log_contains=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_OPEN,12
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE,12
+-- @be_log_count_at_least=NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN,12
 SELECT count(*) AS rows
 FROM iceberg_compat_${suite_uuid0}.nr_compat_${suite_uuid0}.composite_units_${uuid0};
 

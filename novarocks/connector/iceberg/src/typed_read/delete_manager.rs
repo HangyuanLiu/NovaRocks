@@ -261,15 +261,11 @@ impl DeleteManager {
         let (applied, previously_applied) = evaluation_inputs(split, &mode)?;
 
         // Classification and the cost bound both run before any I/O, so an
-        // illegal or oversized closure never opens a file. One data file has
-        // one physical delete state however a change window divides it, so
-        // the structural rules are proved over both sides together: a
-        // deletion vector that already applied and one that newly applies
-        // would be two answers for the same rows.
-        DeleteClosure::classify(
-            split.path(),
-            applied.iter().chain(previously_applied.iter()),
-        )?;
+        // illegal or oversized closure never opens a file. A rewritten
+        // deletion vector is one complete closure at the lower endpoint and a
+        // different complete closure at the upper endpoint, so structural
+        // validation is intentionally per side. The reverse-side verdict then
+        // emits the upper closure minus the lower closure.
         validate_split_delete_cost(split, applied, previously_applied)?;
 
         let data_sequence_number = split.data_sequence_number();
@@ -2241,17 +2237,14 @@ mod tests {
     }
 
     #[test]
-    fn one_data_file_never_has_two_deletion_vectors_across_the_two_change_window_sides() {
+    fn a_rewritten_deletion_vector_emits_only_newly_hidden_rows() {
         let fixture = Fixture::new();
         let previously = fixture.path("previously.puffin");
         let newly = fixture.path("newly.puffin");
         let previously_range = write_deletion_vector(&previously, &[0], 4);
         let newly_range = write_deletion_vector(&newly, &[0, 2], 4);
 
-        // A rewritten deletion vector would put one on each side. Nothing here
-        // can prove the replacement covers what it replaced, so the structural
-        // rule is proved over both sides together rather than per side.
-        let error = fixture
+        let filter = fixture
             .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
@@ -2265,10 +2258,16 @@ mod tests {
                     ],
                 },
             )
-            .expect_err("two deletion vectors are two answers for the same rows");
+            .expect("one deletion-vector closure per endpoint");
 
-        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
-        assert!(error.to_string().contains("more than one deletion vector"));
-        assert_eq!(fixture.loaded_artifacts(), 0);
+        let mask = filter
+            .evaluate(
+                &data_batch(&[1, 2, 3], &["a", "a", "a"]),
+                &positions(&[0, 1, 2]),
+            )
+            .expect("evaluate rewritten deletion vector");
+        // Position 0 was already hidden at the lower endpoint; position 2 is
+        // the only row this change window newly removes.
+        assert_eq!(keeps(&mask), vec![false, false, true]);
     }
 }
