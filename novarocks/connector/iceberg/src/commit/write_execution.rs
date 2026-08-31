@@ -158,6 +158,19 @@ impl ConnectorWriteExecution for IcebergDataWriteExecution {
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        let scoped = Self::new(
+            self.binding.for_request(request.context.clone()),
+            self.runtime.clone(),
+        );
+        scoped.open_writer_scoped(request)
+    }
+}
+
+impl IcebergDataWriteExecution {
+    fn open_writer_scoped(
+        &self,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
         if request.context.cancellation().is_cancelled() {
             return Err(error(
                 ConnectorErrorKind::Cancelled,

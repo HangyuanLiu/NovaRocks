@@ -35,8 +35,9 @@ use novarocks_spi::connector::{
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorProviderBindingKey, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
 
 use super::add_files::{
@@ -177,6 +178,7 @@ trait IcebergDataMutationBackend: Send + Sync {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
+        context: &ConnectorRequestContext,
     ) -> Result<CommitOutcome, CommitServiceError>;
 
     fn lookup_marker(
@@ -186,6 +188,7 @@ trait IcebergDataMutationBackend: Send + Sync {
         target_ref: &str,
         operation_id_hex: &str,
         identity_digest_hex: &str,
+        context: &ConnectorRequestContext,
     ) -> Result<MarkerLookup, ConnectorError>;
 }
 
@@ -213,12 +216,13 @@ impl RegisteredIcebergDataMutationBackend {
         &self,
         namespace: &str,
         table: &str,
+        request_context: &ConnectorRequestContext,
     ) -> Result<crate::iceberg::table::Table, ConnectorError> {
         self.runtime
             .control_state()
             .invalidate_table_cache(namespace, table);
         self.runtime
-            .load_table(namespace, table)
+            .load_table_for_request(namespace, table, request_context)
             .map(|loaded| loaded.into_table())
             .map_err(map_provider_error)
     }
@@ -244,7 +248,12 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         }
         let namespace = table_payload.namespace;
         let table_name = table_payload.table;
-        let table = self.reload_table(&namespace, &table_name)?;
+        let table = self.reload_table(&namespace, &table_name, &request.context)?;
+        let binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(request.context.clone());
         let metadata = table.metadata();
         let table_uuid = metadata.uuid().to_string();
         let schema_id = metadata.current_schema_id();
@@ -259,13 +268,13 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     source_location,
                     &self.runtime.control_state().configuration().warehouse_uri,
                     table.metadata().location(),
-                    self.runtime.resources().planning_binding(),
+                    &binding,
                 )
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
                 let manifest = plan_manifest_for_table(
                     &table,
                     source_location,
-                    self.runtime.resources().planning_binding(),
+                    &binding,
                     self.runtime.resources().catalog_runtime(),
                 )
                 .map_err(map_provider_error)?;
@@ -342,10 +351,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         &self,
         planned: &PlannedIcebergMutation,
         marker: &IcebergDataMutationMarkerV1,
+        context: &ConnectorRequestContext,
     ) -> Result<CommitOutcome, CommitServiceError> {
         let payload = planned.payload();
         let table = self
-            .reload_table(&payload.namespace, &payload.table)
+            .reload_table(&payload.namespace, &payload.table, context)
             .map_err(connector_error_as_pre_dispatch)?;
         match planned {
             PlannedIcebergMutation::RegisterExistingFiles { .. } => {
@@ -362,6 +372,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             &payload.target_ref,
             &marker.operation_id_hex,
             &marker.identity_digest_hex,
+            context,
         ) {
             Ok(MarkerLookup::Matching { snapshot_id }) => {
                 return Ok(CommitOutcome {
@@ -407,6 +418,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         );
         if let PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } = planned {
             let runtime = Arc::clone(&self.runtime);
+            let request_context = context.clone();
             let source_location = payload
                 .source_location
                 .clone()
@@ -419,7 +431,10 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                 revalidate_manifest_for_table(
                     current,
                     &source_location,
-                    runtime.resources().planning_binding(),
+                    &runtime
+                        .resources()
+                        .planning_binding()
+                        .for_request(request_context.clone()),
                     &expected_manifest,
                     runtime.resources().catalog_runtime(),
                 )
@@ -450,7 +465,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         )]);
         let file_io = table.file_io().clone();
         let (fs, cleanup_path_mapper) =
-            build_abort_cleanup(&self.runtime).map_err(connector_error_as_pre_dispatch)?;
+            build_abort_cleanup(&self.runtime, context).map_err(connector_error_as_pre_dispatch)?;
         let target_ref = payload.target_ref.clone();
         let outcome = self
             .runtime
@@ -481,7 +496,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             .invalidate_table_cache(&payload.namespace, &payload.table);
         let reloaded = self
             .runtime
-            .load_table(&payload.namespace, &payload.table)
+            .load_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(|error| {
                 CommitServiceError::finalize_failed_known_committed(
                     Some(outcome.clone()),
@@ -522,8 +537,9 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
         target_ref: &str,
         operation_id_hex: &str,
         identity_digest_hex: &str,
+        context: &ConnectorRequestContext,
     ) -> Result<MarkerLookup, ConnectorError> {
-        let table = self.reload_table(namespace, table)?;
+        let table = self.reload_table(namespace, table, context)?;
         let metadata = table.metadata();
         let target_snapshot = target_snapshot_id(metadata, target_ref)?;
         let mut by_id = HashMap::new();
@@ -849,6 +865,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             &marker.target_ref,
             &marker.operation_id_hex,
             &marker.identity_digest_hex,
+            &request.context,
         )? {
             MarkerLookup::Matching { snapshot_id } => self.committed(
                 &request.plan,
@@ -862,39 +879,44 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                 ),
                 evidence: self.evidence(&request.plan, cached.private.payload())?,
             },
-            MarkerLookup::Missing => match self.backend.execute(&cached.private, &marker) {
-                Ok(commit) => self.committed(
-                    &request.plan,
-                    commit.new_snapshot_id,
-                    ExternalMutationFinalization::Complete,
-                )?,
-                Err(CommitServiceError::KnownUncommitted { message, .. })
-                | Err(CommitServiceError::InvalidInput { message }) => {
-                    ExternalMutationOutcome::KnownUncommitted {
-                        failure: failure(ConnectorMutationFailureKind::Conflict, message),
+            MarkerLookup::Missing => {
+                match self
+                    .backend
+                    .execute(&cached.private, &marker, &request.context)
+                {
+                    Ok(commit) => self.committed(
+                        &request.plan,
+                        commit.new_snapshot_id,
+                        ExternalMutationFinalization::Complete,
+                    )?,
+                    Err(CommitServiceError::KnownUncommitted { message, .. })
+                    | Err(CommitServiceError::InvalidInput { message }) => {
+                        ExternalMutationOutcome::KnownUncommitted {
+                            failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                        }
                     }
-                }
-                Err(CommitServiceError::Unknown { message, .. }) => {
-                    ExternalMutationOutcome::CommitUnknown {
-                        failure: failure(ConnectorMutationFailureKind::Unavailable, message),
-                        evidence: self.evidence(&request.plan, cached.private.payload())?,
+                    Err(CommitServiceError::Unknown { message, .. }) => {
+                        ExternalMutationOutcome::CommitUnknown {
+                            failure: failure(ConnectorMutationFailureKind::Unavailable, message),
+                            evidence: self.evidence(&request.plan, cached.private.payload())?,
+                        }
                     }
-                }
-                Err(CommitServiceError::FinalizeFailedKnownCommitted {
-                    outcome,
-                    finalize_error,
-                    ..
-                }) => self.committed(
-                    &request.plan,
-                    outcome
-                        .map(|outcome| outcome.new_snapshot_id)
-                        .unwrap_or_default(),
-                    ExternalMutationFinalization::Failed(failure(
-                        ConnectorMutationFailureKind::Internal,
+                    Err(CommitServiceError::FinalizeFailedKnownCommitted {
+                        outcome,
                         finalize_error,
-                    )),
-                )?,
-            },
+                        ..
+                    }) => self.committed(
+                        &request.plan,
+                        outcome
+                            .map(|outcome| outcome.new_snapshot_id)
+                            .unwrap_or_default(),
+                        ExternalMutationFinalization::Failed(failure(
+                            ConnectorMutationFailureKind::Internal,
+                            finalize_error,
+                        )),
+                    )?,
+                }
+            }
         };
         self.terminal
             .lock()
@@ -925,6 +947,7 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
             &evidence.target_ref,
             &evidence.operation_id_hex,
             &evidence.identity_digest_hex,
+            &request.context,
         )? {
             MarkerLookup::Matching { snapshot_id } => {
                 self.committed_from_reconcile(&request, &evidence, snapshot_id)
@@ -1102,16 +1125,22 @@ fn validate_no_duplicate_data_files(
 
 fn build_abort_cleanup(
     runtime: &IcebergMetadataContext,
+    context: &ConnectorRequestContext,
 ) -> Result<(crate::opendal::Operator, Option<CleanupPathMapper>), ConnectorError> {
     let state = runtime.control_state();
     let warehouse_uri = &state.configuration().warehouse_uri;
-    let access =
-        fs_io::resolve_access_for_location(warehouse_uri, runtime.resources().planning_binding())
-            .map_err(|error| {
-            internal(format!(
-                "resolve Iceberg warehouse for data mutation cleanup: {error}"
-            ))
-        })?;
+    let access = fs_io::resolve_access_for_location(
+        warehouse_uri,
+        &runtime
+            .resources()
+            .planning_binding()
+            .for_request(context.clone()),
+    )
+    .map_err(|error| {
+        internal(format!(
+            "resolve Iceberg warehouse for data mutation cleanup: {error}"
+        ))
+    })?;
     if access.handle().scheme() == novarocks_fs::FsScheme::ObjectStore {
         let bucket = access
             .handle()
@@ -1371,6 +1400,7 @@ mod tests {
     struct FakeBackend {
         lookup: Mutex<MarkerLookup>,
         execute_count: AtomicUsize,
+        context_calls: AtomicUsize,
         namespace: String,
     }
 
@@ -1379,6 +1409,7 @@ mod tests {
             Self {
                 lookup: Mutex::new(MarkerLookup::Missing),
                 execute_count: AtomicUsize::new(0),
+                context_calls: AtomicUsize::new(0),
                 namespace: "db".to_string(),
             }
         }
@@ -1403,6 +1434,7 @@ mod tests {
             ),
             ConnectorError,
         > {
+            self.context_calls.fetch_add(1, Ordering::SeqCst);
             Ok((
                 PlannedIcebergMutation::Truncate {
                     payload: IcebergDataMutationPlanPayloadV1 {
@@ -1428,8 +1460,10 @@ mod tests {
             &self,
             planned: &PlannedIcebergMutation,
             _marker: &IcebergDataMutationMarkerV1,
+            _context: &ConnectorRequestContext,
         ) -> Result<CommitOutcome, CommitServiceError> {
             self.execute_count.fetch_add(1, Ordering::SeqCst);
+            self.context_calls.fetch_add(1, Ordering::SeqCst);
             Err(CommitServiceError::unknown(
                 "response lost".to_string(),
                 recovery_evidence(planned.payload(), CommitOpKind::Truncate),
@@ -1443,7 +1477,9 @@ mod tests {
             _target_ref: &str,
             _operation_id_hex: &str,
             _identity_digest_hex: &str,
+            _context: &ConnectorRequestContext,
         ) -> Result<MarkerLookup, ConnectorError> {
+            self.context_calls.fetch_add(1, Ordering::SeqCst);
             Ok(*self.lookup.lock().expect("lookup"))
         }
     }
@@ -1759,6 +1795,36 @@ mod tests {
         assert_eq!(first.plan_digest(), replay.plan_digest());
         let conflict = truncate_request(key, instance_id, operation_id, "dev");
         assert!(adapter.plan_mutation(conflict).is_err());
+    }
+
+    #[test]
+    fn adapter_threads_the_current_context_to_plan_execute_and_reconcile() {
+        let backend = Arc::new(FakeBackend::new());
+        let (adapter, key, instance_id) = test_adapter(Arc::clone(&backend));
+        let plan = adapter
+            .plan_mutation(truncate_request(
+                key,
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([14; 16]),
+                "main",
+            ))
+            .expect("plan");
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } = adapter
+            .execute(
+                ConnectorDataMutationExecuteRequest::try_new(plan.clone(), test_context())
+                    .expect("execute request"),
+            )
+            .expect("unknown execution")
+        else {
+            panic!("expected commit unknown");
+        };
+        adapter
+            .reconcile(
+                ConnectorDataMutationReconcileRequest::try_new(&plan, evidence, test_context())
+                    .expect("reconcile request"),
+            )
+            .expect("reconcile");
+        assert_eq!(backend.context_calls.load(Ordering::SeqCst), 4);
     }
 
     #[test]

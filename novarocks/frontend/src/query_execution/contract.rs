@@ -934,6 +934,19 @@ impl std::error::Error for DistributedQueryError {}
 
 /// Frontend-owned distributed query execution port.
 pub trait DistributedQueryCoordinator: Send + Sync + 'static {
+    /// Reserve the first attempt identity before connector metadata
+    /// materialization. Production owns the query-id source; injected test
+    /// coordinators fail closed unless they explicitly implement this port.
+    fn reserve_initial_attempt(
+        &self,
+    ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
+    {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::Rejected,
+            "distributed query coordinator does not reserve attempt identities",
+        ))
+    }
+
     fn begin_write_operation(
         &self,
         _registration: ConnectorWriteOperationRegistration,
@@ -950,6 +963,20 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         request: DistributedQueryRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError>;
 
+    /// Execute one non-retriable reserved attempt. Callers use this when
+    /// connector planning has already observed attempt-scoped capabilities
+    /// but statement semantics do not permit automatic whole-round replanning.
+    fn execute_reserved(
+        &self,
+        _request: DistributedQueryRequest,
+        _reservation: crate::query_execution::completion::QueryAttemptReservation,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "injected coordinator does not implement reserved distributed attempts",
+        ))
+    }
+
     /// Execute a statement operation whose replacement rounds must carry a
     /// newly derived completion formatter as well as a newly derived request.
     /// The default retains legacy single-round behavior for narrow test
@@ -959,11 +986,17 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
-        let (request, completion, round_factory) = operation.into_parts();
+        let (request, completion, round_factory, reservation) = operation.into_parts();
         if round_factory.is_some() {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "injected coordinator does not implement statement-level pre-ready replan",
+            ));
+        }
+        if reservation.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "injected coordinator does not implement reserved distributed attempts",
             ));
         }
         let outcome = self.execute(request)?;
@@ -980,7 +1013,13 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         &self,
         operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let (request, _round_factory) = operation.into_parts();
+        let (request, _round_factory, reservation) = operation.into_parts();
+        if reservation.is_some() {
+            return Err(DistributedQueryError::new(
+                DistributedQueryErrorKind::ContractViolation,
+                "injected coordinator does not implement reserved raw distributed attempts",
+            ));
+        }
         Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
             format!(

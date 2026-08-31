@@ -62,6 +62,14 @@ impl IcebergTypedProviderFactory {
         Self { binding, options }
     }
 
+    /// Bind the process-local catalog runtime to the admitted fragment request
+    /// before constructing a reader. In particular, a vended catalog can
+    /// resolve storage only through this request's lifecycle-installed
+    /// resolver; it must never fall back to the generation binding.
+    fn binding_for_request(&self, request: &ConnectorRequestContext) -> IcebergReadBinding {
+        self.binding.for_request(request.clone())
+    }
+
     /// Pair this request-scoped execution factory with one exact provider
     /// runtime. This is connector-internal composition; roles only receive
     /// the erased SPI factory created by the execution bundle.
@@ -104,14 +112,12 @@ where
         request: &ConnectorRequestContext,
         reader_policy: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        let binding = self.binding_for_request(request);
+        let context =
+            binding.file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
         let options = apply_reader_policy(self.options, reader_policy);
         Ok(Arc::new(IcebergPageSourceProvider::new(
-            self.binding.clone(),
-            context,
-            options,
+            binding, context, options,
         )))
     }
 
@@ -119,11 +125,11 @@ where
         &self,
         request: &ConnectorRequestContext,
     ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        let binding = self.binding_for_request(request);
+        let context =
+            binding.file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
         Ok(Arc::new(IcebergSystemTableProvider::new(
-            self.binding.clone(),
+            binding,
             context,
             self.options.budget.max_rows,
         )))
@@ -141,8 +147,130 @@ fn apply_reader_policy(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
-    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
+    use novarocks_fs::{
+        FsAccessResolver, FsAccessResources, ObjectStoreProviderPool,
+        ObjectStoreProviderPoolOptions, TokioFileIoRuntime, TokioFileTaskSpawner,
+    };
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+        ConnectorCancellation, ConnectorErrorKind, ConnectorInstanceId, ConnectorStorageResolver,
+        CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
+    };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct RejectingStaticResolver;
+
+    impl crate::access_binding::IcebergStaticCredentialResolver for RejectingStaticResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &novarocks_spi::connector::StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "typed factory test static resolver must not be used",
+            ))
+        }
+    }
+
+    struct RecordingVendedResolver {
+        calls: AtomicUsize,
+    }
+
+    impl ConnectorStorageResolver for RecordingVendedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            assert_eq!(request.owner().catalog_name().as_str(), "typed-vended-test");
+            assert_eq!(request.location(), "s3://warehouse/table/data.parquet");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "typed factory test vended resolver was selected",
+            ))
+        }
+    }
+
+    fn vended_factory() -> IcebergTypedProviderFactory {
+        let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
+        let resources = FsAccessResources::new(
+            Arc::new(
+                ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
+                    .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        // The test does not schedule file I/O; the runtime is needed only to
+        // construct a valid binding while validating resolver selection.
+        let properties = CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("typed-vended-test").expect("catalog"),
+                CatalogVersion::from_bytes([0x27; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![
+                CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")
+                    .expect("endpoint property"),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties");
+        IcebergTypedProviderFactory::new(
+            IcebergReadBinding::from_catalog_properties(
+                resources,
+                Arc::new(RejectingStaticResolver),
+                &properties,
+            )
+            .expect("vended binding"),
+            IcebergPageSourceProviderOptions::with_default_budget(),
+        )
+    }
+
+    fn request_context(resolver: Arc<RecordingVendedResolver>) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            2048,
+        )
+        .expect("request context")
+        .with_storage_resolver(resolver)
+    }
+
+    fn assert_request_binding_uses_vended_resolver(
+        factory: &IcebergTypedProviderFactory,
+        request: &ConnectorRequestContext,
+        resolver: &RecordingVendedResolver,
+    ) {
+        let error = factory
+            .binding_for_request(request)
+            .resolve_access("s3://warehouse/table/data.parquet")
+            .expect_err("request binding must select the lifecycle vended resolver");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn query_reader_policy_overrides_the_generation_default() {
@@ -175,6 +303,28 @@ mod tests {
             catalog_transaction_marker(&handle),
             std::array::from_fn(|index| index as u8),
         );
+    }
+
+    #[test]
+    fn typed_data_provider_binds_the_request_vended_resolver() {
+        let factory = vended_factory();
+        let resolver = Arc::new(RecordingVendedResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let request = request_context(resolver.clone());
+
+        assert_request_binding_uses_vended_resolver(&factory, &request, &resolver);
+    }
+
+    #[test]
+    fn typed_system_table_provider_binds_the_request_vended_resolver() {
+        let factory = vended_factory();
+        let resolver = Arc::new(RecordingVendedResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let request = request_context(resolver.clone());
+
+        assert_request_binding_uses_vended_resolver(&factory, &request, &resolver);
     }
 }
 

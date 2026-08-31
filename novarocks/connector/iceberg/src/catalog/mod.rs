@@ -298,11 +298,16 @@ pub(crate) enum ConditionalCreateVerdict {
 /// collapsing it: `Conflict` is a definite server rejection, `KnownUncommitted`
 /// proves the request never went out, and `CommitUnknown` means it may have.
 /// Flattening these is how a lost response becomes a duplicate publication.
-#[derive(Debug)]
 pub(crate) enum StagedCreateStart {
     Staged {
-        table: crate::iceberg::table::Table,
+        /// The table response must not select a FileIO before a vended
+        /// delegation, when present, has entered the query-attempt collector.
+        table: crate::loaded_table::IcebergLoadedTableMaterialization,
         initialization_updates: Vec<crate::iceberg::TableUpdate>,
+        /// Response-local vended material.  It is intentionally not part of
+        /// the table or staged-write payload; the caller must hand it to the
+        /// query-attempt lease owner or refuse the operation.
+        access_delegation: crate::loaded_table::IcebergAccessDelegation,
     },
     Conflict(String),
     KnownUncommitted(String),
@@ -364,6 +369,15 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// other handle, for instance.
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
 
+    /// The provider-private REST client that may refresh an already-admitted
+    /// vended credential scope. Only the REST implementation owns such a
+    /// capability; callers never downcast or construct a second catalog.
+    fn vended_credential_refresh_catalog(
+        &self,
+    ) -> Option<Arc<crate::iceberg_catalog_rest::RestCatalog>> {
+        None
+    }
+
     // ---- A. Reads -------------------------------------------------------
 
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError>;
@@ -383,7 +397,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     async fn load_table(
         &self,
         table: CatalogTableName,
-    ) -> Result<crate::iceberg::table::Table, ConnectorError>;
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError>;
 
     /// Whether the view exists.
     ///
@@ -463,7 +477,11 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     ) -> StagedCreateStart;
 
     /// Publish a staged create with exactly one assert-create request.
-    async fn commit_staged_table(&self, commit: crate::iceberg::TableCommit) -> StagedCommitResult;
+    async fn commit_staged_table(
+        &self,
+        commit: crate::iceberg::TableCommit,
+        request_file_io: crate::iceberg::io::FileIO,
+    ) -> StagedCommitResult;
 
     /// Stage a conditional create against storage, without publishing it.
     ///

@@ -65,7 +65,7 @@ pub fn unique_file_path(batch: &RecordBatch) -> Result<Option<String>, String> {
     Ok(Some(first.to_string()))
 }
 
-/// Build a FileIO from the exact startup-bound storage binding.
+/// Build a FileIO from one request-scoped storage binding.
 pub fn build_staged_file_io(
     binding: &IcebergReadBinding,
     data_location: &str,
@@ -79,7 +79,7 @@ pub fn build_staged_file_io(
     ))
 }
 
-/// Encode and persist one Parquet file through the exact BE storage binding.
+/// Encode and persist one Parquet file through one request-scoped storage binding.
 pub fn write_parquet_file(
     binding: &IcebergReadBinding,
     runtime: &IcebergExecutionRuntime,
@@ -91,8 +91,7 @@ pub fn write_parquet_file(
     let props = WriterProperties::builder()
         .set_compression(compression)
         .build();
-    let object_store = binding.object_store_binding_for_location(path)?;
-    if object_store.is_some() {
+    if binding.is_object_store_location(path)? {
         let (data, write_result) = write_parquet_to_bytes(schema, batch, props)?;
         let access = binding
             .resolve_access(path)

@@ -86,9 +86,11 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         validate_target(&target_ref)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
+        let statistics_namespace = resolved.namespace.clone();
+        let statistics_table = resolved.table.clone();
         self.execute_iceberg_source(
             engine,
-            &resolved,
+            resolved,
             &command.columns,
             &command.source,
             source,
@@ -106,13 +108,13 @@ impl DmlService {
         self.statistics()
             .observe_insert(
                 StatisticsInsertObservation {
-                    database: &resolved.namespace,
-                    table: &resolved.table,
+                    database: &statistics_namespace,
+                    table: &statistics_table,
                     insert_columns: &command.columns,
                     source: &statistics_source,
                     overwrite_mode: statistics_overwrite_mode,
                 },
-                self.local_statistics_columns(&resolved.namespace, &resolved.table)?,
+                self.local_statistics_columns(&statistics_namespace, &statistics_table)?,
             )
             .map_err(DmlError::executor)?;
         Ok(())
@@ -126,7 +128,7 @@ impl DmlService {
     fn execute_iceberg_source(
         &self,
         engine: &dyn InsertEngine,
-        target: &ResolvedInsertTarget,
+        target: ResolvedInsertTarget,
         insert_columns: &[String],
         source: &InsertCommandSource,
         sql_source: &str,
@@ -159,7 +161,7 @@ impl DmlService {
         let prepared = engine
             .prepare_iceberg_write(PrepareIcebergInsert {
                 publication_id,
-                target: target.clone(),
+                target,
                 insert_columns: prepared_insert_columns,
                 sql_source: sql_source.to_string(),
                 source,

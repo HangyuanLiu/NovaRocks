@@ -373,7 +373,11 @@ impl ConnectorMetadata for IcebergMetadata {
         self.ensure_owner(&request.table.instance_id)?;
         let loaded = self
             .runtime
-            .load_table(&request.table.namespace, &request.table.table)
+            .load_table_for_request(
+                &request.table.namespace,
+                &request.table.table,
+                &request.context,
+            )
             .map_err(unavailable)?;
         read_reference_facts(loaded.table.metadata(), &request.context)
     }
@@ -430,7 +434,12 @@ impl ConnectorMetadata for IcebergMetadata {
             .invalidate_table(&request.table.namespace, &table_name);
         let loaded = self
             .runtime
-            .load_table_classified(&request.table.namespace, &table_name)
+            .load_table_classified_with_credential_lease_collection(
+                &request.table.namespace,
+                &table_name,
+                request.context.vended_credential_lease_collection(),
+                Some(&request.context),
+            )
             .map_err(classified_control_error)?;
         let metadata = loaded.table.metadata();
         let definition_schema = metadata.current_schema().clone();
@@ -635,7 +644,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
             }
             let physical = self
                 .runtime
-                .load_table(&table.namespace, &table.table)
+                .load_table_for_request(&table.namespace, &table.table, &request.context)
                 .map_err(unavailable)?;
             let metadata = physical.table.metadata();
             let metadata_uuid = metadata.uuid().to_string();
@@ -727,7 +736,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
             selector => {
                 let physical = self
                     .runtime
-                    .load_table(&table.namespace, &table.table)
+                    .load_table_for_request(&table.namespace, &table.table, &request.context)
                     .map_err(unavailable)?;
                 (
                     select_snapshot(physical.table.metadata(), selector)?,
@@ -785,7 +794,7 @@ impl ConnectorScanPlanning for IcebergMetadata {
         if let IcebergScanModeV1::ChangeWindow { delta } = &scan.mode {
             return self.plan_change_window_splits(&scan, delta.as_ref().as_ref(), request);
         }
-        let files = self.scan_files(&scan)?;
+        let files = self.scan_files(&scan, &request.context)?;
         if !matches!(scan.purpose, IcebergReadPurposeV1::Query)
             && files.iter().any(|file| {
                 file.delete_files.iter().any(|delete| {
@@ -839,8 +848,17 @@ impl ConnectorScanPlanning for IcebergMetadata {
                 estimated_bytes: Some(estimated_bytes),
             });
         }
+        // Footer reads are FE-side object-store I/O during candidate planning.
+        // Bind this exact request before inspecting a file so a vended catalog
+        // resolves only through the attempt-local capability rather than the
+        // generation-scoped startup binding.
+        let planning_binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(request.context.clone());
         let leaves = materialize_local_scan_units(
-            self.runtime.resources().planning_binding(),
+            &planning_binding,
             leaves,
             false,
             &novarocks_spi::connector::ConnectorPrepareSplitRequest {
@@ -1135,6 +1153,7 @@ impl IcebergMetadata {
     fn scan_files(
         &self,
         scan: &IcebergScanPayload,
+        request_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<IcebergDataFileInfo>, ConnectorError> {
         if scan.table.row_mutation_frozen_source {
             match scan.table.explicit_files.as_deref() {
@@ -1157,7 +1176,11 @@ impl IcebergMetadata {
             (None, Some(snapshot_id)) => {
                 let physical = self
                     .runtime
-                    .load_table(&scan.table.namespace, &scan.table.table)
+                    .load_table_for_request(
+                        &scan.table.namespace,
+                        &scan.table.table,
+                        request_context,
+                    )
                     .map_err(unavailable)?;
                 let expected_uuid = scan.table_uuid.as_deref().ok_or_else(|| {
                     corrupt("Iceberg snapshot scan is missing its table incarnation")
@@ -2140,7 +2163,7 @@ mod plan_splits_pruning_tests {
         };
 
         let error = provider
-            .scan_files(&scan)
+            .scan_files(&scan, &context())
             .expect_err("frozen source must not reload the current catalog");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
         assert!(error.to_string().contains("missing its explicit data file"));

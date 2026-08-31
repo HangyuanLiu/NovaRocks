@@ -23,7 +23,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::backend_topology::{
@@ -34,7 +34,7 @@ use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
     PreparedDistributedQuery, RunningNativeExecutionParts, ValidatedFragmentSchedule,
 };
-use crate::query_execution::completion::PreReadyRetryBoundary;
+use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
     DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
@@ -42,7 +42,9 @@ use crate::query_execution::contract::{
 };
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
-use crate::query_execution::lifecycle_plan::{QueryInitOptions, QueryLifecycleLease};
+use crate::query_execution::lifecycle_plan::{
+    QueryCredentialLeases, QueryInitOptions, QueryLifecycleLease,
+};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::RoundSplitSource;
@@ -599,6 +601,38 @@ pub struct FrontendDistributedQueryCoordinator {
     native_compatibility_id: NativeCompatibilityId,
 }
 
+/// Credential material stays under its planning collector until the round has
+/// opened every connector split source. Opening a source may read Iceberg
+/// manifests through the request-bound resolver and may observe the vended
+/// response that must be sealed into the same Init manifest.
+enum RoundCredentialLeaseSource {
+    Frozen(QueryCredentialLeases),
+    Reservation {
+        reservation: QueryAttemptReservation,
+        observed_collected: Option<Arc<AtomicBool>>,
+    },
+}
+
+impl RoundCredentialLeaseSource {
+    fn into_credential_leases(self) -> Result<QueryCredentialLeases, DistributedQueryError> {
+        match self {
+            Self::Frozen(leases) => Ok(leases),
+            Self::Reservation {
+                reservation,
+                observed_collected,
+            } => {
+                if let Some(observed_collected) = observed_collected {
+                    observed_collected.store(
+                        reservation.has_collected_credential_leases(),
+                        Ordering::Release,
+                    );
+                }
+                reservation.into_credential_leases()
+            }
+        }
+    }
+}
+
 fn build_lifecycle_config(
     timeouts: crate::application::FrontendQueryControlTimeouts,
 ) -> Result<FrontendQueryLifecycleConfig, DistributedQueryError> {
@@ -851,8 +885,38 @@ impl FrontendDistributedQueryCoordinator {
         let intent = request.intent();
         let query_id = self.query_ids.next_query_id()?;
         let execution_id = execution_id_for_round(query_id, 1)?;
-        self.execute_round(query_id, execution_id, statement_deadline, request, None)
-            .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
+        self.execute_round(
+            query_id,
+            execution_id,
+            statement_deadline,
+            request,
+            None,
+            RoundCredentialLeaseSource::Frozen(QueryCredentialLeases::empty()),
+        )
+        .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
+    }
+
+    fn execute_reserved_request(
+        &self,
+        request: DistributedQueryRequest,
+        reservation: QueryAttemptReservation,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        let statement_deadline = statement_deadline_for_request(&request)?;
+        let intent = request.intent();
+        let query_id = reservation.query_id();
+        let execution_id = reservation.execution_id();
+        self.execute_round(
+            query_id,
+            execution_id,
+            statement_deadline,
+            request,
+            None,
+            RoundCredentialLeaseSource::Reservation {
+                reservation,
+                observed_collected: None,
+            },
+        )
+        .map_err(|error| fail_closed_one_shot_topology_retry(intent, error))
     }
 
     /// Execute exactly one move-only distributed round. A future statement
@@ -867,6 +931,7 @@ impl FrontendDistributedQueryCoordinator {
         statement_deadline: Instant,
         request: DistributedQueryRequest,
         retry_boundary: Option<&dyn PreReadyRetryBoundary>,
+        credential_lease_source: RoundCredentialLeaseSource,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
         let connector_write_session = parts
@@ -925,6 +990,10 @@ impl FrontendDistributedQueryCoordinator {
             Arc::clone(&feedback_state),
             self.connector_split_initial_dynamic_filter_wait_cap,
         )?;
+        // A source open may load manifest metadata under the request-local
+        // resolver and collect one exact vended response. Seal that collector
+        // only after every source is open, then hand its leases to Init.
+        let credential_leases = credential_lease_source.into_credential_leases()?;
         let binding_attachment =
             encode_binding_attachment(parts.artifacts.runtime_filter_binding_view())?;
         let scheduled = parts
@@ -1035,7 +1104,8 @@ impl FrontendDistributedQueryCoordinator {
             query_deadline_unix_ms,
             self.pre_start_timeout,
             self.report_endpoint.resolve()?,
-        )?;
+        )?
+        .with_credential_leases(credential_leases);
         let connector_binding_ready = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)
             .map_err(|error| {
@@ -1177,6 +1247,19 @@ impl FrontendDistributedQueryCoordinator {
             novarocks_spi::connector::read_stack::SplitSourceProfile::default()
         };
 
+        // A vended connector write needs one final FE-local metadata reload to
+        // commit or reconcile after the BE terminal reports converge. Retain
+        // only that opaque terminal capability before lifecycle finalization;
+        // it is attached to the completion and clears itself after the SQL
+        // terminal decision.
+        let terminal_storage_resolver =
+            if intent == DistributedQueryIntent::Write && !connector_write_plans.is_empty() {
+                query_lifecycle_lease
+                    .as_ref()
+                    .and_then(|lease| lease.retain_terminal_storage_resolver())
+            } else {
+                None
+            };
         let terminal_set = query_lifecycle_lease
             .take()
             .expect("query lifecycle lease is present through query completion")
@@ -1224,11 +1307,15 @@ impl FrontendDistributedQueryCoordinator {
                     commit.as_ref(),
                 ) {
                     (Some(session), attachments, Some(commit)) if !attachments.is_empty() => {
-                        Some(ConnectorWriteCompletion::from_write_commits(
+                        let completion = ConnectorWriteCompletion::from_write_commits(
                             session,
                             attachments.into_values(),
                             commit,
-                        )?)
+                        )?;
+                        Some(match terminal_storage_resolver {
+                            Some(resolver) => completion.with_terminal_storage_resolver(resolver),
+                            None => completion,
+                        })
                     }
                     (Some(_), attachments, None) if !attachments.is_empty() => {
                         return Err(DistributedQueryError::new(
@@ -1331,6 +1418,15 @@ impl FrontendDistributedQueryCoordinator {
 }
 
 impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
+    fn reserve_initial_attempt(
+        &self,
+    ) -> Result<crate::query_execution::completion::QueryAttemptReservation, DistributedQueryError>
+    {
+        crate::query_execution::completion::QueryAttemptReservation::first(
+            self.query_ids.next_query_id()?,
+        )
+    }
+
     fn begin_write_operation(
         &self,
         registration: ConnectorWriteOperationRegistration,
@@ -1352,15 +1448,30 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         self.execute_request(request)
     }
 
+    fn execute_reserved(
+        &self,
+        request: DistributedQueryRequest,
+        reservation: QueryAttemptReservation,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.execute_reserved_request(request, reservation)
+    }
+
     fn execute_prepared(
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
-        let query_id = self.query_ids.next_query_id()?;
-        let (first_request, first_completion, mut round_factory) = operation.into_parts();
+        let (first_request, first_completion, mut round_factory, reservation) =
+            operation.into_parts();
+        let reservation = match reservation {
+            Some(reservation) => reservation,
+            None => crate::query_execution::completion::QueryAttemptReservation::first(
+                self.query_ids.next_query_id()?,
+            )?,
+        };
+        let query_id = reservation.query_id();
+        let first_execution_id = reservation.execution_id();
         let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
-        let first_execution_id = execution_id_for_round(query_id, 1)?;
         let first_retry_boundary = round_factory
             .as_deref()
             .map(|factory| factory as &dyn PreReadyRetryBoundary);
@@ -1370,6 +1481,10 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
             retry_deadline,
             first_request,
             first_retry_boundary,
+            RoundCredentialLeaseSource::Reservation {
+                reservation,
+                observed_collected: None,
+            },
         ) {
             Ok(outcome) => first_completion.complete(outcome).map_err(failed),
             Err(first_error) => {
@@ -1406,24 +1521,51 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     })?;
                 observe_waiting_for_backend(waiting_started_at.elapsed());
                 let replan_started_at = Instant::now();
-                let replacement = factory.replan(fresh_topology);
+                let replacement_reservation =
+                    crate::query_execution::completion::QueryAttemptReservation::retry(
+                        query_id, 2,
+                    )?;
+                let replacement = factory.replan(fresh_topology, replacement_reservation);
                 observe_pre_ready_replan(replan_started_at.elapsed());
                 let replacement = replacement?;
-                let (replacement_request, replacement_completion, replacement_factory) =
-                    replacement.into_parts();
+                let (
+                    replacement_request,
+                    replacement_completion,
+                    replacement_factory,
+                    replacement_reservation,
+                ) = replacement.into_parts();
                 if replacement_factory.is_some() {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "replacement distributed round must not retain another automatic retry factory",
                     ));
                 }
-                let replacement_execution_id = execution_id_for_round(query_id, 2)?;
+                let replacement_reservation = replacement_reservation.ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "replacement distributed round lost its reserved attempt identity",
+                    )
+                })?;
+                if replacement_reservation.query_id() != query_id
+                    || replacement_reservation.execution_id().attempt_id()
+                        != execution_id_for_round(query_id, 2)?.attempt_id()
+                {
+                    return Err(DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "replacement distributed round changed its reserved attempt identity",
+                    ));
+                }
+                let replacement_execution_id = replacement_reservation.execution_id();
                 self.execute_round(
                     query_id,
                     replacement_execution_id,
                     retry_deadline,
                     replacement_request,
                     None,
+                    RoundCredentialLeaseSource::Reservation {
+                        reservation: replacement_reservation,
+                        observed_collected: None,
+                    },
                 )
                 .and_then(|outcome| replacement_completion.complete(outcome).map_err(failed))
             }
@@ -1434,22 +1576,43 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         &self,
         operation: crate::query_execution::completion::PreparedRetriableDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let query_id = self.query_ids.next_query_id()?;
-        let (first_request, mut round_factory) = operation.into_parts();
+        let (first_request, mut round_factory, reservation) = operation.into_parts();
+        let reservation = match reservation {
+            Some(reservation) => reservation,
+            None => crate::query_execution::completion::QueryAttemptReservation::first(
+                self.query_ids.next_query_id()?,
+            )?,
+        };
+        let query_id = reservation.query_id();
+        let first_execution_id = reservation.execution_id();
+        let retry_collected_vended_credentials = Arc::new(AtomicBool::new(
+            reservation.has_collected_credential_leases(),
+        ));
         let first_revision = first_request.topology().revision();
         let retry_deadline = statement_deadline_for_request(&first_request)?;
-        let first_execution_id = execution_id_for_round(query_id, 1)?;
         match self.execute_round(
             query_id,
             first_execution_id,
             retry_deadline,
             first_request,
             Some(round_factory.as_ref() as &dyn PreReadyRetryBoundary),
+            RoundCredentialLeaseSource::Reservation {
+                reservation,
+                observed_collected: Some(Arc::clone(&retry_collected_vended_credentials)),
+            },
         ) {
             Ok(outcome) => Ok(outcome),
             Err(first_error) => {
                 if first_error.pre_ready_topology_outcome().is_none() {
                     return Err(first_error);
+                }
+                if retry_collected_vended_credentials.load(Ordering::Acquire) {
+                    return Err(DistributedQueryError::topology_retry_unsupported(
+                        first_error
+                            .pre_ready_topology_outcome()
+                            .expect("pre-ready topology outcome checked above"),
+                        "distributed write collected vended credentials and requires fresh whole-round materialization for a topology retry",
+                    ));
                 }
                 let reason = pre_ready_topology_reason(
                     first_error
@@ -1485,6 +1648,7 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
                     retry_deadline,
                     replacement,
                     None,
+                    RoundCredentialLeaseSource::Frozen(QueryCredentialLeases::empty()),
                 )
             }
         }
@@ -2052,6 +2216,7 @@ mod tests {
         fn replan(
             &mut self,
             topology: crate::common::backend_topology::BackendTopologySnapshot,
+            reservation: crate::query_execution::completion::QueryAttemptReservation,
         ) -> Result<PreparedDistributedQuery, DistributedQueryError> {
             self.replanned_topologies
                 .lock()
@@ -2060,7 +2225,8 @@ mod tests {
             Ok(PreparedDistributedQuery::new(
                 fresh_result_request(topology)?,
                 PreparedQueryCompletion::result(),
-            ))
+            )
+            .with_attempt_reservation(reservation))
         }
     }
 

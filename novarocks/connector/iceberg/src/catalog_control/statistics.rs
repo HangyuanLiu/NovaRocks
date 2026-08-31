@@ -89,7 +89,7 @@ impl StatisticsReader for IcebergMetadata {
         })?;
         let physical = self
             .runtime()
-            .load_table(&table.namespace, &table.table)
+            .load_table_for_request(&table.namespace, &table.table, &request.context)
             .map_err(unavailable)?;
         let metadata = physical.table.metadata();
         // Deliberately no currentness check. The query was planned on this
@@ -407,7 +407,7 @@ impl StatisticsCollection for IcebergMetadata {
         }
         let physical = self
             .runtime()
-            .load_table(&table.namespace, &table.table)
+            .load_table_for_request(&table.namespace, &table.table, &request.context)
             .map_err(unavailable)?;
         // The path is derived from the snapshot the collection measured, not
         // from whatever is current now, so a table that advances between
@@ -455,7 +455,7 @@ impl StatisticsCollection for IcebergMetadata {
 
         let physical = self
             .runtime()
-            .load_table(&table.namespace, &table.table)
+            .load_table_for_request(&table.namespace, &table.table, &request.context)
             .map_err(unavailable)?;
         let metadata = physical.table.metadata();
         // Statistics belong to the snapshot they measured. Requiring that

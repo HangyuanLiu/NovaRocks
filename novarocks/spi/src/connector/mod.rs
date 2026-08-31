@@ -73,8 +73,8 @@ pub use cleanup_maintenance::{
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
 pub use context::{
-    ConnectorCancellation, ConnectorRequestContext, ConnectorStorageResolver,
-    ResolvedVendedS3Access, StorageAccessRequest,
+    ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,
+    ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -91,10 +91,12 @@ pub use credential::{
     canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
 };
 pub use credential_lease::{
-    CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-    MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
+    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
+    CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
     MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
-    MAX_CREDENTIAL_LEASES_PER_QUERY,
+    MAX_CREDENTIAL_LEASES_PER_QUERY, VendedS3CredentialLeaseContribution,
+    VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

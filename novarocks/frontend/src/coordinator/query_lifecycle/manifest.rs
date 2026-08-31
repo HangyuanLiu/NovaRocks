@@ -50,7 +50,7 @@ impl MaterializedParticipant {
                 "materialized participant manifest is unavailable while clearing credential leases: {error}"
             ))
         })?;
-        self.request = QueryInitRequest::from_manifest(manifest);
+        self.request = QueryInitRequest::retain_manifest_after_confidential_send(manifest);
         Ok(())
     }
 }

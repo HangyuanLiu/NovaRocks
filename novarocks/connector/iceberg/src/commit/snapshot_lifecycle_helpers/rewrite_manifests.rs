@@ -99,10 +99,11 @@ pub async fn run_rewrite_manifests_with_marker(
 /// Runs one frozen-plan attempt without the legacy OCC retry loop.
 pub async fn run_rewrite_manifests_once_with_marker(
     catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
+    table: crate::iceberg::table::Table,
+    file_io: FileIO,
     marker: Option<String>,
 ) -> Result<RewriteManifestsOutcome, crate::iceberg::Error> {
-    run_rewrite_manifests_one_attempt(catalog, table_ident, marker).await
+    run_rewrite_manifests_with_table(catalog, table, file_io, marker).await
 }
 
 fn generate_snapshot_id() -> i64 {
@@ -166,14 +167,26 @@ async fn run_rewrite_manifests_one_attempt(
     marker: Option<String>,
 ) -> Result<RewriteManifestsOutcome, crate::iceberg::Error> {
     let table = catalog.load_table(&table_ident).await?;
+    let file_io = table.file_io().clone();
+    run_rewrite_manifests_with_table(catalog, table, file_io, marker).await
+}
+
+/// Run one manifest rewrite from a caller-bound table and FileIO. The catalog
+/// remains the metadata commit owner; all manifest I/O uses the supplied
+/// action-scoped FileIO.
+async fn run_rewrite_manifests_with_table(
+    catalog: Arc<dyn Catalog>,
+    table: crate::iceberg::table::Table,
+    file_io: FileIO,
+    marker: Option<String>,
+) -> Result<RewriteManifestsOutcome, crate::iceberg::Error> {
     let metadata = table.metadata();
-    let file_io = table.file_io();
 
     // Step 1: load current snapshot; noop if empty.
     let Some(current) = metadata.current_snapshot() else {
         return Ok(RewriteManifestsOutcome::default());
     };
-    let manifest_list = current.load_manifest_list(file_io, metadata).await?;
+    let manifest_list = current.load_manifest_list(&file_io, metadata).await?;
     let manifest_files: Vec<ManifestFile> = manifest_list.entries().to_vec();
     if manifest_files.len() <= 1 {
         // Single (or zero) manifest: nothing to merge.
@@ -204,7 +217,7 @@ async fn run_rewrite_manifests_one_attempt(
         // Multi-manifest group: merge.
         let new_manifest_path = format!("{}/{}-m0.avro", meta_dir, uuid::Uuid::new_v4());
         let merged = merge_manifest_group(
-            file_io,
+            &file_io,
             metadata,
             group,
             &new_manifest_path,
@@ -242,7 +255,7 @@ async fn run_rewrite_manifests_one_attempt(
     };
 
     write_manifest_list(
-        file_io,
+        &file_io,
         &manifest_list_path,
         new_manifests,
         new_snapshot_id,
@@ -345,7 +358,7 @@ async fn run_rewrite_manifests_one_attempt(
         },
     ];
     let commit = TableCommit::builder()
-        .ident(table_ident)
+        .ident(table.identifier().clone())
         .updates(updates)
         .requirements(requirements)
         .build();

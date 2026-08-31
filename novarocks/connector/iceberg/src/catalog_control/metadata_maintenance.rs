@@ -24,7 +24,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::iceberg::NamespaceIdent;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -174,7 +173,7 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&namespace, &table_name);
         let loaded = self
             .runtime
-            .load_table(&namespace, &table_name)
+            .load_table_for_request(&namespace, &table_name, &request.context)
             .map_err(|error| unavailable(format!("load Iceberg table for maintenance: {error}")))?;
         let table = loaded.into_table();
         let metadata = table.metadata();
@@ -322,13 +321,14 @@ impl IcebergMetadataMaintenanceAdapter {
         &self,
         payload: &IcebergMetadataMaintenancePlanPayloadV1,
         marker: &IcebergMetadataMaintenanceMarkerV1,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<MarkerLookup, ConnectorError> {
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
         let loaded = self
             .runtime
-            .load_table(&payload.namespace, &payload.table)
+            .load_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(|error| {
                 unavailable(format!("load Iceberg table for marker lookup: {error}"))
             })?;
@@ -379,6 +379,7 @@ impl IcebergMetadataMaintenanceAdapter {
         plan: &ConnectorMetadataMaintenancePlan,
         payload: &IcebergMetadataMaintenancePlanPayloadV1,
         marker: &IcebergMetadataMaintenanceMarkerV1,
+        context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<ConnectorMetadataMaintenanceReceipt, ExecFailure> {
         self.runtime
             .control_state()
@@ -386,10 +387,12 @@ impl IcebergMetadataMaintenanceAdapter {
         let catalog = self.runtime.novarocks_catalog().vendored_client();
         let loaded = self
             .runtime
-            .load_table(&payload.namespace, &payload.table)
+            .load_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(|error| ExecFailure::KnownUncommitted(unavailable(error.to_string())))?;
         validate_frozen_state(&loaded.table, plan, payload)
             .map_err(ExecFailure::KnownUncommitted)?;
+        let table = loaded.into_table();
+        let file_io = table.file_io().clone();
         let marker_bytes = canonical_json(marker, "Iceberg metadata maintenance marker")
             .map_err(ExecFailure::KnownUncommitted)?;
         let marker_text = String::from_utf8(marker_bytes.to_vec()).map_err(|error| {
@@ -402,10 +405,8 @@ impl IcebergMetadataMaintenanceAdapter {
                 .catalog_runtime()
                 .block_on(run_rewrite_manifests_once_with_marker(
                     catalog,
-                    crate::iceberg::TableIdent::new(
-                        NamespaceIdent::new(payload.namespace.clone()),
-                        payload.table.clone(),
-                    ),
+                    table,
+                    file_io,
                     Some(marker_text),
                 ))
                 .map_err(|error| ExecFailure::Unknown(unavailable(error)))
@@ -424,10 +425,8 @@ impl IcebergMetadataMaintenanceAdapter {
                 .catalog_runtime()
                 .block_on(run_expire_snapshots_once_with_marker(
                     catalog,
-                    crate::iceberg::TableIdent::new(
-                        NamespaceIdent::new(payload.namespace.clone()),
-                        payload.table.clone(),
-                    ),
+                    table,
+                    file_io,
                     ExpireParams {
                         older_than_ms: payload.older_than_ms,
                         retain_last: payload.retain_last,
@@ -454,7 +453,7 @@ impl IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&payload.namespace, &payload.table);
         let committed = self
             .runtime
-            .load_table(&payload.namespace, &payload.table)
+            .load_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(|error| {
                 ExecFailure::Unknown(unavailable(format!(
                     "reload committed Iceberg table: {error}"
@@ -556,7 +555,7 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         }
         let payload = self.payload_for_plan(&request.plan)?;
         let marker = self.marker(&request.plan, &payload);
-        let outcome = match self.lookup_marker(&payload, &marker)? {
+        let outcome = match self.lookup_marker(&payload, &marker, &request.context)? {
             MarkerLookup::Matching { snapshot_id } => ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
                 receipt: self.receipt_from_marker(&request.plan, &payload, snapshot_id)?,
@@ -569,22 +568,30 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
                 ),
                 evidence: self.evidence(&request.plan, &payload)?,
             },
-            MarkerLookup::Missing => match self.execute_once(&request.plan, &payload, &marker) {
-                Ok(receipt) => ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt,
-                    finalization: ExternalMutationFinalization::Complete,
-                },
-                Err(ExecFailure::KnownUncommitted(error)) => {
-                    ExternalMutationOutcome::KnownUncommitted {
-                        failure: failure(ConnectorMutationFailureKind::Conflict, error.to_string()),
+            MarkerLookup::Missing => {
+                match self.execute_once(&request.plan, &payload, &marker, &request.context) {
+                    Ok(receipt) => ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        receipt,
+                        finalization: ExternalMutationFinalization::Complete,
+                    },
+                    Err(ExecFailure::KnownUncommitted(error)) => {
+                        ExternalMutationOutcome::KnownUncommitted {
+                            failure: failure(
+                                ConnectorMutationFailureKind::Conflict,
+                                error.to_string(),
+                            ),
+                        }
                     }
+                    Err(ExecFailure::Unknown(error)) => ExternalMutationOutcome::CommitUnknown {
+                        failure: failure(
+                            ConnectorMutationFailureKind::Unavailable,
+                            error.to_string(),
+                        ),
+                        evidence: self.evidence(&request.plan, &payload)?,
+                    },
                 }
-                Err(ExecFailure::Unknown(error)) => ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(ConnectorMutationFailureKind::Unavailable, error.to_string()),
-                    evidence: self.evidence(&request.plan, &payload)?,
-                },
-            },
+            }
         };
         self.terminal
             .lock()
@@ -611,7 +618,7 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
             .invalidate_table_cache(&namespace, &table_name);
         let physical = self
             .runtime
-            .load_table(&namespace, &table_name)
+            .load_table_for_request(&namespace, &table_name, &request.context)
             .map_err(|error| unavailable(format!("load Iceberg table for observation: {error}")))?;
         let preserve_row_lineage =
             crate::schema_facts::row_lineage_enabled(physical.table.metadata());

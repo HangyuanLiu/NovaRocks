@@ -30,22 +30,24 @@ use crate::catalog_control::data_mutation::IcebergDataMutationAdapter;
 use crate::catalog_control::metadata_maintenance::IcebergMetadataMaintenanceAdapter;
 use crate::catalog_control::staged_create::IcebergStagedCreateAdapter;
 use crate::catalog_control::unanchored_ctas_cleanup::IcebergUnanchoredCtasCleanupAdapter;
+use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::commit::IcebergWriteControl;
 use crate::distributed_rewrite::IcebergDistributedRewriteControl;
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::provider_binding::IcebergInstanceDistribution;
 use crate::resources::IcebergMetadataResources;
-use crate::typed_boundary::IcebergTypedBoundary;
+use crate::typed_boundary::{IcebergTypedBoundary, IcebergTypedRequestControlFactory};
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadSplitManager,
+    ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadRequestControlFactory,
+    ConnectorReadSplitManager,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
-    ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorProviderBindingKey, ConnectorProviderId,
-    ProviderBindingEpoch,
+    CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle, ConnectorControlBinding,
+    ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProviderBindingKey,
+    ConnectorProviderId, ProviderBindingEpoch,
 };
 use std::sync::Arc;
 
@@ -64,6 +66,7 @@ pub type IcebergReadControlInstaller = Arc<
             Arc<dyn ConnectorReadMetadata>,
             Arc<dyn ConnectorReadSplitManager>,
             Arc<dyn ConnectorReadCodec>,
+            Arc<dyn ConnectorReadRequestControlFactory>,
         ) -> Result<Arc<dyn ConnectorReadRegistrationLease>, ConnectorError>
         + Send
         + Sync,
@@ -123,6 +126,18 @@ impl IcebergConnectorFactory {
                 "Iceberg control factory received catalog properties for another provider",
             ));
         }
+        let properties = catalog_properties
+            .execution_properties()
+            .iter()
+            .map(|property| (property.key().to_string(), property.value().to_string()))
+            .collect::<Vec<_>>();
+        let rest_access_delegation = rest_access_delegation_mode(catalog_properties, &properties)?;
+        // Both modes bind the immutable catalog definition.  Vended binding
+        // carries only the owner and endpoint; it deliberately has no static
+        // secret and therefore requires a request storage resolver before any
+        // object-store I/O.  Leaving it as an unbound template loses that
+        // mode information and makes optional control-generation probes try
+        // to resolve an unauthorised warehouse instead of deferring them.
         let planning_binding = self
             .control_resources
             .planning_binding()
@@ -131,18 +146,21 @@ impl IcebergConnectorFactory {
             .control_resources
             .clone()
             .with_planning_binding(planning_binding.clone());
-        let properties = catalog_properties
-            .execution_properties()
-            .iter()
-            .map(|property| (property.key().to_string(), property.value().to_string()))
-            .collect::<Vec<_>>();
-        let object_store_config = properties
-            .iter()
-            .find(|(key, _)| key == "iceberg.catalog.warehouse" || key == "warehouse")
-            .map(|(_, location)| planning_binding.object_store_binding_for_location(location))
-            .transpose()
-            .map_err(invalid)?
-            .flatten();
+        let object_store_config =
+            matches!(rest_access_delegation, RestAccessDelegationMode::Static)
+                .then(|| {
+                    properties
+                        .iter()
+                        .find(|(key, _)| key == "iceberg.catalog.warehouse" || key == "warehouse")
+                        .map(|(_, location)| {
+                            planning_binding.object_store_binding_for_location(location)
+                        })
+                        .transpose()
+                        .map_err(invalid)
+                        .map(|binding| binding.flatten())
+                })
+                .transpose()?
+                .flatten();
         let configuration = parse_catalog_configuration_with_object_store_binding(
             request.instance_id().as_str(),
             &properties,
@@ -152,9 +170,10 @@ impl IcebergConnectorFactory {
         .without_object_store_config();
         let durable_properties = sanitize_durable_properties(&configuration.properties);
         let runtime = Arc::new(
-            IcebergMetadataContext::try_new(
+            IcebergMetadataContext::try_new_with_rest_access_delegation(
                 IcebergCatalogControlState::new(configuration),
                 control_resources,
+                rest_access_delegation,
             )
             .map_err(unavailable)?,
         );
@@ -277,15 +296,19 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                     ),
                     Arc::clone(&runtime),
                 ));
-                let adapter = Arc::new(boundary.read_runtime_adapter());
+                let adapter = Arc::new(Arc::clone(&boundary).read_runtime_adapter());
                 let codec: Arc<dyn ConnectorReadCodec> = Arc::new(
                     crate::typed_read::IcebergConnectorReadCodec::new(adapter.as_ref().clone()),
+                );
+                let request_control_factory: Arc<dyn ConnectorReadRequestControlFactory> = Arc::new(
+                    IcebergTypedRequestControlFactory::new(Arc::clone(&boundary)),
                 );
                 let lease = installer(
                     catalog_handle.clone(),
                     Arc::clone(&adapter) as Arc<dyn ConnectorReadMetadata>,
                     adapter as Arc<dyn ConnectorReadSplitManager>,
                     codec,
+                    request_control_factory,
                 )?;
                 provider.install_read_registration_lease(lease)
             }));
@@ -340,6 +363,34 @@ fn credential_like_property(key: &str) -> bool {
     ]
     .iter()
     .any(|marker| normalized.contains(marker))
+}
+
+fn rest_access_delegation_mode(
+    properties: &novarocks_spi::connector::CatalogProperties,
+    execution_properties: &[(String, String)],
+) -> Result<RestAccessDelegationMode, ConnectorError> {
+    let object_store_binding = properties
+        .credential_bindings()
+        .iter()
+        .find(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData);
+    let vended = matches!(
+        object_store_binding.map(|binding| binding.mode()),
+        Some(CatalogCredentialMode::Vended)
+    );
+    if !vended {
+        return Ok(RestAccessDelegationMode::Static);
+    }
+    let rest = execution_properties.iter().any(|(key, value)| {
+        (key == "iceberg.catalog.type" && value.eq_ignore_ascii_case("rest"))
+            || (key == "type" && value.eq_ignore_ascii_case("rest"))
+    });
+    if !rest {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg vended object-store credentials are supported only for REST catalogs",
+        ));
+    }
+    Ok(RestAccessDelegationMode::Vended)
 }
 
 fn invalid(error: String) -> ConnectorError {
@@ -715,17 +766,19 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ))
-        .with_read_control_installer(Arc::new(move |handle, metadata, splits, codec| {
-            // The installer receives one complete matching unit, never an
-            // exposed provider boundary or a separately selected codec.
-            assert_eq!(codec.owner(), handle.catalog_name().as_str());
-            let _ = (metadata, splits);
-            *key_sink.lock().expect("key lock") = Some(handle);
-            let lease: Arc<dyn ConnectorReadRegistrationLease> =
-                Arc::new(TestReadRegistrationLease);
-            *lease_sink.lock().expect("lease lock") = Some(Arc::downgrade(&lease));
-            Ok(lease)
-        }));
+        .with_read_control_installer(Arc::new(
+            move |handle, metadata, splits, codec, request_factory| {
+                // The installer receives one complete matching unit, never an
+                // exposed provider boundary or a separately selected codec.
+                assert_eq!(codec.owner(), handle.catalog_name().as_str());
+                let _ = (metadata, splits, request_factory);
+                *key_sink.lock().expect("key lock") = Some(handle);
+                let lease: Arc<dyn ConnectorReadRegistrationLease> =
+                    Arc::new(TestReadRegistrationLease);
+                *lease_sink.lock().expect("lease lock") = Some(Arc::downgrade(&lease));
+                Ok(lease)
+            },
+        ));
         let request = ConnectorControlFactoryRequest::try_new(
             factory.provider_id().clone(),
             ConnectorInstanceId::parse("ice").expect("instance ID"),
@@ -787,7 +840,7 @@ mod tests {
             binding,
             runtime.handle().clone(),
         ))
-        .with_read_control_installer(Arc::new(|_, _, _, _| {
+        .with_read_control_installer(Arc::new(|_, _, _, _, _| {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Internal,
                 "read-control registration rejected",

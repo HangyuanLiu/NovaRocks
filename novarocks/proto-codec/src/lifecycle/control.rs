@@ -43,6 +43,20 @@ impl QueryInitRequest {
             .expect("manifest without lease descriptors forms a valid InitQuery request")
     }
 
+    /// Retain the public manifest after the FE has finished every Init retry
+    /// and scrubbed its confidential side channel. This value is for local
+    /// lifecycle identity/terminal validation only and must never be sent as a
+    /// new Init RPC: BE ingress deliberately rejects descriptors without their
+    /// TLS envelopes.
+    pub fn retain_manifest_after_confidential_send(manifest: ParticipantManifest) -> Self {
+        Self {
+            raw: novarocks::InitQueryRequest {
+                manifest: Some(manifest.as_proto().clone()),
+                credential_lease_envelopes: Vec::new(),
+            },
+        }
+    }
+
     /// Frames an Init request that carries confidential values. This constructor
     /// is for the FE TLS sender path. BE ingress must use `parse_tls` only
     /// after it has independently verified the native connection is TLS.

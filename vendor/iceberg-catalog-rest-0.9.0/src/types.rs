@@ -284,6 +284,30 @@ pub struct StorageCredential {
     pub config: HashMap<String, String>,
 }
 
+/// Result returned by a REST credentials-refresh endpoint.
+///
+/// The Iceberg REST protocol uses the same prefix-scoped credential shape as
+/// a table-load response, but a refresh has no table metadata or FileIO
+/// configuration. Keep it as a separate closed response so callers cannot
+/// accidentally treat a refresh as a second table observation.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct LoadCredentialsResult {
+    /// Refreshed storage credentials for the already-admitted scope.
+    pub storage_credentials: Option<Vec<StorageCredential>>,
+}
+
+impl Debug for LoadCredentialsResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadCredentialsResult")
+            .field(
+                "storage_credentials",
+                &self.storage_credentials.as_ref().map(|credentials| credentials.len()),
+            )
+            .finish()
+    }
+}
+
 impl Debug for StorageCredential {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StorageCredential")

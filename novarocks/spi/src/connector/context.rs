@@ -15,20 +15,62 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use novarocks_secret::SecretValue;
 
 use super::{
-    CatalogHandle, ConnectorError, ConnectorErrorKind, CredentialLeaseId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
+    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
+    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
 pub trait ConnectorCancellation: Send + Sync {
     fn is_cancelled(&self) -> bool;
+}
+
+/// One non-wire, attempt-local sidecar shared by every clone of an admitted
+/// request context. Providers may retain private frozen planning state here,
+/// but the sidecar itself has no serialization or Debug path and is released
+/// with the final owning request context.
+#[derive(Clone, Default)]
+pub struct ConnectorRequestScope {
+    extensions: Arc<Mutex<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>>,
+}
+
+impl ConnectorRequestScope {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the one provider-private extension of type `T` for this attempt.
+    /// Construction runs while holding only this short in-memory registry lock;
+    /// extensions must not perform I/O in their constructors.
+    pub fn extension_or_insert_with<T>(&self, make: impl FnOnce() -> T) -> Arc<T>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut extensions = self
+            .extensions
+            .lock()
+            .expect("connector request scope lock");
+        if let Some(existing) = extensions.get(&TypeId::of::<T>()) {
+            return Arc::clone(existing)
+                .downcast::<T>()
+                .expect("connector request scope extension type");
+        }
+        let extension = Arc::new(make());
+        extensions.insert(
+            TypeId::of::<T>(),
+            Arc::clone(&extension) as Arc<dyn Any + Send + Sync>,
+        );
+        extension
+    }
 }
 
 /// A non-secret target presented to the query-scoped storage capability.
@@ -190,6 +232,9 @@ pub struct ConnectorRequestContext {
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
     storage_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
+    vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
+    vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
+    request_scope: ConnectorRequestScope,
 }
 
 impl ConnectorRequestContext {
@@ -216,7 +261,18 @@ impl ConnectorRequestContext {
             max_handle_payload_bytes,
             max_total_payload_bytes,
             storage_resolver: None,
+            vended_credential_lease_sink: None,
+            vended_credential_lease_collection: None,
+            request_scope: ConnectorRequestScope::new(),
         })
+    }
+
+    /// Bind this context to the reservation-owned attempt sidecar. A retry
+    /// receives a newly minted scope, so no request-bound provider state can
+    /// cross an attempt boundary.
+    pub fn with_request_scope(mut self, request_scope: ConnectorRequestScope) -> Self {
+        self.request_scope = request_scope;
+        self
     }
 
     /// Installs a local capability after query admission. It is intentionally
@@ -226,6 +282,48 @@ impl ConnectorRequestContext {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         self.storage_resolver = Some(storage_resolver);
+        self
+    }
+
+    /// Installs the FE-local collector that owns vended metadata-response
+    /// credentials for one query attempt. This remains a request-local
+    /// capability and is never encoded on a wire. Query materialization later
+    /// decorates its cloned context with each exact catalog generation.
+    pub fn with_vended_credential_lease_sink(
+        mut self,
+        sink: Arc<dyn ConnectorVendedCredentialLeaseSink>,
+    ) -> Self {
+        self.vended_credential_lease_sink = Some(sink);
+        self.vended_credential_lease_collection = None;
+        self
+    }
+
+    /// Decorate one metadata call with the exact catalog properties acquired
+    /// by query materialization. Calling this without the query-wide sink is
+    /// invalid; a vended provider otherwise remains fail-closed.
+    pub fn with_vended_credential_lease_collection(
+        mut self,
+        catalog_properties: CatalogProperties,
+    ) -> Result<Self, ConnectorError> {
+        let sink = self.vended_credential_lease_sink.clone().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "vended credential lease collection requires a query-attempt sink",
+            )
+        })?;
+        self.vended_credential_lease_collection = Some(
+            ConnectorVendedCredentialLeaseCollectionPort::new(catalog_properties, sink),
+        );
+        Ok(self)
+    }
+
+    /// Retain only the already-admitted storage resolver for a terminal
+    /// operation. The terminal path may reload catalog metadata, but it must
+    /// not ingest a second vended response after the attempt's descriptor set
+    /// has been frozen and sent over Init.
+    pub fn without_vended_credential_lease_sink(mut self) -> Self {
+        self.vended_credential_lease_sink = None;
+        self.vended_credential_lease_collection = None;
         self
     }
 
@@ -247,6 +345,32 @@ impl ConnectorRequestContext {
 
     pub fn storage_resolver(&self) -> Option<&Arc<dyn ConnectorStorageResolver>> {
         self.storage_resolver.as_ref()
+    }
+
+    /// The base query-attempt sink before a metadata call decorates it with
+    /// one exact catalog generation.
+    pub fn vended_credential_lease_sink(
+        &self,
+    ) -> Option<&Arc<dyn ConnectorVendedCredentialLeaseSink>> {
+        self.vended_credential_lease_sink.as_ref()
+    }
+
+    /// The vended credential contribution port, when this request was created
+    /// for an admitted distributed query attempt.
+    pub fn vended_credential_lease_collection(
+        &self,
+    ) -> Option<&ConnectorVendedCredentialLeaseCollectionPort> {
+        self.vended_credential_lease_collection.as_ref()
+    }
+
+    /// Obtain provider-private state shared by all clones of this admitted
+    /// attempt context. This is local process state only; it must not be put
+    /// into connector handles, plans, or any transport payload.
+    pub fn request_scope_extension_or_insert_with<T>(&self, make: impl FnOnce() -> T) -> Arc<T>
+    where
+        T: Any + Send + Sync,
+    {
+        self.request_scope.extension_or_insert_with(make)
     }
 }
 

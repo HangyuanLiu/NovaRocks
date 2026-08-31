@@ -16,8 +16,8 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
 use crate::query_execution::contract::{
@@ -35,13 +35,348 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_models::common;
 use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, CredentialLeaseDescriptor, CredentialLeaseId,
+    CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
+    CatalogProviderKind, CatalogStorageAccessDomainInput, ConnectorControlPlanningLease,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
+    ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
+    CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
+    ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
+    VendedS3CredentialLeaseContribution,
 };
 use novarocks_types::BackendProcessId;
 use novarocks_types::NativeCompatibilityId;
+use sha2::{Digest, Sha256};
 
 use crate::query_execution::launch::StageParticipantBinding;
 use crate::query_execution::terminal_set::QueryTerminalSet;
+
+const ATTEMPT_CREDENTIAL_LEASE_ID_DOMAIN: &[u8] = b"novarocks.attempt-credential-lease-id.v1";
+
+/// Secret-free indirection for one attempt's FE-local storage authority. It
+/// follows the move-only lease owner from candidate planning into the admitted
+/// lifecycle control, but never owns a secret envelope itself.
+struct AttemptCredentialLeaseStorageRoute {
+    owner: Mutex<AttemptCredentialLeaseStorageRouteOwner>,
+}
+
+enum AttemptCredentialLeaseStorageRouteOwner {
+    Planning(Weak<AttemptCredentialLeaseCollector>),
+    Admitted(Weak<dyn ConnectorStorageResolver>),
+    Revoked,
+}
+
+impl AttemptCredentialLeaseStorageRoute {
+    fn new_planning(owner: Weak<AttemptCredentialLeaseCollector>) -> Self {
+        Self {
+            owner: Mutex::new(AttemptCredentialLeaseStorageRouteOwner::Planning(owner)),
+        }
+    }
+
+    fn adopt(&self, owner: Arc<dyn ConnectorStorageResolver>) {
+        *self.owner.lock().expect("attempt credential storage route") =
+            AttemptCredentialLeaseStorageRouteOwner::Admitted(Arc::downgrade(&owner));
+    }
+
+    fn revoke(&self) {
+        *self.owner.lock().expect("attempt credential storage route") =
+            AttemptCredentialLeaseStorageRouteOwner::Revoked;
+    }
+}
+
+impl ConnectorStorageResolver for AttemptCredentialLeaseStorageRoute {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let owner = {
+            let owner = self.owner.lock().expect("attempt credential storage route");
+            match &*owner {
+                AttemptCredentialLeaseStorageRouteOwner::Planning(owner) => owner
+                    .upgrade()
+                    .map(|owner| Arc::clone(&owner) as Arc<dyn ConnectorStorageResolver>),
+                AttemptCredentialLeaseStorageRouteOwner::Admitted(owner) => owner.upgrade(),
+                AttemptCredentialLeaseStorageRouteOwner::Revoked => None,
+            }
+        };
+        owner
+            .ok_or_else(vended_storage_access_denied)?
+            .resolve_vended_s3(request)
+    }
+}
+
+/// Move-only FE collection state for credentials obtained during one candidate
+/// attempt's metadata observation. The SPI sees only the sink trait; table,
+/// plan, cache, and Core request types cannot recover these values.
+pub(crate) struct AttemptCredentialLeaseCollector {
+    execution_id: QueryExecutionId,
+    state: Mutex<AttemptCredentialLeaseCollectorState>,
+    route: Arc<AttemptCredentialLeaseStorageRoute>,
+}
+
+struct AttemptCredentialLeaseCollectorState {
+    scopes: BTreeSet<(
+        novarocks_spi::connector::CatalogHandle,
+        StorageCredentialScopePrefix,
+    )>,
+    leases: Vec<QueryCredentialLease>,
+    drained: bool,
+}
+
+impl AttemptCredentialLeaseCollector {
+    pub(crate) fn new(execution_id: QueryExecutionId) -> Arc<Self> {
+        Arc::new_cyclic(|collector| Self {
+            execution_id,
+            state: Mutex::new(AttemptCredentialLeaseCollectorState {
+                scopes: BTreeSet::new(),
+                leases: Vec::new(),
+                drained: false,
+            }),
+            route: Arc::new(AttemptCredentialLeaseStorageRoute::new_planning(
+                collector.clone(),
+            )),
+        })
+    }
+
+    pub(crate) fn has_collected_leases(&self) -> bool {
+        !self
+            .state
+            .lock()
+            .expect("attempt credential collector lock")
+            .leases
+            .is_empty()
+    }
+
+    pub(crate) fn into_credential_leases(
+        &self,
+    ) -> Result<QueryCredentialLeases, DistributedQueryError> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.drained {
+            return Err(contract_error(
+                "attempt credential lease collector was consumed more than once",
+            ));
+        }
+        state.drained = true;
+        state.scopes.clear();
+        QueryCredentialLeases::try_new_with_storage_route(
+            std::mem::take(&mut state.leases),
+            Arc::clone(&self.route),
+        )
+    }
+
+    pub(crate) fn sink(self: &Arc<Self>) -> Arc<dyn ConnectorVendedCredentialLeaseSink> {
+        Arc::clone(self) as Arc<dyn ConnectorVendedCredentialLeaseSink>
+    }
+
+    /// The collector is also the FE-local storage authority while planning is
+    /// still observing metadata. It deliberately stops resolving after its
+    /// one-way hand-off to the lifecycle plan, so a stale planning context
+    /// cannot retain a credential capability past attempt admission.
+    pub(crate) fn storage_resolver(self: &Arc<Self>) -> Arc<dyn ConnectorStorageResolver> {
+        Arc::clone(&self.route) as Arc<dyn ConnectorStorageResolver>
+    }
+}
+
+impl ConnectorStorageResolver for AttemptCredentialLeaseCollector {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        let state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.drained {
+            return Err(vended_storage_access_denied());
+        }
+        resolve_vended_s3_access(&state.leases, request)
+    }
+}
+
+impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        catalog_properties: &CatalogProperties,
+        contribution: VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError> {
+        let binding = catalog_properties
+            .credential_bindings()
+            .iter()
+            .find(|binding| {
+                binding.purpose() == CatalogCredentialPurpose::ObjectStoreData
+                    && binding.consumer_role() == CredentialConsumerRole::FrontendAndBackend
+                    && matches!(binding.mode(), CatalogCredentialMode::Vended)
+            })
+            .cloned()
+            .ok_or_else(|| collector_error("catalog has no vended object-store data binding"))?;
+        if catalog_properties.provider_kind() != CatalogProviderKind::Iceberg {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "vended S3 credential collection currently supports Iceberg catalogs only",
+            ));
+        }
+        let provider_id = ConnectorProviderId::parse("iceberg")
+            .map_err(|error| collector_error(&format!("parse Iceberg provider id: {error}")))?;
+        let non_secret_properties = catalog_properties
+            .execution_properties()
+            .iter()
+            .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (entries, refresh_endpoint, provider_refresher) =
+            contribution.into_parts_with_refresher();
+        if refresh_endpoint.is_some() != provider_refresher.is_some() {
+            return Err(collector_error(
+                "vended S3 credential refresh endpoint and provider source differ",
+            ));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .expect("attempt credential collector lock");
+        if state.drained {
+            return Err(collector_error(
+                "vended credential contribution arrived after attempt collector consumption",
+            ));
+        }
+        for entry in entries {
+            let (prefix, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
+                entry.into_parts();
+            let owner = catalog_properties.handle().clone();
+            if !state.scopes.insert((owner.clone(), prefix.clone())) {
+                // The first response-local value is the sole retained value
+                // for this exact attempt scope. The duplicate is dropped here,
+                // never compared, logged, cached, or exported.
+                continue;
+            }
+            let access_domain = CatalogStorageAccessDomainInput::try_new(
+                provider_id.clone(),
+                owner.catalog_name().clone(),
+                catalog_properties.config_format_version(),
+                non_secret_properties.clone(),
+                binding.clone(),
+                vec![prefix.clone()],
+            )
+            .map(|input| input.derive_access_domain())?;
+            let lease_id = credential_lease_id(self.execution_id, &owner, &prefix)?;
+            let refresh_capable = refresh_endpoint.is_some();
+            let descriptor = CredentialLeaseDescriptor::try_new(
+                lease_id,
+                1,
+                owner,
+                CredentialLeaseProvider::S3,
+                vec![prefix],
+                not_after_unix_ms,
+                refresh_capable,
+                access_domain,
+            )?;
+            let envelope = CredentialLeaseSecretEnvelope::try_new(
+                lease_id,
+                1,
+                access_key_id,
+                secret_access_key,
+                session_token,
+                not_after_unix_ms,
+            )
+            .map_err(|error| {
+                collector_error(&format!("build vended credential envelope: {error}"))
+            })?;
+            let refresher = provider_refresher.as_ref().map(|provider| {
+                Arc::new(ProviderVendedS3LeaseRefresher {
+                    provider: Arc::clone(provider),
+                }) as Arc<dyn QueryCredentialLeaseRefresher>
+            });
+            state.leases.push(
+                QueryCredentialLease::try_new(descriptor, envelope, refresher)
+                    .map_err(|error| collector_error(error.message()))?,
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Adapts a provider-owned, FE-local credential source to this attempt's
+/// immutable lease identity. The provider returns one complete refreshed
+/// response; this adapter consumes only the exact existing prefix and rejects
+/// any scope drift before forming the next confidential epoch.
+struct ProviderVendedS3LeaseRefresher {
+    provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+}
+
+impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
+    fn refresh(
+        &self,
+        current: &CredentialLeaseDescriptor,
+    ) -> Result<QueryCredentialLeaseRefresh, String> {
+        if current.provider() != CredentialLeaseProvider::S3 || current.prefixes().len() != 1 {
+            return Err("vended S3 credential refresh has an invalid existing scope".to_string());
+        }
+        let target_prefix = &current.prefixes()[0];
+        let entry = self
+            .provider
+            .refresh_vended_s3_credentials()
+            .map_err(|_| "provider vended S3 credential refresh failed".to_string())?
+            .into_entries()
+            .into_iter()
+            .find(|entry| entry.prefix() == target_prefix)
+            .ok_or_else(|| {
+                "provider vended S3 credential refresh changed prefix scope".to_string()
+            })?;
+        let (prefix, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
+            entry.into_parts();
+        let epoch = current
+            .epoch()
+            .checked_add(1)
+            .ok_or_else(|| "vended S3 credential lease epoch overflow".to_string())?;
+        let descriptor = CredentialLeaseDescriptor::try_new(
+            current.lease_id(),
+            epoch,
+            current.owner().clone(),
+            CredentialLeaseProvider::S3,
+            vec![prefix],
+            not_after_unix_ms,
+            true,
+            current.storage_access_domain_id(),
+        )
+        .map_err(|_| "build refreshed vended S3 credential descriptor failed".to_string())?;
+        let envelope = CredentialLeaseSecretEnvelope::try_new(
+            current.lease_id(),
+            epoch,
+            access_key_id,
+            secret_access_key,
+            session_token,
+            not_after_unix_ms,
+        )
+        .map_err(|_| "build refreshed vended S3 credential envelope failed".to_string())?;
+        QueryCredentialLeaseRefresh::try_new(descriptor, envelope)
+            .map_err(|_| "refreshed vended S3 credential lease violates its contract".to_string())
+    }
+}
+
+fn credential_lease_id(
+    execution_id: QueryExecutionId,
+    owner: &novarocks_spi::connector::CatalogHandle,
+    prefix: &StorageCredentialScopePrefix,
+) -> Result<CredentialLeaseId, ConnectorError> {
+    let mut digest = Sha256::new();
+    digest.update(ATTEMPT_CREDENTIAL_LEASE_ID_DOMAIN);
+    digest.update(execution_id.query_id().high().to_be_bytes());
+    digest.update(execution_id.query_id().low().to_be_bytes());
+    digest.update(execution_id.attempt_id().get().to_be_bytes());
+    digest.update(owner.catalog_name().as_str().as_bytes());
+    digest.update(owner.version().as_bytes());
+    digest.update(prefix.as_str().as_bytes());
+    let digest = digest.finalize();
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .expect("SHA-256 digest always contains a credential lease id");
+    CredentialLeaseId::try_from_bytes(bytes)
+}
+
+fn collector_error(message: &str) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::InvalidRequest, message)
+}
 
 /// Frozen target selected from one live backend snapshot.
 ///
@@ -238,11 +573,15 @@ impl QueryCredentialLease {
 /// in-memory material and code outside the lifecycle owner cannot copy it.
 pub(crate) struct QueryCredentialLeases {
     leases: Vec<QueryCredentialLease>,
+    storage_route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
 }
 
 impl QueryCredentialLeases {
     pub(crate) fn empty() -> Self {
-        Self { leases: Vec::new() }
+        Self {
+            leases: Vec::new(),
+            storage_route: None,
+        }
     }
 
     pub(crate) fn try_new(
@@ -257,7 +596,19 @@ impl QueryCredentialLeases {
                 "query credential lease contribution repeats a lease id",
             ));
         }
-        Ok(Self { leases })
+        Ok(Self {
+            leases,
+            storage_route: None,
+        })
+    }
+
+    fn try_new_with_storage_route(
+        leases: Vec<QueryCredentialLease>,
+        storage_route: Arc<AttemptCredentialLeaseStorageRoute>,
+    ) -> Result<Self, DistributedQueryError> {
+        let mut leases = Self::try_new(leases)?;
+        leases.storage_route = Some(storage_route);
+        Ok(leases)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -321,6 +672,70 @@ impl QueryCredentialLeases {
     pub(crate) fn clear(&mut self) {
         self.leases.clear();
     }
+
+    fn storage_route(&self) -> Option<Arc<AttemptCredentialLeaseStorageRoute>> {
+        self.storage_route.clone()
+    }
+
+    pub(crate) fn adopt_storage_resolver(&self, owner: Arc<dyn ConnectorStorageResolver>) {
+        if let Some(storage_route) = &self.storage_route {
+            storage_route.adopt(owner);
+        }
+    }
+
+    pub(crate) fn revoke_storage_resolver(&self) {
+        if let Some(storage_route) = &self.storage_route {
+            storage_route.revoke();
+        }
+    }
+}
+
+pub(crate) fn resolve_vended_s3_access(
+    leases: &[QueryCredentialLease],
+    request: &StorageAccessRequest,
+) -> Result<ResolvedVendedS3Access, ConnectorError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let mut selected: Option<(&QueryCredentialLease, &StorageCredentialScopePrefix)> = None;
+    for lease in leases {
+        let descriptor = lease.descriptor();
+        if descriptor.provider() != CredentialLeaseProvider::S3
+            || descriptor.owner() != request.owner()
+            || lease.envelope().session_token_expires_at_unix_ms() <= now
+        {
+            continue;
+        }
+        for prefix in descriptor.prefixes() {
+            if !request.location().starts_with(prefix.as_str()) {
+                continue;
+            }
+            if selected.is_none_or(|(_, current)| prefix.as_str().len() > current.as_str().len()) {
+                selected = Some((lease, prefix));
+            }
+        }
+    }
+    let (lease, matched_prefix) = selected.ok_or_else(vended_storage_access_denied)?;
+    Ok(ResolvedVendedS3Access::new(
+        lease.descriptor().storage_access_domain_id(),
+        lease.descriptor().lease_id(),
+        lease.envelope().epoch(),
+        matched_prefix.clone(),
+        lease.envelope().session_token_expires_at_unix_ms(),
+        lease.envelope().access_key_id().clone(),
+        lease.envelope().secret_access_key().clone(),
+        lease.envelope().session_token().clone(),
+    ))
+}
+
+fn vended_storage_access_denied() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::InvalidRequest,
+        "vended storage access is unavailable for this query attempt",
+    )
 }
 
 impl QueryInitPlanHeader {
@@ -695,6 +1110,15 @@ impl QueryLifecycleAbortOutcome {
 pub trait QueryLifecycleLeaseGuard: Send + 'static {
     fn finalize(self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError>;
 
+    /// Returns a FE-local, terminal-only storage capability before finalization
+    /// consumes the lifecycle guard. The capability may outlive a successful
+    /// native terminal only while a connector write still needs its exact
+    /// commit or reconciliation decision; its owner revokes the underlying
+    /// lease material when the capability is dropped.
+    fn retain_terminal_storage_resolver(&self) -> Option<Arc<dyn ConnectorStorageResolver>> {
+        None
+    }
+
     fn abort_preserving(self: Box<Self>, primary_error: String) -> QueryLifecycleAbortOutcome;
 }
 
@@ -765,6 +1189,17 @@ impl QueryLifecycleLease {
             .take()
             .expect("query lifecycle lease is consumed exactly once")
             .finalize()
+    }
+
+    /// Obtain the narrowly-scoped FE terminal capability before consuming the
+    /// lifecycle lease. It is only meaningful for a successful connector-write
+    /// terminal; ordinary result paths never request it.
+    pub(crate) fn retain_terminal_storage_resolver(
+        &self,
+    ) -> Option<Arc<dyn ConnectorStorageResolver>> {
+        self.guard
+            .as_ref()
+            .and_then(|guard| guard.retain_terminal_storage_resolver())
     }
 
     pub fn abort_with_outcome(mut self, primary_error: String) -> QueryLifecycleAbortOutcome {
@@ -903,24 +1338,27 @@ pub(crate) fn compile_query_init_plan(
     }
     let header = QueryInitPlanHeader::new(options.execution_id, options.query_deadline_unix_ms);
     fragments.freeze_query_init_header(header)?;
+    let leases = options
+        .credential_leases
+        .leases
+        .iter()
+        .map(|lease| {
+            QueryCredentialLease::try_new(
+                lease.descriptor.clone(),
+                lease.envelope.clone(),
+                lease.refresher.clone(),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let credential_leases = match options.credential_leases.storage_route() {
+        Some(route) => QueryCredentialLeases::try_new_with_storage_route(leases, route)?,
+        None => QueryCredentialLeases::try_new(leases)?,
+    };
     Ok(QueryInitPlan {
         execution_id: options.execution_id,
         query_deadline_unix_ms: header.query_deadline_unix_ms,
         participants,
-        credential_leases: QueryCredentialLeases::try_new(
-            options
-                .credential_leases
-                .leases
-                .iter()
-                .map(|lease| {
-                    QueryCredentialLease::try_new(
-                        lease.descriptor.clone(),
-                        lease.envelope.clone(),
-                        lease.refresher.clone(),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )?,
+        credential_leases,
     })
 }
 
@@ -932,8 +1370,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        QueryCatalogLease, QueryInitOptions, QueryLifecycleAbortOutcome, QueryLifecycleLease,
-        QueryLifecycleLeaseGuard, compile_query_init_plan,
+        AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions,
+        QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
+        compile_query_init_plan,
     };
     use crate::common::backend_topology::{CoordinatorReportEndpoint, LiveBackendTarget};
     use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
@@ -944,9 +1383,13 @@ mod tests {
     };
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_proto_models::novarocks;
+    use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion,
-        ConnectorControlPlanningLease, ConnectorInstanceId,
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorControlPlanningLease,
+        ConnectorInstanceId, ConnectorVendedCredentialLeaseSink, CredentialConsumerRole,
+        StorageAccessRequest, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry,
     };
     use novarocks_types::{BackendProcessId, UniqueId};
 
@@ -1031,6 +1474,85 @@ mod tests {
         )
         .expect("catalog properties")])
         .expect("catalog set")
+    }
+
+    fn vended_catalog_properties() -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("catalog.vended").expect("catalog name"),
+                CatalogVersion::from_bytes([0x24; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties")
+    }
+
+    fn vended_contribution(canary: &str) -> VendedS3CredentialLeaseContribution {
+        VendedS3CredentialLeaseContribution::try_new(
+            vec![
+                VendedS3CredentialLeaseEntry::try_new(
+                    StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/data")
+                        .expect("prefix"),
+                    9_999_999_999,
+                    SecretValue::new(format!("access-{canary}")),
+                    SecretValue::new(format!("secret-{canary}")),
+                    SecretValue::new(format!("token-{canary}")),
+                )
+                .expect("entry"),
+            ],
+            None,
+        )
+        .expect("contribution")
+    }
+
+    #[test]
+    fn attempt_collector_deduplicates_scope_and_drains_once() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        collector
+            .offer_vended_s3_credential_lease(&properties, vended_contribution("first-canary"))
+            .expect("first contribution");
+        collector
+            .offer_vended_s3_credential_lease(&properties, vended_contribution("second-canary"))
+            .expect("duplicate scope is dropped without retaining its value");
+
+        let leases = collector.into_credential_leases().expect("one-time drain");
+        assert_eq!(leases.leases().len(), 1);
+        assert!(collector.into_credential_leases().is_err());
+    }
+
+    #[test]
+    fn attempt_collector_resolves_only_before_lifecycle_handoff() {
+        let collector = AttemptCredentialLeaseCollector::new(execution_id());
+        let properties = vended_catalog_properties();
+        collector
+            .offer_vended_s3_credential_lease(&properties, vended_contribution("resolver-canary"))
+            .expect("contribution");
+        let resolver = collector.storage_resolver();
+        let request = StorageAccessRequest::try_new(
+            properties.handle().clone(),
+            "s3://warehouse/data/file.parquet",
+        )
+        .expect("storage request");
+        let resolved = resolver
+            .resolve_vended_s3(&request)
+            .expect("collector resolves its current attempt scope");
+        assert_eq!(resolved.matched_prefix().as_str(), "s3://warehouse/data");
+
+        collector
+            .into_credential_leases()
+            .expect("one-way lifecycle handoff");
+        assert!(resolver.resolve_vended_s3(&request).is_err());
     }
 
     #[test]

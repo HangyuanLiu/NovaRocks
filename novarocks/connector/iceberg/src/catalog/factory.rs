@@ -60,7 +60,9 @@ impl NovaRocksCatalogFactory {
                     "REST Iceberg configuration produced no REST client".to_string()
                 })?;
                 Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
-                    rest, warehouse,
+                    rest,
+                    warehouse,
+                    client.rest_access_delegation(),
                 )))
             }
             IcebergCatalogKind::Hive => Ok(Arc::new(super::hive::NovaRocksHiveCatalog::adopt(

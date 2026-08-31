@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use crate::query_execution::completion::{
-    PreparedDistributedQuery, PreparedRetriableDistributedRequest,
+    PreparedDistributedQuery, PreparedRetriableDistributedRequest, QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
     ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
@@ -52,6 +52,16 @@ impl QueryExecutionService {
         self.coordinator.execute(request)
     }
 
+    /// Execute one statement-owned reserved attempt without allowing the
+    /// coordinator to construct an automatic replacement round.
+    pub(crate) fn execute_reserved(
+        &self,
+        request: DistributedQueryRequest,
+        reservation: QueryAttemptReservation,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.coordinator.execute_reserved(request, reservation)
+    }
+
     /// Submit one statement-owned distributed operation. Production may
     /// replace a pre-ready round, but only through a factory that returns a
     /// complete new request and matching completion formatter.
@@ -60,6 +70,14 @@ impl QueryExecutionService {
         operation: PreparedDistributedQuery,
     ) -> Result<StatementResult, DistributedQueryError> {
         self.coordinator.execute_prepared(operation)
+    }
+
+    /// Reserve a candidate first-round identity before any provider metadata
+    /// materialization can return attempt-scoped credentials.
+    pub(crate) fn reserve_initial_attempt(
+        &self,
+    ) -> Result<QueryAttemptReservation, DistributedQueryError> {
+        self.coordinator.reserve_initial_attempt()
     }
 
     /// Submit a statement-owned operation whose caller must retain the raw

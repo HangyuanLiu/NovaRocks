@@ -22,8 +22,12 @@
 //! here: the native lifecycle confidential carrier owns their short-lived
 //! transport and execution-side installation.
 
+use std::sync::Arc;
+
+use novarocks_secret::SecretValue;
+
 use super::{
-    CatalogHandle, ConnectorError, ConnectorErrorKind, StorageAccessDomainId,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, StorageAccessDomainId,
     StorageCredentialScopePrefix,
 };
 
@@ -56,6 +60,253 @@ impl CredentialLeaseId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CredentialLeaseProvider {
     S3,
+}
+
+/// One move-only S3 credential entry contributed by a provider while it still
+/// owns a vended metadata response.
+///
+/// The entry deliberately has no `Clone`, `Debug`, or serialization trait.
+/// Secret values move only into the query-attempt collector that owns
+/// confidential lifecycle installation.
+pub struct VendedS3CredentialLeaseEntry {
+    prefix: StorageCredentialScopePrefix,
+    not_after_unix_ms: u64,
+    access_key_id: SecretValue,
+    secret_access_key: SecretValue,
+    session_token: SecretValue,
+}
+
+impl VendedS3CredentialLeaseEntry {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        prefix: StorageCredentialScopePrefix,
+        not_after_unix_ms: u64,
+        access_key_id: SecretValue,
+        secret_access_key: SecretValue,
+        session_token: SecretValue,
+    ) -> Result<Self, ConnectorError> {
+        if not_after_unix_ms == 0 {
+            return Err(invalid("vended S3 credential expiration"));
+        }
+        Ok(Self {
+            prefix,
+            not_after_unix_ms,
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
+    }
+
+    pub fn prefix(&self) -> &StorageCredentialScopePrefix {
+        &self.prefix
+    }
+
+    pub const fn not_after_unix_ms(&self) -> u64 {
+        self.not_after_unix_ms
+    }
+
+    /// Transfer the secret scalars to the sole query-attempt lease owner.
+    /// Callers must not retain this entry after invoking this method.
+    pub fn into_parts(
+        self,
+    ) -> (
+        StorageCredentialScopePrefix,
+        u64,
+        SecretValue,
+        SecretValue,
+        SecretValue,
+    ) {
+        (
+            self.prefix,
+            self.not_after_unix_ms,
+            self.access_key_id,
+            self.secret_access_key,
+            self.session_token,
+        )
+    }
+}
+
+/// Provider-neutral, response-local contribution for one vended S3 lease
+/// scope.
+///
+/// This value is deliberately move-only. It may travel only from a provider's
+/// metadata-response adapter to an in-process query-attempt collector; it is
+/// never a table attribute, cache value, SQL plan field, or native wire value.
+pub struct VendedS3CredentialLeaseContribution {
+    entries: Vec<VendedS3CredentialLeaseEntry>,
+    refresh_endpoint: Option<Arc<str>>,
+    refresher: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+}
+
+impl VendedS3CredentialLeaseContribution {
+    pub fn try_new(
+        mut entries: Vec<VendedS3CredentialLeaseEntry>,
+        refresh_endpoint: Option<Arc<str>>,
+    ) -> Result<Self, ConnectorError> {
+        if entries.is_empty() || entries.len() > MAX_CREDENTIAL_LEASE_PREFIXES {
+            return Err(exhausted("vended S3 credential entry set"));
+        }
+        entries.sort_by(|left, right| left.prefix.cmp(&right.prefix));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].prefix == pair[1].prefix)
+        {
+            return Err(invalid("duplicate vended S3 credential prefix"));
+        }
+        if refresh_endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.is_empty())
+        {
+            return Err(invalid("vended S3 credential refresh endpoint"));
+        }
+        Ok(Self {
+            entries,
+            refresh_endpoint,
+            refresher: None,
+        })
+    }
+
+    /// Attach the provider-owned, FE-local source for a later refresh. The
+    /// source is a capability, not a wire field or a table property; it can be
+    /// consumed only by the query-attempt collector that receives this
+    /// response-local contribution.
+    pub fn with_refresher(
+        mut self,
+        refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+    ) -> Result<Self, ConnectorError> {
+        if self.refresh_endpoint.is_none() {
+            return Err(invalid(
+                "vended S3 credential refresher without refresh endpoint",
+            ));
+        }
+        self.refresher = Some(refresher);
+        Ok(self)
+    }
+
+    pub fn entries(&self) -> &[VendedS3CredentialLeaseEntry] {
+        &self.entries
+    }
+
+    pub fn refresh_endpoint(&self) -> Option<&str> {
+        self.refresh_endpoint.as_deref()
+    }
+
+    pub fn refresher(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+        self.refresher.as_ref()
+    }
+
+    /// Transfer the complete response-local contribution to the sole
+    /// query-attempt collector.
+    pub fn into_parts(self) -> (Vec<VendedS3CredentialLeaseEntry>, Option<Arc<str>>) {
+        (self.entries, self.refresh_endpoint)
+    }
+
+    /// Transfer both the confidential entries and the provider refresh source
+    /// to the only query-attempt collector. Existing callers that do not own a
+    /// refresher should use [`Self::into_parts`].
+    pub fn into_parts_with_refresher(
+        self,
+    ) -> (
+        Vec<VendedS3CredentialLeaseEntry>,
+        Option<Arc<str>>,
+        Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    ) {
+        (self.entries, self.refresh_endpoint, self.refresher)
+    }
+}
+
+/// Provider-neutral, move-only values returned by one FE-owned vended S3
+/// refresh. The provider retains all HTTP/catalog identity; the lifecycle
+/// owner receives only another closed set of response-local credential values.
+pub struct VendedS3CredentialLeaseRefresh {
+    entries: Vec<VendedS3CredentialLeaseEntry>,
+}
+
+impl VendedS3CredentialLeaseRefresh {
+    pub fn try_new(mut entries: Vec<VendedS3CredentialLeaseEntry>) -> Result<Self, ConnectorError> {
+        if entries.is_empty() || entries.len() > MAX_CREDENTIAL_LEASE_PREFIXES {
+            return Err(exhausted("refreshed vended S3 credential entry set"));
+        }
+        entries.sort_by(|left, right| left.prefix.cmp(&right.prefix));
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].prefix == pair[1].prefix)
+        {
+            return Err(invalid("duplicate refreshed vended S3 credential prefix"));
+        }
+        Ok(Self { entries })
+    }
+
+    pub fn entries(&self) -> &[VendedS3CredentialLeaseEntry] {
+        &self.entries
+    }
+
+    /// Transfer all refreshed values to the FE lifecycle owner. It is
+    /// responsible for selecting the existing lease's exact scope and forming
+    /// the next confidential epoch.
+    pub fn into_entries(self) -> Vec<VendedS3CredentialLeaseEntry> {
+        self.entries
+    }
+}
+
+/// FE-local provider capability for refreshing an already-admitted vended S3
+/// lease. Implementations must use their own catalog identity and may never
+/// be serialized or attached to a BE request.
+pub trait ConnectorVendedS3CredentialLeaseRefresher: Send + Sync {
+    fn refresh_vended_s3_credentials(
+        &self,
+    ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError>;
+}
+
+/// FE-local receiver for provider vended-credential contributions.
+///
+/// The trait object is carried only by the request context. It is not
+/// serializable and must never be captured by table, plan, fragment, or cache
+/// state.
+pub trait ConnectorVendedCredentialLeaseSink: Send + Sync {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        catalog_properties: &CatalogProperties,
+        contribution: VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError>;
+}
+
+/// A request-local, query-wide vended-credential sink attachment.
+///
+/// A query can touch multiple catalog generations, so each metadata call
+/// clones the query-wide context and decorates its own collection port with
+/// the exact catalog properties before invoking the provider.
+#[derive(Clone)]
+pub struct ConnectorVendedCredentialLeaseCollectionPort {
+    catalog_properties: CatalogProperties,
+    sink: Arc<dyn ConnectorVendedCredentialLeaseSink>,
+}
+
+impl ConnectorVendedCredentialLeaseCollectionPort {
+    pub fn new(
+        catalog_properties: CatalogProperties,
+        sink: Arc<dyn ConnectorVendedCredentialLeaseSink>,
+    ) -> Self {
+        Self {
+            catalog_properties,
+            sink,
+        }
+    }
+
+    pub const fn catalog_properties(&self) -> &CatalogProperties {
+        &self.catalog_properties
+    }
+
+    /// Immediately transfer one provider response into the attached
+    /// query-attempt collector. The exact catalog-generation properties are
+    /// attached by query materialization before this provider call starts.
+    pub fn offer_vended_s3_credential_lease(
+        &self,
+        contribution: VendedS3CredentialLeaseContribution,
+    ) -> Result<(), ConnectorError> {
+        self.sink
+            .offer_vended_s3_credential_lease(&self.catalog_properties, contribution)
+    }
 }
 
 /// Immutable, secret-free lease metadata frozen for one query participant.
@@ -168,14 +419,21 @@ fn exhausted(subject: &'static str) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::{
+        ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-        MAX_CREDENTIAL_LEASE_PREFIXES,
+        MAX_CREDENTIAL_LEASE_PREFIXES, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry,
     };
     use crate::connector::{
-        CatalogHandle, CatalogVersion, ConnectorInstanceId, StorageAccessDomainId,
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorError,
+        ConnectorInstanceId, CredentialConsumerRole, StorageAccessDomainId,
         StorageCredentialScopePrefix,
     };
+    use novarocks_secret::SecretValue;
 
     fn owner() -> CatalogHandle {
         CatalogHandle::new(
@@ -266,6 +524,81 @@ mod tests {
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
+        );
+    }
+
+    struct RecordingVendedSink {
+        seen: Mutex<Vec<(CatalogHandle, usize, Option<String>)>>,
+    }
+
+    impl ConnectorVendedCredentialLeaseSink for RecordingVendedSink {
+        fn offer_vended_s3_credential_lease(
+            &self,
+            catalog_properties: &CatalogProperties,
+            contribution: VendedS3CredentialLeaseContribution,
+        ) -> Result<(), ConnectorError> {
+            let (entries, refresh_endpoint) = contribution.into_parts();
+            self.seen.lock().expect("record sink").push((
+                catalog_properties.handle().clone(),
+                entries.len(),
+                refresh_endpoint.map(|endpoint| endpoint.to_string()),
+            ));
+            Ok(())
+        }
+    }
+
+    fn vended_catalog_properties() -> CatalogProperties {
+        CatalogProperties::new(
+            owner(),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties")
+    }
+
+    #[test]
+    fn collection_port_forwards_exact_catalog_properties_and_move_only_contribution() {
+        let sink = Arc::new(RecordingVendedSink {
+            seen: Mutex::new(Vec::new()),
+        });
+        let port = ConnectorVendedCredentialLeaseCollectionPort::new(
+            vended_catalog_properties(),
+            sink.clone(),
+        );
+        let contribution = VendedS3CredentialLeaseContribution::try_new(
+            vec![
+                VendedS3CredentialLeaseEntry::try_new(
+                    prefix("s3://bucket/table"),
+                    100,
+                    SecretValue::new("access-canary"),
+                    SecretValue::new("secret-canary"),
+                    SecretValue::new("token-canary"),
+                )
+                .expect("entry"),
+            ],
+            Some(Arc::from("https://catalog.example.test/v1/credentials")),
+        )
+        .expect("contribution");
+
+        port.offer_vended_s3_credential_lease(contribution)
+            .expect("offer contribution");
+
+        let seen = sink.seen.lock().expect("record sink");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, owner());
+        assert_eq!(seen[0].1, 1);
+        assert_eq!(
+            seen[0].2.as_deref(),
+            Some("https://catalog.example.test/v1/credentials")
         );
     }
 }

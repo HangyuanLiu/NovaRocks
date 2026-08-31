@@ -748,12 +748,13 @@ pub fn compose_frontend_control_factories(
     let factory =
         IcebergConnectorFactory::new(IcebergMetadataResources::new(iceberg_binding, runtime))
             .with_read_control_installer(std::sync::Arc::new(
-                move |key, metadata, splits, codec| {
+                move |key, metadata, splits, codec, request_factory| {
                     sink.install_read_control(
             key,
             novarocks_frontend::connector::typed_control_registry::InstalledReadControl::new(
                 metadata, splits, codec,
-            ),
+            )
+            .with_request_factory(request_factory),
         )
                 },
             ));

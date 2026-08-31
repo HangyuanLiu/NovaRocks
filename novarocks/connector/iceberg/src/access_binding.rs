@@ -22,6 +22,7 @@
 //! execution operators and SQL/application lifecycle.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_fs::{
     FileError, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
@@ -31,8 +32,8 @@ use novarocks_fs::{
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogProviderKind, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
-    ConnectorError, ConnectorErrorKind, ConnectorProviderId, StaticCredentialReference,
-    StorageAccessDomainId,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext,
+    StaticCredentialReference, StorageAccessDomainId, StorageAccessRequest,
 };
 
 /// Role-local resolver for one exact static object-store credential reference.
@@ -49,10 +50,14 @@ pub trait IcebergStaticCredentialResolver: Send + Sync {
 
 #[derive(Clone)]
 enum IcebergStorageAccess {
-    ObjectStore {
+    StaticObjectStore {
         access_domain: StorageAccessDomainId,
         endpoint_config: ObjectStoreEndpointConfig,
         credential_reference: StaticCredentialReference,
+    },
+    VendedObjectStore {
+        owner: novarocks_spi::connector::CatalogHandle,
+        endpoint_config: ObjectStoreEndpointConfig,
     },
     Uncredentialed {
         provider_id: ConnectorProviderId,
@@ -67,6 +72,7 @@ pub struct IcebergReadBinding {
     resources: FsAccessResources,
     credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
     storage_access: Option<IcebergStorageAccess>,
+    request_context: Option<ConnectorRequestContext>,
 }
 
 /// Provider-local credentials selected for one Iceberg object-store location.
@@ -108,6 +114,7 @@ impl IcebergReadBinding {
             resources,
             credential_resolver: None,
             storage_access: None,
+            request_context: None,
         }
     }
 
@@ -121,6 +128,7 @@ impl IcebergReadBinding {
             resources,
             credential_resolver: Some(credential_resolver),
             storage_access: None,
+            request_context: None,
         }
     }
 
@@ -163,26 +171,29 @@ impl IcebergReadBinding {
 
         let storage_access = match object_store_binding {
             Some(binding) => {
-                let CatalogCredentialMode::Static(reference) = binding.mode() else {
-                    return Err(invalid(
-                        "Iceberg vended object-store credentials require M2 query leases",
-                    ));
-                };
                 let endpoint_config = endpoint_config.ok_or_else(|| {
-                    invalid("static Iceberg object-store binding missing endpoint config")
+                    invalid("Iceberg object-store binding missing endpoint config")
                 })?;
-                let domain_input = CatalogStorageAccessDomainInput::try_new(
-                    provider_id,
-                    properties.handle().catalog_name().clone(),
-                    properties.config_format_version(),
-                    non_secret_properties,
-                    binding.clone(),
-                    vec![],
-                )?;
-                IcebergStorageAccess::ObjectStore {
-                    access_domain: domain_input.derive_access_domain(),
-                    endpoint_config,
-                    credential_reference: reference.clone(),
+                match binding.mode() {
+                    CatalogCredentialMode::Static(reference) => {
+                        let domain_input = CatalogStorageAccessDomainInput::try_new(
+                            provider_id,
+                            properties.handle().catalog_name().clone(),
+                            properties.config_format_version(),
+                            non_secret_properties,
+                            binding.clone(),
+                            vec![],
+                        )?;
+                        IcebergStorageAccess::StaticObjectStore {
+                            access_domain: domain_input.derive_access_domain(),
+                            endpoint_config,
+                            credential_reference: reference.clone(),
+                        }
+                    }
+                    CatalogCredentialMode::Vended => IcebergStorageAccess::VendedObjectStore {
+                        owner: properties.handle().clone(),
+                        endpoint_config,
+                    },
                 }
             }
             None => {
@@ -203,6 +214,7 @@ impl IcebergReadBinding {
             resources,
             credential_resolver: Some(credential_resolver),
             storage_access: Some(storage_access),
+            request_context: None,
         })
     }
 
@@ -234,7 +246,7 @@ impl IcebergReadBinding {
             FsAccessResources::new(pool, access_resolver, file_runtime, file_task_spawner);
         let access_domain = StorageAccessDomainId::from_bytes([0x54; 32]);
         let storage_access = match object_store_config.as_ref() {
-            Some(config) => IcebergStorageAccess::ObjectStore {
+            Some(config) => IcebergStorageAccess::StaticObjectStore {
                 access_domain,
                 endpoint_config: config.endpoint_config(),
                 credential_reference: StaticCredentialReference::try_new(
@@ -261,7 +273,30 @@ impl IcebergReadBinding {
             resources,
             credential_resolver: Some(resolver),
             storage_access: Some(storage_access),
+            request_context: None,
         }
+    }
+
+    /// Bind this provider template to one admitted request. This local view is
+    /// carried only by an active reader or writer, never by a table or handle.
+    pub fn for_request(&self, request_context: ConnectorRequestContext) -> Self {
+        Self {
+            resources: self.resources.clone(),
+            credential_resolver: self.credential_resolver.clone(),
+            storage_access: self.storage_access.clone(),
+            request_context: Some(request_context),
+        }
+    }
+
+    /// Whether object-store access is intentionally unavailable until this
+    /// binding is rebound to an admitted request. Callers use this only to
+    /// defer optional startup capability probes; actual I/O must still call
+    /// [`Self::resolve_access`] and therefore remains fail-closed.
+    pub(crate) fn requires_request_storage_resolver(&self) -> bool {
+        matches!(
+            self.storage_access,
+            Some(IcebergStorageAccess::VendedObjectStore { .. })
+        )
     }
 
     /// Resolve the startup-composed object-store credentials for an Iceberg
@@ -308,18 +343,16 @@ impl IcebergReadBinding {
         }))
     }
 
-    pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
-        let parsed = self
-            .resources
-            .access_resolver()
-            .parse_location(location)
-            .map_err(file_error)?;
-        let access_domain = self.access_domain_for_location(&parsed)?;
-        let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
+    pub fn is_object_store_location(&self, location: &str) -> Result<bool, String> {
         self.resources
             .access_resolver()
-            .resolve_location(access_domain, location, object_store_access)
-            .map_err(file_error)
+            .parse_location(location)
+            .map(|location| location.scheme() == FsScheme::ObjectStore)
+            .map_err(|error| format!("parse Iceberg output location: {error}"))
+    }
+
+    pub fn resolve_access(&self, location: &str) -> Result<FsAccessHandle, ConnectorError> {
+        self.resolve_access_for_locations(std::iter::once(location))
     }
 
     pub fn resolve_access_for_locations<I, S>(
@@ -342,6 +375,12 @@ impl IcebergReadBinding {
             .access_resolver()
             .parse_location(first)
             .map_err(file_error)?;
+        if matches!(
+            self.storage_access.as_ref(),
+            Some(IcebergStorageAccess::VendedObjectStore { .. })
+        ) {
+            return self.resolve_vended_access_for_locations(locations, parsed.scheme());
+        }
         let access_domain = self.access_domain_for_location(&parsed)?;
         let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
         self.resources
@@ -357,7 +396,7 @@ impl IcebergReadBinding {
         match self.storage_access.as_ref().ok_or_else(|| {
             invalid("Iceberg filesystem operation has no admitted storage capability")
         })? {
-            IcebergStorageAccess::ObjectStore { access_domain, .. } => {
+            IcebergStorageAccess::StaticObjectStore { access_domain, .. } => {
                 if location.scheme() != FsScheme::ObjectStore {
                     return Err(invalid(
                         "Iceberg object-store capability cannot resolve an uncredentialed location",
@@ -365,6 +404,9 @@ impl IcebergReadBinding {
                 }
                 Ok(*access_domain)
             }
+            IcebergStorageAccess::VendedObjectStore { .. } => Err(invalid(
+                "Iceberg vended object-store access must resolve through the query storage resolver",
+            )),
             IcebergStorageAccess::Uncredentialed {
                 provider_id,
                 catalog_name,
@@ -395,13 +437,86 @@ impl IcebergReadBinding {
         }
     }
 
+    fn resolve_vended_access_for_locations(
+        &self,
+        locations: Vec<String>,
+        scheme: FsScheme,
+    ) -> Result<FsAccessHandle, ConnectorError> {
+        if scheme != FsScheme::ObjectStore {
+            return Err(invalid(
+                "Iceberg vended object-store capability cannot resolve an uncredentialed location",
+            ));
+        }
+        let IcebergStorageAccess::VendedObjectStore {
+            owner,
+            endpoint_config,
+        } = self
+            .storage_access
+            .as_ref()
+            .expect("checked vended storage access")
+        else {
+            unreachable!("vended path requires vended storage access");
+        };
+        let context = self.request_context.as_ref().ok_or_else(|| {
+            invalid("Iceberg vended object-store operation has no query storage resolver")
+        })?;
+        let resolver = context.storage_resolver().ok_or_else(|| {
+            invalid("Iceberg vended object-store operation has no query storage resolver")
+        })?;
+        let mut resolved = locations
+            .iter()
+            .map(|location| {
+                StorageAccessRequest::try_new(owner.clone(), location)
+                    .and_then(|request| resolver.resolve_vended_s3(&request))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let selected = resolved
+            .drain(..)
+            .next()
+            .ok_or_else(|| invalid("Iceberg filesystem locations are empty"))?;
+        if resolved.iter().any(|other| {
+            other.storage_access_domain_id() != selected.storage_access_domain_id()
+                || other.lease_id() != selected.lease_id()
+                || other.epoch() != selected.epoch()
+                || other.matched_prefix() != selected.matched_prefix()
+                || other.not_after_unix_ms() != selected.not_after_unix_ms()
+        }) {
+            return Err(invalid(
+                "Iceberg vended filesystem locations require different credential selections",
+            ));
+        }
+        let expires_at = credential_expiration(selected.not_after_unix_ms())?;
+        let object_store_access = ObjectStoreAccessContext::new(
+            endpoint_config.clone(),
+            ObjectStoreCredentialProviderIdentity::Vended {
+                lease_id: selected.lease_id(),
+                epoch: selected.epoch(),
+            },
+            ObjectStoreSecretMaterial {
+                access_key_id: selected.access_key_id().clone(),
+                access_key_secret: selected.secret_access_key().clone(),
+                session_token: Some(selected.session_token().clone()),
+            },
+            self.resources.object_store_provider_pool(),
+        )
+        .with_credential_expiration(expires_at);
+        self.resources
+            .access_resolver()
+            .resolve_locations(
+                selected.storage_access_domain_id(),
+                locations,
+                Some(object_store_access),
+            )
+            .map_err(file_error)
+    }
+
     fn object_store_access_context_for_scheme(
         &self,
         scheme: FsScheme,
     ) -> Result<Option<ObjectStoreAccessContext<'_>>, ConnectorError> {
         if scheme == FsScheme::ObjectStore {
             let (endpoint_config, secret_material) = self.object_store_access_context()?;
-            let IcebergStorageAccess::ObjectStore {
+            let IcebergStorageAccess::StaticObjectStore {
                 credential_reference,
                 ..
             } = self
@@ -426,7 +541,7 @@ impl IcebergReadBinding {
     fn object_store_access_context(
         &self,
     ) -> Result<(ObjectStoreEndpointConfig, ObjectStoreSecretMaterial), ConnectorError> {
-        let IcebergStorageAccess::ObjectStore {
+        let IcebergStorageAccess::StaticObjectStore {
             endpoint_config,
             credential_reference,
             ..
@@ -487,6 +602,21 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
+fn credential_expiration(not_after_unix_ms: u64) -> Result<Instant, ConnectorError> {
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let remaining_ms = not_after_unix_ms
+        .checked_sub(now_unix_ms)
+        .ok_or_else(|| invalid("Iceberg vended object-store credential has expired"))?;
+    Instant::now()
+        .checked_add(Duration::from_millis(remaining_ms))
+        .ok_or_else(|| invalid("Iceberg vended object-store credential expiration is invalid"))
+}
+
 fn file_error(error: novarocks_fs::FileError) -> ConnectorError {
     invalid(error.to_string())
 }
@@ -517,10 +647,68 @@ impl IcebergStaticCredentialResolver for TestCredentialResolver {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
     use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorStorageResolver,
+        CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
+    };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct RejectingVendedResolver {
+        calls: AtomicUsize,
+    }
+
+    impl ConnectorStorageResolver for RejectingVendedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            assert_eq!(request.owner().catalog_name().as_str(), "vended-test");
+            assert_eq!(request.location(), "s3://warehouse/table/data.parquet");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "test vended resolver denial",
+            ))
+        }
+    }
+
+    fn vended_catalog_properties() -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("vended-test").expect("catalog"),
+                CatalogVersion::from_bytes([0x61; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![
+                CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")
+                    .expect("endpoint property"),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties")
+    }
 
     #[test]
     fn requires_a_composition_owned_runtime() {
@@ -582,5 +770,78 @@ mod tests {
                 .expect("local location")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn vended_object_store_refuses_to_use_the_static_resolver_without_request_context() {
+        let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
+        let resources = FsAccessResources::new(
+            Arc::new(
+                novarocks_fs::ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let binding = IcebergReadBinding::from_catalog_properties(
+            resources,
+            Arc::new(TestCredentialResolver {
+                object_store_config: None,
+            }),
+            &vended_catalog_properties(),
+        )
+        .expect("vended binding");
+        assert!(binding.requires_request_storage_resolver());
+
+        let error = binding
+            .resolve_access("s3://warehouse/table/data.parquet")
+            .expect_err("vended access without request resolver must fail closed");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(error.message().contains("query storage resolver"));
+    }
+
+    #[test]
+    fn vended_object_store_uses_the_request_resolver_instead_of_static_credentials() {
+        let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
+        let resources = FsAccessResources::new(
+            Arc::new(
+                novarocks_fs::ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let binding = IcebergReadBinding::from_catalog_properties(
+            resources,
+            Arc::new(TestCredentialResolver {
+                object_store_config: None,
+            }),
+            &vended_catalog_properties(),
+        )
+        .expect("vended binding");
+        let resolver = Arc::new(RejectingVendedResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            2048,
+        )
+        .expect("request context")
+        .with_storage_resolver(resolver.clone());
+
+        let error = binding
+            .for_request(request)
+            .resolve_access("s3://warehouse/table/data.parquet")
+            .expect_err("resolver denial must not fall back to static credentials");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
     }
 }

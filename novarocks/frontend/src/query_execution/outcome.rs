@@ -28,7 +28,10 @@ use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use crate::runtime::query_result::QueryResult;
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteCohortId};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorStorageResolver, ConnectorWriteCohortId,
+};
+use std::sync::Arc;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
@@ -182,6 +185,7 @@ pub struct ConnectorWriteCompletion {
     session: ConnectorWriteOperationSession,
     attempts:
         BTreeMap<ConnectorWriteCohortId, (ConnectorWritePlanAttachment, ConnectorWriteCommitInput)>,
+    terminal_storage_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
 }
 
 impl ConnectorWriteCompletion {
@@ -254,7 +258,11 @@ impl ConnectorWriteCompletion {
                 format!("register accepted connector write attempts: {error}"),
             )
         })?;
-        Ok(Self { session, attempts })
+        Ok(Self {
+            session,
+            attempts,
+            terminal_storage_resolver: None,
+        })
     }
 
     fn single_attempt(
@@ -280,6 +288,34 @@ impl ConnectorWriteCompletion {
     )]
     pub(crate) fn commit_context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
         self.session.request_context()
+    }
+
+    /// Uses the short-lived FE terminal capability when this completion came
+    /// from a vended-credential write. It also removes the collector sink:
+    /// descriptors were frozen at Init, so terminal reloads may consume an
+    /// existing lease but can never contribute a new one.
+    pub(crate) fn terminal_request_context(
+        &self,
+    ) -> novarocks_spi::connector::ConnectorRequestContext {
+        let context = self
+            .session
+            .request_context()
+            .clone()
+            .without_vended_credential_lease_sink();
+        self.terminal_storage_resolver
+            .as_ref()
+            .map_or(context.clone(), |resolver| {
+                context.with_storage_resolver(Arc::clone(resolver))
+            })
+    }
+
+    pub(crate) fn with_terminal_storage_resolver(
+        mut self,
+        terminal_storage_resolver: Arc<dyn ConnectorStorageResolver>,
+    ) -> Self {
+        debug_assert!(self.terminal_storage_resolver.is_none());
+        self.terminal_storage_resolver = Some(terminal_storage_resolver);
+        self
     }
 
     pub(crate) fn attachment(&self) -> Result<&ConnectorWritePlanAttachment, ConnectorError> {

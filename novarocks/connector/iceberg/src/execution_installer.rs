@@ -276,8 +276,8 @@ impl IcebergReadOnlyConnectorInstance {
             "prepared split shared payload",
             request.context.max_handle_payload_bytes(),
         )?;
-        let units =
-            materialize_local_scan_units(&self.binding, payload.units, special_unit, &request)?;
+        let binding = self.binding.for_request(request.context.clone());
+        let units = materialize_local_scan_units(&binding, payload.units, special_unit, &request)?;
         let leaf_kind = if units.iter().any(|unit| unit.row_groups.is_some()) {
             "row_group"
         } else {
@@ -289,7 +289,7 @@ impl IcebergReadOnlyConnectorInstance {
             .map(|unit| {
                 request.check_active()?;
                 let facts = iceberg_unit_domain_facts(
-                    &self.binding,
+                    &binding,
                     &mut inspections,
                     &unit,
                     &fact_columns,
@@ -370,19 +370,21 @@ impl IcebergReadOnlyConnectorInstance {
             ));
         }
         if let Some(delta) = shared.delta {
+            let binding = self.binding.for_request(request.context.clone());
             return IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
-                self.binding.clone(),
+                binding,
                 request,
             )
             .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
         }
-        let file_context = self.binding.file_read_context(
+        let binding = self.binding.for_request(request.context.clone());
+        let file_context = binding.file_read_context(
             novarocks_fs::FileCancellation::new(),
             request.context.deadline(),
         )?;
-        let access = self.binding.resolve_access_for_locations(
+        let access = binding.resolve_access_for_locations(
             std::iter::once(prepared.data_file.path.as_str()).chain(
                 prepared
                     .data_file

@@ -32,6 +32,10 @@ use super::{
     CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
     ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
+use crate::catalog_runtime::RestAccessDelegationMode;
+use crate::loaded_table::{
+    IcebergAccessDelegation, IcebergLoadedTable, parse_vended_access_delegation,
+};
 
 /// A REST Iceberg catalog.
 ///
@@ -48,17 +52,20 @@ pub(super) struct NovaRocksRestCatalog {
     /// on the generic catalog trait. It never leaves this module.
     client: Arc<crate::iceberg_catalog_rest::RestCatalog>,
     warehouse: Option<Arc<str>>,
+    access_delegation: RestAccessDelegationMode,
 }
 
 impl NovaRocksRestCatalog {
     pub(super) fn new(
         client: Arc<crate::iceberg_catalog_rest::RestCatalog>,
         warehouse: Option<Arc<str>>,
+        access_delegation: RestAccessDelegationMode,
     ) -> Self {
         Self {
             delegate: CatalogDelegate::new(client.clone()),
             client,
             warehouse,
+            access_delegation,
         }
     }
 
@@ -86,6 +93,12 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
 
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog> {
         Arc::clone(self.delegate.client())
+    }
+
+    fn vended_credential_refresh_catalog(
+        &self,
+    ) -> Option<Arc<crate::iceberg_catalog_rest::RestCatalog>> {
+        Some(Arc::clone(&self.client))
     }
 
     fn admit_create(
@@ -126,8 +139,28 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn load_table(
         &self,
         table: CatalogTableName,
-    ) -> Result<crate::iceberg::table::Table, ConnectorError> {
-        self.delegate.load_table(&table).await
+    ) -> Result<IcebergLoadedTable, ConnectorError> {
+        let ident = super::delegate::table_ident(&table)?;
+        match self.access_delegation {
+            RestAccessDelegationMode::Static => {
+                self.delegate.load_table(&table).await.map(|table| {
+                    IcebergLoadedTable::new(table, IcebergAccessDelegation::static_binding())
+                })
+            }
+            RestAccessDelegationMode::Vended => {
+                let response = self
+                    .client
+                    .load_table_deferred_with_access_delegation(&ident)
+                    .await
+                    .map_err(|error| super::error::map_read_error(&error))?;
+                let (materialization, delegation) = response.into_parts();
+                let access_delegation = parse_vended_access_delegation(&delegation)?;
+                Ok(IcebergLoadedTable::deferred_rest(
+                    materialization,
+                    access_delegation,
+                ))
+            }
+        }
     }
 
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -189,12 +222,51 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             Ok(ident) => ident,
             Err(error) => return super::StagedCreateStart::KnownUncommitted(error.to_string()),
         };
-        match self.client.stage_create_table_typed(&ident, creation).await {
-            Ok(staged) => {
-                let (table, initialization_updates) = staged.into_parts();
+        let staged = match self.access_delegation {
+            RestAccessDelegationMode::Static => self
+                .client
+                .stage_create_table_typed(&ident, creation)
+                .await
+                .map(|staged| {
+                    let (table, initialization_updates) = staged.into_parts();
+                    (
+                        crate::loaded_table::IcebergLoadedTableMaterialization::Materialized(table),
+                        initialization_updates,
+                        IcebergAccessDelegation::static_binding(),
+                    )
+                }),
+            RestAccessDelegationMode::Vended => self
+                .client
+                .stage_create_table_typed_deferred_with_access_delegation(&ident, creation)
+                .await
+                .and_then(|staged| {
+                    let (materialization, initialization_updates, delegation) = staged.into_parts();
+                    parse_vended_access_delegation(&delegation)
+                        .map(|access_delegation| {
+                            (
+                                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(
+                                    materialization,
+                                ),
+                                initialization_updates,
+                                access_delegation,
+                            )
+                        })
+                        .map_err(|error| {
+                            crate::iceberg_catalog_rest::StagedCreateError::PossiblyDispatched(
+                                crate::iceberg::Error::new(
+                                    crate::iceberg::ErrorKind::DataInvalid,
+                                    error.to_string(),
+                                ),
+                            )
+                        })
+                }),
+        };
+        match staged {
+            Ok((table, initialization_updates, access_delegation)) => {
                 super::StagedCreateStart::Staged {
                     table,
                     initialization_updates,
+                    access_delegation,
                 }
             }
             Err(crate::iceberg_catalog_rest::StagedCreateError::Conflict(error)) => {
@@ -212,8 +284,20 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     async fn commit_staged_table(
         &self,
         commit: crate::iceberg::TableCommit,
+        request_file_io: crate::iceberg::io::FileIO,
     ) -> super::StagedCommitResult {
-        match self.client.commit_staged_table_typed(commit).await {
+        let result = match self.access_delegation {
+            RestAccessDelegationMode::Static => self.client.commit_staged_table_typed(commit).await,
+            // The vended generation has no catalog-global StorageFactory. The
+            // caller owns an admitted request FileIO, which is the only
+            // capability allowed to materialize the committed response.
+            RestAccessDelegationMode::Vended => {
+                self.client
+                    .commit_staged_table_typed_with_file_io(commit, request_file_io)
+                    .await
+            }
+        };
+        match result {
             Ok(table) => super::StagedCommitResult::Committed(table),
             Err(crate::iceberg_catalog_rest::StagedCommitError::Conflict(error)) => {
                 super::StagedCommitResult::Conflict(error.to_string())
@@ -266,6 +350,15 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
+        if self.access_delegation == RestAccessDelegationMode::Vended {
+            // The generic transaction API cannot retain the response-local
+            // lease seed. Do not issue its static REST request and silently
+            // lose the vended authority; T23 must install an attempt consumer
+            // before this direct-create surface can be enabled.
+            return CatalogTransactionStart::Unsupported(super::error::CatalogUnsupported::new(
+                "REST Iceberg vended credentials require a query-attempt lease consumer",
+            ));
+        }
         match request.intent {
             CatalogCreateIntent::EmptyTable => {
                 let request = crate::catalog::transaction::CreateTableTransactionRequest {
@@ -290,6 +383,11 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         request: CreateTableTransactionRequest,
     ) -> CatalogTransactionStart {
+        if self.access_delegation == RestAccessDelegationMode::Vended {
+            return CatalogTransactionStart::Unsupported(super::error::CatalogUnsupported::new(
+                "REST Iceberg vended credentials require a query-attempt lease consumer",
+            ));
+        }
         match self.admit_create(CatalogCreateIntent::CreateTableAsSelect) {
             Ok(()) => super::start_create_table_transaction(&self.delegate, request),
             Err(reason) => CatalogTransactionStart::Unsupported(reason),

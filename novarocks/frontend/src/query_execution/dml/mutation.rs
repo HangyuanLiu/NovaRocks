@@ -722,7 +722,14 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         let commit = commit_handle(commit)?;
         commit
             .session
-            .adjudicate_publication(evidence, commit.session.request_context().clone())
+            .adjudicate_publication(
+                evidence,
+                commit
+                    .session
+                    .request_context()
+                    .clone()
+                    .without_vended_credential_lease_sink(),
+            )
             .map_err(|error| error.to_string())
     }
 

@@ -331,6 +331,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         NativeCarrierDeclaration::try_new("starrocks", 1)?,
     ])?;
     let init = proto::InitQueryRequest {
+        credential_lease_envelopes: vec![],
         manifest: Some(proto::ParticipantManifest {
             execution_id: Some(proto::QueryExecutionId {
                 query_id: Some(common::UniqueId { hi: 1, lo: 1 }),

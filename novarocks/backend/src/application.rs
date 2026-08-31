@@ -310,6 +310,10 @@ impl QueryLifecycleIngress for BackendStageLifecycleIngress {
         self.registry.init_query(request)
     }
 
+    fn init_query_tls(&self, request: QueryInitRequest) -> QueryInitAck {
+        self.registry.init_query_tls(request)
+    }
+
     fn prune_catalogs(
         &self,
         reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,

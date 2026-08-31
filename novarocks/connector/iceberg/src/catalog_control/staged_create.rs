@@ -38,7 +38,8 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
     ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorWriteControl, ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
+    ConnectorVendedS3CredentialLeaseRefresher, ConnectorWriteControl,
+    ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
@@ -47,9 +48,8 @@ use crate::commit::{
     AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, IcebergWriteControl,
     build_staged_fast_append_action,
 };
-use crate::iceberg::{
-    Catalog, ErrorKind, TableCommit, TableCreation, TableRequirement, TableUpdate,
-};
+use crate::iceberg::{Catalog, TableCommit, TableCreation, TableRequirement, TableUpdate};
+use crate::loaded_table::{IcebergPhysicalTable, IcebergRestVendedS3LeaseRefresher};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
 
@@ -122,6 +122,7 @@ impl From<ConnectorError> for RestStagedPrepareFailure {
 )]
 pub(crate) fn prepare_rest_staged_table(
     runtime: &IcebergMetadataContext,
+    request_context: Option<&novarocks_spi::connector::ConnectorRequestContext>,
     _operation_id: ConnectorStagedCreateOperationId,
     publication_id: novarocks_spi::connector::LakePublicationId,
     namespace_name: &str,
@@ -249,7 +250,69 @@ pub(crate) fn prepare_rest_staged_table(
         crate::catalog::StagedCreateStart::Staged {
             table,
             initialization_updates,
-        } => (table, initialization_updates),
+            access_delegation,
+        } => {
+            if let Some(seed) = access_delegation.into_vended_lease_seed() {
+                let Some(request_context) = request_context else {
+                    // The stage request has already reached the REST catalog, so
+                    // this cannot be reported as an unsupported preflight.  T21
+                    // intentionally refuses the possibly-created staged target
+                    // until T23 supplies the query-attempt lease consumer; storing
+                    // this secret in the staged table/handle would violate the
+                    // confidential carrier boundary.
+                    return Err(RestStagedPrepareFailure::CommitUnknown(
+                    "REST staged create returned vended credentials but no query-attempt lease consumer is installed".to_string(),
+                ));
+                };
+                let collection = request_context
+                .vended_credential_lease_collection()
+                .ok_or_else(|| RestStagedPrepareFailure::CommitUnknown(
+                    "REST staged create returned vended credentials but the request has no query-attempt lease consumer".to_string(),
+                ))?;
+                let refresh_scope = seed.refresh_scope();
+                let contribution = seed
+                    .into_vended_s3_credential_lease_contribution()
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                let contribution = match refresh_scope {
+                    None => contribution,
+                    Some(scope) => contribution
+                        .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                            runtime
+                                .novarocks_catalog()
+                                .vended_credential_refresh_catalog()
+                                .ok_or_else(|| {
+                                    RestStagedPrepareFailure::CommitUnknown(
+                                        "REST staged create vended refresh has no catalog owner"
+                                            .to_string(),
+                                    )
+                                })?,
+                            runtime.resources().catalog_runtime().clone(),
+                            scope,
+                        ))
+                            as Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>)
+                        .map_err(|error| {
+                            RestStagedPrepareFailure::CommitUnknown(error.to_string())
+                        })?,
+                };
+                collection
+                    .offer_vended_s3_credential_lease(contribution)
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                let table = table
+                    .materialize_for_request(
+                        runtime
+                            .resources()
+                            .planning_binding()
+                            .for_request(request_context.clone()),
+                    )
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                (table, initialization_updates)
+            } else {
+                let table = table
+                    .into_static_table()
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                (table, initialization_updates)
+            }
+        }
         crate::catalog::StagedCreateStart::Conflict(error) => {
             return Err(RestStagedPrepareFailure::Conflict(format!(
                 "prepare staged REST table: {error}"
@@ -350,6 +413,7 @@ fn write_unanchored_ctas_provenance(
     runtime: &IcebergMetadataContext,
     table_location: &str,
     provenance: &ConnectorCtasUnanchoredProvenance,
+    request_context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     provenance.validate()?;
     let staged_table_uuid = provenance.staged_table_uuid.ok_or_else(|| {
@@ -373,7 +437,10 @@ fn write_unanchored_ctas_provenance(
     let location = unanchored_ctas_provenance_location(table_location)?;
     let file_io = crate::fs_io::build_file_io_for_location(
         table_location,
-        runtime.resources().planning_binding().clone(),
+        runtime
+            .resources()
+            .planning_binding()
+            .for_request(request_context.clone()),
     );
     let output = file_io
         .new_output(&location)
@@ -605,6 +672,7 @@ impl IcebergStagedCreateAdapter {
         &self,
         prepared: &PreparedOperation,
         completion: &ConnectorWriteOperationCompletion,
+        context: &ConnectorRequestContext,
     ) -> Result<StagedCreateAction, ConnectorError> {
         if completion.owner() != &self.owner() {
             return Err(invalid(
@@ -664,7 +732,17 @@ impl IcebergStagedCreateAdapter {
             .as_ref()
             .map(|write| Arc::clone(&write.abort_handle))
             .ok_or_else(|| invalid("staged-create action requires a bound writer aggregate"))?;
-        let table = prepared.staged.table.clone();
+        // Never drive a later action through the table/FileIO captured by
+        // prepare. In particular, a vended response must resolve through this
+        // action's request-local capability, not through another action's.
+        let table = IcebergPhysicalTable::request_scoped(
+            &prepared.staged.table,
+            self.runtime
+                .resources()
+                .planning_binding()
+                .for_request(context.clone()),
+        )?
+        .into_table();
         let catalog: Arc<dyn Catalog> = self.runtime.novarocks_catalog().vendored_client();
         let file_io = table.file_io().clone();
         let action_abort = Arc::clone(&abort_handle);
@@ -751,7 +829,11 @@ impl IcebergStagedCreateAdapter {
         Ok(collector.abort_log)
     }
 
-    fn abort_prepared(&self, prepared: &PreparedOperation) -> ExternalMutationFinalization {
+    fn abort_prepared(
+        &self,
+        prepared: &PreparedOperation,
+        context: &ConnectorRequestContext,
+    ) -> ExternalMutationFinalization {
         let Some(write) = &prepared.write else {
             return ExternalMutationFinalization::Complete;
         };
@@ -759,6 +841,7 @@ impl IcebergStagedCreateAdapter {
             .runtime
             .resources()
             .planning_binding()
+            .for_request(context.clone())
             .resolve_access(prepared.staged.table.metadata().location())
         {
             Ok(access) => access,
@@ -896,6 +979,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let properties = properties.into_iter().collect::<Vec<_>>();
         let result = prepare_rest_staged_table(
             &self.runtime,
+            Some(&request.context),
             request.operation_id,
             request.publication_id,
             &request.table.namespace,
@@ -931,9 +1015,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         );
                     }
                 };
-                if let Err(error) =
-                    write_unanchored_ctas_provenance(&self.runtime, &table_location, &provenance)
-                {
+                if let Err(error) = write_unanchored_ctas_provenance(
+                    &self.runtime,
+                    &table_location,
+                    &provenance,
+                    &request.context,
+                ) {
                     return self.prepare_commit_unknown(
                         request.operation_id,
                         format!("persist CTAS unanchored provenance after staged create: {error}"),
@@ -1160,7 +1247,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             });
         }
         if !write.action_built {
-            match self.build_action(&prepared, &request.completion) {
+            match self.build_action(&prepared, &request.completion, &request.context) {
                 Ok((updates, expected_snapshot_id, abort_handle)) => {
                     let write = prepared.write.as_mut().expect("validated staged write");
                     write.updates = updates;
@@ -1191,12 +1278,23 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             .requirements(vec![TableRequirement::NotExist])
             .updates(updates)
             .build();
+        // A vended REST commit response does not carry a fresh credential
+        // contribution, yet it must become a Table. Materialize it only with
+        // this target request's terminal lease; never install a generation-wide
+        // StorageFactory as a fallback.
+        let request_file_io = crate::fs_io::build_file_io_for_location(
+            prepared.staged.table.metadata().location(),
+            self.runtime
+                .resources()
+                .planning_binding()
+                .for_request(request.context.clone()),
+        );
         let owner = Arc::clone(self.runtime.novarocks_catalog());
         let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(async move { owner.commit_staged_table(commit).await })
+            .block_on(async move { owner.commit_staged_table(commit, request_file_io).await })
             .map(staged_commit_to_legacy);
         match result {
             Ok(Ok(table))
@@ -1231,7 +1329,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             }
             Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::Conflict(error))) => {
                 if prepared.policy == CreatePolicy::NoOpIfExists {
-                    let finalization = self.abort_prepared(&prepared);
+                    let finalization = self.abort_prepared(&prepared, &request.context);
                     let finalization = self.finish_write_terminal(&prepared, finalization);
                     self.record_terminal(operation_id, OperationState::Published);
                     Ok(ConnectorStagedCreatePublishOutcome::NoOp {
@@ -1352,7 +1450,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             self.record_terminal(operation_id, OperationState::Prepared(prepared));
             return Err(invalid("Iceberg staged-create abort completion mismatch"));
         }
-        let finalization = self.abort_prepared(&prepared);
+        let finalization = self.abort_prepared(&prepared, &request.context);
         let finalization = self.finish_write_terminal(&prepared, finalization);
         self.record_terminal(operation_id, OperationState::Aborted);
         Ok(ConnectorStagedCreateAbortOutcome::Aborted {
@@ -1418,15 +1516,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create publish evidence does not match the exact operation",
             ));
         }
-        let catalog: Arc<dyn Catalog> = self.runtime.novarocks_catalog().vendored_client();
-        let ident = ident.clone();
         let load = self
             .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { catalog.load_table(&ident).await });
+            .load_table_for_request(
+                &ident.namespace.to_url_string(),
+                &ident.name,
+                &request.context,
+            )
+            .map(|physical| physical.into_table());
         match load {
-            Ok(Ok(table))
+            Ok(table)
                 if publication_matches(
                     &table,
                     operation_id,
@@ -1451,7 +1550,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     },
                 )
             }
-            Ok(Ok(table)) if table.metadata().uuid().to_string() != evidence.table_uuid => Ok(
+            Ok(table) if table.metadata().uuid().to_string() != evidence.table_uuid => Ok(
                 ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Conflict,
@@ -1460,7 +1559,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence: request.evidence,
                 },
             ),
-            Ok(Ok(_)) => Ok(
+            Ok(_) => Ok(
                 ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
@@ -1469,29 +1568,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence: request.evidence,
                 },
             ),
-            Ok(Err(error)) if error.kind() == ErrorKind::TableNotFound => Ok(
-                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        "the staged-create target is authoritatively absent",
-                    ),
-                    evidence: request.evidence,
-                },
-            ),
-            Ok(Err(error)) => Ok(
-                ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
-                    failure: ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        format!("authoritative staged-create reload failed: {error}"),
-                    ),
-                    evidence: request.evidence,
-                },
-            ),
             Err(error) => Ok(
                 ConnectorStagedCreatePublicationAdjudicationOutcome::CommitUnknown {
                     failure: ConnectorMutationFailure::new(
                         ConnectorMutationFailureKind::Unavailable,
-                        format!("authoritative staged-create reload runtime failed: {error}"),
+                        format!("authoritative staged-create reload failed: {error}"),
                     ),
                     evidence: request.evidence,
                 },
@@ -1870,6 +1951,7 @@ mod tests {
         assert_eq!(runtime.novarocks_catalog().implementation_name(), "hadoop");
         let failure = match prepare_rest_staged_table(
             &runtime,
+            None,
             ConnectorMutationOperationId::new(),
             novarocks_spi::connector::LakePublicationId::new_v7(),
             "db",
@@ -1913,6 +1995,7 @@ mod tests {
             .expect_err("admission refuses CTAS without an enumerable staging root");
         let failure = match prepare_rest_staged_table(
             &runtime,
+            None,
             ConnectorMutationOperationId::new(),
             novarocks_spi::connector::LakePublicationId::new_v7(),
             "db",

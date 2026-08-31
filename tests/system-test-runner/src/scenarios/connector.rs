@@ -1,14 +1,20 @@
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
 use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
-use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, QueryExecutionResourceSnapshot,
-    ServerHandle,
+use novarocks_cluster_harness::vended_rest_catalog::{
+    VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
+    VendedTableCommitResponseBehavior,
 };
+use novarocks_cluster_harness::{
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
+    QueryExecutionResourceSnapshot, ServerHandle,
+};
+use novarocks_secret::SecretValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
@@ -42,8 +48,10 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogFeRestartCache),
         Box::new(CatalogReadyLifecycle),
         Box::new(CatalogReadWriteRuntime),
+        Box::new(VendedRestReadWritePem::default()),
+        Box::new(VendedRestRefreshPem::default()),
+        Box::new(VendedRestWriteOutcomePem::default()),
         Box::new(CatalogVersionDrain),
-        Box::new(GenerationReplacement),
         Box::new(StaticCredentialGeneration::default()),
         Box::new(AccessDomainCacheIsolation::default()),
         Box::new(PredicatePageIndexPruning),
@@ -728,6 +736,646 @@ impl Scenario for CatalogReadWriteRuntime {
 
         await_resource_convergence(context, &baseline, "catalog read-write runtime")?;
         Ok(())
+    }
+}
+
+/// Reserved M2 acceptance entrypoint for the real REST-vended read/write
+/// path. It is explicit-only because the fixture must own its isolated REST
+/// catalog and S3 credential authority rather than consuming shared Docker
+/// state.
+#[derive(Default)]
+struct VendedRestReadWritePem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+struct VendedRestSystemFixture {
+    rest: IsolatedIcebergRestFixture,
+    proxy: VendedRestCatalogFixture,
+}
+
+impl Scenario for VendedRestReadWritePem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-read-write"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST and MinIO fixture for vended credentials")?;
+        // Bootstrap the namespace and target table with the fixture's private
+        // catalog authority before the vended proxy exists. NovaRocks must
+        // observe and use that table solely through a per-attempt lease.
+        rest.provision_empty_table("vended_rest_db", "vended_rest_data")
+            .context("provision isolated vended REST source table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated initial and rotated vended S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.initial.not_after_unix_ms)
+            })
+            .context("build initial vended S3 credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.rotated.not_after_unix_ms)
+            })
+            .context("build rotated vended S3 credential")?,
+            // This read/write scenario proves normal use of the initial
+            // leased credential. Refresh uses a dedicated short-TTL scenario.
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .context("start bounded REST vended-credential proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended REST fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        // Vended lease envelopes are confidential lifecycle payloads. The
+        // scenario must therefore exercise the native TLS branch, never the
+        // default authenticated h2c fixture.
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?;
+            let fixture = fixture.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("vended REST fixture is missing after cluster launch")
+            })?;
+            (
+                fixture.proxy.uri().to_string(),
+                fixture.rest.endpoints().rest_warehouse.clone(),
+            )
+        };
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended REST read/write control session")?,
+        )?;
+
+        const CATALOG: &str = "vended_rest_catalog";
+        const DATABASE: &str = "vended_rest_db";
+        const TABLE: &str = "vended_rest_data";
+        const CTAS: &str = "vended_rest_ctas";
+        context.action("create REST catalog with an explicit vended data binding");
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")",
+                self.vended_minio_endpoint()?
+            ))
+            .context("create vended REST catalog")?;
+        context.action("write three vended REST data files through the native 1FE+3BE path");
+        // Three committed files give the three-backend read enough independent
+        // work to prove that every Backend uses the vended data-plane lease.
+        for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+            control
+                .query_drop(format!(
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                ))
+                .with_context(|| format!("insert vended REST data range {range}"))?;
+        }
+        let rows: Vec<(i64, i64)> = control
+            .query(format!(
+                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"
+            ))
+            .context("read vended REST data")?;
+        if rows != [(3_000, 4_501_500)] {
+            bail!("vended REST read returned {rows:?}, expected [(3000, 4501500)]");
+        }
+        wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe a vended REST reader on every Backend",
+        )?;
+        context.action("create a vended REST CTAS target through staged publication");
+        control
+            .query_drop(format!(
+                "CREATE TABLE {CATALOG}.{DATABASE}.{CTAS} AS SELECT v FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v <= 1000"
+            ))
+            .with_context(|| {
+                self.vended_proxy_audit()
+                    .map(|audit| format!("create vended REST CTAS target; proxy audit: {audit:?}"))
+                    .unwrap_or_else(|error| {
+                        format!("create vended REST CTAS target; read proxy audit: {error}")
+                    })
+            })?;
+        let ctas_rows: Vec<(i64, i64)> = control
+            .query(format!(
+                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{CTAS}"
+            ))
+            .context("read vended REST CTAS target")?;
+        if ctas_rows != [(1_000, 500_500)] {
+            bail!("vended REST CTAS returned {ctas_rows:?}, expected [(1000, 500500)]");
+        }
+        let audit = self.vended_proxy_audit()?;
+        if audit.table_loads == 0 || audit.staged_creates < 1 {
+            bail!(
+                "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
+            );
+        }
+        if audit.refreshes != 0 || audit.issued_key_ids.len() != 1 {
+            bail!(
+                "normal vended read/write unexpectedly refreshed or issued a second key: {audit:?}"
+            );
+        }
+        context.action(
+            "verify REST fixture observed only the initial vended credential in normal read/write",
+        );
+        await_resource_convergence(context, &baseline, "vended REST read/write")?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended REST fixture")
+    }
+}
+
+impl VendedRestReadWritePem {
+    fn vended_minio_endpoint(&self) -> Result<String> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.rest.endpoints().minio_endpoint.clone())
+            .ok_or_else(|| anyhow::anyhow!("vended REST fixture is missing"))
+    }
+
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended REST fixture is missing"))
+    }
+}
+
+/// Exercises the write outcome boundary after a catalog-side effect exists but
+/// before its response reaches NovaRocks. The fixture reports response loss
+/// after the one durable commit; the statement must resolve the committed
+/// outcome without replaying it.
+#[derive(Default)]
+struct VendedRestWriteOutcomePem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+impl Scenario for VendedRestWriteOutcomePem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-write-outcome"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST fixture for vended write outcome")?;
+        rest.provision_empty_table("vended_write_outcome_db", "vended_write_outcome_data")
+            .context("provision isolated vended write-outcome table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated vended write-outcome identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .context("build short-lived initial vended write-outcome credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .context("build rotated vended write-outcome credential")?,
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::FailUnavailableAfterSideEffect,
+            hold_first_table_commit_response: false,
+        })
+        .context("start response-loss vended REST catalog proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended write-outcome fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended write-outcome control session")?,
+        )?;
+        const CATALOG: &str = "vended_write_outcome_catalog";
+        const DATABASE: &str = "vended_write_outcome_db";
+        const TABLE: &str = "vended_write_outcome_data";
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+            ))
+            .context("create response-loss REST vended catalog")?;
+
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let query_user = user.clone();
+        let insert = format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT 1 AS v");
+        let writer = thread::spawn(move || {
+            let mut connection = mysql_actor::connect(&query_user, port, Duration::from_secs(10))
+                .context("connect vended write-outcome writer")?;
+            let result = connection.query_drop(insert);
+            done_tx
+                .send(result.map_err(anyhow::Error::from))
+                .context("publish vended write-outcome result")
+        });
+
+        context.action("inject catalog response loss after one durable vended table commit");
+        let outcome = done
+            .recv_timeout(context.remaining("await failed write after held response release")?)
+            .context("vended write-outcome writer did not finish")?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome writer panicked"))??;
+        ensure!(
+            outcome.is_ok(),
+            "response-lost vended write must reconcile the already-committed outcome: {outcome:?}"
+        );
+        let audit = self.vended_proxy_audit()?;
+        ensure!(
+            audit.table_commits == 1,
+            "vended write must not replay the catalog commit after response loss; audit={audit:?}"
+        );
+        ensure!(
+            audit.refreshes == 0 && audit.refresh_failures == 0,
+            "response-loss write must not manufacture a refresh side path; audit={audit:?}"
+        );
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("read the already-applied vended write outcome")?;
+        ensure!(
+            rows == vec![1],
+            "response-loss write side effect must be visible exactly once, got {rows:?}"
+        );
+        await_resource_convergence(context, &baseline, "vended write-outcome failure")?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended write-outcome REST fixture")
+    }
+}
+
+impl VendedRestWriteOutcomePem {
+    fn fixture_endpoints(&self) -> Result<(String, String, String)> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?;
+        let fixture = fixture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended write-outcome fixture is missing"))?;
+        Ok((
+            fixture.proxy.uri().to_owned(),
+            fixture.rest.endpoints().rest_warehouse.clone(),
+            fixture.rest.endpoints().minio_endpoint.clone(),
+        ))
+    }
+
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended write-outcome fixture is missing"))
+    }
+}
+
+/// Exercises the one attempt-local FE refresh owner against the production
+/// 1FE+3BE TLS path. The source lease has a synthetic short expiry while its
+/// real STS material remains valid, so the test can prove refresh semantics
+/// without manufacturing invalid S3 credentials.
+#[derive(Default)]
+struct VendedRestRefreshPem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+impl Scenario for VendedRestRefreshPem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-refresh"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST and MinIO fixture for vended credential refresh")?;
+        rest.provision_empty_table("vended_refresh_db", "vended_refresh_data")
+            .context("provision isolated vended refresh source table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated vended refresh S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            // Deliberately omit the STS-issued expiration from the fixture
+            // response. The proxy instead advertises this bounded synthetic
+            // TTL, while MinIO continues to validate the real STS material.
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .context("build short-lived initial vended S3 credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .context("build rotated vended S3 credential")?,
+            // The vended refresh policy clamps the soft margin at five
+            // seconds. Eight seconds leaves a deterministic local window for
+            // the 3-BE prepare/commit barrier without slowing the scenario.
+            initial_ttl: Duration::from_secs(8),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .context("start short-TTL REST vended-credential proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended refresh REST fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse, minio_endpoint) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            let fixture = fixture.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("vended refresh REST fixture is missing after cluster launch")
+            })?;
+            (
+                fixture.proxy.uri().to_string(),
+                fixture.rest.endpoints().rest_warehouse.clone(),
+                fixture.rest.endpoints().minio_endpoint.clone(),
+            )
+        };
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended credential refresh control session")?,
+        )?;
+
+        const CATALOG: &str = "vended_refresh_catalog";
+        const DATABASE: &str = "vended_refresh_db";
+        const TABLE: &str = "vended_refresh_data";
+        context.action("create short-TTL REST catalog with a vended data binding");
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+            ))
+            .context("create short-TTL vended REST catalog")?;
+        context.action("write three independent vended data files for the 1FE+3BE long read");
+        for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+            control
+                .query_drop(format!(
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                ))
+                .with_context(|| format!("insert vended refresh data range {range}"))?;
+        }
+        // Each setup write is itself a legitimate short-TTL attempt and can
+        // independently refresh. Drain them before taking the audit baseline
+        // so the assertion below is attributable to the one long read.
+        await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
+        let refresh_baseline = self.vended_proxy_audit()?;
+
+        context.action("start one long-running vended read on all three Backends");
+        let target = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let connection_id = target
+            .ready
+            .recv_timeout(context.remaining("receive vended refresh read connection id")?)
+            .context("vended refresh read terminated before publishing its connection id")?;
+        let reader_logs = wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe the short-TTL vended read on every Backend",
+        )?;
+        assert_readers_are_in_flight(&reader_logs, "before vended credential refresh")?;
+
+        context.action("wait for the FE-owned vended credential refresh response");
+        let _first_refresh = self.wait_for_refresh(context, refresh_baseline.refreshes)?;
+        // A refresh response alone precedes the distributed prepare/commit
+        // acknowledgement barrier. Keep the same statement alive after that
+        // barrier's local control round, then require every BE still owns its
+        // original reader before deliberately terminating the test query.
+        thread::sleep(
+            context
+                .remaining("allow vended refresh prepare/commit to settle")?
+                .min(Duration::from_secs(2)),
+        );
+        let settled_audit = self.vended_proxy_audit()?;
+        let expected_table_loads = refresh_baseline.table_loads.saturating_add(1);
+        let expected_refreshes = refresh_baseline.refreshes.saturating_add(1);
+        let strict_observation_failure = (settled_audit.table_loads != expected_table_loads
+            || settled_audit.refreshes != expected_refreshes
+            || settled_audit.issued_key_ids.len() != 2)
+        .then(|| {
+            format!(
+                "one vended attempt must observe one metadata response and execute one refresh; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, expected_refreshes={expected_refreshes}, observed={settled_audit:?}"
+            )
+        });
+        let reader_logs = wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "verify every Backend continues the same vended read after refresh",
+        )?;
+        assert_readers_are_in_flight(&reader_logs, "after vended credential refresh")?;
+        if let Ok(result) = target.done.try_recv() {
+            bail!(
+                "vended read terminated after refresh instead of continuing across the 3-BE epoch commit: {result:?}"
+            );
+        }
+
+        context.action(format!(
+            "cancel the post-refresh vended read through KILL QUERY {connection_id}"
+        ));
+        control
+            .query_drop(format!("KILL QUERY {connection_id}"))
+            .context("cancel post-refresh vended reader")?;
+        assert_cancelled_query(
+            &target.done,
+            context.remaining("await post-refresh vended read cancellation")?,
+        )?;
+        assert_target_connection_remains_usable(
+            &target,
+            context.remaining("verify post-refresh KILL QUERY connection behavior")?,
+        )?;
+        assert_idle_query(&mut control, connection_id)?;
+        release_connector_read(&target)?;
+        target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("vended refresh reader thread panicked"))??;
+
+        let reader_logs = wait_for_balanced_reader_lifecycle(
+            context,
+            "wait for post-refresh vended reader close after cancellation",
+        )?;
+        assert_no_reader_open_after_abort(&reader_logs)?;
+        let audit = self.vended_proxy_audit()?;
+        if audit != settled_audit {
+            bail!(
+                "vended refresh audit changed unexpectedly after cancellation; settled={settled_audit:?}, observed={audit:?}"
+            );
+        }
+        await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
+        if let Some(failure) = strict_observation_failure {
+            bail!("{failure}");
+        }
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended credential refresh fixture")
+    }
+}
+
+impl VendedRestRefreshPem {
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))
+    }
+
+    fn wait_for_refresh(
+        &self,
+        context: &mut ScenarioContext,
+        refresh_baseline: u64,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        loop {
+            let audit = self.vended_proxy_audit()?;
+            if audit.refreshes > refresh_baseline {
+                return Ok(audit);
+            }
+            let remaining = context.remaining("observe vended credential refresh")?;
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
     }
 }
 

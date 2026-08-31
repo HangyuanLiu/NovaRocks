@@ -248,6 +248,29 @@ pub fn metadata_namespace_exists(
         .map_err(|error| error.to_string())
 }
 
+/// Attach a query-attempt vended-credential collector to one exact catalog
+/// generation. Every provider metadata entry point that can transitively load
+/// a table must use this adapter; callers may not recreate an unbound context
+/// after query admission.
+pub(crate) fn context_for_planning_lease(
+    binding: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    context: ConnectorRequestContext,
+) -> Result<ConnectorRequestContext, String> {
+    if context.vended_credential_lease_sink().is_some() {
+        context
+            .with_vended_credential_lease_collection(
+                binding
+                    .binding()
+                    .catalog_properties()
+                    .map_err(|error| error.to_string())?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())
+    } else {
+        Ok(context)
+    }
+}
+
 /// Resolve table existence through an admission-frozen planning lease.  A
 /// caller that performs a table-or-view decision must retain this lease for
 /// every metadata lookup in that decision.
@@ -258,6 +281,7 @@ pub fn metadata_table_exists_with_planning_lease(
     table: &str,
 ) -> Result<bool, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -281,6 +305,7 @@ pub fn metadata_list_namespaces_with_planning_lease(
     context: ConnectorRequestContext,
 ) -> Result<Vec<ConnectorNamespaceIdentity>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -303,6 +328,7 @@ pub fn metadata_list_tables_with_planning_lease(
     namespace: &str,
 ) -> Result<Vec<String>, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(binding, context)?;
     let mut tables = binding
         .binding()
         .metadata()
@@ -331,6 +357,7 @@ pub fn metadata_read_reference_facts_with_planning_lease(
     table: &str,
 ) -> Result<ConnectorReadReferenceFacts, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
     binding
         .binding()
         .metadata()
@@ -368,6 +395,7 @@ pub fn metadata_load_table_with_planning_lease(
     resolution: ConnectorTableResolution,
 ) -> Result<(backend::ResolvedTable, Option<i32>), String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(&binding, context)?;
     let metadata = binding
         .binding()
         .metadata()
@@ -418,6 +446,7 @@ pub fn metadata_load_connector_table_with_planning_lease(
     resolution: ConnectorTableResolution,
 ) -> Result<novarocks_spi::connector::ConnectorTableMetadata, String> {
     let instance_id = binding.binding().descriptor().instance_id.clone();
+    let context = context_for_planning_lease(binding, context)?;
     binding
         .binding()
         .metadata()

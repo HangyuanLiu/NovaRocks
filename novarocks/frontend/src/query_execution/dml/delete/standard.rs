@@ -257,7 +257,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
     > {
         completion
             .session()
-            .commit(self.connector_context.clone())
+            .commit(completion.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 

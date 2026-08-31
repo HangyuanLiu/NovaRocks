@@ -70,8 +70,9 @@ pub use runtime::{
     ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
     ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRegistrationLease,
     ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
-    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
+    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
     ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
     ConnectorReadWorkSource,
 };

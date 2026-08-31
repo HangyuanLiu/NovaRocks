@@ -772,9 +772,11 @@ impl CoreCtasCatalogAction {
 struct CoreStandardCtasTargetPreflight {
     target: crate::catalog_application::resolver::TargetBackend,
     lease: ConnectorStagedCreateLease,
-    _unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
+    unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
     write_lease: ConnectorWriteLease,
-    context: novarocks_spi::connector::ConnectorRequestContext,
+    target_catalog_properties: novarocks_spi::connector::CatalogProperties,
+    attempt_reservation:
+        Arc<Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>>,
 }
 
 impl CtasPreparedTargetPreflight for CoreStandardCtasTargetPreflight {
@@ -790,6 +792,7 @@ struct CorePreparedStandardCtasSource {
     target: crate::catalog_application::resolver::TargetBackend,
     query_options: Option<QueryOptions>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
     output_schema: arrow::datatypes::SchemaRef,
     output_columns: Vec<ConnectorColumnDefinition>,
     target_session: Arc<Mutex<Option<Arc<CoreStandardCtasTargetSession>>>>,
@@ -811,7 +814,7 @@ struct CoreStandardCtasTargetSession {
     write_lease: ConnectorWriteLease,
     handle: ConnectorStagedTableHandle,
     publication_id: LakePublicationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
+    context: Mutex<novarocks_spi::connector::ConnectorRequestContext>,
     write_plan_started: AtomicBool,
     write_unknown_latched: AtomicBool,
     publish_started: AtomicBool,
@@ -861,7 +864,11 @@ impl CoreStandardCtasTargetSession {
             ),
             handle: self.handle.clone(),
             completion,
-            context: self.context.clone(),
+            context: self
+                .context
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
         })
     }
 }
@@ -887,6 +894,8 @@ trait CtasWriteTarget: Send + Sync {
         &self,
         completion: ConnectorWriteOperationCompletion,
     ) -> Result<(), novarocks_spi::connector::ConnectorError>;
+
+    fn install_terminal_context(&self, context: novarocks_spi::connector::ConnectorRequestContext);
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError>;
 
@@ -962,6 +971,13 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
         completion: ConnectorWriteOperationCompletion,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
         self.lease.bind_write(self.handle.clone(), completion)
+    }
+
+    fn install_terminal_context(&self, context: novarocks_spi::connector::ConnectorRequestContext) {
+        *self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = context;
     }
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError> {
@@ -1107,6 +1123,7 @@ struct CorePreparedCtasWrite {
     write_session:
         Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
     write_unknown: Mutex<Option<ExternalMutationEvidence>>,
+    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
     execution_identity: [u8; 32],
 }
 
@@ -1387,9 +1404,14 @@ impl CtasEngine for DmlExecutionKernel {
             current_database,
         )
         .map_err(internal_failure)?;
-        let context =
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
-                .map_err(internal_failure)?;
+        // CTAS reaches the target catalog before its distributed writer is
+        // built. Reserve the one native attempt here so target preflight,
+        // source planning, staged creation, and the eventual writer share one
+        // request-local vended credential authority.
+        let attempt_reservation = self
+            .query_execution()
+            .reserve_initial_attempt()
+            .map_err(|error| internal_failure(error.to_string()))?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(connector_failure)?;
         let planning = self
@@ -1413,12 +1435,15 @@ impl CtasEngine for DmlExecutionKernel {
                 "standard CTAS staged-create, cleanup, and writer leases do not share one exact generation",
             ));
         }
-        sweep_unanchored_ctas_roots(self, &unanchored_ctas_cleanup_lease, context.clone())?;
         // The provider's staged-create publication contract is the only
         // authority allowed to decide whether IF NOT EXISTS is a no-op. A
         // frontend metadata read is not a substitute for its exact commit
         // result and would race the publication frontier.
         let binding = planning.binding();
+        let target_catalog_properties = binding
+            .catalog_properties()
+            .map_err(connector_failure)?
+            .clone();
         Ok(CtasTargetPreflightOutcome::Ready(
             PreparedCtasTargetPreflight {
                 facts: CtasTargetPreflightFacts {
@@ -1433,9 +1458,10 @@ impl CtasEngine for DmlExecutionKernel {
                 handle: Arc::new(CoreStandardCtasTargetPreflight {
                     target,
                     lease,
-                    _unanchored_ctas_cleanup_lease: unanchored_ctas_cleanup_lease,
+                    unanchored_ctas_cleanup_lease,
                     write_lease,
-                    context,
+                    target_catalog_properties,
+                    attempt_reservation: Arc::new(Mutex::new(Some(attempt_reservation))),
                 }),
             },
         ))
@@ -1469,6 +1495,20 @@ impl CtasEngine for DmlExecutionKernel {
             &request.execution,
         )
         .map_err(internal_failure)?;
+        let connector_context = {
+            let reservation = preflight.attempt_reservation.lock().map_err(|error| {
+                internal_failure(format!("CTAS attempt reservation lock: {error}"))
+            })?;
+            let reservation = reservation.as_ref().ok_or_else(|| {
+                internal_failure("standard CTAS attempt reservation was already consumed")
+            })?;
+            reservation
+                .connector_request_context(connector_context)
+                .with_vended_credential_lease_collection(
+                    preflight.target_catalog_properties.clone(),
+                )
+                .map_err(|error| internal_failure(error.to_string()))?
+        };
         let planned = plan_query_for_ctas_source(
             self,
             request.current_catalog.as_deref(),
@@ -1530,6 +1570,14 @@ impl CtasEngine for DmlExecutionKernel {
             Arc::new(planned),
             request.execution,
         ));
+        let attempt_reservation = preflight
+            .attempt_reservation
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS attempt reservation lock: {error}")))?
+            .take()
+            .ok_or_else(|| {
+                internal_failure("standard CTAS attempt reservation was already consumed")
+            })?;
         Ok(PreparedCtasSource {
             facts: CtasPreparedSourceFacts {
                 target_catalog: target.catalog.clone(),
@@ -1549,6 +1597,7 @@ impl CtasEngine for DmlExecutionKernel {
                 target,
                 query_options: request.query_options,
                 connector_context,
+                attempt_reservation: Mutex::new(Some(attempt_reservation)),
                 output_schema,
                 output_columns,
                 target_session: Arc::new(Mutex::new(None)),
@@ -1633,11 +1682,22 @@ impl CtasEngine for DmlExecutionKernel {
                     write_lease: preflight.write_lease.clone(),
                     handle,
                     publication_id: request.publication_id,
-                    context: request.context.clone(),
+                    context: Mutex::new(request.context.clone()),
                     write_plan_started: AtomicBool::new(false),
                     write_unknown_latched: AtomicBool::new(false),
                     publish_started: AtomicBool::new(false),
                 });
+                // A vended catalog cannot clean its warehouse before staged
+                // creation: the staged response is the first place it can
+                // disclose this request's storage authority. Run the same
+                // maintenance step only after that response has populated the
+                // request-local lease collector. This ordering is universal,
+                // so static and vended catalogs retain one CTAS lifecycle.
+                sweep_unanchored_ctas_roots(
+                    self,
+                    &preflight.unanchored_ctas_cleanup_lease,
+                    request.context.clone(),
+                )?;
                 *target_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&target));
@@ -1721,6 +1781,14 @@ impl CtasEngine for DmlExecutionKernel {
             .sealed_cohorts()
             .map_err(connector_failure)?
             .digest();
+        let attempt_reservation = source
+            .attempt_reservation
+            .lock()
+            .map_err(|error| internal_failure(format!("CTAS attempt reservation lock: {error}")))?
+            .take()
+            .ok_or_else(|| {
+                internal_failure("standard CTAS attempt reservation was already consumed")
+            })?;
         let identity = source.gate.execution_identity();
         let target_facts = target_arc.facts();
         let target_for_write: Arc<dyn CtasWriteTarget> = target_arc;
@@ -1739,6 +1807,7 @@ impl CtasEngine for DmlExecutionKernel {
                 completion: Mutex::new(None),
                 write_session: Mutex::new(None),
                 write_unknown: Mutex::new(None),
+                attempt_reservation: Mutex::new(Some(attempt_reservation)),
                 execution_identity: identity,
             }),
         })
@@ -1822,7 +1891,17 @@ impl CtasEngine for DmlExecutionKernel {
                 let request = request
                     .into_request(&execution, registration)
                     .map_err(|error| error.to_string())?;
-                let outcome = match prepared.state.query_execution().execute(request) {
+                let attempt_reservation = prepared
+                    .attempt_reservation
+                    .lock()
+                    .map_err(|error| format!("CTAS attempt reservation lock: {error}"))?
+                    .take()
+                    .ok_or_else(|| "CTAS attempt reservation was already consumed".to_string())?;
+                let outcome = match prepared
+                    .state
+                    .query_execution()
+                    .execute_reserved(request, attempt_reservation)
+                {
                     Ok(outcome) => outcome,
                     Err(error) => {
                         return Ok(standard_write_commit_unknown(
@@ -1850,6 +1929,14 @@ impl CtasEngine for DmlExecutionKernel {
                         "CTAS writer returned no complete generic completion",
                     ));
                 };
+                // Native execution has finalized by the time a CTAS binds its
+                // writer aggregate. Switch the staged target to the
+                // completion-owned terminal capability before any later
+                // metadata write, publication, or reconciliation can touch
+                // vended object storage.
+                prepared
+                    .target
+                    .install_terminal_context(completion.terminal_request_context());
                 let sealed = match completion.sealed_operation_completion() {
                     Ok(sealed) => sealed,
                     Err(error) => {
@@ -1901,7 +1988,13 @@ impl CtasEngine for DmlExecutionKernel {
                         write_lease: target.write_lease.clone(),
                         handle: target.handle.clone(),
                         publication_id: target.publication_id,
-                        context: target.context.clone(),
+                        context: Mutex::new(
+                            target
+                                .context
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .clone(),
+                        ),
                         write_plan_started: AtomicBool::new(true),
                         write_unknown_latched: AtomicBool::new(
                             target.write_unknown_latched.load(Ordering::Acquire),
@@ -1974,7 +2067,11 @@ impl CtasEngine for DmlExecutionKernel {
                         target.publication_id.to_bytes(),
                     ),
                 evidence,
-                context: target.context.clone(),
+                context: target
+                    .context
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })
             .map_err(connector_failure)?;
         match outcome {

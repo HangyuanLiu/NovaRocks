@@ -2431,6 +2431,7 @@ mod tests {
                     )),
                     || {},
                 ),
+                attempt_reservation: None,
             })
         }
 

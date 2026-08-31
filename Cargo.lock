@@ -3188,6 +3188,8 @@ name = "novarocks-cluster-harness"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
+ "hmac",
  "mysql",
  "novarocks-failpoint",
  "novarocks-native-trust",
@@ -3198,6 +3200,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
+ "time",
+ "tokio",
  "toml",
 ]
 
@@ -3573,6 +3578,7 @@ dependencies = [
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
+ "novarocks-fs",
  "novarocks-native-trust",
  "novarocks-proto-models",
  "novarocks-secret",

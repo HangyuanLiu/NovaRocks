@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod isolated_iceberg_rest;
 pub mod loopback_s3;
+pub mod vended_rest_catalog;
 
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;

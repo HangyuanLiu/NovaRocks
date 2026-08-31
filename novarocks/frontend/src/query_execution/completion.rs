@@ -21,8 +21,111 @@
 //! completion. It cannot construct a replacement completion for a different
 //! query intent or rehydrate planning inputs after admission.
 
+use crate::query_execution::lifecycle_plan::{
+    AttemptCredentialLeaseCollector, QueryCredentialLeases,
+};
 use crate::runtime::query_result::build_string_query_result;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
+use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+use std::sync::Arc;
+
+/// FE-local identity reserved before connector metadata materialization for
+/// one distributed attempt. It intentionally belongs to the statement wrapper
+/// rather than the Core request, because metadata can acquire attempt-scoped
+/// capabilities before Core request construction.
+pub struct QueryAttemptReservation {
+    query_id: QueryId,
+    execution_id: QueryExecutionId,
+    credential_collector: Arc<AttemptCredentialLeaseCollector>,
+    request_scope: ConnectorRequestScope,
+}
+
+impl QueryAttemptReservation {
+    pub(crate) fn first(
+        query_id: QueryId,
+    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
+        Self::for_round(query_id, 1)
+    }
+
+    pub(crate) fn retry(
+        query_id: QueryId,
+        attempt: u32,
+    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
+        Self::for_round(query_id, attempt)
+    }
+
+    fn for_round(
+        query_id: QueryId,
+        attempt: u32,
+    ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
+        let execution_id = QueryExecutionId::new(
+            query_id,
+            AttemptId::new(u64::from(attempt)).map_err(|error| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                    error.to_string(),
+                )
+            })?,
+        )
+        .map_err(|error| {
+            crate::query_execution::contract::DistributedQueryError::new(
+                crate::query_execution::contract::DistributedQueryErrorKind::ContractViolation,
+                error.to_string(),
+            )
+        })?;
+        Ok(Self {
+            query_id,
+            execution_id,
+            credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
+            request_scope: ConnectorRequestScope::new(),
+        })
+    }
+
+    pub(crate) const fn query_id(&self) -> QueryId {
+        self.query_id
+    }
+
+    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
+        self.execution_id
+    }
+
+    pub(crate) fn credential_lease_sink(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorVendedCredentialLeaseSink> {
+        self.credential_collector.sink()
+    }
+
+    pub(crate) fn credential_storage_resolver(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorStorageResolver> {
+        self.credential_collector.storage_resolver()
+    }
+
+    /// Bind one application request context to this exact candidate attempt.
+    /// The sidecar is local-only and fresh for every retry, while the lease
+    /// collector remains the sole owner of response-local secret material.
+    pub(crate) fn connector_request_context(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> ConnectorRequestContext {
+        context
+            .with_request_scope(self.request_scope.clone())
+            .with_storage_resolver(self.credential_storage_resolver())
+            .with_vended_credential_lease_sink(self.credential_lease_sink())
+    }
+
+    pub(crate) fn has_collected_credential_leases(&self) -> bool {
+        self.credential_collector.has_collected_leases()
+    }
+
+    pub(crate) fn into_credential_leases(
+        self,
+    ) -> Result<QueryCredentialLeases, crate::query_execution::contract::DistributedQueryError>
+    {
+        self.credential_collector.into_credential_leases()
+    }
+}
 
 /// Frontend-owned factory for a replacement *whole* distributed round.  It
 /// receives a fresh topology snapshot and must return newly planned request
@@ -42,6 +145,7 @@ pub(crate) trait PreparedDistributedRoundFactory: Send + PreReadyRetryBoundary {
     fn replan(
         &mut self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
+        reservation: QueryAttemptReservation,
     ) -> Result<PreparedDistributedQuery, crate::query_execution::contract::DistributedQueryError>;
 }
 
@@ -66,6 +170,11 @@ pub(crate) trait PreparedDistributedRequestFactory: Send + PreReadyRetryBoundary
 pub struct PreparedRetriableDistributedRequest {
     request: crate::query_execution::contract::DistributedQueryRequest,
     round_factory: Box<dyn PreparedDistributedRequestFactory>,
+    /// A DML operation can observe vended storage credentials while it is
+    /// still building its first native request.  Keep the matching attempt
+    /// reservation move-only with that request so lifecycle Init, rather than
+    /// a later coordinator-generated identity, owns those credentials.
+    reservation: Option<QueryAttemptReservation>,
 }
 
 impl PreparedRetriableDistributedRequest {
@@ -76,7 +185,13 @@ impl PreparedRetriableDistributedRequest {
         Self {
             request,
             round_factory,
+            reservation: None,
         }
+    }
+
+    pub(crate) fn with_attempt_reservation(mut self, reservation: QueryAttemptReservation) -> Self {
+        self.reservation = Some(reservation);
+        self
     }
 
     pub(crate) fn into_parts(
@@ -84,8 +199,9 @@ impl PreparedRetriableDistributedRequest {
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         Box<dyn PreparedDistributedRequestFactory>,
+        Option<QueryAttemptReservation>,
     ) {
-        (self.request, self.round_factory)
+        (self.request, self.round_factory, self.reservation)
     }
 }
 
@@ -131,6 +247,7 @@ pub struct PreparedDistributedQuery {
     request: crate::query_execution::contract::DistributedQueryRequest,
     completion: PreparedQueryCompletion,
     round_factory: Option<Box<dyn PreparedDistributedRoundFactory>>,
+    reservation: Option<QueryAttemptReservation>,
 }
 
 impl PreparedDistributedQuery {
@@ -145,6 +262,7 @@ impl PreparedDistributedQuery {
             request,
             completion,
             round_factory: None,
+            reservation: None,
         }
     }
 
@@ -156,14 +274,25 @@ impl PreparedDistributedQuery {
         self
     }
 
+    pub(crate) fn with_attempt_reservation(mut self, reservation: QueryAttemptReservation) -> Self {
+        self.reservation = Some(reservation);
+        self
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
         crate::query_execution::contract::DistributedQueryRequest,
         PreparedQueryCompletion,
         Option<Box<dyn PreparedDistributedRoundFactory>>,
+        Option<QueryAttemptReservation>,
     ) {
-        (self.request, self.completion, self.round_factory)
+        (
+            self.request,
+            self.completion,
+            self.round_factory,
+            self.reservation,
+        )
     }
 }
 
