@@ -618,6 +618,7 @@ upload_raw_files() {
 run_spark_loader() {
   log "Writing $suite data to Iceberg with Spark..."
   local loader_tmp_dir="/tmp/novarocks-benchmark-bootstrap-${NOVA_ENV_ID:-env}-$$"
+  local fixture_contract_in_spark="$loader_tmp_dir/fixture-contract.json"
   local schema_arg=""
   local spark_master="${NOVAROCKS_BENCHMARK_SPARK_MASTER:-local[2]}"
   local spark_memory="${NOVAROCKS_BENCHMARK_SPARK_MEMORY:-2g}"
@@ -625,6 +626,7 @@ run_spark_loader() {
   local spark_default_parallelism="${NOVAROCKS_BENCHMARK_SPARK_DEFAULT_PARALLELISM:-8}"
   "${compose_args[@]}" exec -T spark /bin/bash -lc "rm -rf '$loader_tmp_dir' && mkdir -p '$loader_tmp_dir'"
   "${compose_args[@]}" cp "$spark_loader" "spark:$loader_tmp_dir/write_standard_benchmark.py"
+  "${compose_args[@]}" cp "$fixture_contract_file" "spark:$fixture_contract_in_spark"
   if [[ -n "$schema_ddl_file" ]]; then
     [[ -f "$schema_ddl_file" ]] || die "schema DDL is missing: $schema_ddl_file"
     "${compose_args[@]}" cp "$schema_ddl_file" "spark:$loader_tmp_dir/schema.sql"
@@ -663,7 +665,7 @@ run_spark_loader() {
       --s3-secret-key '$AWS_S3_SECRET_ACCESS_KEY' \
       --generator '$generator_name' \
       --generator-version '$generator_version' \
-      --fixture-contract-json '$fixture_contract_file' \
+      --fixture-contract-json '$fixture_contract_in_spark' \
       $schema_arg
   "
 }
