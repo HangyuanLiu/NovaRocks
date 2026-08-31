@@ -25,7 +25,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
-CURRENT_ENV="$SCRIPT_DIR/runtime/current/env.sh"
+# See spark-sql.sh: CI supplies its already-resolved generated environment so
+# this helper does not depend on the mutable interactive `current` link.
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then
   echo "environment is not initialized: $CURRENT_ENV" >&2

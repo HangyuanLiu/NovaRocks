@@ -20,7 +20,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
-CURRENT_ENV="$SCRIPT_DIR/runtime/current/env.sh"
+# `current` is a convenience link for interactive use. CI passes the exact
+# generated entry it prepared so isolated system fixtures cannot redirect or
+# remove the environment required by subsequent SQL helpers.
+CURRENT_ENV="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/runtime/current/env.sh}"
 
 if [[ ! -f "$CURRENT_ENV" ]]; then
   echo "environment is not initialized: $CURRENT_ENV" >&2

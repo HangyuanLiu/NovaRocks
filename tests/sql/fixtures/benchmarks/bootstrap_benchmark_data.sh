@@ -20,7 +20,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
-ENV_FILE="$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh"
+# A full CI run resolves this once before system scenarios create and remove
+# their isolated fixtures. Prefer that stable entry over the mutable `current`
+# symlink, while keeping the normal interactive default unchanged.
+ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 
 SSB_VERSION="d006a6c49ff1a145a7d4ac7d837427627b213091"
 SSB_ARCHIVE_URL="https://github.com/greenlion/ssb-dbgen/archive/d006a6c49ff1a145a7d4ac7d837427627b213091.zip"

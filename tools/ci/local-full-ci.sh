@@ -426,6 +426,8 @@ run_cargo_gates() {
     tools/ci/tests/legacy-branding-test.sh
   run_fail_fast_stage "system scenario stage tests" "system-scenarios-stage-test.log" \
     tools/ci/tests/system-scenarios-stage-test.sh
+  run_fail_fast_stage "SQL helper environment binding" "sql-helper-env-file.log" \
+    docker/iceberg-rest/tests/sql-helper-env-file-test.sh
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
@@ -942,6 +944,7 @@ run_sql_suites() {
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
       NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
+      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
@@ -1074,6 +1077,7 @@ run_native_cross_process_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
+      NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh" \
       cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
