@@ -98,10 +98,10 @@ statistics_contract = "spark_compute_table_stats"
 "parquet.page.row.count.limit" = "1048576"
 
 [fixture.spark_runtime]
-spark_version = "3.5.3"
-iceberg_version = "1.7.1"
+spark_version = "3.5.5-java17"
+iceberg_version = "1.11.0"
 hadoop_version = "3.3.4"
-aws_sdk_version = "2.20.160"
+aws_sdk_version = "1.12.262"
 
 [[fixture.table_layouts]]
 suite = "ssb"

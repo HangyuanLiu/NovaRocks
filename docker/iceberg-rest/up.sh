@@ -68,6 +68,36 @@ else
   compose_project="${NOVA_ENV_COMPOSE_PROJECT:-nr-${env_id}}"
 fi
 
+shared_benchmark_root="${NOVA_ENV_SHARED_BENCHMARK_ROOT:-s3://novarocks/shared/benchmarks}"
+benchmark_lease_image="${NOVA_ENV_BENCHMARK_LEASE_IMAGE:-docker.io/library/busybox@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213}"
+benchmark_lease_heartbeat_seconds="${NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS:-10}"
+benchmark_lease_expiry_seconds="${NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS:-45}"
+benchmark_lease_wait_seconds="${NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS:-600}"
+benchmark_build_timeout_seconds="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-3600}"
+
+if [[ ! "$shared_benchmark_root" =~ ^s3://[^/[:space:]]+/[^[:space:]]+$ ]]; then
+  echo "NOVA_ENV_SHARED_BENCHMARK_ROOT must be a non-empty s3://bucket/prefix URI" >&2
+  exit 2
+fi
+if [[ ! "$benchmark_lease_image" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]]; then
+  echo "NOVA_ENV_BENCHMARK_LEASE_IMAGE must be pinned by an immutable sha256 digest" >&2
+  exit 2
+fi
+for benchmark_timing in \
+  "$benchmark_lease_heartbeat_seconds" \
+  "$benchmark_lease_expiry_seconds" \
+  "$benchmark_lease_wait_seconds" \
+  "$benchmark_build_timeout_seconds"; do
+  if [[ ! "$benchmark_timing" =~ ^[1-9][0-9]*$ ]]; then
+    echo "benchmark lease timings must be positive integer seconds" >&2
+    exit 2
+  fi
+done
+if (( benchmark_lease_heartbeat_seconds * 3 >= benchmark_lease_expiry_seconds )); then
+  echo "NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS must be less than one third of expiry" >&2
+  exit 2
+fi
+
 mkdir -p "$runtime_dir"
 
 port_in_use() {
@@ -204,6 +234,7 @@ if [[ "$shared_docker" == "true" ]]; then
 else
   compose_project="${NOVA_ENV_COMPOSE_PROJECT:-$compose_project}"
 fi
+benchmark_lease_namespace="$compose_project"
 
 minio_user="${MINIO_ROOT_USER:-admin}"
 minio_password="${MINIO_ROOT_PASSWORD:-admin123}"
@@ -362,6 +393,13 @@ NOVA_ENV_MINIO_CONSOLE_PORT=$minio_console_port
 NOVA_ENV_REST_PORT=$rest_port
 NOVA_ENV_SPARK_UI_PORT=$spark_ui_port
 NOVA_ENV_REST_WAREHOUSE_URI=$compose_rest_warehouse
+NOVA_ENV_SHARED_BENCHMARK_ROOT=$shared_benchmark_root
+NOVA_ENV_BENCHMARK_LEASE_NAMESPACE=$benchmark_lease_namespace
+NOVA_ENV_BENCHMARK_LEASE_IMAGE=$benchmark_lease_image
+NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS=$benchmark_lease_heartbeat_seconds
+NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS=$benchmark_lease_expiry_seconds
+NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS=$benchmark_lease_wait_seconds
+NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS=$benchmark_build_timeout_seconds
 MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
 ICEBERG_REST_IMAGE=$rest_image
@@ -479,6 +517,7 @@ iceberg_rest_uri = $toml_iceberg_rest_uri
 iceberg_rest_warehouse = $toml_iceberg_rest_warehouse
 iceberg_object_store_credential_name = "iceberg-test-data"
 iceberg_object_store_credential_generation = "v1"
+benchmark_shared_root = $(toml_string "$shared_benchmark_root")
 EOF
 
 cat > "$runtime_dir/ice-rest-catalog.sql" <<EOF
@@ -582,6 +621,13 @@ export NOVA_ENV_SHARED_REST_WAREHOUSE_URI="$shared_rest_warehouse"
 export NOVA_ENV_REST_SERVER_WAREHOUSE_URI="$compose_rest_warehouse"
 export NOVA_ENV_REST_WAREHOUSE_URI="$rest_warehouse"
 export NOVAROCKS_ICEBERG_REST_WAREHOUSE="$rest_warehouse"
+export NOVA_ENV_SHARED_BENCHMARK_ROOT="$shared_benchmark_root"
+export NOVA_ENV_BENCHMARK_LEASE_NAMESPACE="$benchmark_lease_namespace"
+export NOVA_ENV_BENCHMARK_LEASE_IMAGE="$benchmark_lease_image"
+export NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS="$benchmark_lease_heartbeat_seconds"
+export NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS="$benchmark_lease_expiry_seconds"
+export NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS="$benchmark_lease_wait_seconds"
+export NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS="$benchmark_build_timeout_seconds"
 export NOVAROCKS_FE_CONFIG="$runtime_dir/fe.toml"
 export NOVAROCKS_BE_CONFIG="$runtime_dir/be.toml"
 export NOVAROCKS_STATE_STORE_PATH="$runtime_dir/frontend-state.sqlite"
@@ -605,6 +651,15 @@ cat > "$manifest_file" <<EOF
   "env_id": "$env_id",
   "shared_docker": $shared_docker,
   "compose_project": "$compose_project",
+  "benchmark_fixture": {
+    "shared_root": "$shared_benchmark_root",
+    "lease_namespace": "$benchmark_lease_namespace",
+    "lease_image": "$benchmark_lease_image",
+    "lease_heartbeat_seconds": $benchmark_lease_heartbeat_seconds,
+    "lease_expiry_seconds": $benchmark_lease_expiry_seconds,
+    "lease_wait_seconds": $benchmark_lease_wait_seconds,
+    "build_timeout_seconds": $benchmark_build_timeout_seconds
+  },
   "runtime_dir": "$runtime_dir",
   "current_dir": "$current_link",
   "compose_file": "$compose_file",
@@ -669,6 +724,9 @@ Do not guess ports.
 - Iceberg REST: \`$rest_uri\`
 - Iceberg REST warehouse: \`$rest_warehouse\`
 - REST server default warehouse: \`$compose_rest_warehouse\`
+- Shared benchmark fixture root: \`$shared_benchmark_root\`
+- Benchmark lease namespace: \`$benchmark_lease_namespace\`
+- Benchmark lease helper image: \`$benchmark_lease_image\`
 - Spark UI: \`http://127.0.0.1:$spark_ui_port\`
 - NovaRocks MySQL port: \`$mysql_port\`
 - NovaRocks FE Native gRPC port: \`$fe_grpc_port\`
@@ -757,6 +815,9 @@ MinIO console: http://127.0.0.1:$minio_console_port
 Iceberg REST: $rest_uri
 Iceberg REST warehouse: $rest_warehouse
 REST server default warehouse: $compose_rest_warehouse
+Shared benchmark fixture root: $shared_benchmark_root
+Benchmark lease namespace: $benchmark_lease_namespace
+Benchmark lease helper image: $benchmark_lease_image
 Spark UI: http://127.0.0.1:$spark_ui_port
 $docker_state
 

@@ -26,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-workspace="$tmpdir/workspace"
+workspace="$REPO_ROOT"
 runtime_dir="$tmpdir/prepared-runtime"
 env_file="$runtime_dir/env.sh"
 compose_env="$runtime_dir/compose.env"
@@ -47,15 +47,25 @@ export iceberg_object_store_credential_name="iceberg-test-data"
 export iceberg_object_store_credential_generation="v1"
 export NOVAROCKS_SPARK_DEFAULTS="$spark_defaults"
 export NOVA_ENV_ID="ci-prepared"
+export NOVA_ENV_SHARED_BENCHMARK_ROOT="s3://novarocks/shared/benchmarks"
+export NOVA_ENV_BENCHMARK_LEASE_NAMESPACE="ci-prepared-rest"
+export NOVA_ENV_BENCHMARK_LEASE_IMAGE="docker.io/library/busybox@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213"
 EOF
 
 # There deliberately is no workspace/docker/iceberg-rest/runtime/current/env.sh.
 # These helpers must use the explicit CI-resolved entry instead.
 bootstrap_output="$tmpdir/bootstrap.out"
+resolved_dataset="$tmpdir/resolved-dataset.json"
+python3 "$REPO_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" \
+  --workspace-root "$workspace" \
+  --suite ssb \
+  --scale 1 \
+  --shared-root s3://novarocks/shared/benchmarks >"$resolved_dataset"
 NOVA_ENV_REST_ENV_FILE="$env_file" \
 NOVAROCKS_WORKSPACE_ROOT="$workspace" \
   "$REPO_ROOT/tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh" \
-  --suite ssb --scale 1 --dry-run >"$bootstrap_output"
+  --suite ssb --scale 1 --resolved-dataset "$resolved_dataset" --dry-run \
+  >/dev/null 2>"$bootstrap_output"
 
 if ! grep -Fx "env_file=$env_file" "$bootstrap_output" >/dev/null; then
   echo "benchmark bootstrap did not use the explicit REST environment file" >&2

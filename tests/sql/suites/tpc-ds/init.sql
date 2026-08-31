@@ -21,7 +21,7 @@ CREATE EXTERNAL CATALOG IF NOT EXISTS `iceberg_cat_${uuid0}`
 PROPERTIES (
     "type"="iceberg",
     "iceberg.catalog.type"="${iceberg_catalog_type}",
-    "iceberg.catalog.warehouse"="${iceberg_catalog_warehouse}",
+    "iceberg.catalog.warehouse"="${benchmark_iceberg_catalog_warehouse}",
     "credential.object-store-data.consumer-role" = "frontend-and-backend",
     "credential.object-store-data.mode" = "static",
     "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",

@@ -24,6 +24,10 @@ WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # their isolated fixtures. Prefer that stable entry over the mutable `current`
 # symlink, while keeping the normal interactive default unchanged.
 ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
+# shellcheck source=benchmark_fixture_lease.sh
+source "$SCRIPT_DIR/benchmark_fixture_lease.sh"
+# shellcheck source=benchmark_fixture_publication.sh
+source "$SCRIPT_DIR/benchmark_fixture_publication.sh"
 
 SSB_VERSION="d006a6c49ff1a145a7d4ac7d837427627b213091"
 SSB_ARCHIVE_URL="https://github.com/greenlion/ssb-dbgen/archive/d006a6c49ff1a145a7d4ac7d837427627b213091.zip"
@@ -53,13 +57,10 @@ TPCDS_TABLES=(
 
 suite=""
 scale=""
-target_catalog="iceberg_cat"
-mysql_host="127.0.0.1"
-mysql_port=""
-mysql_user="root"
-mysql_password=""
+resolved_dataset_file=""
 check_only=0
 rebuild=0
+ensure=0
 dry_run=0
 
 usage() {
@@ -69,12 +70,9 @@ Usage: bootstrap_benchmark_data.sh --suite <ssb|tpc-h|tpc-ds> --scale <scale> [o
 Options:
   --suite <name>             Benchmark suite: ssb, tpc-h, or tpc-ds.
   --scale <scale>            Standard scale. Defaults: ssb=1, tpc-h=1, tpc-ds=1GB.
-  --target-catalog <name>    Target Iceberg catalog name. Default: iceberg_cat.
-  --mysql-host <host>        NovaRocks MySQL host. Default: 127.0.0.1.
-  --mysql-port <port>        NovaRocks MySQL port. Default: env NOVA_ENV_MYSQL_PORT.
-  --mysql-user <user>        NovaRocks MySQL user. Default: root.
-  --mysql-password <pass>    NovaRocks MySQL password. Default: empty.
-  --check                    Check existing bootstrap readiness and exit.
+  --resolved-dataset <file>  T01 resolver JSON for this exact dataset (required).
+  --check                    Check READY and emit a typed result/error.
+  --ensure                   Reuse READY or build only when it is absent (default).
   --rebuild                  Rebuild even if readiness check succeeds.
   --dry-run                  Print resolved paths without generating or uploading.
   --help                     Show this help.
@@ -88,11 +86,6 @@ die() {
 
 log() {
   echo "$*"
-}
-
-quote_ident() {
-  local ident="$1"
-  printf '`%s`' "${ident//\`/\`\`}"
 }
 
 require_value() {
@@ -114,29 +107,9 @@ parse_args() {
         scale="${2:-}"
         shift 2
         ;;
-      --target-catalog)
+      --resolved-dataset)
         require_value "$1" "${2:-}"
-        target_catalog="${2:-}"
-        shift 2
-        ;;
-      --mysql-host)
-        require_value "$1" "${2:-}"
-        mysql_host="${2:-}"
-        shift 2
-        ;;
-      --mysql-port)
-        require_value "$1" "${2:-}"
-        mysql_port="${2:-}"
-        shift 2
-        ;;
-      --mysql-user)
-        require_value "$1" "${2:-}"
-        mysql_user="${2:-}"
-        shift 2
-        ;;
-      --mysql-password)
-        require_value "$1" "${2:-}"
-        mysql_password="${2:-}"
+        resolved_dataset_file="${2:-}"
         shift 2
         ;;
       --check)
@@ -145,6 +118,10 @@ parse_args() {
         ;;
       --rebuild)
         rebuild=1
+        shift
+        ;;
+      --ensure)
+        ensure=1
         shift
         ;;
       --dry-run)
@@ -193,7 +170,9 @@ validate_suite_and_scale() {
       die "unsupported --suite: $suite"
       ;;
   esac
-  [[ -n "$target_catalog" ]] || die "--target-catalog must not be empty"
+  [[ -n "$resolved_dataset_file" ]] || die "--resolved-dataset is required"
+  [[ -f "$resolved_dataset_file" ]] || die "resolved dataset is missing: $resolved_dataset_file"
+  (( check_only + rebuild + ensure <= 1 )) || die "choose at most one of --check, --ensure, or --rebuild"
 
   generator_scale="$(scale_to_generator_value "$scale")"
   [[ "$generator_scale" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "invalid scale for $suite: $scale"
@@ -243,33 +222,23 @@ source_env() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
 
-  mysql_port="${mysql_port:-${NOVA_ENV_MYSQL_PORT:-}}"
-  [[ -n "$mysql_port" ]] || die "--mysql-port is required when NOVA_ENV_MYSQL_PORT is unset"
   : "${NOVA_ENV_COMPOSE_ENV:?missing NOVA_ENV_COMPOSE_ENV in $ENV_FILE}"
   : "${NOVA_ENV_COMPOSE_PROJECT:?missing NOVA_ENV_COMPOSE_PROJECT in $ENV_FILE}"
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
-  : "${CATALOG_WAREHOUSE_URI:?missing CATALOG_WAREHOUSE_URI in $ENV_FILE}"
+  : "${NOVA_ENV_SHARED_BENCHMARK_ROOT:?missing NOVA_ENV_SHARED_BENCHMARK_ROOT in $ENV_FILE}"
+  : "${NOVA_ENV_BENCHMARK_LEASE_NAMESPACE:?missing NOVA_ENV_BENCHMARK_LEASE_NAMESPACE in $ENV_FILE}"
+  : "${NOVA_ENV_BENCHMARK_LEASE_IMAGE:?missing NOVA_ENV_BENCHMARK_LEASE_IMAGE in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
-  : "${iceberg_object_store_credential_name:?missing iceberg_object_store_credential_name in $ENV_FILE}"
-  : "${iceberg_object_store_credential_generation:?missing iceberg_object_store_credential_generation in $ENV_FILE}"
-  AWS_S3_ACCESS_KEY_ID="${AWS_S3_ACCESS_KEY_ID:-admin}"
-  AWS_S3_SECRET_ACCESS_KEY="${AWS_S3_SECRET_ACCESS_KEY:-admin123}"
+  : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
+  : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
 }
 
 resolve_paths() {
   cache_dir="$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/cache"
   generated_dir="$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/generated/$suite/$scale_slug"
   raw_dir="$generated_dir/raw"
-  lock_dir="$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/.bootstrap-$suite-$scale_slug.lock"
   archive_file="$cache_dir/$archive_basename"
   source_dir="$cache_dir/$archive_root"
-  warehouse_uri="${CATALOG_WAREHOUSE_URI%/}"
-  raw_uri="$warehouse_uri/_benchmark_raw/$suite/$scale_slug"
-  local manifest_version="$scale_slug"
-  if [[ "$suite" == "tpc-ds" ]]; then
-    manifest_version="$scale_slug/latin1-v1"
-  fi
-  manifest_uri="$warehouse_uri/_bootstrap_manifest/$suite/$manifest_version"
   spark_loader="$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
 
   schema_ddl_file=""
@@ -288,13 +257,11 @@ print_dry_run() {
 DRY_RUN suite=$suite scale=$scale generator_scale=$generator_scale
 workspace=$WORKSPACE_ROOT
 env_file=$ENV_FILE
-target_catalog=$target_catalog
 database=$suite_database
-mysql=$mysql_user@$mysql_host:$mysql_port
-warehouse=$warehouse_uri
 raw_dir=$raw_dir
-raw_uri=$raw_uri
-manifest_uri=$manifest_uri
+dataset_key=$dataset_key_json
+ready_uri=$ready_uri
+staging_parent=$staging_parent
 cache_dir=$cache_dir
 source_dir=$source_dir
 schema_ddl_file=$schema_ddl_file
@@ -305,150 +272,134 @@ compose_project=$NOVA_ENV_COMPOSE_PROJECT
 EOF
 }
 
-mysql_client() {
-  if command -v mysql >/dev/null 2>&1; then
-    echo mysql
-    return
-  fi
-  if command -v mariadb >/dev/null 2>&1; then
-    echo mariadb
-    return
-  fi
-  die "mysql or mariadb client is required"
+emit_result() {
+  local reused="$1" built="$2" etag="$3"
+  python3 - "$reused" "$built" "$etag" "$resolved_dataset_file" "$ready_exact_warehouse" "$ready_manifest_uri" "$ready_identity" >&3 <<'PY'
+import json, sys
+reused, built, etag, resolved_path, warehouse, manifest, identity = sys.argv[1:]
+resolved = json.load(open(resolved_path, encoding="utf-8"))
+print(json.dumps({"schema_version": 1, "dataset_key": resolved["dataset_key"], "state": "ReadyValid",
+  "reused": reused == "true", "built": built == "true", "exact_warehouse": warehouse,
+  "manifest_uri": manifest, "publication": {"ready_uri": resolved["ready_uri"], "etag": etag, "identity": identity}}, separators=(",", ":")))
+PY
 }
 
-run_sql() {
-  local sql="$1"
-  local client
-  client="$(mysql_client)"
-  local args=(-h "$mysql_host" -P "$mysql_port" -u "$mysql_user" --protocol=TCP --batch --raw --skip-column-names)
-  if [[ -n "$mysql_password" ]]; then
-    args+=("-p$mysql_password")
-  fi
-  "$client" "${args[@]}" -e "$sql"
+emit_error() {
+  local error="$1" message="$2"
+  python3 - "$error" "$message" "$resolved_dataset_file" >&3 <<'PY'
+import json, sys
+resolved = json.load(open(sys.argv[3], encoding="utf-8"))
+print(json.dumps({"schema_version": 1, "error": sys.argv[1], "dataset_key": resolved["dataset_key"], "message": sys.argv[2]}, separators=(",", ":")))
+PY
 }
 
-create_target_catalog() {
-  local catalog_sql
-  catalog_sql=$(cat <<EOF
-CREATE EXTERNAL CATALOG IF NOT EXISTS $(quote_ident "$target_catalog")
-PROPERTIES (
-  "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "$warehouse_uri",
-  "aws.s3.endpoint" = "$AWS_S3_ENDPOINT",
-  "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true",
-  "credential.object-store-data.consumer-role" = "frontend-and-backend",
-  "credential.object-store-data.mode" = "static",
-  "credential.object-store-data.name" = "$iceberg_object_store_credential_name",
-  "credential.object-store-data.generation" = "$iceberg_object_store_credential_generation"
-);
-EOF
-)
-  run_sql "$catalog_sql"
+load_resolved_dataset() {
+  local expected actual
+  expected="$(python3 "$WORKSPACE_ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --workspace-root "$WORKSPACE_ROOT" --suite "$suite" --scale "$scale" --shared-root "$NOVA_ENV_SHARED_BENCHMARK_ROOT")" || die "unable to resolve fixture contract"
+  actual="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1], encoding='utf-8')), sort_keys=True, separators=(',', ':')))
+PY
+)" || die "invalid resolved dataset JSON"
+  [[ "$actual" == "$expected" ]] || die "resolved dataset does not match the T01 resolver contract"
+  dataset_key_json="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.dumps(json.load(open(sys.argv[1]))['dataset_key'], sort_keys=True, separators=(',', ':')))
+PY
+)"
+  ready_uri="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['ready_uri'])
+PY
+)"
+  staging_parent="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['staging_parent'])
+PY
+)"
+  fixture_contract_id="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['fixture_contract_id'])
+PY
+)"
+  normalized_scale="$(python3 - "$resolved_dataset_file" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1]))['dataset_key']['scale'])
+PY
+)"
 }
 
-check_manifest() {
-  local path
-  path="$(s3_to_mc_path "$manifest_uri")"
-  local required_encoding=""
-  if [[ "$suite" == "tpc-ds" ]]; then
-    required_encoding='"raw_text_encoding": "ISO-8859-1"'
-  fi
-  local required_format_version='"iceberg_format_version": "3"'
-  local required_table_format='"format_version": "3"'
-  local required_puffin_ndv='"puffin_ndv": "spark_compute_table_stats"'
-  local required_statistics='"statistics_file"'
-  local required_statistics_prefix='"statistics_file": "'
-  local required_empty_statistics='"statistics_file": ""'
-  local required_statistics_count="${#suite_tables[@]}"
-  "${compose_args[@]}" run --rm -T \
-    -e "MINIO_ROOT_USER=$AWS_S3_ACCESS_KEY_ID" \
-    -e "MINIO_ROOT_PASSWORD=$AWS_S3_SECRET_ACCESS_KEY" \
-    --entrypoint /bin/sh mc -c "
-    set -eu
-    /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
-    /usr/bin/mc stat '$path/_SUCCESS' >/dev/null
-    manifest_file=\$(/usr/bin/mc find '$path' --name 'part-*' | head -n 1)
-    [ -n \"\$manifest_file\" ]
-    manifest_json=\$(/usr/bin/mc cat \"\$manifest_file\")
-    count_occurrences() {
-      value=\$1
-      needle=\$2
-      count=0
-      while :; do
-        case \"\$value\" in
-          *\"\$needle\"*)
-            value=\${value#*\"\$needle\"}
-            count=\$((count + 1))
-            ;;
-          *) break ;;
-        esac
-      done
-      printf '%s' \"\$count\"
-    }
-    check_table_format_version() {
-      case \"\$manifest_json\" in
-        *'$required_format_version'*) ;;
-        *) exit 1 ;;
-      esac
-      table_format_count=\$(count_occurrences \"\$manifest_json\" '$required_table_format')
-      [ \"\$table_format_count\" -ge '$required_statistics_count' ]
-    }
-    check_statistics_files() {
-      case \"\$manifest_json\" in
-        *'$required_puffin_ndv'*) ;;
-        *) exit 1 ;;
-      esac
-      case \"\$manifest_json\" in
-        *'$required_empty_statistics'*) exit 1 ;;
-        *) ;;
-      esac
-      statistics_count=\$(count_occurrences \"\$manifest_json\" '$required_statistics')
-      [ \"\$statistics_count\" -ge '$required_statistics_count' ]
-      remaining=\$manifest_json
-      checked_statistics_count=0
-      while :; do
-        case \"\$remaining\" in
-          *'$required_statistics_prefix'*)
-            remaining=\${remaining#*'$required_statistics_prefix'}
-            stats_uri=\${remaining%%\\\"*}
-            ;;
-          *) break ;;
-        esac
-        [ -n \"\$stats_uri\" ]
-        case \"\$stats_uri\" in
-          s3a://*) stats_path=\"minio/\${stats_uri#s3a://}\" ;;
-          s3://*) stats_path=\"minio/\${stats_uri#s3://}\" ;;
-          *) exit 1 ;;
-        esac
-        /usr/bin/mc stat \"\$stats_path\" >/dev/null
-        checked_statistics_count=\$((checked_statistics_count + 1))
-      done
-      [ \"\$checked_statistics_count\" -ge '$required_statistics_count' ]
-    }
-    check_table_format_version
-    check_statistics_files
-    if [ -n '$required_encoding' ]; then
-      case \"\$manifest_json\" in
-        *'$required_encoding'*) ;;
-        *) exit 1 ;;
-      esac
-    fi
-  "
+validate_ready_json() {
+  local ready_json="$1"
+  python3 - "$resolved_dataset_file" "$ready_json" <<'PY'
+import json, sys
+r=json.load(open(sys.argv[1], encoding='utf-8')); value=json.loads(sys.argv[2])
+required={'schema_version','dataset_key','state','exact_warehouse','manifest_uri','contract','producer_fingerprint','publication','lease'}
+if set(value) < required or value['schema_version'] != 1 or value['dataset_key'] != r['dataset_key'] or value['state'] != 'ReadyValid': raise SystemExit(1)
+if value['contract'] != r['contract'] or value['producer_fingerprint'] != r['producer_fingerprint']: raise SystemExit(1)
+if value['publication'].get('ready_uri') != r['ready_uri'] or not value['publication'].get('identity'): raise SystemExit(1)
+if not value['exact_warehouse'].startswith(r['staging_parent'] + '/') or not value['manifest_uri'].startswith(value['exact_warehouse'] + '/'): raise SystemExit(1)
+print(value['exact_warehouse']); print(value['manifest_uri']); print(value['publication']['identity'])
+PY
+}
+
+normalize_s3_uri() {
+  case "$1" in
+    s3://*) printf '%s\n' "$1" ;;
+    s3a://*) printf 's3://%s\n' "${1#s3a://}" ;;
+    *) return 1 ;;
+  esac
+}
+
+check_manifest_objects() {
+  local manifest_prefix="$1" objects manifest_object manifest_json object_uris uri
+  objects="$(fixture_publication_list_prefix "${manifest_prefix%/}/")" || return 2
+  grep -Fxq "${manifest_prefix%/}/_SUCCESS" <<<"$objects" || return 2
+  manifest_object="$(awk -F/ '$NF ~ /^part-/ {print; exit}' <<<"$objects")"
+  [[ -n "$manifest_object" ]] || return 2
+  fixture_publication_get "$manifest_object" || return 2
+  manifest_json="$FIXTURE_PUBLICATION_BODY"
+  object_uris="$(python3 - "$resolved_dataset_file" "$manifest_json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1], encoding='utf-8'))
+manifest = json.loads(sys.argv[2])
+if manifest.get('dataset_key') != r['dataset_key']:
+    raise SystemExit(1)
+if manifest.get('fixture_contract') != r['contract']:
+    raise SystemExit(1)
+if manifest.get('producer_fingerprint') != r['producer_fingerprint']:
+    raise SystemExit(1)
+tables = manifest.get('tables')
+if not isinstance(tables, list) or {row.get('name') for row in tables} != set(r['contract']['tables']):
+    raise SystemExit(1)
+for row in tables:
+    metadata, statistics = row.get('metadata_uri'), row.get('statistics_file')
+    if not isinstance(metadata, str) or not metadata.startswith(('s3://', 's3a://')):
+        raise SystemExit(1)
+    if not isinstance(statistics, str) or not statistics.startswith(('s3://', 's3a://')):
+        raise SystemExit(1)
+    print(metadata)
+    print(statistics)
+PY
+)" || return 2
+  while IFS= read -r uri; do
+    [[ -n "$uri" ]] || continue
+    fixture_publication_head "$(normalize_s3_uri "$uri")" || return 2
+  done <<<"$object_uris"
 }
 
 check_readiness() {
-  log "Checking benchmark data readiness..."
-  create_target_catalog || return 1
-  run_sql "USE $(quote_ident "$target_catalog").$(quote_ident "$suite_database");" || return 1
-  local table
-  for table in "${suite_tables[@]}"; do
-    run_sql "SHOW CREATE TABLE $(quote_ident "$target_catalog").$(quote_ident "$suite_database").$(quote_ident "$table");" >/dev/null || return 1
-  done
-  check_manifest || return 1
-  log "Benchmark data is ready: suite=$suite scale=$scale catalog=$target_catalog"
+  local ready_json parsed
+  fixture_publication_get "$ready_uri" || return 1
+  ready_json="$FIXTURE_PUBLICATION_BODY"
+  ready_etag="$FIXTURE_PUBLICATION_ETAG"
+  parsed="$(validate_ready_json "$ready_json")" || return 2
+  ready_exact_warehouse="$(sed -n '1p' <<<"$parsed")"
+  ready_manifest_uri="$(sed -n '2p' <<<"$parsed")"
+  ready_identity="$(sed -n '3p' <<<"$parsed")"
+  # These are direct object checks; no FE/MySQL/catalog state is created here.
+  check_manifest_objects "$ready_manifest_uri" || return 2
+  return 0
 }
 
 sha256_file() {
@@ -658,6 +609,7 @@ upload_raw_files() {
     --entrypoint /bin/sh mc -c "
     set -eu
     /usr/bin/mc alias set minio http://minio:9000 \"\$MINIO_ROOT_USER\" \"\$MINIO_ROOT_PASSWORD\" >/dev/null
+    # raw_uri is this writer's unique staging prefix, never a shared dataset key.
     /usr/bin/mc rm --recursive --force '$target_path' >/dev/null 2>&1 || true
     /usr/bin/mc cp --recursive /benchmark-raw/ '$target_path/'
   "
@@ -700,37 +652,136 @@ run_spark_loader() {
       --conf 'spark.default.parallelism=$spark_default_parallelism' \
       '$loader_tmp_dir/write_standard_benchmark.py' \
       --suite '$suite' \
-      --scale '$scale' \
+      --scale '$normalized_scale' \
       --raw-base-uri '$raw_uri' \
-      --catalog '$target_catalog' \
+      --catalog '$spark_catalog' \
       --database '$suite_database' \
-      --warehouse '$warehouse_uri' \
+      --warehouse '$exact_warehouse' \
       --manifest-output '$manifest_uri' \
       --s3-endpoint '${NOVAROCKS_SPARK_S3_ENDPOINT:-http://minio:9000}' \
       --s3-access-key '$AWS_S3_ACCESS_KEY_ID' \
       --s3-secret-key '$AWS_S3_SECRET_ACCESS_KEY' \
       --generator '$generator_name' \
       --generator-version '$generator_version' \
+      --fixture-contract-json '$fixture_contract_file' \
       $schema_arg
   "
 }
 
-acquire_lock() {
-  if ! mkdir "$lock_dir" 2>/dev/null; then
-    die "bootstrap is already running or lock is stale: $lock_dir"
-  fi
-  trap 'rm -rf "$lock_dir"' EXIT
-}
-
 ensure_docker_services() {
+  if [[ -n "${BENCHMARK_FIXTURE_UP_COMMAND:-}" ]]; then
+    "$BENCHMARK_FIXTURE_UP_COMMAND"
+    return
+  fi
   "$WORKSPACE_ROOT/docker/iceberg-rest/up.sh"
 }
 
+new_identity() {
+  local random
+  random="$(openssl rand -hex 12 2>/dev/null || printf '%s' "$RANDOM$RANDOM$(date +%s)")"
+  printf '%s-%s' "$(date +%s)" "$random"
+}
+
+lease_is_live() {
+  fixture_lease_matches "$lease_id" "$dataset_key_json" "$owner_token" "$staging_identity" || return 1
+  fixture_lease_heartbeat "$lease_id" >/dev/null
+}
+
+run_with_lease() {
+  # Keep the exact fencing token alive while an expensive child is running.
+  # This wrapper is also the only place that kills owner-local children.
+  local started now interval expiry deadline child_status
+  interval="${NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS:-30}"
+  expiry="${NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS:-180}"
+  deadline="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-7200}"
+  [[ "$interval" =~ ^[0-9]+$ && "$expiry" =~ ^[0-9]+$ && "$deadline" =~ ^[0-9]+$ ]] || return 64
+  (( interval * 3 < expiry )) || return 64
+  "$@" &
+  owner_child_pid="$!"
+  started="$(fixture_lease_now)"
+  while kill -0 "$owner_child_pid" 2>/dev/null; do
+    sleep "$interval"
+    now="$(fixture_lease_now)"
+    if (( now - started > deadline )); then
+      kill "$owner_child_pid" 2>/dev/null || true; wait "$owner_child_pid" 2>/dev/null || true; return 124
+    fi
+    if ! lease_is_live; then
+      kill "$owner_child_pid" 2>/dev/null || true; wait "$owner_child_pid" 2>/dev/null || true; return 75
+    fi
+  done
+  wait "$owner_child_pid"; child_status="$?"
+  owner_child_pid=""
+  return "$child_status"
+}
+
+cleanup_owner() {
+  [[ -z "${owner_child_pid:-}" ]] || kill "$owner_child_pid" 2>/dev/null || true
+  [[ -z "${lease_id:-}" ]] || fixture_lease_release "$lease_id"
+  [[ -z "${fixture_contract_file:-}" ]] || rm -f "$fixture_contract_file"
+}
+
+publish_ready() {
+  local candidate="$1" mode="$2" observed_etag="${3:-}" status
+  lease_is_live || return 3
+  status="$(fixture_publication_put_conditional "$ready_uri" "$candidate" "$mode" "$observed_etag")" || return 4
+  case "$status" in
+    200|201) return 0 ;;
+    409|412)
+      # A conditional loser can only reuse a fully valid exact winner.
+      if check_readiness; then return 10; fi
+      return 5
+      ;;
+    *) return 4 ;;
+  esac
+}
+
+write_ready_candidate() {
+  local candidate="$1"
+  python3 - "$resolved_dataset_file" "$exact_warehouse" "$manifest_uri" "$lease_id" "$owner_token" "$staging_identity" > "$candidate" <<'PY'
+import json, sys
+r=json.load(open(sys.argv[1], encoding='utf-8'))
+warehouse, manifest, lease_id, owner, staging = sys.argv[2:]
+value={"schema_version": 1, "dataset_key": r["dataset_key"], "state": "ReadyValid", "exact_warehouse": warehouse,
+       "manifest_uri": manifest, "contract": r["contract"], "producer_fingerprint": r["producer_fingerprint"],
+       "publication": {"ready_uri": r["ready_uri"], "identity": staging},
+       "lease": {"container_id": lease_id, "owner": owner, "staging_identity": staging}}
+print(json.dumps(value, sort_keys=True, separators=(',', ':')))
+PY
+}
+
+wait_or_takeover() {
+  local started now observed old_id old_key old_owner old_staging
+  started="$(fixture_lease_now)"
+  while :; do
+    if check_readiness; then return 10; fi
+    observed="$(fixture_lease_inspect "$lease_name" 2>/dev/null || true)"
+    if [[ -n "$observed" ]]; then
+      read -r old_id old_key old_owner old_staging <<<"$observed"
+      if [[ "$old_key" == "$dataset_key_json" ]]; then
+        now="$(fixture_lease_now)"
+        if (( now - started >= ${NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS:-900} )); then return 1; fi
+        # The exact-id recheck and delete are deliberately inside the lease module.
+        if fixture_lease_takeover_stale "$old_id" "$dataset_key_json" "${NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS:-180}" "$old_owner" "$old_staging"; then
+          return 0
+        fi
+      else
+        return 1
+      fi
+    fi
+    sleep "${NOVA_ENV_BENCHMARK_LEASE_POLL_SECONDS:-2}"
+  done
+}
+
 main() {
+  # The runner treats stdout as a one-object protocol.  All command output,
+  # including Docker/Spark diagnostics, belongs on stderr.
+  exec 3>&1
+  exec 1>&2
   parse_args "$@"
   validate_suite_and_scale
   configure_suite
   source_env
+  load_resolved_dataset
   resolve_paths
 
   compose_args=(
@@ -745,26 +796,71 @@ main() {
     exit 0
   fi
 
-  acquire_lock
   ensure_docker_services
-
-  if [[ "$rebuild" != "1" ]]; then
-    if check_readiness; then
-      [[ "$check_only" == "1" ]] && exit 0
-      log "Existing benchmark data is ready; use --rebuild to regenerate."
-      exit 0
-    fi
-    log "Existing benchmark data is not ready; bootstrapping..."
+  ready_etag=""
+  if check_readiness; then
+    if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi
+    observed_ready_etag="$ready_etag"
+  else
+    ready_status="$?"
+    if [[ "$check_only" == 1 ]]; then emit_error ready_invalid "READY is absent or invalid"; exit 1; fi
+    if [[ "$ready_status" == 2 && "$rebuild" != 1 ]]; then emit_error ready_invalid "READY exists but fails the exact fixture contract"; exit 1; fi
+    # A ReadyInvalid object still has an observed ETag.  Explicit rebuild is
+    # permitted only as If-Match against precisely that object; absence has no
+    # ETag and therefore remains an If-None-Match publication.
+    observed_ready_etag="${ready_etag:-}"
   fi
 
-  [[ "$check_only" != "1" ]] || die "benchmark data is not ready"
+  staging_identity="$(new_identity)"
+  owner_token="$(new_identity)"
+  lease_name="$(fixture_lease_name "$NOVA_ENV_BENCHMARK_LEASE_NAMESPACE" "$dataset_key_json")"
+  lease_id=""
+  fixture_contract_file="$(mktemp)"; chmod 600 "$fixture_contract_file"; cp "$resolved_dataset_file" "$fixture_contract_file"
+  trap cleanup_owner EXIT INT TERM
+  while [[ -z "$lease_id" ]]; do
+    if lease_id="$(fixture_lease_acquire "$lease_name" "$dataset_key_json" "$owner_token" "$staging_identity" "$NOVA_ENV_BENCHMARK_LEASE_IMAGE")"; then break; fi
+    acquire_status="$?"
+    if [[ "$acquire_status" != 75 ]]; then emit_error writer_failed "unable to acquire fixture lease"; exit 1; fi
+    if wait_or_takeover; then continue; fi
+    wait_status="$?"
+    if [[ "$wait_status" == 10 ]] && check_readiness; then emit_result true false "$ready_etag"; exit 0; fi
+    emit_error wait_timeout "timed out waiting for the exact fixture lease"; exit 1
+  done
 
-  extract_generator_source
-  patch_generator_source
-  generate_raw_files
-  upload_raw_files
-  run_spark_loader
-  check_readiness
+  # The lease holder must always recheck: another writer can publish while we waited.
+  if check_readiness; then
+    if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi
+  else
+    holder_ready_status="$?"
+    if [[ "$holder_ready_status" == 2 && "$rebuild" != 1 ]]; then
+      emit_error ready_invalid "READY exists but fails the exact fixture contract"; exit 1
+    fi
+  fi
+
+  exact_warehouse="$staging_parent/$staging_identity/warehouse"
+  raw_uri="$staging_parent/$staging_identity/raw"
+  manifest_uri="$exact_warehouse/manifest"
+  spark_catalog="fixture_${fixture_contract_id:0:12}_${staging_identity//[^a-zA-Z0-9]/_}"
+  fixture_publication_curl_capable || [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]] || { emit_error publication_failed "curl lacks --aws-sigv4"; exit 1; }
+  extract_generator_source || { emit_error writer_failed "generator setup failed"; exit 1; }
+  patch_generator_source || { emit_error writer_failed "generator patch failed"; exit 1; }
+  run_with_lease generate_raw_files || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during raw generation" || emit_error writer_failed "raw generation failed"; exit 1; }
+  run_with_lease upload_raw_files || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during raw upload" || emit_error writer_failed "raw upload failed"; exit 1; }
+  run_with_lease run_spark_loader || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during Spark load" || emit_error writer_failed "Spark loader failed"; exit 1; }
+  fixture_publication_head "$manifest_uri/_SUCCESS" || { emit_error ready_invalid "candidate manifest is incomplete"; exit 1; }
+  candidate="$(mktemp)"; chmod 600 "$candidate"; trap 'rm -f "$candidate"; cleanup_owner' EXIT INT TERM
+  write_ready_candidate "$candidate"
+  if publish_ready "$candidate" "$( [[ "$rebuild" == 1 ]] && echo rebuild || echo absent )" "$observed_ready_etag"; then
+    check_readiness || { emit_error publication_failed "published READY failed direct validation"; exit 1; }
+    emit_result false true "$ready_etag"; exit 0
+  fi
+  publish_status="$?"
+  if [[ "$publish_status" == 3 ]]; then emit_error lease_lost "lease fencing failed before READY publication";
+  elif [[ "$publish_status" == 5 ]]; then emit_error publication_conflict "conditional READY publication lost without a valid winner";
+  else emit_error publication_failed "conditional READY publication failed"; fi
+  exit 1
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

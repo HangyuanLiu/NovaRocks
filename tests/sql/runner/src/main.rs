@@ -36,7 +36,8 @@ mod types;
 mod engine_error_codes;
 
 use crate::benchmark_bootstrap::{
-    BenchmarkBootstrapOptions, ensure_benchmark_data, parse_scale_overrides,
+    BenchmarkBootstrapOptions, ReadyBenchmarkFixture, dry_run_benchmark_fixture,
+    ensure_benchmark_data, parse_scale_overrides,
 };
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
@@ -65,7 +66,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::net::TcpStream;
@@ -604,6 +605,19 @@ fn ensure_iceberg_object_store_prereqs(runner_config: &RunnerConfig) -> Result<(
          hint: start it with:\n  \
          mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
         endpoint
+    );
+}
+
+fn inject_benchmark_fixture_placeholder(
+    variables: &mut HashMap<String, String>,
+    fixture: Option<&ReadyBenchmarkFixture>,
+) {
+    let Some(fixture) = fixture else {
+        return;
+    };
+    variables.insert(
+        "benchmark_iceberg_catalog_warehouse".to_string(),
+        fixture.exact_warehouse.clone(),
     );
 }
 
@@ -4012,7 +4026,9 @@ fn run() -> Result<i32> {
             return Ok(1);
         }
     };
-    ensure_iceberg_object_store_prereqs(&runner_config)?;
+    if !cli.dry_run {
+        ensure_iceberg_object_store_prereqs(&runner_config)?;
+    }
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
@@ -4211,7 +4227,23 @@ fn run() -> Result<i32> {
                 suite.sql_glob.clone()
             };
 
-            let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+            let benchmark_fixture = if cli.dry_run {
+                dry_run_benchmark_fixture(
+                    &runner_config,
+                    &base_dir,
+                    &suite.name,
+                    &benchmark_bootstrap_options,
+                )?
+            } else {
+                ensure_benchmark_data(
+                    &benchmark_bootstrap_options,
+                    &runner_config,
+                    &base_dir,
+                    &suite.name,
+                )?
+            };
+            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+            inject_benchmark_fixture_placeholder(&mut placeholder_vars, benchmark_fixture.as_ref());
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -4448,21 +4480,6 @@ fn run() -> Result<i32> {
                     .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
             }
 
-            if !cli.dry_run {
-                ensure_benchmark_data(
-                    &benchmark_bootstrap_options,
-                    &runner_config,
-                    &base_dir,
-                    &suite.name,
-                    &target_catalog_name,
-                    &target_host,
-                    &target_port,
-                    &target_user,
-                    target_password.as_deref(),
-                )
-                .with_context(|| format!("failed to prepare benchmark data for {}", suite.name))?;
-            }
-
             // Print suite header
             println!("{}", "=".repeat(72));
             println!(
@@ -4488,6 +4505,23 @@ fn run() -> Result<i32> {
                 println!("result_dir={}", dir.display());
             }
             println!("query_timeout={}s", query_timeout);
+            if let Some(fixture) = benchmark_fixture.as_ref() {
+                println!(
+                    "benchmark_fixture.key={}",
+                    serde_json::to_string(&fixture.dataset_key)
+                        .expect("BTreeMap serializes to JSON")
+                );
+                println!("benchmark_fixture.ready_uri={}", fixture.ready_uri);
+                println!(
+                    "benchmark_fixture.publication_identity={}",
+                    fixture.publication_identity
+                );
+                println!("benchmark_fixture.reused={}", fixture.reused);
+                println!("benchmark_fixture.built={}", fixture.built);
+                if cli.dry_run {
+                    println!("benchmark_fixture.warehouse=unresolved");
+                }
+            }
             println!("{}", summarize_connection("target", &target_conn_base));
             if cli.mode == Mode::Diff
                 || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)

@@ -432,6 +432,12 @@ run_cargo_gates() {
     tools/ci/tests/system-scenarios-stage-test.sh
   run_fail_fast_stage "SQL helper environment binding" "sql-helper-env-file.log" \
     docker/iceberg-rest/tests/sql-helper-env-file-test.sh
+  run_fail_fast_stage "shared benchmark environment guard" "shared-benchmark-environment.log" \
+    docker/iceberg-rest/tests/shared-benchmark-environment-test.sh
+  run_fail_fast_stage "shared benchmark fixture lifecycle" "shared-benchmark-fixture-lifecycle.log" \
+    tests/sql/fixtures/benchmarks/tests/bootstrap-lifecycle-test.sh
+  run_fail_fast_stage "shared benchmark fixture contract" "shared-benchmark-fixture-contract.log" \
+    python3 tests/sql/fixtures/benchmarks/tests/fixture-contract-test.py
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
