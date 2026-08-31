@@ -16,7 +16,9 @@
 // under the License.
 
 use novarocks_server::app_config::NovaRocksConfig;
+use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
+use novarocks_types::ClusterRole;
 use std::process::Command;
 
 #[test]
@@ -33,24 +35,17 @@ fn server_load_resolves_environment_references_once_without_secret_diagnostics()
         match std::env::var(CHILD_SCENARIO_ENV).as_deref() {
             Ok("success") => {
                 let config = result?;
-                let object_store = config
+                let registry = config
                     .connector
-                    .object_store
-                    .expect("object store configuration");
-                assert_eq!(
-                    object_store
-                        .access_key_id
-                        .as_ref()
-                        .map(|value| value.expose_secret()),
-                    Some(CANARY)
-                );
-                assert_eq!(
-                    object_store
-                        .access_key_secret
-                        .as_ref()
-                        .map(|value| value.expose_secret()),
-                    Some(CANARY)
-                );
+                    .credential_registry(ClusterRole::Fe)
+                    .map_err(anyhow::Error::msg)?;
+                let reference = StaticCredentialReference::try_new("warehouse", "blue")?;
+                let object_store = registry
+                    .resolve(CatalogCredentialPurpose::ObjectStoreData, &reference)
+                    .and_then(|material| material.as_s3())
+                    .expect("object-store credential");
+                assert_eq!(object_store.access_key_id().expose_secret(), CANARY);
+                assert_eq!(object_store.access_key_secret().expose_secret(), CANARY);
                 assert!(!format!("{object_store:?}").contains(CANARY));
             }
             Ok("missing") => assert_error_category(result, "missing"),
@@ -65,8 +60,11 @@ fn server_load_resolves_environment_references_once_without_secret_diagnostics()
         (
             "success",
             r#"
-[connector.object_store]
-endpoint = "http://object-store:9000"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
 access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
 access_key_secret = "${ENV:NOVAROCKS_NWT1_ACCESS_SECRET}"
 "#,
@@ -76,8 +74,13 @@ access_key_secret = "${ENV:NOVAROCKS_NWT1_ACCESS_SECRET}"
         (
             "missing",
             r#"
-[connector.object_store]
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
 access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+access_key_secret = "secret"
 "#,
             None,
             None,
@@ -85,8 +88,13 @@ access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
         (
             "empty",
             r#"
-[connector.object_store]
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
 access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+access_key_secret = "secret"
 "#,
             Some(""),
             None,
@@ -94,8 +102,13 @@ access_key_id = "${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
         (
             "malformed",
             r#"
-[connector.object_store]
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse"
+generation = "blue"
+kind = "s3"
 access_key_id = "prefix-${ENV:NOVAROCKS_NWT1_ACCESS_KEY}"
+access_key_secret = "secret"
 "#,
             Some(CANARY),
             None,

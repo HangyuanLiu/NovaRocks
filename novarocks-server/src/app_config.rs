@@ -2207,7 +2207,7 @@ generation = "blue"
 kind = "iceberg-rest-bearer"
 token = "token"
 "#,
-                "role Be cannot own CatalogControl",
+                "role Be cannot own CatalogControl credential",
             ),
             (
                 "duplicate-static-reference",
@@ -2265,10 +2265,12 @@ access_key_secret = ""
         for (name, document, expected) in cases {
             let config = tempfile::NamedTempFile::new().expect("temporary config");
             std::fs::write(config.path(), document).expect("write config");
-            let error = NovaRocksConfig::load_from_file(config.path())
-                .expect_err("invalid credential configuration must fail startup");
+            let error = match NovaRocksConfig::load_from_file(config.path()) {
+                Ok(_) => panic!("invalid credential configuration must fail startup"),
+                Err(error) => error,
+            };
             assert!(
-                error.to_string().contains(expected),
+                format!("{error:#}").contains(expected),
                 "{name}: expected {expected:?}, got {error:#}"
             );
         }

@@ -939,32 +939,4 @@ mod tests {
             1
         );
     }
-
-    #[test]
-    fn frontend_factory_resource_failure_is_reported_before_role_startup() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let mut config = crate::app_config::NovaRocksConfig::default();
-        config.connector.object_store = Some(crate::app_config::ConnectorObjectStoreConfig {
-            endpoint: Some("http://minio:9000".to_string()),
-            access_key_id: None,
-            access_key_secret: None,
-            region: None,
-            enable_path_style_access: Some(true),
-        });
-
-        let error = match compose_frontend_control_factories(
-            &config,
-            runtime.handle().clone(),
-            std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new()),
-        ) {
-            Ok(_) => panic!("incomplete frontend resources must fail before role startup"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("object-store credentials missing aws.s3.access_key"),
-            "{error}"
-        );
-    }
 }
