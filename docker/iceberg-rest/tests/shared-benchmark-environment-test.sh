@@ -139,6 +139,13 @@ if PATH="$fakebin:$PATH" NOVAROCKS_WORKSPACE_ROOT="$workspace_b" NOVA_ENV_CONFIG
 fi
 grep -F 'refusing to delete canonical shared Docker volume' "$tmpdir/canonical.err" >/dev/null
 
+if PATH="$fakebin:$PATH" NOVAROCKS_WORKSPACE_ROOT="$workspace_b" NOVA_ENV_CONFIG_FILE="$canonical_config" \
+  "$REPO_ROOT/docker/iceberg-rest/down.sh" --docker --purge >"$tmpdir/canonical-purge.out" 2>"$tmpdir/canonical-purge.err"; then
+  echo "canonical project docker purge must not bypass the volume guard" >&2
+  exit 1
+fi
+grep -F 'refusing to delete canonical shared Docker volume' "$tmpdir/canonical-purge.err" >/dev/null
+
 : >"$DOCKER_CALLS"
 PATH="$fakebin:$PATH" NOVAROCKS_WORKSPACE_ROOT="$workspace_b" NOVA_ENV_CONFIG_FILE="$config_file" \
   "$REPO_ROOT/docker/iceberg-rest/down.sh" --docker >"$tmpdir/preserve.out" 2>"$tmpdir/preserve.err"

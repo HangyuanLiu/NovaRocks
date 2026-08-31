@@ -89,7 +89,7 @@ fixture_lease_release() {
 }
 
 fixture_lease_takeover_stale() {
-  local exact_old_id="$1" expected_key="$2" expiry_seconds="$3" now heartbeat observed id key
+  local exact_old_id="$1" expected_key="$2" expiry_seconds="$3" now heartbeat rechecked observed id key
   # A stale owner's owner/staging labels are intentionally unknown to a waiter;
   # only its immutable exact id and dataset key authorize the takeover attempt.
   observed="$(fixture_lease_inspect "$exact_old_id" 2>/dev/null)" || return 1
@@ -99,7 +99,12 @@ fixture_lease_takeover_stale() {
   [[ "$heartbeat" =~ ^[0-9]+$ ]] || return 1
   now="$(fixture_lease_now)"
   (( now - heartbeat > expiry_seconds )) || return 1
-  # Re-read the exact id immediately before removal.  Do not resolve the name again.
-  fixture_lease_heartbeat_epoch "$exact_old_id" >/dev/null 2>&1 || return 1
+  # Re-read and re-evaluate the exact id immediately before removal. Do not
+  # resolve the name again: a live owner that refreshed in this interval must
+  # never be deleted by a stale waiter.
+  rechecked="$(fixture_lease_heartbeat_epoch "$exact_old_id")" || return 1
+  [[ "$rechecked" =~ ^[0-9]+$ ]] || return 1
+  now="$(fixture_lease_now)"
+  (( now - rechecked > expiry_seconds )) || return 1
   fixture_lease_docker container rm -f "$exact_old_id" >/dev/null
 }

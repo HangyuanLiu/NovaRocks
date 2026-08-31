@@ -101,6 +101,13 @@ for arg in "$@"; do
   esac
 done
 
+if [[ "$purge_requested" == true && "$stop_docker" == true ]]; then
+  # `--docker --purge` has always meant a full Docker teardown. Treat its
+  # implied volume deletion exactly like an explicit `--volumes` request.
+  down_args+=("--volumes")
+  volume_delete_requested=true
+fi
+
 if [[ "$volume_delete_requested" == true ]]; then
   expected_project="${NOVA_ENV_EXPECTED_COMPOSE_PROJECT:-}"
   expected_volume="${NOVA_ENV_EXPECTED_MINIO_VOLUME:-}"
@@ -118,10 +125,6 @@ if [[ "$volume_delete_requested" == true ]]; then
     exit 2
   fi
   echo "Volume deletion authorized for exact project: $compose_project; volume: $actual_volume"
-fi
-
-if [[ "$purge_requested" == true && "$stop_docker" == true ]]; then
-  down_args+=("--volumes")
 fi
 
 purge_object_store_prefixes() {

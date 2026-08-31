@@ -100,6 +100,22 @@ fixture_lease_release "$id" # stale release must not remove id2
 fixture_lease_matches "$id2" "$key" owner-b stage-b || fail 'exact-id release fence'
 fixture_lease_release "$id2"
 
+# A stale waiter must re-evaluate the heartbeat immediately before exact-ID
+# removal. A live owner that refreshed during that interval stays fenced in.
+id3="$(fixture_lease_acquire "$name" "$key" owner-c stage-c 'example.invalid/lease@sha256:deadbeef')"
+lease_race_counter="$TMP/lease-race-counter"
+fixture_lease_now() { printf '100\n'; }
+fixture_lease_heartbeat_epoch() {
+  local count=0
+  [[ -f "$lease_race_counter" ]] && count="$(cat "$lease_race_counter")"
+  printf '%s' "$((count + 1))" > "$lease_race_counter"
+  if [[ "$count" == 0 ]]; then printf '1\n'; else printf '100\n'; fi
+}
+if fixture_lease_takeover_stale "$id3" "$key" 10; then fail 'live heartbeat refresh lost its lease'; fi
+[[ -f "$FAKE_DOCKER_STATE/$id3" ]] || fail 'refreshed exact lease was removed'
+unset -f fixture_lease_now fixture_lease_heartbeat_epoch
+fixture_lease_release "$id3"
+
 # Runner-facing --check is typed JSON and uses only direct storage objects.
 env_file="$TMP/env.sh"
 cat > "$env_file" <<EOF
