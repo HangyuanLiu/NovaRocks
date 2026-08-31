@@ -1,9 +1,10 @@
-//! Descriptor-driven canonical projection for native protobuf messages.
+//! Lifecycle-private descriptor-driven canonical projection.
 //!
 //! Generated DTOs remain the schema representation. This module turns a
-//! decoded DTO into a deterministic semantic byte stream for lifecycle digest
-//! consumers: fields are ordered by tag, maps by key, and ordinary repeated
-//! fields retain their sequence order.
+//! decoded DTO into a deterministic semantic byte stream for the Manifest and
+//! Stage digest consumers: fields are ordered by tag, maps by key, and
+//! ordinary repeated fields retain their sequence order.
+// Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
 
 use std::fmt;
 
@@ -13,7 +14,7 @@ use prost_reflect::{DescriptorPool, DynamicMessage, MapKey, Value};
 use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CanonicalError {
+pub(super) struct CanonicalError {
     detail: String,
 }
 
@@ -24,7 +25,8 @@ impl CanonicalError {
         }
     }
 
-    pub fn detail(&self) -> &str {
+    #[cfg(test)]
+    fn detail(&self) -> &str {
         &self.detail
     }
 }
@@ -44,7 +46,7 @@ static NATIVE_DESCRIPTOR_POOL: Lazy<DescriptorPool> = Lazy::new(|| {
 
 /// Computes a SHA-256 digest over a domain-separated canonical projection of
 /// one generated protobuf message.
-pub fn digest_message<M: Message>(
+pub(super) fn digest_message<M: Message>(
     domain: &[u8],
     message_name: &str,
     message: &M,
@@ -56,8 +58,9 @@ pub fn digest_message<M: Message>(
 }
 
 /// Adds a canonical protobuf message projection to an existing digest. This
-/// is crate-visible for compound lifecycle digests such as StageDigest.
-pub(crate) fn hash_message<M: Message>(
+/// is visible only to the lifecycle module for compound digests such as
+/// StageDigest.
+pub(super) fn hash_message<M: Message>(
     hasher: &mut Sha256,
     message_name: &str,
     message: &M,

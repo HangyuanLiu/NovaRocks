@@ -7,9 +7,9 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use super::canonical;
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
-use crate::canonical;
 use crate::catalog::CatalogSet;
 use crate::membership::{BackendProcessId, required_native_compatibility_id};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
@@ -144,7 +144,7 @@ impl ParticipantBackendIdentity {
 ///
 /// This value intentionally excludes endpoint and backend ordinal: both are
 /// routing facts and cannot identify a BE process incarnation.
-// Design: ADR-0127 (docs/adr/ADR-0127-participant-attempt-stage-fence.md)
+// Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParticipantAttemptRef {
     raw: novarocks::ParticipantAttemptRef,
@@ -652,6 +652,7 @@ impl ParticipantManifest {
     /// Computes the descriptor-driven digest of the complete generated
     /// manifest, so new schema fields enter the fence without a hand-written
     /// projection update.
+    // Design: ADR-0128 (docs/adr/ADR-0128-lifecycle-canonical-engine-private-typed-digests.md)
     pub fn digest(&self) -> Result<ParticipantManifestDigest, ProtocolError> {
         canonical::digest_message(
             PARTICIPANT_MANIFEST_V1_DOMAIN,
@@ -1044,6 +1045,20 @@ mod tests {
         assert_ne!(
             changed_again.digest().expect("digest"),
             changed_install.digest().expect("digest")
+        );
+    }
+
+    #[test]
+    fn manifest_digest_matches_fixed_canonical_golden() {
+        let manifest = ParticipantManifest::parse(manifest()).expect("valid manifest");
+        let digest = manifest.digest().expect("digest");
+        assert_eq!(
+            digest
+                .as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>(),
+            "da5916181193fe76e19ba26d713048062cb36a8570a81b8631e78059e4563656"
         );
     }
 

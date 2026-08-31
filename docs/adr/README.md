@@ -64,7 +64,7 @@ code-anchors:
 - ADR-0027 — Runtime Filter 规划为何由 SQL 私有拥有、角色之间只交换封存 wire facts（active）
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
-- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
+- ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 
 #### 历史
@@ -75,6 +75,7 @@ code-anchors:
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
+- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
 - ADR-0053 — MV snapshot change window 复用 exact-generation scan planning（superseded → ADR-0114）
 - ADR-0039 — scan unit 的 immutable、bounded physical domain facts（superseded → ADR-0114）
 - ADR-0034 — cluster composite split 与 Backend local scan unit 的两级生命周期（superseded → ADR-0114）
@@ -106,7 +107,7 @@ code-anchors:
 - ADR-0024 — 无需 BE staging 的 data mutation 为何使用 FE-only frozen plan 与 marker-only reconcile（active）
 - ADR-0028 — metadata maintenance 为何由 FE 以 exact lease、durable plan 与 marker reconcile 执行（active）
 - ADR-0029 — distributed rewrite 为何以 frozen groups、C1 cohorts 与 FE aggregate commit 实现单 snapshot（active）
-- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
+- ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
@@ -145,6 +146,7 @@ code-anchors:
 - ADR-0120 — Frontend restart 后为何仅由 Backend 回收无 query lease 的旧 connector generation（superseded → ADR-0125）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
+- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
 ### distributed-query-lifecycle
 
 领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，
@@ -157,7 +159,7 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
-- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
+- ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0114 — participant 分类为何以载荷为唯一权威表示，删除自证式派生的 participant_roles 字段（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
@@ -176,6 +178,7 @@ code-anchors:
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
+- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
 
 ### sql-compiler
 
@@ -364,7 +367,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active）
-- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
+- ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
 - ADR-0112 — native FE/BE role launch、management surface 与 ephemeral backend membership 为何保持同一启动路径（active）
 - ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active）
@@ -376,6 +379,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
+- ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
 - ADR-0093 — StateStore provider 为何作为 leaf crate、Frontend 直接拥有 consumer runtime（superseded → ADR-0122）
 
 ### configuration
