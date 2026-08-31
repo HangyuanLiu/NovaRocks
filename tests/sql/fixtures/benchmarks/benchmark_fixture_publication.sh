@@ -76,10 +76,12 @@ print(quote(sys.argv[1], safe='/'))
 PY
 )"
   config="$(mktemp)"; headers="$(mktemp)"; body="$(mktemp)"
-  trap 'rm -f "$config" "$headers" "$body"' RETURN
   fixture_publication_make_curl_config "$config" GET "s3://$bucket" "" "" "?list-type=2&prefix=$encoded_prefix"
   status="$(curl --config "$config" --dump-header "$headers" --output "$body" --write-out '%{http_code}' 2>/dev/null || true)"
-  [[ "$status" == 200 ]] || return 44
+  if [[ "$status" != 200 ]]; then
+    rm -f "$config" "$headers" "$body"
+    return 44
+  fi
   python3 - "$bucket" "$body" <<'PY'
 import sys
 from xml.etree import ElementTree
@@ -89,6 +91,9 @@ for node in root.iter():
     if node.tag.rsplit('}', 1)[-1] == 'Key' and node.text:
         print(f's3://{bucket}/{node.text}')
 PY
+  status=$?
+  rm -f "$config" "$headers" "$body"
+  return "$status"
 }
 
 fixture_publication_get() {
@@ -106,13 +111,19 @@ fixture_publication_get() {
   fixture_publication_curl_capable || return 64
   local config headers body status
   config="$(mktemp)"; headers="$(mktemp)"; body="$(mktemp)"
-  trap 'rm -f "$config" "$headers" "$body"' RETURN
   fixture_publication_make_curl_config "$config" GET "$uri"
   status="$(curl --config "$config" --dump-header "$headers" --output "$body" --write-out '%{http_code}' 2>/dev/null || true)"
-  [[ "$status" == 200 ]] || return 44
+  if [[ "$status" != 200 ]]; then
+    rm -f "$config" "$headers" "$body"
+    return 44
+  fi
   FIXTURE_PUBLICATION_ETAG="$(awk 'BEGIN{IGNORECASE=1} /^etag:/ {gsub("\\r", ""); sub(/^[^:]*:[[:space:]]*/, ""); gsub(/\"/, ""); print; exit}' "$headers")"
-  [[ -n "$FIXTURE_PUBLICATION_ETAG" ]] || return 1
+  if [[ -z "$FIXTURE_PUBLICATION_ETAG" ]]; then
+    rm -f "$config" "$headers" "$body"
+    return 1
+  fi
   FIXTURE_PUBLICATION_BODY="$(cat "$body")"
+  rm -f "$config" "$headers" "$body"
 }
 
 fixture_publication_head() {
@@ -123,9 +134,10 @@ fixture_publication_head() {
   fi
   fixture_publication_curl_capable || return 64
   local config status
-  config="$(mktemp)"; trap 'rm -f "$config"' RETURN
+  config="$(mktemp)"
   fixture_publication_make_curl_config "$config" HEAD "$uri"
   status="$(curl --config "$config" --output /dev/null --write-out '%{http_code}' 2>/dev/null || true)"
+  rm -f "$config"
   [[ "$status" == 200 ]]
 }
 
@@ -143,7 +155,6 @@ fixture_publication_put_conditional() {
     path="$(fixture_publication_uri_path "$uri")"; lock="$path.conditional-lock"
     mkdir -p "$(dirname "$path")"
     if ! mkdir "$lock" 2>/dev/null; then printf '409\n'; return; fi
-    trap 'rmdir "$lock" 2>/dev/null || true' RETURN
     if [[ -f "$path.etag" ]]; then
       etag="$(cat "$path.etag")"
     elif [[ -f "$path" ]]; then
@@ -151,14 +162,20 @@ fixture_publication_put_conditional() {
     else
       etag=""
     fi
-    if [[ "$mode" == absent && -e "$path" ]]; then printf '412\n'; return; fi
-    if [[ "$mode" == rebuild && "$etag" != "$observed_etag" ]]; then printf '412\n'; return; fi
-    cp "$body" "$path"; sha256sum "$path" | awk '{print $1}' > "$path.etag"; printf '200\n'; return
+    if [[ "$mode" == absent && -e "$path" ]]; then rmdir "$lock"; printf '412\n'; return; fi
+    if [[ "$mode" == rebuild && "$etag" != "$observed_etag" ]]; then rmdir "$lock"; printf '412\n'; return; fi
+    if ! cp "$body" "$path" || ! sha256sum "$path" | awk '{print $1}' > "$path.etag"; then
+      rmdir "$lock" 2>/dev/null || true
+      return 1
+    fi
+    rmdir "$lock"
+    printf '200\n'; return
   fi
   fixture_publication_curl_capable || return 64
   local config status
-  config="$(mktemp)"; trap 'rm -f "$config"' RETURN
+  config="$(mktemp)"
   fixture_publication_make_curl_config "$config" PUT "$uri" "$header" "$body"
   status="$(curl --config "$config" --output /dev/null --write-out '%{http_code}' 2>/dev/null || true)"
+  rm -f "$config"
   printf '%s\n' "$status"
 }
