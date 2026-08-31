@@ -1212,8 +1212,8 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn installed_read_execution() -> crate::connector::InstalledReadExecution {
-        crate::connector::InstalledReadExecution::new(
+    pub(crate) fn installed_read_execution() -> crate::connector::ConnectorExecutionReadBinding {
+        crate::connector::ConnectorExecutionReadBinding::new(
             std::sync::Arc::new(FixtureFactory),
             std::sync::Arc::new(fixture_codec()),
         )

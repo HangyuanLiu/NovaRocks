@@ -82,7 +82,7 @@ pub(crate) type RuntimeFilterSessionResolver = Arc<
 pub(crate) type CatalogReadExecutionResolver = Arc<
     dyn Fn(
             &novarocks_spi::connector::CatalogHandle,
-        ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String>
+        ) -> Result<crate::connector::ConnectorExecutionReadBinding, String>
         + Send
         + Sync,
 >;
@@ -92,7 +92,7 @@ pub(crate) type CatalogReadExecutionResolver = Arc<
 pub(crate) type CatalogWriteExecutionResolver = Arc<
     dyn Fn(
             &novarocks_spi::connector::CatalogHandle,
-        ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String>
+        ) -> Result<crate::connector::ConnectorExecutionWriteBinding, String>
         + Send
         + Sync,
 >;
@@ -125,14 +125,14 @@ impl TypedScanRuntime {
     pub(crate) fn catalog_read_execution(
         &self,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
+    ) -> Result<crate::connector::ConnectorExecutionReadBinding, String> {
         (self.catalog_read_execution)(handle)
     }
 
     pub(crate) fn catalog_write_execution(
         &self,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String> {
+    ) -> Result<crate::connector::ConnectorExecutionWriteBinding, String> {
         (self.catalog_write_execution)(handle)
     }
 
@@ -165,7 +165,7 @@ impl TypedScanRuntime {
     pub(crate) fn register_read_execution(
         &self,
         plan_node_id: i32,
-        execution: crate::connector::typed_registry::InstalledReadExecution,
+        execution: crate::connector::ConnectorExecutionReadBinding,
     ) -> Result<(), String> {
         self.read_context.register(plan_node_id, execution)
     }

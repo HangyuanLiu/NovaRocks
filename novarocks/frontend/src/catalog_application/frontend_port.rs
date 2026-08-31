@@ -33,6 +33,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::desired_state::{
     CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
@@ -44,6 +45,9 @@ use super::{
     CatalogRuntimePublisherSink,
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use novarocks_connector_binding::{
+    ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
+};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
@@ -58,6 +62,99 @@ use crate::catalog_attachment::{
     CatalogAttachmentRepository,
 };
 use crate::connector::ConnectorControlHost;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CatalogMaterializationConfig {
+    pub attempt_timeout: Duration,
+    pub retry_initial_backoff: Duration,
+    pub retry_max_backoff: Duration,
+    pub max_inflight: usize,
+}
+
+impl CatalogMaterializationConfig {
+    pub fn try_new(
+        attempt_timeout: Duration,
+        retry_initial_backoff: Duration,
+        retry_max_backoff: Duration,
+        max_inflight: usize,
+    ) -> Result<Self, CatalogApplicationError> {
+        if attempt_timeout.is_zero()
+            || retry_initial_backoff.is_zero()
+            || retry_max_backoff.is_zero()
+            || retry_initial_backoff > retry_max_backoff
+            || max_inflight == 0
+        {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::InvalidRequest,
+                "catalog materialization bounds must be nonzero and retry initial must not exceed retry max",
+            ));
+        }
+        Ok(Self {
+            attempt_timeout,
+            retry_initial_backoff,
+            retry_max_backoff,
+            max_inflight,
+        })
+    }
+}
+
+impl Default for CatalogMaterializationConfig {
+    fn default() -> Self {
+        Self::try_new(
+            Duration::from_secs(10),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            64,
+        )
+        .expect("default catalog materialization bounds are valid")
+    }
+}
+
+/// Per-exact-key state owned by the FE projection loop. The entry deliberately
+/// stores no provider binding: a binding is published only after the attempt
+/// completes and its token is still current.
+struct ProjectionAttempt {
+    instance_id: ConnectorInstanceId,
+    attachment_id: Uuid,
+    token: u64,
+    context: MaterializationContext,
+    completion_waiters: Vec<
+        tokio::sync::oneshot::Sender<Result<CatalogRuntimeObservation, CatalogApplicationError>>,
+    >,
+}
+
+struct MaterializationSubmission {
+    entry: CatalogDesiredStateEntry,
+    provider_id: ConnectorProviderId,
+    properties: NormalizedCatalogProperties,
+    factory: Arc<dyn novarocks_connector_binding::ConnectorControlRoleBindingFactory>,
+    key: CatalogHandle,
+    token: u64,
+    context: MaterializationContext,
+}
+
+struct ProjectionScheduler {
+    attempts: Mutex<BTreeMap<CatalogHandle, ProjectionAttempt>>,
+    next_token: AtomicU64,
+    permits: Arc<tokio::sync::Semaphore>,
+    config: CatalogMaterializationConfig,
+}
+
+enum CreatedControlBinding {
+    Legacy(novarocks_spi::connector::ConnectorControlBinding),
+    Role(novarocks_connector_binding::ConnectorControlRoleBinding),
+}
+
+impl ProjectionScheduler {
+    fn new(config: CatalogMaterializationConfig) -> Self {
+        Self {
+            attempts: Mutex::new(BTreeMap::new()),
+            next_token: AtomicU64::new(1),
+            permits: Arc::new(tokio::sync::Semaphore::new(config.max_inflight)),
+            config,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalProjection {
@@ -114,6 +211,7 @@ pub struct FrontendCatalogApplicationPort {
     projections: Mutex<BTreeMap<ConnectorInstanceId, LocalProjection>>,
     complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
+    scheduler: ProjectionScheduler,
 }
 
 impl FrontendCatalogApplicationPort {
@@ -130,6 +228,7 @@ impl FrontendCatalogApplicationPort {
             projections: Mutex::new(BTreeMap::new()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
+            scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
         }
     }
 
@@ -139,6 +238,22 @@ impl FrontendCatalogApplicationPort {
         runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
         runtime: Handle,
     ) -> Self {
+        Self::new_with_materialization_config(
+            source,
+            control,
+            runtime_publisher,
+            runtime,
+            CatalogMaterializationConfig::default(),
+        )
+    }
+
+    pub fn new_with_materialization_config(
+        source: CatalogDesiredStateSource,
+        control: Arc<ConnectorControlHost>,
+        runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
+        runtime: Handle,
+        materialization_config: CatalogMaterializationConfig,
+    ) -> Self {
         Self {
             source: Some(source),
             control,
@@ -147,6 +262,7 @@ impl FrontendCatalogApplicationPort {
             projections: Mutex::new(BTreeMap::new()),
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
+            scheduler: ProjectionScheduler::new(materialization_config),
         }
     }
 
@@ -196,6 +312,22 @@ impl FrontendCatalogApplicationPort {
             Err(_) => self.runtime.block_on(future),
         };
         result.map_err(repository_error)
+    }
+
+    fn block_on_catalog<T>(
+        &self,
+        future: impl Future<Output = Result<T, CatalogApplicationError>>,
+    ) -> Result<T, CatalogApplicationError> {
+        match Handle::try_current() {
+            Ok(_) if self.runtime.runtime_flavor() == RuntimeFlavor::CurrentThread => {
+                Err(CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Unavailable,
+                    "catalog materialization is unavailable on a current-thread Tokio runtime",
+                ))
+            }
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
+        }
     }
 
     fn next_projection_generation(&self) -> u64 {
@@ -270,12 +402,16 @@ impl FrontendCatalogApplicationPort {
     fn install_created(
         &self,
         entry: &CatalogDesiredStateEntry,
-        binding: novarocks_spi::connector::ConnectorControlBinding,
+        binding: CreatedControlBinding,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id();
         let provider_id = entry.config().provider_id();
-        self.control.register(binding).map_err(connector_error)?;
+        match binding {
+            CreatedControlBinding::Legacy(binding) => self.control.register(binding),
+            CreatedControlBinding::Role(binding) => self.control.register_role_binding(binding),
+        }
+        .map_err(connector_error)?;
         let generation = self.next_projection_generation();
         let observation = CatalogRuntimeObservation {
             attachment_id,
@@ -492,6 +628,277 @@ impl FrontendCatalogApplicationPort {
         Ok(())
     }
 
+    fn enqueue_materialization(
+        self: &Arc<Self>,
+        entry: CatalogDesiredStateEntry,
+        mode: CatalogDesiredStateSourceMode,
+    ) -> Result<bool, CatalogApplicationError> {
+        let (submitted, work) = self.submit_materialization(entry, mode, None)?;
+        if let Some(work) = work {
+            let projection = Arc::clone(self);
+            self.runtime.spawn(async move {
+                projection.run_materialization(work).await;
+            });
+        }
+        Ok(submitted)
+    }
+
+    /// Submits an exact desired-state key to the one scheduler. A caller that
+    /// must preserve CREATE's synchronous success contract receives a ticket
+    /// for this same attempt; it never constructs a separate provider path.
+    fn submit_materialization(
+        &self,
+        entry: CatalogDesiredStateEntry,
+        mode: CatalogDesiredStateSourceMode,
+        completion: Option<
+            tokio::sync::oneshot::Sender<
+                Result<CatalogRuntimeObservation, CatalogApplicationError>,
+            >,
+        >,
+    ) -> Result<(bool, Option<MaterializationSubmission>), CatalogApplicationError> {
+        let attachment_id = entry.identity().as_uuid();
+        let instance_id = entry.config().instance_id().clone();
+        let provider_id = entry.config().provider_id().clone();
+        let raw_properties = entry.catalog_properties(mode)?;
+        let factory = match self.control.role_factory(&provider_id) {
+            Ok(factory) => factory,
+            // T05 switches production composition to role factories. Keep the
+            // pre-cutover test/legacy path explicit rather than silently
+            // treating a missing role factory as an unsupported capability.
+            Err(error)
+                if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
+            {
+                return Ok((false, None));
+            }
+            Err(error) => return Err(connector_error(error)),
+        };
+        let properties = factory
+            .normalize_and_validate(raw_properties)
+            .map_err(|error| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::InvalidRequest,
+                    error.to_string(),
+                )
+            })?;
+        let key = properties.handle().clone();
+        let context =
+            MaterializationContext::new(Instant::now() + self.scheduler.config.attempt_timeout);
+        let token = self.scheduler.next_token.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut attempts = self.scheduler.attempts.lock().map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    "catalog projection scheduler lock is poisoned",
+                )
+            })?;
+            if attempts.get(&key).is_some_and(|attempt| {
+                attempt.attachment_id == attachment_id && attempt.instance_id == instance_id
+            }) {
+                if let Some(completion) = completion {
+                    if let Some(attempt) = attempts.get_mut(&key) {
+                        attempt.completion_waiters.push(completion);
+                    }
+                }
+                return Ok((true, None));
+            }
+            for attempt in attempts.values() {
+                if attempt.instance_id == instance_id {
+                    attempt.context.cancel();
+                }
+            }
+            attempts
+                .retain(|existing, _| existing.catalog_name() != &instance_id || existing == &key);
+            attempts.insert(
+                key.clone(),
+                ProjectionAttempt {
+                    instance_id: instance_id.clone(),
+                    attachment_id,
+                    token,
+                    context: context.clone(),
+                    completion_waiters: completion.into_iter().collect(),
+                },
+            );
+        }
+        self.mark_unavailable(
+            &instance_id,
+            attachment_id,
+            &provider_id,
+            "catalog desired-state runtime is being materialized",
+        );
+        Ok((
+            true,
+            Some(MaterializationSubmission {
+                entry,
+                provider_id,
+                properties,
+                factory,
+                key,
+                token,
+                context,
+            }),
+        ))
+    }
+
+    fn token_is_current(&self, key: &CatalogHandle, token: u64) -> bool {
+        self.scheduler
+            .attempts
+            .lock()
+            .ok()
+            .and_then(|attempts| attempts.get(key).map(|attempt| attempt.token == token))
+            .unwrap_or(false)
+    }
+
+    fn replace_attempt_context(
+        &self,
+        key: &CatalogHandle,
+        token: u64,
+    ) -> Option<MaterializationContext> {
+        let mut attempts = self.scheduler.attempts.lock().ok()?;
+        let attempt = attempts.get_mut(key)?;
+        if attempt.token != token {
+            return None;
+        }
+        let context =
+            MaterializationContext::new(Instant::now() + self.scheduler.config.attempt_timeout);
+        attempt.context = context.clone();
+        Some(context)
+    }
+
+    fn take_completion_waiters(
+        &self,
+        key: &CatalogHandle,
+        token: u64,
+    ) -> Vec<tokio::sync::oneshot::Sender<Result<CatalogRuntimeObservation, CatalogApplicationError>>>
+    {
+        if let Ok(mut attempts) = self.scheduler.attempts.lock()
+            && attempts
+                .get(key)
+                .is_some_and(|attempt| attempt.token == token)
+        {
+            return attempts
+                .get_mut(key)
+                .map(|attempt| std::mem::take(&mut attempt.completion_waiters))
+                .unwrap_or_default();
+        }
+        Vec::new()
+    }
+
+    fn clear_attempt(&self, key: &CatalogHandle, token: u64) {
+        if let Ok(mut attempts) = self.scheduler.attempts.lock()
+            && attempts
+                .get(key)
+                .is_some_and(|attempt| attempt.token == token)
+        {
+            attempts.remove(key);
+        }
+    }
+
+    async fn run_materialization(&self, work: MaterializationSubmission) {
+        let MaterializationSubmission {
+            entry,
+            provider_id,
+            properties,
+            factory,
+            key,
+            token,
+            mut context,
+        } = work;
+        let mut backoff = self.scheduler.config.retry_initial_backoff;
+        let mut attempts = 0_u64;
+        loop {
+            if !self.token_is_current(&key, token) || context.check_active().is_err() {
+                return;
+            }
+            let Ok(permit) = Arc::clone(&self.scheduler.permits).acquire_owned().await else {
+                return;
+            };
+            let result =
+                tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(context.deadline()),
+                    factory.materialize(properties.clone(), context.clone()),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Timeout,
+                    ConnectorMaterializationRetryDisposition::Transient,
+                    "connector materialization deadline elapsed",
+                ))
+                });
+            drop(permit);
+            if !self.token_is_current(&key, token) {
+                return;
+            }
+            match result {
+                Ok(binding) => {
+                    if self.token_is_current(&key, token) {
+                        let completion = if let Err(error) =
+                            self.install_created(&entry, CreatedControlBinding::Role(binding))
+                        {
+                            self.mark_unavailable(
+                                entry.config().instance_id(),
+                                entry.identity().as_uuid(),
+                                &provider_id,
+                                error.to_string(),
+                            );
+                            Err(error)
+                        } else {
+                            self.admit_catalog(entry.config().instance_id())
+                                .require_ready(entry.config().instance_id())
+                        };
+                        for waiter in self.take_completion_waiters(&key, token) {
+                            let _ = waiter.send(completion.clone());
+                        }
+                        self.clear_attempt(&key, token);
+                    }
+                    return;
+                }
+                Err(error)
+                    if error.disposition()
+                        == ConnectorMaterializationRetryDisposition::UntilDefinitionChanges =>
+                {
+                    self.mark_unavailable(
+                        entry.config().instance_id(),
+                        entry.identity().as_uuid(),
+                        &provider_id,
+                        error.to_string(),
+                    );
+                    let completion = Err(materialization_error(&error));
+                    for waiter in self.take_completion_waiters(&key, token) {
+                        let _ = waiter.send(completion.clone());
+                    }
+                    // Keep the exact key as the suppression marker. A new
+                    // desired definition has a new key and wakes immediately.
+                    return;
+                }
+                Err(error) => {
+                    self.mark_unavailable(
+                        entry.config().instance_id(),
+                        entry.identity().as_uuid(),
+                        &provider_id,
+                        error.to_string(),
+                    );
+                    let completion = Err(materialization_error(&error));
+                    for waiter in self.take_completion_waiters(&key, token) {
+                        let _ = waiter.send(completion.clone());
+                    }
+                    attempts = attempts.saturating_add(1);
+                    let jitter = Duration::from_millis((token.wrapping_add(attempts) % 17) + 1);
+                    tokio::time::sleep(backoff.saturating_add(jitter)).await;
+                    if !self.token_is_current(&key, token) {
+                        return;
+                    }
+                    backoff =
+                        (backoff.saturating_mul(2)).min(self.scheduler.config.retry_max_backoff);
+                    let Some(next) = self.replace_attempt_context(&key, token) else {
+                        return;
+                    };
+                    context = next;
+                }
+            }
+        }
+    }
+
     /// Materializes one located entry into a local runtime generation.
     ///
     /// Returns nothing on purpose. The entry exists only because a complete
@@ -500,7 +907,7 @@ impl FrontendCatalogApplicationPort {
     /// abort the reconcile of every healthy one, which is the failure scope
     /// this design exists to keep separate.
     fn materialize_entry(
-        &self,
+        self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
         mode: CatalogDesiredStateSourceMode,
     ) {
@@ -522,6 +929,16 @@ impl FrontendCatalogApplicationPort {
             .unwrap_or(false)
             && self.control.observe_current_binding(&instance_id).is_ok();
         if installed {
+            return;
+        }
+
+        if self
+            .enqueue_materialization(entry.clone(), mode)
+            .unwrap_or_else(|error| {
+                self.mark_unavailable(&instance_id, attachment_id, &provider_id, error.to_string());
+                true
+            })
+        {
             return;
         }
 
@@ -548,7 +965,8 @@ impl FrontendCatalogApplicationPort {
             let binding = binding
                 .with_catalog_properties(catalog_properties)
                 .map_err(connector_error)?;
-            self.install_created(&entry, binding).map(|_| ())
+            self.install_created(&entry, CreatedControlBinding::Legacy(binding))
+                .map(|_| ())
         })();
         if let Err(error) = installed {
             self.mark_unavailable(&instance_id, attachment_id, &provider_id, error.to_string());
@@ -626,6 +1044,16 @@ impl FrontendCatalogApplicationPort {
     }
 
     fn retire_projection(&self, instance_id: &ConnectorInstanceId) {
+        if let Ok(mut attempts) = self.scheduler.attempts.lock() {
+            attempts.retain(|_, attempt| {
+                if &attempt.instance_id == instance_id {
+                    attempt.context.cancel();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let projection = self
             .projections
             .lock()
@@ -684,44 +1112,39 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
         let candidate_entry = CatalogDesiredStateEntry::from_attachment(&attachment)?;
         let candidate_properties =
             candidate_entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?;
-        let request = ConnectorControlFactoryRequest::try_new(
-            provider_id.clone(),
-            attachment.instance_id.clone(),
-            attachment.durable_properties.clone(),
-        )
-        .and_then(|request| request.with_catalog_properties(candidate_properties))
-        .map_err(connector_error)?;
-        // The factory may validate provider configuration, but it does not
-        // become live until after the attachment CAS succeeds below.
-        let creation = self
-            .control
-            .create_control(request)
-            .map_err(connector_error)?;
-        let (binding, mut returned_durable_properties) = creation.into_parts();
-        returned_durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
-        if returned_durable_properties != attachment.durable_properties {
+        self.control
+            .role_factory(&provider_id)
+            .map_err(connector_error)?
+            .normalize_and_validate(candidate_properties)
+            .map_err(|error| materialization_error(&error))?;
+        let created = self.block_on(repository.create(attachment))?;
+        // CREATE uses the exact same keyed scheduler as reconcile. The ticket
+        // observes that attempt's first completion and does not create a
+        // second materialization policy or provider side effect path.
+        let entry = CatalogDesiredStateEntry::from_attachment(&created.attachment)?;
+        let (completion, ticket) = tokio::sync::oneshot::channel();
+        let (submitted, work) = self.submit_materialization(
+            entry,
+            CatalogDesiredStateSourceMode::DynamicStateStore,
+            Some(completion),
+        )?;
+        if !submitted {
             return Err(CatalogApplicationError::new(
-                CatalogApplicationErrorKind::InvalidRequest,
-                "connector control factory changed the catalog execution properties after typed binding",
+                CatalogApplicationErrorKind::Unavailable,
+                "connector control role factory is unavailable for this provider",
             ));
         }
-        let created = self.block_on(repository.create(attachment))?;
-        // CREATE materializes through the same located-entry type a reconcile
-        // uses, so a freshly created catalog and a rediscovered one install
-        // through one code path instead of two that can drift.
-        let entry = CatalogDesiredStateEntry::from_attachment(&created.attachment)?;
-        self.mark_unavailable(
-            entry.config().instance_id(),
-            entry.identity().as_uuid(),
-            entry.config().provider_id(),
-            "catalog desired-state runtime is being installed",
-        );
-        let binding = binding
-            .with_catalog_properties(
-                entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?,
-            )
-            .map_err(connector_error)?;
-        self.install_created(&entry, binding)
+        self.block_on_catalog(async {
+            if let Some(work) = work {
+                self.run_materialization(work).await;
+            }
+            ticket.await.map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Unavailable,
+                    "catalog materialization attempt stopped before completion",
+                )
+            })?
+        })
     }
 
     fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError> {
@@ -946,6 +1369,25 @@ fn connector_error(error: novarocks_spi::connector::ConnectorError) -> CatalogAp
     CatalogApplicationError::new(kind, error.to_string())
 }
 
+fn materialization_error(
+    error: &novarocks_connector_binding::ConnectorMaterializationError,
+) -> CatalogApplicationError {
+    use novarocks_connector_binding::ConnectorMaterializationErrorClass;
+
+    let kind = match error.class() {
+        ConnectorMaterializationErrorClass::InvalidDefinition => {
+            CatalogApplicationErrorKind::InvalidRequest
+        }
+        ConnectorMaterializationErrorClass::Authentication
+        | ConnectorMaterializationErrorClass::Unavailable
+        | ConnectorMaterializationErrorClass::Timeout
+        | ConnectorMaterializationErrorClass::ResourceExhausted
+        | ConnectorMaterializationErrorClass::Cancelled => CatalogApplicationErrorKind::Unavailable,
+        ConnectorMaterializationErrorClass::Internal => CatalogApplicationErrorKind::Internal,
+    };
+    CatalogApplicationError::new(kind, error.to_string())
+}
+
 fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
     let kind = match error.kind() {
         // A source mode that forbids the operation refuses it permanently, so
@@ -971,6 +1413,140 @@ fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    use futures::FutureExt;
+
+    struct FailingRoleFactory {
+        disposition: ConnectorMaterializationRetryDisposition,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for FailingRoleFactory {
+        fn provider_kind(&self) -> novarocks_spi::connector::CatalogProviderKind {
+            novarocks_spi::connector::CatalogProviderKind::Iceberg
+        }
+
+        fn normalize_and_validate(
+            &self,
+            properties: novarocks_spi::connector::CatalogProperties,
+        ) -> Result<
+            NormalizedCatalogProperties,
+            novarocks_connector_binding::ConnectorMaterializationError,
+        > {
+            NormalizedCatalogProperties::try_new(properties).map_err(|detail| {
+                novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
+                )
+            })
+        }
+
+        fn materialize(
+            &self,
+            _properties: NormalizedCatalogProperties,
+            _context: MaterializationContext,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<
+                novarocks_connector_binding::ConnectorControlRoleBinding,
+                novarocks_connector_binding::ConnectorMaterializationError,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let disposition = self.disposition;
+            async move {
+                Err(novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
+                    disposition,
+                    "injected projection failure",
+                ))
+            }
+            .boxed()
+        }
+    }
+
+    fn scheduler_entry(instance: &str) -> CatalogDesiredStateEntry {
+        CatalogDesiredStateEntry::from_attachment(&CatalogAttachment {
+            attachment_id: Uuid::now_v7(),
+            instance_id: ConnectorInstanceId::parse(instance).expect("instance id"),
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider id"),
+            display_name: instance.to_owned(),
+            durable_properties: vec![("type".to_owned(), "iceberg".to_owned())],
+            credential_bindings: Vec::new(),
+            created_at_ms: 1,
+        })
+        .expect("desired-state entry")
+    }
+
+    fn scheduler_port(factory: Arc<FailingRoleFactory>) -> Arc<FrontendCatalogApplicationPort> {
+        let control = Arc::new(
+            ConnectorControlHost::with_role_factories(vec![factory]).expect("role factory host"),
+        );
+        Arc::new(FrontendCatalogApplicationPort::unavailable(
+            control,
+            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            tokio::runtime::Handle::current(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn scheduler_single_flight_retries_transient_and_drop_clears_exact_token() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = scheduler_port(Arc::new(FailingRoleFactory {
+            disposition: ConnectorMaterializationRetryDisposition::Transient,
+            calls: Arc::clone(&calls),
+        }));
+        let entry = scheduler_entry("catalog.scheduler");
+        assert!(
+            port.enqueue_materialization(
+                entry.clone(),
+                CatalogDesiredStateSourceMode::DynamicStateStore
+            )
+            .expect("first enqueue")
+        );
+        assert!(
+            port.enqueue_materialization(
+                entry.clone(),
+                CatalogDesiredStateSourceMode::DynamicStateStore
+            )
+            .expect("same key enqueue")
+        );
+        tokio::time::sleep(Duration::from_millis(260)).await;
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "transient failure retries"
+        );
+        port.retire_projection(entry.config().instance_id());
+        let key = entry
+            .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)
+            .expect("properties")
+            .handle()
+            .clone();
+        assert!(!port.token_is_current(&key, 1), "drop clears old token");
+    }
+
+    #[tokio::test]
+    async fn scheduler_suppresses_permanent_failure_until_exact_definition_changes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let port = scheduler_port(Arc::new(FailingRoleFactory {
+            disposition: ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+            calls: Arc::clone(&calls),
+        }));
+        let entry = scheduler_entry("catalog.permanent");
+        port.enqueue_materialization(
+            entry.clone(),
+            CatalogDesiredStateSourceMode::DynamicStateStore,
+        )
+        .expect("enqueue");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        port.enqueue_materialization(entry, CatalogDesiredStateSourceMode::DynamicStateStore)
+            .expect("same permanent key remains suppressed");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn create_catalog_requires_one_type_property() {

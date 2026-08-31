@@ -30,9 +30,7 @@ use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBindingStore,
 };
 use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
-use crate::connector::typed_control_registry::{
-    ConnectorReadControlRegistry, InstalledReadControl,
-};
+use crate::connector::ConnectorControlHost;
 use crate::query_execution::preparation::scan::{
     PreparedTypedConnectorScan, QueryPinnedFileSetRead, QueryRewriteGroupRead, ResolvedScanBinding,
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
@@ -68,15 +66,12 @@ const NO_NODE_LIMIT: i64 = -1;
 /// planner hands it.
 #[derive(Clone)]
 pub(crate) struct TypedScanPreparation {
-    control: Arc<ConnectorReadControlRegistry>,
+    control: Arc<ConnectorControlHost>,
     session: ConnectorSession,
 }
 
 impl TypedScanPreparation {
-    pub(crate) fn new(
-        control: Arc<ConnectorReadControlRegistry>,
-        session: ConnectorSession,
-    ) -> Self {
+    pub(crate) fn new(control: Arc<ConnectorControlHost>, session: ConnectorSession) -> Self {
         Self { control, session }
     }
 }
@@ -128,7 +123,7 @@ impl ScanPreparationOptions {
     /// Attach the statement's typed connector control and session.
     pub(crate) fn with_typed_connector_control(
         mut self,
-        control: Arc<ConnectorReadControlRegistry>,
+        control: Arc<ConnectorControlHost>,
         session: ConnectorSession,
     ) -> Self {
         self.typed = Some(TypedScanPreparation::new(control, session));
@@ -737,11 +732,10 @@ fn prepare_typed_relation_scan(
             "typed connector scan node_id={node_id} has catalog properties from another frozen desired state"
         ));
     }
-    let control: InstalledReadControl = typed.control.resolve_read_control(catalog_handle).ok_or_else(|| {
-        format!(
-            "typed connector scan node_id={node_id}: no installed read control for exact catalog handle"
-        )
-    })?;
+    let control = typed
+        .control
+        .typed_read_for_planning_lease(planning_lease)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     // This remains a FE-only control validation: providers use the request
     // context to observe cancellation before expensive read preparation. The
     // returned legacy declaration is deliberately discarded; typed reads are
@@ -757,7 +751,18 @@ fn prepare_typed_relation_scan(
         .provider_binding(&request_context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let request_control = control
-        .for_request(&request_context)
+        .request_factory()
+        .map_or_else(
+            || {
+                Ok(
+                    novarocks_spi::connector::read_stack::ConnectorReadRequestControl::new(
+                        control.metadata(),
+                        control.splits(),
+                    ),
+                )
+            },
+            |factory| factory.for_request(&request_context),
+        )
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let prepared = prepare_typed_scan(
         &typed.session,

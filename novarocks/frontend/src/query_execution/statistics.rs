@@ -329,9 +329,7 @@ impl PreparedStatisticsCollectionRequest {
 /// connector identity or reader path.
 pub fn prepare_statistics_collection_request(
     controls: &dyn ConnectorControlResolver,
-    typed_connector_control: &Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &Arc<crate::connector::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     identity: &StatisticsRelationIdentity,

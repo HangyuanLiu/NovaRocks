@@ -103,14 +103,14 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         },
-        catalog_runtime_materializers: Vec::new(),
-        read_execution_bundle_factories: Vec::new(),
-        write_execution_bundle_factories: Vec::new(),
+        catalog_manager_config:
+            novarocks_backend::connector::catalog_manager::CatalogManagerConfig::default(),
+        execution_role_binding_factories: Vec::new(),
     }
 }
 
 #[test]
-fn host_accepts_an_empty_sealed_catalog_runtime_set() {
+fn host_accepts_an_empty_sealed_execution_role_binding_factory_set() {
     let grpc_port = unused_port();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

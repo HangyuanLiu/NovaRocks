@@ -336,9 +336,8 @@ fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
     let connectors = registry(vec![data_file("s3://bucket/data.parquet")]);
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
-    // An empty registry stands for "this catalog handle was never installed".
-    let empty =
-        Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new());
+    // An empty role host stands for "this catalog handle was never installed".
+    let empty = Arc::new(crate::connector::ConnectorControlHost::new());
     let error = expect_preparation_error(
         super::super::prepare_scan_bindings(
             &plan,
@@ -352,7 +351,7 @@ fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
         "an uninstalled catalog handle cannot be planned",
     );
     assert!(
-        error.contains("no installed read control for exact catalog handle"),
+        error.contains("no complete typed control generation"),
         "unexpected error: {error}"
     );
 }

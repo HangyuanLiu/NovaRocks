@@ -17,7 +17,8 @@
 
 pub(crate) mod batch_transform;
 pub mod catalog_manager;
-pub mod typed_registry;
 pub mod typed_runtime;
 
-pub use typed_registry::{InstalledReadExecution, InstalledWriteExecution};
+pub use novarocks_connector_binding::{
+    ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
+};

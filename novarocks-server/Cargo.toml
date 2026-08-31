@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 novarocks-backend = { path = "../novarocks/backend" }
+novarocks-connector-binding = { path = "../novarocks/connector-binding" }
 novarocks-connector-iceberg = { path = "../novarocks/connector/iceberg" }
 novarocks-connector-starrocks = { path = "../novarocks/connector/starrocks" }
 novarocks-execution = { path = "../novarocks/execution" }

@@ -110,7 +110,7 @@ pub(super) fn lower_typed_connector_scan(
             .append_field("catalog_name")
     })?;
     let decoded_scan = novarocks_proto_codec::connector_read::DecodedConnectorReadScan::decode(
-        execution.codec().as_ref(),
+        execution.decoder().as_ref(),
         &scan_source,
     )
     .map_err(|error| {
@@ -141,7 +141,7 @@ pub(super) fn lower_typed_connector_scan(
             // The provider is built per fragment instance so its footer cache
             // and delete manager cannot outlive the request that opened them.
             let page_source_provider = execution
-                .factory()
+                .provider_factory()
                 .create_page_source_provider(&inputs.request, inputs.reader_policy)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorScanSource::new(
@@ -167,7 +167,7 @@ pub(super) fn lower_typed_connector_scan(
             // no split queue and no runtime filter: there is nothing to divide
             // and nothing to prune between splits.
             let system_table_provider = execution
-                .factory()
+                .provider_factory()
                 .create_system_table_provider(&inputs.request)
                 .map_err(provider_refusal)?;
             let source = TypedConnectorSystemTableScanSource::new(

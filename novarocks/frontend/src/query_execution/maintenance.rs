@@ -1489,9 +1489,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 /// assembly remains a Frontend-only step after this sealed Core preparation.
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,

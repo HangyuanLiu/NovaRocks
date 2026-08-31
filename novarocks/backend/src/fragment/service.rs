@@ -450,7 +450,7 @@ impl NativeFragmentService {
                     read_execution
                         .as_ref()
                         .expect("new splits require a typed read execution")
-                        .codec()
+                        .decoder()
                         .decode_scheduled_split(split)
                         .map(|decoded| {
                             let (evidence, split) = decoded.into_parts();

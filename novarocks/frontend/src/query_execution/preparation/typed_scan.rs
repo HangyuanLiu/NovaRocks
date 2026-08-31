@@ -31,7 +31,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_connector_binding::ConnectorControlReadBinding;
+use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_spi::connector::ConnectorPinnedFileSet;
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorReadChangeWindow, ConnectorReadColumnBinding, ConnectorReadConstraint,
@@ -41,7 +42,6 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_sql::plan_read::PlanScanNode;
 
-use crate::connector::typed_control_registry::InstalledReadControl;
 use crate::query_execution::connector_domain::{
     CatalogHandle, DynamicFilterBinding, TableHandle, TableScanNode,
 };
@@ -130,7 +130,7 @@ pub(crate) struct PreparedTypedScan {
     pub(crate) split_manager: Arc<dyn ConnectorReadSplitManager>,
     /// The only conversion authority for this exact binding.  It is retained
     /// solely for fragment and TaskUpdate egress; planning never calls it.
-    pub(crate) codec: Arc<dyn ConnectorReadCodec>,
+    pub(crate) encoder: Arc<dyn ConnectorReadEncoder>,
     /// The constraint that was offered to the connector, kept so the round
     /// driver enumerates splits under exactly what planning pushed down.
     pub(crate) constraint: ConnectorReadConstraint,
@@ -196,7 +196,7 @@ impl std::fmt::Debug for PreparedTypedScan {
 pub(crate) fn prepare_typed_scan(
     session: &ConnectorSession,
     catalog: CatalogHandle,
-    control: &InstalledReadControl,
+    control: &ConnectorControlReadBinding,
     request_control: &novarocks_spi::connector::read_stack::ConnectorReadRequestControl,
     plan_node_id: i32,
     scan: &PlanScanNode,
@@ -480,7 +480,7 @@ pub(crate) fn prepare_typed_scan(
     Ok(PreparedTypedScan {
         table_scan,
         split_manager: request_control.splits(),
-        codec: control.codec(),
+        encoder: control.encoder(),
         constraint,
         residual_ordinals: lowered.residual_ordinals,
         limit_guaranteed,

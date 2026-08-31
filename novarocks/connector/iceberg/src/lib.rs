@@ -84,6 +84,7 @@ pub mod write_payload;
 
 pub use commit::write_execution::IcebergCatalogWriteExecutionFactory;
 pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
+pub use role_binding::{IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory};
 
 pub mod iceberg {
     pub use ::iceberg::*;
@@ -101,6 +102,7 @@ pub mod opendal {
     pub use ::opendal::*;
 }
 pub mod read_model;
+pub mod role_binding;
 
 pub use novarocks_fs;
 pub use novarocks_spi;

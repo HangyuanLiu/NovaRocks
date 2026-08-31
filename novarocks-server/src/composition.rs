@@ -23,19 +23,22 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::{BackendServerConfig, QueryLifecycleRegistryConfig};
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::connector_factory::IcebergConnectorFactory;
-use novarocks_connector_iceberg::file_reader::execution_installer::{
-    IcebergCatalogRuntimeMaterializer, IcebergConnectorInstaller,
+use novarocks_connector_binding::{
+    ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
 };
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
+use novarocks_connector_iceberg::file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
     IcebergStorageLakeTargetSnapshotObservation, IcebergStoragePartitionTransform,
     IcebergStorageRefreshTechnique,
 };
+use novarocks_connector_iceberg::{
+    IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
+};
 use novarocks_connector_starrocks::{
-    StarRocksCatalogRuntimeMaterializer, StarRocksExecutionInstaller,
+    StarRocksCatalogRuntimeMaterializer, StarRocksExecutionRoleBindingFactory,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -53,8 +56,7 @@ use novarocks_fs::{
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::{
-    ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionInstaller, ConnectorProviderBindingKind, ConnectorRequestContext,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
     MvLakePackageObservation, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
     MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
@@ -376,29 +378,18 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
     }
 }
 
-pub fn compose_backend_execution_installers(
+pub fn compose_backend_execution_role_binding_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>>> {
+) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
     let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
-    let iceberg_installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(IcebergConnectorInstaller::new(
+    Ok(vec![
+        std::sync::Arc::new(IcebergExecutionRoleBindingFactory::new(
             iceberg_resources,
-        ))];
-    let expected = ConnectorProviderBindingKind::Iceberg;
-    let mut installers: Vec<std::sync::Arc<dyn ConnectorExecutionInstaller>> =
-        vec![std::sync::Arc::new(StarRocksExecutionInstaller::new())];
-    for installer in &iceberg_installers {
-        if installer.provider_kind() != expected {
-            anyhow::bail!(
-                "composed connector execution installer has kind {:?}; expected {:?}",
-                installer.provider_kind(),
-                expected
-            );
-        }
-    }
-    installers.extend(iceberg_installers);
-    Ok(installers)
+            novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
+        )),
+        std::sync::Arc::new(StarRocksExecutionRoleBindingFactory::new()),
+    ])
 }
 
 /// Resolve the BE-owned startup facts from the application wire configuration.
@@ -424,8 +415,6 @@ pub fn compose_backend_server_config(
         .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
         .parse::<novarocks_types::NativeEndpoint>()
         .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
-    let iceberg_binding =
-        compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Be)?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
@@ -475,15 +464,24 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        catalog_runtime_materializers: compose_backend_catalog_runtime_materializers(
-            iceberg_binding.clone(),
-        )?,
-        read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
-            iceberg_binding.clone(),
-        )?,
-        write_execution_bundle_factories: compose_backend_write_execution_bundle_factories(
-            iceberg_binding,
-            runtime,
+        catalog_manager_config:
+            novarocks_backend::connector::catalog_manager::CatalogManagerConfig {
+                max_retained_catalogs:
+                    novarocks_backend::connector::catalog_manager::DEFAULT_MAX_RETAINED_CATALOGS,
+                max_failed_catalogs: runtime_config.catalog_bind_max_failed,
+                failed_retention: Duration::from_millis(
+                    runtime_config.catalog_bind_failed_retention_ms,
+                ),
+                transient_retry_cooldown: Duration::from_millis(
+                    runtime_config.catalog_bind_transient_retry_cooldown_ms,
+                ),
+                provider_max_concurrent_binds: runtime_config.catalog_bind_provider_max_concurrent,
+                provider_min_bind_interval: Duration::from_millis(
+                    runtime_config.catalog_bind_provider_min_interval_ms,
+                ),
+            },
+        execution_role_binding_factories: compose_backend_execution_role_binding_factories(
+            config, runtime,
         )?,
     })
 }
@@ -551,6 +549,15 @@ pub fn compose_frontend_server_config(
     .with_connector_split_initial_dynamic_filter_wait_cap(Duration::from_millis(
         runtime_config.connector_split_initial_dynamic_filter_wait_cap_ms,
     ))
+    .with_catalog_materialization_config(
+        novarocks_frontend::catalog_application::frontend_port::CatalogMaterializationConfig::try_new(
+            Duration::from_millis(runtime_config.catalog_materialization_attempt_timeout_ms),
+            Duration::from_millis(runtime_config.catalog_materialization_retry_initial_backoff_ms),
+            Duration::from_millis(runtime_config.catalog_materialization_retry_max_backoff_ms),
+            runtime_config.catalog_materialization_max_inflight,
+        )
+        .map_err(|error| anyhow::anyhow!("construct catalog materialization configuration: {error}"))?,
+    )
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
         heartbeat_interval_ms: runtime_config.query_control_heartbeat_interval_ms,
         heartbeat_timeout_ms: runtime_config.query_control_heartbeat_timeout_ms,
@@ -627,10 +634,6 @@ pub fn compose_frontend_server_config(
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
-    // One registry: the control factory installs into it and the planner
-    // resolves from it, so a generation is either reachable to both or neither.
-    let typed_connector_control =
-        std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new());
     Ok(FrontendServerConfig {
         execution,
         backend_open,
@@ -640,12 +643,7 @@ pub fn compose_frontend_server_config(
         frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
         frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
         mysql_listener,
-        connector_control_factories: compose_frontend_control_factories(
-            config,
-            runtime,
-            std::sync::Arc::clone(&typed_connector_control),
-        )?,
-        typed_connector_control,
+        connector_control_role_factories: compose_frontend_control_role_factories(config, runtime)?,
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
         state_store_input,
         state_store_provider_registry,
@@ -734,79 +732,17 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
     }
 }
 
-pub fn compose_frontend_control_factories(
+pub fn compose_frontend_control_role_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-    typed_control: std::sync::Arc<novarocks_frontend::ConnectorReadControlRegistry>,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
+) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlRoleBindingFactory>>> {
     let iceberg_binding =
         compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
-    // The installer runs only after the provider has built and validated its
-    // complete control binding.  A registration failure therefore prevents a
-    // binding from escaping without its matching read services and codec.
-    let sink = std::sync::Arc::clone(&typed_control);
-    let factory =
-        IcebergConnectorFactory::new(IcebergMetadataResources::new(iceberg_binding, runtime))
-            .with_read_control_installer(std::sync::Arc::new(
-                move |key, metadata, splits, codec, request_factory| {
-                    sink.install_read_control(
-            key,
-            novarocks_frontend::connector::typed_control_registry::InstalledReadControl::new(
-                metadata, splits, codec,
-            )
-            .with_request_factory(request_factory),
-        )
-                },
-            ));
-    Ok(vec![std::sync::Arc::new(factory)])
-}
-
-/// The worker-side typed provider factory of every built-in provider.
-///
-/// StarRocks has no typed read contract yet, so it deliberately contributes no
-/// factory: a typed StarRocks scan must fail to resolve rather than reach a
-/// placeholder that would look like support.
-pub fn compose_backend_read_execution_bundle_factories(
-    binding: IcebergReadBinding,
-) -> anyhow::Result<
-    Vec<(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        std::sync::Arc<dyn novarocks_backend::ConnectorReadExecutionBundleFactory>,
-    )>,
-> {
-    let factory = std::sync::Arc::new(
-        novarocks_connector_iceberg::typed_provider_factory::IcebergTypedProviderFactory::new(
-            binding,
-            novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
-        ),
-    );
-    Ok(vec![(
-        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
-        factory,
-    )])
-}
-
-/// The worker-side catalog-keyed writer factory of every built-in provider.
-/// StarRocks contributes none because it has no native distributed writer
-/// contract; a request for one therefore fails closed during catalog lookup.
-pub fn compose_backend_write_execution_bundle_factories(
-    binding: IcebergReadBinding,
-    runtime: tokio::runtime::Handle,
-) -> anyhow::Result<
-    Vec<(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        std::sync::Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
-    )>,
-> {
-    let factory = std::sync::Arc::new(
-        novarocks_connector_iceberg::IcebergCatalogWriteExecutionFactory::new(
-            binding,
-            novarocks_connector_iceberg::resources::IcebergExecutionRuntime::new(runtime),
-        ),
-    );
-    Ok(vec![(
-        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg,
-        factory,
+    Ok(vec![std::sync::Arc::new(
+        IcebergControlRoleBindingFactory::new(IcebergMetadataResources::new(
+            iceberg_binding,
+            runtime,
+        )),
     )])
 }
 
@@ -890,10 +826,11 @@ pub fn state_store_provider_registry(
 #[cfg(test)]
 mod tests {
     use super::{
-        IcebergStorageLakeTargetSnapshotObservation, compose_backend_execution_installers,
-        compose_frontend_control_factories, mv_lake_target_snapshot_observation,
+        IcebergStorageLakeTargetSnapshotObservation,
+        compose_backend_execution_role_binding_factories, compose_frontend_control_role_factories,
+        mv_lake_target_snapshot_observation,
     };
-    use novarocks_spi::connector::ConnectorProviderBindingKind;
+    use novarocks_spi::connector::CatalogProviderKind;
 
     #[test]
     fn lake_target_snapshot_adapter_preserves_provider_metadata() {
@@ -914,27 +851,18 @@ mod tests {
     fn frontend_and_backend_compose_distinct_iceberg_role_capabilities() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = crate::app_config::NovaRocksConfig::default();
-        let factories = compose_frontend_control_factories(
-            &config,
-            runtime.handle().clone(),
-            std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new()),
-        )
-        .expect("frontend factories");
-        let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
-            .expect("backend installers");
-        let iceberg = novarocks_spi::connector::ConnectorProviderId::parse(
-            novarocks_connector_iceberg::PROVIDER_ID,
-        )
-        .expect("provider ID");
+        let factories = compose_frontend_control_role_factories(&config, runtime.handle().clone())
+            .expect("frontend factories");
+        let factories_on_backend =
+            compose_backend_execution_role_binding_factories(&config, runtime.handle().clone())
+                .expect("backend factories");
 
         assert_eq!(factories.len(), 1);
-        assert_eq!(factories[0].provider_id(), &iceberg);
+        assert_eq!(factories[0].provider_kind(), CatalogProviderKind::Iceberg);
         assert_eq!(
-            installers
+            factories_on_backend
                 .iter()
-                .filter(
-                    |installer| installer.provider_kind() == ConnectorProviderBindingKind::Iceberg
-                )
+                .filter(|factory| factory.provider_kind() == CatalogProviderKind::Iceberg)
                 .count(),
             1
         );

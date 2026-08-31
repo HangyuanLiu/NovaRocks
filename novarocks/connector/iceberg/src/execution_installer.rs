@@ -123,6 +123,44 @@ impl IcebergConnectorInstaller {
             resources,
         }
     }
+
+    /// Build the legacy generic execution facets for one exact catalog
+    /// definition without consulting a request or opening a remote client.
+    ///
+    /// The role-binding factory uses this while the generic SPI execution
+    /// carrier still coexists with the typed read/write groups. The exact
+    /// catalog handle remains the authority for role selection; this local
+    /// key exists only to satisfy the legacy capability owner invariant.
+    pub(crate) fn bind_for_catalog_properties(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
+        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg execution binding received another provider kind",
+            ));
+        }
+        let mut incarnation = [0_u8; 16];
+        incarnation.copy_from_slice(&properties.handle().version().as_bytes()[..16]);
+        let key = ConnectorProviderBindingKey {
+            instance_id: properties.handle().catalog_name().clone(),
+            incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes(incarnation),
+        };
+        let binding = self.resources.binding().bind_catalog(properties)?;
+        ConnectorExecutionBinding::try_new_capabilities(
+            self.provider_id.clone(),
+            key.clone(),
+            Some(Arc::new(IcebergReadOnlyConnectorInstance {
+                key: key.clone(),
+                binding: binding.clone(),
+            })),
+            Some(Arc::new(IcebergDataWriteExecution::new(
+                binding,
+                self.resources.runtime().clone(),
+            ))),
+        )
+    }
 }
 
 impl ConnectorExecutionInstaller for IcebergConnectorInstaller {

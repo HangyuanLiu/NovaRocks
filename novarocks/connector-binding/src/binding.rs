@@ -24,8 +24,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadSplitManager,
 };
 use novarocks_spi::connector::{
-    CatalogProviderKind, ConnectorControlBinding, ConnectorError, ConnectorExecutionBinding,
-    ConnectorWriteControl, ConnectorWriteExecution,
+    CatalogProviderKind, CatalogWriteExecution, ConnectorControlBinding, ConnectorError,
+    ConnectorExecutionBinding, ConnectorWriteControl,
 };
 
 use crate::{ConnectorMaterializationError, MaterializationContext, NormalizedCatalogProperties};
@@ -91,7 +91,7 @@ impl ConnectorControlWriteBinding {
 /// One complete FE role binding for one exact desired catalog generation.
 pub struct ConnectorControlRoleBinding {
     properties: NormalizedCatalogProperties,
-    control: ConnectorControlBinding,
+    control: Arc<ConnectorControlBinding>,
     read: Option<ConnectorControlReadBinding>,
     write: Option<ConnectorControlWriteBinding>,
 }
@@ -99,7 +99,7 @@ pub struct ConnectorControlRoleBinding {
 impl ConnectorControlRoleBinding {
     pub fn try_new(
         properties: NormalizedCatalogProperties,
-        control: ConnectorControlBinding,
+        control: Arc<ConnectorControlBinding>,
         read: Option<ConnectorControlReadBinding>,
         write: Option<ConnectorControlWriteBinding>,
     ) -> Result<Self, ConnectorError> {
@@ -135,8 +135,12 @@ impl ConnectorControlRoleBinding {
         &self.properties
     }
 
-    pub const fn control(&self) -> &ConnectorControlBinding {
+    pub fn control(&self) -> &ConnectorControlBinding {
         &self.control
+    }
+
+    pub fn control_arc(&self) -> Arc<ConnectorControlBinding> {
+        Arc::clone(&self.control)
     }
 
     pub const fn read(&self) -> Option<&ConnectorControlReadBinding> {
@@ -151,7 +155,7 @@ impl ConnectorControlRoleBinding {
         self,
     ) -> (
         NormalizedCatalogProperties,
-        ConnectorControlBinding,
+        Arc<ConnectorControlBinding>,
         Option<ConnectorControlReadBinding>,
         Option<ConnectorControlWriteBinding>,
     ) {
@@ -188,15 +192,15 @@ impl ConnectorExecutionReadBinding {
 
 #[derive(Clone)]
 pub struct ConnectorExecutionWriteBinding {
-    write: Arc<dyn ConnectorWriteExecution>,
+    write: Arc<dyn CatalogWriteExecution>,
 }
 
 impl ConnectorExecutionWriteBinding {
-    pub fn new(write: Arc<dyn ConnectorWriteExecution>) -> Self {
+    pub fn new(write: Arc<dyn CatalogWriteExecution>) -> Self {
         Self { write }
     }
 
-    pub fn write(&self) -> Arc<dyn ConnectorWriteExecution> {
+    pub fn write(&self) -> Arc<dyn CatalogWriteExecution> {
         Arc::clone(&self.write)
     }
 }
@@ -205,7 +209,7 @@ impl ConnectorExecutionWriteBinding {
 /// request; all remote control work must have completed on the FE side.
 pub struct ConnectorExecutionRoleBinding {
     properties: NormalizedCatalogProperties,
-    execution: ConnectorExecutionBinding,
+    execution: Option<ConnectorExecutionBinding>,
     read: Option<ConnectorExecutionReadBinding>,
     write: Option<ConnectorExecutionWriteBinding>,
 }
@@ -213,24 +217,29 @@ pub struct ConnectorExecutionRoleBinding {
 impl ConnectorExecutionRoleBinding {
     pub fn try_new(
         properties: NormalizedCatalogProperties,
-        execution: ConnectorExecutionBinding,
+        execution: Option<ConnectorExecutionBinding>,
         read: Option<ConnectorExecutionReadBinding>,
         write: Option<ConnectorExecutionWriteBinding>,
     ) -> Result<Self, ConnectorError> {
-        if execution.key().instance_id != *properties.handle().catalog_name()
-            || execution.provider_id().as_str() != properties.provider_kind().provider_id()
-        {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "execution role binding owner does not match normalized catalog properties",
-            ));
+        if let Some(execution) = execution.as_ref() {
+            if execution.key().instance_id != *properties.handle().catalog_name()
+                || execution.provider_id().as_str() != properties.provider_kind().provider_id()
+            {
+                return Err(ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                    "execution role binding owner does not match normalized catalog properties",
+                ));
+            }
         }
-        if read.is_some() != execution.read().is_some()
-            || write.is_some() != execution.write().is_some()
+        if read.is_some()
+            != execution
+                .as_ref()
+                .and_then(ConnectorExecutionBinding::read)
+                .is_some()
         {
             return Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "execution role binding named groups do not match generic execution capabilities",
+                "execution role binding read group does not match generic execution capability",
             ));
         }
         Ok(Self {
@@ -245,8 +254,8 @@ impl ConnectorExecutionRoleBinding {
         &self.properties
     }
 
-    pub const fn execution(&self) -> &ConnectorExecutionBinding {
-        &self.execution
+    pub const fn execution(&self) -> Option<&ConnectorExecutionBinding> {
+        self.execution.as_ref()
     }
 
     pub const fn read(&self) -> Option<&ConnectorExecutionReadBinding> {

@@ -26,226 +26,76 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
-use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogRuntime, CatalogRuntimeMaterializer,
+use novarocks_connector_binding::{
+    ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
+    ConnectorMaterializationError, ConnectorMaterializationErrorClass,
+    ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
 };
+use novarocks_spi::connector::{CatalogHandle, CatalogProperties, CatalogProviderKind};
 use novarocks_types::QueryExecutionId;
 
 /// The bounded number of unleased materialized catalogs retained by default.
 pub const DEFAULT_MAX_RETAINED_CATALOGS: usize = 64;
+pub const DEFAULT_MAX_FAILED_CATALOGS: usize = 64;
+const DEFAULT_FAILED_RETENTION: Duration = Duration::from_secs(60);
+const DEFAULT_TRANSIENT_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
+const DEFAULT_PROVIDER_MAX_CONCURRENT_BINDS: usize = 4;
 
-/// A BE-local provider runtime selected for one exact immutable catalog.
-///
-/// The wrapper keeps the trait object out of the generic lifecycle manager's
-/// public surface while preserving the provider runtime for the native decode
-/// resolver that will consume the same catalog lease.
+/// Startup-sealed execution-role factories keyed by the closed catalog family.
+/// Each selected factory constructs the entire immutable BE capability binding
+/// in one local, bounded operation.
 #[derive(Clone)]
-pub struct MaterializedCatalogRuntime {
-    runtime: Arc<dyn CatalogRuntime>,
-    read_execution: Option<super::typed_registry::InstalledReadExecution>,
-    write_execution: Option<super::typed_registry::InstalledWriteExecution>,
+pub struct ConnectorExecutionRoleBindingFactorySet {
+    factories: Arc<BTreeMap<CatalogProviderKind, Arc<dyn ConnectorExecutionRoleBindingFactory>>>,
 }
 
-impl MaterializedCatalogRuntime {
-    pub fn new(runtime: Arc<dyn CatalogRuntime>) -> Self {
-        Self {
-            runtime,
-            read_execution: None,
-            write_execution: None,
-        }
-    }
-
-    fn with_executions(
-        runtime: Arc<dyn CatalogRuntime>,
-        read_execution: Option<super::typed_registry::InstalledReadExecution>,
-        write_execution: Option<super::typed_registry::InstalledWriteExecution>,
-    ) -> Self {
-        Self {
-            runtime,
-            read_execution,
-            write_execution,
-        }
-    }
-
-    pub fn runtime(&self) -> Arc<dyn CatalogRuntime> {
-        Arc::clone(&self.runtime)
-    }
-
-    pub fn read_execution(&self) -> Option<super::typed_registry::InstalledReadExecution> {
-        self.read_execution.clone()
-    }
-
-    pub fn write_execution(&self) -> Option<super::typed_registry::InstalledWriteExecution> {
-        self.write_execution.clone()
-    }
-}
-
-/// Startup-sealed provider materializers keyed by the closed catalog family.
-#[derive(Clone)]
-pub struct CatalogRuntimeMaterializerSet {
-    materializers: Arc<
-        BTreeMap<
-            novarocks_spi::connector::CatalogProviderKind,
-            Arc<dyn CatalogRuntimeMaterializer>,
-        >,
-    >,
-    read_bundle_factories: Arc<
-        BTreeMap<
-            novarocks_spi::connector::CatalogProviderKind,
-            Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-        >,
-    >,
-    write_bundle_factories: Arc<
-        BTreeMap<
-            novarocks_spi::connector::CatalogProviderKind,
-            Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
-        >,
-    >,
-}
-
-impl CatalogRuntimeMaterializerSet {
+impl ConnectorExecutionRoleBindingFactorySet {
     pub fn try_new(
-        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
+        factories: impl IntoIterator<Item = Arc<dyn ConnectorExecutionRoleBindingFactory>>,
     ) -> Result<Self, CatalogManagerError> {
         let mut sealed = BTreeMap::new();
-        for materializer in materializers {
-            let provider_kind = materializer.provider_kind();
-            if sealed.insert(provider_kind, materializer).is_some() {
+        for factory in factories {
+            let provider_kind = factory.provider_kind();
+            if sealed.insert(provider_kind, factory).is_some() {
                 return Err(CatalogManagerError::InvalidConfiguration(
-                    "duplicate catalog runtime materializer provider kind",
+                    "duplicate connector execution role binding factory provider kind",
                 ));
             }
         }
         Ok(Self {
-            materializers: Arc::new(sealed),
-            read_bundle_factories: Arc::new(BTreeMap::new()),
-            write_bundle_factories: Arc::new(BTreeMap::new()),
+            factories: Arc::new(sealed),
         })
     }
 
-    /// Seal the provider read factories alongside catalog materializers.  The
-    /// factory is invoked only after the exact immutable catalog has been
-    /// materialized and identity-checked below.
-    pub fn try_new_with_read_execution_factories(
-        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
-        factories: impl IntoIterator<
-            Item = (
-                novarocks_spi::connector::CatalogProviderKind,
-                Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-            ),
-        >,
-    ) -> Result<Self, CatalogManagerError> {
-        let mut result = Self::try_new(materializers)?;
-        let mut sealed = BTreeMap::new();
-        for (provider_kind, factory) in factories {
-            if sealed.insert(provider_kind, factory).is_some() {
-                return Err(CatalogManagerError::InvalidConfiguration(
-                    "duplicate catalog read execution provider kind",
-                ));
-            }
-        }
-        result.read_bundle_factories = Arc::new(sealed);
-        Ok(result)
-    }
-
-    /// Seal catalog-scoped writer factories alongside the immutable catalog
-    /// materializers and typed-read factories. Each factory is selected only
-    /// by the closed catalog provider kind and receives the exact handle that
-    /// materialization has just verified.
-    pub fn try_new_with_execution_factories(
-        materializers: impl IntoIterator<Item = Arc<dyn CatalogRuntimeMaterializer>>,
-        read_factories: impl IntoIterator<
-            Item = (
-                novarocks_spi::connector::CatalogProviderKind,
-                Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-            ),
-        >,
-        write_factories: impl IntoIterator<
-            Item = (
-                novarocks_spi::connector::CatalogProviderKind,
-                Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
-            ),
-        >,
-    ) -> Result<Self, CatalogManagerError> {
-        let mut result =
-            Self::try_new_with_read_execution_factories(materializers, read_factories)?;
-        let mut sealed = BTreeMap::new();
-        for (provider_kind, factory) in write_factories {
-            if sealed.insert(provider_kind, factory).is_some() {
-                return Err(CatalogManagerError::InvalidConfiguration(
-                    "duplicate catalog write execution provider kind",
-                ));
-            }
-        }
-        result.write_bundle_factories = Arc::new(sealed);
-        Ok(result)
-    }
-
-    pub fn materialize(
+    pub fn bind(
         &self,
         properties: &CatalogProperties,
-    ) -> Result<MaterializedCatalogRuntime, CatalogManagerError> {
-        let Some(materializer) = self.materializers.get(&properties.provider_kind()) else {
-            return Err(CatalogManagerError::materialization_failed(
-                "catalog runtime provider is not installed",
+    ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
+        let normalized =
+            NormalizedCatalogProperties::try_new(properties.clone()).map_err(|detail| {
+                ConnectorMaterializationError::new(
+                    ConnectorMaterializationErrorClass::InvalidDefinition,
+                    ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
+                )
+            })?;
+        let Some(factory) = self.factories.get(&normalized.provider_kind()) else {
+            return Err(ConnectorMaterializationError::new(
+                ConnectorMaterializationErrorClass::InvalidDefinition,
+                ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                "connector execution role provider is not installed",
             ));
         };
-        let runtime = materializer
-            .materialize(properties)
-            .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))?;
-        if runtime.handle() != properties.handle()
-            || runtime.provider_kind() != properties.provider_kind()
-        {
-            return Err(CatalogManagerError::materialization_failed(
-                "catalog runtime materializer returned an incompatible runtime",
-            ));
-        }
+        let binding = factory.bind(&normalized)?;
         if crate::config::debug_emit_catalog_materialization_marker() {
             println!(
                 "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",
                 properties.handle()
             );
         }
-        let read_execution = self
-            .read_bundle_factories
-            .get(&properties.provider_kind())
-            .map(|factory| {
-                factory
-                    .build(properties)
-                    .map(|bundle| {
-                        super::typed_registry::InstalledReadExecution::new(
-                            bundle.provider_factory(),
-                            bundle.codec(),
-                        )
-                    })
-                    .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))
-            })
-            .transpose()?;
-        let write_execution =
-            self.write_bundle_factories
-                .get(&properties.provider_kind())
-                .map(|factory| {
-                    factory
-                    .build(properties)
-                    .and_then(|bundle| {
-                        let execution = bundle.execution();
-                        if execution.catalog_handle() != properties.handle() {
-                            return Err(novarocks_spi::connector::ConnectorError::new(
-                                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                                "catalog writer factory returned an incompatible catalog handle",
-                            ));
-                        }
-                        Ok(super::typed_registry::InstalledWriteExecution::new(execution))
-                    })
-                    .map_err(|error| CatalogManagerError::materialization_failed(error.to_string()))
-                })
-                .transpose()?;
-        Ok(if read_execution.is_some() || write_execution.is_some() {
-            MaterializedCatalogRuntime::with_executions(runtime, read_execution, write_execution)
-        } else {
-            MaterializedCatalogRuntime::new(runtime)
-        })
+        Ok(binding)
     }
 }
 
@@ -253,12 +103,22 @@ impl CatalogRuntimeMaterializerSet {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogManagerConfig {
     pub max_retained_catalogs: usize,
+    pub max_failed_catalogs: usize,
+    pub failed_retention: Duration,
+    pub transient_retry_cooldown: Duration,
+    pub provider_max_concurrent_binds: usize,
+    pub provider_min_bind_interval: Duration,
 }
 
 impl Default for CatalogManagerConfig {
     fn default() -> Self {
         Self {
             max_retained_catalogs: DEFAULT_MAX_RETAINED_CATALOGS,
+            max_failed_catalogs: DEFAULT_MAX_FAILED_CATALOGS,
+            failed_retention: DEFAULT_FAILED_RETENTION,
+            transient_retry_cooldown: DEFAULT_TRANSIENT_RETRY_COOLDOWN,
+            provider_max_concurrent_binds: DEFAULT_PROVIDER_MAX_CONCURRENT_BINDS,
+            provider_min_bind_interval: Duration::ZERO,
         }
     }
 }
@@ -267,14 +127,44 @@ impl Default for CatalogManagerConfig {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CatalogManagerError {
     InvalidConfiguration(&'static str),
-    ConflictingProperties { handle: CatalogHandle },
-    MaterializationFailed { message: Arc<str> },
+    ConflictingProperties {
+        handle: CatalogHandle,
+    },
+    MaterializationFailed {
+        class: ConnectorMaterializationErrorClass,
+        disposition: ConnectorMaterializationRetryDisposition,
+        detail: Arc<str>,
+    },
 }
 
 impl CatalogManagerError {
     pub fn materialization_failed(message: impl Into<Arc<str>>) -> Self {
         Self::MaterializationFailed {
-            message: message.into(),
+            class: ConnectorMaterializationErrorClass::Internal,
+            disposition: ConnectorMaterializationRetryDisposition::Transient,
+            detail: message.into(),
+        }
+    }
+
+    pub fn from_materialization(error: ConnectorMaterializationError) -> Self {
+        Self::MaterializationFailed {
+            class: error.class(),
+            disposition: error.disposition(),
+            detail: Arc::from(error.detail()),
+        }
+    }
+
+    pub const fn class(&self) -> Option<ConnectorMaterializationErrorClass> {
+        match self {
+            Self::MaterializationFailed { class, .. } => Some(*class),
+            Self::InvalidConfiguration(_) | Self::ConflictingProperties { .. } => None,
+        }
+    }
+
+    pub const fn disposition(&self) -> Option<ConnectorMaterializationRetryDisposition> {
+        match self {
+            Self::MaterializationFailed { disposition, .. } => Some(*disposition),
+            Self::InvalidConfiguration(_) | Self::ConflictingProperties { .. } => None,
         }
     }
 }
@@ -288,8 +178,11 @@ impl fmt::Display for CatalogManagerError {
                 "catalog handle {} has conflicting materialization properties",
                 handle.catalog_name().as_str()
             ),
-            Self::MaterializationFailed { message } => {
-                write!(formatter, "catalog materialization failed: {message}")
+            Self::MaterializationFailed { class, detail, .. } => {
+                write!(
+                    formatter,
+                    "catalog materialization failed ({class:?}): {detail}"
+                )
             }
         }
     }
@@ -332,7 +225,8 @@ impl CatalogPruneResult {
 #[derive(Clone)]
 pub struct CatalogManager<T> {
     state: Arc<Mutex<CatalogManagerState<T>>>,
-    max_retained_catalogs: usize,
+    config: CatalogManagerConfig,
+    provider_changed: Arc<Condvar>,
 }
 
 /// A bounded, provider-neutral view of catalog leases held by admitted
@@ -348,6 +242,13 @@ struct CatalogManagerState<T> {
     entries: BTreeMap<CatalogHandle, Arc<CatalogCell<T>>>,
     query_reachability: BTreeMap<QueryExecutionId, BTreeSet<CatalogHandle>>,
     next_registration_token: u64,
+    provider_binds: BTreeMap<CatalogProviderKind, ProviderBindState>,
+}
+
+#[derive(Default)]
+struct ProviderBindState {
+    active: usize,
+    last_started: Option<Instant>,
 }
 
 struct CatalogCell<T> {
@@ -362,7 +263,12 @@ enum CatalogCellState<T> {
         runtime: Arc<T>,
         registration_token: RegistrationToken,
     },
-    Failed(CatalogManagerError),
+    FailedSuppressed {
+        error: CatalogManagerError,
+        attempts: u32,
+        retry_after: Option<Instant>,
+        last_used: Instant,
+    },
 }
 
 /// BE-private registration identity.  It is never supplied by FE input or
@@ -387,18 +293,22 @@ impl<T> CatalogCell<T> {
         }
     }
 
-    fn wait_for_result(&self) -> Result<Arc<T>, CatalogManagerError> {
+    fn wait_for_result(&self, active: &impl Fn() -> bool) -> Result<Arc<T>, CatalogManagerError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         loop {
             match &*state {
                 CatalogCellState::Materializing => {
-                    state = self
+                    if !active() {
+                        return Err(cancelled_catalog_install_error());
+                    }
+                    let (next, _) = self
                         .changed
-                        .wait(state)
+                        .wait_timeout(state, Duration::from_millis(10))
                         .unwrap_or_else(|error| error.into_inner());
+                    state = next;
                 }
                 CatalogCellState::Ready { runtime, .. } => return Ok(Arc::clone(runtime)),
-                CatalogCellState::Failed(error) => return Err(error.clone()),
+                CatalogCellState::FailedSuppressed { error, .. } => return Err(error.clone()),
             }
         }
     }
@@ -407,6 +317,8 @@ impl<T> CatalogCell<T> {
         &self,
         result: Result<T, CatalogManagerError>,
         registration_token: Option<RegistrationToken>,
+        attempts: u32,
+        retry_after: Option<Instant>,
     ) -> Result<Arc<T>, CatalogManagerError> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         let result = match result {
@@ -421,7 +333,12 @@ impl<T> CatalogCell<T> {
                 Ok(runtime)
             }
             Err(error) => {
-                *state = CatalogCellState::Failed(error.clone());
+                *state = CatalogCellState::FailedSuppressed {
+                    error: error.clone(),
+                    attempts,
+                    retry_after,
+                    last_used: Instant::now(),
+                };
                 Err(error)
             }
         };
@@ -452,75 +369,143 @@ impl<T> CatalogManager<T> {
                 "catalog manager must retain at least one catalog",
             ));
         }
+        if config.max_failed_catalogs == 0 {
+            return Err(CatalogManagerError::InvalidConfiguration(
+                "catalog manager must retain at least one suppressed failure",
+            ));
+        }
+        if config.failed_retention.is_zero() || config.provider_max_concurrent_binds == 0 {
+            return Err(CatalogManagerError::InvalidConfiguration(
+                "catalog manager suppression and provider bind limits must be positive",
+            ));
+        }
         Ok(Self {
             state: Arc::new(Mutex::new(CatalogManagerState {
                 entries: BTreeMap::new(),
                 query_reachability: BTreeMap::new(),
                 next_registration_token: 0,
+                provider_binds: BTreeMap::new(),
             })),
-            max_retained_catalogs: config.max_retained_catalogs,
+            config,
+            provider_changed: Arc::new(Condvar::new()),
         })
     }
 
     /// Materialize one exact catalog, lease it to `query`, and return the
-    /// shared local runtime.  Concurrent callers for matching properties wait
-    /// on one installation.  A failed installation is rolled back atomically:
-    /// it never becomes a retained entry or a query-reachable handle.
+    /// shared local runtime.  Pending installation and query reachability are
+    /// intentionally separate: only a completed Ready binding acquires a
+    /// query lease.  A suppressed failure therefore cannot become a decode
+    /// authority while it protects a provider from an Init storm.
     pub fn ensure(
         &self,
         query: QueryExecutionId,
         properties: CatalogProperties,
         materialize: impl FnOnce(&CatalogProperties) -> Result<T, CatalogManagerError>,
     ) -> Result<Arc<T>, CatalogManagerError> {
+        self.ensure_while(query, properties, || true, materialize)
+    }
+
+    pub fn ensure_while(
+        &self,
+        query: QueryExecutionId,
+        properties: CatalogProperties,
+        active: impl Fn() -> bool,
+        materialize: impl FnOnce(&CatalogProperties) -> Result<T, CatalogManagerError>,
+    ) -> Result<Arc<T>, CatalogManagerError> {
         let handle = properties.handle().clone();
-        let (cell, installer) = {
+        let (cell, installer, attempts) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             if let Some(cell) = state.entries.get(&handle).cloned() {
                 if cell.properties != properties {
                     return Err(CatalogManagerError::ConflictingProperties { handle });
                 }
-                state
-                    .query_reachability
-                    .entry(query)
-                    .or_default()
-                    .insert(properties.handle().clone());
-                (cell, false)
+                let mut cell_state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
+                match &mut *cell_state {
+                    CatalogCellState::Ready { runtime, .. } => {
+                        let runtime = Arc::clone(runtime);
+                        drop(cell_state);
+                        state
+                            .query_reachability
+                            .entry(query)
+                            .or_default()
+                            .insert(handle);
+                        return Ok(runtime);
+                    }
+                    CatalogCellState::Materializing => {
+                        drop(cell_state);
+                        (cell, false, 0)
+                    }
+                    CatalogCellState::FailedSuppressed {
+                        error,
+                        attempts,
+                        retry_after,
+                        last_used,
+                    } => {
+                        *last_used = Instant::now();
+                        let retryable = error.disposition()
+                            == Some(ConnectorMaterializationRetryDisposition::Transient)
+                            && retry_after.is_some_and(|deadline| Instant::now() >= deadline);
+                        if !retryable {
+                            return Err(error.clone());
+                        }
+                        let next_attempt = attempts.saturating_add(1);
+                        *cell_state = CatalogCellState::Materializing;
+                        drop(cell_state);
+                        (cell, true, next_attempt)
+                    }
+                }
             } else {
                 let cell = Arc::new(CatalogCell::materializing(properties));
                 state.entries.insert(handle.clone(), Arc::clone(&cell));
-                state
-                    .query_reachability
-                    .entry(query)
-                    .or_default()
-                    .insert(handle.clone());
-                (cell, true)
+                (cell, true, 1)
             }
         };
 
         if !installer {
-            let result = cell.wait_for_result();
-            if result.is_err() {
-                self.remove_query_handle(query, &handle);
+            let runtime = cell.wait_for_result(&active)?;
+            if !active() {
+                return Err(cancelled_catalog_install_error());
             }
-            return result;
+            self.lease_ready(query, &handle, &cell)?;
+            return Ok(runtime);
         }
 
-        let materialized = materialize(&cell.properties);
+        self.acquire_provider_bind(cell.properties.provider_kind(), &active)?;
+        let materialized = if active() {
+            materialize(&cell.properties)
+        } else {
+            Err(cancelled_catalog_install_error())
+        };
+        self.release_provider_bind(cell.properties.provider_kind());
+        let materialized = if active() {
+            materialized
+        } else {
+            Err(cancelled_catalog_install_error())
+        };
         let registration_token = materialized
             .as_ref()
             .ok()
             .map(|_| self.allocate_registration_token());
-        let result = cell.complete(materialized, registration_token);
-        if result.is_err() {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            if state
-                .entries
-                .get(&handle)
-                .is_some_and(|current| Arc::ptr_eq(current, &cell))
-            {
-                state.entries.remove(&handle);
+        let retry_after = materialized.as_ref().err().and_then(|error| {
+            (error.disposition() == Some(ConnectorMaterializationRetryDisposition::Transient))
+                .then(|| Instant::now() + self.config.transient_retry_cooldown)
+        });
+        let result = cell.complete(materialized, registration_token, attempts, retry_after);
+        if let Ok(runtime) = result {
+            if !active() {
+                return Err(cancelled_catalog_install_error());
             }
-            remove_handle_from_all_queries(&mut state.query_reachability, &handle);
+            self.lease_ready(query, &handle, &cell)?;
+            return Ok(runtime);
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            trim_failed_entries(
+                &mut state,
+                self.config.max_failed_catalogs,
+                self.config.failed_retention,
+                Instant::now(),
+            );
         }
         result
     }
@@ -567,7 +552,18 @@ impl<T> CatalogManager<T> {
     pub fn release_query(&self, query: QueryExecutionId) -> BTreeSet<CatalogHandle> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.query_reachability.remove(&query);
-        trim_unreachable_ready_entries(&mut state, self.max_retained_catalogs, &BTreeSet::new())
+        let removed = trim_unreachable_ready_entries(
+            &mut state,
+            self.config.max_retained_catalogs,
+            &BTreeSet::new(),
+        );
+        trim_failed_entries(
+            &mut state,
+            self.config.max_failed_catalogs,
+            self.config.failed_retention,
+            Instant::now(),
+        );
+        removed
     }
 
     /// Reconcile retained entries with the frontend's complete view of live
@@ -586,6 +582,7 @@ impl<T> CatalogManager<T> {
                 missing_live_handles,
             };
         }
+        remove_unreachable_failed_entries(&mut state, reachable);
         let handles = trim_unreachable_ready_entries(&mut state, 0, reachable);
         CatalogPruneResult::Pruned { handles }
     }
@@ -601,7 +598,7 @@ impl<T> CatalogManager<T> {
         let state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
         match &*state {
             CatalogCellState::Ready { runtime, .. } => Some(Arc::clone(runtime)),
-            CatalogCellState::Materializing | CatalogCellState::Failed(_) => None,
+            CatalogCellState::Materializing | CatalogCellState::FailedSuppressed { .. } => None,
         }
     }
 
@@ -625,7 +622,7 @@ impl<T> CatalogManager<T> {
         let state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
         match &*state {
             CatalogCellState::Ready { runtime, .. } => Some(Arc::clone(runtime)),
-            CatalogCellState::Materializing | CatalogCellState::Failed(_) => None,
+            CatalogCellState::Materializing | CatalogCellState::FailedSuppressed { .. } => None,
         }
     }
 
@@ -659,18 +656,64 @@ impl<T> CatalogManager<T> {
         }
     }
 
-    fn remove_query_handle(&self, query: QueryExecutionId, handle: &CatalogHandle) {
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let remove_query = state
-            .query_reachability
-            .get_mut(&query)
-            .is_some_and(|handles| {
-                handles.remove(handle);
-                handles.is_empty()
-            });
-        if remove_query {
-            state.query_reachability.remove(&query);
+    fn lease_ready(
+        &self,
+        query: QueryExecutionId,
+        handle: &CatalogHandle,
+        cell: &Arc<CatalogCell<T>>,
+    ) -> Result<(), CatalogManagerError> {
+        let cell_state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
+        if !matches!(&*cell_state, CatalogCellState::Ready { .. }) {
+            return Err(CatalogManagerError::materialization_failed(
+                "catalog install did not complete Ready",
+            ));
         }
+        drop(cell_state);
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .query_reachability
+            .entry(query)
+            .or_default()
+            .insert(handle.clone());
+        Ok(())
+    }
+
+    fn acquire_provider_bind(
+        &self,
+        provider: CatalogProviderKind,
+        active: &impl Fn() -> bool,
+    ) -> Result<(), CatalogManagerError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if !active() {
+                return Err(cancelled_catalog_install_error());
+            }
+            let provider_state = state.provider_binds.entry(provider).or_default();
+            let rate_ready = provider_state
+                .last_started
+                .is_none_or(|last| last.elapsed() >= self.config.provider_min_bind_interval);
+            if provider_state.active < self.config.provider_max_concurrent_binds && rate_ready {
+                provider_state.active += 1;
+                provider_state.last_started = Some(Instant::now());
+                return Ok(());
+            }
+            let (next, _) = self
+                .provider_changed
+                .wait_timeout(state, Duration::from_millis(10))
+                .unwrap_or_else(|error| error.into_inner());
+            state = next;
+        }
+    }
+
+    fn release_provider_bind(&self, provider: CatalogProviderKind) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let provider_state = state
+            .provider_binds
+            .get_mut(&provider)
+            .expect("acquired provider bind state must exist");
+        provider_state.active = provider_state.active.saturating_sub(1);
+        self.provider_changed.notify_all();
     }
 
     fn allocate_registration_token(&self) -> RegistrationToken {
@@ -698,13 +741,66 @@ fn all_query_handles(
         .collect()
 }
 
-fn remove_handle_from_all_queries(
-    query_reachability: &mut BTreeMap<QueryExecutionId, BTreeSet<CatalogHandle>>,
-    handle: &CatalogHandle,
+fn cancelled_catalog_install_error() -> CatalogManagerError {
+    CatalogManagerError::from_materialization(ConnectorMaterializationError::new(
+        ConnectorMaterializationErrorClass::Cancelled,
+        ConnectorMaterializationRetryDisposition::Transient,
+        "catalog installation was cancelled before Ready",
+    ))
+}
+
+fn trim_failed_entries<T>(
+    state: &mut CatalogManagerState<T>,
+    retain_at_most: usize,
+    retention: Duration,
+    now: Instant,
 ) {
-    query_reachability.retain(|_, handles| {
-        handles.remove(handle);
-        !handles.is_empty()
+    let mut failed = state
+        .entries
+        .iter()
+        .filter_map(|(handle, cell)| {
+            let cell_state = cell.state.lock().unwrap_or_else(|error| error.into_inner());
+            let CatalogCellState::FailedSuppressed { last_used, .. } = &*cell_state else {
+                return None;
+            };
+            Some((handle.clone(), *last_used))
+        })
+        .collect::<Vec<_>>();
+    failed.sort_by_key(|(_, last_used)| *last_used);
+    let expired = failed
+        .iter()
+        .filter(|(_, last_used)| now.duration_since(*last_used) >= retention)
+        .map(|(handle, _)| handle.clone())
+        .collect::<BTreeSet<_>>();
+    let overflow = failed.len().saturating_sub(retain_at_most);
+    let evicted = failed
+        .into_iter()
+        .take(overflow)
+        .map(|(handle, _)| handle)
+        .collect::<BTreeSet<_>>();
+    for handle in expired.union(&evicted) {
+        let removable = state.entries.get(handle).is_some_and(|cell| {
+            matches!(
+                &*cell.state.lock().unwrap_or_else(|error| error.into_inner()),
+                CatalogCellState::FailedSuppressed { .. }
+            )
+        });
+        if removable {
+            state.entries.remove(handle);
+        }
+    }
+}
+
+fn remove_unreachable_failed_entries<T>(
+    state: &mut CatalogManagerState<T>,
+    reachable: &BTreeSet<CatalogHandle>,
+) {
+    state.entries.retain(|handle, cell| {
+        reachable.contains(handle)
+            || !matches!(
+                &*cell.state.lock().unwrap_or_else(|error| error.into_inner()),
+                CatalogCellState::FailedSuppressed { .. }
+            )
     });
 }
 
@@ -782,53 +878,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
+    use std::time::Duration;
 
+    use novarocks_connector_binding::{
+        ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
+        ConnectorMaterializationError, ConnectorMaterializationErrorClass,
+        ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
+    };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
-        CatalogRuntimeMaterializer, CatalogVersion, ConnectorError, ConnectorInstanceId,
+        CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
     };
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
     use super::{
         CatalogManager, CatalogManagerConfig, CatalogManagerError, CatalogPruneResult,
-        CatalogRuntimeMaterializerSet, remove_ready_candidate_if_current,
+        ConnectorExecutionRoleBindingFactorySet, remove_ready_candidate_if_current,
     };
-
-    struct TestRuntime {
-        handle: CatalogHandle,
-        provider_kind: CatalogProviderKind,
-    }
-
-    impl CatalogRuntime for TestRuntime {
-        fn handle(&self) -> &CatalogHandle {
-            &self.handle
-        }
-
-        fn provider_kind(&self) -> CatalogProviderKind {
-            self.provider_kind
-        }
-    }
-
-    struct TestMaterializer {
-        provider_kind: CatalogProviderKind,
-        returned_kind: CatalogProviderKind,
-    }
-
-    impl CatalogRuntimeMaterializer for TestMaterializer {
-        fn provider_kind(&self) -> CatalogProviderKind {
-            self.provider_kind
-        }
-
-        fn materialize(
-            &self,
-            properties: &CatalogProperties,
-        ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
-            Ok(Arc::new(TestRuntime {
-                handle: properties.handle().clone(),
-                provider_kind: self.returned_kind,
-            }))
-        }
-    }
 
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, value), AttemptId::new(1).expect("attempt"))
@@ -844,33 +909,38 @@ mod tests {
             .expect("catalog properties")
     }
 
+    struct UnsupportedFactory {
+        provider_kind: CatalogProviderKind,
+    }
+
+    impl ConnectorExecutionRoleBindingFactory for UnsupportedFactory {
+        fn provider_kind(&self) -> CatalogProviderKind {
+            self.provider_kind
+        }
+
+        fn bind(
+            &self,
+            properties: &NormalizedCatalogProperties,
+        ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
+            ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None, None)
+                .map_err(Into::into)
+        }
+    }
+
     #[test]
-    fn sealed_materializer_set_requires_the_exact_provider_and_runtime_identity() {
-        let properties = properties(1);
-        let set = CatalogRuntimeMaterializerSet::try_new([Arc::new(TestMaterializer {
-            provider_kind: CatalogProviderKind::Iceberg,
-            returned_kind: CatalogProviderKind::Iceberg,
-        })
-            as Arc<dyn CatalogRuntimeMaterializer>])
-        .expect("seal materializer set");
-        let runtime = set.materialize(&properties).expect("exact materialization");
-        assert_eq!(runtime.runtime().handle(), properties.handle());
-
-        let mismatched = CatalogRuntimeMaterializerSet::try_new([Arc::new(TestMaterializer {
-            provider_kind: CatalogProviderKind::Iceberg,
-            returned_kind: CatalogProviderKind::StarRocks,
-        })
-            as Arc<dyn CatalogRuntimeMaterializer>])
-        .expect("seal materializer set");
+    fn execution_role_factory_set_rejects_duplicate_provider_kind_before_admission() {
         assert!(matches!(
-            mismatched.materialize(&properties),
-            Err(CatalogManagerError::MaterializationFailed { .. })
-        ));
-
-        let missing = CatalogRuntimeMaterializerSet::try_new([]).expect("empty set is valid");
-        assert!(matches!(
-            missing.materialize(&properties),
-            Err(CatalogManagerError::MaterializationFailed { .. })
+            ConnectorExecutionRoleBindingFactorySet::try_new([
+                Arc::new(UnsupportedFactory {
+                    provider_kind: CatalogProviderKind::Iceberg,
+                }) as Arc<dyn ConnectorExecutionRoleBindingFactory>,
+                Arc::new(UnsupportedFactory {
+                    provider_kind: CatalogProviderKind::Iceberg,
+                }) as Arc<dyn ConnectorExecutionRoleBindingFactory>,
+            ]),
+            Err(CatalogManagerError::InvalidConfiguration(
+                "duplicate connector execution role binding factory provider kind"
+            ))
         ));
     }
 
@@ -908,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_materialization_rolls_back_entry_and_all_query_reachability() {
+    fn failed_materialization_is_suppressed_but_never_query_reachable() {
         let manager = CatalogManager::<usize>::default();
         let catalog = properties(3);
         let handle = catalog.handle().clone();
@@ -924,7 +994,7 @@ mod tests {
             CatalogManagerError::materialization_failed("credentials unavailable")
         );
         assert!(manager.resolve(&handle).is_none());
-        assert!(manager.retained_handles().is_empty());
+        assert!(manager.retained_handles().contains(&handle));
         assert!(manager.query_handles(query(1)).is_empty());
     }
 
@@ -954,8 +1024,41 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_failed_materialization_creates_a_fresh_runtime() {
-        let manager = CatalogManager::<usize>::default();
+    fn cooldown_suppresses_repeated_transient_bind_attempts() {
+        let manager = CatalogManager::<usize>::try_new(CatalogManagerConfig {
+            transient_retry_cooldown: Duration::from_secs(60),
+            ..CatalogManagerConfig::default()
+        })
+        .expect("valid manager");
+        let catalog = properties(3);
+        let calls = AtomicUsize::new(0);
+        manager
+            .ensure(query(1), catalog.clone(), |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(CatalogManagerError::materialization_failed(
+                    "transient failure",
+                ))
+            })
+            .expect_err("first materialization fails");
+        assert!(
+            manager
+                .ensure(query(2), catalog.clone(), |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(9)
+                })
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(manager.resolve(catalog.handle()).is_none());
+    }
+
+    #[test]
+    fn expired_transient_suppression_allows_one_fresh_installer_and_success_clears_failure() {
+        let manager = CatalogManager::<usize>::try_new(CatalogManagerConfig {
+            transient_retry_cooldown: Duration::ZERO,
+            ..CatalogManagerConfig::default()
+        })
+        .expect("valid manager");
         let catalog = properties(3);
         manager
             .ensure(query(1), catalog.clone(), |_| {
@@ -963,17 +1066,175 @@ mod tests {
                     "transient failure",
                 ))
             })
-            .expect_err("first materialization fails");
+            .expect_err("first bind fails");
         assert_eq!(
             *manager
                 .ensure(query(2), catalog.clone(), |_| Ok(9))
-                .expect("retry materializes a fresh entry"),
+                .expect("expired suppression permits one fresh bind"),
             9
         );
         assert_eq!(
-            *manager.resolve(catalog.handle()).expect("retry resolves"),
+            *manager.resolve(catalog.handle()).expect("Ready runtime"),
             9
         );
+        assert_eq!(manager.query_handles(query(1)).len(), 0);
+        assert_eq!(manager.query_handles(query(2)).len(), 1);
+    }
+
+    #[test]
+    fn permanent_failure_waits_for_a_new_exact_handle() {
+        let manager = CatalogManager::<usize>::default();
+        let calls = AtomicUsize::new(0);
+        let permanent =
+            CatalogManagerError::from_materialization(ConnectorMaterializationError::new(
+                ConnectorMaterializationErrorClass::InvalidDefinition,
+                ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                "invalid catalog definition",
+            ));
+        manager
+            .ensure(query(1), properties(3), |_| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(permanent.clone())
+            })
+            .expect_err("permanent bind fails");
+        assert!(
+            manager
+                .ensure(query(2), properties(3), |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(9)
+                })
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *manager
+                .ensure(query(3), properties(4), |_| Ok(11))
+                .expect("new exact handle is independent"),
+            11
+        );
+    }
+
+    #[test]
+    fn provider_limiter_serializes_many_exact_keys() {
+        let manager = Arc::new(
+            CatalogManager::<usize>::try_new(CatalogManagerConfig {
+                provider_max_concurrent_binds: 1,
+                ..CatalogManagerConfig::default()
+            })
+            .expect("valid manager"),
+        );
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let run = |query, catalog: CatalogProperties| {
+            let manager = Arc::clone(&manager);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            thread::spawn(move || {
+                manager.ensure(query, catalog, |_| {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(25));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(1)
+                })
+            })
+        };
+        let first = run(query(1), properties(1));
+        let second = run(query(2), properties(2));
+        first.join().expect("first bind").expect("first Ready");
+        second.join().expect("second bind").expect("second Ready");
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_suppression_capacity_evicts_lru_without_creating_query_leases() {
+        let manager = CatalogManager::<usize>::try_new(CatalogManagerConfig {
+            max_failed_catalogs: 1,
+            transient_retry_cooldown: Duration::from_secs(60),
+            ..CatalogManagerConfig::default()
+        })
+        .expect("valid manager");
+        for (query_id, catalog) in [(1, properties(1)), (2, properties(2))] {
+            manager
+                .ensure(query(query_id), catalog, |_| {
+                    Err(CatalogManagerError::materialization_failed(
+                        "transient failure",
+                    ))
+                })
+                .expect_err("suppressed failure");
+        }
+        assert_eq!(manager.retained_handles().len(), 1);
+        assert!(manager.query_handles(query(1)).is_empty());
+        assert!(manager.query_handles(query(2)).is_empty());
+    }
+
+    #[test]
+    fn failed_suppression_ttl_expires_without_turning_failure_into_a_lease() {
+        let manager = CatalogManager::<usize>::try_new(CatalogManagerConfig {
+            failed_retention: Duration::from_millis(1),
+            transient_retry_cooldown: Duration::from_secs(60),
+            ..CatalogManagerConfig::default()
+        })
+        .expect("valid manager");
+        let catalog = properties(1);
+        let handle = catalog.handle().clone();
+        manager
+            .ensure(query(1), catalog, |_| {
+                Err(CatalogManagerError::materialization_failed(
+                    "transient failure",
+                ))
+            })
+            .expect_err("suppressed failure");
+        thread::sleep(Duration::from_millis(2));
+        manager.release_query(query(1));
+        assert!(!manager.retained_handles().contains(&handle));
+        assert!(manager.query_handles(query(1)).is_empty());
+    }
+
+    #[test]
+    fn prune_retires_failed_suppression_for_an_absent_exact_handle() {
+        let manager = CatalogManager::<usize>::default();
+        let catalog = properties(1);
+        let handle = catalog.handle().clone();
+        manager
+            .ensure(query(1), catalog, |_| {
+                Err(CatalogManagerError::materialization_failed(
+                    "transient failure",
+                ))
+            })
+            .expect_err("suppressed failure");
+        assert!(manager.retained_handles().contains(&handle));
+        assert_eq!(
+            manager.prune_unreachable(&BTreeSet::new()),
+            CatalogPruneResult::Pruned {
+                handles: BTreeSet::new(),
+            }
+        );
+        assert!(!manager.retained_handles().contains(&handle));
+    }
+
+    #[test]
+    fn cancelled_install_never_calls_provider_or_leases_pending_handle() {
+        let manager = CatalogManager::<usize>::default();
+        let calls = AtomicUsize::new(0);
+        let catalog = properties(1);
+        let handle = catalog.handle().clone();
+        assert!(
+            manager
+                .ensure_while(
+                    query(1),
+                    catalog,
+                    || false,
+                    |_| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(1)
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(manager.query_handles(query(1)).is_empty());
+        assert!(manager.resolve(&handle).is_none());
     }
 
     #[test]
@@ -1123,6 +1384,7 @@ mod tests {
     fn release_enforces_bounded_retention_after_queries_finish() {
         let manager = CatalogManager::<usize>::try_new(CatalogManagerConfig {
             max_retained_catalogs: 1,
+            ..CatalogManagerConfig::default()
         })
         .expect("valid manager");
         let first = properties(1);
@@ -1152,6 +1414,7 @@ mod tests {
         assert!(matches!(
             CatalogManager::<()>::try_new(CatalogManagerConfig {
                 max_retained_catalogs: 0,
+                ..CatalogManagerConfig::default()
             }),
             Err(CatalogManagerError::InvalidConfiguration(
                 "catalog manager must retain at least one catalog"

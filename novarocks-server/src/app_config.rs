@@ -1008,6 +1008,24 @@ pub struct RuntimeConfig {
     pub catalog_prune_rpc_timeout_ms: u64,
     #[serde(default = "default_catalog_prune_max_inflight")]
     pub catalog_prune_max_inflight: usize,
+    #[serde(default = "default_catalog_materialization_attempt_timeout_ms")]
+    pub catalog_materialization_attempt_timeout_ms: u64,
+    #[serde(default = "default_catalog_materialization_retry_initial_backoff_ms")]
+    pub catalog_materialization_retry_initial_backoff_ms: u64,
+    #[serde(default = "default_catalog_materialization_retry_max_backoff_ms")]
+    pub catalog_materialization_retry_max_backoff_ms: u64,
+    #[serde(default = "default_catalog_materialization_max_inflight")]
+    pub catalog_materialization_max_inflight: usize,
+    #[serde(default = "default_catalog_bind_max_failed")]
+    pub catalog_bind_max_failed: usize,
+    #[serde(default = "default_catalog_bind_failed_retention_ms")]
+    pub catalog_bind_failed_retention_ms: u64,
+    #[serde(default = "default_catalog_bind_transient_retry_cooldown_ms")]
+    pub catalog_bind_transient_retry_cooldown_ms: u64,
+    #[serde(default = "default_catalog_bind_provider_max_concurrent")]
+    pub catalog_bind_provider_max_concurrent: usize,
+    #[serde(default = "default_catalog_bind_provider_min_interval_ms")]
+    pub catalog_bind_provider_min_interval_ms: u64,
     #[serde(default = "default_query_control_stage_rpc_timeout_ms")]
     pub query_control_stage_rpc_timeout_ms: u64,
     #[serde(default = "default_query_control_start_rpc_timeout_ms")]
@@ -1264,6 +1282,34 @@ fn default_catalog_prune_max_inflight() -> usize {
     16
 }
 
+fn default_catalog_materialization_attempt_timeout_ms() -> u64 {
+    10_000
+}
+fn default_catalog_materialization_retry_initial_backoff_ms() -> u64 {
+    100
+}
+fn default_catalog_materialization_retry_max_backoff_ms() -> u64 {
+    5_000
+}
+fn default_catalog_materialization_max_inflight() -> usize {
+    64
+}
+fn default_catalog_bind_max_failed() -> usize {
+    64
+}
+fn default_catalog_bind_failed_retention_ms() -> u64 {
+    60_000
+}
+fn default_catalog_bind_transient_retry_cooldown_ms() -> u64 {
+    1_000
+}
+fn default_catalog_bind_provider_max_concurrent() -> usize {
+    4
+}
+fn default_catalog_bind_provider_min_interval_ms() -> u64 {
+    0
+}
+
 fn default_query_control_stage_rpc_timeout_ms() -> u64 {
     5_000
 }
@@ -1443,6 +1489,24 @@ fn validate_query_control_config(runtime: &RuntimeConfig) -> Result<()> {
     }
     if runtime.catalog_prune_max_inflight == 0 {
         bail!("runtime.catalog_prune_max_inflight must be greater than 0");
+    }
+    if runtime.catalog_materialization_max_inflight == 0
+        || runtime.catalog_bind_max_failed == 0
+        || runtime.catalog_bind_provider_max_concurrent == 0
+    {
+        bail!("catalog materialization and bind capacities must be greater than 0");
+    }
+    if runtime.catalog_materialization_attempt_timeout_ms == 0
+        || runtime.catalog_materialization_retry_initial_backoff_ms == 0
+        || runtime.catalog_materialization_retry_max_backoff_ms == 0
+        || runtime.catalog_materialization_retry_initial_backoff_ms
+            > runtime.catalog_materialization_retry_max_backoff_ms
+        || runtime.catalog_bind_failed_retention_ms == 0
+        || runtime.catalog_bind_transient_retry_cooldown_ms == 0
+    {
+        bail!(
+            "catalog materialization and bind durations must be nonzero and retry initial must not exceed retry max"
+        );
     }
     if runtime.query_control_max_active_entries == 0 {
         bail!("runtime.query_control_max_active_entries must be greater than 0");
@@ -1769,6 +1833,19 @@ impl Default for RuntimeConfig {
             catalog_prune_interval_ms: default_catalog_prune_interval_ms(),
             catalog_prune_rpc_timeout_ms: default_catalog_prune_rpc_timeout_ms(),
             catalog_prune_max_inflight: default_catalog_prune_max_inflight(),
+            catalog_materialization_attempt_timeout_ms:
+                default_catalog_materialization_attempt_timeout_ms(),
+            catalog_materialization_retry_initial_backoff_ms:
+                default_catalog_materialization_retry_initial_backoff_ms(),
+            catalog_materialization_retry_max_backoff_ms:
+                default_catalog_materialization_retry_max_backoff_ms(),
+            catalog_materialization_max_inflight: default_catalog_materialization_max_inflight(),
+            catalog_bind_max_failed: default_catalog_bind_max_failed(),
+            catalog_bind_failed_retention_ms: default_catalog_bind_failed_retention_ms(),
+            catalog_bind_transient_retry_cooldown_ms:
+                default_catalog_bind_transient_retry_cooldown_ms(),
+            catalog_bind_provider_max_concurrent: default_catalog_bind_provider_max_concurrent(),
+            catalog_bind_provider_min_interval_ms: default_catalog_bind_provider_min_interval_ms(),
             query_control_stage_rpc_timeout_ms: default_query_control_stage_rpc_timeout_ms(),
             query_control_start_rpc_timeout_ms: default_query_control_start_rpc_timeout_ms(),
             query_control_pre_start_timeout_ms: default_query_control_pre_start_timeout_ms(),

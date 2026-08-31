@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use novarocks_connector_binding::ConnectorExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
@@ -16,7 +17,6 @@ use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_proto_codec::membership::{
     BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
 };
-use novarocks_spi::connector::CatalogRuntimeMaterializer;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 
 use crate::BackendDataRuntime;
@@ -64,25 +64,12 @@ pub struct BackendServerConfig {
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
-    /// Provider-owned materializers for immutable catalog properties. The set
-    /// is sealed before query lifecycle admission and contains all local
-    /// credential and client construction authority.
-    pub catalog_runtime_materializers: Vec<Arc<dyn CatalogRuntimeMaterializer>>,
-    /// Provider-owned constructors for complete worker read bundles, one per
-    /// provider kind. The Host installs factory and matching codec atomically
-    /// for each exact admitted binding generation.
-    pub read_execution_bundle_factories: Vec<(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-    )>,
-    /// Provider-owned constructors for catalog-scoped writer capabilities,
-    /// one per provider kind. Catalog materialization installs them before a
-    /// query becomes ControlReady; decode must resolve the result through the
-    /// query's exact catalog lease.
-    pub write_execution_bundle_factories: Vec<(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
-    )>,
+    /// Server-frozen bounded failure and provider-bind policy for the BE
+    /// catalog manager.
+    pub catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    /// Provider-owned complete BE role factories. The backend seals exactly
+    /// one factory per provider kind before query lifecycle admission.
+    pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -483,15 +470,8 @@ fn compose_backend_application_services(
     query_lifecycle_config: QueryLifecycleRegistryConfig,
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
-    catalog_runtime_materializers: &[Arc<dyn CatalogRuntimeMaterializer>],
-    read_execution_bundle_factories: &[(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        Arc<dyn novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory>,
-    )],
-    write_execution_bundle_factories: &[(
-        novarocks_spi::connector::ConnectorProviderBindingKind,
-        Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
-    )],
+    catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let execution_runtime = Arc::new(ExecutionRuntime::new(execution_runtime_config).map_err(
         |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
@@ -501,30 +481,25 @@ fn compose_backend_application_services(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
     let local_runtime = Arc::new(NativeQueryLifecycleLocalRuntime::new(Arc::clone(&controls)));
-    let catalog_runtime_materializers = Arc::new(
-        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new_with_execution_factories(
-            catalog_runtime_materializers.iter().cloned(),
-            read_execution_bundle_factories.iter().map(|(kind, factory)| {
-                (catalog_provider_kind(*kind), Arc::clone(factory))
-            }),
-            write_execution_bundle_factories.iter().map(|(kind, factory)| {
-                (catalog_provider_kind(*kind), Arc::clone(factory))
-            }),
+    let execution_role_binding_factories = Arc::new(
+        crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new(
+            execution_role_binding_factories.iter().cloned(),
         )
         .map_err(|error| {
             BackendApplicationError::new(
                 BackendApplicationErrorKind::Configuration,
-                format!("seal catalog runtime materializer set: {error}"),
+                format!("seal connector execution role binding factories: {error}"),
             )
         })?,
     );
     let query_lifecycle_registry =
-        QueryLifecycleRegistry::new_with_runtime_and_catalog_materializers(
+        QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
             data_runtime.clone(),
             local_runtime,
             query_lifecycle_config,
             native_compatibility_id,
-            catalog_runtime_materializers,
+            execution_role_binding_factories,
+            catalog_manager_config,
         );
     let native_fragment_service = Arc::new(
         NativeFragmentService::new_with_controls(
@@ -556,19 +531,6 @@ fn compose_backend_application_services(
         exchange_receiver_port,
         query_lifecycle_ingress,
     })
-}
-
-fn catalog_provider_kind(
-    kind: novarocks_spi::connector::ConnectorProviderBindingKind,
-) -> novarocks_spi::connector::CatalogProviderKind {
-    match kind {
-        novarocks_spi::connector::ConnectorProviderBindingKind::Iceberg => {
-            novarocks_spi::connector::CatalogProviderKind::Iceberg
-        }
-        novarocks_spi::connector::ConnectorProviderBindingKind::StarRocks => {
-            novarocks_spi::connector::CatalogProviderKind::StarRocks
-        }
-    }
 }
 
 impl BackendApplicationHost {
@@ -674,9 +636,8 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             write_commit_evidence_limits,
             execution_runtime_config,
-            catalog_runtime_materializers,
-            read_execution_bundle_factories,
-            write_execution_bundle_factories,
+            catalog_manager_config,
+            execution_role_binding_factories,
         } = config;
         let readiness_endpoint =
             NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
@@ -693,9 +654,8 @@ impl BackendApplicationHost {
             query_lifecycle_config,
             native_compatibility_id,
             write_commit_evidence_limits,
-            &catalog_runtime_materializers,
-            &read_execution_bundle_factories,
-            &write_execution_bundle_factories,
+            catalog_manager_config,
+            &execution_role_binding_factories,
         )?;
         let process_descriptor = BackendProcessDescriptor::new(
             services.query_lifecycle_ingress.backend_process_id(),
@@ -1112,9 +1072,9 @@ mod tests {
             query_lifecycle_config: query_lifecycle_registry_config(Duration::from_millis(5_000)),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
             execution_runtime_config: execution_runtime_config(),
-            catalog_runtime_materializers: Vec::new(),
-            read_execution_bundle_factories: Vec::new(),
-            write_execution_bundle_factories: Vec::new(),
+            catalog_manager_config:
+                crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            execution_role_binding_factories: Vec::new(),
         }
     }
 
@@ -1267,8 +1227,7 @@ mod tests {
             query_lifecycle_registry_config(Duration::from_millis(5_000)),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             WriteCommitEvidenceLimits::default(),
-            &[],
-            &[],
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],
         )
         .expect("compose backend application services");

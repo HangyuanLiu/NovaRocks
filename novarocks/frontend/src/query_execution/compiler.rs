@@ -116,9 +116,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>;
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost>;
     fn catalog_application(
         &self,
     ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
@@ -133,10 +131,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
-    {
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
@@ -165,10 +160,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
-    {
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
@@ -1468,9 +1460,7 @@ fn optimizer_settings_for_execution(
 /// The typed control registry is the composition root's single instance, so
 /// planning resolves exactly the generation the control factory installed.
 pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
@@ -2073,9 +2063,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// the resulting writer/cohort map for application-owned operation fencing.
 pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
@@ -2107,9 +2095,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 /// sealed plan with the exact admitted bindings and connector write template.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,

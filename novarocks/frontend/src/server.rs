@@ -34,7 +34,7 @@ use crate::{
     ClientConnectionControlPort, ClientConnectionTerminationReason, MysqlClientConnectionRegistry,
     QuerySessionFactory, ResolvedMysqlListenerSettings,
 };
-use novarocks_spi::connector::ConnectorControlFactory;
+use novarocks_connector_binding::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::query_execution::maintenance::{
@@ -77,13 +77,8 @@ pub struct FrontendServerConfig {
     /// Upper bound for terminal resource cleanup after graceful/deadline drain.
     pub frontend_cleanup_timeout: Duration,
     pub mysql_listener: ResolvedMysqlListenerSettings,
-    /// Provider-owned FE control factories composed by the server root.
-    pub connector_control_factories: Vec<Arc<dyn ConnectorControlFactory>>,
-    /// Coordinator-side typed connector control, keyed by the exact binding
-    /// generation. The composition root installs into the same instance the
-    /// planner resolves from, so there is one answer to "which generation".
-    pub typed_connector_control:
-        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
+    /// Provider-owned FE control role factories composed by the server root.
+    pub connector_control_role_factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
     /// Application-owned storage observation composed by the server role.
     /// Frontend and Core never decode provider table handles directly.
     pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -105,15 +100,12 @@ pub async fn open_frontend_application_for_server(
     config: &FrontendServerConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    FrontendApplicationHost::open_with_factories_and_state_store_registry(
+    FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         config.state_store_input.clone(),
         &config.state_store_provider_registry,
         config.execution.clone(),
         config.backend_open.clone(),
-        config.connector_control_factories.clone(),
-        // The same registry the control factories above install into: one
-        // generation is reachable to installation and planning, or to neither.
-        Arc::clone(&config.typed_connector_control),
+        config.connector_control_role_factories.clone(),
         data_runtime,
         Arc::clone(&config.native_trust),
         config.native_transport.clone(),
@@ -1000,10 +992,7 @@ mod tests {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
                 "root",
             ),
-            connector_control_factories: Vec::new(),
-            typed_connector_control: Arc::new(
-                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
-            ),
+            connector_control_role_factories: Vec::new(),
             mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
             state_store_input: None,
             state_store_provider_registry: StateStoreProviderRegistry::new(),
@@ -1023,36 +1012,61 @@ mod tests {
         .expect("valid frontend backend config")
     }
 
-    /// Answers whichever catalog instance the factory request carries, so the
-    /// cutover test exercises the real create path without an object store.
-    struct EchoingControlFactory;
+    /// Answers whichever catalog instance the role binding carries, so the
+    /// cutover test exercises the real scheduler-backed CREATE path without an
+    /// object store.
+    struct EchoingControlRoleFactory;
 
-    impl novarocks_spi::connector::ConnectorControlFactory for EchoingControlFactory {
-        fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
-            static PROVIDER: std::sync::OnceLock<novarocks_spi::connector::ConnectorProviderId> =
-                std::sync::OnceLock::new();
-            PROVIDER.get_or_init(|| {
-                novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                    .expect("provider ID")
-            })
+    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for EchoingControlRoleFactory {
+        fn provider_kind(&self) -> novarocks_spi::connector::CatalogProviderKind {
+            novarocks_spi::connector::CatalogProviderKind::Iceberg
         }
 
-        fn create_control(
+        fn normalize_and_validate(
             &self,
-            request: novarocks_spi::connector::ConnectorControlFactoryRequest,
+            properties: novarocks_spi::connector::CatalogProperties,
         ) -> Result<
-            novarocks_spi::connector::ConnectorControlCreation,
-            novarocks_spi::connector::ConnectorError,
+            novarocks_connector_binding::NormalizedCatalogProperties,
+            novarocks_connector_binding::ConnectorMaterializationError,
         > {
-            let binding = crate::connector::control_host::tests::test_control_binding_for(
-                request.instance_id().clone(),
-                1,
-            );
-            novarocks_spi::connector::ConnectorControlCreation::try_new(
-                &request,
-                binding,
-                request.properties().to_vec(),
+            novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(
+                |detail| novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
+                ),
             )
+        }
+
+        fn materialize(
+            &self,
+            properties: novarocks_connector_binding::NormalizedCatalogProperties,
+            _context: novarocks_connector_binding::MaterializationContext,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<
+                novarocks_connector_binding::ConnectorControlRoleBinding,
+                novarocks_connector_binding::ConnectorMaterializationError,
+            >,
+        > {
+            use futures::FutureExt;
+
+            async move {
+                let control = crate::connector::control_host::tests::test_control_binding_for(
+                    properties.handle().catalog_name().clone(),
+                    1,
+                )
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
+                novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                    properties,
+                    Arc::new(control),
+                    None,
+                    None,
+                )
+                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+            }
+            .boxed()
         }
     }
 
@@ -1063,7 +1077,7 @@ mod tests {
     async fn cp2_production_composition_owns_catalog_ddl_through_the_state_store_attachment() {
         let state_store = test_state_store_input("cp2-cutover");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new(
@@ -1074,8 +1088,7 @@ mod tests {
             )
             .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::DynamicStateStore),
             frontend_backend_open_config(),
-            vec![Arc::new(EchoingControlFactory)],
-            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
+            vec![Arc::new(EchoingControlRoleFactory)],
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

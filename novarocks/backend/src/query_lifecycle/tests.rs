@@ -20,6 +20,10 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::metrics::query_lifecycle::BackendQueryLifecycleMetricsSnapshot;
+use novarocks_connector_binding::{
+    ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
+    ConnectorMaterializationError, NormalizedCatalogProperties,
+};
 use novarocks_execution::runtime::fragment::{
     FragmentExecutionError, FragmentExecutionErrorKind, FragmentOutcome,
 };
@@ -34,8 +38,7 @@ use novarocks_proto_codec::lifecycle::{
 };
 use novarocks_proto_models::{common, filter, novarocks as proto_novarocks, plan};
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
-    CatalogRuntimeMaterializer, CatalogVersion, ConnectorError, ConnectorInstanceId,
+    CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogVersion, ConnectorInstanceId,
 };
 use novarocks_types::UniqueId;
 use novarocks_types::{BackendProcessId, QueryId};
@@ -277,11 +280,6 @@ struct BlockingCatalogMaterializerGate {
     completed: bool,
 }
 
-struct TestCatalogRuntime {
-    handle: CatalogHandle,
-    provider_kind: CatalogProviderKind,
-}
-
 impl BlockingCatalogMaterializer {
     fn blocked() -> Self {
         Self {
@@ -325,25 +323,15 @@ impl BlockingCatalogMaterializer {
     }
 }
 
-impl CatalogRuntime for TestCatalogRuntime {
-    fn handle(&self) -> &CatalogHandle {
-        &self.handle
-    }
-
-    fn provider_kind(&self) -> CatalogProviderKind {
-        self.provider_kind
-    }
-}
-
-impl CatalogRuntimeMaterializer for BlockingCatalogMaterializer {
+impl ConnectorExecutionRoleBindingFactory for BlockingCatalogMaterializer {
     fn provider_kind(&self) -> CatalogProviderKind {
         CatalogProviderKind::Iceberg
     }
 
-    fn materialize(
+    fn bind(
         &self,
-        properties: &CatalogProperties,
-    ) -> Result<Arc<dyn CatalogRuntime>, ConnectorError> {
+        properties: &NormalizedCatalogProperties,
+    ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
         {
             let mut gate = self.state.gate.lock().expect("catalog materializer gate");
             gate.entered = true;
@@ -358,10 +346,8 @@ impl CatalogRuntimeMaterializer for BlockingCatalogMaterializer {
             gate.completed = true;
             self.state.changed.notify_all();
         }
-        Ok(Arc::new(TestCatalogRuntime {
-            handle: properties.handle().clone(),
-            provider_kind: properties.provider_kind(),
-        }))
+        ConnectorExecutionRoleBinding::try_new(properties.clone(), None, None, None)
+            .map_err(Into::into)
     }
 }
 
@@ -717,16 +703,18 @@ fn registry_with_blocking_catalog_materializer(
     runtime: RecordingLocalRuntime,
     materializer: BlockingCatalogMaterializer,
 ) -> Arc<QueryLifecycleRegistry> {
-    let materializers = crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new(
-        [Arc::new(materializer) as Arc<dyn CatalogRuntimeMaterializer>],
-    )
-    .expect("test catalog materializer set");
-    QueryLifecycleRegistry::new_with_runtime_and_catalog_materializers(
+    let factories =
+        crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new([
+            Arc::new(materializer) as Arc<dyn ConnectorExecutionRoleBindingFactory>,
+        ])
+        .expect("test connector execution role factory set");
+    QueryLifecycleRegistry::new_with_runtime_and_execution_role_binding_factories(
         test_backend_data_runtime(),
         Arc::new(runtime),
         registry_config(8),
         novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-        Arc::new(materializers),
+        Arc::new(factories),
+        crate::connector::catalog_manager::CatalogManagerConfig::default(),
     )
 }
 

@@ -18,6 +18,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, Weak};
 
+use novarocks_connector_binding::{
+    ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
+};
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
@@ -36,6 +39,7 @@ use novarocks_spi::connector::{
 pub struct ConnectorControlHost {
     state: Arc<Mutex<ControlHostState>>,
     factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlFactory>>>,
+    role_factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlRoleBindingFactory>>>,
 }
 
 #[derive(Default)]
@@ -96,6 +100,11 @@ impl ControlHostState {
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
 struct ControlGeneration {
     binding: Arc<ConnectorControlBinding>,
+    /// The complete role generation is the only typed-read authority.  The
+    /// generic binding remains separately stored only while legacy SPI callers
+    /// still consume it; a planning lease always resolves the typed group from
+    /// this same exact generation rather than through a second registry.
+    role_binding: Option<Arc<ConnectorControlRoleBinding>>,
     legacy_execution_key: ConnectorProviderBindingKey,
     state: ControlGenerationState,
     planning_leases: usize,
@@ -164,7 +173,57 @@ impl ConnectorControlHost {
         Ok(Self {
             state: Arc::new(Mutex::new(ControlHostState::default())),
             factories: Arc::new(factory_map),
+            role_factories: Arc::new(BTreeMap::new()),
         })
+    }
+
+    /// Creates the production host from exactly one complete role factory per
+    /// provider.  Provider code is selected at composition time; request
+    /// paths can only acquire already-published exact generations.
+    pub fn with_role_factories(
+        factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
+    ) -> Result<Self, ConnectorError> {
+        let mut factory_map = BTreeMap::new();
+        for factory in factories {
+            let provider_id = ConnectorProviderId::parse(factory.provider_kind().provider_id())
+                .map_err(|error| {
+                    invalid(format!(
+                        "invalid connector role factory provider id: {error}"
+                    ))
+                })?;
+            if factory_map.insert(provider_id.clone(), factory).is_some() {
+                return Err(invalid(format!(
+                    "duplicate connector control role factory for provider `{}`",
+                    provider_id.as_str()
+                )));
+            }
+        }
+        Ok(Self {
+            state: Arc::new(Mutex::new(ControlHostState::default())),
+            factories: Arc::new(BTreeMap::new()),
+            role_factories: Arc::new(factory_map),
+        })
+    }
+
+    /// Resolve the one factory selected for a provider during composition.
+    /// The returned object owns no host state and cannot publish a generation
+    /// by itself.
+    pub(crate) fn role_factory(
+        &self,
+        provider_id: &ConnectorProviderId,
+    ) -> Result<Arc<dyn ConnectorControlRoleBindingFactory>, ConnectorError> {
+        self.role_factories
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control role factory for provider `{}` is not installed",
+                        provider_id.as_str()
+                    ),
+                )
+            })
     }
 
     /// Every exact catalog handle still protected by this FE process.
@@ -184,7 +243,26 @@ impl ConnectorControlHost {
     }
 
     pub fn register(&self, binding: ConnectorControlBinding) -> Result<(), ConnectorError> {
-        let binding = Arc::new(binding);
+        self.register_generation(Arc::new(binding), None)
+    }
+
+    /// Publishes one complete, immutable FE role generation.  The generic SPI
+    /// control binding and every typed-read capability are installed together;
+    /// a subsequent planning lease cannot pair one generation's generic
+    /// control with another generation's encoder or request factory.
+    pub fn register_role_binding(
+        &self,
+        role_binding: ConnectorControlRoleBinding,
+    ) -> Result<(), ConnectorError> {
+        let role_binding = Arc::new(role_binding);
+        self.register_generation(role_binding.control_arc(), Some(role_binding))
+    }
+
+    fn register_generation(
+        &self,
+        binding: Arc<ConnectorControlBinding>,
+        role_binding: Option<Arc<ConnectorControlRoleBinding>>,
+    ) -> Result<(), ConnectorError> {
         let legacy_execution_key = ConnectorProviderBindingKey {
             instance_id: binding.descriptor().instance_id.clone(),
             incarnation: binding.incarnation(),
@@ -227,6 +305,7 @@ impl ConnectorControlHost {
             control_runtime_id,
             ControlGeneration {
                 binding,
+                role_binding,
                 legacy_execution_key,
                 state: ControlGenerationState::Active,
                 planning_leases: 0,
@@ -240,6 +319,56 @@ impl ConnectorControlHost {
             },
         );
         Ok(())
+    }
+
+    /// Returns the typed-read group carried by the exact generation already
+    /// retained by `planning_lease`.  This is a snapshot lookup only; it does
+    /// not acquire another host lease or consult a parallel typed registry.
+    pub(crate) fn typed_read_for_planning_lease(
+        &self,
+        planning_lease: &ConnectorControlPlanningLease,
+    ) -> Result<ConnectorControlReadBinding, ConnectorError> {
+        let runtime_id = planning_lease.binding().control_runtime_id();
+        let state = self.lock_state()?;
+        let generation = state.generations.get(&runtime_id).or_else(|| {
+            // Fixture and topology-replan callers can retain an independently
+            // constructed SPI lease for the same immutable desired-state
+            // generation. Production composition uses the direct runtime-id
+            // branch above; this exact-handle fallback still rejects an
+            // ambiguous or cross-version typed group.
+            let handle = planning_lease.binding().catalog_handle().ok()?;
+            let mut matching = state.generations.values().filter(|candidate| {
+                candidate
+                    .role_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.properties().handle() == handle)
+            });
+            let first = matching.next()?;
+            matching.next().is_none().then_some(first)
+        }).ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                "no complete typed control generation is installed for the planning lease's exact catalog handle",
+            )
+        })?;
+        if generation.binding.control_runtime_id() == runtime_id
+            && !Arc::ptr_eq(&generation.binding, planning_lease.binding())
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector control planning lease does not match the host generation",
+            ));
+        }
+        generation
+            .role_binding
+            .as_ref()
+            .and_then(|binding| binding.read().cloned())
+            .ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "connector control generation has no typed read capability",
+                )
+            })
     }
 
     /// Prevents new planning immediately. Existing leases retain their exact
