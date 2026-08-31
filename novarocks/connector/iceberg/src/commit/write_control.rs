@@ -1445,6 +1445,14 @@ impl IcebergWriteControl {
                     super::service::RecoveryEvidence::from_collector(&bridge_collector),
                 )
             })??;
+        // `load_exact_commit_table` deliberately invalidates then refills the
+        // generation-local physical-table cache with the exact sealed base.
+        // A successful catalog commit makes that cached metadata stale before
+        // the managed-publication receipt projects the committed snapshot's
+        // row count.  Invalidate at the proven-commit boundary so the
+        // projection reloads through the request-local access authority rather
+        // than reading the pre-commit table view.
+        self.invalidate_target_caches(&active.target);
         let resulting_row_count = if matches!(
             active.activation_intent,
             ConnectorWriteActivationIntent::ManagedPublication(_)
