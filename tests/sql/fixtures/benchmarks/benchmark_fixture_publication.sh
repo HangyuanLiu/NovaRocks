@@ -135,10 +135,14 @@ fixture_publication_head() {
   fixture_publication_curl_capable || return 64
   local config status
   config="$(mktemp)"
-  fixture_publication_make_curl_config "$config" HEAD "$uri"
+  # Some S3-compatible servers retain keep-alive after an explicit HEAD while
+  # reporting the object's non-zero Content-Length.  A one-byte ranged GET is
+  # an equally direct existence check and has a bounded response body.
+  fixture_publication_make_curl_config "$config" GET "$uri" 'Range: bytes=0-0'
   status="$(curl --config "$config" --output /dev/null --write-out '%{http_code}' 2>/dev/null || true)"
   rm -f "$config"
-  [[ "$status" == 200 ]]
+  # A zero-byte _SUCCESS sentinel is present but its only range is unsatisfiable.
+  [[ "$status" == 200 || "$status" == 206 || "$status" == 416 ]]
 }
 
 fixture_publication_put_conditional() {
