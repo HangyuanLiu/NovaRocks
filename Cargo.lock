@@ -3207,6 +3207,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-binding"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "novarocks-proto-codec",
+ "novarocks-spi",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
