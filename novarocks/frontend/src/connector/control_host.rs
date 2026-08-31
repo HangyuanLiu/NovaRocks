@@ -24,7 +24,6 @@ use novarocks_connector_binding::{
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
     ConnectorCleanupMaintenanceLease, ConnectorCleanupMaintenanceResolver, ConnectorControlBinding,
-    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
     ConnectorControlPlanningLease, ConnectorControlRegistry, ConnectorControlResolver,
     ConnectorControlRuntimeId, ConnectorDataMutationLease, ConnectorDataMutationResolver,
     ConnectorDistributedRewriteLease, ConnectorDistributedRewriteResolver, ConnectorError,
@@ -36,9 +35,9 @@ use novarocks_spi::connector::{
 /// FE process owner of logical Connector control generations. It contains no
 /// BE reader/runtime state and exposes only a narrow planning resolver to core.
 #[derive(Clone, Default)]
+// Design: ADR-0130 (docs/adr/ADR-0130-connector-role-binding-generation-ownership.md)
 pub struct ConnectorControlHost {
     state: Arc<Mutex<ControlHostState>>,
-    factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlFactory>>>,
     role_factories: Arc<BTreeMap<ConnectorProviderId, Arc<dyn ConnectorControlRoleBindingFactory>>>,
 }
 
@@ -72,29 +71,6 @@ impl ControlHostState {
             })
     }
 
-    fn active_legacy_effect(
-        &self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<ConnectorProviderBindingKey, ConnectorError> {
-        let runtime_id = self.active.get(instance_id).copied().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                format!(
-                    "connector control instance `{}` is not active",
-                    instance_id.as_str()
-                ),
-            )
-        })?;
-        self.generations
-            .get(&runtime_id)
-            .map(|generation| generation.legacy_execution_key.clone())
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "active connector control generation is missing",
-                )
-            })
-    }
 }
 
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
@@ -151,30 +127,10 @@ pub struct ConnectorControlRetirement {
 )]
 impl ConnectorControlHost {
     pub fn new() -> Self {
-        Self::with_factories(Vec::new()).expect("an empty connector factory set is valid")
-    }
-
-    /// Creates a control host with an immutable provider factory map. Provider
-    /// IDs are process-level composition keys, so duplicates are rejected
-    /// before the host can publish any generation.
-    pub fn with_factories(
-        factories: Vec<Arc<dyn ConnectorControlFactory>>,
-    ) -> Result<Self, ConnectorError> {
-        let mut factory_map = BTreeMap::new();
-        for factory in factories {
-            let provider_id = factory.provider_id().clone();
-            if factory_map.insert(provider_id.clone(), factory).is_some() {
-                return Err(invalid(format!(
-                    "duplicate connector control factory for provider `{}`",
-                    provider_id.as_str()
-                )));
-            }
-        }
-        Ok(Self {
+        Self {
             state: Arc::new(Mutex::new(ControlHostState::default())),
-            factories: Arc::new(factory_map),
             role_factories: Arc::new(BTreeMap::new()),
-        })
+        }
     }
 
     /// Creates the production host from exactly one complete role factory per
@@ -200,7 +156,6 @@ impl ConnectorControlHost {
         }
         Ok(Self {
             state: Arc::new(Mutex::new(ControlHostState::default())),
-            factories: Arc::new(BTreeMap::new()),
             role_factories: Arc::new(factory_map),
         })
     }
@@ -1053,36 +1008,6 @@ impl ConnectorControlResolver for ConnectorControlHost {
     }
 }
 
-impl ConnectorControlFactoryResolver for ConnectorControlHost {
-    fn create_control(
-        &self,
-        request: ConnectorControlFactoryRequest,
-    ) -> Result<novarocks_spi::connector::ConnectorControlCreation, ConnectorError> {
-        let factory = self.factories.get(request.provider_id()).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::NotFound,
-                format!(
-                    "connector control factory for provider `{}` is not installed",
-                    request.provider_id().as_str()
-                ),
-            )
-        })?;
-        // Do not acquire the generation mutex while invoking provider code.
-        // Providers may resolve local clients or perform validation that
-        // re-enters frontend-owned lifecycle paths.
-        let creation = factory.create_control(request.clone())?;
-        let descriptor = creation.binding().descriptor();
-        if descriptor.provider_id != *request.provider_id()
-            || descriptor.instance_id != *request.instance_id()
-        {
-            return Err(invalid(
-                "connector control factory returned a binding for a different owner",
-            ));
-        }
-        Ok(creation)
-    }
-}
-
 impl ConnectorCatalogMutationResolver for ConnectorControlHost {
     fn acquire_current_mutation(
         &self,
@@ -1288,145 +1213,14 @@ pub(crate) mod tests {
         StarRocksMetadataSource, StarRocksResolvedTable,
     };
     use novarocks_spi::connector::{
-        ConnectorBeginScanRequest, ConnectorControlCreation, ConnectorControlFactory,
-        ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorError,
-        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorListTablesRequest,
-        ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderBinding,
-        ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-        ConnectorSplitPlanningRequest, ConnectorTableHandle, ConnectorTableMetadata,
-        ConnectorTableRequest, ProviderBindingEpoch,
+        ConnectorBeginScanRequest, ConnectorError, ConnectorExecutionDistribution,
+        ConnectorInstanceDescriptor, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorNamespaceRequest, ConnectorProviderBinding, ConnectorProviderId, ConnectorScan,
+        ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+        ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
     };
 
     use super::*;
-
-    struct TestControlFactory {
-        provider_id: ConnectorProviderId,
-    }
-
-    impl ConnectorControlFactory for TestControlFactory {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            &self.provider_id
-        }
-
-        fn create_control(
-            &self,
-            _request: ConnectorControlFactoryRequest,
-        ) -> Result<ConnectorControlCreation, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "test factory does not create controls",
-            ))
-        }
-    }
-
-    struct OwnerMismatchFactory;
-
-    impl ConnectorControlFactory for OwnerMismatchFactory {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            // The static provider ID is only used for factory-map lookup. The
-            // returned binding intentionally belongs to another instance.
-            static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
-            PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
-        }
-
-        fn create_control(
-            &self,
-            request: ConnectorControlFactoryRequest,
-        ) -> Result<ConnectorControlCreation, ConnectorError> {
-            let wrong_request = ConnectorControlFactoryRequest::try_new(
-                request.provider_id().clone(),
-                ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-                Vec::new(),
-            )?;
-            ConnectorControlCreation::try_new(&wrong_request, binding(1), Vec::new())
-        }
-    }
-
-    #[test]
-    fn factory_host_rejects_duplicate_provider_ids_before_startup() {
-        let provider_id = ConnectorProviderId::parse("test").expect("provider ID");
-        let first: Arc<dyn ConnectorControlFactory> = Arc::new(TestControlFactory {
-            provider_id: provider_id.clone(),
-        });
-        let second: Arc<dyn ConnectorControlFactory> = Arc::new(TestControlFactory { provider_id });
-        let error = match ConnectorControlHost::with_factories(vec![first, second]) {
-            Ok(_) => panic!("duplicate provider factory must fail fast"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(
-            error
-                .to_string()
-                .contains("duplicate connector control factory")
-        );
-    }
-
-    #[test]
-    fn factory_host_rejects_requests_for_uninstalled_providers() {
-        let host = ConnectorControlHost::new();
-        let request = ConnectorControlFactoryRequest::try_new(
-            ConnectorProviderId::parse("iceberg").expect("provider ID"),
-            ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-            Vec::new(),
-        )
-        .expect("factory request");
-
-        let error = match ConnectorControlFactoryResolver::create_control(&host, request) {
-            Ok(_) => panic!("missing provider factory must fail closed"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::NotFound);
-        assert!(error.to_string().contains("is not installed"));
-        assert!(
-            host.observe_current_binding(
-                &ConnectorInstanceId::parse("catalog.analytics").expect("instance ID")
-            )
-            .is_err(),
-            "a missing factory must not publish a generation"
-        );
-    }
-
-    #[test]
-    fn factory_host_propagates_provider_error_without_publishing_generation() {
-        let provider_id = ConnectorProviderId::parse("test").expect("provider ID");
-        let factory: Arc<dyn ConnectorControlFactory> = Arc::new(TestControlFactory {
-            provider_id: provider_id.clone(),
-        });
-        let host = ConnectorControlHost::with_factories(vec![factory]).expect("factory host");
-        let request = ConnectorControlFactoryRequest::try_new(
-            provider_id,
-            ConnectorInstanceId::parse("catalog.analytics").expect("instance ID"),
-            Vec::new(),
-        )
-        .expect("factory request");
-        let error = match ConnectorControlFactoryResolver::create_control(&host, request) {
-            Ok(_) => panic!("provider factory error must be returned"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
-        assert!(
-            host.observe_current_binding(&ConnectorInstanceId::parse("catalog.analytics").unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn factory_host_rejects_returned_binding_for_different_owner() {
-        let factory: Arc<dyn ConnectorControlFactory> = Arc::new(OwnerMismatchFactory);
-        let host = ConnectorControlHost::with_factories(vec![factory]).expect("factory host");
-        let request = ConnectorControlFactoryRequest::try_new(
-            ConnectorProviderId::parse("iceberg").expect("provider ID"),
-            ConnectorInstanceId::parse("catalog.requested").expect("instance ID"),
-            Vec::new(),
-        )
-        .expect("factory request");
-        let error = match ConnectorControlFactoryResolver::create_control(&host, request) {
-            Ok(_) => panic!("factory owner mismatch must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
-        assert!(error.to_string().contains("different owner"));
-    }
 
     struct NeverCancelled;
 

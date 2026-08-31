@@ -149,7 +149,7 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
         &crate::connector::test_request_context(),
         Some(&bindings),
         Some(&delta_resolver),
-        fixture_scan_preparation_options(fixture_typed_control_registry(&distributed, &controls)),
+        fixture_scan_preparation_options(fixture_control_role_host(&distributed, &controls)),
     )
     .expect("tokenized coalesce scans must prepare from exact bindings");
     for (node_id, _) in &scan_facts {
@@ -197,7 +197,7 @@ fn scan_preparation_propagates_caller_cancellation() {
         &context,
         Some(&query_bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
         &[],
     ) {
         Ok(_) => panic!("caller cancellation must reach the connector provider"),
@@ -224,7 +224,7 @@ fn sqlx2_preparation_uses_request_local_scan_materialization_without_reacquiring
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
         &[],
     )
     .expect("exact query binding must plan the scan");
@@ -265,7 +265,7 @@ fn sqlx1_preparation_rejects_unbound_binding_instead_of_reacquiring_current() {
         &crate::connector::test_request_context(),
         Some(&bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
         &[],
     ) {
         Ok(_) => panic!("unbound binding must fail before a current-generation acquire"),
@@ -345,10 +345,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         &context,
         Some(&bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(
-            &plan,
-            &admission_controls,
-        )),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &admission_controls)),
         &[],
     )
     .expect("first preparation must use its admitted binding");
@@ -364,7 +361,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
             None,
         )
         .with_typed_connector_control(
-            fixture_typed_control_registry(&plan, &admission_controls),
+            fixture_control_role_host(&plan, &admission_controls),
             novarocks_spi::connector::read_stack::ConnectorSession::try_new(
                 "fixture-query",
                 "fixture-user",
@@ -428,7 +425,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
         &[],
         &mut seen_scan_node_ids,
         &mut bindings,
@@ -441,7 +438,7 @@ fn duplicate_scan_node_defense_reports_exact_error() {
         &context,
         Some(&query_bindings),
         None,
-        &fixture_scan_preparation_options(fixture_typed_control_registry(&plan, &controls)),
+        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &controls)),
         &[],
         &mut seen_scan_node_ids,
         &mut bindings,

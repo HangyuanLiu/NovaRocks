@@ -32,9 +32,6 @@ use novarocks_connector_binding::{
     ConnectorMaterializationError, ConnectorMaterializationErrorClass,
     ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
 };
-use novarocks_proto_codec::connector_read::{
-    ConnectorReadExecutionBundleFactory, legacy_read_decoder, legacy_read_encoder,
-};
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
     CatalogProperties, CatalogProviderKind, CatalogWriteExecutionBundleFactory,
@@ -43,7 +40,7 @@ use novarocks_spi::connector::{
 
 use crate::IcebergCatalogWriteExecutionFactory;
 use crate::connector_factory::IcebergConnectorFactory;
-use crate::file_reader::execution_installer::IcebergConnectorInstaller;
+use crate::file_reader::execution_installer::IcebergExecutionBindingFactory;
 use crate::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use crate::typed_provider_factory::IcebergTypedProviderFactory;
 use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
@@ -115,13 +112,9 @@ fn materialize_control_blocking(
     let captured_read = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&captured_read);
     let factory = IcebergConnectorFactory::new(resources).with_read_control_installer(Arc::new(
-        move |_handle, metadata, splits, codec, request_factory| {
-            let read = ConnectorControlReadBinding::new(
-                metadata,
-                splits,
-                Some(request_factory),
-                legacy_read_encoder(codec),
-            );
+        move |_handle, metadata, splits, encoder, request_factory| {
+            let read =
+                ConnectorControlReadBinding::new(metadata, splits, Some(request_factory), encoder);
             let mut slot = capture.lock().map_err(|_| {
                 ConnectorError::new(
                     ConnectorErrorKind::Internal,
@@ -225,7 +218,7 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         )
         .build(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
-        let legacy_execution = IcebergConnectorInstaller::new(self.resources.clone())
+        let execution = IcebergExecutionBindingFactory::new(self.resources.clone())
             .bind_for_catalog_properties(catalog_properties)
             .map_err(ConnectorMaterializationError::from)?;
         let typed_write = IcebergCatalogWriteExecutionFactory::new(
@@ -234,14 +227,12 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         )
         .build(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
-        let read = ConnectorExecutionReadBinding::new(
-            typed_read.provider_factory(),
-            legacy_read_decoder(typed_read.codec()),
-        );
+        let read =
+            ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
         let write = ConnectorExecutionWriteBinding::new(typed_write.execution());
         ConnectorExecutionRoleBinding::try_new(
             properties.clone(),
-            Some(legacy_execution),
+            Some(execution),
             Some(read),
             Some(write),
         )

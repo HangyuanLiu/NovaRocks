@@ -89,6 +89,7 @@ impl ConnectorControlWriteBinding {
 }
 
 /// One complete FE role binding for one exact desired catalog generation.
+// Design: ADR-0130 (docs/adr/ADR-0130-connector-role-binding-generation-ownership.md)
 pub struct ConnectorControlRoleBinding {
     properties: NormalizedCatalogProperties,
     control: Arc<ConnectorControlBinding>,
@@ -207,6 +208,7 @@ impl ConnectorExecutionWriteBinding {
 
 /// One complete BE role binding. Its factory receives no remote context or
 /// request; all remote control work must have completed on the FE side.
+// Design: ADR-0130 (docs/adr/ADR-0130-connector-role-binding-generation-ownership.md)
 pub struct ConnectorExecutionRoleBinding {
     properties: NormalizedCatalogProperties,
     execution: Option<ConnectorExecutionBinding>,

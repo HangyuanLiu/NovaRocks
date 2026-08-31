@@ -38,7 +38,7 @@ use crate::metadata_context::IcebergMetadataContext;
 use crate::provider_binding::IcebergInstanceDistribution;
 use crate::resources::IcebergMetadataResources;
 use crate::typed_boundary::{IcebergTypedBoundary, IcebergTypedRequestControlFactory};
-use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadMetadata, ConnectorReadRegistrationLease, ConnectorReadRequestControlFactory,
     ConnectorReadSplitManager,
@@ -65,7 +65,7 @@ pub type IcebergReadControlInstaller = Arc<
             CatalogHandle,
             Arc<dyn ConnectorReadMetadata>,
             Arc<dyn ConnectorReadSplitManager>,
-            Arc<dyn ConnectorReadCodec>,
+            Arc<dyn ConnectorReadEncoder>,
             Arc<dyn ConnectorReadRequestControlFactory>,
         ) -> Result<Arc<dyn ConnectorReadRegistrationLease>, ConnectorError>
         + Send
@@ -301,9 +301,10 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                     Arc::clone(&runtime),
                 ));
                 let adapter = Arc::new(Arc::clone(&boundary).read_runtime_adapter());
-                let codec: Arc<dyn ConnectorReadCodec> = Arc::new(
-                    crate::typed_read::IcebergConnectorReadCodec::new(adapter.as_ref().clone()),
-                );
+                let encoder: Arc<dyn ConnectorReadEncoder> =
+                    Arc::new(crate::typed_read::IcebergConnectorReadWireAdapter::new(
+                        adapter.as_ref().clone(),
+                    ));
                 let request_control_factory: Arc<dyn ConnectorReadRequestControlFactory> = Arc::new(
                     IcebergTypedRequestControlFactory::new(Arc::clone(&boundary)),
                 );
@@ -311,7 +312,7 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                     catalog_handle.clone(),
                     Arc::clone(&adapter) as Arc<dyn ConnectorReadMetadata>,
                     adapter as Arc<dyn ConnectorReadSplitManager>,
-                    codec,
+                    encoder,
                     request_control_factory,
                 )?;
                 provider.install_read_registration_lease(lease)

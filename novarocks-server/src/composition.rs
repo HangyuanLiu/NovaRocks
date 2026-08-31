@@ -27,7 +27,6 @@ use novarocks_connector_binding::{
     ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
 };
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;
 use novarocks_connector_iceberg::resources::{IcebergExecutionResources, IcebergMetadataResources};
 use novarocks_connector_iceberg::storage_inspector::{
     IcebergStorageInspector, IcebergStorageLakePublication,
@@ -37,9 +36,7 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
 };
-use novarocks_connector_starrocks::{
-    StarRocksCatalogRuntimeMaterializer, StarRocksExecutionRoleBindingFactory,
-};
+use novarocks_connector_starrocks::StarRocksExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
@@ -484,20 +481,6 @@ pub fn compose_backend_server_config(
             config, runtime,
         )?,
     })
-}
-
-/// Assemble provider-local materializers for immutable CatalogSet entries.
-/// The materializers receive only credential-free frontend properties; all
-/// credentials and I/O resources remain in this startup composition path.
-pub fn compose_backend_catalog_runtime_materializers(
-    iceberg_binding: IcebergReadBinding,
-) -> anyhow::Result<Vec<std::sync::Arc<dyn novarocks_spi::connector::CatalogRuntimeMaterializer>>> {
-    Ok(vec![
-        std::sync::Arc::new(StarRocksCatalogRuntimeMaterializer),
-        std::sync::Arc::new(IcebergCatalogRuntimeMaterializer::from_binding(
-            iceberg_binding,
-        )),
-    ])
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.

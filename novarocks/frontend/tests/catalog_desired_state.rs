@@ -56,10 +56,9 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlCreation,
-    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
+    CatalogProviderKind, ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError,
+    ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
     ConnectorProviderBinding, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
     ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
@@ -173,8 +172,8 @@ fn binding(instance_id: ConnectorInstanceId, incarnation: u8) -> ConnectorContro
     .expect("control binding")
 }
 
-/// Mints a distinct control generation per creation, like a real provider
-/// factory: reusing an incarnation would trip the retired-generation guard on a
+/// Mints a distinct control generation per materialization, like a real provider
+/// role factory: reusing an incarnation would trip the retired-generation guard on a
 /// same-name recreate. `poisoned` names the one catalog whose materialization
 /// fails, so a single-catalog failure scope can be observed alongside healthy
 /// catalogs in one frontend.
@@ -199,28 +198,60 @@ impl SelectivelyFailingFactory {
     }
 }
 
-impl ConnectorControlFactory for SelectivelyFailingFactory {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
-        PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for SelectivelyFailingFactory {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::Iceberg
     }
 
-    fn create_control(
+    fn normalize_and_validate(
         &self,
-        request: ConnectorControlFactoryRequest,
-    ) -> Result<ConnectorControlCreation, ConnectorError> {
-        if self.poisoned == Some(request.instance_id().as_str()) {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                "injected provider materialization failure",
-            ));
-        }
+        properties: novarocks_spi::connector::CatalogProperties,
+    ) -> Result<
+        novarocks_connector_binding::NormalizedCatalogProperties,
+        novarocks_connector_binding::ConnectorMaterializationError,
+    > {
+        novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(|detail| novarocks_connector_binding::ConnectorMaterializationError::new(
+            novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+            novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+            detail,
+        ))
+    }
+
+    fn materialize(
+        &self,
+        properties: novarocks_connector_binding::NormalizedCatalogProperties,
+        _context: novarocks_connector_binding::MaterializationContext,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<
+            novarocks_connector_binding::ConnectorControlRoleBinding,
+            novarocks_connector_binding::ConnectorMaterializationError,
+        >,
+    > {
+        use futures::FutureExt;
+
+        let poisoned = self.poisoned;
         let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
-        ConnectorControlCreation::try_new(
-            &request,
-            binding(request.instance_id().clone(), incarnation),
-            request.properties().to_vec(),
-        )
+        async move {
+            if poisoned == Some(properties.handle().catalog_name().as_str()) {
+                return Err(novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    "injected provider materialization failure",
+                ));
+            }
+            let binding = binding(properties.handle().catalog_name().clone(), incarnation)
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
+            novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                properties,
+                Arc::new(binding),
+                None,
+                None,
+            )
+            .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+        }
+        .boxed()
     }
 }
 
@@ -333,7 +364,7 @@ fn port_with(
     Arc<FrontendCatalogApplicationPort>,
 ) {
     let control = Arc::new(
-        ConnectorControlHost::with_factories(vec![Arc::new(factory)]).expect("control host"),
+        ConnectorControlHost::with_role_factories(vec![Arc::new(factory)]).expect("control host"),
     );
     let port = Arc::new(FrontendCatalogApplicationPort::new(
         source,
@@ -352,11 +383,14 @@ fn controller(
         .expect("catalog controller")
 }
 
-fn ready_attachment_id(port: &FrontendCatalogApplicationPort, name: &str) -> Uuid {
-    match port.admit_catalog(&catalog(name)) {
-        CatalogAdmission::Ready(observation) => observation.attachment_id,
-        other => panic!("catalog `{name}` must be Ready: {other:?}"),
+async fn ready_attachment_id(port: &FrontendCatalogApplicationPort, name: &str) -> Uuid {
+    for _ in 0..100 {
+        if let CatalogAdmission::Ready(observation) = port.admit_catalog(&catalog(name)) {
+            return observation.attachment_id;
+        }
+        tokio::task::yield_now().await;
     }
+    panic!("catalog `{name}` did not become Ready after scheduler materialization")
 }
 
 async fn shutdown(mut host: novarocks_frontend::StateStoreHost) {
@@ -443,11 +477,11 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
         .expect("bootstrap after restart");
 
     assert_eq!(
-        ready_attachment_id(&port, "catalog.analytics"),
+        ready_attachment_id(&port, "catalog.analytics").await,
         created.attachment_id,
         "a restart rediscovers the same durable catalog identity"
     );
-    let _ = ready_attachment_id(&port, "catalog.raw");
+    let _ = ready_attachment_id(&port, "catalog.raw").await;
 
     // DROP removes desired state, so the restart after it must not rediscover
     // the catalog.
@@ -461,7 +495,7 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
         port.admit_catalog(&catalog("catalog.raw")),
         CatalogAdmission::Absent
     ));
-    let _ = ready_attachment_id(&port, "catalog.analytics");
+    let _ = ready_attachment_id(&port, "catalog.analytics").await;
 
     drop(restarted);
     drop(port);
@@ -548,7 +582,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
     for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // No StateStore input at all: if the rejection depended on anything the
         // frontend opens, this could not fail here.
-        let error = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let error = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             None,
             &registry,
             FrontendExecutionConfig::new(
@@ -557,7 +591,9 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
                 std::num::NonZeroUsize::new(1).expect("one worker"),
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             )
-            .with_catalog_desired_state_source(CatalogDesiredStateSourceInput::ManagedControllerUnsupported),
+            .with_catalog_desired_state_source(
+                CatalogDesiredStateSourceInput::ManagedControllerUnsupported,
+            ),
             ClusterBackendOpenConfig::new(
                 novarocks_types::ClusterRole::Fe,
                 novarocks_types::NativeCompatibilityId::new([0x71; 32]),
@@ -567,9 +603,6 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
             )
             .expect("valid FE backend config"),
             Vec::new(),
-            std::sync::Arc::new(
-                novarocks_frontend::connector::typed_control_registry::ConnectorReadControlRegistry::default(),
-            ),
             tokio::runtime::Handle::current(),
             Arc::new(NativeTrust::new(
                 DeploymentId::parse("catalog-desired-state-test").expect("deployment"),
@@ -626,7 +659,7 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
         .bootstrap()
         .await
         .expect("bootstrap with a healthy source");
-    let admitted = ready_attachment_id(&port, "catalog.analytics");
+    let admitted = ready_attachment_id(&port, "catalog.analytics").await;
 
     // From here the source can no longer be enumerated. The records are all
     // still present — only the scan fails.
@@ -649,7 +682,7 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
         .expect_err("an incomplete enumeration must block frontend bootstrap");
 
     assert_eq!(
-        ready_attachment_id(&port, "catalog.analytics"),
+        ready_attachment_id(&port, "catalog.analytics").await,
         admitted,
         "an enumeration failure proves nothing about desired state, so it must \
          not retire the catalogs a working enumeration had found"
@@ -706,7 +739,7 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
         .await
         .expect("one provider failure must not fail the whole bootstrap");
 
-    let _ = ready_attachment_id(&port, "catalog.analytics");
+    let _ = ready_attachment_id(&port, "catalog.analytics").await;
     let broken = port.admit_catalog(&catalog("catalog.broken"));
     assert!(
         matches!(broken, CatalogAdmission::Unavailable { .. }),
@@ -732,8 +765,8 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
         .bootstrap()
         .await
         .expect("retry bootstrap");
-    let _ = ready_attachment_id(&retry_port, "catalog.broken");
-    let _ = ready_attachment_id(&retry_port, "catalog.analytics");
+    let _ = ready_attachment_id(&retry_port, "catalog.broken").await;
+    let _ = ready_attachment_id(&retry_port, "catalog.analytics").await;
 
     drop(retry_port);
     drop(_retry_control);
@@ -806,7 +839,7 @@ async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap(
         "a snapshot is total truth: a catalog the source no longer declares \
          must not come back as an additive seed"
     );
-    let _ = ready_attachment_id(&port, "catalog.analytics");
+    let _ = ready_attachment_id(&port, "catalog.analytics").await;
 
     drop(port);
     drop(_control);

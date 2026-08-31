@@ -53,7 +53,7 @@ fn prepare_scan_bindings_with_runtime_filters(
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
-    let typed = fixture_typed_control_registry(plan, &controls);
+    let typed = fixture_control_role_host(plan, &controls);
     super::prepare_scan_bindings(
         plan,
         &controls,
@@ -73,7 +73,7 @@ fn prepare_scan_bindings_with_delta_resolver(
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
-    let typed = fixture_typed_control_registry(plan, &controls);
+    let typed = fixture_control_role_host(plan, &controls);
     let resolver = crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
         &query_bindings,
     );
@@ -96,7 +96,7 @@ fn prepare_scan_bindings_with_controls(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let query_bindings = fixture_query_table_bindings(plan, controls);
-    let typed = fixture_typed_control_registry(plan, controls);
+    let typed = fixture_control_role_host(plan, controls);
     super::prepare_scan_bindings(
         plan,
         controls,
@@ -130,7 +130,7 @@ fn fixture_scan_preparation_options(
 ///
 /// The handle is the exact desired-state identity the fixture lease already
 /// froze, so the registry answers precisely what production would answer.
-fn fixture_typed_control_registry(
+fn fixture_control_role_host(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
 ) -> Arc<crate::connector::ConnectorControlHost> {

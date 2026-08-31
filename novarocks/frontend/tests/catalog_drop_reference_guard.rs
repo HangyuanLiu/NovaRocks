@@ -57,9 +57,8 @@ use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_frontend::mv::repository::key::{dependency_by_upstream_key, target_lookup_key};
 use novarocks_frontend::state_family::StateFamily;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlCreation,
-    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorControlResolver,
-    ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
+    CatalogProviderKind, ConnectorBeginScanRequest, ConnectorControlBinding,
+    ConnectorControlResolver, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorNamespaceRequest, ConnectorProviderBinding, ConnectorProviderId,
     ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
@@ -156,8 +155,8 @@ impl ConnectorExecutionDistribution for TestControl {
     }
 }
 
-/// Mints a distinct control generation per creation, like a real provider
-/// factory would: reusing an incarnation trips the retired-generation guard.
+/// Mints a distinct control generation per materialization, like a real
+/// provider role factory would: reusing an incarnation trips the retired-generation guard.
 struct ReadyFactory {
     incarnations: AtomicU8,
 }
@@ -170,34 +169,67 @@ impl ReadyFactory {
     }
 }
 
-impl ConnectorControlFactory for ReadyFactory {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
-        PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for ReadyFactory {
+    fn provider_kind(&self) -> CatalogProviderKind {
+        CatalogProviderKind::Iceberg
     }
 
-    fn create_control(
+    fn normalize_and_validate(
         &self,
-        request: ConnectorControlFactoryRequest,
-    ) -> Result<ConnectorControlCreation, ConnectorError> {
+        properties: novarocks_spi::connector::CatalogProperties,
+    ) -> Result<
+        novarocks_connector_binding::NormalizedCatalogProperties,
+        novarocks_connector_binding::ConnectorMaterializationError,
+    > {
+        novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(|detail| novarocks_connector_binding::ConnectorMaterializationError::new(
+            novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+            novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+            detail,
+        ))
+    }
+
+    fn materialize(
+        &self,
+        properties: novarocks_connector_binding::NormalizedCatalogProperties,
+        _context: novarocks_connector_binding::MaterializationContext,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<
+            novarocks_connector_binding::ConnectorControlRoleBinding,
+            novarocks_connector_binding::ConnectorMaterializationError,
+        >,
+    > {
+        use futures::FutureExt;
+
         let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
-        let provider = Arc::new(TestControl {
-            instance_id: request.instance_id().clone(),
-            incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
-        });
-        let binding = ConnectorControlBinding::try_new(
-            ConnectorInstanceDescriptor {
-                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
-                instance_id: provider.instance_id.clone(),
-            },
-            provider.incarnation,
-            provider.clone(),
-            provider.clone(),
-            provider,
-            None,
-        )
-        .expect("control binding");
-        ConnectorControlCreation::try_new(&request, binding, request.properties().to_vec())
+        async move {
+            let provider = Arc::new(TestControl {
+                instance_id: properties.handle().catalog_name().clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
+            });
+            let binding = ConnectorControlBinding::try_new(
+                ConnectorInstanceDescriptor {
+                    provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                    instance_id: provider.instance_id.clone(),
+                },
+                provider.incarnation,
+                provider.clone(),
+                provider.clone(),
+                provider,
+                None,
+            )
+            .expect("control binding")
+            .with_catalog_properties(properties.as_catalog_properties().clone())
+            .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
+            novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                properties,
+                Arc::new(binding),
+                None,
+                None,
+            )
+            .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+        }
+        .boxed()
     }
 }
 
@@ -445,7 +477,7 @@ fn port_with(
     Arc<FrontendCatalogApplicationPort>,
 ) {
     let control = Arc::new(
-        ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::new())])
+        ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::new())])
             .expect("control host"),
     );
     let port = Arc::new(FrontendCatalogApplicationPort::new(

@@ -26,7 +26,6 @@ use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_connector_binding::ConnectorControlRoleBindingFactory;
 use novarocks_native_trust::NativeTrust;
-use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_types::NativeCompatibilityId;
 
@@ -383,73 +382,12 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(
+        Self::open_with_role_factories_and_state_store_registry(
             state_store,
+            &StateStoreProviderRegistry::new(),
             execution,
             backend,
             Vec::new(),
-            data_runtime,
-            native_trust,
-            native_transport,
-        )
-        .await
-    }
-
-    pub async fn open_with_factories(
-        state_store: Option<StateStoreHostInput>,
-        execution: FrontendExecutionConfig,
-        backend: ClusterBackendOpenConfig,
-        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
-        data_runtime: Handle,
-        native_trust: Arc<NativeTrust>,
-        native_transport: FrontendNativeTransport,
-    ) -> Result<Self, FrontendApplicationError> {
-        let registry = StateStoreProviderRegistry::new();
-        Self::open_with_factories_and_state_store_registry(
-            state_store,
-            &registry,
-            execution,
-            backend,
-            connector_factories,
-            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
-            data_runtime,
-            native_trust,
-            native_transport,
-        )
-        .await
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Server composition deliberately supplies StateStore, role execution, and immutable Native trust capabilities independently."
-    )]
-    pub async fn open_with_factories_and_state_store_registry(
-        state_store: Option<StateStoreHostInput>,
-        state_store_registry: &StateStoreProviderRegistry,
-        execution: FrontendExecutionConfig,
-        backend: ClusterBackendOpenConfig,
-        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
-        _legacy_typed_connector_control: Arc<
-            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-        >,
-        data_runtime: Handle,
-        native_trust: Arc<NativeTrust>,
-        native_transport: FrontendNativeTransport,
-    ) -> Result<Self, FrontendApplicationError> {
-        let connector_control = Arc::new(
-            ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
-                FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::ConnectorControlHost,
-                    error,
-                )
-            })?,
-        );
-        Self::open_with_connector_control_host_and_state_store_registry(
-            state_store,
-            state_store_registry,
-            execution,
-            backend,
-            connector_control,
             data_runtime,
             native_trust,
             native_transport,
@@ -995,13 +933,6 @@ impl FrontendApplicationHost {
         Arc::clone(&self.connector_control)
     }
 
-    pub fn connector_control_factory_resolver(
-        &self,
-    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver> {
-        Arc::clone(&self.connector_control)
-            as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>
-    }
-
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
         self.state_store_host
             .as_ref()
@@ -1410,7 +1341,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("valid frontend backend config");
-        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new(
@@ -1421,9 +1352,6 @@ mod tests {
             ),
             backend,
             Vec::new(),
-            std::sync::Arc::new(
-                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
-            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

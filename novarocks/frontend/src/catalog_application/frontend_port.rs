@@ -50,9 +50,8 @@ use novarocks_connector_binding::{
 };
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
-    ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
-    canonicalize_catalog_credential_bindings,
+    ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
+    StaticCredentialReference, canonicalize_catalog_credential_bindings,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -138,11 +137,6 @@ struct ProjectionScheduler {
     next_token: AtomicU64,
     permits: Arc<tokio::sync::Semaphore>,
     config: CatalogMaterializationConfig,
-}
-
-enum CreatedControlBinding {
-    Legacy(novarocks_spi::connector::ConnectorControlBinding),
-    Role(novarocks_connector_binding::ConnectorControlRoleBinding),
 }
 
 impl ProjectionScheduler {
@@ -402,16 +396,14 @@ impl FrontendCatalogApplicationPort {
     fn install_created(
         &self,
         entry: &CatalogDesiredStateEntry,
-        binding: CreatedControlBinding,
+        binding: novarocks_connector_binding::ConnectorControlRoleBinding,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         let attachment_id = entry.identity().as_uuid();
         let instance_id = entry.config().instance_id();
         let provider_id = entry.config().provider_id();
-        match binding {
-            CreatedControlBinding::Legacy(binding) => self.control.register(binding),
-            CreatedControlBinding::Role(binding) => self.control.register_role_binding(binding),
-        }
-        .map_err(connector_error)?;
+        self.control
+            .register_role_binding(binding)
+            .map_err(connector_error)?;
         let generation = self.next_projection_generation();
         let observation = CatalogRuntimeObservation {
             attachment_id,
@@ -662,9 +654,6 @@ impl FrontendCatalogApplicationPort {
         let raw_properties = entry.catalog_properties(mode)?;
         let factory = match self.control.role_factory(&provider_id) {
             Ok(factory) => factory,
-            // T05 switches production composition to role factories. Keep the
-            // pre-cutover test/legacy path explicit rather than silently
-            // treating a missing role factory as an unsupported capability.
             Err(error)
                 if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound =>
             {
@@ -832,9 +821,7 @@ impl FrontendCatalogApplicationPort {
             match result {
                 Ok(binding) => {
                     if self.token_is_current(&key, token) {
-                        let completion = if let Err(error) =
-                            self.install_created(&entry, CreatedControlBinding::Role(binding))
-                        {
+                        let completion = if let Err(error) = self.install_created(&entry, binding) {
                             self.mark_unavailable(
                                 entry.config().instance_id(),
                                 entry.identity().as_uuid(),
@@ -946,36 +933,8 @@ impl FrontendCatalogApplicationPort {
             &instance_id,
             attachment_id,
             &provider_id,
-            "catalog desired-state runtime is being materialized",
+            "connector control role factory is not installed",
         );
-        let installed = (|| {
-            let catalog_properties = entry.catalog_properties(mode)?;
-            let request = ConnectorControlFactoryRequest::try_new(
-                provider_id.clone(),
-                instance_id.clone(),
-                entry.config().durable_properties().to_vec(),
-            )
-            .and_then(|request| request.with_catalog_properties(catalog_properties.clone()))
-            .map_err(connector_error)?;
-            let creation = self
-                .control
-                .create_control(request)
-                .map_err(connector_error)?;
-            let (binding, _) = creation.into_parts();
-            let binding = binding
-                .with_catalog_properties(catalog_properties)
-                .map_err(connector_error)?;
-            self.install_created(&entry, CreatedControlBinding::Legacy(binding))
-                .map(|_| ())
-        })();
-        if let Err(error) = installed {
-            self.mark_unavailable(&instance_id, attachment_id, &provider_id, error.to_string());
-            // A single provider failure must not make the source's truth
-            // disappear or prevent unrelated catalog projections. Its admission
-            // remains Unavailable until a later resync works, and that retry
-            // needs nothing beyond another successful global enumeration.
-            tracing::warn!(%error, catalog = instance_id.as_str(), "catalog remains unavailable after projection attempt");
-        }
     }
 
     /// Stops all local admission before retiring existing leases. Durable

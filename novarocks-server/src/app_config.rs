@@ -2370,6 +2370,17 @@ access_key_secret = ""
         assert_eq!(runtime.catalog_prune_interval_ms, 30_000);
         assert_eq!(runtime.catalog_prune_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.catalog_prune_max_inflight, 16);
+        assert_eq!(runtime.catalog_materialization_attempt_timeout_ms, 10_000);
+        assert_eq!(
+            runtime.catalog_materialization_retry_initial_backoff_ms,
+            100
+        );
+        assert_eq!(runtime.catalog_materialization_retry_max_backoff_ms, 5_000);
+        assert_eq!(runtime.catalog_materialization_max_inflight, 64);
+        assert_eq!(runtime.catalog_bind_max_failed, 64);
+        assert_eq!(runtime.catalog_bind_failed_retention_ms, 60_000);
+        assert_eq!(runtime.catalog_bind_transient_retry_cooldown_ms, 1_000);
+        assert_eq!(runtime.catalog_bind_provider_max_concurrent, 4);
         assert_eq!(runtime.query_control_stage_rpc_timeout_ms, 5_000);
         assert_eq!(runtime.query_control_start_rpc_timeout_ms, 2_000);
         assert_eq!(runtime.query_control_pre_start_timeout_ms, 30_000);
@@ -2503,6 +2514,17 @@ access_key_secret = ""
                 "error must identify {field}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn catalog_materialization_config_rejects_invalid_bounds() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.catalog_materialization_retry_initial_backoff_ms = 5_001;
+        assert!(validate_query_control_config(&runtime).is_err());
+
+        let mut runtime = RuntimeConfig::default();
+        runtime.catalog_bind_provider_max_concurrent = 0;
+        assert!(validate_query_control_config(&runtime).is_err());
     }
 
     #[test]

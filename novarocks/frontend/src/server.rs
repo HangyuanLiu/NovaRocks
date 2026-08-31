@@ -1177,7 +1177,7 @@ mod tests {
     async fn frontend_report_endpoint_binds_loopback_without_core_transport_facade() {
         let state_store = test_state_store_input("frontend-report-listener");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new(
@@ -1188,7 +1188,6 @@ mod tests {
             ),
             frontend_backend_open_config(),
             Vec::new(),
-            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),
@@ -1228,7 +1227,7 @@ mod tests {
     async fn sqlx2_application_frontend_services_inject_statistics_application_port() {
         let state_store = test_state_store_input("statistics-application-port");
         let registry = test_state_store_registry();
-        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new(
@@ -1239,7 +1238,6 @@ mod tests {
             ),
             frontend_backend_open_config(),
             Vec::new(),
-            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

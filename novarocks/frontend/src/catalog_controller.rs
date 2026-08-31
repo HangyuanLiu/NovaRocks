@@ -301,8 +301,7 @@ mod tests {
         builtin_state_store_provider_registry,
     };
     use novarocks_spi::connector::{
-        ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
-        ConnectorControlResolver, ConnectorError, ConnectorProviderId,
+        CatalogProviderKind, ConnectorControlResolver, ConnectorProviderId,
     };
     use novarocks_spi::state_store::{
         ChangePage, ChangePollRequest, CommitResolution, ReadTransaction, StateStore,
@@ -314,8 +313,8 @@ mod tests {
     use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
     use crate::connector::ConnectorControlHost;
 
-    /// Mints a distinct control generation per creation, like a real provider
-    /// factory: reusing an incarnation would trip the retired-generation guard
+    /// Mints a distinct control generation per materialization, like a real
+    /// provider role factory: reusing an incarnation would trip the retired-generation guard
     /// on a same-name recreate.
     #[derive(Default)]
     struct ReadyFactory {
@@ -497,42 +496,102 @@ mod tests {
         }
     }
 
-    impl ConnectorControlFactory for ReadyFactory {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
-            PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for ReadyFactory {
+        fn provider_kind(&self) -> CatalogProviderKind {
+            CatalogProviderKind::Iceberg
         }
 
-        fn create_control(
+        fn normalize_and_validate(
             &self,
-            request: ConnectorControlFactoryRequest,
-        ) -> Result<ConnectorControlCreation, ConnectorError> {
-            let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
-            ConnectorControlCreation::try_new(
-                &request,
-                crate::connector::control_host::tests::test_control_binding_for(
-                    request.instance_id().clone(),
-                    incarnation,
+            properties: novarocks_spi::connector::CatalogProperties,
+        ) -> Result<
+            novarocks_connector_binding::NormalizedCatalogProperties,
+            novarocks_connector_binding::ConnectorMaterializationError,
+        > {
+            novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(
+                |detail| novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
                 ),
-                request.properties().to_vec(),
             )
+        }
+
+        fn materialize(
+            &self,
+            properties: novarocks_connector_binding::NormalizedCatalogProperties,
+            _context: novarocks_connector_binding::MaterializationContext,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<
+                novarocks_connector_binding::ConnectorControlRoleBinding,
+                novarocks_connector_binding::ConnectorMaterializationError,
+            >,
+        > {
+            use futures::FutureExt;
+
+            let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+            async move {
+                let control = crate::connector::control_host::tests::test_control_binding_for(
+                    properties.handle().catalog_name().clone(),
+                    incarnation,
+                )
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
+                novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+                    properties,
+                    Arc::new(control),
+                    None,
+                    None,
+                )
+                .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)
+            }
+            .boxed()
         }
     }
 
-    impl ConnectorControlFactory for UnavailableFactory {
-        fn provider_id(&self) -> &ConnectorProviderId {
-            static PROVIDER: std::sync::OnceLock<ConnectorProviderId> = std::sync::OnceLock::new();
-            PROVIDER.get_or_init(|| ConnectorProviderId::parse("iceberg").expect("provider ID"))
+    impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for UnavailableFactory {
+        fn provider_kind(&self) -> CatalogProviderKind {
+            CatalogProviderKind::Iceberg
         }
 
-        fn create_control(
+        fn normalize_and_validate(
             &self,
-            _request: ConnectorControlFactoryRequest,
-        ) -> Result<ConnectorControlCreation, ConnectorError> {
-            Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                "injected provider materialization failure",
-            ))
+            properties: novarocks_spi::connector::CatalogProperties,
+        ) -> Result<
+            novarocks_connector_binding::NormalizedCatalogProperties,
+            novarocks_connector_binding::ConnectorMaterializationError,
+        > {
+            novarocks_connector_binding::NormalizedCatalogProperties::try_new(properties).map_err(
+                |detail| novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::InvalidDefinition,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    detail,
+                ),
+            )
+        }
+
+        fn materialize(
+            &self,
+            _properties: novarocks_connector_binding::NormalizedCatalogProperties,
+            _context: novarocks_connector_binding::MaterializationContext,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<
+                novarocks_connector_binding::ConnectorControlRoleBinding,
+                novarocks_connector_binding::ConnectorMaterializationError,
+            >,
+        > {
+            use futures::FutureExt;
+
+            async move {
+                Err(novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    "injected provider materialization failure",
+                ))
+            }
+            .boxed()
         }
     }
 
@@ -736,7 +795,7 @@ mod tests {
         Arc<FrontendCatalogApplicationPort>,
     ) {
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
+            ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
@@ -756,6 +815,27 @@ mod tests {
             properties: vec![("type".to_string(), "iceberg".to_string())],
             if_not_exists,
         }
+    }
+
+    async fn wait_for_ready(
+        port: &FrontendCatalogApplicationPort,
+        instance_id: &novarocks_spi::connector::ConnectorInstanceId,
+    ) -> CatalogRuntimeObservation {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let CatalogAdmission::Ready(observation) = port.admit_catalog(instance_id) {
+                    return observation;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "catalog `{}` did not become ready after scheduler materialization",
+                instance_id.as_str()
+            )
+        })
     }
 
     /// Name uniqueness is arbitrated by the absent-precondition commit, not by a
@@ -823,12 +903,11 @@ mod tests {
             .expect("second host reconcile");
         let instance_id = create_command(false).instance_id;
         for port in [&first_port, &second_port] {
-            match port.admit_catalog(&instance_id) {
-                CatalogAdmission::Ready(observation) => {
-                    assert_eq!(observation.attachment_id, winner)
-                }
-                other => panic!("both hosts must admit the surviving attachment: {other:?}"),
-            }
+            assert_eq!(
+                wait_for_ready(port, &instance_id).await.attachment_id,
+                winner,
+                "both hosts must admit the surviving attachment"
+            );
         }
         assert!(
             _first_control.observe_current_binding(&instance_id).is_ok()
@@ -847,16 +926,17 @@ mod tests {
             .expect("shutdown SQLite StateStore");
     }
 
-    /// The factory validates provider input before the attachment commit, so a
-    /// provider that cannot be materialized leaves no durable trace at all.
+    /// CREATE validates the pure definition before commit, but a provider
+    /// materialization failure leaves its durable desired state for recovery
+    /// after a process-local dependency becomes available again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn factory_preflight_failure_commits_no_attachment() {
+    async fn materialization_failure_keeps_durable_attachment() {
         let (_directory, mut host, store) = open_store().await;
         let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
             .await
             .expect("open catalog attachment repository");
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(UnavailableFactory)])
+            ConnectorControlHost::with_role_factories(vec![Arc::new(UnavailableFactory)])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
@@ -868,17 +948,18 @@ mod tests {
 
         assert_eq!(
             port.create_catalog(create_command(false))
-                .expect_err("provider preflight failure must reject CREATE")
+                .expect_err("provider materialization failure must reject CREATE")
                 .kind(),
             CatalogApplicationErrorKind::Unavailable
         );
-        assert!(
+        assert_eq!(
             repository
                 .list_with_page_size(256)
                 .await
                 .expect("list attachments")
-                .is_empty(),
-            "a preflight failure must not commit durable truth"
+                .len(),
+            1,
+            "a post-CAS materialization failure must preserve durable desired state"
         );
 
         drop(port);
@@ -899,7 +980,7 @@ mod tests {
             .await
             .expect("open catalog attachment repository");
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
+            ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
@@ -1044,7 +1125,7 @@ mod tests {
             .await
             .expect("create attachment");
         let control = Arc::new(
-            ConnectorControlHost::with_factories(vec![Arc::new(ReadyFactory::default())])
+            ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
         let port = Arc::new(FrontendCatalogApplicationPort::new(
@@ -1069,11 +1150,19 @@ mod tests {
             CatalogAdmission::Unavailable { .. }
         ));
         assert_eq!(port.projection_count(), 0);
-        assert!(
-            control
-                .observe_current_binding(&created.attachment.instance_id)
-                .is_err()
-        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if control
+                    .observe_current_binding(&created.attachment.instance_id)
+                    .is_err()
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("failed publication must retire its registered control generation");
 
         drop(controller);
         drop(port);
@@ -1118,10 +1207,7 @@ mod tests {
                 .is_err(),
             "the injected StateStore read failure must be active"
         );
-        assert!(matches!(
-            port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Ready(_)
-        ));
+        wait_for_ready(&port, &created.attachment.instance_id).await;
 
         drop(controller);
         drop(port);
@@ -1283,10 +1369,7 @@ mod tests {
         )
         .expect("bootstrap controller");
         bootstrap.bootstrap().await.expect("bootstrap projection");
-        assert!(matches!(
-            port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Ready(_)
-        ));
+        wait_for_ready(&port, &created.attachment.instance_id).await;
 
         let config = CatalogProjectionConfig {
             poll_interval: Duration::from_millis(1),
@@ -1341,10 +1424,7 @@ mod tests {
         )
         .expect("controller");
         let cursor = controller.bootstrap().await.expect("bootstrap projection");
-        assert!(matches!(
-            port.admit_catalog(&created.attachment.instance_id),
-            CatalogAdmission::Ready(_)
-        ));
+        wait_for_ready(&port, &created.attachment.instance_id).await;
         repository
             .drop_exact(created.clone())
             .await

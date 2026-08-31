@@ -189,57 +189,14 @@ pub(crate) struct TestConnectorControlRegistry {
             Arc<novarocks_spi::connector::ConnectorControlBinding>,
         >,
     >,
-    factories: std::collections::HashMap<
-        novarocks_spi::connector::ConnectorProviderId,
-        Arc<dyn novarocks_spi::connector::ConnectorControlFactory>,
-    >,
 }
 
 #[cfg(test)]
 impl Default for TestConnectorControlRegistry {
     fn default() -> Self {
-        let factory: Arc<dyn novarocks_spi::connector::ConnectorControlFactory> =
-            Arc::new(TestConnectorControlFactory);
         Self {
             active: std::sync::Mutex::new(std::collections::HashMap::new()),
-            factories: std::collections::HashMap::from([(factory.provider_id().clone(), factory)]),
         }
-    }
-}
-
-#[cfg(test)]
-struct TestConnectorControlFactory;
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorControlFactory for TestConnectorControlFactory {
-    fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
-        static PROVIDER_ID: std::sync::OnceLock<novarocks_spi::connector::ConnectorProviderId> =
-            std::sync::OnceLock::new();
-        PROVIDER_ID.get_or_init(|| {
-            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                .expect("test provider ID")
-        })
-    }
-
-    fn create_control(
-        &self,
-        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorControlCreation,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let durable_properties = request.properties().to_vec();
-        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
-            request.provider_id().clone(),
-            request.instance_id().as_str(),
-            std::collections::HashMap::new(),
-            None,
-        );
-        novarocks_spi::connector::ConnectorControlCreation::try_new(
-            &request,
-            binding,
-            durable_properties,
-        )
     }
 }
 
@@ -882,25 +839,6 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
                 ),
             )
         })
-    }
-}
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnectorControlRegistry {
-    fn create_control(
-        &self,
-        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorControlCreation,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let factory = self.factories.get(request.provider_id()).ok_or_else(|| {
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::NotFound,
-                "test connector control factory is not installed",
-            )
-        })?;
-        factory.create_control(request)
     }
 }
 

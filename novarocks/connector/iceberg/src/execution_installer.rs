@@ -24,10 +24,9 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
     CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorInstanceId,
-    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderBindingKind, ConnectorProviderId,
+    ConnectorExecutionBinding, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderBindingKey, ConnectorProviderId,
     ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
@@ -43,17 +42,16 @@ use crate::file_reader::execution_payload::{
     validate_split_payload,
 };
 use crate::metadata_batch_reader::open_metadata_connector_reader;
-use crate::provider_binding::prepare_iceberg_execution_binding;
 use crate::resources::IcebergExecutionResources;
 
 const PROVIDER_ID: &str = "iceberg";
 
-/// Startup-composed installer for exact Iceberg BE execution generations.
+/// Startup-composed local factory for exact Iceberg BE execution generations.
 ///
 /// Its declaration selects only a named, startup-provided access binding;
 /// cloud properties, catalog handles and runtimes are never carried over the
 /// FE/BE wire.
-pub struct IcebergConnectorInstaller {
+pub struct IcebergExecutionBindingFactory {
     provider_id: ConnectorProviderId,
     resources: IcebergExecutionResources,
 }
@@ -115,7 +113,7 @@ impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
     }
 }
 
-impl IcebergConnectorInstaller {
+impl IcebergExecutionBindingFactory {
     pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
@@ -124,13 +122,8 @@ impl IcebergConnectorInstaller {
         }
     }
 
-    /// Build the legacy generic execution facets for one exact catalog
-    /// definition without consulting a request or opening a remote client.
-    ///
-    /// The role-binding factory uses this while the generic SPI execution
-    /// carrier still coexists with the typed read/write groups. The exact
-    /// catalog handle remains the authority for role selection; this local
-    /// key exists only to satisfy the legacy capability owner invariant.
+    /// Build generic execution facets for one exact catalog definition without
+    /// consulting a request or opening a remote client.
     pub(crate) fn bind_for_catalog_properties(
         &self,
         properties: &CatalogProperties,
@@ -157,37 +150,6 @@ impl IcebergConnectorInstaller {
             })),
             Some(Arc::new(IcebergDataWriteExecution::new(
                 binding,
-                self.resources.runtime().clone(),
-            ))),
-        )
-    }
-}
-
-impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_kind(&self) -> ConnectorProviderBindingKind {
-        ConnectorProviderBindingKind::Iceberg
-    }
-
-    fn install(
-        &self,
-        declaration: &ConnectorProviderBinding,
-        _context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        // Validate the legacy provider declaration's kind only. Production NID
-        // execution binds the role-local template from its immutable
-        // `CatalogProperties`; the old opaque access-binding label has no
-        // credential authority and must not select a BE configuration.
-        let _ = prepare_iceberg_execution_binding(declaration)?;
-        let key = declaration.binding_key().clone();
-        ConnectorExecutionBinding::try_new_capabilities(
-            self.provider_id.clone(),
-            key.clone(),
-            Some(Arc::new(IcebergReadOnlyConnectorInstance {
-                key: key.clone(),
-                binding: self.resources.binding().clone(),
-            })),
-            Some(Arc::new(IcebergDataWriteExecution::new(
-                self.resources.binding().clone(),
                 self.resources.runtime().clone(),
             ))),
         )

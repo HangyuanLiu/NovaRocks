@@ -1128,7 +1128,7 @@ impl IcebergTypedBoundary {
 ///
 /// It retains the established Iceberg enumeration lifecycle, but returns the
 /// concrete split enum directly. Encoding happens only at the role's wire
-/// egress through `IcebergConnectorReadCodec`.
+/// egress through `IcebergConnectorReadWireAdapter`.
 #[derive(Debug)]
 struct IcebergRuntimeSplitSource<S> {
     inner: S,

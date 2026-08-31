@@ -1060,7 +1060,7 @@ impl Drop for RegisteredPageSource {
 pub(crate) mod test_support {
     use std::collections::BTreeMap;
 
-    use novarocks_proto_codec::connector_read::{ConnectorReadCodec, encode_value_type};
+    use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 
@@ -1219,7 +1219,7 @@ pub(crate) mod test_support {
         )
     }
 
-    impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureCodec {
+    impl ConnectorReadDecoder for FixtureCodec {
         fn owner(&self) -> &str {
             "fixture"
         }
@@ -1244,15 +1244,6 @@ pub(crate) mod test_support {
                     )
                 })
         }
-        fn encode_relation(
-            &self,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadRelation,
-        ) -> Result<
-            dto::CatalogTableHandle,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-        > {
-            unreachable!("fixture only decodes")
-        }
         fn decode_column(
             &self,
             _: &novarocks_proto_codec::connector_read::ValidatedColumnHandle,
@@ -1261,13 +1252,6 @@ pub(crate) mod test_support {
             novarocks_proto_codec::connector_read::ConnectorReadCodecError,
         > {
             Ok(self.adapter.wrap_column(FixtureColumn(1)))
-        }
-        fn encode_column(
-            &self,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-        ) -> Result<dto::ColumnHandle, novarocks_proto_codec::connector_read::ConnectorReadCodecError>
-        {
-            unreachable!("fixture only decodes")
         }
         fn decode_transaction(
             &self,
@@ -1278,15 +1262,6 @@ pub(crate) mod test_support {
         > {
             Ok(self.adapter.wrap_transaction(()))
         }
-        fn encode_transaction(
-            &self,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
-        ) -> Result<
-            dto::ConnectorTransactionHandle,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-        > {
-            unreachable!("fixture only decodes")
-        }
         fn decode_split(
             &self,
             _: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
@@ -1295,15 +1270,6 @@ pub(crate) mod test_support {
             novarocks_proto_codec::connector_read::ConnectorReadCodecError,
         > {
             Ok(self.adapter.wrap_split(FixtureSplit))
-        }
-        fn encode_split(
-            &self,
-            _: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
-        ) -> Result<
-            dto::ConnectorSplit,
-            novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-        > {
-            unreachable!("fixture only decodes")
         }
     }
 

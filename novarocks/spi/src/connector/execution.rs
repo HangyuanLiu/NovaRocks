@@ -22,9 +22,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
-    ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderBindingKind,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsSummary, ConnectorSplit, ConnectorWriteExecution,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsSummary, ConnectorSplit,
+    ConnectorWriteExecution,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -488,19 +488,6 @@ impl ConnectorExecutionBinding {
     pub fn write(&self) -> Option<&Arc<dyn ConnectorWriteExecution>> {
         self.write.as_ref()
     }
-}
-
-/// Startup-composed provider factory. Implementations receive a validated,
-/// credential-free domain declaration and use only local process bindings for
-/// credentials and clients.
-pub trait ConnectorExecutionInstaller: Send + Sync {
-    fn provider_kind(&self) -> ConnectorProviderBindingKind;
-
-    fn install(
-        &self,
-        declaration: &ConnectorProviderBinding,
-        context: &ConnectorRequestContext,
-    ) -> Result<ConnectorExecutionBinding, ConnectorError>;
 }
 
 /// A resolver scoped to one admitted BE query. Generic native decode receives

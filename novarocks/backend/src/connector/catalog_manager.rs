@@ -223,6 +223,7 @@ impl CatalogPruneResult {
 /// Handle-keyed BE-local materializations.  Multiple versions of one catalog
 /// name coexist; only an exact `CatalogHandle` can resolve a runtime.
 #[derive(Clone)]
+// Design: ADR-0130 (docs/adr/ADR-0130-connector-role-binding-generation-ownership.md)
 pub struct CatalogManager<T> {
     state: Arc<Mutex<CatalogManagerState<T>>>,
     config: CatalogManagerConfig,
