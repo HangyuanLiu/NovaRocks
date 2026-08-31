@@ -190,12 +190,11 @@ impl Scenario for DistributedReaderCancel {
             .recv_timeout(context.remaining("receive connector read connection id")?)
             .context("connector read terminated before publishing its connection id")?;
 
-        let reader_logs = wait_for_open_reader_on_every_backend(
+        wait_for_in_flight_reader_on_every_backend(
             context,
             "connector_cancel_catalog",
             "wait for every BE to open a distributed connector reader",
         )?;
-        assert_readers_are_in_flight(&reader_logs, "before KILL QUERY")?;
         if let Ok(result) = target.done.try_recv() {
             bail!("connector read completed before cancellation was issued: {result:?}");
         }
@@ -286,12 +285,11 @@ impl Scenario for DistributedReaderKillConnection {
             .ready
             .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
             .context("KILL CONNECTION target terminated before publishing its connection id")?;
-        let reader_logs = wait_for_open_reader_on_every_backend(
+        wait_for_in_flight_reader_on_every_backend(
             context,
             "connector_kill_connection_catalog",
             "wait for every BE to open a KILL CONNECTION target reader",
         )?;
-        assert_readers_are_in_flight(&reader_logs, "before KILL CONNECTION")?;
 
         context.action(format!(
             "terminate the active public-MySQL reader through KILL CONNECTION {connection_id}"
@@ -924,12 +922,11 @@ impl Scenario for CatalogVersionDrain {
             .ready
             .recv_timeout(context.remaining("receive old-version connection id")?)
             .context("old-version connector read terminated before publishing its connection id")?;
-        let old_logs = wait_for_open_reader_on_every_backend(
+        let old_logs = wait_for_in_flight_reader_on_every_backend(
             context,
             "connector_generation_catalog",
             "wait for every BE to open an old-version connector reader",
         )?;
-        assert_readers_are_in_flight(&old_logs, "before catalog replacement")?;
         let old_versions = reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
         if let Ok(result) = target.done.try_recv() {
             bail!(
@@ -1392,6 +1389,20 @@ fn wait_for_open_reader_on_every_backend(
     })
 }
 
+fn wait_for_in_flight_reader_on_every_backend(
+    context: &mut ScenarioContext,
+    catalog: &str,
+    operation: &str,
+) -> Result<Vec<String>> {
+    let marker = format!("{CONNECTOR_READER_OPEN} provider=iceberg instance={catalog}");
+    wait_for_backend_logs(context, operation, |logs| {
+        logs.iter().all(|log| {
+            let (opens, closes) = reader_counts(log);
+            log.contains(&marker) && opens > closes
+        })
+    })
+}
+
 fn wait_for_replacement_reader_on_every_backend(
     context: &mut ScenarioContext,
     catalog: &str,
@@ -1550,18 +1561,6 @@ fn assert_exactly_one_new_catalog_marker_per_backend(
 fn release_catalog_install_hold(hold_file: &std::path::Path) -> Result<()> {
     std::fs::remove_file(hold_file)
         .with_context(|| format!("release catalog-install hold file {}", hold_file.display()))
-}
-
-fn assert_readers_are_in_flight(logs: &[String], phase: &str) -> Result<()> {
-    for (index, log) in logs.iter().enumerate() {
-        let (opens, closes) = reader_counts(log);
-        if opens <= closes {
-            bail!(
-                "BE[{index}] has no in-flight connector reader {phase}: opens={opens} closes={closes}"
-            );
-        }
-    }
-    Ok(())
 }
 
 fn assert_no_reader_open_after_abort(logs: &[String]) -> Result<()> {
