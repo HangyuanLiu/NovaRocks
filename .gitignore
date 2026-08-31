@@ -16,6 +16,7 @@
 /tests/sql/fixtures/benchmarks/parquet/
 /tests/sql/suites/.sql_test_catalog
 /tools/target
+/tools/connector-binding-bench/target/
 /logs/ci-full/
 /vendor/*/target/
 thirdparty/installed
