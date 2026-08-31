@@ -826,8 +826,11 @@ main() {
       acquire_status="$?"
     fi
     if [[ "$acquire_status" != 75 ]]; then emit_error writer_failed "unable to acquire fixture lease"; exit 1; fi
-    if wait_or_takeover; then continue; fi
-    wait_status="$?"
+    if wait_or_takeover; then
+      continue
+    else
+      wait_status="$?"
+    fi
     if [[ "$wait_status" == 10 ]] && check_readiness; then emit_result true false "$ready_etag"; exit 0; fi
     emit_error wait_timeout "timed out waiting for the exact fixture lease"; exit 1
   done
@@ -858,8 +861,9 @@ main() {
   if publish_ready "$candidate" "$( [[ "$rebuild" == 1 ]] && echo rebuild || echo absent )" "$observed_ready_etag"; then
     check_readiness || { emit_error publication_failed "published READY failed direct validation"; exit 1; }
     emit_result false true "$ready_etag"; exit 0
+  else
+    publish_status="$?"
   fi
-  publish_status="$?"
   if [[ "$publish_status" == 3 ]]; then emit_error lease_lost "lease fencing failed before READY publication";
   elif [[ "$publish_status" == 5 ]]; then emit_error publication_conflict "conditional READY publication lost without a valid winner";
   else emit_error publication_failed "conditional READY publication failed"; fi
