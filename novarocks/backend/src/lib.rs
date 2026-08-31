@@ -16,6 +16,5 @@ pub use application::{
     BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
 };
 pub use fragment::NativeFragmentService;
-pub use novarocks_proto_codec::connector_read::ConnectorReadExecutionBundleFactory;
 pub use query_lifecycle::QueryLifecycleRegistryConfig;
 pub use rpc::runtime::{BackendDataRuntime, BackendNativeTransport};

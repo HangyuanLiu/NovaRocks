@@ -53,7 +53,7 @@ fn prepare_scan_bindings_with_runtime_filters(
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
-    let typed = fixture_typed_control_registry(plan, &controls);
+    let typed = fixture_control_role_host(plan, &controls);
     super::prepare_scan_bindings(
         plan,
         &controls,
@@ -73,7 +73,7 @@ fn prepare_scan_bindings_with_delta_resolver(
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(plan, &controls);
-    let typed = fixture_typed_control_registry(plan, &controls);
+    let typed = fixture_control_role_host(plan, &controls);
     let resolver = crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
         &query_bindings,
     );
@@ -96,7 +96,7 @@ fn prepare_scan_bindings_with_controls(
     resolver: Option<&dyn ScanBindingResolver>,
 ) -> Result<crate::query_execution::preparation::scan::ScanExecutionBindings, String> {
     let query_bindings = fixture_query_table_bindings(plan, controls);
-    let typed = fixture_typed_control_registry(plan, controls);
+    let typed = fixture_control_role_host(plan, controls);
     super::prepare_scan_bindings(
         plan,
         controls,
@@ -111,7 +111,7 @@ fn prepare_scan_bindings_with_controls(
 /// Fixture options carrying a typed control registry, mirroring how the
 /// composition root hands one to production preparation.
 fn fixture_scan_preparation_options(
-    typed: Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
+    typed: Arc<crate::connector::ConnectorControlHost>,
 ) -> super::ScanPreparationOptions {
     super::ScanPreparationOptions::single_backend_fixture().with_typed_connector_control(
         typed,
@@ -130,14 +130,13 @@ fn fixture_scan_preparation_options(
 ///
 /// The handle is the exact desired-state identity the fixture lease already
 /// froze, so the registry answers precisely what production would answer.
-fn fixture_typed_control_registry(
+fn fixture_control_role_host(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry> {
+) -> Arc<crate::connector::ConnectorControlHost> {
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
-    let registry =
-        Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new());
+    let registry = Arc::new(crate::connector::ConnectorControlHost::new());
     let mut facts = Vec::new();
     for fragment in plan.fragments() {
         fn collect(node: &DistributedNode, facts: &mut Vec<SqlScanPreparationFacts>) {
@@ -173,20 +172,31 @@ fn fixture_typed_control_registry(
                 &control,
             )),
         );
-        let lease = registry
-            .install_read_control(
-                catalog_handle,
-                crate::connector::typed_control_registry::InstalledReadControl::new(
+        let properties = novarocks_connector_binding::NormalizedCatalogProperties::try_new(
+            lease
+                .binding()
+                .catalog_properties()
+                .expect("fixture control binding has catalog properties")
+                .clone(),
+        )
+        .expect("fixture normalized properties");
+        let role = novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
+            properties,
+            Arc::clone(lease.binding()),
+            Some(
+                novarocks_connector_binding::ConnectorControlReadBinding::new(
                     Arc::clone(&adapter) as _,
                     adapter as _,
+                    None,
                     Arc::new(FixtureReadCodec),
                 ),
-            )
+            ),
+            None,
+        )
+        .expect("fixture control role binding");
+        registry
+            .register_role_binding(role)
             .expect("fixture read control install");
-        // This is the provider-side generation owner in miniature.  The
-        // registry has only a weak edge; the service held in the installed
-        // bundle retains the strong lease for the fixture generation.
-        control.retain_registration_lease(lease);
     }
     registry
 }
@@ -218,13 +228,6 @@ struct FixtureTransaction;
 struct FixtureTypedControl {
     descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
     catalog_handle: novarocks_spi::connector::CatalogHandle,
-    registration_lease: std::sync::Mutex<
-        Option<
-            std::sync::Arc<
-                dyn crate::connector::typed_control_registry::ReadControlRegistrationLease,
-            >,
-        >,
-    >,
     pinned_requests: std::sync::Mutex<Vec<novarocks_spi::connector::ConnectorPinnedFileSet>>,
 }
 
@@ -254,21 +257,8 @@ impl FixtureTypedControl {
                 instance_id: catalog_handle.catalog_name().clone(),
             },
             catalog_handle,
-            registration_lease: std::sync::Mutex::new(None),
             pinned_requests: std::sync::Mutex::new(Vec::new()),
         }
-    }
-
-    fn retain_registration_lease(
-        &self,
-        lease: std::sync::Arc<
-            dyn crate::connector::typed_control_registry::ReadControlRegistrationLease,
-        >,
-    ) {
-        *self
-            .registration_lease
-            .lock()
-            .expect("fixture read registration lease lock") = Some(lease);
     }
 
     fn table(
@@ -480,19 +470,9 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
 /// must never invoke a codec before native egress.
 struct FixtureReadCodec;
 
-impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureReadCodec {
+impl novarocks_proto_codec::connector_read::ConnectorReadEncoder for FixtureReadCodec {
     fn owner(&self) -> &str {
         "fixture"
-    }
-
-    fn decode_relation(
-        &self,
-        _relation: &novarocks_proto_codec::connector_read::CatalogTableHandle,
-    ) -> Result<
-        novarocks_spi::connector::read_stack::ConnectorReadRelation,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-    > {
-        unreachable!("scan preparation fixture must not decode wire relations")
     }
 
     fn encode_relation(
@@ -505,16 +485,6 @@ impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureReadCo
         unreachable!("scan preparation fixture must not encode wire relations")
     }
 
-    fn decode_column(
-        &self,
-        _column: &novarocks_proto_codec::connector_read::ValidatedColumnHandle,
-    ) -> Result<
-        novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-    > {
-        unreachable!("scan preparation fixture must not decode wire columns")
-    }
-
     fn encode_column(
         &self,
         _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
@@ -525,16 +495,6 @@ impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureReadCo
         unreachable!("scan preparation fixture must not encode wire columns")
     }
 
-    fn decode_transaction(
-        &self,
-        _transaction: &novarocks_proto_codec::connector_read::ValidatedTransactionHandle,
-    ) -> Result<
-        novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-    > {
-        unreachable!("scan preparation fixture must not decode wire transactions")
-    }
-
     fn encode_transaction(
         &self,
         _transaction: &novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
@@ -543,16 +503,6 @@ impl novarocks_proto_codec::connector_read::ConnectorReadCodec for FixtureReadCo
         novarocks_proto_codec::connector_read::ConnectorReadCodecError,
     > {
         unreachable!("scan preparation fixture must not encode wire transactions")
-    }
-
-    fn decode_split(
-        &self,
-        _split: &novarocks_proto_codec::connector_read::ValidatedConnectorSplit,
-    ) -> Result<
-        novarocks_spi::connector::read_stack::ConnectorReadSplit,
-        novarocks_proto_codec::connector_read::ConnectorReadCodecError,
-    > {
-        unreachable!("scan preparation fixture must not decode wire splits")
     }
 
     fn encode_split(

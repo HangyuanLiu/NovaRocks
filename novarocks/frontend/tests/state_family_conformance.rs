@@ -228,7 +228,7 @@ async fn open_application(
     input: novarocks_frontend::StateStoreHostInput,
 ) -> FrontendApplicationHost {
     let registry = state_store_fixture::registry();
-    FrontendApplicationHost::open_with_factories_and_state_store_registry(
+    FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         Some(input),
         &registry,
         FrontendExecutionConfig::new(
@@ -239,9 +239,6 @@ async fn open_application(
         ),
         backend_config(),
         Vec::new(),
-        std::sync::Arc::new(
-            novarocks_frontend::connector::typed_control_registry::ConnectorReadControlRegistry::default(),
-        ),
         tokio::runtime::Handle::current(),
         test_native_trust(),
         FrontendNativeTransport::plaintext(),

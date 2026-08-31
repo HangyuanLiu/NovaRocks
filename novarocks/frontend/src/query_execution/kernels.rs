@@ -27,7 +27,7 @@ use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::common::backend_topology::BackendTopologyService;
-use crate::connector::typed_control_registry::ConnectorReadControlRegistry;
+use crate::connector::ConnectorControlHost;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
@@ -48,7 +48,7 @@ pub struct QueryPreparationKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    typed_connector_control: Arc<ConnectorReadControlRegistry>,
+    typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     query_execution: QueryExecutionService,
     backend_topology: BackendTopologyService,
@@ -110,7 +110,7 @@ impl QueryPreparationKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<ConnectorReadControlRegistry>,
+        typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
@@ -130,7 +130,7 @@ impl QueryPreparationKernel {
 
     /// The typed connector controls this statement may resolve, frozen with
     /// the composition root's one registry.
-    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorReadControlRegistry> {
+    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorControlHost> {
         &self.typed_connector_control
     }
 
@@ -176,7 +176,7 @@ pub struct DmlExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    typed_connector_control: Arc<ConnectorReadControlRegistry>,
+    typed_connector_control: Arc<ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
@@ -189,7 +189,7 @@ impl DmlExecutionKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<ConnectorReadControlRegistry>,
+        typed_connector_control: Arc<ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
@@ -207,7 +207,7 @@ impl DmlExecutionKernel {
     }
 
     /// The typed connector controls this statement may resolve.
-    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorReadControlRegistry> {
+    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorControlHost> {
         &self.typed_connector_control
     }
 
@@ -445,7 +445,7 @@ pub struct MaintenanceExecutionKernel {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
-    typed_connector_control: Arc<ConnectorReadControlRegistry>,
+    typed_connector_control: Arc<ConnectorControlHost>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
@@ -457,7 +457,7 @@ impl MaintenanceExecutionKernel {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<ConnectorReadControlRegistry>,
+        typed_connector_control: Arc<ConnectorControlHost>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
@@ -474,7 +474,7 @@ impl MaintenanceExecutionKernel {
     }
 
     /// The typed connector controls a maintenance-owned read may resolve.
-    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorReadControlRegistry> {
+    pub(crate) fn typed_connector_control(&self) -> &Arc<ConnectorControlHost> {
         &self.typed_connector_control
     }
 

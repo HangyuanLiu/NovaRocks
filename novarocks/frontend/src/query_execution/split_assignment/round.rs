@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadColumnHandle;
 use novarocks_spi::connector::read_stack::ConnectorReadSplitSource;
@@ -54,7 +54,7 @@ pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::f
 pub(crate) struct RoundSplitSource {
     pub(crate) plan_node_id: i32,
     pub(crate) source: Box<dyn ConnectorReadSplitSource>,
-    pub(crate) codec: Arc<dyn ConnectorReadCodec>,
+    pub(crate) encoder: Arc<dyn ConnectorReadEncoder>,
     /// FE admission state is query-attempt local and shared only with this
     /// attempt's control readers.  The source observes it afresh for every
     /// batch; already emitted splits are never revisited.
@@ -117,7 +117,7 @@ impl RoundSplitAssignment {
                 max_queued_splits_per_task,
                 sources
                     .iter()
-                    .map(|source| (source.plan_node_id, Arc::clone(&source.codec)))
+                    .map(|source| (source.plan_node_id, Arc::clone(&source.encoder)))
                     .collect(),
                 retry_policy,
                 stop.clone(),
@@ -267,10 +267,7 @@ pub(crate) type RoundSplitAssignmentStop = SplitAssignmentStop;
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use novarocks_proto_codec::connector_read::{
-        CatalogTableHandle, ConnectorReadCodecError, ValidatedColumnHandle,
-        ValidatedConnectorSplit, ValidatedTransactionHandle,
-    };
+    use novarocks_proto_codec::connector_read::ConnectorReadCodecError;
     use novarocks_spi::connector::ConnectorError;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
@@ -323,19 +320,9 @@ mod tests {
 
     struct InertCodec;
 
-    impl ConnectorReadCodec for InertCodec {
+    impl ConnectorReadEncoder for InertCodec {
         fn owner(&self) -> &str {
             "round-close-test"
-        }
-
-        fn decode_relation(
-            &self,
-            _relation: &CatalogTableHandle,
-        ) -> Result<
-            novarocks_spi::connector::read_stack::ConnectorReadRelation,
-            ConnectorReadCodecError,
-        > {
-            unreachable!("close lifecycle tests must not decode relations")
         }
 
         fn encode_relation(
@@ -348,32 +335,12 @@ mod tests {
             unreachable!("close lifecycle tests must not encode relations")
         }
 
-        fn decode_column(
-            &self,
-            _column: &ValidatedColumnHandle,
-        ) -> Result<
-            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
-            ConnectorReadCodecError,
-        > {
-            unreachable!("close lifecycle tests must not decode columns")
-        }
-
         fn encode_column(
             &self,
             _column: &novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
         ) -> Result<novarocks_proto_models::connector_read::ColumnHandle, ConnectorReadCodecError>
         {
             unreachable!("close lifecycle tests must not encode columns")
-        }
-
-        fn decode_transaction(
-            &self,
-            _transaction: &ValidatedTransactionHandle,
-        ) -> Result<
-            novarocks_spi::connector::read_stack::ConnectorReadTransactionHandle,
-            ConnectorReadCodecError,
-        > {
-            unreachable!("close lifecycle tests must not decode transactions")
         }
 
         fn encode_transaction(
@@ -384,13 +351,6 @@ mod tests {
             ConnectorReadCodecError,
         > {
             unreachable!("close lifecycle tests must not encode transactions")
-        }
-
-        fn decode_split(
-            &self,
-            _split: &ValidatedConnectorSplit,
-        ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
-            unreachable!("close lifecycle tests must not decode splits")
         }
 
         fn encode_split(
@@ -416,7 +376,7 @@ mod tests {
             vec![RoundSplitSource {
                 plan_node_id: 7,
                 source: Box::new(CloseCountingSource { close_calls }),
-                codec: Arc::new(InertCodec),
+                encoder: Arc::new(InertCodec),
                 feedback: Arc::new(
                     RuntimeFilterFeedbackState::new(execution_id, Default::default())
                         .expect("empty feedback declaration"),

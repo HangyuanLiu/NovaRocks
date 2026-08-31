@@ -253,11 +253,11 @@ fn observation_participant_ref(participant: &ParticipantAttemptRef) -> Participa
     participant.clone()
 }
 
-fn empty_catalog_runtime_materializers()
--> Arc<crate::connector::catalog_manager::CatalogRuntimeMaterializerSet> {
+fn empty_execution_role_binding_factories()
+-> Arc<crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet> {
     Arc::new(
-        crate::connector::catalog_manager::CatalogRuntimeMaterializerSet::try_new([])
-            .expect("an empty catalog runtime materializer set is valid"),
+        crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new([])
+            .expect("an empty connector execution role binding factory set is valid"),
     )
 }
 
@@ -1150,12 +1150,17 @@ impl Drop for StageResourceReservation {
 pub(crate) struct QueryLifecycleRegistry {
     state: Mutex<QueryLifecycleRegistryState>,
     local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
+    /// BE-owned runtime for bounded, lifecycle-checked catalog bind work.
+    /// The task never outlives its query authority: every wait and completion
+    /// rechecks the entry before it can lease or publish Ready.
+    catalog_install_runtime: BackendDataRuntime,
     catalog_manager: Arc<
         crate::connector::catalog_manager::CatalogManager<
-            crate::connector::catalog_manager::MaterializedCatalogRuntime,
+            crate::connector::ConnectorExecutionRoleBinding,
         >,
     >,
-    catalog_materializers: Arc<crate::connector::catalog_manager::CatalogRuntimeMaterializerSet>,
+    execution_role_binding_factories:
+        Arc<crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet>,
     runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     config: QueryLifecycleRegistryConfig,
     local_process_id: BackendProcessId,
@@ -1469,7 +1474,8 @@ impl QueryLifecycleRegistry {
             metrics,
             terminal_fallback,
             NativeCompatibilityId::new([0x71; 32]),
-            empty_catalog_runtime_materializers(),
+            empty_execution_role_binding_factories(),
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
         )
     }
 
@@ -1488,6 +1494,7 @@ impl QueryLifecycleRegistry {
         runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
+            crate::rpc::runtime::test_backend_data_runtime(),
             local_process_id,
             local_runtime,
             config,
@@ -1496,7 +1503,8 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             runtime_filter_factory,
             NativeCompatibilityId::new([0x71; 32]),
-            empty_catalog_runtime_materializers(),
+            empty_execution_role_binding_factories(),
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
         )
     }
 
@@ -1516,7 +1524,8 @@ impl QueryLifecycleRegistry {
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             NativeCompatibilityId::new([0x71; 32]),
-            empty_catalog_runtime_materializers(),
+            empty_execution_role_binding_factories(),
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
         )
     }
 
@@ -1526,23 +1535,25 @@ impl QueryLifecycleRegistry {
         config: QueryLifecycleRegistryConfig,
         native_compatibility_id: NativeCompatibilityId,
     ) -> Arc<Self> {
-        Self::new_with_runtime_and_catalog_materializers(
+        Self::new_with_runtime_and_execution_role_binding_factories(
             runtime,
             local_runtime,
             config,
             native_compatibility_id,
-            empty_catalog_runtime_materializers(),
+            empty_execution_role_binding_factories(),
+            crate::connector::catalog_manager::CatalogManagerConfig::default(),
         )
     }
 
-    pub(crate) fn new_with_runtime_and_catalog_materializers(
+    pub(crate) fn new_with_runtime_and_execution_role_binding_factories(
         runtime: BackendDataRuntime,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
         native_compatibility_id: NativeCompatibilityId,
-        catalog_materializers: Arc<
-            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        execution_role_binding_factories: Arc<
+            crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
+        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     ) -> Arc<Self> {
         Self::new_with_backend_identity(
             runtime.clone(),
@@ -1553,7 +1564,8 @@ impl QueryLifecycleRegistry {
             Arc::new(PrometheusQueryLifecycleMetricsSink),
             Arc::new(GrpcQueryTerminalFallbackTransport { runtime }),
             native_compatibility_id,
-            catalog_materializers,
+            execution_role_binding_factories,
+            catalog_manager_config,
         )
     }
 
@@ -1570,11 +1582,13 @@ impl QueryLifecycleRegistry {
         metrics: Arc<dyn QueryLifecycleMetricsSink>,
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
         native_compatibility_id: NativeCompatibilityId,
-        catalog_materializers: Arc<
-            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        execution_role_binding_factories: Arc<
+            crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
+        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     ) -> Arc<Self> {
         Self::new_with_backend_identity_and_runtime_filter_factory(
+            runtime.clone(),
             local_process_id,
             local_runtime,
             config,
@@ -1583,7 +1597,8 @@ impl QueryLifecycleRegistry {
             terminal_fallback,
             Arc::new(BackendRuntimeFilterParticipantFactory::new(runtime)),
             native_compatibility_id,
-            catalog_materializers,
+            execution_role_binding_factories,
+            catalog_manager_config,
         )
     }
 
@@ -1592,6 +1607,7 @@ impl QueryLifecycleRegistry {
         reason = "This constructor accepts the complete production lifecycle dependency set and explicit runtime-filter factory."
     )]
     fn new_with_backend_identity_and_runtime_filter_factory(
+        catalog_install_runtime: BackendDataRuntime,
         local_process_id: BackendProcessId,
         local_runtime: Arc<dyn QueryLifecycleLocalRuntime>,
         config: QueryLifecycleRegistryConfig,
@@ -1600,9 +1616,10 @@ impl QueryLifecycleRegistry {
         terminal_fallback: Arc<dyn QueryTerminalFallbackTransport>,
         runtime_filter_factory: Arc<dyn RuntimeFilterParticipantFactory>,
         native_compatibility_id: NativeCompatibilityId,
-        catalog_materializers: Arc<
-            crate::connector::catalog_manager::CatalogRuntimeMaterializerSet,
+        execution_role_binding_factories: Arc<
+            crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet,
         >,
+        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     ) -> Arc<Self> {
         assert!(config.max_active_entries > 0);
         assert!(config.tombstone_capacity > 0);
@@ -1628,8 +1645,12 @@ impl QueryLifecycleRegistry {
         let registry = Arc::new_cyclic(|self_weak| Self {
             state: Mutex::new(QueryLifecycleRegistryState::default()),
             local_runtime,
-            catalog_manager: Arc::new(crate::connector::catalog_manager::CatalogManager::default()),
-            catalog_materializers,
+            catalog_install_runtime,
+            catalog_manager: Arc::new(
+                crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
+                    .expect("backend catalog manager configuration was validated at startup"),
+            ),
+            execution_role_binding_factories,
             runtime_filter_factory,
             config,
             local_process_id,
@@ -1659,7 +1680,7 @@ impl QueryLifecycleRegistry {
         &self,
         execution_id: QueryExecutionId,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::typed_registry::InstalledReadExecution, String> {
+    ) -> Result<crate::connector::ConnectorExecutionReadBinding, String> {
         let runtime = self
             .catalog_manager
             .resolve_for_query(execution_id, handle)
@@ -1670,7 +1691,7 @@ impl QueryLifecycleRegistry {
                     handle.version().short_hex()
                 )
             })?;
-        runtime.read_execution().ok_or_else(|| {
+        runtime.read().cloned().ok_or_else(|| {
             format!(
                 "catalog runtime for {}@{} has no typed read capability",
                 handle.catalog_name().as_str(),
@@ -1686,7 +1707,7 @@ impl QueryLifecycleRegistry {
         &self,
         execution_id: QueryExecutionId,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::typed_registry::InstalledWriteExecution, String> {
+    ) -> Result<crate::connector::ConnectorExecutionWriteBinding, String> {
         let runtime = self
             .catalog_manager
             .resolve_for_query(execution_id, handle)
@@ -1697,7 +1718,7 @@ impl QueryLifecycleRegistry {
                     handle.version().short_hex()
                 )
             })?;
-        runtime.write_execution().ok_or_else(|| {
+        runtime.write().cloned().ok_or_else(|| {
             format!(
                 "catalog runtime for {}@{} has no catalog-scoped write capability",
                 handle.catalog_name().as_str(),
@@ -2019,9 +2040,8 @@ impl QueryLifecycleRegistry {
         catalogs: Vec<CatalogProperties>,
     ) {
         let registry = Arc::clone(self);
-        std::thread::Builder::new()
-            .name("catalog-lifecycle-install".to_owned())
-            .spawn(move || {
+        let runtime = registry.catalog_install_runtime.clone();
+        runtime.handle().spawn_blocking(move || {
                 if crate::config::debug_emit_catalog_lifecycle_marker() {
                     println!(
                         "NOVAROCKS_CATALOG_LOADING execution_id={} process_id={} catalog_count={}",
@@ -2032,6 +2052,11 @@ impl QueryLifecycleRegistry {
                 }
                 if let Some(hold_file) = crate::config::debug_catalog_install_hold_file() {
                     while hold_file.exists() {
+                        if !registry.catalog_install_active(&entry) {
+                            registry.catalog_manager.release_query(execution_id);
+                            registry.publish_catalog_lease_metrics();
+                            return;
+                        }
                         std::thread::sleep(Duration::from_millis(10));
                     }
                 }
@@ -2043,11 +2068,13 @@ impl QueryLifecycleRegistry {
                     ))
                 } else {
                     catalogs.into_iter().try_for_each(|properties| {
-                        let materializers = Arc::clone(&registry.catalog_materializers);
+                        let factories = Arc::clone(&registry.execution_role_binding_factories);
                         registry
                             .catalog_manager
-                            .ensure(execution_id, properties, move |properties| {
-                                materializers.materialize(properties)
+                            .ensure_while(execution_id, properties, || registry.catalog_install_active(&entry), move |properties| {
+                                factories.bind(properties).map_err(
+                                    crate::connector::catalog_manager::CatalogManagerError::from_materialization,
+                                )
                             })
                             .map(|_| ())
                     })
@@ -2109,8 +2136,21 @@ impl QueryLifecycleRegistry {
                 {
                     let _ = events.try_send(event);
                 }
-            })
-            .expect("catalog lifecycle installer thread must start");
+        });
+    }
+
+    fn catalog_install_active(&self, entry: &QueryLifecycleEntry) -> bool {
+        let state = entry.state.lock().expect("query lifecycle entry lock");
+        state.termination_reason.is_none()
+            && !matches!(
+                state.phase,
+                QueryLifecyclePhase::Terminating
+                    | QueryLifecyclePhase::TerminalRetained
+                    | QueryLifecyclePhase::Tombstone
+            )
+            && state
+                .pre_start_deadline
+                .is_none_or(|deadline| Instant::now() < deadline)
     }
 
     fn wait_for_existing_init(

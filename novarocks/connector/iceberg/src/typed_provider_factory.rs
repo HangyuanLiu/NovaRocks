@@ -24,9 +24,7 @@
 
 use std::sync::Arc;
 
-use novarocks_proto_codec::connector_read::{
-    ConnectorReadExecutionBundle, ConnectorReadExecutionBundleFactory,
-};
+use novarocks_proto_codec::connector_read::ConnectorReadDecoder;
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
@@ -45,7 +43,7 @@ use crate::typed_read::page_source_provider::{
 };
 use crate::typed_read::system_page_source::IcebergSystemTableProvider;
 use crate::typed_read::{
-    HiveTransactionHandle, IcebergColumnHandle, IcebergConnectorReadCodec,
+    HiveTransactionHandle, IcebergColumnHandle, IcebergConnectorReadWireAdapter,
     IcebergExecutionReadRuntime, IcebergReadSplit, IcebergRuntimeRelation,
 };
 
@@ -89,6 +87,36 @@ impl IcebergTypedProviderFactory {
         Self: ProviderReadFactory<P>,
     {
         ProviderReadFactoryAdapter::new(adapter, Arc::new(self))
+    }
+
+    /// Bind one immutable catalog generation to the directional BE read
+    /// services. The returned decoder cannot be used by FE composition.
+    pub fn build(
+        &self,
+        properties: &CatalogProperties,
+    ) -> Result<IcebergExecutionReadBinding, ConnectorError> {
+        let binding = self.binding.bind_catalog(properties)?;
+        let catalog_handle = properties.handle();
+        let runtime = IcebergExecutionReadRuntime::new(
+            iceberg_descriptor(catalog_handle),
+            catalog_handle.clone(),
+            HiveTransactionHandle::new(true, catalog_transaction_marker(catalog_handle)),
+        );
+
+        let adapter = ReadRuntimeAdapter::new(Arc::new(runtime));
+        let decoder: Arc<dyn ConnectorReadDecoder> =
+            Arc::new(IcebergConnectorReadWireAdapter::new(adapter.clone()));
+        let provider_factory = Arc::new(ProviderReadFactoryAdapter::new(
+            adapter,
+            Arc::new(Self {
+                binding,
+                options: self.options.clone(),
+            }),
+        ));
+        Ok(IcebergExecutionReadBinding {
+            provider_factory,
+            decoder,
+        })
     }
 }
 
@@ -356,29 +384,20 @@ mod tests {
     }
 }
 
-impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
-    fn build(
-        &self,
-        properties: &CatalogProperties,
-    ) -> Result<ConnectorReadExecutionBundle, ConnectorError> {
-        let binding = self.binding.bind_catalog(properties)?;
-        let catalog_handle = properties.handle();
-        let runtime = IcebergExecutionReadRuntime::new(
-            iceberg_descriptor(catalog_handle),
-            catalog_handle.clone(),
-            HiveTransactionHandle::new(true, catalog_transaction_marker(catalog_handle)),
-        );
+pub struct IcebergExecutionReadBinding {
+    provider_factory: Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadProviderFactory>,
+    decoder: Arc<dyn ConnectorReadDecoder>,
+}
 
-        let adapter = ReadRuntimeAdapter::new(Arc::new(runtime));
-        let codec = Arc::new(IcebergConnectorReadCodec::new(adapter.clone()));
-        let provider_factory = Arc::new(ProviderReadFactoryAdapter::new(
-            adapter,
-            Arc::new(Self {
-                binding,
-                options: self.options.clone(),
-            }),
-        ));
-        Ok(ConnectorReadExecutionBundle::new(provider_factory, codec))
+impl IcebergExecutionReadBinding {
+    pub fn provider_factory(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadProviderFactory> {
+        Arc::clone(&self.provider_factory)
+    }
+
+    pub fn decoder(&self) -> Arc<dyn ConnectorReadDecoder> {
+        Arc::clone(&self.decoder)
     }
 }
 

@@ -26,9 +26,8 @@ pub use predicate::{
     encode_connector_expression, encode_tuple_domain,
 };
 pub use runtime_codec::{
-    ConnectorReadCodec, ConnectorReadCodecError, ConnectorReadExecutionBundle,
-    ConnectorReadExecutionBundleFactory, DecodedConnectorReadScan, DecodedScheduledReadSplit,
-    ReceivedScheduledSplit,
+    ConnectorReadCodecError, ConnectorReadDecoder, ConnectorReadEncoder, DecodedConnectorReadScan,
+    DecodedScheduledReadSplit, ReceivedScheduledSplit,
 };
 pub use scan::{ConnectorTableScanSource, DynamicFilterBinding, ScanAssignment, ScanWorkSource};
 pub use split::{SplitCategory, ValidatedConnectorSplit};

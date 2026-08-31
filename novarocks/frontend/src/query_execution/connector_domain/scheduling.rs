@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_proto_models::connector_read as dto;
 use novarocks_types::UniqueId;
 
@@ -116,9 +116,9 @@ impl ScheduledSplit {
     /// exact provider binding.
     pub(crate) fn to_proto(
         &self,
-        codec: &dyn ConnectorReadCodec,
+        encoder: &dyn ConnectorReadEncoder,
     ) -> Result<dto::ScheduledSplit, String> {
-        codec
+        encoder
             .encode_scheduled_split(self.sequence_id, self.plan_node_id, self.split.split())
             .map_err(|error| error.to_string())
     }
@@ -130,7 +130,7 @@ pub(crate) struct SplitAssignment {
     plan_node_id: i32,
     splits: Vec<ScheduledSplit>,
     no_more_splits: bool,
-    codec: std::sync::Arc<dyn ConnectorReadCodec>,
+    encoder: std::sync::Arc<dyn ConnectorReadEncoder>,
 }
 
 impl std::fmt::Debug for SplitAssignment {
@@ -163,7 +163,7 @@ impl SplitAssignment {
             splits: self
                 .splits
                 .iter()
-                .map(|split| split.to_proto(self.codec.as_ref()))
+                .map(|split| split.to_proto(self.encoder.as_ref()))
                 .collect::<Result<_, _>>()?,
             no_more_splits: self.no_more_splits,
         })
@@ -205,7 +205,7 @@ impl PlanNodeAssignmentState {
         plan_node_id: i32,
         splits: Vec<Split>,
         no_more_splits: bool,
-        codec: std::sync::Arc<dyn ConnectorReadCodec>,
+        encoder: std::sync::Arc<dyn ConnectorReadEncoder>,
     ) -> Result<SplitAssignment, SplitAssignmentError> {
         if self.is_terminal(plan_node_id) {
             return Err(SplitAssignmentError::AlreadyTerminal { plan_node_id });
@@ -234,7 +234,7 @@ impl PlanNodeAssignmentState {
             plan_node_id,
             splits: scheduled,
             no_more_splits,
-            codec,
+            encoder,
         })
     }
 }

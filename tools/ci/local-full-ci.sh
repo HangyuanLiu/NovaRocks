@@ -420,6 +420,10 @@ run_cargo_gates() {
     tools/ci/check-native-trust-dependency-boundary.py
   run_fail_fast_stage "native trust dependency boundary mutations" "native-trust-dependency-boundary-test.log" \
     tools/ci/tests/native-trust-dependency-boundary-test.sh
+  run_fail_fast_stage "connector role binding boundary" "connector-role-binding-boundary.log" \
+    tools/ci/check-connector-role-binding-boundary.py
+  run_fail_fast_stage "connector role binding boundary mutations" "connector-role-binding-boundary-test.log" \
+    tools/ci/tests/connector-role-binding-boundary-test.sh
   run_fail_fast_stage "legacy branding" "legacy-branding.log" \
     tools/ci/check-legacy-branding.sh
   run_fail_fast_stage "legacy branding tests" "legacy-branding-test.log" \

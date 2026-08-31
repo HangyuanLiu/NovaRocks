@@ -64,7 +64,7 @@ impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
 /// decoded. They become visible to TaskUpdate only after the existing fragment
 /// admission/registration path succeeds.
 pub(crate) struct TypedReadAttemptContext {
-    entries: Mutex<BTreeMap<i32, crate::connector::typed_registry::InstalledReadExecution>>,
+    entries: Mutex<BTreeMap<i32, crate::connector::ConnectorExecutionReadBinding>>,
     published: AtomicBool,
 }
 
@@ -79,7 +79,7 @@ impl TypedReadAttemptContext {
     pub(crate) fn register(
         &self,
         plan_node_id: i32,
-        execution: crate::connector::typed_registry::InstalledReadExecution,
+        execution: crate::connector::ConnectorExecutionReadBinding,
     ) -> Result<(), String> {
         let mut entries = self
             .entries
@@ -100,7 +100,7 @@ impl TypedReadAttemptContext {
     pub(crate) fn resolve(
         &self,
         plan_node_id: i32,
-    ) -> Option<crate::connector::typed_registry::InstalledReadExecution> {
+    ) -> Option<crate::connector::ConnectorExecutionReadBinding> {
         if !self.published.load(Ordering::Acquire) {
             return None;
         }

@@ -110,6 +110,7 @@ code-anchors:
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
 - ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（active）
+- ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）

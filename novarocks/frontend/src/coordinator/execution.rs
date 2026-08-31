@@ -2603,7 +2603,7 @@ fn prepare_round_split_assignment(
         sources.push(RoundSplitSource {
             plan_node_id,
             source,
-            codec: Arc::clone(&scan.prepared.codec),
+            encoder: Arc::clone(&scan.prepared.encoder),
             feedback: Arc::clone(&feedback),
             feedback_bindings: feedback_bindings(table_scan),
             initial_wait_deadline: None,

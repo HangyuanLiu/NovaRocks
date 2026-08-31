@@ -30,10 +30,9 @@ use std::sync::Arc;
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorReadColumnHandle, ConnectorReadProviderFactory, ConnectorReadRelation,
-    ConnectorReadSplit, ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
+    Assignment, ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit,
+    ConnectorReadTransactionHandle, ConnectorReadWorkSource, TupleDomain,
 };
-use novarocks_spi::connector::{CatalogProperties, ConnectorError};
 
 use super::{
     CatalogTableHandle, ConnectorTableScanSource, ScheduledSplit, ValidatedColumnHandle,
@@ -85,57 +84,175 @@ impl fmt::Display for ConnectorReadCodecError {
 
 impl std::error::Error for ConnectorReadCodecError {}
 
-/// One complete worker-side read bundle for an exact execution binding.
+/// FE-to-wire half of the connector read codec contract.
 ///
-/// The backend installs this pair atomically after its existing Host has
-/// admitted the binding.  It has no registry or lifecycle authority; the
-/// factory merely gives the role matching provider services and codec for the
-/// same opaque-handle family.
-#[derive(Clone)]
-pub struct ConnectorReadExecutionBundle {
-    provider_factory: Arc<dyn ConnectorReadProviderFactory>,
-    codec: Arc<dyn ConnectorReadCodec>,
-}
+/// An encoder can create only carrier values.  It has no methods that turn
+/// untrusted carrier data into provider-owned runtime handles.
+pub trait ConnectorReadEncoder: Send + Sync {
+    fn owner(&self) -> &str;
 
-impl ConnectorReadExecutionBundle {
-    pub fn new(
-        provider_factory: Arc<dyn ConnectorReadProviderFactory>,
-        codec: Arc<dyn ConnectorReadCodec>,
-    ) -> Self {
-        Self {
-            provider_factory,
-            codec,
-        }
-    }
-
-    pub fn provider_factory(&self) -> Arc<dyn ConnectorReadProviderFactory> {
-        Arc::clone(&self.provider_factory)
-    }
-
-    pub fn codec(&self) -> Arc<dyn ConnectorReadCodec> {
-        Arc::clone(&self.codec)
-    }
-}
-
-impl fmt::Debug for ConnectorReadExecutionBundle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ConnectorReadExecutionBundle")
-            .finish_non_exhaustive()
-    }
-}
-
-/// Provider-owned constructor for a worker read bundle.
-///
-/// Server composition supplies implementations by provider kind. The backend
-/// invokes it only for complete CatalogManager-admitted immutable properties and owns all
-/// subsequent
-/// installation, retirement, and query lifecycle state.
-pub trait ConnectorReadExecutionBundleFactory: Send + Sync {
-    fn build(
+    fn encode_relation(
         &self,
-        properties: &CatalogProperties,
-    ) -> Result<ConnectorReadExecutionBundle, ConnectorError>;
+        relation: &ConnectorReadRelation,
+    ) -> Result<dto::CatalogTableHandle, ConnectorReadCodecError>;
+
+    fn encode_column(
+        &self,
+        column: &ConnectorReadColumnHandle,
+    ) -> Result<dto::ColumnHandle, ConnectorReadCodecError>;
+
+    fn encode_transaction(
+        &self,
+        transaction: &ConnectorReadTransactionHandle,
+    ) -> Result<dto::ConnectorTransactionHandle, ConnectorReadCodecError>;
+
+    fn encode_split(
+        &self,
+        split: &ConnectorReadSplit,
+    ) -> Result<dto::ConnectorSplit, ConnectorReadCodecError>;
+
+    fn encode_tuple_domain(
+        &self,
+        domain: &TupleDomain<ConnectorReadColumnHandle>,
+        path: FieldPath,
+    ) -> Result<dto::TupleDomain, ConnectorReadCodecError> {
+        let Some(domains) = domain.domains() else {
+            return Ok(encode_tuple_domain(&TupleDomain::none()));
+        };
+        let mut validated = BTreeMap::new();
+        for (column, value) in domains {
+            let raw = self.encode_column(column)?;
+            let raw = ValidatedColumnHandle::parse(raw, path.clone().field("column"))
+                .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
+            validated.insert(raw, value.clone());
+        }
+        Ok(encode_tuple_domain(
+            &TupleDomain::with_column_domains(validated).map_err(|error| {
+                ConnectorReadCodecError::invalid(self.owner(), path, error.to_string())
+            })?,
+        ))
+    }
+
+    fn encode_assignment(
+        &self,
+        assignment: &Assignment<ConnectorReadColumnHandle>,
+        _path: FieldPath,
+    ) -> Result<dto::ScanAssignment, ConnectorReadCodecError> {
+        Ok(dto::ScanAssignment {
+            variable: assignment.variable().to_owned(),
+            column: Some(self.encode_column(assignment.column())?),
+            value_type: Some(encode_value_type(assignment.value_type())),
+        })
+    }
+
+    fn encode_scheduled_split(
+        &self,
+        sequence_id: u64,
+        plan_node_id: i32,
+        split: &ConnectorReadSplit,
+    ) -> Result<dto::ScheduledSplit, ConnectorReadCodecError> {
+        Ok(dto::ScheduledSplit {
+            sequence_id,
+            plan_node_id,
+            split: Some(self.encode_split(split)?),
+        })
+    }
+}
+
+/// Wire-to-BE half of the connector read codec contract.
+///
+/// A decoder is the only directional interface allowed to construct opaque
+/// provider handles from a validated carrier.
+pub trait ConnectorReadDecoder: Send + Sync {
+    fn owner(&self) -> &str;
+
+    fn decode_relation(
+        &self,
+        relation: &CatalogTableHandle,
+    ) -> Result<ConnectorReadRelation, ConnectorReadCodecError>;
+
+    fn decode_column(
+        &self,
+        column: &ValidatedColumnHandle,
+    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError>;
+
+    fn decode_transaction(
+        &self,
+        transaction: &ValidatedTransactionHandle,
+    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError>;
+
+    fn decode_split(
+        &self,
+        split: &ValidatedConnectorSplit,
+    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError>;
+
+    fn decode_tuple_domain(
+        &self,
+        domain: &dto::TupleDomain,
+        path: FieldPath,
+    ) -> Result<TupleDomain<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
+        let validated = decode_tuple_domain(domain, path)
+            .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
+        let Some(domains) = validated.domains() else {
+            return Ok(TupleDomain::none());
+        };
+        let mut decoded = BTreeMap::new();
+        for (column, value) in domains {
+            decoded.insert(self.decode_column(column)?, value.clone());
+        }
+        TupleDomain::with_column_domains(decoded).map_err(|error| {
+            ConnectorReadCodecError::invalid(
+                self.owner(),
+                FieldPath::root("tuple_domain"),
+                error.to_string(),
+            )
+        })
+    }
+
+    fn decode_validated_tuple_domain(
+        &self,
+        domain: &TupleDomain<ValidatedColumnHandle>,
+    ) -> Result<TupleDomain<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
+        let Some(domains) = domain.domains() else {
+            return Ok(TupleDomain::none());
+        };
+        let mut decoded = BTreeMap::new();
+        for (column, value) in domains {
+            decoded.insert(self.decode_column(column)?, value.clone());
+        }
+        TupleDomain::with_column_domains(decoded).map_err(|error| {
+            ConnectorReadCodecError::invalid(
+                self.owner(),
+                FieldPath::root("tuple_domain"),
+                error.to_string(),
+            )
+        })
+    }
+
+    fn decode_assignment(
+        &self,
+        assignment: &dto::ScanAssignment,
+        path: FieldPath,
+    ) -> Result<Assignment<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
+        let validated = super::ScanAssignment::parse(assignment.clone(), path.clone())
+            .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
+        Assignment::try_new(
+            validated.variable(),
+            self.decode_column(validated.column())?,
+            validated.value_type(),
+        )
+        .map_err(|error| ConnectorReadCodecError::invalid(self.owner(), path, error.to_string()))
+    }
+
+    fn decode_scheduled_split(
+        &self,
+        scheduled: &ScheduledSplit,
+    ) -> Result<DecodedScheduledReadSplit, ConnectorReadCodecError> {
+        Ok(DecodedScheduledReadSplit::new(
+            ReceivedScheduledSplit::from_scheduled(scheduled),
+            self.decode_split(scheduled.split())?,
+        ))
+    }
 }
 
 /// Sequence facts carried beside a provider-private split after decoding.
@@ -189,167 +306,6 @@ impl DecodedScheduledReadSplit {
     }
 }
 
-/// A provider-owned codec for one exact installed connector binding.
-pub trait ConnectorReadCodec: Send + Sync {
-    /// A stable, non-secret diagnostic name for the selected binding.
-    fn owner(&self) -> &str;
-
-    fn decode_relation(
-        &self,
-        relation: &CatalogTableHandle,
-    ) -> Result<ConnectorReadRelation, ConnectorReadCodecError>;
-
-    fn encode_relation(
-        &self,
-        relation: &ConnectorReadRelation,
-    ) -> Result<dto::CatalogTableHandle, ConnectorReadCodecError>;
-
-    fn decode_column(
-        &self,
-        column: &ValidatedColumnHandle,
-    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError>;
-
-    fn encode_column(
-        &self,
-        column: &ConnectorReadColumnHandle,
-    ) -> Result<dto::ColumnHandle, ConnectorReadCodecError>;
-
-    fn decode_transaction(
-        &self,
-        transaction: &ValidatedTransactionHandle,
-    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError>;
-
-    fn encode_transaction(
-        &self,
-        transaction: &ConnectorReadTransactionHandle,
-    ) -> Result<dto::ConnectorTransactionHandle, ConnectorReadCodecError>;
-
-    fn decode_split(
-        &self,
-        split: &ValidatedConnectorSplit,
-    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError>;
-
-    fn encode_split(
-        &self,
-        split: &ConnectorReadSplit,
-    ) -> Result<dto::ConnectorSplit, ConnectorReadCodecError>;
-
-    fn decode_tuple_domain(
-        &self,
-        domain: &dto::TupleDomain,
-        path: FieldPath,
-    ) -> Result<TupleDomain<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
-        let validated = decode_tuple_domain(domain, path)
-            .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
-        let Some(domains) = validated.domains() else {
-            return Ok(TupleDomain::none());
-        };
-        let mut decoded = BTreeMap::new();
-        for (column, value) in domains {
-            decoded.insert(self.decode_column(column)?, value.clone());
-        }
-        TupleDomain::with_column_domains(decoded).map_err(|error| {
-            ConnectorReadCodecError::invalid(
-                self.owner(),
-                FieldPath::root("tuple_domain"),
-                error.to_string(),
-            )
-        })
-    }
-
-    fn decode_validated_tuple_domain(
-        &self,
-        domain: &TupleDomain<ValidatedColumnHandle>,
-    ) -> Result<TupleDomain<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
-        let Some(domains) = domain.domains() else {
-            return Ok(TupleDomain::none());
-        };
-        let mut decoded = BTreeMap::new();
-        for (column, value) in domains {
-            decoded.insert(self.decode_column(column)?, value.clone());
-        }
-        TupleDomain::with_column_domains(decoded).map_err(|error| {
-            ConnectorReadCodecError::invalid(
-                self.owner(),
-                FieldPath::root("tuple_domain"),
-                error.to_string(),
-            )
-        })
-    }
-
-    fn encode_tuple_domain(
-        &self,
-        domain: &TupleDomain<ConnectorReadColumnHandle>,
-        path: FieldPath,
-    ) -> Result<dto::TupleDomain, ConnectorReadCodecError> {
-        let Some(domains) = domain.domains() else {
-            return Ok(encode_tuple_domain(&TupleDomain::none()));
-        };
-        let mut validated = BTreeMap::new();
-        for (column, value) in domains {
-            let raw = self.encode_column(column)?;
-            let raw = ValidatedColumnHandle::parse(raw, path.clone().field("column"))
-                .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
-            validated.insert(raw, value.clone());
-        }
-        Ok(encode_tuple_domain(
-            &TupleDomain::with_column_domains(validated).map_err(|error| {
-                ConnectorReadCodecError::invalid(self.owner(), path, error.to_string())
-            })?,
-        ))
-    }
-
-    fn decode_assignment(
-        &self,
-        assignment: &dto::ScanAssignment,
-        path: FieldPath,
-    ) -> Result<Assignment<ConnectorReadColumnHandle>, ConnectorReadCodecError> {
-        let validated = super::ScanAssignment::parse(assignment.clone(), path.clone())
-            .map_err(|error| ConnectorReadCodecError::new(self.owner(), error))?;
-        Assignment::try_new(
-            validated.variable(),
-            self.decode_column(validated.column())?,
-            validated.value_type(),
-        )
-        .map_err(|error| ConnectorReadCodecError::invalid(self.owner(), path, error.to_string()))
-    }
-
-    fn encode_assignment(
-        &self,
-        assignment: &Assignment<ConnectorReadColumnHandle>,
-        _path: FieldPath,
-    ) -> Result<dto::ScanAssignment, ConnectorReadCodecError> {
-        Ok(dto::ScanAssignment {
-            variable: assignment.variable().to_owned(),
-            column: Some(self.encode_column(assignment.column())?),
-            value_type: Some(encode_value_type(assignment.value_type())),
-        })
-    }
-
-    fn decode_scheduled_split(
-        &self,
-        scheduled: &ScheduledSplit,
-    ) -> Result<DecodedScheduledReadSplit, ConnectorReadCodecError> {
-        Ok(DecodedScheduledReadSplit::new(
-            ReceivedScheduledSplit::from_scheduled(scheduled),
-            self.decode_split(scheduled.split())?,
-        ))
-    }
-
-    fn encode_scheduled_split(
-        &self,
-        sequence_id: u64,
-        plan_node_id: i32,
-        split: &ConnectorReadSplit,
-    ) -> Result<dto::ScheduledSplit, ConnectorReadCodecError> {
-        Ok(dto::ScheduledSplit {
-            sequence_id,
-            plan_node_id,
-            split: Some(self.encode_split(split)?),
-        })
-    }
-}
-
 /// Codec-only form of a frozen scan. Roles use this only at a protocol edge;
 /// after decoding they retain the SPI values rather than DTO-backed handles.
 #[derive(Clone, Debug)]
@@ -364,7 +320,7 @@ pub struct DecodedConnectorReadScan {
 
 impl DecodedConnectorReadScan {
     pub fn decode(
-        codec: &dyn ConnectorReadCodec,
+        codec: &dyn ConnectorReadDecoder,
         source: &ConnectorTableScanSource,
     ) -> Result<Self, ConnectorReadCodecError> {
         let relation = codec.decode_relation(source.table())?;

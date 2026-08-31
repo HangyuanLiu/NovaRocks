@@ -136,10 +136,9 @@ pub use domain_facts::{
 };
 pub use error::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
 pub use execution::{
-    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorExecutionResolver,
-    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
-    ConnectorPreparedScanUnitSet, ConnectorReadExecution,
-    MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
+    ConnectorExecutionBinding, ConnectorExecutionResolver, ConnectorPrepareSplitRequest,
+    ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet,
+    ConnectorReadExecution, MAX_CONNECTOR_PREPARED_SCAN_UNITS_PER_SPLIT,
 };
 pub use handle::{
     ConnectorPinnedFileSet, ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle,

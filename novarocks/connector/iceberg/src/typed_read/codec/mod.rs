@@ -26,8 +26,8 @@ use std::sync::Arc;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::encode_catalog_handle;
 use novarocks_proto_codec::connector_read::{
-    CatalogTableHandle, ConnectorReadCodec, ConnectorReadCodecError, ConnectorRelation,
-    ValidatedColumnHandle, ValidatedConnectorSplit, ValidatedTransactionHandle,
+    CatalogTableHandle, ConnectorReadCodecError, ConnectorReadDecoder, ConnectorReadEncoder,
+    ConnectorRelation, ValidatedColumnHandle, ValidatedConnectorSplit, ValidatedTransactionHandle,
 };
 use novarocks_proto_models::connector_read as dto;
 use novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime;
@@ -45,7 +45,7 @@ use super::{
 };
 
 #[derive(Clone)]
-pub struct IcebergConnectorReadCodec<P>
+pub struct IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
@@ -58,7 +58,7 @@ where
     owner: Arc<str>,
 }
 
-impl<P> IcebergConnectorReadCodec<P>
+impl<P> IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
@@ -75,7 +75,7 @@ where
     }
 
     fn invalid(&self, path: FieldPath, error: impl std::fmt::Display) -> ConnectorReadCodecError {
-        ConnectorReadCodecError::invalid(self.owner(), path, error.to_string())
+        ConnectorReadCodecError::invalid(&self.owner, path, error.to_string())
     }
 
     fn ensure_outer_relation(
@@ -123,7 +123,7 @@ where
     }
 }
 
-impl<P> ConnectorReadCodec for IcebergConnectorReadCodec<P>
+impl<P> ConnectorReadDecoder for IcebergConnectorReadWireAdapter<P>
 where
     P: ProviderReadRuntime<
             Table = IcebergRuntimeRelation,
@@ -182,6 +182,77 @@ where
             .map_err(|error| self.invalid(FieldPath::root("catalog_table_handle"), error))
     }
 
+    fn decode_column(
+        &self,
+        column: &ValidatedColumnHandle,
+    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError> {
+        let column = IcebergColumnHandle::from_column_handle_proto(column.as_proto())
+            .map_err(|error| self.invalid(FieldPath::root("column_handle"), error))?;
+        Ok(self.adapter.wrap_column(column))
+    }
+
+    fn decode_transaction(
+        &self,
+        transaction: &ValidatedTransactionHandle,
+    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError> {
+        Ok(self
+            .adapter
+            .wrap_transaction(self.decode_transaction_value(transaction.as_proto())?))
+    }
+
+    fn decode_split(
+        &self,
+        split: &ValidatedConnectorSplit,
+    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
+        let split = match split.category() {
+            novarocks_proto_codec::connector_read::SplitCategory::Data => IcebergReadSplit::Data(
+                IcebergTableHandleSplit::from_connector_split_proto(split.as_proto())
+                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
+            ),
+            novarocks_proto_codec::connector_read::SplitCategory::TableChanges => {
+                IcebergReadSplit::TableChanges(
+                    TableChangesSplit::from_connector_split_proto(split.as_proto())
+                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
+                )
+            }
+            novarocks_proto_codec::connector_read::SplitCategory::ChangeWindow => {
+                IcebergReadSplit::ChangeWindow(
+                    IcebergChangeSplit::from_connector_split_proto(split.as_proto())
+                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
+                )
+            }
+            novarocks_proto_codec::connector_read::SplitCategory::SystemFiles => {
+                IcebergReadSplit::SystemFiles(
+                    FilesTableSplit::from_connector_split_proto(split.as_proto())
+                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
+                )
+            }
+            novarocks_proto_codec::connector_read::SplitCategory::RewritePositionDeleteFiles => {
+                IcebergReadSplit::RewritePositionDeleteFiles(
+                    IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(
+                        split.as_proto(),
+                    )
+                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
+                )
+            }
+        };
+        Ok(self.adapter.wrap_split(split))
+    }
+}
+
+impl<P> ConnectorReadEncoder for IcebergConnectorReadWireAdapter<P>
+where
+    P: ProviderReadRuntime<
+            Table = IcebergRuntimeRelation,
+            Column = IcebergColumnHandle,
+            Transaction = HiveTransactionHandle,
+            Split = IcebergReadSplit,
+        >,
+{
+    fn owner(&self) -> &str {
+        &self.owner
+    }
+
     fn encode_relation(
         &self,
         relation: &ConnectorReadRelation,
@@ -227,15 +298,6 @@ where
         Ok(self.encode_outer_relation(transaction, raw))
     }
 
-    fn decode_column(
-        &self,
-        column: &ValidatedColumnHandle,
-    ) -> Result<ConnectorReadColumnHandle, ConnectorReadCodecError> {
-        let column = IcebergColumnHandle::from_column_handle_proto(column.as_proto())
-            .map_err(|error| self.invalid(FieldPath::root("column_handle"), error))?;
-        Ok(self.adapter.wrap_column(column))
-    }
-
     fn encode_column(
         &self,
         column: &ConnectorReadColumnHandle,
@@ -247,15 +309,6 @@ where
         Ok(column.to_column_handle_proto())
     }
 
-    fn decode_transaction(
-        &self,
-        transaction: &ValidatedTransactionHandle,
-    ) -> Result<ConnectorReadTransactionHandle, ConnectorReadCodecError> {
-        Ok(self
-            .adapter
-            .wrap_transaction(self.decode_transaction_value(transaction.as_proto())?))
-    }
-
     fn encode_transaction(
         &self,
         transaction: &ConnectorReadTransactionHandle,
@@ -265,45 +318,6 @@ where
             .transaction(transaction)
             .map_err(|error| self.invalid(FieldPath::root("transaction"), error))?;
         Ok(transaction.to_transaction_handle_proto())
-    }
-
-    fn decode_split(
-        &self,
-        split: &ValidatedConnectorSplit,
-    ) -> Result<ConnectorReadSplit, ConnectorReadCodecError> {
-        let split = match split.category() {
-            novarocks_proto_codec::connector_read::SplitCategory::Data => IcebergReadSplit::Data(
-                IcebergTableHandleSplit::from_connector_split_proto(split.as_proto())
-                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-            ),
-            novarocks_proto_codec::connector_read::SplitCategory::TableChanges => {
-                IcebergReadSplit::TableChanges(
-                    TableChangesSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::ChangeWindow => {
-                IcebergReadSplit::ChangeWindow(
-                    IcebergChangeSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::SystemFiles => {
-                IcebergReadSplit::SystemFiles(
-                    FilesTableSplit::from_connector_split_proto(split.as_proto())
-                        .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-            novarocks_proto_codec::connector_read::SplitCategory::RewritePositionDeleteFiles => {
-                IcebergReadSplit::RewritePositionDeleteFiles(
-                    IcebergRewritePositionDeleteFilesSplit::from_connector_split_proto(
-                        split.as_proto(),
-                    )
-                    .map_err(|error| self.invalid(FieldPath::root("connector_split"), error))?,
-                )
-            }
-        };
-        Ok(self.adapter.wrap_split(split))
     }
 
     fn encode_split(

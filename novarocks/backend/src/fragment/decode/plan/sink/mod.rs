@@ -382,7 +382,7 @@ fn decode_connector_write_sink_program(
             .append_field("writer")
             .append_field("catalog_handle")
         })?;
-    let execution = write_execution.execution();
+    let execution = write_execution.write();
     let root_schema = context
         .decode_output_layout(
             &fragment.output_columns,

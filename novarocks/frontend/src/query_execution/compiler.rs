@@ -116,9 +116,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>;
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost>;
     fn catalog_application(
         &self,
     ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
@@ -133,10 +131,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
-    {
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
@@ -165,10 +160,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(
-        &self,
-    ) -> &std::sync::Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>
-    {
+    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
@@ -197,57 +189,14 @@ pub(crate) struct TestConnectorControlRegistry {
             Arc<novarocks_spi::connector::ConnectorControlBinding>,
         >,
     >,
-    factories: std::collections::HashMap<
-        novarocks_spi::connector::ConnectorProviderId,
-        Arc<dyn novarocks_spi::connector::ConnectorControlFactory>,
-    >,
 }
 
 #[cfg(test)]
 impl Default for TestConnectorControlRegistry {
     fn default() -> Self {
-        let factory: Arc<dyn novarocks_spi::connector::ConnectorControlFactory> =
-            Arc::new(TestConnectorControlFactory);
         Self {
             active: std::sync::Mutex::new(std::collections::HashMap::new()),
-            factories: std::collections::HashMap::from([(factory.provider_id().clone(), factory)]),
         }
-    }
-}
-
-#[cfg(test)]
-struct TestConnectorControlFactory;
-
-#[cfg(test)]
-impl novarocks_spi::connector::ConnectorControlFactory for TestConnectorControlFactory {
-    fn provider_id(&self) -> &novarocks_spi::connector::ConnectorProviderId {
-        static PROVIDER_ID: std::sync::OnceLock<novarocks_spi::connector::ConnectorProviderId> =
-            std::sync::OnceLock::new();
-        PROVIDER_ID.get_or_init(|| {
-            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                .expect("test provider ID")
-        })
-    }
-
-    fn create_control(
-        &self,
-        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorControlCreation,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let durable_properties = request.properties().to_vec();
-        let binding = crate::connector::scan_model::planned_files_fixture_binding_for_provider(
-            request.provider_id().clone(),
-            request.instance_id().as_str(),
-            std::collections::HashMap::new(),
-            None,
-        );
-        novarocks_spi::connector::ConnectorControlCreation::try_new(
-            &request,
-            binding,
-            durable_properties,
-        )
     }
 }
 
@@ -894,25 +843,6 @@ impl novarocks_spi::connector::ConnectorControlRegistry for TestConnectorControl
 }
 
 #[cfg(test)]
-impl novarocks_spi::connector::ConnectorControlFactoryResolver for TestConnectorControlRegistry {
-    fn create_control(
-        &self,
-        request: novarocks_spi::connector::ConnectorControlFactoryRequest,
-    ) -> Result<
-        novarocks_spi::connector::ConnectorControlCreation,
-        novarocks_spi::connector::ConnectorError,
-    > {
-        let factory = self.factories.get(request.provider_id()).ok_or_else(|| {
-            novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::NotFound,
-                "test connector control factory is not installed",
-            )
-        })?;
-        factory.create_control(request)
-    }
-}
-
-#[cfg(test)]
 struct RejectingTestDistributedQueryCoordinator;
 
 #[cfg(test)]
@@ -1468,9 +1398,7 @@ fn optimizer_settings_for_execution(
 /// The typed control registry is the composition root's single instance, so
 /// planning resolves exactly the generation the control factory installed.
 pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
@@ -2073,9 +2001,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// the resulting writer/cohort map for application-owned operation fencing.
 pub(crate) fn prepare_dml_change_stream_write_with_execution(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
@@ -2107,9 +2033,7 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 /// sealed plan with the exact admitted bindings and connector write template.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<
-        crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-    >,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,

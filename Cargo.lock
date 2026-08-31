@@ -3159,6 +3159,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-native-trust",
@@ -3207,6 +3208,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-binding"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "novarocks-proto-codec",
+ "novarocks-spi",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
@@ -3218,9 +3228,11 @@ dependencies = [
  "chrono",
  "crc32fast",
  "datasketches",
+ "futures",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
+ "novarocks-connector-binding",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3249,6 +3261,8 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "futures",
+ "novarocks-connector-binding",
  "novarocks-spi",
  "reqwest",
  "serde",
@@ -3321,6 +3335,7 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common 0.32.4",
+ "novarocks-connector-binding",
  "novarocks-connector-starrocks",
  "novarocks-execution",
  "novarocks-failpoint",
@@ -3449,6 +3464,7 @@ dependencies = [
  "libc",
  "mysql",
  "novarocks-backend",
+ "novarocks-connector-binding",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
  "novarocks-execution",

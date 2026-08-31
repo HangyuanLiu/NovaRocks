@@ -2680,9 +2680,18 @@ fn frontend_query_lifecycle_terminal_replacement_is_frontend_liveness() {
     let replacement = live_backend(1, "127.0.0.1:18001".parse().unwrap());
     let topology = BackendTopologySnapshot::try_new(2, vec![replacement])
         .expect("replacement topology snapshot");
-    let finalize_config = config()
-        .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
-        .expect("terminal timeouts");
+    // This test isolates terminal replacement classification. Its recording
+    // sessions deliberately do not emit heartbeat acks, so keep the unrelated
+    // heartbeat watchdog outside the short terminal-delivery window.
+    let finalize_config = FrontendQueryLifecycleConfig::new(
+        Duration::from_secs(1),
+        Duration::from_secs(3),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+    )
+    .expect("lifecycle config")
+    .with_terminal_timeouts(Duration::from_millis(20), Duration::from_millis(20))
+    .expect("terminal timeouts");
     let barrier = FrontendQueryLifecycleBarrier::new(
         Arc::new(transport),
         Arc::clone(&registry),

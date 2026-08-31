@@ -25,6 +25,7 @@ hex = "0.4"
 libc = "0.2"
 novarocks-fs = { path = "../fs" }
 novarocks-execution = { path = "../execution" }
+novarocks-connector-binding = { path = "../connector-binding" }
 novarocks-failpoint = { path = "../failpoint" }
 novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto-codec = { path = "../proto-codec" }

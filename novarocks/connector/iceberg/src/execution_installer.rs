@@ -24,10 +24,9 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProviderKind, CatalogRuntime,
     CatalogRuntimeMaterializer, ConnectorBatchReader, ConnectorError, ConnectorErrorKind,
-    ConnectorExecutionBinding, ConnectorExecutionInstaller, ConnectorInstanceId,
-    ConnectorOpenReaderRequest, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderBindingKind, ConnectorProviderId,
+    ConnectorExecutionBinding, ConnectorInstanceId, ConnectorOpenReaderRequest,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderBindingKey, ConnectorProviderId,
     ConnectorReadExecution, ConnectorRequestContext, ConnectorScanUnitDomainFacts, ConnectorSplit,
 };
 
@@ -43,17 +42,16 @@ use crate::file_reader::execution_payload::{
     validate_split_payload,
 };
 use crate::metadata_batch_reader::open_metadata_connector_reader;
-use crate::provider_binding::prepare_iceberg_execution_binding;
 use crate::resources::IcebergExecutionResources;
 
 const PROVIDER_ID: &str = "iceberg";
 
-/// Startup-composed installer for exact Iceberg BE execution generations.
+/// Startup-composed local factory for exact Iceberg BE execution generations.
 ///
 /// Its declaration selects only a named, startup-provided access binding;
 /// cloud properties, catalog handles and runtimes are never carried over the
 /// FE/BE wire.
-pub struct IcebergConnectorInstaller {
+pub struct IcebergExecutionBindingFactory {
     provider_id: ConnectorProviderId,
     resources: IcebergExecutionResources,
 }
@@ -115,7 +113,7 @@ impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
     }
 }
 
-impl IcebergConnectorInstaller {
+impl IcebergExecutionBindingFactory {
     pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
             provider_id: ConnectorProviderId::parse(PROVIDER_ID)
@@ -123,33 +121,35 @@ impl IcebergConnectorInstaller {
             resources,
         }
     }
-}
 
-impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
-    fn provider_kind(&self) -> ConnectorProviderBindingKind {
-        ConnectorProviderBindingKind::Iceberg
-    }
-
-    fn install(
+    /// Build generic execution facets for one exact catalog definition without
+    /// consulting a request or opening a remote client.
+    pub(crate) fn bind_for_catalog_properties(
         &self,
-        declaration: &ConnectorProviderBinding,
-        _context: &ConnectorRequestContext,
+        properties: &CatalogProperties,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        // Validate the legacy provider declaration's kind only. Production NID
-        // execution binds the role-local template from its immutable
-        // `CatalogProperties`; the old opaque access-binding label has no
-        // credential authority and must not select a BE configuration.
-        let _ = prepare_iceberg_execution_binding(declaration)?;
-        let key = declaration.binding_key().clone();
+        if properties.provider_kind() != CatalogProviderKind::Iceberg {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg execution binding received another provider kind",
+            ));
+        }
+        let mut incarnation = [0_u8; 16];
+        incarnation.copy_from_slice(&properties.handle().version().as_bytes()[..16]);
+        let key = ConnectorProviderBindingKey {
+            instance_id: properties.handle().catalog_name().clone(),
+            incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes(incarnation),
+        };
+        let binding = self.resources.binding().bind_catalog(properties)?;
         ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),
             key.clone(),
             Some(Arc::new(IcebergReadOnlyConnectorInstance {
                 key: key.clone(),
-                binding: self.resources.binding().clone(),
+                binding: binding.clone(),
             })),
             Some(Arc::new(IcebergDataWriteExecution::new(
-                self.resources.binding().clone(),
+                binding,
                 self.resources.runtime().clone(),
             ))),
         )

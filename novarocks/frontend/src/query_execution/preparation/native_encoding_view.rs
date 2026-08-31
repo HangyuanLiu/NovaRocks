@@ -230,7 +230,7 @@ impl<'a> NativeConnectorReadView<'a> {
     /// handle.
     pub fn table_scan_source(self) -> Result<ConnectorTableScanSource, String> {
         let node = &self.scan.prepared.table_scan;
-        let codec = self.scan.prepared.codec.as_ref();
+        let codec = self.scan.prepared.encoder.as_ref();
         let source = node.source();
         let assignments = source
             .assignments()

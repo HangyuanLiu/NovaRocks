@@ -24,8 +24,8 @@ use tokio::runtime::Handle;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
+use novarocks_connector_binding::ConnectorControlRoleBindingFactory;
 use novarocks_native_trust::NativeTrust;
-use novarocks_spi::connector::ConnectorControlFactory;
 use novarocks_spi::state_store::{StateStore, StateStoreProviderId};
 use novarocks_types::NativeCompatibilityId;
 
@@ -34,6 +34,7 @@ use crate::catalog_application::desired_state::{
 };
 use crate::catalog_application::{
     CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, FrontendCatalogApplicationPort,
+    frontend_port::CatalogMaterializationConfig,
 };
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
@@ -139,12 +140,6 @@ impl std::error::Error for FrontendApplicationError {}
 
 pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
-    /// Coordinator-side typed connector controls, keyed by the exact binding
-    /// generation. The composition root hands in the same instance its control
-    /// factories install into, so planning and installation never disagree
-    /// about which generation exists.
-    typed_connector_control:
-        Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
     statistics_service: Option<Arc<FrontendStatisticsService>>,
@@ -234,6 +229,7 @@ pub struct FrontendExecutionConfig {
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     catalog_projection: CatalogProjectionConfig,
+    catalog_materialization: CatalogMaterializationConfig,
     catalog_prune: CatalogPruneConfig,
     /// The deployment's catalog desired-state authority, selected and validated
     /// once before this application opens any runtime resource.
@@ -272,6 +268,7 @@ impl FrontendExecutionConfig {
             )
             .expect("default lake publication policy is safe"),
             catalog_projection: CatalogProjectionConfig::default(),
+            catalog_materialization: CatalogMaterializationConfig::default(),
             catalog_prune: CatalogPruneConfig::try_new(
                 Duration::from_secs(30),
                 Duration::from_secs(5),
@@ -349,6 +346,14 @@ impl FrontendExecutionConfig {
         self
     }
 
+    pub fn with_catalog_materialization_config(
+        mut self,
+        config: CatalogMaterializationConfig,
+    ) -> Self {
+        self.catalog_materialization = config;
+        self
+    }
+
     pub fn with_catalog_prune_config(mut self, config: CatalogPruneConfig) -> Self {
         self.catalog_prune = config;
         self
@@ -377,8 +382,9 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        Self::open_with_factories(
+        Self::open_with_role_factories_and_state_store_registry(
             state_store,
+            &StateStoreProviderRegistry::new(),
             execution,
             backend,
             Vec::new(),
@@ -389,26 +395,33 @@ impl FrontendApplicationHost {
         .await
     }
 
-    pub async fn open_with_factories(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_with_role_factories_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
+        state_store_registry: &StateStoreProviderRegistry,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
-        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
+        connector_role_factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
         data_runtime: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        let registry = StateStoreProviderRegistry::new();
-        Self::open_with_factories_and_state_store_registry(
+        let connector_control = Arc::new(
+            ConnectorControlHost::with_role_factories(connector_role_factories).map_err(
+                |error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::ConnectorControlHost,
+                        error,
+                    )
+                },
+            )?,
+        );
+        Self::open_with_connector_control_host_and_state_store_registry(
             state_store,
-            &registry,
+            state_store_registry,
             execution,
             backend,
-            connector_factories,
-            // No composition root supplied one, so this host owns a private,
-            // empty registry: a typed scan then fails to resolve rather than
-            // reaching some other host's generation.
-            Arc::new(crate::connector::typed_control_registry::ConnectorReadControlRegistry::new()),
+            connector_control,
             data_runtime,
             native_trust,
             native_transport,
@@ -416,19 +429,13 @@ impl FrontendApplicationHost {
         .await
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Server composition deliberately supplies StateStore, role execution, and immutable Native trust capabilities independently."
-    )]
-    pub async fn open_with_factories_and_state_store_registry(
+    #[allow(clippy::too_many_arguments)]
+    async fn open_with_connector_control_host_and_state_store_registry(
         state_store: Option<StateStoreHostInput>,
         state_store_registry: &StateStoreProviderRegistry,
         execution: FrontendExecutionConfig,
         backend: ClusterBackendOpenConfig,
-        connector_factories: Vec<Arc<dyn ConnectorControlFactory>>,
-        typed_connector_control: Arc<
-            crate::connector::typed_control_registry::ConnectorReadControlRegistry,
-        >,
+        connector_control: Arc<ConnectorControlHost>,
         data_runtime: Handle,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
@@ -456,15 +463,7 @@ impl FrontendApplicationHost {
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
-            connector_control: Arc::new(
-                ConnectorControlHost::with_factories(connector_factories).map_err(|error| {
-                    FrontendApplicationError::new(
-                        FrontendApplicationErrorKind::ConnectorControlHost,
-                        error,
-                    )
-                })?,
-            ),
-            typed_connector_control,
+            connector_control,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
             statistics_service: None,
@@ -538,12 +537,15 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-        host.catalog_application_port = Some(Arc::new(FrontendCatalogApplicationPort::new(
-            catalog_source,
-            Arc::clone(&host.connector_control),
-            host.catalog_runtime_projection.publisher(),
-            tokio::runtime::Handle::current(),
-        )));
+        host.catalog_application_port = Some(Arc::new(
+            FrontendCatalogApplicationPort::new_with_materialization_config(
+                catalog_source,
+                Arc::clone(&host.connector_control),
+                host.catalog_runtime_projection.publisher(),
+                tokio::runtime::Handle::current(),
+                execution.catalog_materialization,
+            ),
+        ));
         if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore {
             let store = host
                 .state_store()
@@ -925,22 +927,10 @@ impl FrontendApplicationHost {
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
     }
 
-    /// The typed connector control registry this host was composed with.
-    ///
-    /// It is a constructor-supplied capability, not something a request may
-    /// resolve from the host: query preparation receives it once, when the
-    /// session factory is built.
-    pub fn typed_connector_control(
-        &self,
-    ) -> Arc<crate::connector::typed_control_registry::ConnectorReadControlRegistry> {
-        Arc::clone(&self.typed_connector_control)
-    }
-
-    pub fn connector_control_factory_resolver(
-        &self,
-    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver> {
+    /// Typed-read planning is carried by the same complete control host
+    /// generation as generic planning. There is no parallel registry.
+    pub fn typed_connector_control(&self) -> Arc<ConnectorControlHost> {
         Arc::clone(&self.connector_control)
-            as Arc<dyn novarocks_spi::connector::ConnectorControlFactoryResolver>
     }
 
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
@@ -1351,7 +1341,7 @@ mod tests {
             Duration::from_secs(1),
         )
         .expect("valid frontend backend config");
-        let host = FrontendApplicationHost::open_with_factories_and_state_store_registry(
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
             Some(state_store),
             &registry,
             FrontendExecutionConfig::new(
@@ -1362,9 +1352,6 @@ mod tests {
             ),
             backend,
             Vec::new(),
-            std::sync::Arc::new(
-                crate::connector::typed_control_registry::ConnectorReadControlRegistry::new(),
-            ),
             tokio::runtime::Handle::current(),
             test_native_trust(),
             FrontendNativeTransport::plaintext(),

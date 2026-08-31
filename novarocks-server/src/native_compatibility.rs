@@ -73,8 +73,8 @@ fn validate_declared_provider_kinds(
 #[cfg(test)]
 mod tests {
     use super::{native_carrier_declarations, resolve_native_compatibility_material};
-    use crate::composition::compose_backend_execution_installers;
-    use novarocks_spi::connector::ConnectorProviderBindingKind;
+    use crate::composition::compose_backend_execution_role_binding_factories;
+    use novarocks_spi::connector::{CatalogProviderKind, ConnectorProviderBindingKind};
 
     #[test]
     fn static_manifest_matches_the_closed_provider_enum_and_backend_installers() {
@@ -97,15 +97,16 @@ mod tests {
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let config = crate::app_config::NovaRocksConfig::default();
-        let installers = compose_backend_execution_installers(&config, runtime.handle().clone())
-            .expect("backend installers");
-        let installer_kinds = installers
+        let factories =
+            compose_backend_execution_role_binding_factories(&config, runtime.handle().clone())
+                .expect("backend factories");
+        let factory_kinds = factories
             .iter()
-            .map(|installer| installer.provider_kind())
+            .map(|factory| factory.provider_kind())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            installer_kinds,
-            ConnectorProviderBindingKind::ALL.into_iter().collect()
+            factory_kinds,
+            CatalogProviderKind::ALL.into_iter().collect()
         );
     }
 

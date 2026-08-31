@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::UniqueId;
 
-use novarocks_proto_codec::connector_read::ConnectorReadCodec;
+use novarocks_proto_codec::connector_read::ConnectorReadEncoder;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadDynamicFilterSnapshot, ConnectorReadSplitSource,
 };
@@ -279,7 +279,7 @@ pub(crate) struct SplitAssignmentDriver {
     /// Splits the backends reported as still queued, above which the driver
     /// stops pulling new batches.
     max_queued_splits_per_task: u64,
-    codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
+    encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadEncoder>>,
     retry_policy: TaskUpdateRetryPolicy,
     stop: SplitAssignmentStop,
 }
@@ -290,7 +290,7 @@ impl SplitAssignmentDriver {
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
         tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
-        codecs: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadCodec>>,
+        encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadEncoder>>,
         retry_policy: TaskUpdateRetryPolicy,
         stop: SplitAssignmentStop,
     ) -> Self {
@@ -321,7 +321,7 @@ impl SplitAssignmentDriver {
             sources,
             closed: false,
             max_queued_splits_per_task,
-            codecs,
+            encoders,
             retry_policy,
             stop,
         }
@@ -471,10 +471,10 @@ impl SplitAssignmentDriver {
                     plan_node_id,
                     splits,
                     no_more_splits,
-                    self.codecs.get(&plan_node_id).cloned().ok_or_else(|| {
+                    self.encoders.get(&plan_node_id).cloned().ok_or_else(|| {
                         SplitAssignmentDriverError::SplitSource {
                             plan_node_id,
-                            detail: "missing exact connector read codec".to_owned(),
+                            detail: "missing exact connector read encoder".to_owned(),
                         }
                     })?,
                 )?;

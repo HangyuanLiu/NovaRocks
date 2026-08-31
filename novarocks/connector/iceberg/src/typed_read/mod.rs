@@ -62,7 +62,7 @@ pub use change_window_page_source::{
     IcebergChangeWindowPageSource, IcebergChangeWindowPageSourceRequest,
     create_iceberg_change_window_page_source,
 };
-pub use codec::IcebergConnectorReadCodec;
+pub use codec::IcebergConnectorReadWireAdapter;
 pub use column_handle::{
     ColumnIdentity, ColumnIdentityCategory, IcebergColumnHandle, IcebergColumnHandleParams,
     decode_tuple_domain, encode_tuple_domain,
