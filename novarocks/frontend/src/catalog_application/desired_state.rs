@@ -1051,12 +1051,15 @@ mod tests {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
             display_name: "analytics".to_string(),
             durable_properties: properties,
+            credential_bindings: Vec::new(),
             created_at_ms: 1,
         };
         let mut later_attachment = attachment.clone();
         later_attachment.created_at_ms = 2;
-        let first_entry = CatalogDesiredStateEntry::from_attachment(&attachment);
-        let later_entry = CatalogDesiredStateEntry::from_attachment(&later_attachment);
+        let first_entry =
+            CatalogDesiredStateEntry::from_attachment(&attachment).expect("valid attachment");
+        let later_entry =
+            CatalogDesiredStateEntry::from_attachment(&later_attachment).expect("valid attachment");
         assert_eq!(
             first_entry
                 .catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)

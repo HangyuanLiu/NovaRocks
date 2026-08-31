@@ -1256,12 +1256,11 @@ impl Scenario for VendedRestRefreshPem {
             .ready
             .recv_timeout(context.remaining("receive vended refresh read connection id")?)
             .context("vended refresh read terminated before publishing its connection id")?;
-        let reader_logs = wait_for_open_reader_on_every_backend(
+        wait_for_in_flight_reader_on_every_backend(
             context,
             CATALOG,
             "observe the short-TTL vended read on every Backend",
         )?;
-        assert_readers_are_in_flight(&reader_logs, "before vended credential refresh")?;
 
         context.action("wait for the FE-owned vended credential refresh response");
         let _first_refresh = self.wait_for_refresh(context, refresh_baseline.refreshes)?;
@@ -1285,12 +1284,11 @@ impl Scenario for VendedRestRefreshPem {
                 "one vended attempt must observe one metadata response and execute one refresh; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, expected_refreshes={expected_refreshes}, observed={settled_audit:?}"
             )
         });
-        let reader_logs = wait_for_open_reader_on_every_backend(
+        wait_for_in_flight_reader_on_every_backend(
             context,
             CATALOG,
             "verify every Backend continues the same vended read after refresh",
         )?;
-        assert_readers_are_in_flight(&reader_logs, "after vended credential refresh")?;
         if let Ok(result) = target.done.try_recv() {
             bail!(
                 "vended read terminated after refresh instead of continuing across the 3-BE epoch commit: {result:?}"
