@@ -51,6 +51,8 @@ pub struct SessionExecutionSettings {
     group_concat_max_len: i64,
     pipeline_dop: Option<i32>,
     enable_parquet_reader_page_index: bool,
+    enable_scan_datacache: bool,
+    enable_populate_datacache: bool,
     runtime_filter_scan_wait_time_ms: Option<i64>,
     runtime_filter_wait_timeout_ms: Option<i32>,
 }
@@ -62,6 +64,8 @@ impl Default for SessionExecutionSettings {
             group_concat_max_len: 1024,
             pipeline_dop: None,
             enable_parquet_reader_page_index: false,
+            enable_scan_datacache: false,
+            enable_populate_datacache: false,
             runtime_filter_scan_wait_time_ms: None,
             runtime_filter_wait_timeout_ms: None,
         }
@@ -89,6 +93,14 @@ impl SessionExecutionSettings {
 
     pub fn set_enable_parquet_reader_page_index(&mut self, enabled: bool) {
         self.enable_parquet_reader_page_index = enabled;
+    }
+
+    pub fn set_enable_scan_datacache(&mut self, enabled: bool) {
+        self.enable_scan_datacache = enabled;
+    }
+
+    pub fn set_enable_populate_datacache(&mut self, enabled: bool) {
+        self.enable_populate_datacache = enabled;
     }
 
     pub fn set_runtime_filter_scan_wait_time_ms(
@@ -130,6 +142,8 @@ impl SessionExecutionSettings {
             runtime_filter_scan_wait_time_ms: self.runtime_filter_scan_wait_time_ms,
             runtime_filter_wait_timeout_ms: self.runtime_filter_wait_timeout_ms,
             enable_parquet_reader_page_index: self.enable_parquet_reader_page_index,
+            enable_scan_datacache: self.enable_scan_datacache,
+            enable_populate_datacache: self.enable_populate_datacache,
             ..Default::default()
         })
         // Session settings never enable spilling, so the Protocol validation
@@ -362,5 +376,25 @@ mod tests {
                 .as_proto()
                 .enable_parquet_reader_page_index
         );
+    }
+
+    #[test]
+    fn execution_settings_projects_external_datacache_switches() {
+        let mut settings = SessionExecutionSettings::default();
+        let initial = settings.query_options();
+        assert!(!initial.as_proto().enable_scan_datacache);
+        assert!(!initial.as_proto().enable_populate_datacache);
+
+        settings.set_enable_scan_datacache(true);
+        settings.set_enable_populate_datacache(true);
+        let enabled = settings.query_options();
+        assert!(enabled.as_proto().enable_scan_datacache);
+        assert!(enabled.as_proto().enable_populate_datacache);
+
+        settings.set_enable_scan_datacache(false);
+        settings.set_enable_populate_datacache(false);
+        let disabled = settings.query_options();
+        assert!(!disabled.as_proto().enable_scan_datacache);
+        assert!(!disabled.as_proto().enable_populate_datacache);
     }
 }

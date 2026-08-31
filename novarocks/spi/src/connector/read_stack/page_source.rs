@@ -259,9 +259,51 @@ impl PageSourceFileMetrics {
 /// provider. It is separate from the provider's generation-scoped resources:
 /// two queries using the same installed connector generation may choose
 /// different physical reader behavior.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectorPageSourceProviderOptions {
     pub enable_parquet_reader_page_index: bool,
+    /// Frozen query policy for external file reads. The connector maps these
+    /// neutral values to its local cache implementation without accepting
+    /// cache state or credentials from the coordinator.
+    pub data_cache: ConnectorDataCacheOptions,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorDataCacheOptions {
+    pub enable_scan_datacache: bool,
+    pub enable_populate_datacache: bool,
+    pub enable_datacache_async_populate_mode: bool,
+    pub enable_datacache_io_adaptor: bool,
+    pub enable_cache_select: bool,
+    pub datacache_evict_probability: i32,
+    pub datacache_priority: i32,
+    pub datacache_ttl_seconds: i64,
+    pub datacache_sharing_work_period: Option<i64>,
+}
+
+impl Default for ConnectorDataCacheOptions {
+    fn default() -> Self {
+        Self {
+            enable_scan_datacache: false,
+            enable_populate_datacache: false,
+            enable_datacache_async_populate_mode: false,
+            enable_datacache_io_adaptor: false,
+            enable_cache_select: false,
+            datacache_evict_probability: 100,
+            datacache_priority: 0,
+            datacache_ttl_seconds: 0,
+            datacache_sharing_work_period: None,
+        }
+    }
+}
+
+impl Default for ConnectorPageSourceProviderOptions {
+    fn default() -> Self {
+        Self {
+            enable_parquet_reader_page_index: false,
+            data_cache: ConnectorDataCacheOptions::default(),
+        }
+    }
 }
 
 /// A connector reader bound to exactly one split.

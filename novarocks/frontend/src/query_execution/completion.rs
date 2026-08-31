@@ -504,6 +504,8 @@ const RUNTIME_FILTER_SCAN_UNIT_COUNTER_NAMES: &[&str] = &[
     "RuntimeFilterScanUnitsNotEvaluatedSnapshotNotPublished",
 ];
 const CONNECTOR_FILE_COUNTER_NAMES: &[&str] = &[
+    "ConnectorFileCacheHits",
+    "ConnectorFileCacheMisses",
     "ConnectorFileRowGroupsRead",
     "ConnectorFileRowGroupsPruned",
     "ConnectorUnitReadersOpened",
@@ -562,10 +564,12 @@ fn format_explain_analyze_duration(duration: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn connector_file_summary_includes_page_index_effect_counters() {
+    fn connector_file_summary_includes_cache_and_page_index_effect_counters() {
         assert_eq!(
             super::CONNECTOR_FILE_COUNTER_NAMES,
             [
+                "ConnectorFileCacheHits",
+                "ConnectorFileCacheMisses",
                 "ConnectorFileRowGroupsRead",
                 "ConnectorFileRowGroupsPruned",
                 "ConnectorUnitReadersOpened",

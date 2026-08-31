@@ -50,8 +50,8 @@ pub use handle::{
     MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
 };
 pub use page_source::{
-    ConnectorPageSource, ConnectorPageSourceProviderOptions, LazyBlockLoader,
-    PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+    ConnectorDataCacheOptions, ConnectorPageSource, ConnectorPageSourceProviderOptions,
+    LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics, SourcePage,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

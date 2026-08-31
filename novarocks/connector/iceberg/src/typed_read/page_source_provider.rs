@@ -29,7 +29,9 @@
 
 use std::sync::Arc;
 
-use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
+use novarocks_fs::{
+    CacheOptions, DataCacheContext, FileReadBudget, FileReadContext, FileReaderOptions,
+};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession, DynamicFilter};
 
@@ -51,11 +53,14 @@ use super::table_execute::{IcebergTableExecuteHandle, IcebergTableExecuteProcedu
 use super::{IcebergReadSplit, IcebergRuntimeRelation};
 
 /// Reader policy the fragment instance chose, not something a split carries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct IcebergPageSourceProviderOptions {
     /// The row and byte budget of one produced page.
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
+    /// Query-scoped external cache policy, converted from the neutral SPI
+    /// policy at the connector boundary.
+    pub cache_options: CacheOptions,
 }
 
 impl IcebergPageSourceProviderOptions {
@@ -69,7 +74,22 @@ impl IcebergPageSourceProviderOptions {
                 max_bytes: std::num::NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
             },
             reader_options: FileReaderOptions::default(),
+            cache_options: disabled_external_cache_options(),
         }
+    }
+}
+
+pub(crate) fn disabled_external_cache_options() -> CacheOptions {
+    CacheOptions {
+        enable_scan_datacache: false,
+        enable_populate_datacache: false,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
     }
 }
 
@@ -160,6 +180,9 @@ where
                     footers: Arc::clone(&self.footers),
                     access_binding: self.access_binding.clone(),
                     context: self.context.clone(),
+                    cache: Some(DataCacheContext::external(
+                        self.options.cache_options.clone(),
+                    )),
                     budget: self.options.budget,
                     reader_options: self.options.reader_options,
                     scheduled_split_sequence_id,
@@ -199,6 +222,9 @@ where
             footers: Arc::clone(&self.footers),
             access_binding: self.access_binding.clone(),
             context: self.context.clone(),
+            cache: Some(DataCacheContext::external(
+                self.options.cache_options.clone(),
+            )),
             budget: self.options.budget,
             reader_options: self.options.reader_options,
             scheduled_split_sequence_id,
@@ -259,6 +285,7 @@ mod tests {
                     max_bytes: NonZeroUsize::new(1024 * 1024).expect("nonzero"),
                 },
                 reader_options: FileReaderOptions::default(),
+                cache_options: disabled_external_cache_options(),
             },
         );
 

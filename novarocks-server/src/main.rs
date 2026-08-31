@@ -108,6 +108,7 @@ fn run_backend(
     native_compatibility_id: NativeCompatibilityId,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
+    initialize_backend_file_caches(&role.config);
     let backend = composition::compose_backend_server_config(
         &role.config,
         &role.native_trust,
@@ -142,6 +143,7 @@ async fn run_all_in_one(
     native_compatibility_id: NativeCompatibilityId,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
+    initialize_backend_file_caches(&be.config);
     let frontend = composition::compose_frontend_server_config(
         &fe.config,
         &fe.native_trust,
@@ -189,6 +191,26 @@ async fn run_all_in_one(
         termination_signal(),
     )
     .await
+}
+
+/// Initialize the BE-local file caches before the first connector reader can
+/// create a query-scoped cache context. FE does not own these process-local
+/// execution resources.
+fn initialize_backend_file_caches(config: &NovaRocksConfig) {
+    let cache = &config.runtime.cache;
+    if cache.page_cache_enable {
+        let _ = novarocks_fs::DataCacheManager::instance().init_page_cache(
+            novarocks_fs::DataCachePageCacheOptions {
+                capacity: cache.page_cache_capacity,
+                evict_probability: cache.page_cache_evict_probability,
+            },
+        );
+    }
+    let _ = novarocks_fs::init_parquet_cache(novarocks_fs::ParquetCacheOptions {
+        enable_metadata: cache.parquet_meta_cache_enable,
+        metadata_ttl: std::time::Duration::from_secs(cache.parquet_meta_cache_ttl_seconds),
+        enable_page: cache.parquet_page_cache_enable,
+    });
 }
 
 fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {

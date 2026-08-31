@@ -760,6 +760,7 @@ pub struct IcebergPageSourceRequest<'a> {
     pub footers: Arc<ParquetFooterCache>,
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
+    pub cache: Option<novarocks_fs::DataCacheContext>,
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     /// Names this split within its task attempt; the only scheduling identity.
@@ -839,6 +840,7 @@ pub fn create_iceberg_page_source(
         effective_predicate,
         access_binding: request.access_binding,
         context: request.context,
+        cache: request.cache,
         footers: request.footers,
         budget: request.budget,
         reader_options: request.reader_options,
@@ -1182,6 +1184,7 @@ pub struct IcebergParquetPageSource {
     effective_predicate: TupleDomain<IcebergColumnHandle>,
     access_binding: IcebergReadBinding,
     context: FileReadContext,
+    cache: Option<novarocks_fs::DataCacheContext>,
     footers: Arc<ParquetFooterCache>,
     budget: FileReadBudget,
     reader_options: FileReaderOptions,
@@ -1495,7 +1498,7 @@ impl IcebergParquetPageSource {
                 pages: Vec::new(),
             },
             options: self.reader_options,
-            cache: None,
+            cache: self.cache.clone(),
             context: self.context.clone(),
         })
         .map_err(map_file_error)
@@ -2350,6 +2353,7 @@ mod tests {
                 footers: Arc::clone(&self.footers),
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
+                cache: None,
                 budget: FileReadBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero"),
                     max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),
@@ -2536,6 +2540,7 @@ mod tests {
                 footers: Arc::clone(&self.footers),
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
+                cache: None,
                 budget: FileReadBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero"),
                     max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),

@@ -1585,6 +1585,15 @@ impl Scenario for AccessDomainCacheIsolation {
             port,
             context.remaining("connect access-domain cache control session")?,
         )?;
+        // Cache policy is a query-scoped FE-to-BE contract. The process-level
+        // cache service configured by this scenario is intentionally inert
+        // until the client opts this session into both reads and population.
+        control
+            .query_drop("SET enable_scan_datacache = true")
+            .context("enable cache reads for access-domain isolation")?;
+        control
+            .query_drop("SET enable_populate_datacache = true")
+            .context("enable cache population for access-domain isolation")?;
 
         run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
         await_resource_convergence(context, &baseline, "access-domain cache isolation")?;

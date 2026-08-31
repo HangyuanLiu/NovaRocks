@@ -259,6 +259,16 @@ fn typed_scan_runtime_inputs(
             error.to_string(),
         )
     })?;
+    let cache = novarocks_execution::runtime::cache::ExecutionCacheOptions::from_query_options(
+        ctx.query_options(),
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "query_options",
+            error,
+        )
+    })?;
     Ok(TypedScanRuntimeInputs {
         catalog_read_execution: Arc::new({
             let runtime = runtime.clone();
@@ -271,6 +281,17 @@ fn typed_scan_runtime_inputs(
             enable_parquet_reader_page_index: ctx
                 .query_options()
                 .is_some_and(|options| options.enable_parquet_reader_page_index()),
+            data_cache: novarocks_spi::connector::read_stack::ConnectorDataCacheOptions {
+                enable_scan_datacache: cache.enable_scan_datacache,
+                enable_populate_datacache: cache.enable_populate_datacache,
+                enable_datacache_async_populate_mode: cache.enable_datacache_async_populate_mode,
+                enable_datacache_io_adaptor: cache.enable_datacache_io_adaptor,
+                enable_cache_select: cache.enable_cache_select,
+                datacache_evict_probability: cache.datacache_evict_probability,
+                datacache_priority: cache.datacache_priority,
+                datacache_ttl_seconds: cache.datacache_ttl_seconds,
+                datacache_sharing_work_period: cache.datacache_sharing_work_period,
+            },
         },
         runtime_filter: runtime.runtime_filter(),
     })

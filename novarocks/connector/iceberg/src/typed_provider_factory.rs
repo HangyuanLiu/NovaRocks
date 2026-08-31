@@ -27,10 +27,12 @@ use std::sync::Arc;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadExecutionBundle, ConnectorReadExecutionBundleFactory,
 };
-use novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions;
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
+};
+use novarocks_spi::connector::read_stack::{
+    ConnectorDataCacheOptions, ConnectorPageSourceProviderOptions,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorInstanceDescriptor,
@@ -115,7 +117,7 @@ where
         let binding = self.binding_for_request(request);
         let context =
             binding.file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
-        let options = apply_reader_policy(self.options, reader_policy);
+        let options = apply_reader_policy(self.options.clone(), reader_policy);
         Ok(Arc::new(IcebergPageSourceProvider::new(
             binding, context, options,
         )))
@@ -142,7 +144,22 @@ fn apply_reader_policy(
 ) -> IcebergPageSourceProviderOptions {
     options.reader_options.enable_parquet_reader_page_index =
         reader_policy.enable_parquet_reader_page_index;
+    options.cache_options = external_cache_options(reader_policy.data_cache);
     options
+}
+
+fn external_cache_options(policy: ConnectorDataCacheOptions) -> novarocks_fs::CacheOptions {
+    novarocks_fs::CacheOptions {
+        enable_scan_datacache: policy.enable_scan_datacache,
+        enable_populate_datacache: policy.enable_populate_datacache,
+        enable_datacache_async_populate_mode: policy.enable_datacache_async_populate_mode,
+        enable_datacache_io_adaptor: policy.enable_datacache_io_adaptor,
+        enable_cache_select: policy.enable_cache_select,
+        datacache_evict_probability: policy.datacache_evict_probability,
+        datacache_priority: policy.datacache_priority,
+        datacache_ttl_seconds: policy.datacache_ttl_seconds,
+        datacache_sharing_work_period: policy.datacache_sharing_work_period,
+    }
 }
 
 #[cfg(test)]
@@ -278,17 +295,28 @@ mod tests {
             IcebergPageSourceProviderOptions::with_default_budget(),
             ConnectorPageSourceProviderOptions {
                 enable_parquet_reader_page_index: true,
+                data_cache: ConnectorDataCacheOptions {
+                    enable_scan_datacache: true,
+                    enable_populate_datacache: true,
+                    datacache_priority: 2,
+                    ..Default::default()
+                },
             },
         );
         assert!(options.reader_options.enable_parquet_reader_page_index);
+        assert!(options.cache_options.enable_scan_datacache);
+        assert!(options.cache_options.enable_populate_datacache);
+        assert_eq!(options.cache_options.datacache_priority, 2);
 
         let options = apply_reader_policy(
             options,
             ConnectorPageSourceProviderOptions {
                 enable_parquet_reader_page_index: false,
+                data_cache: ConnectorDataCacheOptions::default(),
             },
         );
         assert!(!options.reader_options.enable_parquet_reader_page_index);
+        assert!(!options.cache_options.enable_scan_datacache);
     }
 
     #[test]
@@ -347,7 +375,7 @@ impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
             adapter,
             Arc::new(Self {
                 binding,
-                options: self.options,
+                options: self.options.clone(),
             }),
         ));
         Ok(ConnectorReadExecutionBundle::new(provider_factory, codec))
