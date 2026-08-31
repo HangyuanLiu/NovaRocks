@@ -410,16 +410,13 @@ mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
 
-[connector.object_store]
-endpoint = "$minio_endpoint"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "iceberg-test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
 access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
-# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
-# aws.s3.region, and the Iceberg control factory rejects a catalog whose
-# object-store credentials differ from this server-composed binding, so the
-# region has to be stated on both sides.
-region = "us-east-1"
-enable_path_style_access = true
 EOF
 
 cat > "$runtime_dir/be.toml" <<EOF
@@ -442,16 +439,13 @@ frontend_endpoint = "127.0.0.1:$fe_grpc_port"
 [runtime]
 exchange_wait_ms = 300000
 
-[connector.object_store]
-endpoint = "$minio_endpoint"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "iceberg-test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "\${ENV:AWS_S3_ACCESS_KEY_ID}"
 access_key_secret = "\${ENV:AWS_S3_SECRET_ACCESS_KEY}"
-# Every generated and suite-owned CREATE EXTERNAL CATALOG statement declares
-# aws.s3.region, and the Iceberg control factory rejects a catalog whose
-# object-store credentials differ from this server-composed binding, so the
-# region has to be stated on both sides.
-region = "us-east-1"
-enable_path_style_access = true
 EOF
 
 toml_cluster_host="$(toml_string '127.0.0.1')"

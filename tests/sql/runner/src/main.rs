@@ -5687,10 +5687,13 @@ mod tests {
 [standalone_server]
 mysql_port = 9030
 
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "admin"
-enable_path_style_access = true
+access_key_secret = "admin123"
 "#;
 
         let fe = render_cross_process_config(base, ClusterProcessRole::Fe, 0, &runtime)
@@ -5704,28 +5707,26 @@ enable_path_style_access = true
         assert!(fe_value.get("metadata").is_none());
         assert!(be_value.get("metadata").is_none());
         assert_eq!(
-            fe_value["connector"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
+            fe_value["connector"]["credentials"][0]["purpose"].as_str(),
+            Some("object-store-data")
+        );
+        assert_eq!(
+            fe_value["connector"]["credentials"][0]["name"].as_str(),
+            Some("test-data")
         );
         assert_eq!(
             fe_value["standalone_server"]["mysql_port"].as_integer(),
             Some(29030)
         );
         assert_eq!(fe_value["cluster"]["role"].as_str(), Some("fe"));
-        assert_eq!(
-            fe_value["cluster"]["backends"]
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(|value| value.as_str()),
-            Some("127.0.0.1:19070")
-        );
+        assert!(fe_value["cluster"].get("backends").is_none());
 
         assert_eq!(be_value["cluster"]["role"].as_str(), Some("be"));
         assert_eq!(be_value["server"]["grpc_port"].as_integer(), Some(19070));
         assert!(
             be_value
                 .get("connector")
-                .and_then(|value| value.get("object_store"))
+                .and_then(|value| value.get("credentials"))
                 .is_some()
         );
     }

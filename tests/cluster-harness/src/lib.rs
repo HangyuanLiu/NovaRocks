@@ -5639,10 +5639,13 @@ mode = "dynamic-state-store"
 mysql_port = 9030
 user = "root"
 
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "admin"
-enable_path_style_access = true
+access_key_secret = "admin123"
 "#;
 
     #[test]
@@ -5666,8 +5669,12 @@ enable_path_style_access = true
             "FE rendering must not create a legacy metadata store"
         );
         assert_eq!(
-            fe_value["connector"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
+            fe_value["connector"]["credentials"][0]["purpose"].as_str(),
+            Some("object-store-data")
+        );
+        assert_eq!(
+            fe_value["connector"]["credentials"][0]["name"].as_str(),
+            Some("test-data")
         );
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
@@ -5705,8 +5712,8 @@ enable_path_style_access = true
             "BE rendering must not create a legacy metadata store"
         );
         assert_eq!(
-            be_value["connector"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
+            be_value["connector"]["credentials"][0]["generation"].as_str(),
+            Some("v1")
         );
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
