@@ -90,6 +90,16 @@ impl Scenario for TypedReadData {
             context.remaining("connect typed read control session")?,
         )?;
 
+        // Cache service availability alone is intentionally inert: this
+        // scenario explicitly opts its control session into both cache reads
+        // and population before asserting the warm/cached profiles below.
+        control
+            .query_drop("SET enable_scan_datacache = true")
+            .context("enable cache reads for typed connector data")?;
+        control
+            .query_drop("SET enable_populate_datacache = true")
+            .context("enable cache population for typed connector data")?;
+
         const CATALOG: &str = "typed_read_catalog";
         const DATABASE: &str = "typed_read_db";
         const TABLE: &str = "typed_read_data";
