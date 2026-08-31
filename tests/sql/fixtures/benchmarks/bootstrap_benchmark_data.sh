@@ -820,8 +820,11 @@ main() {
   fixture_contract_file="$(mktemp)"; chmod 600 "$fixture_contract_file"; cp "$resolved_dataset_file" "$fixture_contract_file"
   trap cleanup_owner EXIT INT TERM
   while [[ -z "$lease_id" ]]; do
-    if lease_id="$(fixture_lease_acquire "$lease_name" "$dataset_key_json" "$owner_token" "$staging_identity" "$NOVA_ENV_BENCHMARK_LEASE_IMAGE")"; then break; fi
-    acquire_status="$?"
+    if lease_id="$(fixture_lease_acquire "$lease_name" "$dataset_key_json" "$owner_token" "$staging_identity" "$NOVA_ENV_BENCHMARK_LEASE_IMAGE")"; then
+      break
+    else
+      acquire_status="$?"
+    fi
     if [[ "$acquire_status" != 75 ]]; then emit_error writer_failed "unable to acquire fixture lease"; exit 1; fi
     if wait_or_takeover; then continue; fi
     wait_status="$?"
