@@ -197,7 +197,7 @@ impl ConnectorControlFactory for ReadyFactory {
             None,
         )
         .expect("control binding");
-        ConnectorControlCreation::try_new(&request, binding, Vec::new())
+        ConnectorControlCreation::try_new(&request, binding, request.properties().to_vec())
     }
 }
 

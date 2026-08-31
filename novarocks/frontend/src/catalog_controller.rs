@@ -514,7 +514,7 @@ mod tests {
                     request.instance_id().clone(),
                     incarnation,
                 ),
-                Vec::new(),
+                request.properties().to_vec(),
             )
         }
     }

@@ -1503,7 +1503,11 @@ mod tests {
                 VendedS3CredentialLeaseEntry::try_new(
                     StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/data")
                         .expect("prefix"),
-                    9_999_999_999,
+                    // The lease uses Unix milliseconds, not Unix seconds.
+                    // This fixture is for ownership/handoff behavior, so keep
+                    // its synthetic credential valid independently of wall
+                    // clock progress.
+                    u64::MAX,
                     SecretValue::new(format!("access-{canary}")),
                     SecretValue::new(format!("secret-{canary}")),
                     SecretValue::new(format!("token-{canary}")),
