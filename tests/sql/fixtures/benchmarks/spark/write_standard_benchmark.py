@@ -20,6 +20,7 @@ import argparse
 import json
 import re
 from datetime import datetime, timezone
+from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, lit, trim, when
@@ -244,7 +245,44 @@ def parse_args():
     parser.add_argument("--generator", required=True)
     parser.add_argument("--generator-version", required=True)
     parser.add_argument("--schema-ddl")
+    parser.add_argument("--fixture-contract-json")
     return parser.parse_args()
+
+
+def load_fixture_contract(args):
+    if not args.fixture_contract_json:
+        return None
+    contract_path = Path(args.fixture_contract_json)
+    try:
+        resolved = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read fixture contract: {exc}") from exc
+    required = {
+        "schema_version",
+        "dataset_key",
+        "contract",
+        "fixture_contract_id",
+        "dataset_root",
+        "ready_uri",
+        "staging_parent",
+        "producer_fingerprint",
+    }
+    missing = sorted(required - set(resolved))
+    if missing:
+        raise ValueError(f"fixture contract is missing fields: {missing}")
+    dataset_key = resolved["dataset_key"]
+    contract = resolved["contract"]
+    if (
+        resolved["schema_version"] != 1
+        or dataset_key.get("suite") != args.suite
+        or dataset_key.get("scale") != args.scale
+        or contract.get("suite") != args.suite
+        or contract.get("normalized_scale") != args.scale
+        or contract.get("generator", {}).get("name") != args.generator
+        or contract.get("generator", {}).get("version") != args.generator_version
+    ):
+        raise ValueError("fixture contract does not match the requested benchmark load")
+    return resolved
 
 
 def configure_catalog(spark, args):
@@ -386,8 +424,26 @@ def read_pipe_table(spark, path, columns, encoding):
     return df.select(*projected)
 
 
-def apply_table_layout(suite, table, df):
-    layout = TABLE_LAYOUTS.get((suite, table))
+def parse_fixture_layouts(fixture_contract):
+    if fixture_contract is None:
+        return TABLE_LAYOUTS
+    layouts = fixture_contract["contract"].get("table_layouts")
+    if not isinstance(layouts, list):
+        raise ValueError("fixture contract is missing table_layouts")
+    parsed = {}
+    for layout in layouts:
+        required = {"suite", "table", "range_partitions", "sort_columns", "target_file_size_bytes"}
+        if not isinstance(layout, dict) or required - set(layout):
+            raise ValueError("fixture contract has an invalid table layout")
+        key = (layout["suite"], layout["table"])
+        if key in parsed:
+            raise ValueError(f"fixture contract duplicates table layout: {key}")
+        parsed[key] = {field: layout[field] for field in required if field not in {"suite", "table"}}
+    return parsed
+
+
+def apply_table_layout(suite, table, df, layouts):
+    layout = layouts.get((suite, table))
     if layout is None:
         return df, {}
 
@@ -427,6 +483,23 @@ def compute_table_stats(spark, catalog, database, table):
     return statistics_file
 
 
+def table_publication_metadata(spark, catalog, database, table):
+    table_ref = qualified_name(catalog, database, table)
+    metadata_rows = spark.sql(
+        f"SELECT file, latest_snapshot_id FROM {table_ref}.metadata_log_entries "
+        "ORDER BY timestamp DESC LIMIT 1"
+    ).collect()
+    if not metadata_rows or not metadata_rows[0]["file"]:
+        raise RuntimeError(f"missing metadata log entry for {database}.{table}")
+    snapshot_rows = spark.sql(
+        f"SELECT snapshot_id FROM {table_ref}.snapshots "
+        "ORDER BY committed_at DESC LIMIT 1"
+    ).collect()
+    if not snapshot_rows:
+        raise RuntimeError(f"missing current snapshot for {database}.{table}")
+    return metadata_rows[0]["file"], str(snapshot_rows[0]["snapshot_id"])
+
+
 def main():
     args = parse_args()
     if args.suite not in SUITE_DATABASES:
@@ -436,6 +509,9 @@ def main():
             f"database {args.database} does not match suite {args.suite}; "
             f"expected {SUITE_DATABASES[args.suite]}"
         )
+
+    fixture_contract = load_fixture_contract(args)
+    fixture_layouts = parse_fixture_layouts(fixture_contract)
 
     spark = (
         SparkSession.builder.appName("NovaRocksBenchmarkBootstrap")
@@ -470,7 +546,7 @@ def main():
             raw_path = f"{raw_base_uri}/{raw_name}"
             df = read_pipe_table(spark, raw_path, columns, raw_text_encoding)
             row_count = df.count()
-            df, layout = apply_table_layout(args.suite, table, df)
+            df, layout = apply_table_layout(args.suite, table, df, fixture_layouts)
             target = qualified_name(args.catalog, args.database, table)
 
             spark.sql(f"DROP TABLE IF EXISTS {target}")
@@ -495,12 +571,17 @@ def main():
                 )
             writer.create()
             statistics_file = compute_table_stats(spark, args.catalog, args.database, table)
+            metadata_uri, snapshot_id = table_publication_metadata(
+                spark, args.catalog, args.database, table
+            )
             row_counts.append(
                 {
                     "name": table,
                     "rows": row_count,
                     "format_version": ICEBERG_FORMAT_VERSION,
                     "statistics_file": statistics_file,
+                    "metadata_uri": metadata_uri,
+                    "snapshot_id": snapshot_id,
                     "layout": layout or None,
                 }
             )
@@ -521,6 +602,11 @@ def main():
             "tables": row_counts,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+        if fixture_contract is not None:
+            manifest["fixture_contract"] = fixture_contract["contract"]
+            manifest["producer_fingerprint"] = fixture_contract["producer_fingerprint"]
+            manifest["dataset_key"] = fixture_contract["dataset_key"]
+            manifest["fixture_contract_id"] = fixture_contract["fixture_contract_id"]
         manifest_df = spark.createDataFrame(
             [(json.dumps(manifest, sort_keys=True),)], ["value"]
         )
