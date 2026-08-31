@@ -212,7 +212,7 @@ impl CatalogRuntimeMaterializerSet {
             .get(&properties.provider_kind())
             .map(|factory| {
                 factory
-                    .build(properties.handle())
+                    .build(properties)
                     .map(|bundle| {
                         super::typed_registry::InstalledReadExecution::new(
                             bundle.provider_factory(),
@@ -227,7 +227,7 @@ impl CatalogRuntimeMaterializerSet {
                 .get(&properties.provider_kind())
                 .map(|factory| {
                     factory
-                    .build(properties.handle())
+                    .build(properties)
                     .and_then(|bundle| {
                         let execution = bundle.execution();
                         if execution.catalog_handle() != properties.handle() {

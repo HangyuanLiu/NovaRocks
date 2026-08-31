@@ -16,22 +16,27 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::common::backend_topology::BackendTopologyService;
 use crate::metrics::FrontendQueryLifecycleMetricsSnapshot;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{
-    QueryLifecycleAbortOutcome, QueryLifecycleLease, QueryLifecycleLeaseGuard,
+    QueryCredentialLeaseRefresh, QueryCredentialLeases, QueryLifecycleAbortOutcome,
+    QueryLifecycleLease, QueryLifecycleLeaseGuard, resolve_vended_s3_access,
 };
 use crate::query_execution::terminal_set::QueryTerminalSet;
 use novarocks_proto_codec::lifecycle::{
-    FragmentLiveObservation, ParticipantAttemptRef, ParticipantManifestDigest,
-    ParticipantTerminalOutcome, QueryAbortRequest, QueryControlCommand, QueryControlEvent,
-    QueryExecutionId, QueryTerminalAck, QueryTerminationReason,
+    CredentialLeaseSecretEnvelope, FragmentLiveObservation, ParticipantAttemptRef,
+    ParticipantManifestDigest, ParticipantTerminalOutcome, QueryAbortRequest, QueryControlCommand,
+    QueryControlEvent, QueryExecutionId, QueryTerminalAck, QueryTerminationReason,
+};
+use novarocks_spi::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorStorageResolver, CredentialLeaseId,
+    ResolvedVendedS3Access, StorageAccessRequest,
 };
 
 use super::barrier::FrontendQueryLifecycleConfig;
@@ -53,6 +58,39 @@ const ABORTED: u8 = 1;
 const FINALIZING: u8 = 2;
 const FINALIZED: u8 = 3;
 const ABORT_TERMINAL_DELIVERY_GRACE: Duration = Duration::from_secs(1);
+const CREDENTIAL_LEASE_SOFT_MARGIN_MIN: Duration = Duration::from_secs(5);
+const CREDENTIAL_LEASE_SOFT_MARGIN_MAX: Duration = Duration::from_secs(5 * 60);
+const CREDENTIAL_LEASE_HARD_MARGIN_MIN: Duration = Duration::from_secs(1);
+const CREDENTIAL_LEASE_HARD_MARGIN_MAX: Duration = Duration::from_secs(30);
+const CREDENTIAL_LEASE_JITTER_MAX: Duration = Duration::from_secs(30);
+const CREDENTIAL_LEASE_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const CREDENTIAL_LEASE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CredentialLeaseRefreshTiming {
+    soft_delay: Duration,
+    hard_delay: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct CredentialLeaseRefreshSchedule {
+    lease_id: CredentialLeaseId,
+    soft_delay: Duration,
+    hard_deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialLeaseRefreshFailure {
+    /// The provider did not return a replacement before any prepare was sent.
+    /// Retrying is safe because no participant could have observed an epoch.
+    RetryableProvider,
+    /// An epoch may have reached a participant, or immutable lease scope was
+    /// violated. A retry could produce a conflicting value for the same epoch.
+    Fatal,
+    /// Terminalization/cancellation owns the attempt; do not issue another
+    /// abort from the refresh supervisor.
+    Stopped,
+}
 
 #[derive(Clone, Copy)]
 enum SupervisorFailureKind {
@@ -143,6 +181,27 @@ struct TerminalState {
     outcomes: BTreeMap<usize, RetainedTerminalOutcome>,
     reader_failure: Option<String>,
     stop_readers: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CredentialLeaseRefreshPhase {
+    Vending,
+    Preparing,
+    Committing,
+}
+
+struct CredentialLeaseRefreshRound {
+    lease_id: CredentialLeaseId,
+    epoch: Option<u64>,
+    phase: CredentialLeaseRefreshPhase,
+    prepared: BTreeSet<usize>,
+    committed: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct CredentialLeaseRefreshState {
+    round: Option<CredentialLeaseRefreshRound>,
+    stopped: bool,
 }
 
 /// FE-local retained terminal payload. Typed outcome equality is the only
@@ -370,6 +429,13 @@ pub(super) struct AttemptControl {
     /// immutable; this projection only proves an exact process replacement
     /// after bounded terminal delivery fails.
     backend_topology: Mutex<Option<(BackendTopologyService, u64)>>,
+    /// The only FE owner of vended values after Init has been admitted. The
+    /// participant maps are scrubbed immediately after Init retries finish.
+    credential_leases: Mutex<QueryCredentialLeases>,
+    /// Successful connector writes retain their exact FE credential authority
+    /// only until the SQL terminal commit or reconciliation consumes it.
+    terminal_credential_holds: AtomicUsize,
+    lease_refresh: (Mutex<CredentialLeaseRefreshState>, Condvar),
     readers: Mutex<Vec<JoinHandle<()>>>,
     metrics: Arc<FrontendLifecycleMetrics>,
 }
@@ -406,6 +472,12 @@ impl AttemptControl {
                     .expect("empty runtime filter feedback declaration is valid"),
             )),
             backend_topology: Mutex::new(None),
+            credential_leases: Mutex::new(QueryCredentialLeases::empty()),
+            terminal_credential_holds: AtomicUsize::new(0),
+            lease_refresh: (
+                Mutex::new(CredentialLeaseRefreshState::default()),
+                Condvar::new(),
+            ),
             readers: Mutex::new(Vec::new()),
             metrics,
         })
@@ -413,6 +485,39 @@ impl AttemptControl {
 
     pub fn is_active(&self) -> bool {
         self.state.load(Ordering::Acquire) == ACTIVE
+    }
+
+    fn retain_terminal_storage_resolver(
+        self: &Arc<Self>,
+    ) -> Option<Arc<dyn ConnectorStorageResolver>> {
+        if self
+            .credential_leases
+            .lock()
+            .expect("query credential lease store")
+            .is_empty()
+        {
+            return None;
+        }
+        self.terminal_credential_holds
+            .fetch_add(1, Ordering::AcqRel);
+        Some(Arc::new(TerminalCredentialLease {
+            control: Arc::clone(self),
+        }) as Arc<dyn ConnectorStorageResolver>)
+    }
+
+    fn release_terminal_credential_hold(&self) {
+        debug_assert!(
+            self.terminal_credential_holds.load(Ordering::Acquire) > 0,
+            "terminal credential hold release must match acquisition"
+        );
+        if self
+            .terminal_credential_holds
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+            && self.state.load(Ordering::Acquire) != ACTIVE
+        {
+            self.clear_credential_leases();
+        }
     }
 
     pub(super) const fn execution_id(&self) -> QueryExecutionId {
@@ -460,6 +565,44 @@ impl AttemptControl {
                 .cloned()
                 .map(|participant| (participant.target.backend_idx(), participant)),
         );
+    }
+
+    pub(super) fn install_credential_leases(
+        self: &Arc<Self>,
+        leases: QueryCredentialLeases,
+    ) -> Result<(), DistributedQueryError> {
+        let mut installed = self
+            .credential_leases
+            .lock()
+            .expect("query credential lease store");
+        if !installed.is_empty() {
+            return Err(contract_violation(
+                "query credential leases were installed more than once",
+            ));
+        }
+        *installed = leases;
+        installed.adopt_storage_resolver(Arc::clone(self) as Arc<dyn ConnectorStorageResolver>);
+        drop(installed);
+        Ok(())
+    }
+
+    /// Init uses the values only for its exact retry loop. Once every Init RPC
+    /// has returned, retained participant facts must become secret-free; the
+    /// attempt-local lease store remains the sole FE owner for refresh.
+    pub(super) fn scrub_confidential_init_material(&self) -> Result<(), DistributedQueryError> {
+        for participants in [&self.planned, &self.init_attempted] {
+            let mut participants = participants.lock().expect("lifecycle participant store");
+            for participant in participants.values_mut() {
+                participant.clear_confidential_lease_material()?;
+            }
+        }
+        let mut admitted = self.admitted.lock().expect("admitted participant set");
+        if let Some(participants) = admitted.as_mut() {
+            for participant in participants.values_mut() {
+                participant.clear_confidential_lease_material()?;
+            }
+        }
+        Ok(())
     }
 
     pub fn set_init_attempted(&self, participants: &[MaterializedParticipant]) {
@@ -993,6 +1136,7 @@ impl AttemptControl {
             .lock()
             .expect("runtime filter feedback state")
             .close();
+        self.stop_and_clear_credential_leases();
         self.terminal.1.notify_all();
         self.stop_supervisor();
         self.metrics.attempt_terminated();
@@ -1468,6 +1612,40 @@ impl AttemptControl {
         self.stop.1.notify_all();
     }
 
+    fn stop_credential_lease_refresh(&self) {
+        let mut refresh = self
+            .lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state");
+        refresh.stopped = true;
+        refresh.round = None;
+        self.lease_refresh.1.notify_all();
+    }
+
+    fn clear_credential_leases(&self) {
+        let mut credential_leases = self
+            .credential_leases
+            .lock()
+            .expect("query credential lease store");
+        credential_leases.revoke_storage_resolver();
+        credential_leases.clear();
+        if let Err(error) = self.scrub_confidential_init_material() {
+            tracing::error!(
+                query_id_high = self.execution_id.query_id().high(),
+                query_id_low = self.execution_id.query_id().low(),
+                attempt_id = self.execution_id.attempt_id().get(),
+                error = %error.message(),
+                "frontend query lifecycle could not scrub confidential Init material"
+            );
+        }
+    }
+
+    fn stop_and_clear_credential_leases(&self) {
+        self.stop_credential_lease_refresh();
+        self.clear_credential_leases();
+    }
+
     fn wait_heartbeat_interval(&self) -> bool {
         let stopped = self.stop.0.lock().expect("query lifecycle stop lock");
         if *stopped {
@@ -1479,6 +1657,359 @@ impl AttemptControl {
             .wait_timeout(stopped, self.config.heartbeat_interval())
             .expect("query lifecycle heartbeat wait");
         !*stopped
+    }
+
+    fn next_credential_lease_refresh(&self) -> Option<CredentialLeaseRefreshSchedule> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as u64;
+        let now = Instant::now();
+        self.credential_leases
+            .lock()
+            .expect("query credential lease store")
+            .refreshable()
+            .into_iter()
+            .map(|(lease_id, expires_at_ms)| {
+                let timing = credential_lease_refresh_timing(
+                    lease_id,
+                    Duration::from_millis(expires_at_ms.saturating_sub(now_ms)),
+                );
+                CredentialLeaseRefreshSchedule {
+                    lease_id,
+                    soft_delay: timing.soft_delay,
+                    hard_deadline: now + timing.hard_delay,
+                }
+            })
+            .min_by_key(|schedule| schedule.soft_delay)
+    }
+
+    fn wait_until_stopped_or_credential_refresh(&self, delay: Duration) -> bool {
+        let stopped = self.stop.0.lock().expect("query lifecycle stop lock");
+        if *stopped {
+            return false;
+        }
+        let (stopped, _) = self
+            .stop
+            .1
+            .wait_timeout(stopped, delay)
+            .expect("query lifecycle credential lease wait");
+        !*stopped
+    }
+
+    fn refresh_credential_lease(
+        &self,
+        lease_id: CredentialLeaseId,
+        hard_deadline: Instant,
+    ) -> Result<(), CredentialLeaseRefreshFailure> {
+        let result = self.refresh_credential_lease_once(lease_id, hard_deadline);
+        if result.is_err() {
+            self.clear_credential_lease_refresh_round(lease_id);
+        }
+        result
+    }
+
+    fn refresh_credential_lease_once(
+        &self,
+        lease_id: CredentialLeaseId,
+        hard_deadline: Instant,
+    ) -> Result<(), CredentialLeaseRefreshFailure> {
+        self.ensure_credential_lease_refresh_before(hard_deadline)?;
+        if !self.is_active() {
+            return Err(CredentialLeaseRefreshFailure::Stopped);
+        }
+        let (current, refresher) = {
+            let leases = self
+                .credential_leases
+                .lock()
+                .expect("query credential lease store");
+            let lease = leases
+                .lease(lease_id)
+                .ok_or(CredentialLeaseRefreshFailure::Fatal)?;
+            (
+                lease.descriptor().clone(),
+                lease
+                    .refresher()
+                    .cloned()
+                    .ok_or(CredentialLeaseRefreshFailure::Fatal)?,
+            )
+        };
+        {
+            let mut state = self
+                .lease_refresh
+                .0
+                .lock()
+                .expect("credential lease refresh state");
+            if state.stopped || !self.is_active() {
+                return Err(CredentialLeaseRefreshFailure::Stopped);
+            }
+            if state.round.is_some() {
+                return Err(CredentialLeaseRefreshFailure::Fatal);
+            }
+            state.round = Some(CredentialLeaseRefreshRound {
+                lease_id,
+                epoch: None,
+                phase: CredentialLeaseRefreshPhase::Vending,
+                prepared: BTreeSet::new(),
+                committed: BTreeSet::new(),
+            });
+        }
+
+        let refreshed = refresher
+            .refresh(&current)
+            .map_err(|_| CredentialLeaseRefreshFailure::RetryableProvider)?;
+        self.ensure_credential_lease_refresh_before(hard_deadline)?;
+        if !valid_credential_lease_refresh(&current, &refreshed) {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+        let epoch = refreshed.descriptor().epoch();
+        {
+            let mut state = self
+                .lease_refresh
+                .0
+                .lock()
+                .expect("credential lease refresh state");
+            if state.stopped {
+                return Err(CredentialLeaseRefreshFailure::Stopped);
+            }
+            let Some(round) = state.round.as_mut() else {
+                return Err(CredentialLeaseRefreshFailure::Stopped);
+            };
+            if round.lease_id != lease_id || round.phase != CredentialLeaseRefreshPhase::Vending {
+                return Err(CredentialLeaseRefreshFailure::Fatal);
+            }
+            round.epoch = Some(epoch);
+            round.phase = CredentialLeaseRefreshPhase::Preparing;
+        }
+
+        let sessions = self.sessions();
+        if sessions.len()
+            != self
+                .admitted_len()
+                .map_err(|_| CredentialLeaseRefreshFailure::Fatal)?
+        {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+        self.ensure_credential_lease_refresh_before(hard_deadline)?;
+        let prepare = credential_lease_prepare_command(refreshed.envelope())
+            .map_err(|_| CredentialLeaseRefreshFailure::Fatal)?;
+        for session in &sessions {
+            self.ensure_credential_lease_refresh_before(hard_deadline)?;
+            if session.session.send(prepare.clone()).is_err() {
+                return Err(CredentialLeaseRefreshFailure::Fatal);
+            }
+        }
+        if self
+            .wait_for_credential_lease_ack(
+                lease_id,
+                epoch,
+                CredentialLeaseRefreshPhase::Preparing,
+                sessions.len(),
+                hard_deadline,
+            )
+            .is_err()
+        {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+
+        {
+            let mut state = self
+                .lease_refresh
+                .0
+                .lock()
+                .expect("credential lease refresh state");
+            if state.stopped {
+                return Err(CredentialLeaseRefreshFailure::Stopped);
+            }
+            let Some(round) = state.round.as_mut() else {
+                return Err(CredentialLeaseRefreshFailure::Stopped);
+            };
+            if round.lease_id != lease_id
+                || round.epoch != Some(epoch)
+                || round.phase != CredentialLeaseRefreshPhase::Preparing
+            {
+                state.round = None;
+                self.lease_refresh.1.notify_all();
+                drop(state);
+                return Err(CredentialLeaseRefreshFailure::Fatal);
+            }
+            round.phase = CredentialLeaseRefreshPhase::Committing;
+        }
+        self.ensure_credential_lease_refresh_before(hard_deadline)?;
+        let commit = credential_lease_commit_command(lease_id, epoch)
+            .map_err(|_| CredentialLeaseRefreshFailure::Fatal)?;
+        for session in &sessions {
+            self.ensure_credential_lease_refresh_before(hard_deadline)?;
+            if session.session.send(commit.clone()).is_err() {
+                return Err(CredentialLeaseRefreshFailure::Fatal);
+            }
+        }
+        if self
+            .wait_for_credential_lease_ack(
+                lease_id,
+                epoch,
+                CredentialLeaseRefreshPhase::Committing,
+                sessions.len(),
+                hard_deadline,
+            )
+            .is_err()
+        {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+        let replace_failed = {
+            let mut leases = self
+                .credential_leases
+                .lock()
+                .expect("query credential lease store");
+            leases
+                .replace(refreshed.descriptor().clone(), refreshed.envelope().clone())
+                .is_err()
+        };
+        if replace_failed {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+        let mut state = self
+            .lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state");
+        if state.stopped {
+            return Err(CredentialLeaseRefreshFailure::Stopped);
+        }
+        state.round = None;
+        self.lease_refresh.1.notify_all();
+        Ok(())
+    }
+
+    fn ensure_credential_lease_refresh_before(
+        &self,
+        hard_deadline: Instant,
+    ) -> Result<(), CredentialLeaseRefreshFailure> {
+        if Instant::now() >= hard_deadline {
+            return Err(CredentialLeaseRefreshFailure::Fatal);
+        }
+        if self.credential_lease_refresh_stopped() {
+            return Err(CredentialLeaseRefreshFailure::Stopped);
+        }
+        Ok(())
+    }
+
+    fn credential_lease_refresh_stopped(&self) -> bool {
+        if *self.stop.0.lock().expect("query lifecycle stop lock") {
+            return true;
+        }
+        self.lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state")
+            .stopped
+    }
+
+    fn clear_credential_lease_refresh_round(&self, lease_id: CredentialLeaseId) {
+        let mut state = self
+            .lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state");
+        if state
+            .round
+            .as_ref()
+            .is_some_and(|round| round.lease_id == lease_id)
+        {
+            state.round = None;
+            self.lease_refresh.1.notify_all();
+        }
+    }
+
+    fn record_credential_lease_ack(
+        &self,
+        backend_idx: usize,
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+        phase: CredentialLeaseRefreshPhase,
+    ) -> Result<(), String> {
+        let mut state = self
+            .lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state");
+        if state.stopped {
+            return Err(
+                "credential lease acknowledgement does not match the active refresh".to_string(),
+            );
+        }
+        let round = state.round.as_mut().ok_or_else(|| {
+            "credential lease acknowledgement arrived without an active refresh".to_string()
+        })?;
+        if round.lease_id != lease_id || round.epoch != Some(epoch) || round.phase != phase {
+            return Err(
+                "credential lease acknowledgement does not match the active refresh".to_string(),
+            );
+        }
+        match phase {
+            CredentialLeaseRefreshPhase::Preparing => {
+                round.prepared.insert(backend_idx);
+            }
+            CredentialLeaseRefreshPhase::Committing => {
+                round.committed.insert(backend_idx);
+            }
+            CredentialLeaseRefreshPhase::Vending => {
+                return Err("credential lease acknowledgement arrived before prepare".to_string());
+            }
+        }
+        self.lease_refresh.1.notify_all();
+        Ok(())
+    }
+
+    fn wait_for_credential_lease_ack(
+        &self,
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+        phase: CredentialLeaseRefreshPhase,
+        expected: usize,
+        hard_deadline: Instant,
+    ) -> Result<(), String> {
+        let deadline = hard_deadline.min(Instant::now() + self.config.attach_timeout());
+        let mut state = self
+            .lease_refresh
+            .0
+            .lock()
+            .expect("credential lease refresh state");
+        loop {
+            let round = state.round.as_ref().ok_or_else(|| {
+                "credential lease refresh stopped while awaiting acknowledgement".to_string()
+            })?;
+            if state.stopped
+                || round.lease_id != lease_id
+                || round.epoch != Some(epoch)
+                || round.phase != phase
+            {
+                return Err(
+                    "credential lease refresh acknowledgement barrier lost ownership".to_string(),
+                );
+            }
+            let received = match phase {
+                CredentialLeaseRefreshPhase::Preparing => round.prepared.len(),
+                CredentialLeaseRefreshPhase::Committing => round.committed.len(),
+                CredentialLeaseRefreshPhase::Vending => 0,
+            };
+            if received == expected {
+                return Ok(());
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err("credential lease acknowledgement barrier timed out".to_string());
+            }
+            let (next, timeout) = self
+                .lease_refresh
+                .1
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("credential lease refresh wait");
+            state = next;
+            if timeout.timed_out() {
+                return Err("credential lease acknowledgement barrier timed out".to_string());
+            }
+        }
     }
 
     fn supervisor_failed(&self, reason: String, kind: SupervisorFailureKind) {
@@ -1532,8 +2063,13 @@ impl AttemptControl {
                         }),
                 )
             })?;
+        // A connector-write terminal may have retained an opaque FE-local
+        // capability before entering this method. Stop refresh now, but defer
+        // secret cleanup to that capability's Drop after commit/reconciliation.
+        self.stop_credential_lease_refresh();
         if let Err(error) = self.wait_for_all_drained(self.config.terminal_drain_timeout()) {
             self.metrics.terminal_finalize_failure();
+            self.clear_credential_leases();
             return Err(failed(error));
         }
         let sessions = self.sessions();
@@ -1606,10 +2142,14 @@ impl AttemptControl {
                             .primary_error
                             .lock()
                             .expect("query lifecycle primary error") = Some(message.clone());
+                        self.clear_credential_leases();
                         return Err(failed(message));
                     }
                 };
             self.state.store(FINALIZED, Ordering::Release);
+            if self.terminal_credential_holds.load(Ordering::Acquire) == 0 {
+                self.clear_credential_leases();
+            }
             self.feedback
                 .lock()
                 .expect("runtime filter feedback state")
@@ -1646,8 +2186,61 @@ impl AttemptControl {
                 .primary_error
                 .lock()
                 .expect("query lifecycle primary error") = Some(message.clone());
+            self.clear_credential_leases();
             Err(failed(message))
         }
+    }
+}
+
+impl ConnectorStorageResolver for AttemptControl {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        if !self.is_active() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "vended storage query attempt is no longer active",
+            ));
+        }
+        let leases = self
+            .credential_leases
+            .lock()
+            .expect("query credential lease store");
+        resolve_vended_s3_access(leases.leases(), request)
+    }
+}
+
+/// Opaque FE-local capability for the final commit/reconciliation of one
+/// successfully converged connector write. It never exposes a secret and is
+/// deliberately unusable before `FINALIZED` or after terminal cleanup.
+struct TerminalCredentialLease {
+    control: Arc<AttemptControl>,
+}
+
+impl ConnectorStorageResolver for TerminalCredentialLease {
+    fn resolve_vended_s3(
+        &self,
+        request: &StorageAccessRequest,
+    ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+        if self.control.state.load(Ordering::Acquire) != FINALIZED {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "vended storage terminal capability is unavailable for this query attempt",
+            ));
+        }
+        let leases = self
+            .control
+            .credential_leases
+            .lock()
+            .expect("query credential lease store");
+        resolve_vended_s3_access(leases.leases(), request)
+    }
+}
+
+impl Drop for TerminalCredentialLease {
+    fn drop(&mut self) {
+        self.control.release_terminal_credential_hold();
     }
 }
 
@@ -1903,6 +2496,26 @@ impl AttemptControl {
                 session.target.backend_idx(),
                 failure.reason, failure.safe_detail
             )),
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::CredentialLeasePrepared(
+                    prepared,
+                ),
+            ) => self.record_credential_lease_ack(
+                session.target.backend_idx(),
+                credential_lease_id_from_wire(&prepared.lease_id)?,
+                prepared.epoch,
+                CredentialLeaseRefreshPhase::Preparing,
+            ),
+            Some(
+                novarocks_proto_models::novarocks::query_control_response::Event::CredentialLeaseCommitted(
+                    committed,
+                ),
+            ) => self.record_credential_lease_ack(
+                session.target.backend_idx(),
+                credential_lease_id_from_wire(&committed.lease_id)?,
+                committed.epoch,
+                CredentialLeaseRefreshPhase::Committing,
+            ),
             None => Err("validated query control event is missing its oneof".to_string()),
         }
     }
@@ -2170,6 +2783,74 @@ pub(super) fn spawn_supervisor(control: &Arc<AttemptControl>) -> JoinHandle<()> 
         .expect("spawn frontend query lifecycle supervisor")
 }
 
+/// Starts at most one attempt-local refresh owner. It is deliberately tied to
+/// the same stop latch as heartbeat supervision, so FE terminalization and
+/// control-owner loss leave no orphan provider refresh task behind.
+pub(super) fn spawn_credential_lease_supervisor(
+    control: &Arc<AttemptControl>,
+) -> Option<JoinHandle<()>> {
+    control.next_credential_lease_refresh()?;
+    let weak = Arc::downgrade(control);
+    Some(
+        std::thread::Builder::new()
+            .name(format!(
+                "credential-lease-refresh-{}/{}-{}",
+                control.execution_id.query_id().high(),
+                control.execution_id.query_id().low(),
+                control.execution_id.attempt_id().get(),
+            ))
+            .spawn(move || credential_lease_refresh_supervisor(weak))
+            .expect("spawn frontend credential lease refresh supervisor"),
+    )
+}
+
+fn credential_lease_refresh_supervisor(control: Weak<AttemptControl>) {
+    loop {
+        let Some(control) = control.upgrade() else {
+            return;
+        };
+        let Some(schedule) = control.next_credential_lease_refresh() else {
+            return;
+        };
+        if !control.wait_until_stopped_or_credential_refresh(schedule.soft_delay) {
+            return;
+        }
+
+        let mut retry_delay = CREDENTIAL_LEASE_RETRY_INITIAL;
+        loop {
+            if control.credential_lease_refresh_stopped() {
+                return;
+            }
+            if Instant::now() >= schedule.hard_deadline {
+                let _ = control.abort_preserving("credential lease refresh failed".to_string());
+                return;
+            }
+            match control.refresh_credential_lease(schedule.lease_id, schedule.hard_deadline) {
+                Ok(()) => break,
+                Err(CredentialLeaseRefreshFailure::Stopped) => return,
+                Err(CredentialLeaseRefreshFailure::Fatal) => {
+                    let _ = control.abort_preserving("credential lease refresh failed".to_string());
+                    return;
+                }
+                Err(CredentialLeaseRefreshFailure::RetryableProvider) => {}
+            }
+            let remaining = schedule
+                .hard_deadline
+                .saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = control.abort_preserving("credential lease refresh failed".to_string());
+                return;
+            }
+            if !control.wait_until_stopped_or_credential_refresh(retry_delay.min(remaining)) {
+                return;
+            }
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(CREDENTIAL_LEASE_RETRY_MAX);
+        }
+    }
+}
+
 fn heartbeat_supervisor(control: Weak<AttemptControl>) {
     let Some(control) = control.upgrade() else {
         return;
@@ -2265,6 +2946,7 @@ fn heartbeat_supervisor(control: Weak<AttemptControl>) {
 pub(super) struct FrontendQueryLifecycleLeaseGuard {
     control: Arc<AttemptControl>,
     supervisor: Option<JoinHandle<()>>,
+    credential_lease_supervisor: Option<JoinHandle<()>>,
     _registry_binding: ActiveQueryAttemptBinding,
 }
 
@@ -2272,11 +2954,13 @@ impl FrontendQueryLifecycleLeaseGuard {
     pub fn lease(
         control: Arc<AttemptControl>,
         supervisor: JoinHandle<()>,
+        credential_lease_supervisor: Option<JoinHandle<()>>,
         registry_binding: ActiveQueryAttemptBinding,
     ) -> QueryLifecycleLease {
         QueryLifecycleLease::new(Box::new(Self {
             control,
             supervisor: Some(supervisor),
+            credential_lease_supervisor,
             _registry_binding: registry_binding,
         }))
     }
@@ -2297,10 +2981,22 @@ impl FrontendQueryLifecycleLeaseGuard {
             .heartbeat_timeout()
             .saturating_add(self.control.config.attach_timeout());
         let _ = done_rx.recv_timeout(bound.max(Duration::from_millis(1)));
+        if let Some(refresh) = self.credential_lease_supervisor.take() {
+            let (done_tx, done_rx) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let _ = refresh.join();
+                let _ = done_tx.send(());
+            });
+            let _ = done_rx.recv_timeout(bound.max(Duration::from_millis(1)));
+        }
     }
 }
 
 impl QueryLifecycleLeaseGuard for FrontendQueryLifecycleLeaseGuard {
+    fn retain_terminal_storage_resolver(&self) -> Option<Arc<dyn ConnectorStorageResolver>> {
+        self.control.retain_terminal_storage_resolver()
+    }
+
     fn finalize(mut self: Box<Self>) -> Result<QueryTerminalSet, DistributedQueryError> {
         let result = self.control.finalize();
         self.stop_and_join();
@@ -2363,6 +3059,95 @@ fn control_command(
     .map_err(|error| error.to_string())
 }
 
+fn tls_control_command(
+    command: novarocks_proto_models::novarocks::query_control_request::Command,
+) -> Result<QueryControlCommand, String> {
+    QueryControlCommand::parse_tls(novarocks_proto_models::novarocks::QueryControlRequest {
+        command: Some(command),
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn credential_lease_prepare_command(
+    envelope: &CredentialLeaseSecretEnvelope,
+) -> Result<QueryControlCommand, String> {
+    tls_control_command(
+        novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeasePrepare(
+            novarocks_proto_models::novarocks::CredentialLeasePrepare {
+                envelope: Some(
+                    novarocks_proto_codec::lifecycle::encode_credential_lease_secret_envelope(
+                        envelope,
+                    ),
+                ),
+            },
+        ),
+    )
+}
+
+fn credential_lease_commit_command(
+    lease_id: CredentialLeaseId,
+    epoch: u64,
+) -> Result<QueryControlCommand, String> {
+    tls_control_command(
+        novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeaseCommit(
+            novarocks_proto_models::novarocks::CredentialLeaseCommit {
+                lease_id: lease_id.as_bytes().to_vec(),
+                epoch,
+            },
+        ),
+    )
+}
+
+fn valid_credential_lease_refresh(
+    current: &novarocks_spi::connector::CredentialLeaseDescriptor,
+    refreshed: &QueryCredentialLeaseRefresh,
+) -> bool {
+    let descriptor = refreshed.descriptor();
+    descriptor.has_same_refresh_scope(current)
+        && descriptor.epoch() == current.epoch().saturating_add(1)
+        && descriptor.not_after_unix_ms() > current.not_after_unix_ms()
+        && refreshed.envelope().matches_descriptor(descriptor)
+}
+
+fn credential_lease_refresh_timing(
+    lease_id: CredentialLeaseId,
+    ttl: Duration,
+) -> CredentialLeaseRefreshTiming {
+    let soft_margin = (ttl / 5).clamp(
+        CREDENTIAL_LEASE_SOFT_MARGIN_MIN,
+        CREDENTIAL_LEASE_SOFT_MARGIN_MAX,
+    );
+    let hard_margin = (ttl / 20).clamp(
+        CREDENTIAL_LEASE_HARD_MARGIN_MIN,
+        CREDENTIAL_LEASE_HARD_MARGIN_MAX,
+    );
+    let max_jitter = (ttl / 20).min(CREDENTIAL_LEASE_JITTER_MAX);
+    // Spread simultaneous non-secret lease identifiers deterministically. The
+    // cap is independent of provider data and is always contained in the
+    // configured jitter budget.
+    let jitter_seed = lease_id
+        .as_bytes()
+        .iter()
+        .fold(0_u64, |seed, byte| seed.rotate_left(5) ^ u64::from(*byte));
+    let jitter = if max_jitter.is_zero() {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(jitter_seed % (max_jitter.as_nanos() as u64 + 1))
+    };
+    CredentialLeaseRefreshTiming {
+        soft_delay: ttl.saturating_sub(soft_margin.saturating_add(jitter)),
+        hard_delay: ttl.saturating_sub(hard_margin),
+    }
+}
+
+fn credential_lease_id_from_wire(bytes: &[u8]) -> Result<CredentialLeaseId, String> {
+    let bytes: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| "credential lease acknowledgement has an invalid lease id".to_string())?;
+    CredentialLeaseId::try_from_bytes(bytes)
+        .map_err(|_| "credential lease acknowledgement has an invalid lease id".to_string())
+}
+
 fn terminal_ack_command(
     outcome: &ParticipantTerminalOutcome,
 ) -> Result<QueryControlCommand, String> {
@@ -2375,4 +3160,38 @@ fn terminal_ack_command(
             ack.as_proto().clone(),
         ),
     )
+}
+
+#[cfg(test)]
+mod credential_lease_refresh_timing_tests {
+    use super::*;
+
+    fn lease_id(byte: u8) -> CredentialLeaseId {
+        CredentialLeaseId::try_from_bytes([byte; 16]).expect("nonzero test lease id")
+    }
+
+    #[test]
+    fn timing_uses_the_approved_soft_hard_and_jitter_windows() {
+        let ttl = Duration::from_secs(100);
+        let first = credential_lease_refresh_timing(lease_id(1), ttl);
+        let second = credential_lease_refresh_timing(lease_id(1), ttl);
+
+        assert_eq!(first, second, "lease jitter must be deterministic");
+        assert_eq!(first.hard_delay, Duration::from_secs(95));
+        assert!(first.soft_delay <= Duration::from_secs(80));
+        assert!(first.soft_delay >= Duration::from_secs(75));
+    }
+
+    #[test]
+    fn timing_clamps_short_and_long_ttls_without_crossing_the_hard_boundary() {
+        let short = credential_lease_refresh_timing(lease_id(2), Duration::from_secs(1));
+        assert_eq!(short.soft_delay, Duration::ZERO);
+        assert_eq!(short.hard_delay, Duration::ZERO);
+
+        let long = credential_lease_refresh_timing(lease_id(3), Duration::from_secs(60 * 60));
+        assert_eq!(long.hard_delay, Duration::from_secs(60 * 60 - 30));
+        assert!(long.soft_delay <= Duration::from_secs(60 * 60 - 5 * 60));
+        assert!(long.soft_delay >= Duration::from_secs(60 * 60 - 5 * 60 - 30));
+        assert!(long.soft_delay < long.hard_delay);
+    }
 }

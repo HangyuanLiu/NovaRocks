@@ -18,6 +18,7 @@
 //! This module contains the iceberg REST catalog implementation.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -44,8 +45,8 @@ use crate::client::{
 use crate::types::{
     CatalogConfig, CommitTableRequest, CommitTableResponse, CommitViewRequest,
     CreateNamespaceRequest, CreateTableRequest, CreateViewRequest, ListNamespaceResponse,
-    ListTablesResponse, ListViewsResponse, LoadTableResult, LoadViewResult, NamespaceResponse,
-    RegisterTableRequest, RenameTableRequest,
+    ListTablesResponse, ListViewsResponse, LoadCredentialsResult, LoadTableResult,
+    LoadViewResult, NamespaceResponse, RegisterTableRequest, RenameTableRequest,
 };
 
 /// REST catalog URI
@@ -54,6 +55,13 @@ pub const REST_CATALOG_PROP_URI: &str = "uri";
 pub const REST_CATALOG_PROP_WAREHOUSE: &str = "warehouse";
 /// Disable header redaction in error logs (defaults to false for security)
 pub const REST_CATALOG_PROP_DISABLE_HEADER_REDACTION: &str = "disable-header-redaction";
+/// Header used by a caller that requests REST storage-credential delegation.
+///
+/// The header is deliberately only installed by the parallel access-delegation
+/// APIs below. The upstream [`Catalog`] trait keeps its existing behavior.
+pub const REST_CATALOG_HEADER_ACCESS_DELEGATION: &str = "x-iceberg-access-delegation";
+/// Value for [`REST_CATALOG_HEADER_ACCESS_DELEGATION`] requesting vended credentials.
+pub const REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS: &str = "vended-credentials";
 
 const ICEBERG_REST_SPEC_VERSION: &str = "0.14.1";
 const CARGO_PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -379,6 +387,265 @@ pub struct StagedTableCreate {
     initialization_updates: Vec<TableUpdate>,
 }
 
+/// A redacted view of one prefix-scoped REST storage credential.
+///
+/// Credential values remain private. Consumers can inspect only the keys they
+/// understand and retrieve a value by its exact key while translating this
+/// response into their own closed credential type.
+pub struct StorageCredentialDelegation<'a> {
+    credential: &'a crate::types::StorageCredential,
+}
+
+impl StorageCredentialDelegation<'_> {
+    /// Prefix to which this credential applies.
+    pub fn prefix(&self) -> &str {
+        &self.credential.prefix
+    }
+
+    /// Return the value for one known provider configuration key.
+    pub fn config_value(&self, key: &str) -> Option<&str> {
+        self.credential.config.get(key).map(String::as_str)
+    }
+
+    /// Return the available provider configuration key names, never values.
+    pub fn config_keys(&self) -> impl Iterator<Item = &str> {
+        self.credential.config.keys().map(String::as_str)
+    }
+}
+
+impl Debug for StorageCredentialDelegation<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCredentialDelegation")
+            .field("prefix", &self.credential.prefix)
+            .field(
+                "config_keys",
+                &self.credential.config.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Storage delegation facts received from one REST table response.
+///
+/// This is intentionally not serializable and has no accessor that returns a
+/// raw configuration map. It is a short-lived handoff from the vendored REST
+/// client to the provider-owned parser.
+pub struct RestAccessDelegation {
+    storage_credentials: Option<Vec<crate::types::StorageCredential>>,
+}
+
+impl RestAccessDelegation {
+    fn new(storage_credentials: Option<Vec<crate::types::StorageCredential>>) -> Self {
+        Self { storage_credentials }
+    }
+
+    /// Whether the REST response carried the `storage-credentials` member.
+    pub fn is_present(&self) -> bool {
+        self.storage_credentials.is_some()
+    }
+
+    /// Number of prefix-scoped credentials in the response.
+    pub fn len(&self) -> usize {
+        self.storage_credentials.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Whether no prefix-scoped credentials were returned.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate over redacted prefix-scoped credential views.
+    pub fn credentials(&self) -> impl Iterator<Item = StorageCredentialDelegation<'_>> {
+        self.storage_credentials
+            .iter()
+            .flatten()
+            .map(|credential| StorageCredentialDelegation { credential })
+    }
+}
+
+impl Debug for RestAccessDelegation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestAccessDelegation")
+            .field("present", &self.is_present())
+            .field("credential_count", &self.len())
+            .finish()
+    }
+}
+
+/// One table materialized from a REST response plus its access delegation.
+pub struct RestTableWithAccessDelegation {
+    table: Table,
+    access_delegation: RestAccessDelegation,
+}
+
+impl RestTableWithAccessDelegation {
+    /// Borrow the materialized Iceberg table.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Borrow the response-local, redacted delegation facts.
+    pub fn access_delegation(&self) -> &RestAccessDelegation {
+        &self.access_delegation
+    }
+
+    /// Consume the response into its table and delegation facts.
+    pub fn into_parts(self) -> (Table, RestAccessDelegation) {
+        (self.table, self.access_delegation)
+    }
+}
+
+impl Debug for RestTableWithAccessDelegation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RestTableWithAccessDelegation")
+            .field("table", &self.table)
+            .field("access_delegation", &self.access_delegation)
+            .finish()
+    }
+}
+
+/// A table response whose immutable metadata has not yet been associated with
+/// a [`FileIO`].
+///
+/// This is for providers that must consume response-local credentials before
+/// they choose the request-scoped FileIO.  It deliberately exposes neither
+/// the response's configuration map nor its metadata: callers can only
+/// materialize the already-frozen table with a FileIO they own.
+pub struct DeferredRestTableMaterialization {
+    table_ident: TableIdent,
+    metadata_location: Option<String>,
+    metadata: iceberg::spec::TableMetadata,
+    // Keep ordinary REST table config private so the catalog can retain its
+    // legacy materialization path without exposing a second raw config API.
+    config: HashMap<String, String>,
+}
+
+impl DeferredRestTableMaterialization {
+    /// Materialize this frozen response with an explicitly supplied FileIO.
+    ///
+    /// A request-scoped provider calls this only after it has converted the
+    /// companion access delegation into its own sealed credential capability.
+    pub fn materialize_with_file_io(self, file_io: FileIO) -> Result<Table> {
+        let table_builder = Table::builder()
+            .identifier(self.table_ident)
+            .file_io(file_io)
+            .metadata(self.metadata);
+        match self.metadata_location {
+            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
+            None => table_builder.build(),
+        }
+    }
+}
+
+impl Debug for DeferredRestTableMaterialization {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredRestTableMaterialization")
+            .field("table", &self.table_ident)
+            .field("has_metadata_location", &self.metadata_location.is_some())
+            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// A REST table response with response-local access delegation that has not
+/// yet selected a FileIO.
+pub struct DeferredRestTableWithAccessDelegation {
+    materialization: DeferredRestTableMaterialization,
+    access_delegation: RestAccessDelegation,
+}
+
+impl DeferredRestTableWithAccessDelegation {
+    /// Consume this response into its opaque table materialization and
+    /// response-local delegation facts.
+    pub fn into_parts(self) -> (DeferredRestTableMaterialization, RestAccessDelegation) {
+        (self.materialization, self.access_delegation)
+    }
+}
+
+impl Debug for DeferredRestTableWithAccessDelegation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredRestTableWithAccessDelegation")
+            .field("materialization", &self.materialization)
+            .field("access_delegation", &self.access_delegation)
+            .finish()
+    }
+}
+
+/// A staged table plus response-local storage delegation facts.
+pub struct StagedTableCreateWithAccessDelegation {
+    table: Table,
+    initialization_updates: Vec<TableUpdate>,
+    access_delegation: RestAccessDelegation,
+}
+
+/// A staged table response whose FileIO is intentionally deferred until a
+/// provider has consumed response-local access delegation.
+pub struct DeferredStagedTableCreateWithAccessDelegation {
+    materialization: DeferredRestTableMaterialization,
+    initialization_updates: Vec<TableUpdate>,
+    access_delegation: RestAccessDelegation,
+}
+
+impl DeferredStagedTableCreateWithAccessDelegation {
+    /// Consume this staged response into opaque table materialization, the
+    /// server-derived initialization updates, and response-local delegation.
+    pub fn into_parts(
+        self,
+    ) -> (
+        DeferredRestTableMaterialization,
+        Vec<TableUpdate>,
+        RestAccessDelegation,
+    ) {
+        (
+            self.materialization,
+            self.initialization_updates,
+            self.access_delegation,
+        )
+    }
+}
+
+impl Debug for DeferredStagedTableCreateWithAccessDelegation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeferredStagedTableCreateWithAccessDelegation")
+            .field("materialization", &self.materialization)
+            .field("initialization_update_count", &self.initialization_updates.len())
+            .field("access_delegation", &self.access_delegation)
+            .finish()
+    }
+}
+
+impl StagedTableCreateWithAccessDelegation {
+    /// Return the staged table.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Return the initialization updates required by its first commit.
+    pub fn initialization_updates(&self) -> &[TableUpdate] {
+        &self.initialization_updates
+    }
+
+    /// Borrow the response-local, redacted delegation facts.
+    pub fn access_delegation(&self) -> &RestAccessDelegation {
+        &self.access_delegation
+    }
+
+    /// Consume this result into all of its provider-private facts.
+    pub fn into_parts(self) -> (Table, Vec<TableUpdate>, RestAccessDelegation) {
+        (self.table, self.initialization_updates, self.access_delegation)
+    }
+}
+
+impl Debug for StagedTableCreateWithAccessDelegation {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedTableCreateWithAccessDelegation")
+            .field("table", &self.table)
+            .field("initialization_update_count", &self.initialization_updates.len())
+            .field("access_delegation", &self.access_delegation)
+            .finish()
+    }
+}
+
 /// Dispatch certainty for the REST staged-create request. Downstream saga
 /// owners must never infer this boundary from an error string or a generic
 /// `Unexpected` kind.
@@ -531,13 +798,135 @@ impl RestCatalog {
         creation: TableCreation,
     ) -> Result<StagedTableCreate> {
         let table = self
-            .create_table_with_stage(namespace, creation, true)
+            .create_table_with_stage(namespace, creation, true, false)
             .await?;
+        let (table, _) = table.into_parts();
         let initialization_updates = table.metadata().staged_create_initialization_updates()?;
         Ok(StagedTableCreate {
             table,
             initialization_updates,
         })
+    }
+
+    /// Stage a table while requesting and retaining REST storage delegation.
+    ///
+    /// This is a parallel API for provider-owned credential handling. It does
+    /// not alter the upstream [`Catalog`] trait or its normal request shape.
+    pub async fn stage_create_table_with_access_delegation(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<StagedTableCreateWithAccessDelegation> {
+        let table = self
+            .create_table_with_stage(namespace, creation, true, true)
+            .await?;
+        let (table, access_delegation) = table.into_parts();
+        let initialization_updates = table.metadata().staged_create_initialization_updates()?;
+        Ok(StagedTableCreateWithAccessDelegation {
+            table,
+            initialization_updates,
+            access_delegation,
+        })
+    }
+
+    /// Create a table while requesting and retaining REST storage delegation.
+    ///
+    /// The returned delegation is response-local and deliberately separate
+    /// from the `Table`'s FileIO configuration.
+    pub async fn create_table_with_access_delegation(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<RestTableWithAccessDelegation> {
+        self.create_table_with_stage(namespace, creation, false, true)
+            .await
+    }
+
+    /// Load a table while requesting and retaining REST storage delegation.
+    ///
+    /// Provider code should use this rather than the upstream [`Catalog`]
+    /// trait method when the catalog definition selected vended credentials.
+    pub async fn load_table_with_access_delegation(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<RestTableWithAccessDelegation> {
+        let response = self
+            .load_table_deferred_with_access_delegation(table_ident)
+            .await?;
+        self.materialize_deferred_table_response(response).await
+    }
+
+    /// Load a table while retaining its response-local delegation before any
+    /// FileIO is constructed.
+    ///
+    /// This is intentionally separate from [`Self::load_table_with_access_delegation`].
+    /// The latter preserves the historical catalog-owned FileIO behavior;
+    /// providers using vended credentials must choose a request-scoped FileIO
+    /// only after they consume the companion delegation.
+    pub async fn load_table_deferred_with_access_delegation(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<DeferredRestTableWithAccessDelegation> {
+        let context = self.context().await?;
+        let request = context
+            .client
+            .request(Method::GET, context.config.table_endpoint(table_ident))
+            .header(
+                REST_CATALOG_HEADER_ACCESS_DELEGATION,
+                REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            )
+            .build()?;
+        let http_response = context.client.query_catalog(request).await?;
+        let response = match http_response.status() {
+            StatusCode::OK | StatusCode::NOT_MODIFIED => {
+                deserialize_catalog_response::<LoadTableResult>(http_response).await?
+            }
+            StatusCode::NOT_FOUND => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    "Tried to load a table that does not exist",
+                ));
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    context.client.disable_header_redaction(),
+                )
+                .await);
+            }
+        };
+        Ok(self.defer_table_response(table_ident.clone(), response))
+    }
+
+    /// Load a fresh set of storage credentials from an endpoint advertised by
+    /// a previous vended table response.
+    ///
+    /// The request deliberately reuses this catalog's initialized context and
+    /// authenticated HTTP client. It is not a table load and therefore cannot
+    /// observe a later schema or snapshot. The returned facts stay in the
+    /// existing response-local redacted wrapper until a provider translates
+    /// them into its closed credential type.
+    pub async fn load_credentials_with_access_delegation(
+        &self,
+        credentials_endpoint: &str,
+    ) -> Result<RestAccessDelegation> {
+        let context = self.context().await?;
+        let request = context
+            .client
+            .request(Method::GET, credentials_endpoint)
+            .build()?;
+        let http_response = context.client.query_catalog(request).await?;
+        match http_response.status() {
+            StatusCode::OK => {
+                let response = deserialize_catalog_response::<LoadCredentialsResult>(http_response).await?;
+                Ok(RestAccessDelegation::new(response.storage_credentials))
+            }
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                context.client.disable_header_redaction(),
+            )
+            .await),
+        }
     }
 
     /// Typed staged-create variant for durable application sagas.
@@ -546,6 +935,55 @@ impl RestCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> std::result::Result<StagedTableCreate, StagedCreateError> {
+        self.stage_create_table_typed_with_access_delegation(namespace, creation)
+            .await
+            .map(|response| {
+                let (table, initialization_updates, _) = response.into_parts();
+                StagedTableCreate {
+                    table,
+                    initialization_updates,
+                }
+            })
+    }
+
+    /// Typed staged-create variant that retains REST storage delegation.
+    ///
+    /// Its dispatch certainty matches [`Self::stage_create_table_typed`]; the
+    /// only additional fact is the response-local delegation handoff.
+    pub async fn stage_create_table_typed_with_access_delegation(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> std::result::Result<StagedTableCreateWithAccessDelegation, StagedCreateError> {
+        let staged = self
+            .stage_create_table_typed_deferred_with_access_delegation(namespace, creation)
+            .await?;
+        let (materialization, initialization_updates, access_delegation) = staged.into_parts();
+        let table = self
+            .materialize_deferred_table_response(DeferredRestTableWithAccessDelegation {
+                materialization,
+                access_delegation,
+            })
+            .await
+            .map_err(StagedCreateError::PossiblyDispatched)?;
+        let (table, access_delegation) = table.into_parts();
+        Ok(StagedTableCreateWithAccessDelegation {
+            table,
+            initialization_updates,
+            access_delegation,
+        })
+    }
+
+    /// Typed staged-create variant that retains its response-local delegation
+    /// before constructing a FileIO.
+    ///
+    /// Vended providers must use this form, collect the sealed credential
+    /// contribution, and then materialize with the attempt-scoped resolver.
+    pub async fn stage_create_table_typed_deferred_with_access_delegation(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> std::result::Result<DeferredStagedTableCreateWithAccessDelegation, StagedCreateError> {
         let context = self
             .context()
             .await
@@ -554,6 +992,10 @@ impl RestCatalog {
         let request = context
             .client
             .request(Method::POST, context.config.tables_endpoint(namespace))
+            .header(
+                REST_CATALOG_HEADER_ACCESS_DELEGATION,
+                REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            )
             .json(&CreateTableRequest {
                 name: creation.name,
                 location: creation.location,
@@ -603,35 +1045,18 @@ impl RestCatalog {
                 ));
             }
         };
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-        let file_io_location = response
-            .metadata_location
-            .as_deref()
-            .unwrap_or_else(|| response.metadata.location());
-        let file_io = self
-            .load_file_io(Some(file_io_location), Some(config))
-            .await
-            .map_err(StagedCreateError::PossiblyDispatched)?;
-        let table_builder = Table::builder()
-            .identifier(table_ident)
-            .file_io(file_io)
-            .metadata(response.metadata);
-        let table = match response.metadata_location {
-            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
-            None => table_builder.build(),
-        }
-        .map_err(StagedCreateError::PossiblyDispatched)?;
-        let initialization_updates = table
-            .metadata()
+        let initialization_updates = response
+            .metadata
             .staged_create_initialization_updates()
             .map_err(StagedCreateError::PossiblyDispatched)?;
-        Ok(StagedTableCreate {
-            table,
+        let DeferredRestTableWithAccessDelegation {
+            materialization,
+            access_delegation,
+        } = self.defer_table_response(table_ident, response);
+        Ok(DeferredStagedTableCreateWithAccessDelegation {
+            materialization,
             initialization_updates,
+            access_delegation,
         })
     }
 
@@ -725,8 +1150,34 @@ impl RestCatalog {
     /// and committed-but-unreadable response states.
     pub async fn commit_staged_table_typed(
         &self,
-        mut commit: TableCommit,
+        commit: TableCommit,
     ) -> std::result::Result<Table, StagedCommitError> {
+        let materialization = self.commit_staged_table_typed_deferred(commit).await?;
+        let metadata_location = materialization
+            .metadata_location
+            .clone()
+            .expect("staged commit response always has a metadata location");
+        let file_io = self
+            .load_file_io(Some(&metadata_location), None)
+            .await
+            .map_err(StagedCommitError::CommittedResponseInvalid)?;
+        materialization
+            .materialize_with_file_io(file_io)
+            .map_err(StagedCommitError::CommittedResponseInvalid)
+    }
+
+    /// Submit one staged table commit while leaving FileIO selection to the
+    /// caller that owns the response-local storage capability.
+    ///
+    /// A vended-credential provider cannot use [`Self::commit_staged_table_typed`]:
+    /// the REST response proves the catalog mutation but does not carry another
+    /// storage delegation, while the table response still needs a FileIO. The
+    /// provider must retain its already-admitted request lease and materialize
+    /// this opaque result with that request-scoped FileIO.
+    pub async fn commit_staged_table_typed_deferred(
+        &self,
+        mut commit: TableCommit,
+    ) -> std::result::Result<DeferredRestTableMaterialization, StagedCommitError> {
         let context = self
             .context()
             .await
@@ -785,16 +1236,28 @@ impl RestCatalog {
                 ));
             }
         };
-        let file_io = self
-            .load_file_io(Some(&response.metadata_location), None)
-            .await
-            .map_err(StagedCommitError::CommittedResponseInvalid)?;
-        Table::builder()
-            .identifier(commit.identifier().clone())
-            .file_io(file_io)
-            .metadata(response.metadata)
-            .metadata_location(response.metadata_location)
-            .build()
+        Ok(DeferredRestTableMaterialization {
+            table_ident: commit.identifier().clone(),
+            metadata_location: Some(response.metadata_location),
+            metadata: response.metadata,
+            config: HashMap::new(),
+        })
+    }
+
+    /// Submit one staged table commit using a caller-owned FileIO for the
+    /// committed response.
+    ///
+    /// This is the vended counterpart to [`Self::commit_staged_table_typed`].
+    /// The caller must supply an already-admitted request-scoped FileIO; this
+    /// method never falls back to the catalog-global storage factory.
+    pub async fn commit_staged_table_typed_with_file_io(
+        &self,
+        commit: TableCommit,
+        file_io: FileIO,
+    ) -> std::result::Result<Table, StagedCommitError> {
+        self.commit_staged_table_typed_deferred(commit)
+            .await?
+            .materialize_with_file_io(file_io)
             .map_err(StagedCommitError::CommittedResponseInvalid)
     }
 
@@ -803,13 +1266,22 @@ impl RestCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
         stage_create: bool,
-    ) -> Result<Table> {
+        request_access_delegation: bool,
+    ) -> Result<RestTableWithAccessDelegation> {
         let context = self.context().await?;
         let table_ident = TableIdent::new(namespace.clone(), creation.name.clone());
 
         let request = context
             .client
-            .request(Method::POST, context.config.tables_endpoint(namespace))
+            .request(Method::POST, context.config.tables_endpoint(namespace));
+        let request = if request_access_delegation {
+            request.header(
+                REST_CATALOG_HEADER_ACCESS_DELEGATION,
+                REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            )
+        } else {
+            request
+        }
             .json(&CreateTableRequest {
                 name: creation.name,
                 location: creation.location,
@@ -854,26 +1326,56 @@ impl RestCatalog {
             ));
         }
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-        let file_io_location = response
+        self.materialize_table_response(table_ident, response).await
+    }
+
+    async fn materialize_table_response(
+        &self,
+        table_ident: TableIdent,
+        response: LoadTableResult,
+    ) -> Result<RestTableWithAccessDelegation> {
+        self.materialize_deferred_table_response(self.defer_table_response(table_ident, response))
+            .await
+    }
+
+    async fn materialize_deferred_table_response(
+        &self,
+        response: DeferredRestTableWithAccessDelegation,
+    ) -> Result<RestTableWithAccessDelegation> {
+        let (materialization, access_delegation) = response.into_parts();
+        let file_io_location = materialization
             .metadata_location
             .as_deref()
-            .unwrap_or_else(|| response.metadata.location());
+            .unwrap_or_else(|| materialization.metadata.location());
         let file_io = self
-            .load_file_io(Some(file_io_location), Some(config))
+            .load_file_io(Some(file_io_location), Some(materialization.config.clone()))
             .await?;
+        let table = materialization.materialize_with_file_io(file_io)?;
+        Ok(RestTableWithAccessDelegation {
+            table,
+            access_delegation,
+        })
+    }
 
-        let table_builder = Table::builder()
-            .identifier(table_ident)
-            .file_io(file_io)
-            .metadata(response.metadata);
-        match response.metadata_location {
-            Some(metadata_location) => table_builder.metadata_location(metadata_location).build(),
-            None => table_builder.build(),
+    fn defer_table_response(
+        &self,
+        table_ident: TableIdent,
+        response: LoadTableResult,
+    ) -> DeferredRestTableWithAccessDelegation {
+        let LoadTableResult {
+            metadata_location,
+            metadata,
+            config,
+            storage_credentials,
+        } = response;
+        DeferredRestTableWithAccessDelegation {
+            materialization: DeferredRestTableMaterialization {
+                table_ident,
+                metadata_location,
+                metadata,
+                config,
+            },
+            access_delegation: RestAccessDelegation::new(storage_credentials),
         }
     }
 
@@ -1161,8 +1663,9 @@ impl Catalog for RestCatalog {
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
-        self.create_table_with_stage(namespace, creation, false)
+        self.create_table_with_stage(namespace, creation, false, false)
             .await
+            .map(|response| response.into_parts().0)
     }
 
     /// Load table from the catalog.
@@ -1199,26 +1702,9 @@ impl Catalog for RestCatalog {
             }
         };
 
-        let config = response
-            .config
-            .into_iter()
-            .chain(self.user_config.props.clone())
-            .collect();
-
-        let file_io = self
-            .load_file_io(response.metadata_location.as_deref(), Some(config))
-            .await?;
-
-        let table_builder = Table::builder()
-            .identifier(table_ident.clone())
-            .file_io(file_io)
-            .metadata(response.metadata);
-
-        if let Some(metadata_location) = response.metadata_location {
-            table_builder.metadata_location(metadata_location).build()
-        } else {
-            table_builder.build()
-        }
+        self.materialize_table_response(table_ident.clone(), response)
+            .await
+            .map(|response| response.into_parts().0)
     }
 
     /// Drop a table from the catalog.
@@ -1681,7 +2167,7 @@ mod tests {
         UnboundPartitionSpec,
     };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
-    use mockito::{Mock, Server, ServerGuard};
+    use mockito::{Matcher, Mock, Server, ServerGuard};
     use serde_json::json;
     use uuid::uuid;
 
@@ -2914,6 +3400,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn access_delegation_is_opt_in_and_preserves_redacted_facts() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let response = std::fs::read_to_string(format!(
+            "{}/testdata/load_table_response.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replacen(
+            "\n}",
+            ",\n  \"storage-credentials\": [{\n    \"prefix\": \"s3://warehouse/database/\",\n    \"config\": {\"s3.access-key-id\": \"access-canary\", \"s3.secret-access-key\": \"secret-canary\"}\n  }]\n}",
+            1,
+        );
+        let ordinary = server
+            .mock("GET", "/v1/namespaces/ns1/tables/ordinary")
+            .match_header(REST_CATALOG_HEADER_ACCESS_DELEGATION, Matcher::Missing)
+            .with_status(200)
+            .with_body(response.clone())
+            .create_async()
+            .await;
+        let delegated = server
+            .mock("GET", "/v1/namespaces/ns1/tables/delegated")
+            .match_header(
+                REST_CATALOG_HEADER_ACCESS_DELEGATION,
+                REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            )
+            .with_status(200)
+            .with_body(response)
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let ordinary_table = catalog
+            .load_table(&TableIdent::from_strs(["ns1", "ordinary"]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ordinary_table.identifier().name, "ordinary");
+        let delegated_response = catalog
+            .load_table_deferred_with_access_delegation(
+                &TableIdent::from_strs(["ns1", "delegated"]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (materialization, delegation) = delegated_response.into_parts();
+        assert!(delegation.is_present());
+        assert_eq!(delegation.len(), 1);
+        let credential = delegation
+            .credentials()
+            .next()
+            .unwrap();
+        assert_eq!(credential.prefix(), "s3://warehouse/database/");
+        assert_eq!(credential.config_value("s3.access-key-id"), Some("access-canary"));
+        assert!(format!("{credential:?}").contains("s3.access-key-id"));
+        assert!(!format!("{credential:?}").contains("secret-canary"));
+        assert!(!format!("{materialization:?}").contains("secret-canary"));
+        let request_scoped_table = materialization
+            .materialize_with_file_io(FileIO::new_with_memory())
+            .expect("materialize deferred response with caller-owned FileIO");
+        assert_eq!(request_scoped_table.identifier().name, "delegated");
+
+        config_mock.assert_async().await;
+        ordinary.assert_async().await;
+        delegated.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn credential_refresh_uses_catalog_authentication_and_redacts_values() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let credentials = server
+            .mock("GET", "/credentials")
+            .match_header("authorization", "Bearer refresh-token")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "storage-credentials": [{
+                        "prefix": "s3://warehouse/data/",
+                        "config": {
+                            "s3.access-key-id": "access-canary",
+                            "s3.secret-access-key": "secret-canary"
+                        }
+                    }]
+                }"#,
+            )
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([("token".to_string(), "refresh-token".to_string())]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let delegation = catalog
+            .load_credentials_with_access_delegation(&format!("{}/credentials", server.url()))
+            .await
+            .expect("refresh response");
+        assert!(delegation.is_present());
+        assert_eq!(delegation.len(), 1);
+        let credential = delegation.credentials().next().expect("credential");
+        assert_eq!(credential.prefix(), "s3://warehouse/data/");
+        assert_eq!(credential.config_value("s3.access-key-id"), Some("access-canary"));
+        assert!(!format!("{credential:?}").contains("secret-canary"));
+        assert!(!format!("{delegation:?}").contains("secret-canary"));
+
+        config_mock.assert_async().await;
+        credentials.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_load_table_404() {
         let mut server = Server::new_async().await;
 
@@ -3298,6 +3898,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_deferred_stage_create_keeps_vended_credentials_out_of_file_io() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let response = std::fs::read_to_string(format!(
+            "{}/testdata/create_table_response.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replacen(
+            "\n}",
+            ",\n  \"storage-credentials\": [{\n    \"prefix\": \"s3://warehouse/database/\",\n    \"config\": {\"s3.access-key-id\": \"access-canary\", \"s3.secret-access-key\": \"secret-canary\"}\n  }]\n}",
+            1,
+        );
+        let stage_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables")
+            .match_header(
+                REST_CATALOG_HEADER_ACCESS_DELEGATION,
+                REST_CATALOG_ACCESS_DELEGATION_VENDED_CREDENTIALS,
+            )
+            .with_status(200)
+            .with_body(response)
+            .create_async()
+            .await;
+        // No StorageFactory is installed. A successful deferred response
+        // proves the method did not select a catalog-global FileIO first.
+        let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
+
+        let staged = catalog
+            .stage_create_table_typed_deferred_with_access_delegation(
+                &NamespaceIdent::from_strs(["ns1"]).unwrap(),
+                typed_stage_creation(),
+            )
+            .await
+            .expect("deferred stage response");
+        let (materialization, initialization_updates, delegation) = staged.into_parts();
+        assert!(!initialization_updates.is_empty());
+        assert!(delegation.is_present());
+        assert!(!format!("{materialization:?}").contains("secret-canary"));
+        assert!(!format!("{delegation:?}").contains("secret-canary"));
+        let table = materialization
+            .materialize_with_file_io(FileIO::new_with_memory())
+            .expect("caller-owned request FileIO materializes staged table");
+        assert_eq!(table.identifier().name, "test1");
+
+        config_mock.assert_async().await;
+        stage_mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn test_typed_stage_create_preserves_conflict_and_dispatch_uncertainty() {
         for (status, expected_conflict) in [(409, true), (503, false)] {
             let mut server = Server::new_async().await;
@@ -3390,6 +4039,36 @@ mod tests {
             config_mock.assert_async().await;
             commit_mock.assert_async().await;
         }
+    }
+
+    #[tokio::test]
+    async fn typed_staged_commit_with_caller_file_io_needs_no_catalog_storage_factory() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let response = json!({
+            "metadata-location": "s3://warehouse/database/table/metadata/v1.metadata.json",
+            "metadata": staged_metadata_json(),
+        });
+        let commit_mock = server
+            .mock("POST", "/v1/namespaces/ns1/tables/test1")
+            .with_status(200)
+            .with_body(response.to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        // The caller-owned FileIO is the only storage capability. A vended
+        // catalog must not need a catalog-global StorageFactory to finalize a
+        // successful staged commit response.
+        let catalog = RestCatalog::new(RestCatalogConfig::builder().uri(server.url()).build(), None);
+
+        let table = catalog
+            .commit_staged_table_typed_with_file_io(typed_staged_commit(), FileIO::new_with_memory())
+            .await
+            .expect("caller-owned FileIO materializes committed staged response");
+        assert_eq!(table.identifier().name, "test1");
+
+        config_mock.assert_async().await;
+        commit_mock.assert_async().await;
     }
 
     fn staged_metadata_json() -> serde_json::Value {

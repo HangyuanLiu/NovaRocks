@@ -116,6 +116,23 @@ fn load_connector_table_materialization_with_resolution(
     let planning_lease = controls
         .acquire_current(&instance_id)
         .map_err(|error| error.to_string())?;
+    // The query-wide collector is attached at admitted query preparation, but
+    // only this exact planning lease knows which durable catalog generation a
+    // metadata response belongs to. Decorate this one request after acquiring
+    // the lease so a multi-catalog query cannot misattribute a vended seed.
+    let context = if context.vended_credential_lease_sink().is_some() {
+        context
+            .with_vended_credential_lease_collection(
+                planning_lease
+                    .binding()
+                    .catalog_properties()
+                    .map_err(|error| error.to_string())?
+                    .clone(),
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        context
+    };
     let metadata = planning_lease
         .binding()
         .metadata()

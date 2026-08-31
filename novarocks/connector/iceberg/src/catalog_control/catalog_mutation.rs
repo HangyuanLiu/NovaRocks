@@ -30,11 +30,11 @@ use novarocks_spi::connector::{
     ConnectorDataType, ConnectorDropTableDataDisposition, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorMvMetadataOnlyProvenance, ConnectorPartitionTransform,
-    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction, ConnectorSchemaChange,
-    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreateOrReplacePolicy,
-    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-    ProviderBindingEpoch,
+    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction,
+    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
+    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -174,11 +174,16 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         }
 
         let operation_kind = request.operation.kind();
-        let evidence = match mutation_evidence(self, request.operation_id, &request.operation) {
+        let evidence = match mutation_evidence(
+            self,
+            request.operation_id,
+            &request.operation,
+            &request.context,
+        ) {
             Ok(value) => value,
             Err(error) => return Ok(known_uncommitted(error)),
         };
-        let result = execute_operation(self, &request.operation);
+        let result = execute_operation(self, &request.operation, &request.context);
         match result {
             Ok(effect) => Ok(ExternalMutationOutcome::KnownCommitted {
                 effect,
@@ -215,7 +220,7 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         }
         let decoded = decode_mutation_evidence(request.evidence.provider_payload())
             .map_err(|error| invalid(format!("decode Iceberg mutation evidence: {error}")))?;
-        reconcile_evidence(self, decoded.target, request.evidence)
+        reconcile_evidence(self, decoded.target, request.evidence, &request.context)
     }
 }
 
@@ -288,6 +293,7 @@ fn namespace_effect(
 fn execute_operation(
     provider: &IcebergMetadata,
     operation: &ConnectorCatalogMutationOperation,
+    context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     match operation {
         ConnectorCatalogMutationOperation::CreateTable { .. } => Err(ConnectorError::new(
@@ -411,12 +417,12 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
             ensure_owner(provider, &table.instance_id)?;
-            alter_schema(provider.runtime(), table, changes)?;
+            alter_schema(provider.runtime(), table, changes, context)?;
             Ok(ExternalMutationEffect::Applied)
         }
         ConnectorCatalogMutationOperation::AlterPartitionSpec { table, add, drop } => {
             ensure_owner(provider, &table.instance_id)?;
-            alter_partition_spec(provider.runtime(), table, add, drop)?;
+            alter_partition_spec(provider.runtime(), table, add, drop, context)?;
             Ok(ExternalMutationEffect::Applied)
         }
         ConnectorCatalogMutationOperation::AlterProperties {
@@ -426,14 +432,14 @@ fn execute_operation(
             expected_committed_partitioning: _,
         } => {
             ensure_owner(provider, &table.instance_id)?;
-            alter_properties(provider.runtime(), table, changes, *authority)?;
+            alter_properties(provider.runtime(), table, changes, *authority, context)?;
             Ok(ExternalMutationEffect::Applied)
         }
         ConnectorCatalogMutationOperation::AlterRef { table, action } => {
             ensure_owner(provider, &table.instance_id)?;
             let loaded = provider
                 .runtime()
-                .load_table(&table.namespace, &table.table)
+                .load_table_for_request(&table.namespace, &table.table, context)
                 .map_err(unavailable)?;
             let plan = lower_ref_action(
                 action.clone(),
@@ -447,7 +453,9 @@ fn execute_operation(
                 .runtime()
                 .resources()
                 .catalog_runtime()
-                .block_on(async move { execute_ref_action(catalog.as_ref(), &plan).await })
+                .block_on(async move {
+                    execute_ref_action(catalog.as_ref(), &loaded.table, &plan).await
+                })
                 .map_err(unavailable)?
                 .map_err(unavailable)?;
             provider
@@ -659,7 +667,12 @@ fn execute_create_table(
     };
     let evidence = match &exact_admission {
         Some(facts) => hadoop_create_evidence(provider, request, table, facts)?,
-        None => mutation_evidence(provider, request.operation_id, &request.operation)?,
+        None => mutation_evidence(
+            provider,
+            request.operation_id,
+            &request.operation,
+            &request.context,
+        )?,
     };
     validate_context(&request.context)?;
     let committed = provider
@@ -961,6 +974,7 @@ fn alter_partition_spec(
     table: &ConnectorTableIdentity,
     add: &[ConnectorPartitionTransform],
     drop: &[ConnectorPartitionTransform],
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     if add.len() + drop.len() != 1 {
         return Err(invalid(
@@ -968,7 +982,7 @@ fn alter_partition_spec(
         ));
     }
     let loaded = runtime
-        .load_table(&table.namespace, &table.table)
+        .load_table_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
     let base_spec_id = metadata.default_partition_spec_id();
@@ -1153,12 +1167,13 @@ fn alter_properties(
     table: &ConnectorTableIdentity,
     changes: &[ConnectorPropertyChange],
     authority: ConnectorPropertyAuthority,
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     if changes.is_empty() {
         return Err(invalid("Iceberg property mutation is empty"));
     }
     let loaded = runtime
-        .load_table(&table.namespace, &table.table)
+        .load_table_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
     let updates = property_updates(metadata, changes, authority)?;
@@ -1278,6 +1293,7 @@ fn alter_schema(
     runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
     changes: &[ConnectorSchemaChange],
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     let [change] = changes else {
         return Err(ConnectorError::new(
@@ -1286,7 +1302,7 @@ fn alter_schema(
         ));
     };
     let loaded = runtime
-        .load_table(&table.namespace, &table.table)
+        .load_table_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?;
     let metadata = loaded.table.metadata();
     // Reserved lineage columns are an engine contract rather than observed
@@ -1783,7 +1799,7 @@ fn execute_bootstrap(
         BOOTSTRAP_OPERATION_MARKER.to_string(),
         operation_marker.clone(),
     );
-    let loaded = match load_optional_table(provider.runtime(), table)? {
+    let loaded = match load_optional_table(provider.runtime(), table, &request.context)? {
         Some(loaded) => loaded,
         None => return Ok(known_uncommitted(not_found("Iceberg table does not exist"))),
     };
@@ -1821,14 +1837,13 @@ fn execute_bootstrap(
         },
     )?;
     validate_context(&request.context)?;
-    let ident = table_ident(table).map_err(invalid)?;
+    let current = loaded.table.clone();
     let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let current = catalog.load_table(&ident).await?;
             if current.metadata().current_snapshot().is_some() {
                 return Err(crate::iceberg::Error::new(
                     crate::iceberg::ErrorKind::PreconditionFailed,
@@ -1853,7 +1868,7 @@ fn execute_bootstrap(
             let base = current.clone();
             crate::commit::helpers::submit_action_commit(
                 catalog.as_ref(),
-                ident.clone(),
+                current.identifier().clone(),
                 staged,
                 Vec::new(),
             )
@@ -1915,7 +1930,7 @@ fn execute_metadata_only_mv_stage(
             "metadata-only MV staging has invalid target table UUID: {error}"
         ))
     })?;
-    let loaded = match load_optional_table(provider.runtime(), table)? {
+    let loaded = match load_optional_table(provider.runtime(), table, &request.context)? {
         Some(loaded) => loaded,
         None => {
             return Ok(known_uncommitted(not_found(
@@ -1989,7 +2004,7 @@ fn execute_metadata_only_mv_stage(
     )?;
     let snapshot_properties = provenance.to_summary_properties().map_err(invalid)?;
     validate_context(&request.context)?;
-    let ident = table_ident(table).map_err(invalid)?;
+    let current = loaded.table.clone();
     let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let branch = staging_branch.to_string();
     let committed = provider
@@ -1997,7 +2012,6 @@ fn execute_metadata_only_mv_stage(
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            let current = catalog.load_table(&ident).await?;
             let metadata = current.metadata();
             if metadata.uuid() != expected_uuid
                 || metadata.current_snapshot_id() != expected_main_snapshot_id
@@ -2065,7 +2079,7 @@ fn execute_metadata_only_mv_stage(
                 FormatVersion::V1 | FormatVersion::V2 => snapshot_builder.build(),
             };
             let commit = TableCommit::builder()
-                .ident(ident)
+                .ident(current.identifier().clone())
                 .requirements(vec![
                     TableRequirement::UuidMatch {
                         uuid: expected_uuid,
@@ -2154,10 +2168,11 @@ fn execute_guarded_properties(
             "Iceberg property mutation is empty",
         )));
     }
-    let loaded = match provider
-        .runtime()
-        .load_table(&table.namespace, &table.table)
-    {
+    let loaded = match provider.runtime().load_table_for_request(
+        &table.namespace,
+        &table.table,
+        &request.context,
+    ) {
         Ok(loaded) => loaded,
         Err(error) => return Ok(known_uncommitted(unavailable(error))),
     };
@@ -2187,7 +2202,12 @@ fn execute_guarded_properties(
             finalization: ExternalMutationFinalization::Complete,
         });
     }
-    let evidence = mutation_evidence(provider, request.operation_id, &request.operation)?;
+    let evidence = mutation_evidence(
+        provider,
+        request.operation_id,
+        &request.operation,
+        &request.context,
+    )?;
     validate_context(&request.context)?;
     let commit = TableCommit::builder()
         .ident(table_ident(table).map_err(invalid)?)
@@ -2281,7 +2301,7 @@ fn execute_guarded_publication(
     ensure_mv_publication_staging_ref(source_branch, guard.publication_id())?;
     let loaded = provider
         .runtime()
-        .load_table(&table.namespace, &table.table)
+        .load_table_for_request(&table.namespace, &table.table, &request.context)
         .map_err(unavailable)?;
     let marker = crate::commit::MvPublicationSnapshotMarker {
         publication_id: guard.publication_id(),
@@ -2349,12 +2369,14 @@ fn execute_guarded_publication(
     };
     validate_context(&request.context)?;
     let catalog = provider.runtime().novarocks_catalog().vendored_client();
+    let scoped_table = loaded.table.clone();
     let result = provider
         .runtime()
         .resources()
         .catalog_runtime()
         .block_on(async move {
-            crate::commit::publish_staging_branch_to_main(catalog.as_ref(), &plan).await
+            crate::commit::publish_staging_branch_to_main(catalog.as_ref(), &scoped_table, &plan)
+                .await
         });
     match result {
         Ok(Ok(outcome)) => {
@@ -2364,7 +2386,7 @@ fn execute_guarded_publication(
                 .invalidate_table_cache(&table.namespace, &table.table);
             let current = provider
                 .runtime()
-                .load_table(&table.namespace, &table.table)
+                .load_table_for_request(&table.namespace, &table.table, &request.context)
                 .map_err(unavailable)?;
             Ok(ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
@@ -2416,6 +2438,7 @@ fn mutation_evidence(
     provider: &IcebergMetadata,
     operation_id: ConnectorMutationOperationId,
     operation: &ConnectorCatalogMutationOperation,
+    context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
     let target = match operation {
         ConnectorCatalogMutationOperation::CreateNamespace { namespace, .. } => {
@@ -2436,7 +2459,7 @@ fn mutation_evidence(
                 operation,
                 ConnectorCatalogMutationOperation::CreateTable { .. }
             );
-            let before_uuid = load_optional_table(provider.runtime(), table)?
+            let before_uuid = load_optional_table(provider.runtime(), table, context)?
                 .map(|loaded| loaded.table.metadata().uuid().to_string());
             IcebergMutationEvidenceTarget::Table {
                 namespace: table.namespace.to_string(),
@@ -2461,7 +2484,7 @@ fn mutation_evidence(
         | ConnectorCatalogMutationOperation::AlterProperties { table, .. } => {
             let loaded = provider
                 .runtime()
-                .load_table(&table.namespace, &table.table)
+                .load_table_for_request(&table.namespace, &table.table, context)
                 .map_err(unavailable)?;
             IcebergMutationEvidenceTarget::TableVersion {
                 namespace: table.namespace.to_string(),
@@ -2473,7 +2496,7 @@ fn mutation_evidence(
         ConnectorCatalogMutationOperation::AlterRef { table, action } => {
             let loaded = provider
                 .runtime()
-                .load_table(&table.namespace, &table.table)
+                .load_table_for_request(&table.namespace, &table.table, context)
                 .map_err(unavailable)?;
             let (ref_name, expected_snapshot_id) = match action {
                 ConnectorRefAction::Create {
@@ -2557,6 +2580,7 @@ fn reconcile_evidence(
     provider: &IcebergMetadata,
     target: IcebergMutationEvidenceTarget,
     evidence: ExternalMutationEvidence,
+    context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     let committed = |provider_version: Option<&str>| {
         Ok(ExternalMutationOutcome::KnownCommitted {
@@ -2606,7 +2630,7 @@ fn reconcile_evidence(
                 namespace: namespace.into(),
                 table: table.into(),
             };
-            let current = load_optional_table(provider.runtime(), &identity)?;
+            let current = load_optional_table(provider.runtime(), &identity, context)?;
             match (should_exist, before_uuid, current) {
                 (true, None, Some(_)) | (false, _, None) => {
                     ambiguous("Iceberg table postcondition matches but cannot be attributed")
@@ -2707,7 +2731,7 @@ fn reconcile_evidence(
                 namespace: namespace.into(),
                 table: table.into(),
             };
-            let Some(current) = load_optional_table(provider.runtime(), &identity)? else {
+            let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
                 return ambiguous("Iceberg table disappeared during mutation reconciliation");
             };
             if current.table.metadata().uuid().to_string() != table_uuid {
@@ -2732,7 +2756,7 @@ fn reconcile_evidence(
                 namespace: namespace.into(),
                 table: table.into(),
             };
-            let Some(current) = load_optional_table(provider.runtime(), &identity)? else {
+            let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
                 return uncommitted("Iceberg bootstrap table does not exist");
             };
             if current.table.metadata().uuid().to_string() != table_uuid {
@@ -2769,6 +2793,7 @@ fn reconcile_evidence(
             &table_uuid,
             &ref_name,
             expected_snapshot_id,
+            context,
         ),
         IcebergMutationEvidenceTarget::GuardedFastForward { .. } => Err(unsupported(
             "MV staging publication is crash-only and cannot be reconciled after CommitUnknown",
@@ -2802,13 +2827,14 @@ fn reconcile_ref(
     table_uuid: &str,
     ref_name: &str,
     expected_snapshot_id: Option<i64>,
+    context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
     let identity = ConnectorTableIdentity {
         instance_id: provider.descriptor().instance_id.clone(),
         namespace: namespace.into(),
         table: table.into(),
     };
-    let Some(current) = load_optional_table(provider.runtime(), &identity)? else {
+    let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
         return Ok(known_uncommitted(not_found(
             "Iceberg table does not exist during ref reconciliation",
         )));
@@ -2849,6 +2875,7 @@ fn reconcile_ref(
 fn load_optional_table(
     runtime: &IcebergMetadataContext,
     table: &ConnectorTableIdentity,
+    context: &ConnectorRequestContext,
 ) -> Result<Option<crate::loaded_table::IcebergPhysicalTable>, ConnectorError> {
     if !runtime
         .table_exists(&table.namespace, &table.table)
@@ -2857,7 +2884,7 @@ fn load_optional_table(
         return Ok(None);
     }
     runtime
-        .load_table(&table.namespace, &table.table)
+        .load_table_for_request(&table.namespace, &table.table, context)
         .map(Some)
         .map_err(unavailable)
 }
@@ -3719,7 +3746,7 @@ mod tests {
             },
         };
 
-        let error = alter_schema(provider.runtime(), &table, &[change])
+        let error = alter_schema(provider.runtime(), &table, &[change], &context())
             .expect_err("reserved field must not be resolved from table metadata");
 
         assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);

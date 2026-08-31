@@ -29,8 +29,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_proto_codec::connector_read::ConnectorReadCodec;
 use novarocks_spi::connector::CatalogHandle;
-use novarocks_spi::connector::read_stack::{ConnectorReadMetadata, ConnectorReadSplitManager};
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::read_stack::{
+    ConnectorReadMetadata, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
+    ConnectorReadSplitManager,
+};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorRequestContext};
 
 /// Frontend spelling of the SPI marker retained by a connector-owned control
 /// generation.  Keeping the marker in SPI lets a connector retain the lease
@@ -46,6 +49,7 @@ pub use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease as 
 pub struct InstalledReadControl {
     metadata: Arc<dyn ConnectorReadMetadata>,
     splits: Arc<dyn ConnectorReadSplitManager>,
+    request_factory: Option<Arc<dyn ConnectorReadRequestControlFactory>>,
     codec: Arc<dyn ConnectorReadCodec>,
     registration_lease: Option<Weak<dyn ReadControlRegistrationLease>>,
 }
@@ -59,6 +63,7 @@ impl InstalledReadControl {
         Self {
             metadata,
             splits,
+            request_factory: None,
             codec,
             registration_lease: None,
         }
@@ -78,6 +83,29 @@ impl InstalledReadControl {
 
     pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
         Arc::clone(&self.splits)
+    }
+
+    pub fn with_request_factory(
+        mut self,
+        request_factory: Arc<dyn ConnectorReadRequestControlFactory>,
+    ) -> Self {
+        self.request_factory = Some(request_factory);
+        self
+    }
+
+    pub fn for_request(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<ConnectorReadRequestControl, ConnectorError> {
+        self.request_factory.as_ref().map_or_else(
+            || {
+                Ok(ConnectorReadRequestControl::new(
+                    Arc::clone(&self.metadata),
+                    Arc::clone(&self.splits),
+                ))
+            },
+            |factory| factory.for_request(request),
+        )
     }
 
     pub fn codec(&self) -> Arc<dyn ConnectorReadCodec> {

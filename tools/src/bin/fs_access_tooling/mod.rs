@@ -15,46 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
 use novarocks_fs::{
-    FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig, ObjectStoreCredentials,
-    ObjectStoreCredentialsSource,
+    FsAccessHandle, FsAccessResolver, ObjectStoreAccessContext,
 };
-
-pub fn object_store_config_from_fs_options(
-    fs_options: &BTreeMap<String, String>,
-) -> Result<Option<ObjectStoreConfig>, String> {
-    let has_s3a = fs_options.keys().any(|key| key.starts_with("fs.s3a."));
-    if !has_s3a {
-        return Ok(None);
-    }
-    let credentials = ObjectStoreCredentials::from_s3a_properties(
-        ObjectStoreCredentialsSource::S3AProperties,
-        fs_options,
-    )?;
-    Ok(Some(credentials.to_object_store_config()))
-}
+use novarocks_spi::connector::StorageAccessDomainId;
 
 pub fn resolve_tool_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    access_domain: StorageAccessDomainId,
+    object_store_access: Option<ObjectStoreAccessContext<'_>>,
 ) -> Result<FsAccessHandle, String> {
     let resolver = FsAccessResolver::new();
-    let parsed = resolver
-        .parse_location(location)
-        .map_err(|error| error.to_string())?;
-    match parsed.scheme() {
-        FsScheme::Local => resolver
-            .resolve_location(location, None)
-            .map_err(|error| error.to_string()),
-        FsScheme::ObjectStore => resolver
-            .resolve_location(location, object_store_config)
-            .map_err(|error| error.to_string()),
-        FsScheme::Hdfs => Err(format!(
-            "tools do not support hdfs location yet: {location}"
-        )),
-    }
+    resolver
+        .resolve_location(access_domain, location, object_store_access)
+        .map_err(|error| error.to_string())
 }
 
 pub fn single_relative_path(handle: &FsAccessHandle, location: &str) -> Result<String, String> {

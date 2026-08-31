@@ -45,6 +45,16 @@ pub trait Scenario: Send + Sync {
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
+
+    /// Releases an external fixture created while preparing this scenario.
+    ///
+    /// The runner calls this after both successful and failed cluster runs, as
+    /// well as when cluster launch itself fails. Implementations must be
+    /// idempotent because launch preparation can fail after allocating a
+    /// fixture.
+    fn teardown(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default)]

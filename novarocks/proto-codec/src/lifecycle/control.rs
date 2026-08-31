@@ -2,8 +2,17 @@
 //!
 //! This module owns only neutral protocol carriers. Every wrapper contains one
 //! generated message; role-local control streams, transport, and runtime
-//! profile interpretation remain with their application owners.
+//! profile interpretation remain with their application owners. Confidential
+//! credential lease frames are deliberately fail-closed here: callers must use
+//! the explicit TLS ingress parser after verifying the actual connection.
 
+use std::fmt;
+
+use super::credential_lease::{
+    CredentialLeaseSecretEnvelope, decode_credential_lease_secret_envelope,
+    encode_credential_lease_secret_envelope, validate_initial_credential_lease_envelopes,
+    validate_lease_epoch,
+};
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::manifest::{ParticipantAttemptRef, ParticipantManifest, ParticipantManifestDigest};
 use super::terminal::ParticipantTerminalOutcome;
@@ -23,7 +32,7 @@ pub use novarocks::ReportQueryTerminalOutcome as QueryTerminalReportOutcome;
 /// The request carries the participant manifest alone. Its descriptor-derived
 /// identity is not carried here: each role derives it from the manifest at its
 /// own admission boundary and retains it with role-local state.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct QueryInitRequest {
     raw: novarocks::InitQueryRequest,
 }
@@ -31,14 +40,70 @@ pub struct QueryInitRequest {
 impl QueryInitRequest {
     /// Frames one validated generated manifest.
     pub fn from_manifest(manifest: ParticipantManifest) -> Self {
-        Self::parse(novarocks::InitQueryRequest {
-            manifest: Some(manifest.as_proto().clone()),
-        })
-        .expect("validated participant manifest forms a valid InitQuery request")
+        Self::from_manifest_with_credential_lease_envelopes(manifest, [])
+            .expect("manifest without lease descriptors forms a valid InitQuery request")
     }
 
+    /// Retain the public manifest after the FE has finished every Init retry
+    /// and scrubbed its confidential side channel. This value is for local
+    /// lifecycle identity/terminal validation only and must never be sent as a
+    /// new Init RPC: BE ingress deliberately rejects descriptors without their
+    /// TLS envelopes.
+    pub fn retain_manifest_after_confidential_send(manifest: ParticipantManifest) -> Self {
+        Self {
+            raw: novarocks::InitQueryRequest {
+                manifest: Some(manifest.as_proto().clone()),
+                credential_lease_envelopes: Vec::new(),
+            },
+        }
+    }
+
+    /// Frames an Init request that carries confidential values. This constructor
+    /// is for the FE TLS sender path. BE ingress must use `parse_tls` only
+    /// after it has independently verified the native connection is TLS.
+    pub fn from_manifest_with_credential_lease_envelopes(
+        manifest: ParticipantManifest,
+        envelopes: impl IntoIterator<Item = CredentialLeaseSecretEnvelope>,
+    ) -> Result<Self, ProtocolError> {
+        let mut credential_lease_envelopes = envelopes
+            .into_iter()
+            .map(|envelope| encode_credential_lease_secret_envelope(&envelope))
+            .collect::<Vec<_>>();
+        credential_lease_envelopes.sort_by(|left, right| left.lease_id.cmp(&right.lease_id));
+        Self::parse_tls(novarocks::InitQueryRequest {
+            manifest: Some(manifest.as_proto().clone()),
+            credential_lease_envelopes,
+        })
+    }
+
+    /// Parses an Init request that does not carry confidential lease material.
+    /// The default parser must not be used as an h2c bypass for vended values.
     pub fn parse(raw: novarocks::InitQueryRequest) -> Result<Self, ProtocolError> {
-        required_manifest(&raw.manifest)?;
+        if !raw.credential_lease_envelopes.is_empty() {
+            return Err(ProtocolError::new(
+                FieldPath::root("init_query_request").field("credential_lease_envelopes"),
+                ProtocolErrorKind::InvalidValue,
+                "credential lease envelopes require TLS-aware InitQuery ingress",
+            ));
+        }
+        Self::parse_inner(raw)
+    }
+
+    /// Parses confidential Init material after the BE RPC ingress has checked
+    /// that the concrete native transport is TLS. This type intentionally does
+    /// not accept a boolean transport hint: an h2c caller cannot opt in by
+    /// putting a claim in its protobuf body.
+    pub fn parse_tls(raw: novarocks::InitQueryRequest) -> Result<Self, ProtocolError> {
+        Self::parse_inner(raw)
+    }
+
+    fn parse_inner(raw: novarocks::InitQueryRequest) -> Result<Self, ProtocolError> {
+        let manifest = required_manifest(&raw.manifest)?;
+        validate_initial_credential_lease_envelopes(
+            &manifest.as_proto().credential_lease_descriptors,
+            &raw.credential_lease_envelopes,
+            FieldPath::root("init_query_request"),
+        )?;
         Ok(Self { raw })
     }
 
@@ -48,6 +113,49 @@ impl QueryInitRequest {
 
     pub fn manifest(&self) -> Result<ParticipantManifest, ProtocolError> {
         required_manifest(&self.raw.manifest)
+    }
+
+    /// Projects confidential values only when the TLS-bound request owner
+    /// explicitly asks for them. The generated envelope is not exposed by a
+    /// secret-bearing Debug implementation.
+    pub fn credential_lease_envelopes(
+        &self,
+    ) -> Result<Vec<CredentialLeaseSecretEnvelope>, ProtocolError> {
+        self.raw
+            .credential_lease_envelopes
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, envelope)| {
+                decode_credential_lease_secret_envelope(
+                    envelope,
+                    FieldPath::root("init_query_request")
+                        .field("credential_lease_envelopes")
+                        .index(index),
+                )
+            })
+            .collect()
+    }
+}
+
+impl fmt::Debug for QueryInitRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("QueryInitRequest")
+            .field(
+                "credential_lease_descriptor_count",
+                &self
+                    .raw
+                    .manifest
+                    .as_ref()
+                    .map_or(0, |manifest| manifest.credential_lease_descriptors.len()),
+            )
+            .field(
+                "credential_lease_envelope_count",
+                &self.raw.credential_lease_envelopes.len(),
+            )
+            .field("credential_lease_material", &"[REDACTED]")
+            .finish()
     }
 }
 
@@ -136,13 +244,33 @@ impl QueryControlAttach {
 
 /// A validated active-stream control request. The exact oneof remains in the
 /// generated message, rather than being mirrored by a Rust command enum.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct QueryControlCommand {
     raw: novarocks::QueryControlRequest,
 }
 
 impl QueryControlCommand {
     pub fn parse(raw: novarocks::QueryControlRequest) -> Result<Self, ProtocolError> {
+        if matches!(
+            raw.command.as_ref(),
+            Some(novarocks::query_control_request::Command::CredentialLeasePrepare(_))
+        ) {
+            return Err(ProtocolError::new(
+                FieldPath::root("query_control_request").field("command"),
+                ProtocolErrorKind::InvalidValue,
+                "credential lease prepare requires TLS-aware query-control ingress",
+            ));
+        }
+        Self::parse_inner(raw)
+    }
+
+    /// Parses a control frame after the BE stream owner has independently
+    /// verified its concrete native transport is TLS.
+    pub fn parse_tls(raw: novarocks::QueryControlRequest) -> Result<Self, ProtocolError> {
+        Self::parse_inner(raw)
+    }
+
+    fn parse_inner(raw: novarocks::QueryControlRequest) -> Result<Self, ProtocolError> {
         use novarocks::query_control_request::Command;
 
         match raw.command.as_ref() {
@@ -150,6 +278,33 @@ impl QueryControlCommand {
             Some(Command::Abort(abort)) if !abort.reason.trim().is_empty() => {}
             Some(Command::TerminalAck(ack)) => {
                 QueryTerminalAck::parse(ack.clone())?;
+            }
+            Some(Command::CredentialLeasePrepare(prepare)) => {
+                let envelope = prepare.envelope.clone().ok_or_else(|| {
+                    missing(
+                        FieldPath::root("query_control_request")
+                            .field("command")
+                            .field("credential_lease_prepare")
+                            .field("envelope"),
+                        "credential lease prepare envelope is required",
+                    )
+                })?;
+                decode_credential_lease_secret_envelope(
+                    envelope,
+                    FieldPath::root("query_control_request")
+                        .field("command")
+                        .field("credential_lease_prepare")
+                        .field("envelope"),
+                )?;
+            }
+            Some(Command::CredentialLeaseCommit(commit)) => {
+                validate_lease_epoch(
+                    &commit.lease_id,
+                    commit.epoch,
+                    FieldPath::root("query_control_request")
+                        .field("command")
+                        .field("credential_lease_commit"),
+                )?;
             }
             Some(Command::Abort(_)) => {
                 return Err(invalid(
@@ -179,6 +334,75 @@ impl QueryControlCommand {
 
     pub const fn as_proto(&self) -> &novarocks::QueryControlRequest {
         &self.raw
+    }
+
+    pub fn credential_lease_prepare(
+        &self,
+    ) -> Result<Option<CredentialLeaseSecretEnvelope>, ProtocolError> {
+        match self.raw.command.as_ref() {
+            Some(novarocks::query_control_request::Command::CredentialLeasePrepare(prepare)) => {
+                let envelope = prepare.envelope.clone().ok_or_else(|| {
+                    missing(
+                        FieldPath::root("query_control_request")
+                            .field("command")
+                            .field("credential_lease_prepare")
+                            .field("envelope"),
+                        "credential lease prepare envelope is required",
+                    )
+                })?;
+                decode_credential_lease_secret_envelope(
+                    envelope,
+                    FieldPath::root("query_control_request")
+                        .field("command")
+                        .field("credential_lease_prepare")
+                        .field("envelope"),
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    pub fn credential_lease_commit(
+        &self,
+    ) -> Result<Option<(novarocks_spi::connector::CredentialLeaseId, u64)>, ProtocolError> {
+        match self.raw.command.as_ref() {
+            Some(novarocks::query_control_request::Command::CredentialLeaseCommit(commit)) => {
+                validate_lease_epoch(
+                    &commit.lease_id,
+                    commit.epoch,
+                    FieldPath::root("query_control_request")
+                        .field("command")
+                        .field("credential_lease_commit"),
+                )
+                .map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+impl fmt::Debug for QueryControlCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let has_confidential_prepare = matches!(
+            self.raw.command.as_ref(),
+            Some(novarocks::query_control_request::Command::CredentialLeasePrepare(_))
+        );
+        formatter
+            .debug_struct("QueryControlCommand")
+            .field(
+                "has_confidential_credential_lease_prepare",
+                &has_confidential_prepare,
+            )
+            .field(
+                "credential_lease_material",
+                &if has_confidential_prepare {
+                    "[REDACTED]"
+                } else {
+                    "none"
+                },
+            )
+            .finish()
     }
 }
 
@@ -236,6 +460,24 @@ impl QueryControlEvent {
             }
             Some(Event::RuntimeFilterFeedback(feedback)) => {
                 RuntimeFilterFeedbackEvent::parse(feedback.clone())?;
+            }
+            Some(Event::CredentialLeasePrepared(prepared)) => {
+                validate_lease_epoch(
+                    &prepared.lease_id,
+                    prepared.epoch,
+                    FieldPath::root("query_control_response")
+                        .field("event")
+                        .field("credential_lease_prepared"),
+                )?;
+            }
+            Some(Event::CredentialLeaseCommitted(committed)) => {
+                validate_lease_epoch(
+                    &committed.lease_id,
+                    committed.epoch,
+                    FieldPath::root("query_control_response")
+                        .field("event")
+                        .field("credential_lease_committed"),
+                )?;
             }
             Some(Event::LocalFailure(_)) => {
                 return Err(invalid(
@@ -744,6 +986,54 @@ mod tests {
         }
     }
 
+    fn vended_lease_init() -> novarocks::InitQueryRequest {
+        let mut manifest = manifest();
+        manifest.catalog_set = Some(catalog::CatalogSet {
+            catalogs: vec![catalog::CatalogProperties {
+                handle: Some(catalog::CatalogHandle {
+                    catalog_name: "warehouse".to_owned(),
+                    version: vec![7; 32],
+                }),
+                provider_kind: catalog::CatalogProviderKind::Iceberg as i32,
+                config_format_version: 1,
+                execution_properties: vec![],
+                credential_bindings: vec![catalog::CatalogCredentialBinding {
+                    purpose: catalog::CatalogCredentialPurpose::ObjectStoreData as i32,
+                    consumer_role: catalog::CredentialConsumerRole::FrontendAndBackend as i32,
+                    mode: Some(catalog::catalog_credential_binding::Mode::VendedCredential(
+                        catalog::VendedCredential {},
+                    )),
+                }],
+            }],
+        });
+        manifest.credential_lease_descriptors = vec![novarocks::CredentialLeaseDescriptor {
+            lease_id: vec![1; 16],
+            epoch: 3,
+            owner: Some(catalog::CatalogHandle {
+                catalog_name: "warehouse".to_owned(),
+                version: vec![7; 32],
+            }),
+            provider: novarocks::CredentialLeaseProvider::S3 as i32,
+            prefixes: vec!["s3://bucket/data".to_owned()],
+            not_after_unix_ms: 99,
+            refresh_capable: true,
+            storage_access_domain_id: vec![8; 32],
+        }];
+        novarocks::InitQueryRequest {
+            manifest: Some(manifest),
+            credential_lease_envelopes: vec![novarocks::CredentialLeaseSecretEnvelope {
+                lease_id: vec![1; 16],
+                epoch: 3,
+                s3: Some(novarocks::CredentialLeaseS3SecretMaterial {
+                    access_key_id: "cca-access-canary".to_owned(),
+                    secret_access_key: "cca-secret-canary".to_owned(),
+                    session_token: "cca-token-canary".to_owned(),
+                    session_token_expires_at_unix_ms: 99,
+                }),
+            }],
+        }
+    }
+
     fn execution_id() -> novarocks::QueryExecutionId {
         novarocks::QueryExecutionId {
             query_id: Some(id(5, 6)),
@@ -771,6 +1061,7 @@ mod tests {
     fn init_request_carries_the_manifest_and_requires_it() {
         let raw = novarocks::InitQueryRequest {
             manifest: Some(manifest()),
+            credential_lease_envelopes: vec![],
         };
         let parsed = QueryInitRequest::parse(raw.clone()).expect("valid request");
         assert_eq!(parsed.as_proto(), &raw);
@@ -786,9 +1077,68 @@ mod tests {
             "the receiver derives the same identity the sender retains"
         );
 
-        let error = QueryInitRequest::parse(novarocks::InitQueryRequest { manifest: None })
-            .expect_err("the manifest is required");
+        let error = QueryInitRequest::parse(novarocks::InitQueryRequest {
+            manifest: None,
+            credential_lease_envelopes: vec![],
+        })
+        .expect_err("the manifest is required");
         assert_eq!(error.detail(), "participant manifest is required");
+    }
+
+    #[test]
+    fn confidential_lease_ingress_requires_the_explicit_tls_parser_and_redacts_debug() {
+        let init = vended_lease_init();
+        let error = QueryInitRequest::parse(init.clone())
+            .expect_err("ordinary ingress must reject confidential material");
+        assert!(error.detail().contains("TLS-aware"));
+        let parsed = QueryInitRequest::parse_tls(init).expect("TLS ingress accepts valid envelope");
+        let rendered = format!("{parsed:?}");
+        assert!(rendered.contains("[REDACTED]"));
+        assert!(!rendered.contains("cca-secret-canary"));
+        assert_eq!(
+            parsed.credential_lease_envelopes().expect("envelope").len(),
+            1
+        );
+        let digest = parsed
+            .manifest()
+            .expect("manifest")
+            .digest()
+            .expect("descriptor digest");
+        let mut changed_value = parsed.as_proto().clone();
+        changed_value.credential_lease_envelopes[0]
+            .s3
+            .as_mut()
+            .expect("S3 material")
+            .secret_access_key = "cca-secret-canary-replaced".to_owned();
+        let changed_value = QueryInitRequest::parse_tls(changed_value)
+            .expect("same descriptor with different secret remains structurally valid");
+        assert_eq!(
+            digest,
+            changed_value
+                .manifest()
+                .expect("manifest")
+                .digest()
+                .expect("descriptor digest"),
+            "confidential material must never enter the manifest digest"
+        );
+
+        let command = novarocks::QueryControlRequest {
+            command: Some(
+                novarocks::query_control_request::Command::CredentialLeasePrepare(
+                    novarocks::CredentialLeasePrepare {
+                        envelope: parsed
+                            .as_proto()
+                            .credential_lease_envelopes
+                            .first()
+                            .cloned(),
+                    },
+                ),
+            ),
+        };
+        assert!(QueryControlCommand::parse(command.clone()).is_err());
+        let parsed = QueryControlCommand::parse_tls(command).expect("TLS control ingress");
+        assert!(format!("{parsed:?}").contains("[REDACTED]"));
+        assert!(!format!("{parsed:?}").contains("cca-secret-canary"));
     }
 
     #[test]

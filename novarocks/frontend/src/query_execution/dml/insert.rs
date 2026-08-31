@@ -96,13 +96,17 @@ pub struct ResolveInsertTarget {
 }
 
 /// Iceberg target metadata used by frontend dispatch and shaping.
-#[derive(Clone)]
 pub struct ResolvedInsertTarget {
     pub catalog: String,
     pub namespace: String,
     pub table: String,
     pub columns: Vec<ColumnDef>,
     pub planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    /// Reserved before the first vended metadata observation.  The target is
+    /// move-only so this capability remains paired with the native write
+    /// attempt that consumes the same provider response.
+    pub(crate) attempt_reservation:
+        Option<crate::query_execution::completion::QueryAttemptReservation>,
 }
 
 impl std::fmt::Debug for ResolvedInsertTarget {
@@ -281,6 +285,15 @@ impl InsertEngine for DmlExecutionKernel {
             &request.execution,
         )?;
         crate::connector::validate_request_context(&connector_context)?;
+        // A REST metadata response may be the first place an Iceberg catalog
+        // reveals vended object-store credentials. Reserve the native attempt
+        // before that observation, then retain the move-only reservation
+        // until this INSERT's raw distributed lifecycle consumes it.
+        let attempt_reservation = self
+            .query_execution()
+            .reserve_initial_attempt()
+            .map_err(|error| error.to_string())?;
+        let connector_context = attempt_reservation.connector_request_context(connector_context);
 
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
@@ -294,16 +307,17 @@ impl InsertEngine for DmlExecutionKernel {
         )?;
         let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
             &planning_lease,
-            connector_context,
+            connector_context.clone(),
             &target.namespace,
             &target.table,
             novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
         )?;
-        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
-            self.connector_control().as_ref(),
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.mv_storage_observation().as_ref(),
+            &planning_lease,
             &target,
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
+            connector_context,
         )?;
         let columns = insert_columns_from_connector_metadata(&metadata);
         Ok(ResolvedInsertTarget {
@@ -312,6 +326,7 @@ impl InsertEngine for DmlExecutionKernel {
             table: target.table,
             columns,
             planning_lease,
+            attempt_reservation: Some(attempt_reservation),
         })
     }
 
@@ -319,8 +334,30 @@ impl InsertEngine for DmlExecutionKernel {
         &self,
         request: PrepareIcebergInsert,
     ) -> Result<PreparedIcebergInsert, String> {
-        let target = target_backend(&request.target, "iceberg");
-        let resolved = resolved_table(&request.target);
+        let ResolvedInsertTarget {
+            catalog,
+            namespace,
+            table,
+            columns,
+            planning_lease,
+            attempt_reservation,
+        } = request.target;
+        let attempt_reservation = attempt_reservation.ok_or_else(|| {
+            "Iceberg INSERT target is missing its reserved native attempt".to_string()
+        })?;
+        let target = TargetBackend {
+            backend_name: "iceberg",
+            catalog: catalog.clone(),
+            namespace: namespace.clone(),
+            table: table.clone(),
+        };
+        let resolved = ResolvedTable {
+            catalog,
+            namespace,
+            table,
+            columns,
+            statistics_pin: None,
+        };
         let source = match request.source {
             IcebergInsertSource::Rows(rows) => iceberg_writer::IcebergWriteInput::Rows(
                 rows.iter()
@@ -341,6 +378,7 @@ impl InsertEngine for DmlExecutionKernel {
             &request.execution,
         )?;
         crate::connector::validate_request_context(&connector_context)?;
+        let connector_context = attempt_reservation.connector_request_context(connector_context);
         let prepared = iceberg_writer::prepare_iceberg_write_with_options(
             self,
             &target,
@@ -354,7 +392,8 @@ impl InsertEngine for DmlExecutionKernel {
             iceberg_writer::IcebergWritePreparationOptions::new(ConnectorWriteOperationId::from(
                 request.publication_id,
             )),
-            request.target.planning_lease.clone(),
+            planning_lease.clone(),
+            attempt_reservation,
         )?;
         let operation = IcebergInsertOperation {
             publication_id: request.publication_id,
@@ -437,10 +476,7 @@ impl InsertEngine for DmlExecutionKernel {
         commit
             .completion
             .session()
-            .adjudicate_publication(
-                evidence,
-                commit.completion.session().request_context().clone(),
-            )
+            .adjudicate_publication(evidence, commit.completion.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 
@@ -526,25 +562,6 @@ fn iceberg_write_report_from_result(
     };
     let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit { completion });
     IcebergWriteReport::CommitRequired(commit)
-}
-
-fn target_backend(target: &ResolvedInsertTarget, backend_name: &'static str) -> TargetBackend {
-    TargetBackend {
-        backend_name,
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    }
-}
-
-fn resolved_table(target: &ResolvedInsertTarget) -> ResolvedTable {
-    ResolvedTable {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-        columns: target.columns.clone(),
-        statistics_pin: None,
-    }
 }
 
 fn insert_value_to_literal(value: &InsertValue) -> Literal {

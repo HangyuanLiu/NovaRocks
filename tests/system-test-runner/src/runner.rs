@@ -52,9 +52,20 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let scenario_root = config.artifact_root.join(scenario.name().replace('/', "-"));
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
-    let launch_config = scenario
-        .launch_config(&scenario_root)
-        .with_context(|| format!("prepare launch configuration for {}", scenario.name()))?;
+    let launch_config = match scenario.launch_config(&scenario_root) {
+        Ok(config) => config,
+        Err(error) => {
+            return match scenario.teardown() {
+                Ok(()) => Err(error).with_context(|| {
+                    format!("prepare launch configuration for {}", scenario.name())
+                }),
+                Err(teardown) => Err(anyhow::anyhow!(
+                    "prepare launch configuration for {} failed: {error:#}; fixture teardown failed: {teardown:#}",
+                    scenario.name()
+                )),
+            };
+        }
+    };
     let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
         binary: config.binary.clone(),
         fe_binary: resolve_binary(
@@ -80,7 +91,18 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config_overlay: launch_config.config_overlay,
         native_trust_fixture: launch_config.native_trust_fixture,
     })
-    .with_context(|| format!("launch system scenario {}", scenario.name()))?;
+    .with_context(|| format!("launch system scenario {}", scenario.name()));
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            return match scenario.teardown() {
+                Ok(()) => Err(error),
+                Err(teardown) => Err(anyhow::anyhow!(
+                    "{error:#}; fixture teardown failed: {teardown:#}"
+                )),
+            };
+        }
+    };
     let mut context = ScenarioContext::new(
         scenario.name(),
         handle,
@@ -112,22 +134,45 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             config.cluster_size,
             config.timeout.as_secs(),
         );
-        let cleanup = context.shutdown();
-        return match cleanup {
-            Ok(()) => Err(anyhow::anyhow!(
+        let cluster_cleanup = context.shutdown();
+        let fixture_cleanup = scenario.teardown();
+        return match (cluster_cleanup, fixture_cleanup) {
+            (Ok(()), Ok(())) => Err(anyhow::anyhow!(
                 "scenario {} failed: {error:#}",
                 context.name()
             )),
-            Err(cleanup) => Err(anyhow::anyhow!(
-                "scenario {} failed: {error:#}; cleanup failed: {cleanup:#}",
+            (Err(cluster), Ok(())) => Err(anyhow::anyhow!(
+                "scenario {} failed: {error:#}; cluster cleanup failed: {cluster:#}",
+                context.name()
+            )),
+            (Ok(()), Err(fixture)) => Err(anyhow::anyhow!(
+                "scenario {} failed: {error:#}; fixture teardown failed: {fixture:#}",
+                context.name()
+            )),
+            (Err(cluster), Err(fixture)) => Err(anyhow::anyhow!(
+                "scenario {} failed: {error:#}; cluster cleanup failed: {cluster:#}; fixture teardown failed: {fixture:#}",
                 context.name()
             )),
         };
     }
     context.action("scenario assertions passed");
-    context
+    let cluster_cleanup = context
         .shutdown()
-        .with_context(|| format!("cleanup system scenario {}", context.name()))?;
+        .with_context(|| format!("cleanup system scenario {}", context.name()));
+    let fixture_cleanup = scenario.teardown();
+    match (cluster_cleanup, fixture_cleanup) {
+        (Ok(()), Ok(())) => {}
+        (Err(cluster), Ok(())) => return Err(cluster),
+        (Ok(()), Err(fixture)) => {
+            return Err(fixture)
+                .with_context(|| format!("teardown fixture for {}", scenario.name()));
+        }
+        (Err(cluster), Err(fixture)) => {
+            return Err(anyhow::anyhow!(
+                "{cluster:#}; fixture teardown failed: {fixture:#}"
+            ));
+        }
+    }
     println!("scenario={} PASS", scenario.name());
     Ok(())
 }

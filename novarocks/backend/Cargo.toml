@@ -13,6 +13,7 @@ novarocks-failpoint = { path = "../failpoint" }
 novarocks-native-trust = { path = "../native-trust" }
 novarocks-proto-codec = { path = "../proto-codec" }
 novarocks-proto-models = { path = "../proto-models" }
+novarocks-secret = { path = "../secret" }
 novarocks-spi = { path = "../spi" }
 bytes = "1"
 arrow = "58.2.0"
@@ -41,4 +42,3 @@ protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
 [dev-dependencies]
-novarocks-secret = { path = "../secret" }

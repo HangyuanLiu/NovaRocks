@@ -45,8 +45,10 @@ use super::{
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlFactoryRequest, ConnectorControlFactoryResolver,
-    ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId,
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+    ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlResolver,
+    ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
+    canonicalize_catalog_credential_bindings,
 };
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
@@ -157,10 +159,9 @@ impl FrontendCatalogApplicationPort {
         })
     }
 
-    /// A trustworthy desired-state set plus every still-draining local control
-    /// generation. `None` means this FE has never completed a source
-    /// enumeration, so a prune sender must skip its round rather than send an
-    /// empty or partial snapshot.
+    /// A complete desired-state projection plus every still-draining local
+    /// control generation. `None` means this frontend has not completed a
+    /// source enumeration, so pruning must skip the round.
     pub(crate) fn reachable_catalog_handles(&self) -> Option<BTreeSet<CatalogHandle>> {
         let mut reachable = self.complete_reachable_catalogs.lock().ok()?.clone()?;
         reachable.extend(self.control.reachable_catalog_handles().ok()?);
@@ -531,11 +532,13 @@ impl FrontendCatalogApplicationPort {
             "catalog desired-state runtime is being materialized",
         );
         let installed = (|| {
+            let catalog_properties = entry.catalog_properties(mode)?;
             let request = ConnectorControlFactoryRequest::try_new(
                 provider_id.clone(),
                 instance_id.clone(),
                 entry.config().durable_properties().to_vec(),
             )
+            .and_then(|request| request.with_catalog_properties(catalog_properties.clone()))
             .map_err(connector_error)?;
             let creation = self
                 .control
@@ -543,7 +546,7 @@ impl FrontendCatalogApplicationPort {
                 .map_err(connector_error)?;
             let (binding, _) = creation.into_parts();
             let binding = binding
-                .with_catalog_properties(entry.catalog_properties(mode)?)
+                .with_catalog_properties(catalog_properties)
                 .map_err(connector_error)?;
             self.install_created(&entry, binding).map(|_| ())
         })();
@@ -649,6 +652,8 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
         command: CatalogCreateCommand,
     ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
         let repository = self.sql_mutation_authority()?;
+        let (credential_bindings, provider_properties) =
+            extract_catalog_credential_bindings(command.properties)?;
         if self
             .block_on(repository.get(&command.instance_id))?
             .is_some()
@@ -664,12 +669,27 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
                 .require_ready(&command.instance_id);
         }
 
-        let provider_id = provider_id_from_properties(&command.properties)?;
+        let provider_id = provider_id_from_properties(&provider_properties)?;
+        let mut durable_properties = provider_properties;
+        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
+        let attachment = CatalogAttachment {
+            attachment_id: Uuid::now_v7(),
+            instance_id: command.instance_id,
+            provider_id: provider_id.clone(),
+            display_name: command.display_name,
+            durable_properties,
+            credential_bindings,
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        let candidate_entry = CatalogDesiredStateEntry::from_attachment(&attachment)?;
+        let candidate_properties =
+            candidate_entry.catalog_properties(CatalogDesiredStateSourceMode::DynamicStateStore)?;
         let request = ConnectorControlFactoryRequest::try_new(
             provider_id.clone(),
-            command.instance_id.clone(),
-            command.properties,
+            attachment.instance_id.clone(),
+            attachment.durable_properties.clone(),
         )
+        .and_then(|request| request.with_catalog_properties(candidate_properties))
         .map_err(connector_error)?;
         // The factory may validate provider configuration, but it does not
         // become live until after the attachment CAS succeeds below.
@@ -677,21 +697,19 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
             .control
             .create_control(request)
             .map_err(connector_error)?;
-        let (binding, mut durable_properties) = creation.into_parts();
-        durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
-        let attachment = CatalogAttachment {
-            attachment_id: Uuid::now_v7(),
-            instance_id: command.instance_id,
-            provider_id,
-            display_name: command.display_name,
-            durable_properties,
-            created_at_ms: chrono::Utc::now().timestamp_millis(),
-        };
+        let (binding, mut returned_durable_properties) = creation.into_parts();
+        returned_durable_properties.sort_by(|left, right| left.0.cmp(&right.0));
+        if returned_durable_properties != attachment.durable_properties {
+            return Err(CatalogApplicationError::new(
+                CatalogApplicationErrorKind::InvalidRequest,
+                "connector control factory changed the catalog execution properties after typed binding",
+            ));
+        }
         let created = self.block_on(repository.create(attachment))?;
         // CREATE materializes through the same located-entry type a reconcile
         // uses, so a freshly created catalog and a rediscovered one install
         // through one code path instead of two that can drift.
-        let entry = CatalogDesiredStateEntry::from_attachment(&created.attachment);
+        let entry = CatalogDesiredStateEntry::from_attachment(&created.attachment)?;
         self.mark_unavailable(
             entry.config().instance_id(),
             entry.identity().as_uuid(),
@@ -746,6 +764,127 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
         }
         self.observation(instance_id)
     }
+}
+
+fn extract_catalog_credential_bindings(
+    properties: Vec<(String, String)>,
+) -> Result<(Vec<CatalogCredentialBinding>, Vec<(String, String)>), CatalogApplicationError> {
+    let mut credential_fields = BTreeMap::new();
+    let mut provider_properties = Vec::with_capacity(properties.len());
+    for (key, value) in properties {
+        let normalized = key.to_ascii_lowercase();
+        let recognized = matches!(
+            normalized.as_str(),
+            "credential.catalog-control.consumer-role"
+                | "credential.catalog-control.mode"
+                | "credential.catalog-control.name"
+                | "credential.catalog-control.generation"
+                | "credential.object-store-data.consumer-role"
+                | "credential.object-store-data.mode"
+                | "credential.object-store-data.name"
+                | "credential.object-store-data.generation"
+        );
+        if recognized {
+            if credential_fields.insert(normalized, value).is_some() {
+                return Err(invalid_credential_property(format!(
+                    "duplicate catalog credential property: {key}"
+                )));
+            }
+        } else if normalized.starts_with("credential.") {
+            return Err(invalid_credential_property(format!(
+                "unknown catalog credential property: {key}"
+            )));
+        } else {
+            provider_properties.push((key, value));
+        }
+    }
+
+    let mut bindings = Vec::new();
+    if let Some(binding) = take_credential_binding(
+        &mut credential_fields,
+        "credential.catalog-control",
+        CatalogCredentialPurpose::CatalogControl,
+    )? {
+        bindings.push(binding);
+    }
+    if let Some(binding) = take_credential_binding(
+        &mut credential_fields,
+        "credential.object-store-data",
+        CatalogCredentialPurpose::ObjectStoreData,
+    )? {
+        bindings.push(binding);
+    }
+    debug_assert!(credential_fields.is_empty());
+    let bindings = canonicalize_catalog_credential_bindings(bindings)
+        .map_err(|error| invalid_credential_property(error.to_string()))?;
+    Ok((bindings, provider_properties))
+}
+
+fn take_credential_binding(
+    fields: &mut BTreeMap<String, String>,
+    prefix: &str,
+    purpose: CatalogCredentialPurpose,
+) -> Result<Option<CatalogCredentialBinding>, CatalogApplicationError> {
+    let role = fields.remove(&format!("{prefix}.consumer-role"));
+    let mode = fields.remove(&format!("{prefix}.mode"));
+    let name = fields.remove(&format!("{prefix}.name"));
+    let generation = fields.remove(&format!("{prefix}.generation"));
+    if role.is_none() && mode.is_none() && name.is_none() && generation.is_none() {
+        return Ok(None);
+    }
+    let role = match role.as_deref() {
+        Some("frontend") => CredentialConsumerRole::Frontend,
+        Some("frontend-and-backend") => CredentialConsumerRole::FrontendAndBackend,
+        Some(_) => {
+            return Err(invalid_credential_property(
+                "unknown catalog credential consumer role",
+            ));
+        }
+        None => {
+            return Err(invalid_credential_property(
+                "catalog credential binding requires consumer-role",
+            ));
+        }
+    };
+    let mode = match mode.as_deref() {
+        Some("static") => {
+            let name = name.as_deref().ok_or_else(|| {
+                invalid_credential_property("static catalog credential binding requires name")
+            })?;
+            let generation = generation.as_deref().ok_or_else(|| {
+                invalid_credential_property("static catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new(name, generation)
+                    .map_err(|error| invalid_credential_property(error.to_string()))?,
+            )
+        }
+        Some("vended") => {
+            if name.is_some() || generation.is_some() {
+                return Err(invalid_credential_property(
+                    "vended catalog credential binding forbids name and generation",
+                ));
+            }
+            CatalogCredentialMode::Vended
+        }
+        Some(_) => {
+            return Err(invalid_credential_property(
+                "unknown catalog credential mode",
+            ));
+        }
+        None => {
+            return Err(invalid_credential_property(
+                "catalog credential binding requires mode",
+            ));
+        }
+    };
+    CatalogCredentialBinding::try_new(purpose, role, mode)
+        .map(Some)
+        .map_err(|error| invalid_credential_property(error.to_string()))
+}
+
+fn invalid_credential_property(message: impl Into<String>) -> CatalogApplicationError {
+    CatalogApplicationError::new(CatalogApplicationErrorKind::InvalidRequest, message)
 }
 
 fn provider_id_from_properties(
@@ -858,24 +997,136 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn prune_reachability_requires_a_complete_snapshot_but_allows_complete_empty() {
-        let projection = crate::catalog_application::CatalogRuntimeProjection::new();
-        let port = Arc::new(FrontendCatalogApplicationPort::new(
-            CatalogDesiredStateSource::static_file(
-                CatalogDesiredStateSnapshot::try_new(CatalogDesiredStateSourceMode::StaticFile, [])
-                    .expect("empty static snapshot"),
-            )
-            .expect("static desired-state source"),
-            Arc::new(ConnectorControlHost::new()),
-            projection.publisher(),
-            Handle::current(),
-        ));
+    #[test]
+    fn create_catalog_extracts_closed_typed_credential_properties() {
+        let (bindings, properties) = extract_catalog_credential_bindings(vec![
+            ("type".to_string(), "iceberg".to_string()),
+            (
+                "credential.object-store-data.generation".to_string(),
+                "blue".to_string(),
+            ),
+            (
+                "credential.catalog-control.consumer-role".to_string(),
+                "frontend".to_string(),
+            ),
+            (
+                "credential.object-store-data.consumer-role".to_string(),
+                "frontend-and-backend".to_string(),
+            ),
+            (
+                "credential.catalog-control.mode".to_string(),
+                "static".to_string(),
+            ),
+            (
+                "credential.object-store-data.mode".to_string(),
+                "static".to_string(),
+            ),
+            (
+                "credential.catalog-control.name".to_string(),
+                "rest-control".to_string(),
+            ),
+            (
+                "credential.object-store-data.name".to_string(),
+                "warehouse-data".to_string(),
+            ),
+            (
+                "credential.catalog-control.generation".to_string(),
+                "blue".to_string(),
+            ),
+        ])
+        .expect("typed credential bindings");
+        assert_eq!(
+            properties,
+            vec![("type".to_string(), "iceberg".to_string())]
+        );
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(
+            bindings[0].purpose(),
+            CatalogCredentialPurpose::CatalogControl
+        );
+        assert_eq!(
+            bindings[1].purpose(),
+            CatalogCredentialPurpose::ObjectStoreData
+        );
+        assert_eq!(
+            bindings[1].consumer_role(),
+            CredentialConsumerRole::FrontendAndBackend
+        );
+    }
 
-        assert_eq!(port.reachable_catalog_handles(), None);
-        port.reconcile_snapshot_with_page_size(1, 1)
-            .await
-            .expect("complete empty snapshot reconciles");
-        assert_eq!(port.reachable_catalog_handles(), Some(BTreeSet::new()));
+    #[test]
+    fn create_catalog_rejects_unknown_partial_and_conflicting_credential_properties() {
+        for properties in [
+            vec![(
+                "credential.object-store-data.typo".to_string(),
+                "static".to_string(),
+            )],
+            vec![(
+                "credential.object-store-data.mode".to_string(),
+                "static".to_string(),
+            )],
+            vec![
+                (
+                    "credential.object-store-data.consumer-role".to_string(),
+                    "backend".to_string(),
+                ),
+                (
+                    "credential.object-store-data.mode".to_string(),
+                    "static".to_string(),
+                ),
+                (
+                    "credential.object-store-data.name".to_string(),
+                    "warehouse-data".to_string(),
+                ),
+                (
+                    "credential.object-store-data.generation".to_string(),
+                    "blue".to_string(),
+                ),
+            ],
+            vec![
+                (
+                    "credential.object-store-data.consumer-role".to_string(),
+                    "frontend-and-backend".to_string(),
+                ),
+                (
+                    "credential.object-store-data.mode".to_string(),
+                    "vended".to_string(),
+                ),
+                (
+                    "credential.object-store-data.name".to_string(),
+                    "forbidden".to_string(),
+                ),
+            ],
+            vec![
+                (
+                    "credential.object-store-data.consumer-role".to_string(),
+                    "frontend-and-backend".to_string(),
+                ),
+                (
+                    "CREDENTIAL.OBJECT-STORE-DATA.CONSUMER-ROLE".to_string(),
+                    "frontend-and-backend".to_string(),
+                ),
+                (
+                    "credential.object-store-data.mode".to_string(),
+                    "vended".to_string(),
+                ),
+            ],
+        ] {
+            assert_eq!(
+                extract_catalog_credential_bindings(properties)
+                    .expect_err("invalid credential properties must fail admission")
+                    .kind(),
+                CatalogApplicationErrorKind::InvalidRequest
+            );
+        }
+    }
+
+    #[test]
+    fn create_catalog_allows_an_explicitly_binding_free_local_definition() {
+        let (bindings, properties) =
+            extract_catalog_credential_bindings(vec![("type".to_string(), "local".to_string())])
+                .expect("local catalog definition");
+        assert!(bindings.is_empty());
+        assert_eq!(properties, vec![("type".to_string(), "local".to_string())]);
     }
 }

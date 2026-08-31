@@ -182,6 +182,7 @@ struct FrontendDistributedRoundFactory {
     catalog_service: crate::catalog_application::query_catalog::QueryCatalogService,
     bindings: Arc<QueryTableBindingStore>,
     mv_definitions: Option<novarocks_sql::compiler::MvRewriteDefinitionIndex>,
+    retry_requires_fresh_materialization: bool,
     intent: SqlCompileIntent,
     completion: RetryCompletionTemplate,
     effect_tracker: StatementEffectTracker,
@@ -201,20 +202,35 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
     fn replan(
         &mut self,
         topology: crate::common::backend_topology::BackendTopologySnapshot,
+        reservation: crate::query_execution::completion::QueryAttemptReservation,
     ) -> Result<PreparedQueryDistributedOperation, DistributedQueryError> {
-        if !self.bindings.is_sealed_for_topology_replan() {
+        if !self.retry_requires_fresh_materialization
+            && !self.bindings.is_sealed_for_topology_replan()
+        {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "topology replan requires a sealed first-round semantic binding store",
             ));
         }
+        let bindings = if self.retry_requires_fresh_materialization {
+            Arc::new(QueryTableBindingStore::try_new().map_err(|error| {
+                DistributedQueryError::new(
+                    DistributedQueryErrorKind::Failed,
+                    format!("allocate fresh vended topology-replan bindings: {error}"),
+                )
+            })?)
+        } else {
+            Arc::clone(&self.bindings)
+        };
         let execution = self.statement.for_topology(topology);
+        let connector_context =
+            reservation.connector_request_context(self.connector_context.clone());
         let materializer = build_catalog_service_provider_with_bindings_and_query_local_overlays(
             self.current_catalog.as_deref(),
             &self.catalog_service,
             self.compiler.query.connector_control().as_ref(),
-            self.connector_context.clone(),
-            Arc::clone(&self.bindings),
+            connector_context.clone(),
+            bindings,
             Vec::new(),
             self.compiler.query.catalog_application().map(Arc::as_ref),
         );
@@ -241,7 +257,7 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
             FrontendDistributedRoundFactory::error(FrontendQueryCompilerError::from_compile(error))
         })?;
         let statistics =
-            query_statistics_snapshot(&self.compiler.query, &materializer, &self.connector_context)
+            query_statistics_snapshot(&self.compiler.query, &materializer, &connector_context)
                 .map_err(|error| {
                     DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
                 })?;
@@ -262,7 +278,7 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
             distributed_plan,
             &self.compiler.query,
             &materializer,
-            &self.connector_context,
+            &connector_context,
             self.query_options.clone(),
             execution.execution(),
             self.completion.next_round_intent(),
@@ -275,7 +291,8 @@ impl PreparedDistributedRoundFactory for FrontendDistributedRoundFactory {
         let request = assembly.finish(native_bundle).map_err(|error| {
             DistributedQueryError::new(DistributedQueryErrorKind::Failed, error)
         })?;
-        Ok(PreparedQueryDistributedOperation::new(request, completion))
+        Ok(PreparedQueryDistributedOperation::new(request, completion)
+            .with_attempt_reservation(reservation))
     }
 }
 
@@ -450,7 +467,17 @@ impl FrontendQueryCompiler {
         allow_mv_rewrite_candidates: bool,
         completion_intent: PostCompileIntent,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        // This must happen before the catalog materializer is constructed:
+        // an Iceberg REST observation may return credentials that are valid
+        // only for this candidate attempt.
+        let reservation = self
+            .query
+            .query_execution()
+            .reserve_initial_attempt()
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let catalog_service = query_catalog_service_snapshot(&self.query);
+        let attempt_connector_context =
+            reservation.connector_request_context(connector_context.clone());
         let bindings = Arc::new(
             QueryTableBindingStore::try_new()
                 .expect("query table binding scope allocation must not fail"),
@@ -459,7 +486,7 @@ impl FrontendQueryCompiler {
             current_catalog,
             &catalog_service,
             self.query.connector_control().as_ref(),
-            connector_context.clone(),
+            attempt_connector_context.clone(),
             Arc::clone(&bindings),
             Vec::new(),
             self.query.catalog_application().map(Arc::as_ref),
@@ -486,7 +513,8 @@ impl FrontendQueryCompiler {
         .into_pending()
         .map_err(FrontendQueryCompilerError::from_compile)?;
         reject_quarantined_mv_targets(bindings.as_ref(), self.mv_readiness.as_ref())?;
-        let statistics = query_statistics_snapshot(&self.query, &materializer, &connector_context)?;
+        let statistics =
+            query_statistics_snapshot(&self.query, &materializer, &attempt_connector_context)?;
         let distributed_plan =
             SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
                 .map_err(FrontendQueryCompilerError::from_compile)?
@@ -497,20 +525,23 @@ impl FrontendQueryCompiler {
             distributed_plan,
             &self.query,
             &materializer,
-            &connector_context,
+            &attempt_connector_context,
             query_options.clone(),
             execution,
             completion_intent,
         )?;
         // Semantic admission is complete before native request construction.
-        // A future topology-only round must reuse these exact bindings or fail
-        // closed; it may never materialize a newer `Current` table here.
+        // Static rounds reuse these exact bindings on a topology retry. A
+        // round that collected vended credentials instead rebuilds from a
+        // fresh metadata observation and fresh attempt collector: it may not
+        // revive the old response-local seed.
         materializer
             .query_table_bindings()
             .seal_for_topology_replan();
         let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
         let request = assembly.finish(native_bundle)?;
         drop(materializer);
+        let retry_requires_fresh_materialization = reservation.has_collected_credential_leases();
         let factory = FrontendDistributedRoundFactory {
             compiler: self.clone(),
             query: query.clone(),
@@ -529,13 +560,15 @@ impl FrontendQueryCompiler {
             catalog_service,
             bindings,
             mv_definitions,
+            retry_requires_fresh_materialization,
             intent: intent.clone(),
             completion: retry_completion,
             effect_tracker: StatementEffectTracker::read_only(),
         };
         Ok(PreparedQueryOperation::Distributed(
             PreparedQueryDistributedOperation::new(request, completion)
-                .with_round_factory(Box::new(factory)),
+                .with_round_factory(Box::new(factory))
+                .with_attempt_reservation(reservation),
         ))
     }
 

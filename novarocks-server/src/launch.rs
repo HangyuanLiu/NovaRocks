@@ -421,7 +421,7 @@ mod tests {
             .unwrap_or_default();
         let catalog_source = if role == "fe" {
             let catalogs = path.with_extension("catalogs.toml");
-            std::fs::write(&catalogs, "format_version = 1\ncatalogs = []\n")
+            std::fs::write(&catalogs, "format_version = 3\ncatalogs = []\n")
                 .expect("write catalog snapshot");
             format!(
                 "\n[catalog_source]\nstatic_file_path = \"{}\"\n",

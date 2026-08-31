@@ -606,6 +606,43 @@ pub trait ConnectorReadMetadata: Send + Sync {
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
 }
 
+/// One request-bound FE view of an exact connector read control generation.
+/// The opaque request context never crosses a wire; it lets a provider bind
+/// response-vended object-store access while preserving the generation-scoped
+/// codec and registration lease.
+#[derive(Clone)]
+pub struct ConnectorReadRequestControl {
+    metadata: Arc<dyn ConnectorReadMetadata>,
+    splits: Arc<dyn ConnectorReadSplitManager>,
+}
+
+impl ConnectorReadRequestControl {
+    pub fn new(
+        metadata: Arc<dyn ConnectorReadMetadata>,
+        splits: Arc<dyn ConnectorReadSplitManager>,
+    ) -> Self {
+        Self { metadata, splits }
+    }
+
+    pub fn metadata(&self) -> Arc<dyn ConnectorReadMetadata> {
+        Arc::clone(&self.metadata)
+    }
+
+    pub fn splits(&self) -> Arc<dyn ConnectorReadSplitManager> {
+        Arc::clone(&self.splits)
+    }
+}
+
+/// Connector-owned factory for a request-bound coordinator read view. The
+/// factory is retained by the exact installed control; a role can request a
+/// view but cannot inspect or construct provider payloads.
+pub trait ConnectorReadRequestControlFactory: Send + Sync {
+    fn for_request(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<ConnectorReadRequestControl, ConnectorError>;
+}
+
 pub trait ConnectorReadSplitSource: Send {
     fn profile_snapshot(&self) -> super::SplitSourceProfile {
         super::SplitSourceProfile::default()

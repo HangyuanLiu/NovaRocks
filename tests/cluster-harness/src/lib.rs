@@ -15,6 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod isolated_iceberg_rest;
+pub mod loopback_s3;
+pub mod vended_rest_catalog;
+
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use mysql::{Conn as MysqlConn, OptsBuilder};
@@ -680,6 +684,9 @@ pub struct CrossProcessChildEnvironment {
 pub struct CrossProcessConfigOverlay {
     pub fe: Option<String>,
     pub be: Option<String>,
+    /// Per-index BE TOML overlays applied after `be`. Each fragment passes the
+    /// same harness-owned-key guard as the common overlay.
+    pub be_by_index: BTreeMap<usize, String>,
 }
 
 /// Typed inputs for one ephemeral 1FE+NBE cross-process cluster.
@@ -2320,7 +2327,7 @@ struct CrossProcessLaunchConfig<'a> {
     runtime_dir: &'a Path,
     query_lifecycle_faults_enabled: bool,
     cleanup_faults_enabled: bool,
-    overlay: Option<&'a str>,
+    overlays: Vec<&'a str>,
     native_trust_fixture: &'a PreparedNativeTrustFixture,
 }
 
@@ -2334,7 +2341,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
         runtime_dir,
         query_lifecycle_faults_enabled,
         cleanup_faults_enabled,
-        overlay,
+        overlays,
         native_trust_fixture,
     } = config;
     let rendered = render_cross_process_config(base_config, role, be_index, runtime)?;
@@ -2344,7 +2351,7 @@ fn render_cross_process_launch_config(config: CrossProcessLaunchConfig<'_>) -> R
     let root = value
         .as_table_mut()
         .context("rendered cross-process launch config root must be a TOML table")?;
-    if let Some(overlay) = overlay {
+    for overlay in overlays {
         merge_safe_config_overlay(root, overlay)?;
     }
     materialize_static_catalog_snapshot(root, runtime_dir, source_config_dir)?;
@@ -2926,6 +2933,8 @@ impl CrossProcessServerHandle {
             fe_mysql_port: reserved.fe_mysql_port.port(),
         };
 
+        validate_be_config_overrides(&config_overlay.be_by_index, cluster_size)?;
+
         let base_config = fs::read_to_string(&base_config_path).with_context(|| {
             format!(
                 "read standalone config for cross-process mode: {}",
@@ -2954,9 +2963,19 @@ impl CrossProcessServerHandle {
                 runtime_dir: runtime_dir.path(),
                 query_lifecycle_faults_enabled,
                 cleanup_faults_enabled,
-                overlay: match role {
-                    ClusterProcessRole::Fe => config_overlay.fe.as_deref(),
-                    ClusterProcessRole::Be => config_overlay.be.as_deref(),
+                overlays: match role {
+                    ClusterProcessRole::Fe => config_overlay.fe.as_deref().into_iter().collect(),
+                    ClusterProcessRole::Be => config_overlay
+                        .be
+                        .as_deref()
+                        .into_iter()
+                        .chain(
+                            config_overlay
+                                .be_by_index
+                                .get(&be_index)
+                                .map(String::as_str),
+                        )
+                        .collect(),
                 },
                 native_trust_fixture: &native_trust_fixture,
             })
@@ -4556,6 +4575,20 @@ fn resolve_be_environments(
         .collect())
 }
 
+fn validate_be_config_overrides(
+    overrides: &BTreeMap<usize, String>,
+    cluster_size: usize,
+) -> Result<()> {
+    for index in overrides.keys() {
+        if *index >= cluster_size {
+            bail!(
+                "BE config overlay index {index} is out of bounds for cross-process cluster with {cluster_size} BE(s)"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn next_fragment_failure_token(index: usize) -> String {
     static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
     let sequence = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
@@ -5606,10 +5639,13 @@ mode = "dynamic-state-store"
 mysql_port = 9030
 user = "root"
 
-[connector.object_store]
-endpoint = "http://127.0.0.1:9000"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "test-data"
+generation = "v1"
+kind = "s3"
 access_key_id = "admin"
-enable_path_style_access = true
+access_key_secret = "admin123"
 "#;
 
     #[test]
@@ -5633,8 +5669,12 @@ enable_path_style_access = true
             "FE rendering must not create a legacy metadata store"
         );
         assert_eq!(
-            fe_value["connector"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
+            fe_value["connector"]["credentials"][0]["purpose"].as_str(),
+            Some("object-store-data")
+        );
+        assert_eq!(
+            fe_value["connector"]["credentials"][0]["name"].as_str(),
+            Some("test-data")
         );
         assert_eq!(fe_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(fe_value["server"]["http_port"].as_integer(), Some(28080));
@@ -5672,8 +5712,8 @@ enable_path_style_access = true
             "BE rendering must not create a legacy metadata store"
         );
         assert_eq!(
-            be_value["connector"]["object_store"]["endpoint"].as_str(),
-            Some("http://127.0.0.1:9000")
+            be_value["connector"]["credentials"][0]["generation"].as_str(),
+            Some("v1")
         );
         assert_eq!(be_value["server"]["host"].as_str(), Some("127.0.0.1"));
         assert_eq!(be_value["server"]["http_port"].as_integer(), Some(18080));
@@ -5760,7 +5800,7 @@ enable_path_style_access = true
             runtime_dir: Path::new("/tmp/novarocks-native-trust-reference"),
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
-            overlay: None,
+            overlays: Vec::new(),
             native_trust_fixture: &fixture,
         })
         .expect("render automatic BE config");
@@ -5840,7 +5880,7 @@ enable_path_style_access = true
             runtime_dir: first_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
-            overlay: None,
+            overlays: Vec::new(),
             native_trust_fixture: &native_trust_fixture,
         })
         .unwrap()
@@ -5855,7 +5895,7 @@ enable_path_style_access = true
             runtime_dir: second_runtime,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
-            overlay: None,
+            overlays: Vec::new(),
             native_trust_fixture: &native_trust_fixture,
         })
         .unwrap()
@@ -5920,7 +5960,7 @@ static_file_path = "catalogs.toml"
             runtime_dir: &output,
             query_lifecycle_faults_enabled: false,
             cleanup_faults_enabled: false,
-            overlay: None,
+            overlays: Vec::new(),
             native_trust_fixture: &native_trust_fixture,
         })
         .expect("render static FE config");
@@ -6304,6 +6344,61 @@ static_file_path = "catalogs.toml"
         let error = resolve_be_environments(&BTreeMap::new(), &overrides, 2)
             .expect_err("out of range override must fail");
         assert!(format!("{error:#}").contains("out of bounds"));
+    }
+
+    #[test]
+    fn be_config_overlay_rejects_out_of_range_index() {
+        let overrides = BTreeMap::from([(2, "[runtime]\nexchange_wait_ms = 1\n".to_string())]);
+        let error = validate_be_config_overrides(&overrides, 2)
+            .expect_err("out of range config overlay must fail");
+        assert!(format!("{error:#}").contains("out of bounds"));
+    }
+
+    #[test]
+    fn per_be_config_overlay_applies_after_common_overlay() {
+        let runtime = make_runtime_1be();
+        let fixture = rendered_native_trust_fixture();
+        let rendered = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
+            role: ClusterProcessRole::Be,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: Path::new("/tmp/novarocks-be-config-overlay"),
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlays: vec![
+                "[runtime]\nexchange_wait_ms = 11\n",
+                "[runtime]\nexchange_wait_ms = 29\n",
+            ],
+            native_trust_fixture: &fixture,
+        })
+        .expect("render BE config with ordered overlays");
+        let rendered: Value = rendered.parse().expect("parse BE config");
+        assert_eq!(
+            rendered["runtime"]["exchange_wait_ms"].as_integer(),
+            Some(29)
+        );
+    }
+
+    #[test]
+    fn per_be_config_overlay_cannot_change_harness_owned_keys() {
+        let runtime = make_runtime_1be();
+        let fixture = rendered_native_trust_fixture();
+        let error = render_cross_process_launch_config(CrossProcessLaunchConfig {
+            base_config: BASE_CONFIG,
+            source_config_dir: Path::new("/tmp"),
+            role: ClusterProcessRole::Be,
+            be_index: 0,
+            runtime: &runtime,
+            runtime_dir: Path::new("/tmp/novarocks-be-config-overlay-guard"),
+            query_lifecycle_faults_enabled: false,
+            cleanup_faults_enabled: false,
+            overlays: vec!["[cluster]\nrole = 'fe'\n"],
+            native_trust_fixture: &fixture,
+        })
+        .expect_err("per-BE config overlay must preserve harness-owned cluster keys");
+        assert!(format!("{error:#}").contains("cannot modify [cluster]"));
     }
 
     #[test]

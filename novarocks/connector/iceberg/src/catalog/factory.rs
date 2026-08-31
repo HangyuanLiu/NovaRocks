@@ -60,7 +60,9 @@ impl NovaRocksCatalogFactory {
                     "REST Iceberg configuration produced no REST client".to_string()
                 })?;
                 Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
-                    rest, warehouse,
+                    rest,
+                    warehouse,
+                    client.rest_access_delegation(),
                 )))
             }
             IcebergCatalogKind::Hive => Ok(Arc::new(super::hive::NovaRocksHiveCatalog::adopt(
@@ -72,6 +74,8 @@ impl NovaRocksCatalogFactory {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::catalog::error::CatalogOutcome;
     use crate::catalog::transaction::{
@@ -82,6 +86,7 @@ mod tests {
     };
     use crate::iceberg::TableCreation;
     use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::ConnectorErrorKind;
 
     /// Build a catalog for a test the way production does.
@@ -94,7 +99,14 @@ mod tests {
     async fn adopted(
         configuration: &IcebergCatalogConfiguration,
     ) -> Result<Arc<dyn NovaRocksCatalog>, String> {
-        let client = crate::catalog_runtime::build_catalog_client(configuration).await?;
+        let runtime = tokio::runtime::Handle::current();
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        );
+        let client = crate::catalog_runtime::build_catalog_client(configuration, binding).await?;
         NovaRocksCatalogFactory::adopt(configuration, &client)
     }
 

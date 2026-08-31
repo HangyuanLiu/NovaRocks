@@ -17,8 +17,14 @@
 
 use novarocks_fs::{
     FileCancellation, FileErrorKind, FileIdentity, FileReadRange, FsAccessResolver, FsLocation,
-    FsScheme, ObjectStoreConfig, SecretValue,
+    FsScheme, ObjectStoreAccessContext, ObjectStoreConfig, ObjectStoreCredentialProviderIdentity,
+    ObjectStoreProviderPool, ObjectStoreProviderPoolOptions, SecretValue,
 };
+use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
+
+fn domain(value: u8) -> StorageAccessDomainId {
+    StorageAccessDomainId::from_bytes([value; 32])
+}
 
 #[test]
 fn parses_local_path() {
@@ -32,7 +38,7 @@ fn resolves_and_binds_local_file() {
     let path = directory.path().join("a.parquet");
     std::fs::write(&path, b"physical-bytes").expect("write fixture");
     let access = FsAccessResolver::new()
-        .resolve_location(path.to_string_lossy(), None)
+        .resolve_location(domain(1), path.to_string_lossy(), None)
         .expect("resolve local file");
     let file = access
         .bind(0, FileIdentity::new(path.to_string_lossy(), 14, Some(123)))
@@ -55,7 +61,7 @@ fn binds_relative_local_side_file_within_authorized_root() {
     std::fs::write(&anchor, b"anchor").expect("write anchor");
     std::fs::write(&side_file, b"side-file").expect("write side file");
     let access = FsAccessResolver::new()
-        .resolve_location(anchor.to_string_lossy(), None)
+        .resolve_location(domain(1), anchor.to_string_lossy(), None)
         .expect("resolve local root");
     let side_file = access
         .bind_location(
@@ -106,7 +112,7 @@ fn rejects_unsupported_scheme_with_structured_error() {
     let error = FsLocation::parse("ftp://host/a.parquet").expect_err("unsupported");
     assert_eq!(error.kind(), FileErrorKind::Unsupported);
     let mixed = FsAccessResolver::new()
-        .resolve_locations(["/tmp/a.parquet", "s3://bucket/a.parquet"], None)
+        .resolve_locations(domain(1), ["/tmp/a.parquet", "s3://bucket/a.parquet"], None)
         .expect_err("mixed schemes");
     assert_eq!(mixed.kind(), FileErrorKind::Invalid);
 }
@@ -163,8 +169,21 @@ fn object_store_configuration_error_redacts_secrets() {
         io_timeout_ms: None,
     };
 
+    let credential_reference =
+        StaticCredentialReference::try_new("warehouse-data", "blue").unwrap();
+    let provider_pool =
+        ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).unwrap();
     let error = FsAccessResolver::new()
-        .resolve_location("s3://bucket/data.parquet", Some(&config))
+        .resolve_location(
+            domain(1),
+            "s3://bucket/data.parquet",
+            Some(ObjectStoreAccessContext::new(
+                config.endpoint_config(),
+                ObjectStoreCredentialProviderIdentity::Static(credential_reference),
+                config.secret_material(),
+                &provider_pool,
+            )),
+        )
         .expect_err("empty endpoint must fail");
     let diagnostic = format!("{error:?}: {error}");
     assert!(!diagnostic.contains("nwt-1-access-canary"));

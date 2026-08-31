@@ -159,7 +159,7 @@ impl IcebergDistributedRewriteControl {
             .invalidate_table_cache(&target.namespace, &target.table);
         let table = self
             .runtime
-            .load_table(&target.namespace, &target.table)
+            .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?
             .into_table();
         let metadata = table.metadata();
@@ -299,6 +299,16 @@ impl IcebergDistributedRewriteControl {
         &self,
         plan: &ConnectorDistributedRewritePlan,
     ) -> Result<crate::iceberg::io::FileIO, ConnectorError> {
+        if self
+            .runtime
+            .resources()
+            .planning_binding()
+            .requires_request_storage_resolver()
+        {
+            return Err(unavailable(
+                "Iceberg rewrite checkpoint and restore require a request-scoped storage resolver",
+            ));
+        }
         let target = self.provider.table_payload(plan.target())?;
         self.runtime
             .load_table(&target.namespace, &target.table)
@@ -386,7 +396,11 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             .invalidate_table_cache(&planned.artifact.namespace, &planned.artifact.table);
         let table = self
             .runtime
-            .load_table(&planned.artifact.namespace, &planned.artifact.table)
+            .load_table_for_request(
+                &planned.artifact.namespace,
+                &planned.artifact.table,
+                &context,
+            )
             .map_err(unavailable)?
             .into_table();
         validate_frozen_rewrite_table(&planned.artifact, table.metadata())?;

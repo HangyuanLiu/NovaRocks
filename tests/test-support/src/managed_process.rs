@@ -3008,7 +3008,7 @@ mod tests {
         let ready_path = temp.path().join("ready.txt");
         fs::write(&ready_path, "existing prefix FILE_RE").expect("write file baseline");
         let command = shell_with_arg(
-            "sleep 0.05; printf 'ADY suffix\n' >> \"$1\"; sleep 30",
+            "sleep 0.05; printf 'ADY suffix\n' >> \"$1\"; exec sleep 30",
             &ready_path,
         );
 

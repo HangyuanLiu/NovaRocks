@@ -37,11 +37,35 @@ message CatalogProperty {
   string value = 2;
 }
 
-// Reference only: the resolved credential value stays in role-local startup
-// composition and never crosses native wire.
-message CatalogCredentialReference {
+enum CatalogCredentialPurpose {
+  CATALOG_CREDENTIAL_PURPOSE_UNSPECIFIED = 0;
+  CATALOG_CREDENTIAL_PURPOSE_CATALOG_CONTROL = 1;
+  CATALOG_CREDENTIAL_PURPOSE_OBJECT_STORE_DATA = 2;
+}
+
+enum CredentialConsumerRole {
+  CREDENTIAL_CONSUMER_ROLE_UNSPECIFIED = 0;
+  CREDENTIAL_CONSUMER_ROLE_FRONTEND = 1;
+  CREDENTIAL_CONSUMER_ROLE_BACKEND = 2;
+  CREDENTIAL_CONSUMER_ROLE_FRONTEND_AND_BACKEND = 3;
+}
+
+// Identity only: resolved credential values remain in role-local startup
+// composition and never cross the native wire.
+message StaticCredentialReference {
   string name = 1;
-  optional string revision = 2;
+  string generation = 2;
+}
+
+message VendedCredential {}
+
+message CatalogCredentialBinding {
+  CatalogCredentialPurpose purpose = 1;
+  CredentialConsumerRole consumer_role = 2;
+  oneof mode {
+    StaticCredentialReference static_credential = 3;
+    VendedCredential vended_credential = 4;
+  }
 }
 
 message CatalogProperties {
@@ -49,7 +73,7 @@ message CatalogProperties {
   CatalogProviderKind provider_kind = 2;
   uint32 config_format_version = 3;
   repeated CatalogProperty execution_properties = 4;
-  repeated CatalogCredentialReference credential_references = 5;
+  repeated CatalogCredentialBinding credential_bindings = 5;
 }
 
 // One exact, sorted query-wide contribution. It is carried by every

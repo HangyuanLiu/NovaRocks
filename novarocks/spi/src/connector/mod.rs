@@ -20,6 +20,8 @@ mod catalog_runtime;
 mod cleanup_maintenance;
 mod context;
 mod control;
+mod credential;
+mod credential_lease;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
@@ -48,12 +50,10 @@ pub mod conformance;
 pub mod read_stack;
 
 pub use catalog::{
-    CATALOG_VERSION_BYTES, CatalogCredentialReference, CatalogHandle, CatalogProperties,
-    CatalogProperty, CatalogProviderKind, CatalogVersion, ConnectorControlRuntimeId,
-    MAX_CATALOG_CREDENTIAL_REFERENCE_BYTES, MAX_CATALOG_CREDENTIAL_REFERENCES,
-    MAX_CATALOG_PROPERTIES, MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES,
-    MAX_CATALOG_SET_BYTES, MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES,
-    MAX_REACHABLE_CATALOGS_PER_PRUNE,
+    CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind,
+    CatalogVersion, ConnectorControlRuntimeId, MAX_CATALOG_PROPERTIES,
+    MAX_CATALOG_PROPERTY_KEY_BYTES, MAX_CATALOG_PROPERTY_VALUE_BYTES, MAX_CATALOG_SET_BYTES,
+    MAX_CATALOGS_PER_QUERY, MAX_PRUNE_CATALOG_SET_BYTES, MAX_REACHABLE_CATALOGS_PER_PRUNE,
 };
 pub use catalog_runtime::{
     CatalogRuntime, CatalogRuntimeMaterializer, CatalogWriteExecution, CatalogWriteExecutionBundle,
@@ -72,12 +72,32 @@ pub use cleanup_maintenance::{
     MAX_CONNECTOR_CLEANUP_OWNED_REF_SELECTION_ITEMS, MAX_CONNECTOR_CLEANUP_PROVIDER_PAYLOAD_BYTES,
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
-pub use context::{ConnectorCancellation, ConnectorRequestContext};
+pub use context::{
+    ConnectorCancellation, ConnectorRequestContext, ConnectorRequestScope,
+    ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+};
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
     ConnectorControlFactoryRequest, ConnectorControlFactoryResolver, ConnectorControlPlanningLease,
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
+};
+pub use credential::{
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
+    CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
+    CredentialConsumerRole, MAX_CATALOG_CREDENTIAL_BINDINGS, MAX_CATALOG_NON_SECRET_PROPERTIES,
+    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIXES,
+    StaticCredentialReference, StorageAccessDomainId, StorageCredentialScopePrefix,
+    canonical_catalog_credential_binding_bytes, canonicalize_catalog_credential_bindings,
+};
+pub use credential_lease::{
+    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
+    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, MAX_CREDENTIAL_LEASE_ID_BYTES,
+    MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
+    MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
+    VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
+    VendedS3CredentialLeaseRefresh,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

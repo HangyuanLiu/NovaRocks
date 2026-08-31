@@ -113,6 +113,13 @@ impl FrontendNativeTransport {
         Self::Pem(material)
     }
 
+    /// Whether this concrete role-local Native transport encrypts the wire.
+    /// Confidential query-attempt lease material is admitted only through this
+    /// capability, never through an untrusted protobuf claim.
+    pub(crate) const fn permits_confidential_credential_leases(&self) -> bool {
+        matches!(self, Self::Automatic(_) | Self::Pem(_))
+    }
+
     pub(crate) fn connector(
         &self,
         endpoint: NativeEndpoint,
@@ -470,6 +477,12 @@ impl LifecycleTransport {
     }
 }
 impl QueryLifecycleTransport for LifecycleTransport {
+    fn permits_confidential_credential_leases(&self) -> bool {
+        self.data_runtime
+            .native_transport()
+            .permits_confidential_credential_leases()
+    }
+
     fn init_query(
         &self,
         target: QueryLifecycleTarget,
@@ -481,6 +494,23 @@ impl QueryLifecycleTransport for LifecycleTransport {
             .manifest()
             .and_then(|manifest| manifest.execution_id())
             .map_err(invalid)?;
+        let confidential = !request
+            .credential_lease_envelopes()
+            .map_err(invalid)?
+            .is_empty();
+        if confidential && !self.permits_confidential_credential_leases() {
+            return Err(invalid(
+                "credential lease envelopes require TLS Native transport",
+            ));
+        }
+        // The exact role-local TLS selection is the confidential-carrier
+        // admission point. Reparse with the matching codec entrypoint so an
+        // h2c path cannot reuse a request constructed by a TLS caller.
+        if confidential {
+            QueryInitRequest::parse_tls(request.as_proto().clone()).map_err(invalid)?;
+        } else {
+            QueryInitRequest::parse(request.as_proto().clone()).map_err(invalid)?;
+        }
         let response = unary(
             self.client(target)?,
             "InitQuery",
@@ -547,6 +577,10 @@ impl QueryLifecycleTransport for LifecycleTransport {
             events: Mutex::new(events_rx),
             bridge: Mutex::new(Some(bridge)),
             data_runtime: self.data_runtime.clone(),
+            permits_confidential_credential_leases: self
+                .data_runtime
+                .native_transport()
+                .permits_confidential_credential_leases(),
         }))
     }
     fn stage_fragments(
@@ -675,6 +709,7 @@ struct ControlSession {
     events: Mutex<mpsc::Receiver<Result<QueryControlEvent, QueryLifecycleTransportError>>>,
     bridge: Mutex<Option<tokio::task::JoinHandle<()>>>,
     data_runtime: FrontendDataRuntime,
+    permits_confidential_credential_leases: bool,
 }
 struct ControlCommands {
     sender: Option<mpsc::Sender<novarocks_proto_models::novarocks::QueryControlRequest>>,
@@ -694,6 +729,23 @@ enum Pending {
 }
 impl QueryControlSession for ControlSession {
     fn send(&self, command: QueryControlCommand) -> Result<(), QueryLifecycleTransportError> {
+        let credential_lease_control = matches!(
+            command.as_proto().command.as_ref(),
+            Some(
+                novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeasePrepare(_)
+                    | novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeaseCommit(_)
+            )
+        );
+        if credential_lease_control && !self.permits_confidential_credential_leases {
+            return Err(invalid(
+                "credential lease control requires TLS Native transport",
+            ));
+        }
+        if credential_lease_control {
+            QueryControlCommand::parse_tls(command.as_proto().clone()).map_err(invalid)?;
+        } else {
+            QueryControlCommand::parse(command.as_proto().clone()).map_err(invalid)?;
+        }
         let mut state = self
             .commands
             .lock()
@@ -739,6 +791,10 @@ impl QueryControlSession for ControlSession {
             )) => state.pending.push_back(Pending::Finalize),
             Some(
                 novarocks_proto_models::novarocks::query_control_request::Command::TerminalAck(_),
+            ) => {}
+            Some(
+                novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeasePrepare(_)
+                | novarocks_proto_models::novarocks::query_control_request::Command::CredentialLeaseCommit(_),
             ) => {}
             Some(novarocks_proto_models::novarocks::query_control_request::Command::Attach(_))
             | None => {

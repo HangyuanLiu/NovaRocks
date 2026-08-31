@@ -320,10 +320,7 @@ impl DeleteEngine for DmlExecutionKernel {
         commit
             .completion
             .session()
-            .adjudicate_publication(
-                evidence,
-                commit.completion.session().request_context().clone(),
-            )
+            .adjudicate_publication(evidence, commit.completion.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 

@@ -20,7 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
+    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorInstanceId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableResolution,
 };
 
 use crate::catalog_application::resolver::TargetBackend;
@@ -105,6 +106,37 @@ pub fn reject_if_iceberg_mv_table_with_ports(
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
     let context =
         crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+    reject_if_iceberg_mv_table_with_planning_lease_and_context(
+        storage_observation,
+        &exact_lease,
+        target,
+        mutation,
+        context,
+    )
+}
+
+/// Apply the MV mutation guard through an already-admitted exact generation
+/// and request context. Query-scoped callers use this form so any vended REST
+/// response contributes to the same attempt collector rather than reopening
+/// metadata under an unbound control-only context.
+pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    exact_lease: &ConnectorControlPlanningLease,
+    target: &TargetBackend,
+    mutation: IcebergMvUserMutation,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    if target.backend_name != "iceberg" {
+        return Ok(());
+    }
+
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
+    if exact_lease.binding().descriptor().instance_id != instance_id {
+        return Err(
+            "MV mutation guard planning lease does not match the target connector".to_string(),
+        );
+    }
     let identity = ConnectorTableIdentity {
         instance_id,
         namespace: Arc::from(target.namespace.as_str()),

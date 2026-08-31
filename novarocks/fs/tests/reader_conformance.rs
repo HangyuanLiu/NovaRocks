@@ -637,6 +637,74 @@ fn parquet_exact_ranges_use_foundation_page_cache() {
 }
 
 #[test]
+fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
+    let _ = DataCacheManager::instance().init_page_cache(DataCachePageCacheOptions {
+        capacity: 1024 * 1024,
+        evict_probability: 100,
+    });
+    let read_write_cache = DataCacheManager::instance().external_context(CacheOptions {
+        enable_scan_datacache: true,
+        enable_populate_datacache: true,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
+    });
+    let read_only_cache = DataCacheManager::instance().external_context(CacheOptions {
+        enable_scan_datacache: true,
+        enable_populate_datacache: false,
+        enable_datacache_async_populate_mode: false,
+        enable_datacache_io_adaptor: false,
+        enable_cache_select: false,
+        datacache_evict_probability: 100,
+        datacache_priority: 0,
+        datacache_ttl_seconds: 0,
+        datacache_sharing_work_period: None,
+    });
+
+    let prewarmed = Fixture::parquet();
+    let mut warm_request =
+        prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    warm_request.cache = Some(read_write_cache);
+    let mut warm_reader = open_file_reader(warm_request).expect("open cache-warming reader");
+    collect(warm_reader.as_mut()).expect("warm cache");
+
+    let mut cached_request =
+        prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    cached_request.cache = Some(read_only_cache.clone());
+    let mut cached_reader = open_file_reader(cached_request).expect("open read-only cached reader");
+    collect(cached_reader.as_mut()).expect("read prewarmed cache");
+    assert!(
+        cached_reader.metrics_snapshot().cache_hits > 0,
+        "read-only cache policy may consume bytes that an earlier request populated"
+    );
+
+    let uncached = Fixture::parquet();
+    let mut first_miss =
+        uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    first_miss.cache = Some(read_only_cache.clone());
+    let mut first_reader = open_file_reader(first_miss).expect("open first read-only miss");
+    collect(first_reader.as_mut()).expect("read uncached file");
+    assert_eq!(first_reader.metrics_snapshot().cache_hits, 0);
+    assert!(first_reader.metrics_snapshot().cache_misses > 0);
+
+    let mut second_miss =
+        uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    second_miss.cache = Some(read_only_cache);
+    let mut second_reader = open_file_reader(second_miss).expect("open second read-only miss");
+    collect(second_reader.as_mut()).expect("read uncached file again");
+    let metrics = second_reader.metrics_snapshot();
+    assert_eq!(
+        metrics.cache_hits, 0,
+        "a populate-disabled miss must not become a cached range"
+    );
+    assert!(metrics.cache_misses > 0);
+}
+
+#[test]
 fn orc_projects_physical_columns_and_honors_row_budget() {
     let fixture = Fixture::orc();
     let mut reader = open_file_reader(fixture.request(

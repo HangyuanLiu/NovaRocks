@@ -190,6 +190,21 @@ pub fn iceberg_connector_table_handle(
     if !exact_lease.matches_provider_instance(&instance_id) {
         return Err("Iceberg write lease does not match the target connector instance".to_string());
     }
+    // The retained write lease, rather than a freshly acquired generation,
+    // owns the exact catalog identity for this metadata response.  A vended
+    // response must enter the already-admitted attempt collector under that
+    // identity before the provider can materialize request-scoped FileIO.
+    let context = if context.vended_credential_lease_sink().is_some() {
+        let catalog_properties = exact_lease.catalog_properties().ok_or_else(|| {
+            "Iceberg write lease has no exact-generation catalog properties for vended credentials"
+                .to_string()
+        })?;
+        context
+            .with_vended_credential_lease_collection(catalog_properties.clone())
+            .map_err(|error| error.to_string())?
+    } else {
+        context
+    };
     let metadata = exact_lease
         .load_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {

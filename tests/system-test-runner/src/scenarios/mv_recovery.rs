@@ -6,11 +6,14 @@ use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
+use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::catalog_config::parse_catalog_configuration;
 use novarocks_connector_iceberg::catalog_runtime::build_hadoop_catalog;
 use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
+use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -135,6 +138,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
                     .to_string(),
                 ),
                 be: None,
+                ..Default::default()
             },
             native_trust_fixture: Default::default(),
             ..Default::default()
@@ -693,15 +697,21 @@ fn externally_drop_hadoop_table(
     )
     .map_err(anyhow::Error::msg)
     .context("configure external Hadoop catalog client")?;
-    let catalog = build_hadoop_catalog(&configuration)
-        .map_err(anyhow::Error::msg)
-        .context("construct external Hadoop catalog client")?;
-    let table = TableIdent::from_strs([namespace, table])
-        .context("construct external Hadoop table identifier")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("create external Hadoop catalog runtime")?;
+    let binding = IcebergReadBinding::new(
+        None,
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+    );
+    let catalog = build_hadoop_catalog(&configuration, binding)
+        .map_err(anyhow::Error::msg)
+        .context("construct external Hadoop catalog client")?;
+    let table = TableIdent::from_strs([namespace, table])
+        .context("construct external Hadoop table identifier")?;
     runtime
         .block_on(catalog.drop_table(&table))
         .context("drop original table through external Hadoop catalog client")

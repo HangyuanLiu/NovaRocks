@@ -30,6 +30,7 @@ use novarocks_fs::{
     FileReadRequest, FileResult, FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future,
     FsAccessResolver, PhysicalPruning,
 };
+use novarocks_spi::connector::StorageAccessDomainId;
 use orc_rust::ArrowWriterBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
@@ -92,7 +93,11 @@ impl Fixture {
     fn from_path(directory: TempDir, path: std::path::PathBuf) -> Self {
         let file_size = std::fs::metadata(&path).expect("file metadata").len();
         let access = FsAccessResolver::new()
-            .resolve_location(path.to_string_lossy(), None)
+            .resolve_location(
+                StorageAccessDomainId::from_bytes([1; 32]),
+                path.to_string_lossy(),
+                None,
+            )
             .expect("resolve fixture");
         let file = access
             .bind(

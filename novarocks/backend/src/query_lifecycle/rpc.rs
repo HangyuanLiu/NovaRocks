@@ -49,14 +49,24 @@ pub(crate) type QueryControlResponseStream =
 pub(crate) fn handle_init_query(
     ingress: &dyn QueryLifecycleIngress,
     request: proto::InitQueryRequest,
+    tls_verified: bool,
 ) -> Result<proto::InitQueryResponse, tonic::Status> {
-    let request = QueryInitRequest::parse(request).map_err(status_from_contract_error)?;
+    let request = if tls_verified {
+        QueryInitRequest::parse_tls(request)
+    } else {
+        QueryInitRequest::parse(request)
+    }
+    .map_err(status_from_contract_error)?;
     let execution_id = request
         .manifest()
         .map_err(status_from_contract_error)?
         .execution_id()
         .map_err(status_from_contract_error)?;
-    let ack = ingress.init_query(request);
+    let ack = if tls_verified {
+        ingress.init_query_tls(request)
+    } else {
+        ingress.init_query(request)
+    };
     if matches!(ack.outcome(), Ok(QueryInitOutcome::QueryInitApplied)) {
         if let Some(scope) = claim_backend_fault(
             QueryLifecycleFaultKind::RestartAfterInitAck,
@@ -305,6 +315,7 @@ pub(crate) async fn handle_query_control_stream(
     ingress: Arc<dyn QueryLifecycleIngress>,
     mut inbound: tonic::Streaming<proto::QueryControlRequest>,
     mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_verified: bool,
 ) -> Result<QueryControlResponseStream, tonic::Status> {
     let first = tokio::select! {
         biased;
@@ -392,6 +403,7 @@ pub(crate) async fn handle_query_control_stream(
         terminal_proof_stream_drop,
         terminal_attestation_stream_drop,
         execution_id,
+        tls_verified,
     ));
     Ok(ReceiverStream::new(outbound_rx))
 }
@@ -412,6 +424,7 @@ async fn run_attached_control_stream(
     terminal_proof_stream_drop: Option<QueryLifecycleFaultScope>,
     terminal_attestation_stream_drop: Option<QueryLifecycleFaultScope>,
     execution_id: QueryExecutionId,
+    tls_verified: bool,
 ) {
     let first_event = tokio::select! {
         biased;
@@ -486,7 +499,11 @@ async fn run_attached_control_stream(
                     .await;
                     break;
                 }
-                let command = match ProtocolQueryControlCommand::parse(request)
+                let command = match (if tls_verified {
+                    ProtocolQueryControlCommand::parse_tls(request)
+                } else {
+                    ProtocolQueryControlCommand::parse(request)
+                })
                     .map_err(status_from_contract_error)
                 {
                     Ok(command) => command,
@@ -548,6 +565,20 @@ async fn run_attached_control_stream(
                             lease.mark_graceful();
                         }
                         result
+                    }
+                    Some(proto::query_control_request::Command::CredentialLeasePrepare(_)) => {
+                        let envelope = command
+                            .credential_lease_prepare()
+                            .expect("validated Protocol command parses lease prepare")
+                            .expect("lease prepare command carries an envelope");
+                        lease.control().credential_lease_prepare(envelope)
+                    }
+                    Some(proto::query_control_request::Command::CredentialLeaseCommit(_)) => {
+                        let (lease_id, epoch) = command
+                            .credential_lease_commit()
+                            .expect("validated Protocol command parses lease commit")
+                            .expect("lease commit command carries an epoch");
+                        lease.control().credential_lease_commit(lease_id, epoch)
                     }
                     Some(proto::query_control_request::Command::Attach(_)) | None => unreachable!(
                         "validated Protocol command excludes Attach and empty control frames"

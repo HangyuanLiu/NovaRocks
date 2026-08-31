@@ -24,6 +24,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::access_binding::IcebergReadBinding;
 use crate::catalog_config::{IcebergCatalogConfiguration, IcebergCatalogKind};
 
 /// One concrete catalog client with both its generic control view and the
@@ -34,6 +35,15 @@ pub struct IcebergCatalogClient {
     generic: Arc<dyn crate::iceberg::Catalog>,
     hadoop: Option<Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>>,
     rest: Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>,
+    rest_access_delegation: RestAccessDelegationMode,
+}
+
+/// Explicit catalog-definition mode.  REST response presence must never decide
+/// whether a generation is allowed to accept vended material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestAccessDelegationMode {
+    Static,
+    Vended,
 }
 
 impl IcebergCatalogClient {
@@ -48,10 +58,15 @@ impl IcebergCatalogClient {
     pub fn hadoop(&self) -> Option<&Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>> {
         self.hadoop.as_ref()
     }
+
+    pub(crate) const fn rest_access_delegation(&self) -> RestAccessDelegationMode {
+        self.rest_access_delegation
+    }
 }
 
 pub fn build_hadoop_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<crate::hadoop_catalog::HadoopFileSystemCatalog, String> {
     if configuration.kind != IcebergCatalogKind::Hadoop {
         return Err(format!(
@@ -59,21 +74,40 @@ pub fn build_hadoop_catalog(
             configuration.kind
         ));
     }
-    let file_io = crate::fs_io::build_file_io_for_location(
-        &configuration.warehouse_uri,
-        configuration.object_store_config.as_ref(),
-    );
+    let file_io =
+        crate::fs_io::build_file_io_for_location(&configuration.warehouse_uri, binding.clone());
     Ok(
-        crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_object_store_config(
+        crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
             file_io,
             configuration.warehouse_uri.clone(),
-            configuration.object_store_config.clone(),
+            binding,
         ),
     )
 }
 
 pub async fn build_rest_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
+) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
+    build_rest_catalog_with_access_delegation(
+        configuration,
+        binding,
+        RestAccessDelegationMode::Static,
+    )
+    .await
+}
+
+/// Build a REST catalog generation for the selected storage-authority mode.
+///
+/// A vended generation may authenticate to the REST control plane, but it has
+/// no storage capability until a table response contributes an attempt-scoped
+/// lease.  Do not install a warehouse storage factory in that mode: the REST
+/// adapter's deferred APIs materialize a FileIO only after the collector has
+/// accepted that response-local lease.
+async fn build_rest_catalog_with_access_delegation(
+    configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
+    rest_access_delegation: RestAccessDelegationMode,
 ) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_rest::{
@@ -103,8 +137,14 @@ pub async fn build_rest_catalog(
             configuration.warehouse_uri.clone(),
         );
     }
-    RestCatalogBuilder::default()
-        .with_storage_factory(storage_factory(configuration))
+    let builder = RestCatalogBuilder::default();
+    let builder = match rest_access_delegation {
+        RestAccessDelegationMode::Static => {
+            builder.with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
+        }
+        RestAccessDelegationMode::Vended => builder,
+    };
+    builder
         .load("rest".to_string(), properties)
         .await
         .map_err(|error| format!("build REST iceberg catalog: {error}"))
@@ -112,6 +152,7 @@ pub async fn build_rest_catalog(
 
 pub async fn build_hms_catalog(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
 ) -> Result<crate::iceberg_catalog_hms::HmsCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_hms::{
@@ -156,7 +197,7 @@ pub async fn build_hms_catalog(
         },
     );
     HmsCatalogBuilder::default()
-        .with_storage_factory(storage_factory(configuration))
+        .with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
         .load("hms".to_string(), properties)
         .await
         .map_err(|error| format!("build HMS iceberg catalog: {error}"))
@@ -165,46 +206,84 @@ pub async fn build_hms_catalog(
 /// Construct the single concrete client retained by one control generation.
 pub async fn build_catalog_client(
     configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
+) -> Result<IcebergCatalogClient, String> {
+    build_catalog_client_with_rest_access_delegation(
+        configuration,
+        binding,
+        RestAccessDelegationMode::Static,
+    )
+    .await
+}
+
+/// Build the generation's one catalog client with an explicit credential mode
+/// selected from typed catalog properties by the composition root.
+pub(crate) async fn build_catalog_client_with_rest_access_delegation(
+    configuration: &IcebergCatalogConfiguration,
+    binding: IcebergReadBinding,
+    rest_access_delegation: RestAccessDelegationMode,
 ) -> Result<IcebergCatalogClient, String> {
     match configuration.kind {
         IcebergCatalogKind::Hadoop => {
-            let hadoop = Arc::new(build_hadoop_catalog(configuration)?);
+            let hadoop = Arc::new(build_hadoop_catalog(configuration, binding)?);
             let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
             Ok(IcebergCatalogClient {
                 generic,
                 hadoop: Some(hadoop),
                 rest: None,
+                rest_access_delegation: RestAccessDelegationMode::Static,
             })
         }
         IcebergCatalogKind::Rest => {
-            let rest = Arc::new(build_rest_catalog(configuration).await?);
+            let rest = Arc::new(
+                build_rest_catalog_with_access_delegation(
+                    configuration,
+                    binding,
+                    rest_access_delegation,
+                )
+                .await?,
+            );
             let generic: Arc<dyn crate::iceberg::Catalog> = rest.clone();
             Ok(IcebergCatalogClient {
                 generic,
                 hadoop: None,
                 rest: Some(rest),
+                rest_access_delegation,
             })
         }
         IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
-            generic: Arc::new(build_hms_catalog(configuration).await?),
+            generic: Arc::new(build_hms_catalog(configuration, binding).await?),
             hadoop: None,
             rest: None,
+            rest_access_delegation: RestAccessDelegationMode::Static,
         }),
     }
 }
 
 fn storage_factory(
-    configuration: &IcebergCatalogConfiguration,
+    warehouse_uri: &str,
+    binding: IcebergReadBinding,
 ) -> Arc<dyn crate::iceberg::io::StorageFactory> {
-    crate::fs_io::build_storage_factory_for_location(
-        &configuration.warehouse_uri,
-        configuration.object_store_config.as_ref(),
-    )
+    crate::fs_io::build_storage_factory_for_location(warehouse_uri, binding)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use super::*;
+
+    fn local_binding() -> IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     #[tokio::test]
     async fn dispatches_hadoop_catalog_from_provider_configuration() {
@@ -218,7 +297,7 @@ mod tests {
         )
         .expect("configuration");
 
-        let client = build_catalog_client(&configuration)
+        let client = build_catalog_client(&configuration, local_binding())
             .await
             .expect("provider catalog");
         assert!(client.rest().is_none());

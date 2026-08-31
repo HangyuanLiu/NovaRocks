@@ -23,6 +23,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
+axum = "0.7"
+hmac = "0.12"
 mysql = "25.0.1"
 novarocks-test-support = { path = "../test-support" }
 novarocks-failpoint = { path = "../../novarocks/failpoint", default-features = false }
@@ -33,4 +35,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", features = ["parsing"] }
 toml = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "sync"] }

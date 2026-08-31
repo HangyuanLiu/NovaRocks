@@ -8,12 +8,17 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use super::canonical;
+use super::credential_lease::{
+    decode_credential_lease_descriptor, encode_credential_lease_descriptor,
+    validate_credential_lease_descriptors,
+};
 use super::identity::{QueryExecutionId, decode_query_execution_id, encode_query_execution_id};
 use super::query_options::QueryOptions;
 use crate::catalog::CatalogSet;
 use crate::membership::{BackendProcessId, required_native_compatibility_id};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks};
+use novarocks_spi::connector::CredentialLeaseDescriptor;
 use novarocks_types::{BackendProcessId as DomainBackendProcessId, NativeCompatibilityId};
 
 const PARTICIPANT_MANIFEST_V1_DOMAIN: &[u8] =
@@ -400,6 +405,37 @@ impl ParticipantManifest {
         report_endpoint: QueryControlEndpoint,
         catalog_set: CatalogSet,
     ) -> Result<Self, ProtocolError> {
+        Self::new_with_catalog_set_and_credential_lease_descriptors(
+            execution_id,
+            backend,
+            native_compatibility_id,
+            expected_fragment_instance_ids,
+            query_options,
+            query_deadline_unix_ms,
+            exchange_routes,
+            runtime_filter,
+            pre_start_timeout,
+            report_endpoint,
+            catalog_set,
+            [],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_catalog_set_and_credential_lease_descriptors(
+        execution_id: QueryExecutionId,
+        backend: ParticipantBackendIdentity,
+        native_compatibility_id: NativeCompatibilityId,
+        expected_fragment_instance_ids: impl IntoIterator<Item = common::UniqueId>,
+        query_options: QueryOptions,
+        query_deadline_unix_ms: u64,
+        exchange_routes: impl IntoIterator<Item = ExchangeRouteManifest>,
+        runtime_filter: Option<RuntimeFilterContribution>,
+        pre_start_timeout: Duration,
+        report_endpoint: QueryControlEndpoint,
+        catalog_set: CatalogSet,
+        credential_lease_descriptors: impl IntoIterator<Item = CredentialLeaseDescriptor>,
+    ) -> Result<Self, ProtocolError> {
         let pre_start_timeout_ms = u64::try_from(pre_start_timeout.as_millis()).map_err(|_| {
             out_of_range(
                 FieldPath::root("participant_manifest").field("pre_start_timeout_ms"),
@@ -423,6 +459,10 @@ impl ParticipantManifest {
             pre_start_timeout_ms,
             report_endpoint: Some(report_endpoint.as_proto().clone()),
             catalog_set: Some(catalog_set.as_proto().clone()),
+            credential_lease_descriptors: credential_lease_descriptors
+                .into_iter()
+                .map(|descriptor| encode_credential_lease_descriptor(&descriptor))
+                .collect(),
         })
     }
 
@@ -451,12 +491,17 @@ impl ParticipantManifest {
                 "catalog set is required",
             )
         })?;
-        CatalogSet::parse(catalog_set).map_err(|error| {
+        let catalog_set = CatalogSet::parse(catalog_set).map_err(|error| {
             prefix_path(
                 FieldPath::root("participant_manifest").field("catalog_set"),
                 error,
             )
         })?;
+        validate_credential_lease_descriptors(
+            &raw.credential_lease_descriptors,
+            &catalog_set,
+            FieldPath::root("participant_manifest"),
+        )?;
 
         let mut fragment_ids = BTreeSet::new();
         for (index, fragment_id) in raw
@@ -599,6 +644,25 @@ impl ParticipantManifest {
                 error,
             )
         })
+    }
+
+    pub fn credential_lease_descriptors(
+        &self,
+    ) -> Result<Vec<CredentialLeaseDescriptor>, ProtocolError> {
+        self.raw
+            .credential_lease_descriptors
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, descriptor)| {
+                decode_credential_lease_descriptor(
+                    descriptor,
+                    FieldPath::root("participant_manifest")
+                        .field("credential_lease_descriptors")
+                        .index(index),
+                )
+            })
+            .collect()
     }
 
     pub fn expected_fragment_instance_ids(&self) -> Vec<common::UniqueId> {
@@ -812,6 +876,43 @@ mod tests {
             report_endpoint: Some(endpoint(9031)),
             catalog_set: Some(catalog::CatalogSet { catalogs: vec![] }),
             ..Default::default()
+        }
+    }
+
+    fn vended_catalog_set() -> catalog::CatalogSet {
+        catalog::CatalogSet {
+            catalogs: vec![catalog::CatalogProperties {
+                handle: Some(catalog::CatalogHandle {
+                    catalog_name: "warehouse".to_owned(),
+                    version: vec![7; 32],
+                }),
+                provider_kind: catalog::CatalogProviderKind::Iceberg as i32,
+                config_format_version: 1,
+                execution_properties: vec![],
+                credential_bindings: vec![catalog::CatalogCredentialBinding {
+                    purpose: catalog::CatalogCredentialPurpose::ObjectStoreData as i32,
+                    consumer_role: catalog::CredentialConsumerRole::FrontendAndBackend as i32,
+                    mode: Some(catalog::catalog_credential_binding::Mode::VendedCredential(
+                        catalog::VendedCredential {},
+                    )),
+                }],
+            }],
+        }
+    }
+
+    fn vended_lease_descriptor(epoch: u64) -> novarocks::CredentialLeaseDescriptor {
+        novarocks::CredentialLeaseDescriptor {
+            lease_id: vec![1; 16],
+            epoch,
+            owner: Some(catalog::CatalogHandle {
+                catalog_name: "warehouse".to_owned(),
+                version: vec![7; 32],
+            }),
+            provider: novarocks::CredentialLeaseProvider::S3 as i32,
+            prefixes: vec!["s3://bucket/data".to_owned()],
+            not_after_unix_ms: 100,
+            refresh_capable: true,
+            storage_access_domain_id: vec![9; 32],
         }
     }
 
@@ -1060,6 +1161,30 @@ mod tests {
                 .collect::<String>(),
             "da5916181193fe76e19ba26d713048062cb36a8570a81b8631e78059e4563656"
         );
+    }
+
+    #[test]
+    fn credential_lease_descriptor_is_digest_bound_but_remains_secret_free() {
+        let mut first = manifest();
+        first.catalog_set = Some(vended_catalog_set());
+        first.credential_lease_descriptors = vec![vended_lease_descriptor(1)];
+        let first = ParticipantManifest::parse(first).expect("valid descriptor contribution");
+        assert_eq!(
+            first
+                .credential_lease_descriptors()
+                .expect("descriptor")
+                .len(),
+            1
+        );
+
+        let mut changed = first.as_proto().clone();
+        changed.credential_lease_descriptors[0].epoch = 2;
+        let changed = ParticipantManifest::parse(changed).expect("changed epoch remains valid");
+        assert_ne!(
+            first.digest().expect("digest"),
+            changed.digest().expect("digest")
+        );
+        assert!(!format!("{first:?}").contains("access-key"));
     }
 
     #[test]

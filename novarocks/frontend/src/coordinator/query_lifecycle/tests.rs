@@ -158,6 +158,8 @@ enum QueryControlCommand {
     Abort { reason: String },
     Finalize,
     TerminalAck,
+    CredentialLeasePrepare { lease_id: Vec<u8>, epoch: u64 },
+    CredentialLeaseCommit { lease_id: Vec<u8>, epoch: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -188,6 +190,22 @@ fn query_control_command_view(
         }
         Some(proto::query_control_request::Command::TerminalAck(_)) => {
             Ok(QueryControlCommand::TerminalAck)
+        }
+        Some(proto::query_control_request::Command::CredentialLeasePrepare(prepare)) => {
+            let envelope = prepare
+                .envelope
+                .as_ref()
+                .ok_or_else(|| "credential lease prepare requires an envelope".to_string())?;
+            Ok(QueryControlCommand::CredentialLeasePrepare {
+                lease_id: envelope.lease_id.clone(),
+                epoch: envelope.epoch,
+            })
+        }
+        Some(proto::query_control_request::Command::CredentialLeaseCommit(commit)) => {
+            Ok(QueryControlCommand::CredentialLeaseCommit {
+                lease_id: commit.lease_id.clone(),
+                epoch: commit.epoch,
+            })
         }
         Some(proto::query_control_request::Command::Attach(_)) | None => {
             Err("active command must not be attach or empty".to_string())
@@ -644,7 +662,9 @@ impl QueryControlSession for RecordingSession {
                 Some(QueryTerminationReason::QueryTerminationCoordinatorFinalize)
             }
             Some(proto::query_control_request::Command::Heartbeat(_))
-            | Some(proto::query_control_request::Command::TerminalAck(_)) => None,
+            | Some(proto::query_control_request::Command::TerminalAck(_))
+            | Some(proto::query_control_request::Command::CredentialLeasePrepare(_))
+            | Some(proto::query_control_request::Command::CredentialLeaseCommit(_)) => None,
             Some(proto::query_control_request::Command::Attach(_)) | None => {
                 unreachable!("validated active control command")
             }
@@ -1803,6 +1823,8 @@ impl QueryControlSession for HeartbeatGateSession {
                 ));
             }
             QueryControlCommand::TerminalAck => {}
+            QueryControlCommand::CredentialLeasePrepare { .. }
+            | QueryControlCommand::CredentialLeaseCommit { .. } => {}
         }
         state.commands.push(command);
         Ok(())
@@ -3800,6 +3822,8 @@ impl crate::native::generated::nova_rocks_grpc_server::NovaRocksGrpc
                                 Ok(ack) => control.terminal_ack(ack),
                                 Err(error) => Err(QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, error.to_string())),
                             },
+                            Some(proto::query_control_request::Command::CredentialLeasePrepare(_)
+                                | proto::query_control_request::Command::CredentialLeaseCommit(_)) => Err(QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, "credential lease test ingress requires TLS")),
                             Some(proto::query_control_request::Command::Attach(_)) | None => Err(QueryLifecycleError::new(QueryLifecycleErrorCode::InvalidManifest, "invalid active control command")),
                         };
                         if let Err(error) = result { let _ = outbound.send(Err(Self::status(error))).await; break; }

@@ -69,8 +69,8 @@ use crate::row_lineage_synth::{
 use crate::scan_model::IcebergSchemaFieldDef;
 use crate::write_activation::IcebergWriteActivationReservations;
 use crate::write_codec::{
-    ICEBERG_WRITE_PAYLOAD_VERSION, IcebergPositionDeletePartitionInput, IcebergWriteHandleInput,
-    IcebergWriteHandleMode, encode_write_handle,
+    IcebergPositionDeletePartitionInput, IcebergWriteHandleInput, IcebergWriteHandleMode,
+    encode_write_handle,
 };
 use crate::write_payload::{IcebergFirstRefreshWritePlanPayloadV2, IcebergWritePlanPayloadV1};
 
@@ -898,7 +898,7 @@ impl IcebergWriteControl {
             .invalidate(namespace, table_name);
         let physical = self
             .runtime
-            .load_table(namespace, table_name)
+            .load_table_for_request(namespace, table_name, context)
             .map_err(unavailable)?;
         let open_metadata = physical.table.metadata();
         if prepared_metadata.uuid() != open_metadata.uuid()
@@ -925,7 +925,11 @@ impl IcebergWriteControl {
             .map_err(unavailable)?
             .map_err(unavailable)?;
         validate_context(context)?;
-        let binding = self.runtime.resources().planning_binding();
+        let binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(context.clone());
         let mut partitions = Vec::with_capacity(files.len());
         for file in files {
             let partition_spec_id = file.partition_spec_id.ok_or_else(|| {
@@ -1141,6 +1145,7 @@ impl IcebergWriteControl {
     fn load_exact_commit_table(
         &self,
         target: &ActiveTarget,
+        context: &ConnectorRequestContext,
     ) -> Result<crate::iceberg::table::Table, ConnectorError> {
         self.runtime
             .control_state()
@@ -1148,7 +1153,7 @@ impl IcebergWriteControl {
             .invalidate(&target.namespace, &target.table);
         let physical = self
             .runtime
-            .load_table(&target.namespace, &target.table)
+            .load_table_for_request(&target.namespace, &target.table, context)
             .map_err(unavailable)?;
         let metadata = physical.table.metadata();
         let snapshot =
@@ -1286,7 +1291,7 @@ impl IcebergWriteControl {
                 return Ok(outcome);
             }
             let cleanup = self
-                .cleanup_files(&[])
+                .cleanup_files(&[], &request.context)
                 .map_err(CommitServiceError::invalid_input)?;
             return Err(CommitServiceError::known_uncommitted(
                 "managed Iceberg publication produced empty input".to_string(),
@@ -1376,7 +1381,11 @@ impl IcebergWriteControl {
             }
         }
         let snapshot_properties = self.snapshot_properties(request, active, staged_data_rows)?;
-        let binding = self.runtime.resources().planning_binding();
+        let binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(request.context.clone());
         let access = binding
             .resolve_access(metadata.location())
             .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
@@ -1436,11 +1445,24 @@ impl IcebergWriteControl {
                     super::service::RecoveryEvidence::from_collector(&bridge_collector),
                 )
             })??;
+        // `load_exact_commit_table` deliberately invalidates then refills the
+        // generation-local physical-table cache with the exact sealed base.
+        // A successful catalog commit makes that cached metadata stale before
+        // the managed-publication receipt projects the committed snapshot's
+        // row count.  Invalidate at the proven-commit boundary so the
+        // projection reloads through the request-local access authority rather
+        // than reading the pre-commit table view.
+        self.invalidate_target_caches(&active.target);
         let resulting_row_count = if matches!(
             active.activation_intent,
             ConnectorWriteActivationIntent::ManagedPublication(_)
         ) {
-            table_snapshot_row_count(&self.runtime, &active.target, result.new_snapshot_id)?
+            table_snapshot_row_count(
+                &self.runtime,
+                &active.target,
+                result.new_snapshot_id,
+                &request.context,
+            )?
         } else {
             None
         };
@@ -1551,19 +1573,28 @@ impl IcebergWriteControl {
             .invalidate_table_cache(&target.namespace, &target.table);
     }
 
-    fn cleanup_files(&self, files: &[WrittenFile]) -> Result<super::CleanupAttempt, String> {
-        self.cleanup_paths(files.iter().map(|file| file.path.as_str()))
+    fn cleanup_files(
+        &self,
+        files: &[WrittenFile],
+        context: &ConnectorRequestContext,
+    ) -> Result<super::CleanupAttempt, String> {
+        self.cleanup_paths(files.iter().map(|file| file.path.as_str()), context)
     }
 
     fn cleanup_paths<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a str>,
+        context: &ConnectorRequestContext,
     ) -> Result<super::CleanupAttempt, String> {
         let paths = paths.into_iter().collect::<BTreeSet<_>>();
         if paths.is_empty() {
             return Ok(super::CleanupAttempt::completed(Vec::new()));
         }
-        let binding = self.runtime.resources().planning_binding();
+        let binding = self
+            .runtime
+            .resources()
+            .planning_binding()
+            .for_request(context.clone());
         let access = binding
             .resolve_access_for_locations(paths.iter().copied())
             .map_err(|error| error.to_string())?;
@@ -1996,7 +2027,7 @@ impl ConnectorWriteControl for IcebergWriteControl {
             Ok(())
         };
 
-        let table = match self.load_exact_commit_table(&active.target) {
+        let table = match self.load_exact_commit_table(&active.target, &request.context) {
             Ok(table) => table,
             Err(error) => {
                 restore_active()?;
@@ -2227,7 +2258,11 @@ impl ConnectorWriteControl for IcebergWriteControl {
         } else {
             let physical = self
                 .runtime
-                .load_table(&active.target.namespace, &active.target.table)
+                .load_table_for_request(
+                    &active.target.namespace,
+                    &active.target.table,
+                    &request.context,
+                )
                 .map_err(unavailable)?;
             let metadata = physical.table.metadata();
             let decode_metadata = active
@@ -2277,7 +2312,8 @@ impl ConnectorWriteControl for IcebergWriteControl {
                     }
                 }
             }
-            self.cleanup_files(&files).map_err(internal)?
+            self.cleanup_files(&files, &request.context)
+                .map_err(internal)?
         };
         let outcome = ConnectorWriteAbortOutcome::KnownUncommitted {
             cleanup: cleanup_finalization(&cleanup),
@@ -2386,19 +2422,15 @@ impl ConnectorWriteControl for IcebergWriteControl {
         }
         ensure_reconcile_partition_facts(&evidence, operation_id, &unknown.active)?;
         self.invalidate_target_caches(&unknown.active.target);
-        let ident = crate::iceberg::TableIdent::from_strs([
-            unknown.active.target.namespace.as_str(),
-            unknown.active.target.table.as_str(),
-        ])
-        .map_err(|error| invalid(format!("build Iceberg table identity: {error}")))?;
-        let catalog = self.runtime.novarocks_catalog().vendored_client();
-        let table = self
+        let physical = self
             .runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { catalog.load_table(&ident).await })
-            .map_err(unavailable)?
-            .map_err(|error| unavailable(error.to_string()))?;
+            .load_table_for_request(
+                &unknown.active.target.namespace,
+                &unknown.active.target.table,
+                &request.context,
+            )
+            .map_err(unavailable)?;
+        let table = physical.table;
         if table.metadata().uuid().to_string() != unknown.active.target.table_uuid {
             return Err(corrupt(
                 "Iceberg write reconciliation loaded a different physical table UUID",
@@ -3441,32 +3473,18 @@ fn table_snapshot_row_count(
     runtime: &Arc<IcebergMetadataContext>,
     target: &ActiveTarget,
     snapshot_id: i64,
+    context: &ConnectorRequestContext,
 ) -> Result<Option<u64>, CommitServiceError> {
-    let ident =
-        crate::iceberg::TableIdent::from_strs([target.namespace.as_str(), target.table.as_str()])
-            .map_err(|error| CommitServiceError::invalid_input(error.to_string()))?;
-    let catalog = runtime.novarocks_catalog().vendored_client();
+    // The commit has just invalidated the generation-local table cache.  The
+    // admitted request scope may still retain the exact pre-commit table view,
+    // however, so it cannot prove facts about the newly committed snapshot.
+    // Keep the already-authorized storage resolver but drop the attempt's
+    // lease sink: this forces a metadata reload without admitting a late
+    // vended credential response after Init was frozen.
+    let terminal_context = context.clone().without_vended_credential_lease_sink();
     let table = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { catalog.load_table(&ident).await })
-        .map_err(|error| {
-            CommitServiceError::finalize_failed_known_committed(
-                Some(CommitOutcome {
-                    new_snapshot_id: snapshot_id,
-                    written_manifest_paths: Vec::new(),
-                }),
-                error,
-                RecoveryEvidence {
-                    table_ident: format!("{}.{}", target.namespace, target.table),
-                    op_kind: CommitOpKind::FastAppend,
-                    base_snapshot_id: target.base_snapshot_id,
-                    base_sequence_number: 0,
-                    staging_dir: target.location.clone(),
-                    manifest_cleanup_token: None,
-                },
-            )
-        })?
+        .load_table_for_request(&target.namespace, &target.table, &terminal_context)
+        .map(|physical| physical.into_table())
         .map_err(|error| {
             CommitServiceError::finalize_failed_known_committed(
                 Some(CommitOutcome {

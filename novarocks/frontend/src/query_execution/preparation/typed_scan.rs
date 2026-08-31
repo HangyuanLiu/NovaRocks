@@ -197,6 +197,7 @@ pub(crate) fn prepare_typed_scan(
     session: &ConnectorSession,
     catalog: CatalogHandle,
     control: &InstalledReadControl,
+    request_control: &novarocks_spi::connector::read_stack::ConnectorReadRequestControl,
     plan_node_id: i32,
     scan: &PlanScanNode,
     physical_columns: &[ResolvedScanColumn],
@@ -206,7 +207,7 @@ pub(crate) fn prepare_typed_scan(
     dynamic_filters: &[(u32, String)],
 ) -> Result<PreparedTypedScan, String> {
     let relation_kind = freeze.relation_kind();
-    let metadata = control.metadata();
+    let metadata = request_control.metadata();
     let relation_name = format!("{}.{}", relation.schema_name(), relation.table_name());
 
     // 1. Freeze the relation the lane asked for. Admission already resolved
@@ -478,7 +479,7 @@ pub(crate) fn prepare_typed_scan(
     // 9. Take the enumerator entry point without enumerating anything.
     Ok(PreparedTypedScan {
         table_scan,
-        split_manager: control.splits(),
+        split_manager: request_control.splits(),
         codec: control.codec(),
         constraint,
         residual_ordinals: lowered.residual_ordinals,

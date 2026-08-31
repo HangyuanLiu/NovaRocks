@@ -27,14 +27,16 @@ use std::sync::Arc;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadExecutionBundle, ConnectorReadExecutionBundleFactory,
 };
-use novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions;
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
     ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
 };
+use novarocks_spi::connector::read_stack::{
+    ConnectorDataCacheOptions, ConnectorPageSourceProviderOptions,
+};
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorProviderId,
-    ConnectorRequestContext,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorProviderId, ConnectorRequestContext,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -60,6 +62,14 @@ impl IcebergTypedProviderFactory {
     /// resolve object storage through one owner.
     pub fn new(binding: IcebergReadBinding, options: IcebergPageSourceProviderOptions) -> Self {
         Self { binding, options }
+    }
+
+    /// Bind the process-local catalog runtime to the admitted fragment request
+    /// before constructing a reader. In particular, a vended catalog can
+    /// resolve storage only through this request's lifecycle-installed
+    /// resolver; it must never fall back to the generation binding.
+    fn binding_for_request(&self, request: &ConnectorRequestContext) -> IcebergReadBinding {
+        self.binding.for_request(request.clone())
     }
 
     /// Pair this request-scoped execution factory with one exact provider
@@ -104,14 +114,12 @@ where
         request: &ConnectorRequestContext,
         reader_policy: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
-        let options = apply_reader_policy(self.options, reader_policy);
+        let binding = self.binding_for_request(request);
+        let context =
+            binding.file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        let options = apply_reader_policy(self.options.clone(), reader_policy);
         Ok(Arc::new(IcebergPageSourceProvider::new(
-            self.binding.clone(),
-            context,
-            options,
+            binding, context, options,
         )))
     }
 
@@ -119,11 +127,11 @@ where
         &self,
         request: &ConnectorRequestContext,
     ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError> {
-        let context = self
-            .binding
-            .file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
+        let binding = self.binding_for_request(request);
+        let context =
+            binding.file_read_context(novarocks_fs::FileCancellation::new(), request.deadline())?;
         Ok(Arc::new(IcebergSystemTableProvider::new(
-            self.binding.clone(),
+            binding,
             context,
             self.options.budget.max_rows,
         )))
@@ -136,13 +144,150 @@ fn apply_reader_policy(
 ) -> IcebergPageSourceProviderOptions {
     options.reader_options.enable_parquet_reader_page_index =
         reader_policy.enable_parquet_reader_page_index;
+    options.cache_options = external_cache_options(reader_policy.data_cache);
     options
+}
+
+fn external_cache_options(policy: ConnectorDataCacheOptions) -> novarocks_fs::CacheOptions {
+    novarocks_fs::CacheOptions {
+        enable_scan_datacache: policy.enable_scan_datacache,
+        enable_populate_datacache: policy.enable_populate_datacache,
+        enable_datacache_async_populate_mode: policy.enable_datacache_async_populate_mode,
+        enable_datacache_io_adaptor: policy.enable_datacache_io_adaptor,
+        enable_cache_select: policy.enable_cache_select,
+        datacache_evict_probability: policy.datacache_evict_probability,
+        datacache_priority: policy.datacache_priority,
+        datacache_ttl_seconds: policy.datacache_ttl_seconds,
+        datacache_sharing_work_period: policy.datacache_sharing_work_period,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
     use super::*;
-    use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId};
+    use novarocks_fs::{
+        FsAccessResolver, FsAccessResources, ObjectStoreProviderPool,
+        ObjectStoreProviderPoolOptions, TokioFileIoRuntime, TokioFileTaskSpawner,
+    };
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+        ConnectorCancellation, ConnectorErrorKind, ConnectorInstanceId, ConnectorStorageResolver,
+        CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
+    };
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    struct RejectingStaticResolver;
+
+    impl crate::access_binding::IcebergStaticCredentialResolver for RejectingStaticResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &novarocks_spi::connector::StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "typed factory test static resolver must not be used",
+            ))
+        }
+    }
+
+    struct RecordingVendedResolver {
+        calls: AtomicUsize,
+    }
+
+    impl ConnectorStorageResolver for RecordingVendedResolver {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            assert_eq!(request.owner().catalog_name().as_str(), "typed-vended-test");
+            assert_eq!(request.location(), "s3://warehouse/table/data.parquet");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "typed factory test vended resolver was selected",
+            ))
+        }
+    }
+
+    fn vended_factory() -> IcebergTypedProviderFactory {
+        let runtime = tokio::runtime::Runtime::new().expect("build Tokio runtime");
+        let resources = FsAccessResources::new(
+            Arc::new(
+                ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
+                    .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        // The test does not schedule file I/O; the runtime is needed only to
+        // construct a valid binding while validating resolver selection.
+        let properties = CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("typed-vended-test").expect("catalog"),
+                CatalogVersion::from_bytes([0x27; 32]),
+            ),
+            CatalogProviderKind::Iceberg,
+            1,
+            vec![
+                CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")
+                    .expect("endpoint property"),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::FrontendAndBackend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+            ],
+        )
+        .expect("catalog properties");
+        IcebergTypedProviderFactory::new(
+            IcebergReadBinding::from_catalog_properties(
+                resources,
+                Arc::new(RejectingStaticResolver),
+                &properties,
+            )
+            .expect("vended binding"),
+            IcebergPageSourceProviderOptions::with_default_budget(),
+        )
+    }
+
+    fn request_context(resolver: Arc<RecordingVendedResolver>) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            1024,
+            2048,
+        )
+        .expect("request context")
+        .with_storage_resolver(resolver)
+    }
+
+    fn assert_request_binding_uses_vended_resolver(
+        factory: &IcebergTypedProviderFactory,
+        request: &ConnectorRequestContext,
+        resolver: &RecordingVendedResolver,
+    ) {
+        let error = factory
+            .binding_for_request(request)
+            .resolve_access("s3://warehouse/table/data.parquet")
+            .expect_err("request binding must select the lifecycle vended resolver");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn query_reader_policy_overrides_the_generation_default() {
@@ -150,17 +295,28 @@ mod tests {
             IcebergPageSourceProviderOptions::with_default_budget(),
             ConnectorPageSourceProviderOptions {
                 enable_parquet_reader_page_index: true,
+                data_cache: ConnectorDataCacheOptions {
+                    enable_scan_datacache: true,
+                    enable_populate_datacache: true,
+                    datacache_priority: 2,
+                    ..Default::default()
+                },
             },
         );
         assert!(options.reader_options.enable_parquet_reader_page_index);
+        assert!(options.cache_options.enable_scan_datacache);
+        assert!(options.cache_options.enable_populate_datacache);
+        assert_eq!(options.cache_options.datacache_priority, 2);
 
         let options = apply_reader_policy(
             options,
             ConnectorPageSourceProviderOptions {
                 enable_parquet_reader_page_index: false,
+                data_cache: ConnectorDataCacheOptions::default(),
             },
         );
         assert!(!options.reader_options.enable_parquet_reader_page_index);
+        assert!(!options.cache_options.enable_scan_datacache);
     }
 
     #[test]
@@ -176,13 +332,37 @@ mod tests {
             std::array::from_fn(|index| index as u8),
         );
     }
+
+    #[test]
+    fn typed_data_provider_binds_the_request_vended_resolver() {
+        let factory = vended_factory();
+        let resolver = Arc::new(RecordingVendedResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let request = request_context(resolver.clone());
+
+        assert_request_binding_uses_vended_resolver(&factory, &request, &resolver);
+    }
+
+    #[test]
+    fn typed_system_table_provider_binds_the_request_vended_resolver() {
+        let factory = vended_factory();
+        let resolver = Arc::new(RecordingVendedResolver {
+            calls: AtomicUsize::new(0),
+        });
+        let request = request_context(resolver.clone());
+
+        assert_request_binding_uses_vended_resolver(&factory, &request, &resolver);
+    }
 }
 
 impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
     fn build(
         &self,
-        catalog_handle: &CatalogHandle,
+        properties: &CatalogProperties,
     ) -> Result<ConnectorReadExecutionBundle, ConnectorError> {
+        let binding = self.binding.bind_catalog(properties)?;
+        let catalog_handle = properties.handle();
         let runtime = IcebergExecutionReadRuntime::new(
             iceberg_descriptor(catalog_handle),
             catalog_handle.clone(),
@@ -193,7 +373,10 @@ impl ConnectorReadExecutionBundleFactory for IcebergTypedProviderFactory {
         let codec = Arc::new(IcebergConnectorReadCodec::new(adapter.clone()));
         let provider_factory = Arc::new(ProviderReadFactoryAdapter::new(
             adapter,
-            Arc::new(self.clone()),
+            Arc::new(Self {
+                binding,
+                options: self.options.clone(),
+            }),
         ));
         Ok(ConnectorReadExecutionBundle::new(provider_factory, codec))
     }

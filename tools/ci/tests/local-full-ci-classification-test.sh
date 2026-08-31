@@ -219,6 +219,7 @@ launcher_capture="$tmpdir/sql-runner-launcher.args"
   REPO_ROOT="$tmpdir/current-worktree"
   CI_RUN_DIR="$tmpdir/sql-runner-launcher"
   NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
+  NOVA_ENV_RUNTIME_DIR="$tmpdir/runtime"
   RUN_MODE="explicit"
   mkdir -p "$CI_RUN_DIR/sql"
 
@@ -237,6 +238,11 @@ launcher_capture="$tmpdir/sql-runner-launcher.args"
 
 if ! grep -Fx "NOVAROCKS_WORKSPACE_ROOT=$tmpdir/current-worktree" "$launcher_capture" >/dev/null; then
   echo "SQL runner must receive the current CI worktree root" >&2
+  exit 1
+fi
+
+if ! grep -Fx "NOVA_ENV_REST_ENV_FILE=$tmpdir/runtime/env.sh" "$launcher_capture" >/dev/null; then
+  echo "SQL runner must receive the exact prepared Iceberg REST environment" >&2
   exit 1
 fi
 

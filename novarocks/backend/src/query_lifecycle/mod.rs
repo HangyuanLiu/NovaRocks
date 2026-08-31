@@ -16,6 +16,7 @@
 // under the License.
 
 mod contract;
+mod credential_lease;
 mod entry;
 mod local_runtime;
 mod registry;

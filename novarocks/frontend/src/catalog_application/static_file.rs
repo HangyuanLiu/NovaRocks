@@ -17,7 +17,7 @@
 
 //! Bounded, one-shot parsing for the StaticFile catalog desired-state source.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -26,19 +26,20 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use super::desired_state::{
-    CatalogCredentialReference, CatalogDesiredStateEntry, CatalogDesiredStateSnapshot,
-    CatalogDesiredStateSourceMode, CatalogLogicalConfig, CatalogSourceEntryIdentity,
+    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSourceMode,
+    CatalogLogicalConfig, CatalogSourceEntryIdentity,
 };
 use super::{CatalogApplicationError, CatalogApplicationErrorKind};
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use novarocks_spi::connector::{
+    CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
+    ConnectorProviderId, CredentialConsumerRole, MAX_CATALOG_NON_SECRET_PROPERTIES,
+    StaticCredentialReference, canonicalize_catalog_credential_bindings,
+};
 
 const MAX_FILE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CATALOGS: usize = 1024;
-const MAX_PROPERTIES_PER_CATALOG: usize = 256;
-const MAX_CREDENTIAL_REFERENCES_PER_CATALOG: usize = 16;
 const MAX_DISPLAY_NAME_BYTES: usize = 256;
-const MAX_CREDENTIAL_REFERENCE_BYTES: usize = 256;
-const STATIC_FILE_FORMAT_VERSION: u8 = 1;
+const STATIC_FILE_FORMAT_VERSION: u8 = 3;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,9 +55,18 @@ struct StaticCatalogWire {
     provider_id: String,
     display_name: String,
     config_format_version: u8,
-    #[serde(default)]
-    credential_references: Vec<String>,
+    credential_bindings: Vec<StaticCatalogCredentialBindingWire>,
     properties: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StaticCatalogCredentialBindingWire {
+    purpose: String,
+    consumer_role: String,
+    mode: String,
+    name: Option<String>,
+    generation: Option<String>,
 }
 
 /// Loads one complete StaticFile desired-state snapshot.
@@ -77,7 +87,7 @@ pub fn load_static_file_snapshot(
     })?;
     if file.format_version != STATIC_FILE_FORMAT_VERSION {
         return Err(whole_file_error(format!(
-            "static catalog file {} declares unsupported format_version {}; expected 1",
+            "static catalog file {} declares unsupported format_version {}; expected {STATIC_FILE_FORMAT_VERSION}",
             path.display(),
             file.format_version
         )));
@@ -133,7 +143,7 @@ fn parse_catalog(
 ) -> Result<CatalogDesiredStateEntry, CatalogApplicationError> {
     if wire.config_format_version != STATIC_FILE_FORMAT_VERSION {
         return Err(whole_file_error(format!(
-            "catalog `{}` declares unsupported config_format_version {}; expected 1",
+            "catalog `{}` declares unsupported config_format_version {}; expected {STATIC_FILE_FORMAT_VERSION}",
             wire.instance_id, wire.config_format_version
         )));
     }
@@ -143,15 +153,9 @@ fn parse_catalog(
             wire.instance_id
         )));
     }
-    if wire.properties.len() > MAX_PROPERTIES_PER_CATALOG {
+    if wire.properties.len() > MAX_CATALOG_NON_SECRET_PROPERTIES {
         return Err(whole_file_error(format!(
-            "catalog `{}` declares more than {MAX_PROPERTIES_PER_CATALOG} properties",
-            wire.instance_id
-        )));
-    }
-    if wire.credential_references.len() > MAX_CREDENTIAL_REFERENCES_PER_CATALOG {
-        return Err(whole_file_error(format!(
-            "catalog `{}` declares more than {MAX_CREDENTIAL_REFERENCES_PER_CATALOG} credential references",
+            "catalog `{}` declares more than {MAX_CATALOG_NON_SECRET_PROPERTIES} properties",
             wire.instance_id
         )));
     }
@@ -167,70 +171,71 @@ fn parse_catalog(
             wire.provider_id
         ))
     })?;
-    let properties = wire
-        .properties
-        .into_iter()
-        .map(|(key, value)| validate_durable_property_key(&key).map(|()| (key, value)))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut references = BTreeSet::new();
-    for reference in wire.credential_references {
-        if !valid_credential_reference(&reference) {
-            return Err(whole_file_error(format!(
-                "catalog `{}` has an invalid credential reference `{reference}`",
-                instance_id.as_str()
-            )));
-        }
-        references.insert(reference);
-    }
+    let properties = wire.properties.into_iter().collect();
+    let credential_bindings = canonicalize_catalog_credential_bindings(
+        wire.credential_bindings
+            .into_iter()
+            .map(parse_credential_binding)
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+    .map_err(|error| {
+        whole_file_error(format!(
+            "catalog `{}` has invalid credential bindings: {error}",
+            instance_id.as_str()
+        ))
+    })?;
     Ok(CatalogDesiredStateEntry::new(
         CatalogSourceEntryIdentity::new(Uuid::now_v7()),
-        CatalogLogicalConfig::new(
+        CatalogLogicalConfig::try_new(
             instance_id,
             provider_id,
             wire.display_name,
             properties,
-            references
-                .into_iter()
-                .map(CatalogCredentialReference::new)
-                .collect(),
+            credential_bindings,
             STATIC_FILE_FORMAT_VERSION,
-        ),
+        )
+        .map_err(|error| whole_file_error(error.to_string()))?,
     ))
 }
 
-fn validate_durable_property_key(key: &str) -> Result<(), CatalogApplicationError> {
-    if key.trim().is_empty() {
-        return Err(whole_file_error("catalog property key must not be empty"));
-    }
-    let normalized = key.to_ascii_lowercase();
-    if [
-        "password",
-        "secret",
-        "token",
-        "credential",
-        "access-key",
-        "access_key",
-        "private-key",
-        "private_key",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
-    {
-        return Err(whole_file_error(format!(
-            "credential-like catalog property cannot be durable: {key}"
-        )));
-    }
-    Ok(())
-}
-
-fn valid_credential_reference(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_CREDENTIAL_REFERENCE_BYTES
-        && bytes[0].is_ascii_lowercase()
-        && bytes[1..].iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
-        })
+fn parse_credential_binding(
+    wire: StaticCatalogCredentialBindingWire,
+) -> Result<CatalogCredentialBinding, CatalogApplicationError> {
+    let purpose = match wire.purpose.as_str() {
+        "catalog-control" => CatalogCredentialPurpose::CatalogControl,
+        "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
+        _ => return Err(whole_file_error("unknown catalog credential purpose")),
+    };
+    let consumer_role = match wire.consumer_role.as_str() {
+        "frontend" => CredentialConsumerRole::Frontend,
+        "frontend-and-backend" => CredentialConsumerRole::FrontendAndBackend,
+        _ => return Err(whole_file_error("unknown catalog credential consumer role")),
+    };
+    let mode = match wire.mode.as_str() {
+        "static" => {
+            let name = wire.name.as_deref().ok_or_else(|| {
+                whole_file_error("static catalog credential binding requires name")
+            })?;
+            let generation = wire.generation.as_deref().ok_or_else(|| {
+                whole_file_error("static catalog credential binding requires generation")
+            })?;
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new(name, generation)
+                    .map_err(|error| whole_file_error(error.to_string()))?,
+            )
+        }
+        "vended" => {
+            if wire.name.is_some() || wire.generation.is_some() {
+                return Err(whole_file_error(
+                    "vended catalog credential binding forbids name and generation",
+                ));
+            }
+            CatalogCredentialMode::Vended
+        }
+        _ => return Err(whole_file_error("unknown catalog credential mode")),
+    };
+    CatalogCredentialBinding::try_new(purpose, consumer_role, mode)
+        .map_err(|error| whole_file_error(error.to_string()))
 }
 
 fn whole_file_error(message: impl Into<String>) -> CatalogApplicationError {
@@ -254,26 +259,48 @@ mod tests {
     #[test]
     fn canonicalizes_logical_configuration_and_remints_process_identity() {
         let first = write_file(
-            br#"format_version = 1
+            br#"format_version = 3
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 1
-credential_references = ["connector.object_store", "connector.object_store"]
+config_format_version = 3
+[[catalogs.credential_bindings]]
+purpose = "object-store-data"
+consumer_role = "frontend-and-backend"
+mode = "static"
+name = "warehouse-data"
+generation = "blue"
+[[catalogs.credential_bindings]]
+purpose = "catalog-control"
+consumer_role = "frontend"
+mode = "static"
+name = "rest-control"
+generation = "blue"
 [catalogs.properties]
 z = "last"
 a = "first"
 "#,
         );
         let second = write_file(
-            br#"format_version = 1
+            br#"format_version = 3
 [[catalogs]]
 instance_id = "catalog.analytics"
 provider_id = "iceberg"
 display_name = "Analytics"
-config_format_version = 1
-credential_references = ["connector.object_store"]
+config_format_version = 3
+[[catalogs.credential_bindings]]
+purpose = "catalog-control"
+consumer_role = "frontend"
+mode = "static"
+name = "rest-control"
+generation = "blue"
+[[catalogs.credential_bindings]]
+purpose = "object-store-data"
+consumer_role = "frontend-and-backend"
+mode = "static"
+name = "warehouse-data"
+generation = "blue"
 [catalogs.properties]
 a = "first"
 z = "last"
@@ -285,14 +312,83 @@ z = "last"
         let first_entry = one.into_entries().next().expect("first entry");
         let second_entry = two.into_entries().next().expect("second entry");
         assert_ne!(first_entry.identity(), second_entry.identity());
+        assert_eq!(first_entry.config(), second_entry.config());
+        assert_eq!(first_entry.config().credential_bindings().len(), 2);
+
+        let dynamic_attachment = crate::catalog_attachment::CatalogAttachment {
+            attachment_id: Uuid::now_v7(),
+            instance_id: first_entry.config().instance_id().clone(),
+            provider_id: first_entry.config().provider_id().clone(),
+            display_name: first_entry.config().display_name().to_string(),
+            durable_properties: first_entry.config().durable_properties().to_vec(),
+            credential_bindings: first_entry.config().credential_bindings().to_vec(),
+            created_at_ms: 42,
+        };
+        let dynamic_entry = CatalogDesiredStateEntry::from_attachment(&dynamic_attachment)
+            .expect("dynamic logical projection");
+        assert_eq!(
+            first_entry.config(),
+            dynamic_entry.config(),
+            "StaticFile and DynamicStateStore must project one logical binding model"
+        );
+    }
+
+    #[test]
+    fn local_catalog_may_explicitly_declare_zero_bindings() {
+        let file = write_file(
+            br#"format_version = 3
+[[catalogs]]
+instance_id = "catalog.local"
+provider_id = "local"
+display_name = "Local"
+config_format_version = 3
+credential_bindings = []
+[catalogs.properties]
+type = "local"
+"#,
+        );
+        let snapshot = load_static_file_snapshot(file.path()).expect("local snapshot");
+        let entry = snapshot.into_entries().next().expect("local entry");
+        assert!(entry.config().credential_bindings().is_empty());
+    }
+
+    #[test]
+    fn rejects_v2_backend_only_binding_without_migration() {
+        let file = write_file(
+            br#"format_version = 2
+[[catalogs]]
+instance_id = "catalog.analytics"
+provider_id = "iceberg"
+display_name = "Analytics"
+config_format_version = 2
+[[catalogs.credential_bindings]]
+purpose = "object-store-data"
+consumer_role = "backend"
+mode = "static"
+name = "warehouse-data"
+generation = "blue"
+[catalogs.properties]
+type = "iceberg"
+"#,
+        );
+        let error = load_static_file_snapshot(file.path())
+            .expect_err("v2 Backend-only definition must fail closed");
+        assert_eq!(
+            error.kind(),
+            CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete
+        );
+        assert!(error.to_string().contains("unsupported format_version 2"));
     }
 
     #[test]
     fn structural_errors_fail_the_whole_snapshot() {
         for contents in [
-            b"format_version = 2\ncatalogs = []\n".as_slice(),
-            b"format_version = 1\nunknown = true\ncatalogs = []\n".as_slice(),
-            b"format_version = 1\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 1\ncredential_references = ['BAD']\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 1\ncatalogs = []\n".as_slice(),
+            b"format_version = 3\nunknown = true\ncatalogs = []\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'static'\nname = 'BAD'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'backend'\nmode = 'static'\nname = 'warehouse-data'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\n[[catalogs.credential_bindings]]\npurpose = 'object-store-data'\nconsumer_role = 'frontend-and-backend'\nmode = 'vended'\nname = 'forbidden'\ngeneration = 'blue'\n[catalogs.properties]\ntype = 'iceberg'\n".as_slice(),
+            b"format_version = 3\n[[catalogs]]\ninstance_id = 'catalog.a'\nprovider_id = 'iceberg'\ndisplay_name = 'a'\nconfig_format_version = 3\ncredential_bindings = []\n[catalogs.properties]\ncredential.secret = 'nope'\n".as_slice(),
         ] {
             let file = write_file(contents);
             assert_eq!(

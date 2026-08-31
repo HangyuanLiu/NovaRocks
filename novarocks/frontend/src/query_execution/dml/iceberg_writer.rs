@@ -121,6 +121,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
 ) -> Result<PreparedIcebergWrite, String> {
     debug_assert_eq!(target.backend_name, "iceberg");
 
@@ -171,6 +172,7 @@ pub(crate) fn prepare_iceberg_write_with_options(
         execution,
         connector_context,
         options,
+        attempt_reservation,
     )
 }
 
@@ -187,6 +189,7 @@ fn prepare_iceberg_distributed_write(
     execution: Option<QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     options: IcebergWritePreparationOptions,
+    attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
 ) -> Result<PreparedIcebergWrite, String> {
     let write_lease = write_target.derive_write_lease()?;
     let (query, write_columns) = build_iceberg_write_plan(
@@ -281,6 +284,7 @@ fn prepare_iceberg_distributed_write(
         semantic_binding: Arc::new(semantic_binding),
         spec,
         native_assembly: Mutex::new(None),
+        attempt_reservation: Mutex::new(Some(attempt_reservation)),
     })
 }
 
@@ -400,6 +404,10 @@ pub(crate) struct PreparedIcebergWrite {
     semantic_binding: Arc<FrozenIcebergWriteSemanticBinding>,
     spec: IcebergWriteTransactionSpec,
     native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
+    /// This exact reservation collected every vended response observed while
+    /// preparing the write. It is consumed only when the matching native
+    /// bundle is submitted to the raw attempt lifecycle.
+    attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
 }
 
 /// Borrowed encoder input for an exact prepared INSERT. The mutex guard stays
@@ -530,6 +538,14 @@ impl PreparedIcebergWrite {
                 "prepared Iceberg write native assembly was already consumed".to_string()
             })?;
         let (query_execution, request) = assembly.into_request(native_bundle)?;
+        let attempt_reservation = self
+            .attempt_reservation
+            .lock()
+            .expect("prepared Iceberg write attempt reservation lock poisoned")
+            .take()
+            .ok_or_else(|| {
+                "prepared Iceberg write attempt reservation was already consumed".to_string()
+            })?;
         let publication_id = novarocks_spi::connector::LakePublicationId::try_from_bytes(
             self.semantic_binding
                 .connector_write
@@ -550,7 +566,8 @@ impl PreparedIcebergWrite {
                                 publication_id,
                             ),
                     }),
-                ),
+                )
+                .with_attempt_reservation(attempt_reservation),
             )
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
             .map_err(|error| error.to_string())?;
@@ -584,7 +601,7 @@ impl PreparedIcebergWrite {
     > {
         completion
             .session()
-            .commit(self.semantic_binding.connector_context.clone())
+            .commit(completion.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 

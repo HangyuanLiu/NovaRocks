@@ -18,6 +18,7 @@
 //! Request and response types for the Iceberg REST API.
 
 use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
 
 use iceberg::spec::{
     Schema, SortOrder, TableMetadata, UnboundPartitionSpec, ViewMetadata, ViewVersion,
@@ -42,10 +43,18 @@ impl CatalogConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 /// Wrapper for all non-2xx error responses from the REST API
 pub struct ErrorResponse {
     error: ErrorModel,
+}
+
+impl Debug for ErrorResponse {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorResponse")
+            .field("error", &self.error)
+            .finish()
+    }
 }
 
 impl From<ErrorResponse> for Error {
@@ -54,7 +63,7 @@ impl From<ErrorResponse> for Error {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 /// Error payload returned in a response with further details on the error
 pub struct ErrorModel {
     /// Human-readable error message
@@ -67,14 +76,25 @@ pub struct ErrorModel {
     pub stack: Option<Vec<String>>,
 }
 
+impl Debug for ErrorModel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ErrorModel")
+            .field("message", &"[REDACTED]")
+            .field("type", &self.r#type)
+            .field("code", &self.code)
+            .field("stack_depth", &self.stack.as_ref().map_or(0, Vec::len))
+            .finish()
+    }
+}
+
 impl From<ErrorModel> for Error {
     fn from(value: ErrorModel) -> Self {
-        let mut error = Error::new(ErrorKind::DataInvalid, value.message)
+        let mut error = Error::new(ErrorKind::DataInvalid, "REST catalog returned an error")
             .with_context("type", value.r#type)
             .with_context("code", format!("{}", value.code));
 
         if let Some(stack) = value.stack {
-            error = error.with_context("stack", stack.join("\n"));
+            error = error.with_context("stack_depth", stack.len().to_string());
         }
 
         error
@@ -211,7 +231,7 @@ pub struct RenameTableRequest {
     pub destination: TableIdent,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 /// Result returned when a table is successfully loaded or created.
 ///
@@ -237,7 +257,21 @@ pub struct LoadTableResult {
     pub storage_credentials: Option<Vec<StorageCredential>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl Debug for LoadTableResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadTableResult")
+            .field("metadata_location", &self.metadata_location)
+            .field("metadata", &self.metadata)
+            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
+            .field(
+                "storage_credentials",
+                &self.storage_credentials.as_ref().map(|credentials| credentials.len()),
+            )
+            .finish()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Storage credential for a specific location prefix.
 ///
 /// Indicates a storage location prefix where the credential is relevant. Clients should
@@ -248,6 +282,39 @@ pub struct StorageCredential {
     pub prefix: String,
     /// Configuration map containing credential information
     pub config: HashMap<String, String>,
+}
+
+/// Result returned by a REST credentials-refresh endpoint.
+///
+/// The Iceberg REST protocol uses the same prefix-scoped credential shape as
+/// a table-load response, but a refresh has no table metadata or FileIO
+/// configuration. Keep it as a separate closed response so callers cannot
+/// accidentally treat a refresh as a second table observation.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub struct LoadCredentialsResult {
+    /// Refreshed storage credentials for the already-admitted scope.
+    pub storage_credentials: Option<Vec<StorageCredential>>,
+}
+
+impl Debug for LoadCredentialsResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoadCredentialsResult")
+            .field(
+                "storage_credentials",
+                &self.storage_credentials.as_ref().map(|credentials| credentials.len()),
+            )
+            .finish()
+    }
+}
+
+impl Debug for StorageCredential {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageCredential")
+            .field("prefix", &self.prefix)
+            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,5 +477,21 @@ mod tests {
             serde_json::to_value(&ns_response_no_props).expect("Serialization failed"),
             json_no_props
         );
+    }
+
+    #[test]
+    fn rest_error_response_redacts_secret_canary() {
+        let response: ErrorResponse = serde_json::from_value(serde_json::json!({
+            "error": {
+                "message": "storage-secret-canary",
+                "type": "ServerError",
+                "code": 500,
+                "stack": ["storage-secret-canary"]
+            }
+        }))
+        .unwrap();
+        assert!(!format!("{response:?}").contains("storage-secret-canary"));
+        let error: Error = response.into();
+        assert!(!format!("{error:?}").contains("storage-secret-canary"));
     }
 }

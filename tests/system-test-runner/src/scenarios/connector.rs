@@ -1,11 +1,23 @@
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, QueryExecutionResourceSnapshot,
-    ServerHandle,
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
+use novarocks_cluster_harness::loopback_s3::{
+    LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
+use novarocks_cluster_harness::vended_rest_catalog::{
+    VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
+    VendedTableCommitResponseBehavior,
+};
+use novarocks_cluster_harness::{
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
+    QueryExecutionResourceSnapshot, ServerHandle,
+};
+use novarocks_secret::SecretValue;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -16,6 +28,18 @@ const TYPED_SPLIT_NO_MORE: &str = "NOVAROCKS_TASK_SPLIT_NO_MORE";
 const TYPED_PAGE_SOURCE_OPEN: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN";
 const TYPED_PAGE_SOURCE_CLOSE: &str = "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE";
 const CONNECTOR_READER_CLOSE: &str = "NOVAROCKS_CONNECTOR_UNIT_READER_CLOSE";
+const READER_CACHE_OVERLAY: &str = r#"
+[runtime.cache]
+page_cache_enable = true
+# This fixture writes several real Parquet files. Capacity is bytes at the
+# filesystem boundary, so retain enough ranges to make a repeated typed read
+# a meaningful same-process cache hit check.
+page_cache_capacity = 67108864
+page_cache_evict_probability = 100
+parquet_meta_cache_enable = true
+parquet_meta_cache_ttl_seconds = 3600
+parquet_page_cache_enable = true
+"#;
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -24,7 +48,12 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogFeRestartCache),
         Box::new(CatalogReadyLifecycle),
         Box::new(CatalogReadWriteRuntime),
+        Box::new(VendedRestReadWritePem::default()),
+        Box::new(VendedRestRefreshPem::default()),
+        Box::new(VendedRestWriteOutcomePem::default()),
         Box::new(CatalogVersionDrain),
+        Box::new(StaticCredentialGeneration::default()),
+        Box::new(AccessDomainCacheIsolation::default()),
         Box::new(PredicatePageIndexPruning),
         Box::new(TypedReadData),
     ]
@@ -61,6 +90,16 @@ impl Scenario for TypedReadData {
             context.remaining("connect typed read control session")?,
         )?;
 
+        // Cache service availability alone is intentionally inert: this
+        // scenario explicitly opts its control session into both cache reads
+        // and population before asserting the warm/cached profiles below.
+        control
+            .query_drop("SET enable_scan_datacache = true")
+            .context("enable cache reads for typed connector data")?;
+        control
+            .query_drop("SET enable_populate_datacache = true")
+            .context("enable cache population for typed connector data")?;
+
         const CATALOG: &str = "typed_read_catalog";
         const DATABASE: &str = "typed_read_db";
         const TABLE: &str = "typed_read_data";
@@ -71,9 +110,25 @@ impl Scenario for TypedReadData {
         context.action("create three independent Iceberg data files");
         create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
 
+        let counted_query = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}");
+        context.action("warm the enabled role-local cache through a typed connector read");
+        let warm_profile: Vec<String> =
+            control
+                .query(format!("EXPLAIN ANALYZE {counted_query}"))
+                .context("collect cache-warming typed connector EXPLAIN ANALYZE profile")?;
+        let warm_profile = warm_profile.join("\n");
+        assert_positive_profile_counter(&warm_profile, "ConnectorFileCacheMisses")?;
+
+        context.action("repeat the same typed connector read from the role-local cache");
+        let cached_profile: Vec<String> = control
+            .query(format!("EXPLAIN ANALYZE {counted_query}"))
+            .context("collect cached typed connector EXPLAIN ANALYZE profile")?;
+        let cached_profile = cached_profile.join("\n");
+        assert_positive_profile_counter(&cached_profile, "ConnectorFileCacheHits")?;
+
         context.action("read every row through the typed connector stack");
         let counted: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .query(&counted_query)
             .context("count rows through the typed connector read")?;
         if counted != [300_000] {
             bail!("typed connector read returned {counted:?} rows, expected [300000]");
@@ -694,6 +749,644 @@ impl Scenario for CatalogReadWriteRuntime {
     }
 }
 
+/// Reserved M2 acceptance entrypoint for the real REST-vended read/write
+/// path. It is explicit-only because the fixture must own its isolated REST
+/// catalog and S3 credential authority rather than consuming shared Docker
+/// state.
+#[derive(Default)]
+struct VendedRestReadWritePem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+struct VendedRestSystemFixture {
+    rest: IsolatedIcebergRestFixture,
+    proxy: VendedRestCatalogFixture,
+}
+
+impl Scenario for VendedRestReadWritePem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-read-write"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST and MinIO fixture for vended credentials")?;
+        // Bootstrap the namespace and target table with the fixture's private
+        // catalog authority before the vended proxy exists. NovaRocks must
+        // observe and use that table solely through a per-attempt lease.
+        rest.provision_empty_table("vended_rest_db", "vended_rest_data")
+            .context("provision isolated vended REST source table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated initial and rotated vended S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.initial.not_after_unix_ms)
+            })
+            .context("build initial vended S3 credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.rotated.not_after_unix_ms)
+            })
+            .context("build rotated vended S3 credential")?,
+            // This read/write scenario proves normal use of the initial
+            // leased credential. Refresh uses a dedicated short-TTL scenario.
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .context("start bounded REST vended-credential proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended REST fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        // Vended lease envelopes are confidential lifecycle payloads. The
+        // scenario must therefore exercise the native TLS branch, never the
+        // default authenticated h2c fixture.
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?;
+            let fixture = fixture.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("vended REST fixture is missing after cluster launch")
+            })?;
+            (
+                fixture.proxy.uri().to_string(),
+                fixture.rest.endpoints().rest_warehouse.clone(),
+            )
+        };
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended REST read/write control session")?,
+        )?;
+
+        const CATALOG: &str = "vended_rest_catalog";
+        const DATABASE: &str = "vended_rest_db";
+        const TABLE: &str = "vended_rest_data";
+        const CTAS: &str = "vended_rest_ctas";
+        context.action("create REST catalog with an explicit vended data binding");
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")",
+                self.vended_minio_endpoint()?
+            ))
+            .context("create vended REST catalog")?;
+        context.action("write three vended REST data files through the native 1FE+3BE path");
+        // Three committed files give the three-backend read enough independent
+        // work to prove that every Backend uses the vended data-plane lease.
+        for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+            control
+                .query_drop(format!(
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                ))
+                .with_context(|| format!("insert vended REST data range {range}"))?;
+        }
+        let rows: Vec<(i64, i64)> = control
+            .query(format!(
+                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"
+            ))
+            .context("read vended REST data")?;
+        if rows != [(3_000, 4_501_500)] {
+            bail!("vended REST read returned {rows:?}, expected [(3000, 4501500)]");
+        }
+        wait_for_open_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe a vended REST reader on every Backend",
+        )?;
+        context.action("create a vended REST CTAS target through staged publication");
+        control
+            .query_drop(format!(
+                "CREATE TABLE {CATALOG}.{DATABASE}.{CTAS} AS SELECT v FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v <= 1000"
+            ))
+            .with_context(|| {
+                self.vended_proxy_audit()
+                    .map(|audit| format!("create vended REST CTAS target; proxy audit: {audit:?}"))
+                    .unwrap_or_else(|error| {
+                        format!("create vended REST CTAS target; read proxy audit: {error}")
+                    })
+            })?;
+        let ctas_rows: Vec<(i64, i64)> = control
+            .query(format!(
+                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{CTAS}"
+            ))
+            .context("read vended REST CTAS target")?;
+        if ctas_rows != [(1_000, 500_500)] {
+            bail!("vended REST CTAS returned {ctas_rows:?}, expected [(1000, 500500)]");
+        }
+        let audit = self.vended_proxy_audit()?;
+        if audit.table_loads == 0 || audit.staged_creates < 1 {
+            bail!(
+                "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
+            );
+        }
+        if audit.refreshes != 0 || audit.issued_key_ids.len() != 1 {
+            bail!(
+                "normal vended read/write unexpectedly refreshed or issued a second key: {audit:?}"
+            );
+        }
+        context.action(
+            "verify REST fixture observed only the initial vended credential in normal read/write",
+        );
+        await_resource_convergence(context, &baseline, "vended REST read/write")?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended REST fixture")
+    }
+}
+
+impl VendedRestReadWritePem {
+    fn vended_minio_endpoint(&self) -> Result<String> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.rest.endpoints().minio_endpoint.clone())
+            .ok_or_else(|| anyhow::anyhow!("vended REST fixture is missing"))
+    }
+
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended REST fixture is missing"))
+    }
+}
+
+/// Exercises the write outcome boundary after a catalog-side effect exists but
+/// before its response reaches NovaRocks. The fixture reports response loss
+/// after the one durable commit; the statement must resolve the committed
+/// outcome without replaying it.
+#[derive(Default)]
+struct VendedRestWriteOutcomePem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+impl Scenario for VendedRestWriteOutcomePem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-write-outcome"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST fixture for vended write outcome")?;
+        rest.provision_empty_table("vended_write_outcome_db", "vended_write_outcome_data")
+            .context("provision isolated vended write-outcome table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated vended write-outcome identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .context("build short-lived initial vended write-outcome credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .context("build rotated vended write-outcome credential")?,
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::FailUnavailableAfterSideEffect,
+            hold_first_table_commit_response: false,
+        })
+        .context("start response-loss vended REST catalog proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended write-outcome fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended write-outcome control session")?,
+        )?;
+        const CATALOG: &str = "vended_write_outcome_catalog";
+        const DATABASE: &str = "vended_write_outcome_db";
+        const TABLE: &str = "vended_write_outcome_data";
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+            ))
+            .context("create response-loss REST vended catalog")?;
+
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let query_user = user.clone();
+        let insert = format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT 1 AS v");
+        let writer = thread::spawn(move || {
+            let mut connection = mysql_actor::connect(&query_user, port, Duration::from_secs(10))
+                .context("connect vended write-outcome writer")?;
+            let result = connection.query_drop(insert);
+            done_tx
+                .send(result.map_err(anyhow::Error::from))
+                .context("publish vended write-outcome result")
+        });
+
+        context.action("inject catalog response loss after one durable vended table commit");
+        let outcome = done
+            .recv_timeout(context.remaining("await failed write after held response release")?)
+            .context("vended write-outcome writer did not finish")?;
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome writer panicked"))??;
+        ensure!(
+            outcome.is_ok(),
+            "response-lost vended write must reconcile the already-committed outcome: {outcome:?}"
+        );
+        let audit = self.vended_proxy_audit()?;
+        ensure!(
+            audit.table_commits == 1,
+            "vended write must not replay the catalog commit after response loss; audit={audit:?}"
+        );
+        ensure!(
+            audit.refreshes == 0 && audit.refresh_failures == 0,
+            "response-loss write must not manufacture a refresh side path; audit={audit:?}"
+        );
+        let rows: Vec<i64> = control
+            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            .context("read the already-applied vended write outcome")?;
+        ensure!(
+            rows == vec![1],
+            "response-loss write side effect must be visible exactly once, got {rows:?}"
+        );
+        await_resource_convergence(context, &baseline, "vended write-outcome failure")?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended write-outcome REST fixture")
+    }
+}
+
+impl VendedRestWriteOutcomePem {
+    fn fixture_endpoints(&self) -> Result<(String, String, String)> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?;
+        let fixture = fixture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended write-outcome fixture is missing"))?;
+        Ok((
+            fixture.proxy.uri().to_owned(),
+            fixture.rest.endpoints().rest_warehouse.clone(),
+            fixture.rest.endpoints().minio_endpoint.clone(),
+        ))
+    }
+
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended write-outcome fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended write-outcome fixture is missing"))
+    }
+}
+
+/// Exercises the one attempt-local FE refresh owner against the production
+/// 1FE+3BE TLS path. The source lease has a synthetic short expiry while its
+/// real STS material remains valid, so the test can prove refresh semantics
+/// without manufacturing invalid S3 credentials.
+#[derive(Default)]
+struct VendedRestRefreshPem {
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+impl Scenario for VendedRestRefreshPem {
+    fn name(&self) -> &'static str {
+        "connector/vended-credential-refresh"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST and MinIO fixture for vended credential refresh")?;
+        rest.provision_empty_table("vended_refresh_db", "vended_refresh_data")
+            .context("provision isolated vended refresh source table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated vended refresh S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            // Deliberately omit the STS-issued expiration from the fixture
+            // response. The proxy instead advertises this bounded synthetic
+            // TTL, while MinIO continues to validate the real STS material.
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .context("build short-lived initial vended S3 credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .context("build rotated vended S3 credential")?,
+            // The vended refresh policy clamps the soft margin at five
+            // seconds. Eight seconds leaves a deterministic local window for
+            // the 3-BE prepare/commit barrier without slowing the scenario.
+            initial_ttl: Duration::from_secs(8),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .context("start short-TTL REST vended-credential proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("vended refresh REST fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse, minio_endpoint) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            let fixture = fixture.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("vended refresh REST fixture is missing after cluster launch")
+            })?;
+            (
+                fixture.proxy.uri().to_string(),
+                fixture.rest.endpoints().rest_warehouse.clone(),
+                fixture.rest.endpoints().minio_endpoint.clone(),
+            )
+        };
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect vended credential refresh control session")?,
+        )?;
+
+        const CATALOG: &str = "vended_refresh_catalog";
+        const DATABASE: &str = "vended_refresh_db";
+        const TABLE: &str = "vended_refresh_data";
+        context.action("create short-TTL REST catalog with a vended data binding");
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+            ))
+            .context("create short-TTL vended REST catalog")?;
+        context.action("write three independent vended data files for the 1FE+3BE long read");
+        for range in ["1, 100000", "100001, 200000", "200001, 300000"] {
+            control
+                .query_drop(format!(
+                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                ))
+                .with_context(|| format!("insert vended refresh data range {range}"))?;
+        }
+        // Each setup write is itself a legitimate short-TTL attempt and can
+        // independently refresh. Drain them before taking the audit baseline
+        // so the assertion below is attributable to the one long read.
+        await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
+        let refresh_baseline = self.vended_proxy_audit()?;
+
+        context.action("start one long-running vended read on all three Backends");
+        let target = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
+        let connection_id = target
+            .ready
+            .recv_timeout(context.remaining("receive vended refresh read connection id")?)
+            .context("vended refresh read terminated before publishing its connection id")?;
+        wait_for_in_flight_reader_on_every_backend(
+            context,
+            CATALOG,
+            "observe the short-TTL vended read on every Backend",
+        )?;
+
+        context.action("wait for the FE-owned vended credential refresh response");
+        let _first_refresh = self.wait_for_refresh(context, refresh_baseline.refreshes)?;
+        // A refresh response alone precedes the distributed prepare/commit
+        // acknowledgement barrier. Keep the same statement alive after that
+        // barrier's local control round, then require every BE still owns its
+        // original reader before deliberately terminating the test query.
+        thread::sleep(
+            context
+                .remaining("allow vended refresh prepare/commit to settle")?
+                .min(Duration::from_secs(2)),
+        );
+        let settled_audit = self.vended_proxy_audit()?;
+        let expected_table_loads = refresh_baseline.table_loads.saturating_add(1);
+        let expected_refreshes = refresh_baseline.refreshes.saturating_add(1);
+        let strict_observation_failure = (settled_audit.table_loads != expected_table_loads
+            || settled_audit.refreshes != expected_refreshes
+            || settled_audit.issued_key_ids.len() != 2)
+        .then(|| {
+            format!(
+                "one vended attempt must observe one metadata response and execute one refresh; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, expected_refreshes={expected_refreshes}, observed={settled_audit:?}"
+            )
+        });
+        wait_for_in_flight_reader_on_every_backend(
+            context,
+            CATALOG,
+            "verify every Backend continues the same vended read after refresh",
+        )?;
+        if let Ok(result) = target.done.try_recv() {
+            bail!(
+                "vended read terminated after refresh instead of continuing across the 3-BE epoch commit: {result:?}"
+            );
+        }
+
+        context.action(format!(
+            "cancel the post-refresh vended read through KILL QUERY {connection_id}"
+        ));
+        control
+            .query_drop(format!("KILL QUERY {connection_id}"))
+            .context("cancel post-refresh vended reader")?;
+        assert_cancelled_query(
+            &target.done,
+            context.remaining("await post-refresh vended read cancellation")?,
+        )?;
+        assert_target_connection_remains_usable(
+            &target,
+            context.remaining("verify post-refresh KILL QUERY connection behavior")?,
+        )?;
+        assert_idle_query(&mut control, connection_id)?;
+        release_connector_read(&target)?;
+        target
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("vended refresh reader thread panicked"))??;
+
+        let reader_logs = wait_for_balanced_reader_lifecycle(
+            context,
+            "wait for post-refresh vended reader close after cancellation",
+        )?;
+        assert_no_reader_open_after_abort(&reader_logs)?;
+        let audit = self.vended_proxy_audit()?;
+        if audit != settled_audit {
+            bail!(
+                "vended refresh audit changed unexpectedly after cancellation; settled={settled_audit:?}, observed={audit:?}"
+            );
+        }
+        await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
+        if let Some(failure) = strict_observation_failure {
+            bail!("{failure}");
+        }
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended credential refresh fixture")
+    }
+}
+
+impl VendedRestRefreshPem {
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))
+    }
+
+    fn wait_for_refresh(
+        &self,
+        context: &mut ScenarioContext,
+        refresh_baseline: u64,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        loop {
+            let audit = self.vended_proxy_audit()?;
+            if audit.refreshes > refresh_baseline {
+                return Ok(audit);
+            }
+            let remaining = context.remaining("observe vended credential refresh")?;
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
+    }
+}
+
 /// Proves a Frontend restart reconstructs its durable catalog projection
 /// without invalidating catalog runtimes retained by the live Backends.
 struct CatalogFeRestartCache;
@@ -812,6 +1505,524 @@ impl Scenario for CatalogFeRestartCache {
         await_resource_convergence(context, &baseline, "FE restart catalog cache")?;
         Ok(())
     }
+}
+
+/// A static-file catalog source with two simultaneously active, role-local
+/// object-store credential generations. The two fixtures deliberately accept
+/// different key IDs, so a successful read plus their request logs proves that
+/// each catalog stayed on its exact declared credential generation.
+#[derive(Default)]
+struct StaticCredentialGeneration {
+    fixtures: Mutex<Option<StaticCredentialFixtures>>,
+}
+
+/// Exercises the cache key boundary on the same native topology as static
+/// credentials, but is independently selectable by the M1 acceptance gate.
+#[derive(Default)]
+struct AccessDomainCacheIsolation {
+    fixtures: Mutex<Option<StaticCredentialFixtures>>,
+}
+
+struct StaticCredentialFixtures {
+    blue: LoopbackS3Fixture,
+    green: LoopbackS3Fixture,
+}
+
+const STATIC_BLUE_CATALOG: &str = "cca_static_blue";
+const STATIC_GREEN_CATALOG: &str = "cca_static_green";
+const STATIC_BLUE_CREDENTIAL_NAME: &str = "cca-static-blue";
+const STATIC_GREEN_CREDENTIAL_NAME: &str = "cca-static-green";
+const STATIC_BLUE_CREDENTIAL_GENERATION: &str = "v1";
+const STATIC_GREEN_CREDENTIAL_GENERATION: &str = "v2";
+const STATIC_BLUE_KEY_ID: &str = "cca-static-blue-key";
+const STATIC_GREEN_KEY_ID: &str = "cca-static-green-key";
+const STATIC_BLUE_KEY_SECRET: &str = "cca-static-blue-secret";
+const STATIC_GREEN_KEY_SECRET: &str = "cca-static-green-secret";
+const COLLISION_BLUE_CATALOG: &str = "cca_cache_domain_blue";
+const COLLISION_GREEN_CATALOG: &str = "cca_cache_domain_green";
+const COLLISION_DATABASE: &str = "cache_domain_db";
+const COLLISION_TABLE: &str = "cache_domain_data";
+const COLLISION_WAREHOUSE: &str = "s3://cca-cache-domain-collision/warehouse";
+
+impl Scenario for StaticCredentialGeneration {
+    fn name(&self) -> &'static str {
+        "connector/static-credential-generation"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        static_credential_launch_config(&self.fixtures, scenario_root)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect static credential control session")?,
+        )?;
+
+        run_static_credential_generation(context, &mut control, &self.fixtures)?;
+        await_resource_convergence(context, &baseline, "static credential generation reads")?;
+        Ok(())
+    }
+}
+
+impl Scenario for AccessDomainCacheIsolation {
+    fn name(&self) -> &'static str {
+        "connector/access-domain-cache-isolation"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        access_domain_collision_launch_config(&self.fixtures, scenario_root)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect access-domain cache control session")?,
+        )?;
+        // Cache policy is a query-scoped FE-to-BE contract. The process-level
+        // cache service configured by this scenario is intentionally inert
+        // until the client opts this session into both reads and population.
+        control
+            .query_drop("SET enable_scan_datacache = true")
+            .context("enable cache reads for access-domain isolation")?;
+        control
+            .query_drop("SET enable_populate_datacache = true")
+            .context("enable cache population for access-domain isolation")?;
+
+        run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
+        await_resource_convergence(context, &baseline, "access-domain cache isolation")?;
+        Ok(())
+    }
+}
+
+fn static_credential_launch_config(
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+    scenario_root: &Path,
+) -> Result<ScenarioLaunchConfig> {
+    let blue = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_BLUE_KEY_ID))
+        .context("start blue loopback S3 fixture")?;
+    let green = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key(STATIC_GREEN_KEY_ID))
+        .context("start green loopback S3 fixture")?;
+    let snapshot = scenario_root.join("static-credential-catalogs.toml");
+    write_static_credential_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
+    let mut fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    if fixtures.is_some() {
+        bail!("static credential fixtures were initialized more than once");
+    }
+    *fixtures = Some(StaticCredentialFixtures { blue, green });
+
+    Ok(ScenarioLaunchConfig {
+        child_environment: connector_reader_environment(),
+        config_overlay: static_credential_launch_overlay(&snapshot),
+        ..Default::default()
+    })
+}
+
+fn access_domain_collision_launch_config(
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+    scenario_root: &Path,
+) -> Result<ScenarioLaunchConfig> {
+    let blue = LoopbackS3Fixture::start(collision_loopback_s3_config(STATIC_BLUE_KEY_ID))
+        .context("start blue collision loopback S3 fixture")?;
+    let green = LoopbackS3Fixture::start(collision_loopback_s3_config(STATIC_GREEN_KEY_ID))
+        .context("start green collision loopback S3 fixture")?;
+    let snapshot = scenario_root.join("access-domain-collision-catalogs.toml");
+    write_access_domain_collision_snapshot(&snapshot, blue.endpoint(), green.endpoint())?;
+    let mut fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("access-domain collision fixture lock poisoned"))?;
+    if fixtures.is_some() {
+        bail!("access-domain collision fixtures were initialized more than once");
+    }
+    *fixtures = Some(StaticCredentialFixtures { blue, green });
+
+    Ok(ScenarioLaunchConfig {
+        child_environment: connector_reader_environment(),
+        config_overlay: static_credential_launch_overlay(&snapshot),
+        ..Default::default()
+    })
+}
+
+fn collision_loopback_s3_config(access_key_id: &str) -> LoopbackS3Config {
+    let mut config = LoopbackS3Config::for_access_key(access_key_id);
+    // The source corpus and its same-length canonical copies are both kept
+    // only for this bounded collision setup. The default 128-object ceiling
+    // cannot retain both graphs after three Iceberg commits.
+    config.max_objects = 256;
+    config
+}
+
+fn run_static_credential_generation(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+) -> Result<()> {
+    context.action("write three blue and three green S3 Iceberg files through StaticFile catalogs");
+    create_static_catalog_table_and_data(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+        ["1, 100000", "100001, 200000", "200001, 300000"],
+    )?;
+    create_static_catalog_table_and_data(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+        ["300001, 400000", "400001, 500000", "500001, 600000"],
+    )?;
+
+    context.action("read the blue static credential catalog through every backend");
+    let _blue_profile = static_catalog_profile(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+    )?;
+    assert_static_catalog_sum(
+        control,
+        STATIC_BLUE_CATALOG,
+        "static_blue_db",
+        "static_blue_data",
+        45_000_150_000,
+    )?;
+    let blue_logs = wait_for_open_reader_on_every_backend(
+        context,
+        STATIC_BLUE_CATALOG,
+        "observe every BE read the blue static credential generation",
+    )?;
+    assert_static_reader_opened_on_every_backend(&blue_logs, STATIC_BLUE_CATALOG)?;
+
+    context.action("read the green static credential catalog through every backend");
+    let _green_profile = static_catalog_profile(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+    )?;
+    assert_static_catalog_sum(
+        control,
+        STATIC_GREEN_CATALOG,
+        "static_green_db",
+        "static_green_data",
+        135_000_150_000,
+    )?;
+    let green_logs = wait_for_open_reader_on_every_backend(
+        context,
+        STATIC_GREEN_CATALOG,
+        "observe every BE read the green static credential generation",
+    )?;
+    assert_static_reader_opened_on_every_backend(&green_logs, STATIC_GREEN_CATALOG)?;
+
+    let fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    let fixtures = fixtures
+        .as_ref()
+        .context("static credential fixtures were not retained through scenario execution")?;
+    assert_fixture_used_only_expected_key(
+        "blue",
+        &fixtures.blue.request_log(),
+        STATIC_BLUE_KEY_ID,
+    )?;
+    assert_fixture_used_only_expected_key(
+        "green",
+        &fixtures.green.request_log(),
+        STATIC_GREEN_KEY_ID,
+    )?;
+    context.action("proved blue/v1 and green/v2 reads used distinct exact role-local S3 keys");
+    Ok(())
+}
+
+fn run_access_domain_cache_isolation(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    fixtures: &Mutex<Option<StaticCredentialFixtures>>,
+) -> Result<()> {
+    context.action("write colliding blue and green Iceberg corpora at one S3 URI");
+    create_static_catalog_table_and_data(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        ["100001, 200000", "200001, 300000", "300001, 400000"],
+    )?;
+    create_static_catalog_table_and_data(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        ["100002, 200001", "200002, 300001", "300002, 400001"],
+    )?;
+
+    let fixtures = fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("static credential fixture lock poisoned"))?;
+    let fixtures = fixtures
+        .as_ref()
+        .context("static credential fixtures were not retained through scenario execution")?;
+    let canonical_data_paths = canonicalize_collision_corpus(&fixtures.blue, &fixtures.green)?;
+
+    context.action("warm the blue access domain for the colliding S3 files");
+    let blue_profile = static_catalog_profile(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
+    assert_static_catalog_sum(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        75_000_150_000,
+    )?;
+    let blue_logs = wait_for_open_reader_on_every_backend(
+        context,
+        COLLISION_BLUE_CATALOG,
+        "observe every BE read the blue collision access domain",
+    )?;
+    assert_static_reader_opened_on_every_backend(&blue_logs, COLLISION_BLUE_CATALOG)?;
+
+    context.action("repeat the blue collision read from its role-local cache");
+    let blue_cached_profile = static_catalog_profile(
+        control,
+        COLLISION_BLUE_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&blue_cached_profile, "ConnectorFileCacheHits")?;
+
+    let green_data_reads_before =
+        successful_gets_for_paths(&fixtures.green.request_log(), &canonical_data_paths);
+    context.action("read the same S3 URI through the green endpoint and access domain");
+    let green_profile = static_catalog_profile(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+    )?;
+    assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
+    assert_static_catalog_sum(
+        control,
+        COLLISION_GREEN_CATALOG,
+        COLLISION_DATABASE,
+        COLLISION_TABLE,
+        75_000_450_000,
+    )?;
+    let green_data_reads_after =
+        successful_gets_for_paths(&fixtures.green.request_log(), &canonical_data_paths);
+    if green_data_reads_after <= green_data_reads_before {
+        bail!(
+            "green collision endpoint received no canonical Parquet GET after blue cache warm: before={green_data_reads_before}, after={green_data_reads_after}"
+        );
+    }
+    let green_logs = wait_for_open_reader_on_every_backend(
+        context,
+        COLLISION_GREEN_CATALOG,
+        "observe every BE read the green collision access domain",
+    )?;
+    assert_static_reader_opened_on_every_backend(&green_logs, COLLISION_GREEN_CATALOG)?;
+    assert_fixture_used_only_expected_key(
+        "blue collision",
+        &fixtures.blue.request_log(),
+        STATIC_BLUE_KEY_ID,
+    )?;
+    assert_fixture_used_only_expected_key(
+        "green collision",
+        &fixtures.green.request_log(),
+        STATIC_GREEN_KEY_ID,
+    )?;
+    context.action(
+        "proved a same-URI, same-size, same-mtime cross-endpoint corpus did not reuse blue cache data",
+    );
+    Ok(())
+}
+
+fn canonicalize_collision_corpus(
+    blue: &LoopbackS3Fixture,
+    green: &LoopbackS3Fixture,
+) -> Result<BTreeSet<String>> {
+    let blue_objects = blue.object_snapshot_for_test();
+    let green_objects = green.object_snapshot_for_test();
+    let mappings = collision_data_path_mapping(&blue_objects, &green_objects)?;
+    for blue_object in blue_objects
+        .iter()
+        .filter(|object| object.key.ends_with(".avro"))
+    {
+        let bytes = rewrite_fixed_width_paths(&blue_object.bytes, &mappings.replacements)?;
+        blue.replace_object_for_test(LoopbackS3Object {
+            bucket: blue_object.bucket.clone(),
+            key: blue_object.key.clone(),
+            bytes,
+        })?;
+    }
+    for blue_object in blue_objects
+        .iter()
+        .filter(|object| object.key.ends_with(".parquet"))
+    {
+        let target_key = mappings
+            .replacements
+            .get(&blue_object.key)
+            .context("blue collision data object has no green canonical path")?;
+        blue.replace_object_for_test(LoopbackS3Object {
+            bucket: blue_object.bucket.clone(),
+            key: target_key.clone(),
+            bytes: blue_object.bytes.clone(),
+        })?;
+    }
+    Ok(mappings.canonical_paths)
+}
+
+struct CollisionDataPathMapping {
+    replacements: BTreeMap<String, String>,
+    canonical_paths: BTreeSet<String>,
+}
+
+fn collision_data_path_mapping(
+    blue_objects: &[LoopbackS3Object],
+    green_objects: &[LoopbackS3Object],
+) -> Result<CollisionDataPathMapping> {
+    let blue_data = parquet_objects_by_bucket_and_length(blue_objects);
+    let green_data = parquet_objects_by_bucket_and_length(green_objects);
+    let blue_count = blue_data.values().map(Vec::len).sum::<usize>();
+    let green_count = green_data.values().map(Vec::len).sum::<usize>();
+    if blue_data.is_empty() || blue_count != green_count {
+        bail!(
+            "collision corpus must contain equal non-empty blue and green Parquet data files, got {} and {}",
+            blue_count,
+            green_count
+        );
+    }
+    if blue_data.keys().collect::<Vec<_>>() != green_data.keys().collect::<Vec<_>>() {
+        bail!(
+            "collision Parquet `(bucket, byte_length)` multisets differ: blue={:?}, green={:?}",
+            parquet_length_multiset(&blue_data),
+            parquet_length_multiset(&green_data)
+        );
+    }
+
+    let mut replacements = BTreeMap::new();
+    let mut canonical_paths = BTreeSet::new();
+    let mut distinct_payloads = 0;
+    for ((bucket, byte_length), mut blue_group) in blue_data {
+        let mut green_group = green_data
+            .get(&(bucket.clone(), byte_length))
+            .cloned()
+            .expect("validated collision Parquet multiset has green group");
+        // UUID suffixes are fixed-width. Sorting within equal-length groups makes
+        // the fixture-only rewriting deterministic without changing any bytes.
+        blue_group.sort_by_key(|object| &object.key);
+        green_group.sort_by_key(|object| &object.key);
+        if blue_group.len() != green_group.len() {
+            bail!(
+                "collision Parquet `(bucket, byte_length)` multiplicity differs for {bucket}/{byte_length}: blue={}, green={}",
+                blue_group.len(),
+                green_group.len()
+            );
+        }
+        for (blue_object, green_object) in blue_group.into_iter().zip(green_group) {
+            if blue_object.key.len() != green_object.key.len() {
+                bail!(
+                    "collision data file paths must have equal width: {}/{} vs {}/{}",
+                    blue_object.bucket,
+                    blue_object.key,
+                    green_object.bucket,
+                    green_object.key
+                );
+            }
+            if blue_object.bytes != green_object.bytes {
+                distinct_payloads += 1;
+            }
+            replacements.insert(blue_object.key.clone(), green_object.key.clone());
+            canonical_paths.insert(format!("/{}/{}", green_object.bucket, green_object.key));
+        }
+    }
+    if distinct_payloads == 0 {
+        bail!("collision Parquet corpora have no distinct blue and green payloads");
+    }
+    Ok(CollisionDataPathMapping {
+        replacements,
+        canonical_paths,
+    })
+}
+
+fn parquet_objects_by_bucket_and_length(
+    objects: &[LoopbackS3Object],
+) -> BTreeMap<(String, usize), Vec<&LoopbackS3Object>> {
+    let mut groups = BTreeMap::new();
+    for object in objects
+        .iter()
+        .filter(|object| object.key.ends_with(".parquet"))
+    {
+        groups
+            .entry((object.bucket.clone(), object.bytes.len()))
+            .or_insert_with(Vec::new)
+            .push(object);
+    }
+    groups
+}
+
+fn parquet_length_multiset(
+    groups: &BTreeMap<(String, usize), Vec<&LoopbackS3Object>>,
+) -> Vec<((String, usize), usize)> {
+    groups
+        .iter()
+        .map(|(group, objects)| (group.clone(), objects.len()))
+        .collect()
+}
+
+fn successful_gets_for_paths(requests: &[LoopbackS3Request], paths: &BTreeSet<String>) -> usize {
+    requests
+        .iter()
+        .filter(|request| {
+            request.method == "GET" && request.status < 400 && paths.contains(&request.path)
+        })
+        .count()
+}
+
+fn rewrite_fixed_width_paths(
+    input: &[u8],
+    mappings: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    let mut output = input.to_vec();
+    for (source, target) in mappings {
+        if source.len() != target.len() {
+            bail!("collision path replacement changes byte width: {source} -> {target}");
+        }
+        let source = source.as_bytes();
+        let target = target.as_bytes();
+        let mut offset = 0;
+        while let Some(relative) = output[offset..]
+            .windows(source.len())
+            .position(|window| window == source)
+        {
+            let start = offset + relative;
+            output[start..start + source.len()].copy_from_slice(target);
+            offset = start + source.len();
+        }
+    }
+    Ok(output)
 }
 
 struct PredicatePageIndexPruning;
@@ -1036,18 +2247,154 @@ fn connector_launch_config() -> ScenarioLaunchConfig {
     ScenarioLaunchConfig {
         child_environment: connector_reader_environment(),
         config_overlay: CrossProcessConfigOverlay {
-            be: Some(
+            fe: Some(READER_CACHE_OVERLAY.to_string()),
+            be: Some(format!(
                 r#"
 [runtime]
 operator_buffer_chunks = 1
 query_control_terminal_drain_timeout_ms = 1000
+{READER_CACHE_OVERLAY}
 "#
-                .to_string(),
-            ),
+            )),
             ..Default::default()
         },
         ..Default::default()
     }
+}
+
+fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {
+    let credentials = static_credential_registry_overlay();
+    CrossProcessConfigOverlay {
+        fe: Some(format!(
+            "[catalog_source]\nmode = \"static-file\"\nstatic_file_path = \"{}\"\n{credentials}\n{READER_CACHE_OVERLAY}",
+            snapshot.display()
+        )),
+        be: Some(format!("{credentials}\n{READER_CACHE_OVERLAY}")),
+        ..Default::default()
+    }
+}
+
+fn static_credential_registry_overlay() -> String {
+    format!(
+        r#"
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "{STATIC_BLUE_CREDENTIAL_NAME}"
+generation = "{STATIC_BLUE_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "{STATIC_BLUE_KEY_ID}"
+access_key_secret = "{STATIC_BLUE_KEY_SECRET}"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "{STATIC_GREEN_CREDENTIAL_NAME}"
+generation = "{STATIC_GREEN_CREDENTIAL_GENERATION}"
+kind = "s3"
+access_key_id = "{STATIC_GREEN_KEY_ID}"
+access_key_secret = "{STATIC_GREEN_KEY_SECRET}"
+"#
+    )
+}
+
+fn write_static_credential_snapshot(
+    snapshot: &Path,
+    blue_endpoint: &str,
+    green_endpoint: &str,
+) -> Result<()> {
+    std::fs::write(
+        snapshot,
+        format!(
+            "format_version = 3\n\
+             [[catalogs]]\n\
+             instance_id = \"{STATIC_BLUE_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{STATIC_BLUE_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"s3://cca-static-blue/warehouse\"\n\
+             \"aws.s3.endpoint\" = \"{blue_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n\
+             [[catalogs]]\n\
+             instance_id = \"{STATIC_GREEN_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{STATIC_GREEN_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"s3://cca-static-green/warehouse\"\n\
+             \"aws.s3.endpoint\" = \"{green_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n"
+        ),
+    )
+    .with_context(|| format!("write static credential snapshot {}", snapshot.display()))
+}
+
+fn write_access_domain_collision_snapshot(
+    snapshot: &Path,
+    blue_endpoint: &str,
+    green_endpoint: &str,
+) -> Result<()> {
+    std::fs::write(
+        snapshot,
+        format!(
+            "format_version = 3\n\
+             [[catalogs]]\n\
+             instance_id = \"{COLLISION_BLUE_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{COLLISION_BLUE_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_BLUE_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_BLUE_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"{COLLISION_WAREHOUSE}\"\n\
+             \"aws.s3.endpoint\" = \"{blue_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n\
+             [[catalogs]]\n\
+             instance_id = \"{COLLISION_GREEN_CATALOG}\"\n\
+             provider_id = \"iceberg\"\n\
+             display_name = \"{COLLISION_GREEN_CATALOG}\"\n\
+             config_format_version = 3\n\
+             [[catalogs.credential_bindings]]\n\
+             purpose = \"object-store-data\"\n\
+             consumer_role = \"frontend-and-backend\"\n\
+             mode = \"static\"\n\
+             name = \"{STATIC_GREEN_CREDENTIAL_NAME}\"\n\
+             generation = \"{STATIC_GREEN_CREDENTIAL_GENERATION}\"\n\
+             [catalogs.properties]\n\
+             type = \"iceberg\"\n\
+             \"iceberg.catalog.type\" = \"hadoop\"\n\
+             \"iceberg.catalog.warehouse\" = \"{COLLISION_WAREHOUSE}\"\n\
+             \"aws.s3.endpoint\" = \"{green_endpoint}\"\n\
+             \"aws.s3.enable_path_style_access\" = \"true\"\n"
+        ),
+    )
+    .with_context(|| {
+        format!(
+            "write access-domain collision snapshot {}",
+            snapshot.display()
+        )
+    })
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
@@ -1116,6 +2463,114 @@ fn create_catalog_table_and_data(
                 "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
             ))
             .with_context(|| format!("write data range {range} to {catalog}.{database}.{table}"))?;
+    }
+    Ok(())
+}
+
+fn create_static_catalog_table_and_data(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    ranges: [&str; 3],
+) -> Result<()> {
+    control
+        .query_drop(format!("CREATE DATABASE {catalog}.{database}"))
+        .with_context(|| format!("create {catalog}.{database} from StaticFile source"))?;
+    control
+        .query_drop(format!(
+            "CREATE TABLE {catalog}.{database}.{table} (v BIGINT)"
+        ))
+        .with_context(|| format!("create {catalog}.{database}.{table} from StaticFile source"))?;
+    // One committed data file per range gives the distributed 1FE+3BE query
+    // enough independent S3 work to prove every BE read the declared catalog.
+    for range in ranges {
+        control
+            .query_drop(format!(
+                "INSERT INTO {catalog}.{database}.{table} SELECT generate_series FROM TABLE(generate_series({range}))"
+            ))
+            .with_context(|| {
+                format!("write static credential range {range} to {catalog}.{database}.{table}")
+            })?;
+    }
+    Ok(())
+}
+
+fn static_catalog_profile(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+) -> Result<String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows: Vec<String> = control
+            .query(format!(
+                "EXPLAIN ANALYZE SELECT count(*) FROM {catalog}.{database}.{table}"
+            ))
+            .with_context(|| {
+                format!("profile {catalog}.{database}.{table} through typed connector")
+            })?;
+        let profile = rows.join("\n");
+        if profile.contains("TypedConnectorMetrics:") {
+            return Ok(profile);
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "static credential catalog {catalog}.{database}.{table} EXPLAIN ANALYZE has no typed connector metrics after bounded metadata visibility wait; profile={profile}"
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn assert_static_catalog_sum(
+    control: &mut mysql::Conn,
+    catalog: &str,
+    database: &str,
+    table: &str,
+    expected: i64,
+) -> Result<()> {
+    let rows: Vec<i64> = control
+        .query(format!("SELECT sum(v) FROM {catalog}.{database}.{table}"))
+        .with_context(|| format!("sum {catalog}.{database}.{table} through typed connector"))?;
+    if rows != [expected] {
+        bail!(
+            "static credential catalog {catalog}.{database}.{table} returned sum {rows:?}, expected [{expected}]"
+        );
+    }
+    Ok(())
+}
+
+fn assert_static_reader_opened_on_every_backend(logs: &[String], catalog: &str) -> Result<()> {
+    for (index, log) in logs.iter().enumerate() {
+        if reader_open_lines(log, catalog).next().is_none() {
+            bail!("BE[{index}] did not open a typed reader for static catalog {catalog}");
+        }
+    }
+    Ok(())
+}
+
+fn assert_fixture_used_only_expected_key(
+    fixture: &str,
+    requests: &[LoopbackS3Request],
+    expected_key_id: &str,
+) -> Result<()> {
+    let reads = requests
+        .iter()
+        .filter(|request| request.method == "GET" && request.status < 400)
+        .collect::<Vec<_>>();
+    if reads.is_empty() {
+        bail!("{fixture} loopback S3 fixture recorded no successful GET request");
+    }
+    for request in reads {
+        if request.credential_key_id.as_deref() != Some(expected_key_id) {
+            bail!(
+                "{fixture} loopback S3 GET {} used credential key {:?}, expected {expected_key_id}",
+                request.path,
+                request.credential_key_id
+            );
+        }
     }
     Ok(())
 }

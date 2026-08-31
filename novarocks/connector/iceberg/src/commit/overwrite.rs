@@ -795,6 +795,7 @@ fn _check_status_variant_referenced() {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use super::*;
     use crate::commit::CommitOpKind;
@@ -803,6 +804,17 @@ mod tests {
         FormatVersion, NestedField, PrimitiveType, Schema, Type as IcebergType,
     };
     use crate::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     struct LocalTableFixture {
         catalog: Arc<dyn Catalog>,
@@ -813,11 +825,14 @@ mod tests {
     async fn empty_local_table(format_version: FormatVersion) -> LocalTableFixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
-        let catalog: Arc<dyn Catalog> =
-            Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
-                crate::fs_io::build_file_io_for_location(&warehouse_uri, None),
+        let binding = local_test_binding();
+        let catalog: Arc<dyn Catalog> = Arc::new(
+            crate::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
+                crate::fs_io::build_file_io_for_location(&warehouse_uri, binding.clone()),
                 warehouse_uri,
-            ));
+                binding,
+            ),
+        );
         let namespace = NamespaceIdent::new("db".to_string());
         catalog
             .create_namespace(&namespace, HashMap::new())

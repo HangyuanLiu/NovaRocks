@@ -50,8 +50,8 @@ pub use handle::{
     MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
 };
 pub use page_source::{
-    ConnectorPageSource, ConnectorPageSourceProviderOptions, LazyBlockLoader,
-    PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+    ConnectorDataCacheOptions, ConnectorPageSource, ConnectorPageSourceProviderOptions,
+    LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics, SourcePage,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
@@ -70,8 +70,9 @@ pub use runtime::{
     ConnectorReadFrozenRewriteGroup, ConnectorReadLimitApplication, ConnectorReadMetadata,
     ConnectorReadPageSourceProvider, ConnectorReadProviderFactory, ConnectorReadRegistrationLease,
     ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
-    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
+    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
     ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle, ConnectorReadTransactionHandle,
     ConnectorReadWorkSource,
 };

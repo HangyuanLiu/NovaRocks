@@ -238,6 +238,7 @@ pub fn inspect_parquet_metadata(
     let cache_enabled = cache
         .as_ref()
         .is_some_and(crate::DataCacheContext::datacache_requested);
+    let access_domain = file.access_domain();
     let identity = file.identity().clone();
     let chunk_reader = BoundChunkReader::new(
         file,
@@ -248,13 +249,18 @@ pub fn inspect_parquet_metadata(
     );
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let metadata = if let Some(metadata) =
-        crate::cache::parquet_cache::metadata_get(cache_enabled, &identity, false)
+        crate::cache::parquet_cache::metadata_get(cache_enabled, access_domain, &identity, false)
     {
         metadata
     } else {
         let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
             .map_err(|error| parquet_error("inspect Parquet metadata", error))?;
-        crate::cache::parquet_cache::metadata_put(cache_enabled, &identity, metadata.clone());
+        crate::cache::parquet_cache::metadata_put(
+            cache_enabled,
+            access_domain,
+            &identity,
+            metadata.clone(),
+        );
         metadata
     };
     context.check_active()?;
@@ -512,6 +518,7 @@ impl ParquetPhysicalReader {
             .cache
             .as_ref()
             .is_some_and(crate::DataCacheContext::datacache_requested);
+        let access_domain = request.file.access_domain();
         let identity = request.file.identity().clone();
         let chunk_reader = BoundChunkReader::new(
             request.file,
@@ -530,6 +537,7 @@ impl ParquetPhysicalReader {
         let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
         let arrow_metadata = if let Some(metadata) = crate::cache::parquet_cache::metadata_get(
             cache_enabled,
+            access_domain,
             &identity,
             page_index_policy != PageIndexPolicy::Skip,
         ) {
@@ -537,7 +545,12 @@ impl ParquetPhysicalReader {
         } else {
             let metadata = ArrowReaderMetadata::load(&chunk_reader, options)
                 .map_err(|error| parquet_error("open Parquet metadata", error))?;
-            crate::cache::parquet_cache::metadata_put(cache_enabled, &identity, metadata.clone());
+            crate::cache::parquet_cache::metadata_put(
+                cache_enabled,
+                access_domain,
+                &identity,
+                metadata.clone(),
+            );
             metadata
         };
         let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(

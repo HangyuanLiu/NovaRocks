@@ -71,6 +71,10 @@ impl IcebergCatalogRuntimeMaterializer {
             binding: resources.binding().clone(),
         }
     }
+
+    pub fn from_binding(binding: IcebergReadBinding) -> Self {
+        Self { binding }
+    }
 }
 
 struct IcebergCatalogRuntime {
@@ -103,9 +107,10 @@ impl CatalogRuntimeMaterializer for IcebergCatalogRuntimeMaterializer {
                 "Iceberg catalog materializer received another provider kind",
             ));
         }
+        let binding = self.binding.bind_catalog(properties)?;
         Ok(Arc::new(IcebergCatalogRuntime {
             handle: properties.handle().clone(),
-            _binding: self.binding.clone(),
+            _binding: binding,
         }))
     }
 }
@@ -130,13 +135,11 @@ impl ConnectorExecutionInstaller for IcebergConnectorInstaller {
         declaration: &ConnectorProviderBinding,
         _context: &ConnectorRequestContext,
     ) -> Result<ConnectorExecutionBinding, ConnectorError> {
-        let prepared = prepare_iceberg_execution_binding(declaration)?;
-        if prepared.access_binding() != self.resources.binding().access_binding() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "Iceberg declaration access binding does not match BE startup binding",
-            ));
-        }
+        // Validate the legacy provider declaration's kind only. Production NID
+        // execution binds the role-local template from its immutable
+        // `CatalogProperties`; the old opaque access-binding label has no
+        // credential authority and must not select a BE configuration.
+        let _ = prepare_iceberg_execution_binding(declaration)?;
         let key = declaration.binding_key().clone();
         ConnectorExecutionBinding::try_new_capabilities(
             self.provider_id.clone(),
@@ -273,8 +276,8 @@ impl IcebergReadOnlyConnectorInstance {
             "prepared split shared payload",
             request.context.max_handle_payload_bytes(),
         )?;
-        let units =
-            materialize_local_scan_units(&self.binding, payload.units, special_unit, &request)?;
+        let binding = self.binding.for_request(request.context.clone());
+        let units = materialize_local_scan_units(&binding, payload.units, special_unit, &request)?;
         let leaf_kind = if units.iter().any(|unit| unit.row_groups.is_some()) {
             "row_group"
         } else {
@@ -286,7 +289,7 @@ impl IcebergReadOnlyConnectorInstance {
             .map(|unit| {
                 request.check_active()?;
                 let facts = iceberg_unit_domain_facts(
-                    &self.binding,
+                    &binding,
                     &mut inspections,
                     &unit,
                     &fact_columns,
@@ -367,19 +370,21 @@ impl IcebergReadOnlyConnectorInstance {
             ));
         }
         if let Some(delta) = shared.delta {
+            let binding = self.binding.for_request(request.context.clone());
             return IcebergDeltaBatchReader::try_new(
                 delta.source,
                 delta.delete_side,
-                self.binding.clone(),
+                binding,
                 request,
             )
             .map(|reader| Box::new(reader) as Box<dyn ConnectorBatchReader>);
         }
-        let file_context = self.binding.file_read_context(
+        let binding = self.binding.for_request(request.context.clone());
+        let file_context = binding.file_read_context(
             novarocks_fs::FileCancellation::new(),
             request.context.deadline(),
         )?;
-        let access = self.binding.resolve_access_for_locations(
+        let access = binding.resolve_access_for_locations(
             std::iter::once(prepared.data_file.path.as_str()).chain(
                 prepared
                     .data_file

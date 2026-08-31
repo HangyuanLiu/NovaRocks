@@ -316,19 +316,17 @@ impl PositionDeleteRef {
 }
 
 /// Build a filesystem access handle for provider-owned delta files at a table
-/// location. Callers must pass process-local object-store configuration; no
+/// location. Callers must pass the exact provider-owned access binding; no
 /// credential is carried by a scan or split payload.
 pub fn build_factory_for_table_location(
     location: &str,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
 ) -> Result<novarocks_fs::FsAccessHandle, ChangeError> {
-    crate::fs_io::reader_factory_for_table_location(location, object_store_config).map_err(
-        |error| {
-            ChangeError::InternalInconsistency(format!(
-                "build iceberg table reader factory for {location}: {error}"
-            ))
-        },
-    )
+    binding.resolve_access(location).map_err(|error| {
+        ChangeError::InternalInconsistency(format!(
+            "build iceberg table reader factory for {location}: {error}"
+        ))
+    })
 }
 
 pub fn expected_object_store_bucket_from_location(
@@ -363,14 +361,14 @@ pub fn expected_object_store_bucket_for_table(
 
 pub fn build_factory_for_table(
     table: &crate::iceberg::table::Table,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
 ) -> Result<novarocks_fs::FsAccessHandle, ChangeError> {
-    build_factory_for_table_location(table.metadata().location(), object_store_config)
+    build_factory_for_table_location(table.metadata().location(), binding)
 }
 
 pub fn normalize_delete_projection_path(
     path: &str,
-    object_store_config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
     expected_object_store_bucket: Option<&str>,
 ) -> Result<String, ChangeError> {
     let parsed = novarocks_fs::FsAccessResolver::new()
@@ -383,8 +381,8 @@ pub fn normalize_delete_projection_path(
     match parsed.scheme() {
         novarocks_fs::FsScheme::Local => Ok(parsed.path().to_string()),
         novarocks_fs::FsScheme::ObjectStore => {
-            let access = crate::fs_io::resolve_access_for_location(path, object_store_config)
-                .map_err(|error| {
+            let access =
+                crate::fs_io::resolve_access_for_location(path, binding).map_err(|error| {
                     ChangeError::InternalInconsistency(format!(
                         "normalize object-store delete reverse projection path {path}: {error}"
                     ))
@@ -631,7 +629,21 @@ pub struct DeltaScanDeleteSide {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use super::*;
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Runtime::new().expect("build local test runtime");
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        )
+    }
 
     #[test]
     fn change_batch_keeps_provider_delete_roles_separate() {
@@ -700,8 +712,9 @@ mod tests {
 
     #[test]
     fn local_delete_projection_keeps_the_exact_local_path() {
+        let binding = local_test_binding();
         assert_eq!(
-            normalize_delete_projection_path("file:///tmp/orders.parquet", None, None)
+            normalize_delete_projection_path("file:///tmp/orders.parquet", &binding, None)
                 .expect("local path"),
             "/tmp/orders.parquet"
         );

@@ -43,6 +43,7 @@ pub(crate) struct StoredCatalogAttachment {
     pub(crate) provider_id: String,
     pub(crate) display_name: String,
     pub(crate) durable_properties: Vec<StoredProperty>,
+    pub(crate) credential_bindings: Vec<StoredCredentialBinding>,
     pub(crate) created_at_ms: i64,
 }
 
@@ -51,6 +52,21 @@ pub(crate) struct StoredCatalogAttachment {
 pub(crate) struct StoredProperty {
     pub(crate) key: String,
     pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredCredentialBinding {
+    pub(crate) purpose: String,
+    pub(crate) consumer_role: String,
+    pub(crate) mode: String,
+    pub(crate) name: Option<String>,
+    pub(crate) generation: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StoredCatalogAttachmentVersion {
+    schema_version: u8,
 }
 
 impl DurableRecord for StoredCatalogAttachment {
@@ -67,14 +83,16 @@ pub(crate) fn encode(
 }
 
 pub(crate) fn decode(value: &[u8]) -> Result<StoredCatalogAttachment, String> {
-    let stored = serde_json::from_slice::<StoredCatalogAttachment>(value)
-        .map_err(|error| format!("decode catalog attachment durable record: {error}"))?;
-    if stored.schema_version != CATALOG_ATTACHMENT_SCHEMA_VERSION {
+    let version = serde_json::from_slice::<StoredCatalogAttachmentVersion>(value)
+        .map_err(|error| format!("decode catalog attachment durable record version: {error}"))?;
+    if version.schema_version != CATALOG_ATTACHMENT_SCHEMA_VERSION {
         return Err(format!(
             "catalog attachment has unsupported schema version {}",
-            stored.schema_version
+            version.schema_version
         ));
     }
+    let stored = serde_json::from_slice::<StoredCatalogAttachment>(value)
+        .map_err(|error| format!("decode catalog attachment durable record: {error}"))?;
     Ok(stored)
 }
 
@@ -87,7 +105,9 @@ mod tests {
     fn stored_attachment() -> StoredCatalogAttachment {
         StoredCatalogAttachment {
             schema_version: CATALOG_ATTACHMENT_SCHEMA_VERSION,
-            attachment_id: Uuid::now_v7().to_string(),
+            attachment_id: Uuid::parse_str("01991d9f-939d-7a20-8000-000000000001")
+                .expect("fixture UUID")
+                .to_string(),
             instance_id: "warehouse".to_string(),
             provider_id: "iceberg".to_string(),
             display_name: "Warehouse".to_string(),
@@ -95,18 +115,36 @@ mod tests {
                 key: "type".to_string(),
                 value: "iceberg".to_string(),
             }],
+            credential_bindings: vec![StoredCredentialBinding {
+                purpose: "object-store-data".to_string(),
+                consumer_role: "frontend-and-backend".to_string(),
+                mode: "static".to_string(),
+                name: Some("warehouse-data".to_string()),
+                generation: Some("blue".to_string()),
+            }],
             created_at_ms: 42,
         }
     }
 
     #[test]
-    fn codec_round_trips_v1() {
+    fn codec_round_trips_v3_with_stable_bytes() {
         let value = stored_attachment();
         let store = DurableRecordStore::with_limits(
             novarocks_spi::state_store::StateStoreLimits::default(),
         );
         let encoded = encode(&store, &value).expect("encode");
         assert_eq!(decode(encoded.as_bytes()).expect("decode"), value);
+        assert_eq!(
+            encoded.as_bytes(),
+            br#"{"schema_version":3,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"credential_bindings":[{"purpose":"object-store-data","consumer_role":"frontend-and-backend","mode":"static","name":"warehouse-data","generation":"blue"}],"created_at_ms":42}"#
+        );
+    }
+
+    #[test]
+    fn codec_rejects_v2_instead_of_upgrading_backend_only_bindings() {
+        let old = br#"{"schema_version":2,"attachment_id":"01991d9f-939d-7a20-8000-000000000001","instance_id":"warehouse","provider_id":"iceberg","display_name":"Warehouse","durable_properties":[{"key":"type","value":"iceberg"}],"credential_bindings":[{"purpose":"object-store-data","consumer_role":"backend","mode":"static","name":"warehouse-data","generation":"blue"}],"created_at_ms":42}"#;
+        let error = decode(old).expect_err("v2 must fail closed");
+        assert!(error.contains("unsupported schema version 2"), "{error}");
     }
 
     #[test]

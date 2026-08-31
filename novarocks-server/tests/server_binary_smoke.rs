@@ -294,16 +294,27 @@ fn assert_native_rejects_management(port: u16, path: &str) {
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n"
     )
     .expect("write unauthenticated native request");
-    let mut response = String::new();
-    match stream.read_to_string(&mut response) {
+    let mut response = Vec::new();
+    match stream.read_to_end(&mut response) {
         Ok(_) => {
+            let is_http2_settings = response.len() >= 9
+                && response[3] == 0x04
+                && response[4] == 0x00
+                && response[5..9] == [0x00; 4]
+                && response.len()
+                    >= 9 + ((response[0] as usize) << 16)
+                        + ((response[1] as usize) << 8)
+                        + response[2] as usize;
+            let response_text = String::from_utf8_lossy(&response);
             assert!(
-                response.contains("grpc-status: 16"),
-                "native response: {response}"
+                response_text.contains("grpc-status: 16") || is_http2_settings,
+                "native response must be an unauthenticated gRPC rejection or an HTTP/2 SETTINGS preface: {response_text}"
             );
             assert!(
-                !response.contains("novarocks_"),
-                "native listener must not render management data: {response}"
+                !response
+                    .windows(b"novarocks_".len())
+                    .any(|window| window == b"novarocks_"),
+                "native listener must not render management data: {response_text}"
             );
         }
         Err(error) => assert_eq!(

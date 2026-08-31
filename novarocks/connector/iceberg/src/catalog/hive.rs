@@ -102,8 +102,13 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn load_table(
         &self,
         table: CatalogTableName,
-    ) -> Result<crate::iceberg::table::Table, ConnectorError> {
-        self.delegate.load_table(&table).await
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.delegate.load_table(&table).await.map(|table| {
+            crate::loaded_table::IcebergLoadedTable::new(
+                table,
+                crate::loaded_table::IcebergAccessDelegation::static_binding(),
+            )
+        })
     }
 
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
@@ -168,6 +173,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
+        _request_file_io: crate::iceberg::io::FileIO,
     ) -> super::StagedCommitResult {
         super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
             "Hive Metastore Iceberg catalog has no staged-create protocol",

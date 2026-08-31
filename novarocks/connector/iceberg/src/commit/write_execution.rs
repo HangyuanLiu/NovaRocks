@@ -30,7 +30,7 @@ use std::time::Instant;
 use arrow::array::{Array, Int64Array, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogWriteExecution, CatalogWriteExecutionBundle,
+    CatalogHandle, CatalogProperties, CatalogWriteExecution, CatalogWriteExecutionBundle,
     CatalogWriteExecutionBundleFactory, ConnectorBatchWriter, ConnectorError, ConnectorErrorKind,
     ConnectorOpenWriterRequest, ConnectorStagedReport, ConnectorStagedReportSummary,
     ConnectorWriteExecution, ConnectorWriterTerminalState,
@@ -139,12 +139,14 @@ impl IcebergCatalogWriteExecutionFactory {
 impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory {
     fn build(
         &self,
-        catalog_handle: &CatalogHandle,
+        properties: &CatalogProperties,
     ) -> Result<CatalogWriteExecutionBundle, ConnectorError> {
+        let catalog_handle = properties.handle();
+        let binding = self.binding.bind_catalog(properties)?;
         Ok(CatalogWriteExecutionBundle::new(Arc::new(
             IcebergCatalogWriteExecution::new(
                 catalog_handle.clone(),
-                self.binding.clone(),
+                binding,
                 self.runtime.clone(),
             ),
         )))
@@ -153,6 +155,19 @@ impl CatalogWriteExecutionBundleFactory for IcebergCatalogWriteExecutionFactory 
 
 impl ConnectorWriteExecution for IcebergDataWriteExecution {
     fn open_writer(
+        &self,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
+        let scoped = Self::new(
+            self.binding.for_request(request.context.clone()),
+            self.runtime.clone(),
+        );
+        scoped.open_writer_scoped(request)
+    }
+}
+
+impl IcebergDataWriteExecution {
+    fn open_writer_scoped(
         &self,
         request: ConnectorOpenWriterRequest,
     ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {

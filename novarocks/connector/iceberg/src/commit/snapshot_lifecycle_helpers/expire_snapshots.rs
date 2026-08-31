@@ -125,13 +125,15 @@ pub async fn run_expire_snapshots_with_marker(
 /// Runs one frozen-plan attempt without the legacy OCC retry loop.
 pub async fn run_expire_snapshots_once_with_marker(
     catalog: Arc<dyn Catalog>,
-    table_ident: TableIdent,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
+    file_io: FileIO,
     params: ExpireParams,
     marker: Option<String>,
 ) -> Result<ExpireOutcome, novarocks_connector_iceberg::iceberg::Error> {
-    run_expire_one_attempt(
+    run_expire_with_table(
         &catalog,
-        &table_ident,
+        table,
+        file_io,
         params.older_than_ms,
         params.retain_last,
         marker.as_deref(),
@@ -149,8 +151,22 @@ async fn run_expire_one_attempt(
     marker: Option<&str>,
 ) -> Result<ExpireOutcome, novarocks_connector_iceberg::iceberg::Error> {
     let table = catalog.load_table(table_ident).await?;
+    let file_io = table.file_io().clone();
+    run_expire_with_table(catalog, table, file_io, older_than_ms, retain_last, marker).await
+}
+
+/// Run one snapshot expiry from a caller-bound table and FileIO. The catalog
+/// remains the metadata commit owner; all manifest reads and file deletion use
+/// the supplied action-scoped FileIO.
+async fn run_expire_with_table(
+    catalog: &Arc<dyn Catalog>,
+    table: novarocks_connector_iceberg::iceberg::table::Table,
+    file_io: FileIO,
+    older_than_ms: Option<i64>,
+    retain_last: Option<u32>,
+    marker: Option<&str>,
+) -> Result<ExpireOutcome, novarocks_connector_iceberg::iceberg::Error> {
     let metadata = table.metadata();
-    let file_io = table.file_io();
 
     // Compute candidate snapshot ids (standard Iceberg expireSnapshots:
     // everything not protected by a ref or the main retain window).
@@ -167,7 +183,7 @@ async fn run_expire_one_attempt(
     // Enumerate files referenced by the candidate snapshots (algorithm step 5).
     let candidate_set: HashSet<i64> = candidates.iter().copied().collect();
     let files_for_candidates =
-        enumerate_files_for_snapshots(file_io, metadata, &candidate_set).await?;
+        enumerate_files_for_snapshots(&file_io, metadata, &candidate_set).await?;
 
     let all_snapshot_ids: HashSet<i64> = metadata.snapshots().map(|s| s.snapshot_id()).collect();
     let protected_snapshots: HashSet<i64> = all_snapshot_ids
@@ -175,7 +191,7 @@ async fn run_expire_one_attempt(
         .copied()
         .collect();
     let protected_files =
-        enumerate_files_for_snapshots(file_io, metadata, &protected_snapshots).await?;
+        enumerate_files_for_snapshots(&file_io, metadata, &protected_snapshots).await?;
 
     let mut to_delete: FileSet = files_for_candidates
         .difference(&protected_files)
@@ -187,7 +203,7 @@ async fn run_expire_one_attempt(
     // (`vendor/iceberg-0.9.0/src/spec/manifest/data_file.rs:276`), so the full
     // DV index can be built. If it were absent, we would return an empty index
     // (puffin protection becomes no-op for non-puffin candidates).
-    let dv_index = build_dv_index_from_metadata(metadata, file_io, &all_snapshot_ids).await?;
+    let dv_index = build_dv_index_from_metadata(metadata, &file_io, &all_snapshot_ids).await?;
     puffin_half_reference_protection(&mut to_delete, &dv_index, &protected_files);
 
     // Commit the metadata change via OCC (algorithm step 7).
@@ -228,14 +244,14 @@ async fn run_expire_one_attempt(
         });
     }
     let commit = TableCommit::builder()
-        .ident(table_ident.clone())
+        .ident(table.identifier().clone())
         .updates(updates)
         .requirements(requirements)
         .build();
     catalog.update_table(commit).await?;
 
     // Best-effort physical delete (algorithm step 8).
-    let deleted_file_count = best_effort_delete_files(file_io, &to_delete).await;
+    let deleted_file_count = best_effort_delete_files(&file_io, &to_delete).await;
 
     Ok(ExpireOutcome {
         expired_snapshot_count: candidates.len(),
@@ -368,6 +384,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+
     use super::*;
     use novarocks_connector_iceberg::commit::compute_live_snapshot_set;
     use novarocks_connector_iceberg::iceberg::spec::{
@@ -382,6 +400,16 @@ mod tests {
         catalog: Arc<dyn Catalog>,
         table_ident: TableIdent,
         _warehouse: tempfile::TempDir,
+    }
+
+    fn local_test_binding() -> novarocks_connector_iceberg::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
     }
 
     fn build_test_metadata_with_snapshots(
@@ -445,13 +473,15 @@ mod tests {
     async fn empty_local_v3_table() -> LocalCatalogFixture {
         let warehouse = tempfile::tempdir().expect("warehouse tempdir");
         let warehouse_uri = format!("file://{}", warehouse.path().join("warehouse").display());
+        let binding = local_test_binding();
         let catalog: Arc<dyn Catalog> = Arc::new(
-            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new(
+            novarocks_connector_iceberg::hadoop_catalog::HadoopFileSystemCatalog::new_with_binding(
                 novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                     &warehouse_uri,
-                    None,
+                    binding.clone(),
                 ),
                 warehouse_uri,
+                binding,
             ),
         );
         let namespace = NamespaceIdent::new("db".to_string());

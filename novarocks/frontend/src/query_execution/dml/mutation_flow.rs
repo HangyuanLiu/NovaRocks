@@ -506,7 +506,7 @@ pub(crate) trait MutationExecution: Send + Sync {
     > {
         completion
             .session()
-            .commit(self.terminal_context())
+            .commit(completion.terminal_request_context())
             .map_err(|error| error.to_string())
     }
     fn finalize(&self) -> Result<(), String>;

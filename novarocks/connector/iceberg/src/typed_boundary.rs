@@ -40,7 +40,7 @@
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
@@ -48,14 +48,15 @@ use novarocks_spi::connector::read_stack::adapter::{
 };
 use novarocks_spi::connector::read_stack::{
     Assignment, Bound, ConnectorExpression, ConnectorReadChangeWindow,
-    ConnectorReadRelationVersion, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
-    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
-    SystemTableDistribution, TupleDomain, ValueSet,
+    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
+    ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource, ConnectorTableHandle as _,
+    ConnectorValue, ConnectorValueType, Constraint, Domain, DynamicFilterSnapshot,
+    OrderedAssignments, Range, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
-    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    ConnectorRequestContext, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
@@ -193,6 +194,16 @@ pub struct IcebergTypedBoundary {
     catalog_handle: novarocks_spi::connector::CatalogHandle,
     transaction: HiveTransactionHandle,
     runtime: Arc<IcebergMetadataContext>,
+    /// Query-attempt-local control capability. The installed control template
+    /// has none because a vended metadata response may be materialized only
+    /// through the attempt that owns its lease contribution.
+    request_context: Option<ConnectorRequestContext>,
+    /// A request-local physical-table view shared by typed metadata freezing
+    /// and the later lazy split source.  It keeps the request-bound FileIO
+    /// capability process-local while ensuring split enumeration does not
+    /// reopen REST metadata after the attempt's credential manifest is sealed.
+    request_pinned_physical_tables:
+        Option<Arc<Mutex<HashMap<SchemaTableName, IcebergPhysicalTable>>>>,
     split_source_options: IcebergSplitSourceOptions,
 }
 
@@ -215,7 +226,25 @@ impl IcebergTypedBoundary {
             catalog_handle,
             transaction,
             runtime,
+            request_context: None,
+            request_pinned_physical_tables: None,
             split_source_options: IcebergSplitSourceOptions::default(),
+        }
+    }
+
+    /// Rebind this immutable generation template to one admitted request. The
+    /// context is a process-local capability, never a session property, table
+    /// handle, codec payload, or wire value.
+    fn for_request(&self, request_context: ConnectorRequestContext) -> Self {
+        Self {
+            descriptor: self.descriptor.clone(),
+            incarnation: self.incarnation,
+            catalog_handle: self.catalog_handle.clone(),
+            transaction: self.transaction.clone(),
+            runtime: Arc::clone(&self.runtime),
+            request_context: Some(request_context),
+            request_pinned_physical_tables: Some(Arc::new(Mutex::new(HashMap::new()))),
+            split_source_options: self.split_source_options,
         }
     }
 
@@ -275,9 +304,43 @@ impl IcebergTypedBoundary {
         &self,
         name: &SchemaTableName,
     ) -> Result<IcebergPhysicalTable, ConnectorError> {
-        self.runtime
-            .load_table_classified(name.schema_name(), name.table_name())
-            .map_err(|(kind, message)| ConnectorError::new(kind, message))
+        match (&self.request_context, &self.request_pinned_physical_tables) {
+            (Some(context), Some(tables)) => {
+                if let Some(table) = tables
+                    .lock()
+                    .expect("request-pinned Iceberg table cache lock")
+                    .get(name)
+                    .cloned()
+                {
+                    return Ok(table);
+                }
+                let table = self
+                    .runtime
+                    .load_table_classified_for_request(
+                        name.schema_name(),
+                        name.table_name(),
+                        context,
+                    )
+                    .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+                tables
+                    .lock()
+                    .expect("request-pinned Iceberg table cache lock")
+                    .insert(name.clone(), table.clone());
+                Ok(table)
+            }
+            (Some(_), None) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "request-bound Iceberg typed control has no request-pinned table cache",
+            )),
+            (None, None) => self
+                .runtime
+                .load_table_classified(name.schema_name(), name.table_name())
+                .map_err(|(kind, message)| ConnectorError::new(kind, message)),
+            (None, Some(_)) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "unbound Iceberg typed control unexpectedly retained a request-pinned table cache",
+            )),
+        }
     }
 
     /// The visible files of one change-window endpoint.
@@ -483,6 +546,35 @@ impl std::fmt::Debug for IcebergTypedBoundary {
             .field("runtime", &self.runtime)
             .field("split_source_options", &self.split_source_options)
             .finish()
+    }
+}
+
+/// Connector-owned constructor for the query-scoped FE typed-read services.
+/// The registry retains the generation template, while every request receives
+/// an adapter bound to its own process-local storage authority.
+#[derive(Clone)]
+pub struct IcebergTypedRequestControlFactory {
+    template: Arc<IcebergTypedBoundary>,
+}
+
+impl IcebergTypedRequestControlFactory {
+    pub fn new(template: Arc<IcebergTypedBoundary>) -> Self {
+        Self { template }
+    }
+}
+
+impl ConnectorReadRequestControlFactory for IcebergTypedRequestControlFactory {
+    fn for_request(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<ConnectorReadRequestControl, ConnectorError> {
+        let adapter =
+            Arc::new(Arc::new(self.template.for_request(request.clone())).read_runtime_adapter());
+        Ok(ConnectorReadRequestControl::new(
+            Arc::clone(&adapter)
+                as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadMetadata>,
+            adapter as Arc<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitManager>,
+        ))
     }
 }
 

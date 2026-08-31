@@ -36,8 +36,10 @@ PROPERTIES (
   "iceberg.catalog.type" = "hadoop",
   "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/mvrw_${uuid0}",
   "aws.s3.endpoint" = "${oss_endpoint}",
-  "aws.s3.access_key" = "${oss_ak}",
-  "aws.s3.secret_key" = "${oss_sk}",
+  "credential.object-store-data.consumer-role" = "frontend-and-backend",
+  "credential.object-store-data.mode" = "static",
+  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
   "aws.s3.enable_path_style_access" = "true"
 );
 

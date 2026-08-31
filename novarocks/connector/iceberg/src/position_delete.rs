@@ -175,6 +175,7 @@ mod tests {
     use parquet::arrow::ArrowWriter;
 
     use super::*;
+    use crate::access_binding::IcebergReadBinding;
 
     #[test]
     fn context_loader_uses_provider_owned_file_resources() {
@@ -191,8 +192,17 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
         let task_spawner: Arc<dyn FileTaskSpawner> =
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
-        let access = FsAccessResolver::new()
-            .resolve_location(directory.path().join("__binding__").to_string_lossy(), None)
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::clone(&file_runtime),
+            Arc::clone(&task_spawner),
+        );
+        let access = binding
+            .resolve_access(&format!(
+                "file://{}",
+                directory.path().join("__binding__").display()
+            ))
             .expect("resolve local access");
         let context = FileReadContext {
             cancellation: FileCancellation::new(),

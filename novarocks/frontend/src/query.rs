@@ -915,6 +915,16 @@ impl FrontendQuerySession {
                     .execution_settings
                     .set_enable_parquet_reader_page_index(parse_bool(value)?);
             }
+            "enable_scan_datacache" => {
+                state
+                    .execution_settings
+                    .set_enable_scan_datacache(parse_bool(value)?);
+            }
+            "enable_populate_datacache" => {
+                state
+                    .execution_settings
+                    .set_enable_populate_datacache(parse_bool(value)?);
+            }
             "runtime_filter_scan_wait_time" => {
                 let value = value.parse::<i64>().map_err(|_| {
                     QueryServiceError::new(
@@ -1363,6 +1373,8 @@ fn is_known_session_setting(name: &str) -> bool {
             | "group_concat_max_len"
             | "pipeline_dop"
             | "enable_parquet_reader_page_index"
+            | "enable_scan_datacache"
+            | "enable_populate_datacache"
             | "runtime_filter_scan_wait_time"
             | "global_runtime_filter_wait_timeout"
             | "disable_optimizer_rules"
@@ -2431,6 +2443,7 @@ mod tests {
                     )),
                     || {},
                 ),
+                attempt_reservation: None,
             })
         }
 

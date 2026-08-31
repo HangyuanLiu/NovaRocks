@@ -29,14 +29,28 @@ use bytes::Bytes;
 use h2::client;
 use http::{Request, header};
 use mysql::prelude::Queryable;
+use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
+use novarocks_cluster_harness::vended_rest_catalog::{
+    VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
+};
 use novarocks_cluster_harness::{
     NativeTrustFixture, NativeTrustFixtureMode, ParticipantTerminalOutcomeKind,
     QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use novarocks_native_trust::{NativeEndpointConnector, NativeTrust};
+use novarocks_proto_models::{catalog, common, novarocks as proto};
+use novarocks_secret::SecretValue;
+use novarocks_types::BackendProcessId;
 use novarocks_types::NativeEndpoint;
+use novarocks_version::{
+    NativeCarrierDeclaration, derive_repository_native_compatibility_material,
+};
+use prost::Message;
+use std::sync::Mutex;
+use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
+const GRPC_INVALID_ARGUMENT: u16 = 3;
 const GRPC_UNAUTHENTICATED: u16 = 16;
 const GRPC_UNIMPLEMENTED: u16 = 12;
 const UNKNOWN_NATIVE_PATH: &str = "/novarocks.NovaRocksGrpc/Nwt3Unknown";
@@ -59,6 +73,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(NativeTrustNegative::domain_mismatch()),
         Box::new(NativeTrustNegative::plaintext_tls_mismatch()),
         Box::new(NativeTrustNegative::automatic_pem_mismatch()),
+        Box::new(VendedCredentialTlsGate::plaintext()),
+        Box::new(VendedCredentialTlsGate::automatic()),
+        Box::new(VendedCredentialTlsGate::pem()),
     ]
 }
 
@@ -216,6 +233,223 @@ impl Scenario for NativeTrustNegative {
     }
 }
 
+/// Exercises the confidential query-attempt lease transport boundary with one
+/// real REST-vended catalog definition. The plaintext variant proves both
+/// independently-owned h2c rejections, while the TLS variants prove the same
+/// definition is admitted over automatic and PEM Native TLS.
+struct VendedCredentialTlsGate {
+    name: &'static str,
+    fixture: NativeTrustFixture,
+    rest: Mutex<Option<VendedCredentialTlsFixture>>,
+}
+
+struct VendedCredentialTlsFixture {
+    rest: IsolatedIcebergRestFixture,
+    proxy: VendedRestCatalogFixture,
+}
+
+impl VendedCredentialTlsGate {
+    fn plaintext() -> Self {
+        Self::new(
+            "native-trust/vended-credential-tls-gate",
+            NativeTrustFixture::plaintext_ip(),
+        )
+    }
+
+    fn automatic() -> Self {
+        Self::new(
+            "native-trust/vended-credential-tls-gate-automatic",
+            NativeTrustFixture::automatic_dns(),
+        )
+    }
+
+    fn pem() -> Self {
+        Self::new(
+            "native-trust/vended-credential-tls-gate-pem",
+            NativeTrustFixture::pem_ip(),
+        )
+    }
+
+    fn new(name: &'static str, fixture: NativeTrustFixture) -> Self {
+        Self {
+            name,
+            fixture,
+            rest: Mutex::new(None),
+        }
+    }
+
+    fn fixture_endpoints(&self) -> Result<(String, String, String)> {
+        let fixture = self
+            .rest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+        let fixture = fixture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vended TLS gate fixture is missing"))?;
+        Ok((
+            fixture.proxy.uri().to_owned(),
+            fixture.rest.endpoints().rest_warehouse.clone(),
+            fixture.rest.endpoints().minio_endpoint.clone(),
+        ))
+    }
+
+    fn table_loads(&self) -> Result<u64> {
+        let fixture = self
+            .rest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+        fixture
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit().table_loads)
+            .ok_or_else(|| anyhow::anyhow!("vended TLS gate fixture is missing"))
+    }
+}
+
+impl Scenario for VendedCredentialTlsGate {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST fixture for vended TLS gate")?;
+        rest.provision_empty_table("vended_tls_db", "vended_tls_data")
+            .context("provision isolated vended TLS gate source table")?;
+        let endpoints = rest.endpoints().clone();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated vended TLS gate S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.initial.not_after_unix_ms)
+            })
+            .context("build initial vended TLS gate S3 credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .and_then(|credential| {
+                credential.with_not_after_unix_ms(identities.rotated.not_after_unix_ms)
+            })
+            .context("build rotated vended TLS gate S3 credential")?,
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: VendedRefreshBehavior::IssueRotatedCredential,
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .context("start vended TLS gate REST proxy")?;
+        let mut fixture = self
+            .rest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+        ensure!(
+            fixture.is_none(),
+            "vended TLS gate fixture was initialized more than once"
+        );
+        *fixture = Some(VendedCredentialTlsFixture { rest, proxy });
+        Ok(ScenarioLaunchConfig {
+            native_trust_fixture: self.fixture.clone(),
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        ensure!(
+            context.handle().native_trust_mode() == self.fixture.mode(),
+            "vended TLS gate launched a different Native transport profile"
+        );
+        assert_direct_vended_init_transport(context, self.fixture.mode())?;
+
+        let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect vended TLS gate MySQL client")?,
+        )?;
+        const CATALOG: &str = "vended_tls_gate";
+        connection
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-data.consumer-role\"=\"frontend-and-backend\",\"credential.object-store-data.mode\"=\"vended\")"
+            ))
+            .context("create real REST-vended catalog for Native TLS gate")?;
+
+        let query = format!("SELECT count(*) FROM {CATALOG}.vended_tls_db.vended_tls_data");
+        match self.fixture.mode() {
+            NativeTrustFixtureMode::Plaintext => {
+                let init_counts = (0..REQUIRED_BACKENDS)
+                    .map(|index| context.handle().be_log_count(index, "NOVAROCKS_QUERY_INIT"))
+                    .collect::<Result<Vec<_>>>()?;
+                let error = connection
+                    .query::<i64, _>(&query)
+                    .expect_err("plaintext vended catalog query must fail at FE admission");
+                let diagnostic = error.to_string();
+                ensure!(
+                    diagnostic.contains(
+                        "vended credential lease admission requires TLS Native transport"
+                    ),
+                    "plaintext vended catalog query did not expose the typed FE TLS rejection: {diagnostic}"
+                );
+                for (index, before) in init_counts.into_iter().enumerate() {
+                    ensure!(
+                        context
+                            .handle()
+                            .be_log_count(index, "NOVAROCKS_QUERY_INIT")?
+                            == before,
+                        "plaintext vended catalog query reached BE[{index}] Init ingress after FE rejection"
+                    );
+                }
+                context.action("proved h2c rejects the real vended definition at FE admission before any BE Init");
+            }
+            NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
+                let rows: Vec<i64> = connection
+                    .query(&query)
+                    .context("run real REST-vended query over Native TLS")?;
+                ensure!(
+                    rows == vec![0],
+                    "TLS vended catalog query returned unexpected rows: {rows:?}"
+                );
+                context.action(format!(
+                    "admitted the real vended definition through FE and BE lifecycle over {:?} Native TLS",
+                    self.fixture.mode()
+                ));
+            }
+        }
+        ensure!(
+            self.table_loads()? > 0,
+            "vended TLS gate did not observe a REST table response carrying a lease"
+        );
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .rest
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?
+            .take();
+        let Some(VendedCredentialTlsFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated vended TLS gate REST fixture")
+    }
+}
+
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let count = context.handle().be_count();
     ensure!(
@@ -225,6 +459,222 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     );
     context.action("verified real independent-process 1FE+3BE Native topology");
     Ok(())
+}
+
+fn assert_direct_vended_init_transport(
+    context: &mut ScenarioContext,
+    mode: NativeTrustFixtureMode,
+) -> Result<()> {
+    let endpoint = context.handle().native_be_endpoint(0)?;
+    let connector = context.handle().native_probe_connector(endpoint, mode)?;
+    let authorization = authorization_header(&context.handle().native_probe_trust()?)?;
+    let init = confidential_vended_init()?;
+    match mode {
+        NativeTrustFixtureMode::Plaintext => {
+            let probe = raw_grpc_probe(
+                connector,
+                "/novarocks.NovaRocksGrpc/InitQuery",
+                Some(&authorization),
+                Some(&grpc_frame(&init)?),
+            )?;
+            ensure!(
+                probe.http_status == 200 && probe.grpc_status == Some(GRPC_INVALID_ARGUMENT),
+                "h2c direct Init carrying a vended lease must be rejected at BE ingress, got {probe:?}"
+            );
+            context
+                .action("proved direct h2c BE Init rejects a confidential vended lease envelope");
+        }
+        NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
+            let response: proto::InitQueryResponse = raw_unary(
+                connector,
+                "/novarocks.NovaRocksGrpc/InitQuery",
+                &authorization,
+                init,
+            )?;
+            ensure!(
+                matches!(
+                    proto::QueryInitOutcome::try_from(response.outcome),
+                    Ok(proto::QueryInitOutcome::QueryInitRejectedCompatibilityMismatch)
+                        | Ok(proto::QueryInitOutcome::QueryInitRejectedInvalidManifest)
+                ),
+                "TLS direct Init did not pass confidential-envelope parsing into later lifecycle validation: {response:?}"
+            );
+            context.action(format!(
+                "proved direct BE Init accepts the confidential envelope over {:?} Native TLS",
+                mode
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn confidential_vended_init() -> Result<proto::InitQueryRequest> {
+    let material = derive_repository_native_compatibility_material([
+        NativeCarrierDeclaration::try_new("iceberg", 1)?,
+        NativeCarrierDeclaration::try_new("starrocks", 1)?,
+    ])?;
+    let owner = catalog::CatalogHandle {
+        catalog_name: "vended_tls_gate".to_owned(),
+        version: vec![7; 32],
+    };
+    Ok(proto::InitQueryRequest {
+        manifest: Some(proto::ParticipantManifest {
+            execution_id: Some(proto::QueryExecutionId {
+                query_id: Some(common::UniqueId { hi: 5, lo: 6 }),
+                attempt_id: 1,
+            }),
+            backend: Some(proto::ParticipantBackendIdentity {
+                endpoint: Some(proto::QueryControlEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 9030,
+                }),
+                // The wrong process id is deliberate. Successful TLS parsing
+                // must reach the later compatibility fence, without creating
+                // a real lifecycle entry on the target BE.
+                process_id: Some(proto::BackendProcessId {
+                    value: BackendProcessId::new_v7().to_bytes().to_vec(),
+                }),
+            }),
+            native_compatibility_id: Some(proto::NativeCompatibilityId {
+                value: material.id().as_bytes().to_vec(),
+            }),
+            expected_fragment_instance_ids: vec![common::UniqueId { hi: 11, lo: 12 }],
+            query_options: Some(proto::QueryOptions::default()),
+            query_deadline_unix_ms: 1_000,
+            pre_start_timeout_ms: 30_000,
+            report_endpoint: Some(proto::QueryControlEndpoint {
+                host: "127.0.0.1".to_owned(),
+                port: 9031,
+            }),
+            catalog_set: Some(catalog::CatalogSet {
+                catalogs: vec![catalog::CatalogProperties {
+                    handle: Some(owner.clone()),
+                    provider_kind: catalog::CatalogProviderKind::Iceberg as i32,
+                    config_format_version: 1,
+                    execution_properties: vec![],
+                    credential_bindings: vec![catalog::CatalogCredentialBinding {
+                        purpose: catalog::CatalogCredentialPurpose::ObjectStoreData as i32,
+                        consumer_role: catalog::CredentialConsumerRole::FrontendAndBackend as i32,
+                        mode: Some(catalog::catalog_credential_binding::Mode::VendedCredential(
+                            catalog::VendedCredential {},
+                        )),
+                    }],
+                }],
+            }),
+            credential_lease_descriptors: vec![proto::CredentialLeaseDescriptor {
+                lease_id: vec![1; 16],
+                epoch: 1,
+                owner: Some(owner),
+                provider: proto::CredentialLeaseProvider::S3 as i32,
+                prefixes: vec!["s3://vended-tls-gate/data".to_owned()],
+                not_after_unix_ms: 99,
+                refresh_capable: true,
+                storage_access_domain_id: vec![8; 32],
+            }],
+            ..Default::default()
+        }),
+        credential_lease_envelopes: vec![proto::CredentialLeaseSecretEnvelope {
+            lease_id: vec![1; 16],
+            epoch: 1,
+            s3: Some(proto::CredentialLeaseS3SecretMaterial {
+                access_key_id: "cca-vended-tls-access".to_owned(),
+                secret_access_key: "cca-vended-tls-secret".to_owned(),
+                session_token: "cca-vended-tls-token".to_owned(),
+                session_token_expires_at_unix_ms: 99,
+            }),
+        }],
+    })
+}
+
+fn grpc_frame<M: Message>(message: &M) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    message
+        .encode(&mut payload)
+        .context("encode raw Native gRPC protobuf")?;
+    let mut frame = Vec::with_capacity(payload.len() + 5);
+    frame.push(0);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+fn raw_unary<M: Message, R: Message + Default>(
+    connector: NativeEndpointConnector,
+    path: &str,
+    authorization: &str,
+    message: M,
+) -> Result<R> {
+    let frame = grpc_frame(&message)?;
+    tokio::runtime::Runtime::new()
+        .context("create Native raw unary runtime")?
+        .block_on(async move {
+            let stream = connector
+                .connect()
+                .await
+                .map_err(anyhow::Error::msg)
+                .context("connect Native raw unary")?;
+            let (mut sender, connection) = client::handshake(stream)
+                .await
+                .context("perform Native raw unary HTTP/2 handshake")?;
+            let driver = tokio::spawn(async move { connection.await });
+            let request = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/grpc")
+                .header("te", "trailers")
+                .header(header::AUTHORIZATION, authorization)
+                .body(())
+                .context("build Native raw unary request")?;
+            let (response, mut send_stream) = sender
+                .send_request(request, false)
+                .context("send Native raw unary request")?;
+            send_stream
+                .send_data(Bytes::from(frame), true)
+                .context("send Native raw unary frame")?;
+            let response = response
+                .await
+                .context("receive Native raw unary response")?;
+            ensure!(
+                response.status().as_u16() == 200,
+                "Native raw unary returned HTTP {}",
+                response.status()
+            );
+            let header_status = grpc_status(response.headers());
+            let mut body = response.into_body();
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body
+                .data()
+                .await
+                .transpose()
+                .context("read Native raw unary body")?
+            {
+                bytes.extend_from_slice(&chunk);
+            }
+            let trailer_status = body
+                .trailers()
+                .await
+                .context("read Native raw unary trailers")?
+                .as_ref()
+                .and_then(grpc_status);
+            driver.abort();
+            let _ = driver.await;
+            ensure!(
+                header_status.or(trailer_status) == Some(0),
+                "Native raw unary returned non-OK gRPC status {:?}",
+                header_status.or(trailer_status)
+            );
+            ensure!(
+                bytes.len() >= 5 && bytes[0] == 0,
+                "Native raw unary response lacks an uncompressed gRPC frame"
+            );
+            let length =
+                u32::from_be_bytes(bytes[1..5].try_into().expect("frame header width")) as usize;
+            ensure!(
+                bytes.len() == length + 5,
+                "Native raw unary response frame length mismatch"
+            );
+            R::decode(&bytes[5..]).context("decode Native raw unary response")
+        })
 }
 
 fn assert_authentication_order(
@@ -437,6 +887,9 @@ mod tests {
                 "native-trust/reject-jwt-domain-mismatch",
                 "native-trust/reject-plaintext-tls-mismatch",
                 "native-trust/reject-automatic-pem-mismatch",
+                "native-trust/vended-credential-tls-gate",
+                "native-trust/vended-credential-tls-gate-automatic",
+                "native-trust/vended-credential-tls-gate-pem",
             ]
         );
     }

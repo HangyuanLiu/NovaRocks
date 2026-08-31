@@ -36,7 +36,9 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
+use novarocks_native_trust::{
+    NativeIncomingAdapter, NativeServerAdmission, NativeTransportMode, NativeTrust,
+};
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
@@ -62,6 +64,11 @@ use crate::runtime_filter::rpc::{
 };
 
 const GRPC_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Connection-local proof injected only after `NativeIncomingAdapter::accept`
+/// returns. It cannot be claimed by a lifecycle protobuf frame.
+#[derive(Clone, Copy)]
+struct NativeTlsVerified;
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes them with `BackendDataPlane`.
@@ -300,9 +307,10 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::InitQueryRequest>,
     ) -> Result<tonic::Response<proto::InitQueryResponse>, tonic::Status> {
+        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
         let ingress = Arc::clone(&self.query_lifecycle_ingress);
         let response = tokio::task::spawn_blocking(move || {
-            handle_init_query(ingress.as_ref(), request.into_inner())
+            handle_init_query(ingress.as_ref(), request.into_inner(), tls_verified)
         })
         .await
         .map_err(|error| {
@@ -360,10 +368,12 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<tonic::Streaming<proto::QueryControlRequest>>,
     ) -> Result<tonic::Response<Self::QueryControlStreamStream>, tonic::Status> {
+        let tls_verified = request.extensions().get::<NativeTlsVerified>().is_some();
         let stream: QueryControlResponseStream = handle_query_control_stream(
             Arc::clone(&self.query_lifecycle_ingress),
             request.into_inner(),
             self.query_control_shutdown.clone(),
+            tls_verified,
         )
         .await?;
         Ok(tonic::Response::new(Box::pin(stream)))
@@ -547,6 +557,7 @@ where
                 let app = app.clone();
                 let incoming = incoming.clone();
                 tokio::spawn(async move {
+                    let tls_verified = incoming.mode() != NativeTransportMode::Disabled;
                     let stream = match incoming.accept(stream).await {
                         Ok(stream) => stream,
                         Err(_) => {
@@ -554,9 +565,12 @@ where
                             return;
                         }
                     };
-                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let service = service_fn(move |mut request: hyper::Request<hyper::body::Incoming>| {
                         let app = app.clone();
                         async move {
+                            if tls_verified {
+                                request.extensions_mut().insert(NativeTlsVerified);
+                            }
                             let response = app
                                 .oneshot(request.map(axum::body::Body::new))
                                 .await

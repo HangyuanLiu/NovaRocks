@@ -23,15 +23,16 @@
 
 use std::sync::Arc;
 
-use crate::{FileIoRuntime, FileTaskSpawner, FsAccessResolver, ObjectStoreConfig};
+use crate::{FileIoRuntime, FileTaskSpawner, FsAccessResolver, ObjectStoreProviderPool};
 
 /// Filesystem resources bound by a connector instance or execution binding.
 ///
-/// `ObjectStoreConfig` is intentionally process-local. Callers must not
-/// serialize this value into connector handles, durable state, or wire payloads.
+/// Endpoint configuration and secret material are intentionally absent. Each
+/// acquire operation supplies those short-lived values explicitly while this
+/// resource owns only the shared, bounded provider pool.
 #[derive(Clone)]
 pub struct FsAccessResources {
-    object_store_config: Option<ObjectStoreConfig>,
+    object_store_provider_pool: Arc<ObjectStoreProviderPool>,
     access_resolver: FsAccessResolver,
     file_runtime: Arc<dyn FileIoRuntime>,
     file_task_spawner: Arc<dyn FileTaskSpawner>,
@@ -42,8 +43,8 @@ impl std::fmt::Debug for FsAccessResources {
         formatter
             .debug_struct("FsAccessResources")
             .field(
-                "object_store_config",
-                &self.object_store_config.as_ref().map(|_| "<redacted>"),
+                "object_store_provider_pool",
+                &self.object_store_provider_pool,
             )
             .field("access_resolver", &self.access_resolver)
             .finish_non_exhaustive()
@@ -57,21 +58,21 @@ impl FsAccessResources {
     /// discover a current runtime, construct a fallback runtime, or use a
     /// process-global filesystem service.
     pub fn new(
-        object_store_config: Option<ObjectStoreConfig>,
+        object_store_provider_pool: Arc<ObjectStoreProviderPool>,
         access_resolver: FsAccessResolver,
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
         Self {
-            object_store_config,
+            object_store_provider_pool,
             access_resolver,
             file_runtime,
             file_task_spawner,
         }
     }
 
-    pub fn object_store_config(&self) -> Option<&ObjectStoreConfig> {
-        self.object_store_config.as_ref()
+    pub fn object_store_provider_pool(&self) -> &Arc<ObjectStoreProviderPool> {
+        &self.object_store_provider_pool
     }
 
     pub fn access_resolver(&self) -> FsAccessResolver {
@@ -102,7 +103,10 @@ mod tests {
         let task_spawner: Arc<dyn FileTaskSpawner> =
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
         let resources = FsAccessResources::new(
-            None,
+            Arc::new(
+                ObjectStoreProviderPool::new(crate::ObjectStoreProviderPoolOptions::default())
+                    .expect("provider pool"),
+            ),
             FsAccessResolver::new(),
             Arc::clone(&file_runtime),
             Arc::clone(&task_spawner),
@@ -110,6 +114,9 @@ mod tests {
 
         assert!(Arc::ptr_eq(resources.file_runtime(), &file_runtime));
         assert!(Arc::ptr_eq(resources.file_task_spawner(), &task_spawner));
-        assert!(resources.object_store_config().is_none());
+        assert_eq!(
+            resources.object_store_provider_pool().options(),
+            crate::ObjectStoreProviderPoolOptions::default()
+        );
     }
 }

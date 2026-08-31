@@ -19,6 +19,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
+use novarocks_spi::connector::StorageAccessDomainId;
+
 use super::block_cache::{BlockCache, CacheKey};
 use crate::FileIdentity;
 
@@ -41,12 +43,13 @@ pub struct CacheBlockRead {
 impl CacheInputStream {
     pub fn new(
         cache: Arc<BlockCache>,
+        access_domain: StorageAccessDomainId,
         identity: FileIdentity,
         enable_cache: bool,
         enable_populate: bool,
         async_populate: bool,
     ) -> Self {
-        let cache_key = CacheKey::from_identity(&identity);
+        let cache_key = CacheKey::from_identity(access_domain, &identity);
         Self {
             cache,
             cache_key,

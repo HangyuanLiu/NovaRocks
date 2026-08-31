@@ -67,6 +67,7 @@ pub struct IcebergChangeWindowPageSourceRequest<'a> {
     pub footers: Arc<ParquetFooterCache>,
     pub access_binding: IcebergReadBinding,
     pub context: FileReadContext,
+    pub cache: Option<novarocks_fs::DataCacheContext>,
     pub budget: FileReadBudget,
     pub reader_options: FileReaderOptions,
     pub scheduled_split_sequence_id: u64,
@@ -92,6 +93,7 @@ pub fn create_iceberg_change_window_page_source(
         footers: request.footers,
         access_binding: request.access_binding,
         context: request.context,
+        cache: request.cache,
         budget: request.budget,
         reader_options: request.reader_options,
         scheduled_split_sequence_id: request.scheduled_split_sequence_id,
@@ -572,6 +574,7 @@ mod tests {
                 footers: Arc::clone(&self.footers),
                 access_binding: self.binding.clone(),
                 context: self.context.clone(),
+                cache: None,
                 budget: FileReadBudget {
                     max_rows: NonZeroUsize::new(1024).expect("nonzero"),
                     max_bytes: NonZeroUsize::new(8 * 1024 * 1024).expect("nonzero"),

@@ -219,7 +219,7 @@ impl ConnectorControlFactory for SelectivelyFailingFactory {
         ConnectorControlCreation::try_new(
             &request,
             binding(request.instance_id().clone(), incarnation),
-            Vec::new(),
+            request.properties().to_vec(),
         )
     }
 }

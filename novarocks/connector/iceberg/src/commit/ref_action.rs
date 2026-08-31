@@ -245,21 +245,15 @@ fn build_exact_branch_drop_commit(
 /// Drop one provider-owned branch only if its table incarnation and observed
 /// head are unchanged. This is intentionally separate from SQL `DROP BRANCH`:
 /// it has no `IF EXISTS` mode and never converts a missing or changed ref into
-/// a successful cleanup result.
+/// a successful cleanup result. The caller owns the table load so request-scoped
+/// storage credentials cannot be bypassed by a second catalog load here.
 pub async fn drop_branch_if_exact(
     catalog: &dyn Catalog,
-    namespace: &str,
-    table: &str,
+    loaded: &crate::iceberg::table::Table,
     expected_table_uuid: &str,
     name: &str,
     expected_head_snapshot_id: i64,
 ) -> Result<ExactBranchDropOutcome, String> {
-    let ident = TableIdent::from_strs([namespace, table])
-        .map_err(|error| format!("iceberg cleanup ref: invalid table identifier: {error}"))?;
-    let loaded = catalog
-        .load_table(&ident)
-        .await
-        .map_err(|error| format!("iceberg cleanup ref: load table failed: {error}"))?;
     let metadata = loaded.metadata();
     if metadata.uuid().to_string() != expected_table_uuid {
         return Ok(ExactBranchDropOutcome::Abandoned);
@@ -273,8 +267,12 @@ pub async fn drop_branch_if_exact(
     {
         return Ok(ExactBranchDropOutcome::Abandoned);
     }
-    let commit =
-        build_exact_branch_drop_commit(ident, metadata.uuid(), name, expected_head_snapshot_id);
+    let commit = build_exact_branch_drop_commit(
+        loaded.identifier().clone(),
+        metadata.uuid(),
+        name,
+        expected_head_snapshot_id,
+    );
     match catalog.update_table(commit).await {
         Ok(_) => Ok(ExactBranchDropOutcome::Retired),
         // A concurrently moved/deleted ref is a failed compare-and-swap proof,
@@ -288,15 +286,17 @@ pub async fn drop_branch_if_exact(
 
 pub async fn execute_ref_action(
     catalog: &dyn Catalog,
+    loaded: &crate::iceberg::table::Table,
     plan: &RefActionPlan,
 ) -> Result<RefActionOutcome, String> {
     let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
         .map_err(|e| format!("iceberg ref: invalid table identifier: {e}"))?;
-    let table = catalog
-        .load_table(&ident)
-        .await
-        .map_err(|e| format!("iceberg ref: load table: {e}"))?;
-    let metadata = table.metadata();
+    if loaded.identifier() != &ident {
+        return Err(
+            "iceberg ref: request-scoped table identity does not match action plan".to_string(),
+        );
+    }
+    let metadata = loaded.metadata();
 
     let (updates, requirements) = match &plan.action {
         RefAction::CreateBranch {

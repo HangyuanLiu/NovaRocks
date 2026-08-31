@@ -63,6 +63,13 @@ pub(crate) trait QueryControlSession: Send + Sync + 'static {
     ) -> Result<QueryControlEvent, QueryLifecycleTransportError>;
 }
 pub(crate) trait QueryLifecycleTransport: Send + Sync + 'static {
+    /// Native transport admission for confidential credential lease frames.
+    /// Test and non-network transports default to fail-closed; only the
+    /// concrete TLS transport implementation may opt in.
+    fn permits_confidential_credential_leases(&self) -> bool {
+        false
+    }
+
     fn init_query(
         &self,
         target: QueryLifecycleTarget,

@@ -746,13 +746,24 @@ fn prepare_typed_relation_scan(
     // context to observe cancellation before expensive read preparation. The
     // returned legacy declaration is deliberately discarded; typed reads are
     // materialized solely from the Init-carried CatalogSet.
+    // The installed typed control is generation-scoped, while the provider
+    // materialization below is request-scoped.  Attach the same exact
+    // planning-lease collector used by the other metadata routes before the
+    // typed boundary can observe a vended REST response.
+    let request_context =
+        crate::connector::context_for_planning_lease(planning_lease, context.clone())
+            .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let _ = binding
-        .provider_binding(context)
+        .provider_binding(&request_context)
+        .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
+    let request_control = control
+        .for_request(&request_context)
         .map_err(|error| format!("typed connector scan node_id={node_id}: {error}"))?;
     let prepared = prepare_typed_scan(
         &typed.session,
         catalog_handle.clone(),
         &control,
+        &request_control,
         node_id,
         scan,
         physical_columns,

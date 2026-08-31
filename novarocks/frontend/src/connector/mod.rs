@@ -40,6 +40,7 @@ pub mod fixture;
 #[cfg(test)]
 pub mod scan_model;
 
+pub(crate) use application::context_for_planning_lease;
 pub use application::{
     acquire_metadata_planning_lease, connector_default_to_column_default,
     connector_request_context, connector_request_context_for_execution,

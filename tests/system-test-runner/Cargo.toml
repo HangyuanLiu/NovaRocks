@@ -33,6 +33,7 @@ http = "1"
 mysql = "25.0.1"
 novarocks-cluster-harness = { path = "../cluster-harness" }
 novarocks-connector-iceberg = { path = "../../novarocks/connector/iceberg" }
+novarocks-fs = { path = "../../novarocks/fs" }
 novarocks-native-trust = { path = "../../novarocks/native-trust" }
 novarocks-proto-models = { path = "../../novarocks/proto-models" }
 novarocks-secret = { path = "../../novarocks/secret" }

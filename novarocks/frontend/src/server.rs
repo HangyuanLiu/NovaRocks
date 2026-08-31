@@ -1051,7 +1051,7 @@ mod tests {
             novarocks_spi::connector::ConnectorControlCreation::try_new(
                 &request,
                 binding,
-                Vec::new(),
+                request.properties().to_vec(),
             )
         }
     }

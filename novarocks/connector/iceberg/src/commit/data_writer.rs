@@ -1356,10 +1356,22 @@ fn unique_file_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use novarocks_connector_iceberg::iceberg::spec::{DataContentType, NestedField, Struct};
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::*;
+
+    fn local_test_binding() -> novarocks_connector_iceberg::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        novarocks_connector_iceberg::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     #[test]
     fn parquet_writer_properties_honor_iceberg_row_group_byte_limit() {
@@ -1999,7 +2011,7 @@ mod tests {
             .file_io(
                 novarocks_connector_iceberg::fs_io::build_file_io_for_location(
                     &file_io_location,
-                    None,
+                    local_test_binding(),
                 ),
             )
             .metadata(metadata)
@@ -2454,7 +2466,10 @@ mod tests {
                 novarocks_connector_iceberg::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
             )
             .file_io(
-                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(
+                    &location,
+                    local_test_binding(),
+                ),
             )
             .metadata(metadata)
             .build()
@@ -2599,7 +2614,10 @@ mod tests {
                     .unwrap(),
             )
             .file_io(
-                novarocks_connector_iceberg::fs_io::build_file_io_for_location(&location, None),
+                novarocks_connector_iceberg::fs_io::build_file_io_for_location(
+                    &location,
+                    local_test_binding(),
+                ),
             )
             .metadata(metadata)
             .build()

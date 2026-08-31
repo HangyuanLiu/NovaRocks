@@ -879,6 +879,7 @@ fn lineage_long_bound(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use crate::iceberg::TableIdent;
     use crate::iceberg::spec::{
@@ -886,8 +887,19 @@ mod tests {
         PrimitiveLiteral, Schema, SnapshotRetention, SortOrder, Struct, TableMetadataBuilder,
         Transform, Type,
     };
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::*;
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = tokio::runtime::Handle::current();
+        crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     const SNAPSHOT_ID: i64 = 100;
     const SNAPSHOT_SEQUENCE_NUMBER: i64 = 12;
@@ -1067,7 +1079,7 @@ mod tests {
         let location = format!("file://{}", dir.display());
         std::fs::create_dir_all(dir.join("metadata")).expect("metadata dir");
         let schema = test_schema();
-        let file_io = crate::fs_io::build_file_io_for_location(&location, None);
+        let file_io = crate::fs_io::build_file_io_for_location(&location, local_test_binding());
         let builder = TableMetadataBuilder::new(
             schema.clone(),
             PartitionSpec::unpartition_spec().into_unbound(),

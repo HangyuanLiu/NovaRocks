@@ -20,7 +20,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
-ENV_FILE="$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh"
+# A full CI run resolves this once before system scenarios create and remove
+# their isolated fixtures. Prefer that stable entry over the mutable `current`
+# symlink, while keeping the normal interactive default unchanged.
+ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
 
 SSB_VERSION="d006a6c49ff1a145a7d4ac7d837427627b213091"
 SSB_ARCHIVE_URL="https://github.com/greenlion/ssb-dbgen/archive/d006a6c49ff1a145a7d4ac7d837427627b213091.zip"
@@ -247,6 +250,8 @@ source_env() {
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
   : "${CATALOG_WAREHOUSE_URI:?missing CATALOG_WAREHOUSE_URI in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
+  : "${iceberg_object_store_credential_name:?missing iceberg_object_store_credential_name in $ENV_FILE}"
+  : "${iceberg_object_store_credential_generation:?missing iceberg_object_store_credential_generation in $ENV_FILE}"
   AWS_S3_ACCESS_KEY_ID="${AWS_S3_ACCESS_KEY_ID:-admin}"
   AWS_S3_SECRET_ACCESS_KEY="${AWS_S3_SECRET_ACCESS_KEY:-admin123}"
 }
@@ -332,10 +337,12 @@ PROPERTIES (
   "iceberg.catalog.type" = "hadoop",
   "iceberg.catalog.warehouse" = "$warehouse_uri",
   "aws.s3.endpoint" = "$AWS_S3_ENDPOINT",
-  "aws.s3.access_key" = "$AWS_S3_ACCESS_KEY_ID",
-  "aws.s3.secret_key" = "$AWS_S3_SECRET_ACCESS_KEY",
   "aws.s3.region" = "us-east-1",
-  "aws.s3.enable_path_style_access" = "true"
+  "aws.s3.enable_path_style_access" = "true",
+  "credential.object-store-data.consumer-role" = "frontend-and-backend",
+  "credential.object-store-data.mode" = "static",
+  "credential.object-store-data.name" = "$iceberg_object_store_credential_name",
+  "credential.object-store-data.generation" = "$iceberg_object_store_credential_generation"
 );
 EOF
 )

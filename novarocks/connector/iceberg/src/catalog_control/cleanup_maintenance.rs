@@ -33,7 +33,7 @@ use novarocks_spi::connector::{
     ConnectorCleanupOwnedRefIdentity, ConnectorCleanupOwnedRefSelection, ConnectorCleanupPlan,
     ConnectorCleanupPlanSummary, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProviderBindingKey,
-    PreparedBatch,
+    ConnectorRequestContext, PreparedBatch,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -269,13 +269,17 @@ impl IcebergCleanupMaintenanceAdapter {
         Ok(payload)
     }
 
-    fn table_file_io(&self, payload: &PlanPayload) -> Result<(FileIO, String), ConnectorError> {
+    fn table_file_io(
+        &self,
+        payload: &PlanPayload,
+        context: &ConnectorRequestContext,
+    ) -> Result<(FileIO, String), ConnectorError> {
         self.runtime
             .control_state()
             .invalidate_table(&payload.namespace, &payload.table);
         let physical = self
             .runtime
-            .load_table(&payload.namespace, &payload.table)
+            .load_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(unavailable)?;
         if physical.table.metadata().uuid().to_string() != payload.table_uuid {
             return Err(corrupt(
@@ -297,8 +301,9 @@ impl IcebergCleanupMaintenanceAdapter {
         &self,
         plan: &ConnectorCleanupPlan,
         payload: &PlanPayload,
+        context: &ConnectorRequestContext,
     ) -> Result<Vec<ManifestRecord>, ConnectorError> {
-        let (file_io, table_location) = self.table_file_io(payload)?;
+        let (file_io, table_location) = self.table_file_io(payload, context)?;
         let expected_prefix = format!(
             "{table_location}/_novarocks/maintenance/v4/orphan-cleanup/{}/",
             hex_encode(plan.operation_id().to_bytes())
@@ -320,6 +325,7 @@ impl IcebergCleanupMaintenanceAdapter {
         &self,
         plan: &ConnectorCleanupPlan,
         prepared: &PreparedBatch,
+        context: &ConnectorRequestContext,
     ) -> Result<(PlanPayload, Vec<ManifestRecord>), ConnectorError> {
         let payload = self.plan_payload(plan)?;
         let evidence: PreparedPayload =
@@ -334,7 +340,7 @@ impl IcebergCleanupMaintenanceAdapter {
         {
             return Err(corrupt("Iceberg cleanup prepared evidence is invalid"));
         }
-        let records = self.manifest(plan, &payload)?;
+        let records = self.manifest(plan, &payload, context)?;
         let start = evidence.first_ordinal as usize;
         let end = start
             .checked_add(evidence.record_count as usize)
@@ -354,8 +360,9 @@ impl IcebergCleanupMaintenanceAdapter {
         plan: &ConnectorCleanupPlan,
         prepared: &PreparedBatch,
         payload: &PlanPayload,
+        context: &ConnectorRequestContext,
     ) -> Result<Option<BatchReceipt>, ConnectorError> {
-        let (file_io, _) = self.table_file_io(payload)?;
+        let (file_io, _) = self.table_file_io(payload, context)?;
         let location = receipt_location(payload, prepared.batch_ordinal());
         let Some(bytes) = read_optional(&self.runtime, &file_io, &location, MAX_PART_BYTES * 2)?
         else {
@@ -387,8 +394,9 @@ impl IcebergCleanupMaintenanceAdapter {
         prepared: &PreparedBatch,
         payload: &PlanPayload,
         records: Vec<ReceiptRecord>,
+        context: &ConnectorRequestContext,
     ) -> Result<BatchReceipt, ConnectorError> {
-        let (file_io, _) = self.table_file_io(payload)?;
+        let (file_io, _) = self.table_file_io(payload, context)?;
         let location = receipt_location(payload, prepared.batch_ordinal());
         let bytes = canonical(&ReceiptArtifact {
             version: ARTIFACT_VERSION,
@@ -455,7 +463,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             .invalidate_table(&target.namespace, &target.table);
         let physical = self
             .runtime
-            .load_table(&target.namespace, &target.table)
+            .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?;
         let table = physical.table;
         let older_than_ms = request.operation().older_than_ms();
@@ -481,28 +489,25 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                 (CleanupPhase::OwnedRefRetire, owned_ref_records)
             } else if owned_ref_records.is_empty() {
                 let table_for_scan = table.clone();
-                let object_store = physical.object_store_config.clone();
+                let binding = self
+                    .runtime
+                    .resources()
+                    .planning_binding()
+                    .for_request(request.context.clone());
+                let scan_binding = binding.clone();
                 let scanned = self
                     .runtime
                     .resources()
                     .catalog_runtime()
                     .block_on(async move {
-                        collect_orphan_candidates(
-                            &table_for_scan,
-                            older_than_ms,
-                            object_store.as_ref(),
-                        )
-                        .await
+                        collect_orphan_candidates(&table_for_scan, older_than_ms, &scan_binding)
+                            .await
                     })
                     .map_err(unavailable)?
                     .map_err(unavailable)?;
                 (
                     CleanupPhase::ObjectSweep,
-                    records_from_candidates(
-                        &scanned,
-                        &table,
-                        physical.object_store_config.as_ref(),
-                    )?,
+                    records_from_candidates(&scanned, &table, &binding)?,
                 )
             } else {
                 (CleanupPhase::OwnedRefRetire, owned_ref_records)
@@ -585,7 +590,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         validate_context(&request.context)?;
         self.ensure_owner(request.plan.owner())?;
         let payload = self.plan_payload(&request.plan)?;
-        let records = self.manifest(&request.plan, &payload)?;
+        let records = self.manifest(&request.plan, &payload, &request.context)?;
         let start = request.batch_ordinal as usize * MAX_BATCH_OBJECTS;
         let end = (start + MAX_BATCH_OBJECTS).min(records.len());
         let batch = records
@@ -618,13 +623,21 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         request.plan.validate()?;
         validate_context(&request.context)?;
         self.ensure_owner(request.plan.owner())?;
-        let (payload, batch) = self.prepared_records(&request.plan, &request.prepared)?;
-        if let Some(receipt) = self.existing_receipt(&request.plan, &request.prepared, &payload)? {
+        let (payload, batch) =
+            self.prepared_records(&request.plan, &request.prepared, &request.context)?;
+        if let Some(receipt) =
+            self.existing_receipt(&request.plan, &request.prepared, &payload, &request.context)?
+        {
             return Ok(receipt);
         }
-        let config = self.runtime.control_state().object_store_config();
-        let outcomes = execute_frozen_batch(&self.runtime, &payload, &batch, config)?;
-        self.persist_receipt(&request.plan, &request.prepared, &payload, outcomes)
+        let outcomes = execute_frozen_batch(&self.runtime, &payload, &batch, &request.context)?;
+        self.persist_receipt(
+            &request.plan,
+            &request.prepared,
+            &payload,
+            outcomes,
+            &request.context,
+        )
     }
 
     fn read_candidate_page(
@@ -636,7 +649,7 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         self.ensure_owner(request.plan.owner())?;
         let payload = self.plan_payload(&request.plan)?;
         let table_uuid = table_uuid_from_payload(&payload)?;
-        let records = self.manifest(&request.plan, &payload)?;
+        let records = self.manifest(&request.plan, &payload, &request.context)?;
         let start = request.offset as usize;
         if start > records.len() {
             return Err(invalid("Iceberg cleanup page offset exceeds its manifest"));
@@ -668,10 +681,10 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
 fn records_from_candidates(
     files: &[ScannedFile],
     table: &crate::iceberg::table::Table,
-    config: Option<&novarocks_fs::ObjectStoreConfig>,
+    binding: &crate::access_binding::IcebergReadBinding,
 ) -> Result<Vec<ManifestRecord>, ConnectorError> {
     let supports_version =
-        crate::fs_io::resolve_access_for_location(table.metadata().location(), config)
+        crate::fs_io::resolve_access_for_location(table.metadata().location(), binding)
             .map_err(unavailable)?
             .operator()
             .info()
@@ -804,8 +817,12 @@ fn execute_frozen_batch(
     runtime: &IcebergMetadataContext,
     payload: &PlanPayload,
     batch: &[ManifestRecord],
-    config: Option<&novarocks_fs::ObjectStoreConfig>,
+    context: &ConnectorRequestContext,
 ) -> Result<Vec<ReceiptRecord>, ConnectorError> {
+    let binding = runtime
+        .resources()
+        .planning_binding()
+        .for_request(context.clone());
     batch
         .iter()
         .map(|record| match &record.candidate {
@@ -825,9 +842,10 @@ fn execute_frozen_batch(
                 *provenance_version,
                 provenance_digest_hex.as_deref(),
                 *created_at_ms,
+                context,
             ),
             ManifestCandidate::Object { location, identity } => {
-                let access = crate::fs_io::resolve_access_for_location(location, config)
+                let access = crate::fs_io::resolve_access_for_location(location, &binding)
                     .map_err(unavailable)?;
                 let path = access.single_relative_path().map_err(invalid)?.to_string();
                 let operator = access.operator();
@@ -891,12 +909,13 @@ fn execute_owned_ref(
     provenance_version: u16,
     provenance_digest_hex: Option<&str>,
     created_at_ms: i64,
+    context: &ConnectorRequestContext,
 ) -> Result<ReceiptRecord, ConnectorError> {
     runtime
         .control_state()
         .invalidate_table(&payload.namespace, &payload.table);
     let physical = runtime
-        .load_table(&payload.namespace, &payload.table)
+        .load_table_for_request(&payload.namespace, &payload.table, context)
         .map_err(unavailable)?;
     let expected = OwnedRefCandidate {
         name: name.to_string(),
@@ -920,15 +939,13 @@ fn execute_owned_ref(
         );
     }
     let catalog = runtime.novarocks_catalog().vendored_client();
-    let namespace = payload.namespace.clone();
-    let table = payload.table.clone();
+    let loaded_table = physical.table.clone();
     let table_uuid = payload.table_uuid.clone();
     let name = name.to_string();
     let outcome = runtime.resources().catalog_runtime().block_on(async move {
         crate::commit::drop_branch_if_exact(
             catalog.as_ref(),
-            &namespace,
-            &table,
+            &loaded_table,
             &table_uuid,
             &name,
             expected_head_snapshot_id,

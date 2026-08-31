@@ -48,7 +48,10 @@ use novarocks_frontend::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
 };
-use novarocks_fs::{FsAccessResolver, FsAccessResources, TokioFileIoRuntime, TokioFileTaskSpawner};
+use novarocks_fs::{
+    FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
+    TokioFileIoRuntime, TokioFileTaskSpawner,
+};
 use novarocks_spi::connector::{
     ConnectorControlFactory, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionInstaller, ConnectorProviderBindingKind, ConnectorRequestContext,
@@ -63,7 +66,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_spi::state_store::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
-use novarocks_types::NativeCompatibilityId;
+use novarocks_types::{ClusterRole, NativeCompatibilityId};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -421,6 +424,8 @@ pub fn compose_backend_server_config(
         .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
         .parse::<novarocks_types::NativeEndpoint>()
         .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
+    let iceberg_binding =
+        compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Be)?;
     Ok(BackendServerConfig {
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
@@ -471,15 +476,14 @@ pub fn compose_backend_server_config(
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
         catalog_runtime_materializers: compose_backend_catalog_runtime_materializers(
-            config,
-            runtime.clone(),
+            iceberg_binding.clone(),
         )?,
         read_execution_bundle_factories: compose_backend_read_execution_bundle_factories(
-            config,
-            runtime.clone(),
+            iceberg_binding.clone(),
         )?,
         write_execution_bundle_factories: compose_backend_write_execution_bundle_factories(
-            config, runtime,
+            iceberg_binding,
+            runtime,
         )?,
     })
 }
@@ -488,13 +492,13 @@ pub fn compose_backend_server_config(
 /// The materializers receive only credential-free frontend properties; all
 /// credentials and I/O resources remain in this startup composition path.
 pub fn compose_backend_catalog_runtime_materializers(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    iceberg_binding: IcebergReadBinding,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn novarocks_spi::connector::CatalogRuntimeMaterializer>>> {
-    let iceberg_resources = compose_iceberg_execution_resources(config, runtime)?;
     Ok(vec![
         std::sync::Arc::new(StarRocksCatalogRuntimeMaterializer),
-        std::sync::Arc::new(IcebergCatalogRuntimeMaterializer::new(iceberg_resources)),
+        std::sync::Arc::new(IcebergCatalogRuntimeMaterializer::from_binding(
+            iceberg_binding,
+        )),
     ])
 }
 
@@ -735,23 +739,25 @@ pub fn compose_frontend_control_factories(
     runtime: tokio::runtime::Handle,
     typed_control: std::sync::Arc<novarocks_frontend::ConnectorReadControlRegistry>,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlFactory>>> {
-    let planning_resources = compose_connector_file_planning_resources(config, runtime.clone())?;
+    let iceberg_binding =
+        compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
     // The installer runs only after the provider has built and validated its
     // complete control binding.  A registration failure therefore prevents a
     // binding from escaping without its matching read services and codec.
     let sink = std::sync::Arc::clone(&typed_control);
-    let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
-        IcebergReadBinding::from_resources(planning_resources),
-        runtime,
-    ))
-    .with_read_control_installer(std::sync::Arc::new(move |key, metadata, splits, codec| {
-        sink.install_read_control(
+    let factory =
+        IcebergConnectorFactory::new(IcebergMetadataResources::new(iceberg_binding, runtime))
+            .with_read_control_installer(std::sync::Arc::new(
+                move |key, metadata, splits, codec, request_factory| {
+                    sink.install_read_control(
             key,
             novarocks_frontend::connector::typed_control_registry::InstalledReadControl::new(
                 metadata, splits, codec,
-            ),
+            )
+            .with_request_factory(request_factory),
         )
-    }));
+                },
+            ));
     Ok(vec![std::sync::Arc::new(factory)])
 }
 
@@ -761,17 +767,13 @@ pub fn compose_frontend_control_factories(
 /// factory: a typed StarRocks scan must fail to resolve rather than reach a
 /// placeholder that would look like support.
 pub fn compose_backend_read_execution_bundle_factories(
-    config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
+    binding: IcebergReadBinding,
 ) -> anyhow::Result<
     Vec<(
         novarocks_spi::connector::ConnectorProviderBindingKind,
         std::sync::Arc<dyn novarocks_backend::ConnectorReadExecutionBundleFactory>,
     )>,
 > {
-    let binding = IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
-        config, runtime,
-    )?);
     let factory = std::sync::Arc::new(
         novarocks_connector_iceberg::typed_provider_factory::IcebergTypedProviderFactory::new(
             binding,
@@ -788,7 +790,7 @@ pub fn compose_backend_read_execution_bundle_factories(
 /// StarRocks contributes none because it has no native distributed writer
 /// contract; a request for one therefore fails closed during catalog lookup.
 pub fn compose_backend_write_execution_bundle_factories(
-    config: &NovaRocksConfig,
+    binding: IcebergReadBinding,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<
     Vec<(
@@ -796,11 +798,10 @@ pub fn compose_backend_write_execution_bundle_factories(
         std::sync::Arc<dyn novarocks_spi::connector::CatalogWriteExecutionBundleFactory>,
     )>,
 > {
-    let resources = compose_iceberg_execution_resources(config, runtime)?;
     let factory = std::sync::Arc::new(
         novarocks_connector_iceberg::IcebergCatalogWriteExecutionFactory::new(
-            resources.binding().clone(),
-            resources.runtime().clone(),
+            binding,
+            novarocks_connector_iceberg::resources::IcebergExecutionRuntime::new(runtime),
         ),
     );
     Ok(vec![(
@@ -813,27 +814,42 @@ pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    Ok(IcebergExecutionResources::new(
-        IcebergReadBinding::from_resources(compose_connector_file_planning_resources(
-            config,
-            runtime.clone(),
-        )?),
-        runtime,
+    let binding = compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Be)?;
+    Ok(IcebergExecutionResources::new(binding, runtime))
+}
+
+/// Build one process-local, credential-aware Iceberg access template. The
+/// template itself cannot perform I/O; every provider surface must bind it to
+/// the immutable credential-free `CatalogProperties` before accessing storage.
+fn compose_iceberg_access_template(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    role: ClusterRole,
+) -> anyhow::Result<IcebergReadBinding> {
+    let resolver: std::sync::Arc<
+        dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
+    > = std::sync::Arc::new(
+        config
+            .connector
+            .credential_registry(role)
+            .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?,
+    );
+    let resources = compose_connector_file_planning_resources(config, runtime)?;
+    Ok(IcebergReadBinding::with_static_credential_resolver(
+        resources, resolver,
     ))
 }
 
 pub fn compose_connector_file_planning_resources(
-    config: &NovaRocksConfig,
+    _config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FsAccessResources> {
-    let object_store = config
-        .connector
-        .object_store_config(&config.runtime.object_storage.retry_settings())
-        .map_err(|error| {
-            anyhow::anyhow!("resolve connector startup object-store binding: {error}")
-        })?;
+    let pool = std::sync::Arc::new(
+        ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
+            .map_err(|error| anyhow::anyhow!("construct object-store provider pool: {error}"))?,
+    );
     Ok(FsAccessResources::new(
-        object_store,
+        pool,
         FsAccessResolver::new(),
         std::sync::Arc::new(TokioFileIoRuntime::new(runtime.clone())),
         std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
@@ -921,34 +937,6 @@ mod tests {
                 )
                 .count(),
             1
-        );
-    }
-
-    #[test]
-    fn frontend_factory_resource_failure_is_reported_before_role_startup() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let mut config = crate::app_config::NovaRocksConfig::default();
-        config.connector.object_store = Some(crate::app_config::ConnectorObjectStoreConfig {
-            endpoint: Some("http://minio:9000".to_string()),
-            access_key_id: None,
-            access_key_secret: None,
-            region: None,
-            enable_path_style_access: Some(true),
-        });
-
-        let error = match compose_frontend_control_factories(
-            &config,
-            runtime.handle().clone(),
-            std::sync::Arc::new(novarocks_frontend::ConnectorReadControlRegistry::new()),
-        ) {
-            Ok(_) => panic!("incomplete frontend resources must fail before role startup"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("object-store credentials missing aws.s3.access_key"),
-            "{error}"
         );
     }
 }

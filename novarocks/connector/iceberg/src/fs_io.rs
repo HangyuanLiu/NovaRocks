@@ -29,7 +29,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme, ObjectStoreConfig};
+use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme};
+
+use crate::access_binding::IcebergReadBinding;
 
 #[derive(Clone, Debug)]
 pub struct IcebergFsAccess {
@@ -78,13 +80,13 @@ impl IcebergFsAccess {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IcebergFileSystemFactory {
     #[serde(skip, default)]
-    object_store_config: Option<ObjectStoreConfig>,
+    binding: Option<IcebergReadBinding>,
 }
 
 impl IcebergFileSystemFactory {
-    pub fn new(object_store_config: Option<ObjectStoreConfig>) -> Self {
+    pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
-            object_store_config,
+            binding: Some(binding),
         }
     }
 }
@@ -92,33 +94,42 @@ impl IcebergFileSystemFactory {
 #[typetag::serde]
 impl StorageFactory for IcebergFileSystemFactory {
     fn build(&self, _config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        Ok(Arc::new(IcebergFsStorage::new(
-            self.object_store_config.clone(),
-        )))
+        let binding = self.binding.clone().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Iceberg filesystem factory has no admitted storage capability",
+            )
+        })?;
+        Ok(Arc::new(IcebergFsStorage::new(binding)))
     }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct IcebergFsStorage {
     #[serde(skip, default)]
-    object_store_config: Option<ObjectStoreConfig>,
+    binding: Option<IcebergReadBinding>,
 }
 
 impl IcebergFsStorage {
-    pub fn new(object_store_config: Option<ObjectStoreConfig>) -> Self {
+    pub fn new(binding: IcebergReadBinding) -> Self {
         Self {
-            object_store_config,
+            binding: Some(binding),
         }
     }
 
     fn resolve_path(&self, operation: &str, path: &str) -> Result<(IcebergFsAccess, String)> {
-        let access =
-            resolve_access_for_location(path, self.object_store_config.as_ref()).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("fs {operation}({path}) resolve path: {e}"),
-                )
-            })?;
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "Iceberg filesystem storage has no admitted storage capability",
+            )
+        })?;
+        let access = IcebergFsAccess::new(binding.resolve_access(path).map_err(|error| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!("fs {operation}({path}) resolve path: {error}"),
+            )
+        })?);
         let relative_path = access.single_relative_path().map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -364,47 +375,41 @@ impl FileWrite for IcebergFsFileWrite {
     }
 }
 
-pub fn build_file_io_for_location(
-    location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
-) -> FileIO {
+pub fn build_file_io_for_location(location: &str, binding: IcebergReadBinding) -> FileIO {
     // FileIO construction is lazy: the SDK asks the storage to resolve paths
     // only when actual IO starts, so this helper stores credentials here and
     // leaves location validation to the per-operation FsAccessResolver call.
     let _ = location;
-    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(
-        object_store_config.cloned(),
-    )))
-    .build()
+    FileIOBuilder::new(Arc::new(IcebergFileSystemFactory::new(binding))).build()
 }
 
 pub fn build_storage_factory_for_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: IcebergReadBinding,
 ) -> Arc<dyn StorageFactory> {
     // StorageFactory construction is lazy for the same reason FileIO is: keep
     // credentials here and resolve concrete operators per IO call.
     let _ = location;
-    Arc::new(IcebergFileSystemFactory::new(object_store_config.cloned()))
+    Arc::new(IcebergFileSystemFactory::new(binding))
 }
 
 pub fn resolve_access_for_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<IcebergFsAccess, String> {
-    resolve_access_for_locations(std::iter::once(location), object_store_config)
+    resolve_access_for_locations(std::iter::once(location), binding)
 }
 
 pub fn resolve_access_for_locations<I, S>(
     locations: I,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<IcebergFsAccess, String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let handle = FsAccessResolver::new()
-        .resolve_locations(locations, object_store_config)
+    let handle = binding
+        .resolve_access_for_locations(locations)
         .map_err(|error| error.to_string())?;
     Ok(IcebergFsAccess::new(handle))
 }
@@ -449,14 +454,10 @@ pub fn format_resolved_location(
 
 pub fn reader_factory_for_table_location(
     location: &str,
-    object_store_config: Option<&ObjectStoreConfig>,
+    binding: &IcebergReadBinding,
 ) -> std::result::Result<FsAccessHandle, String> {
-    let resolver = FsAccessResolver::new();
-    let parsed = resolver
-        .parse_location(location)
-        .map_err(|e| format!("parse table fs location {location}: {e}"))?;
-    resolver
-        .resolve_location(parsed.original(), object_store_config)
+    binding
+        .resolve_access(location)
         .map_err(|error| error.to_string())
 }
 
@@ -473,11 +474,26 @@ pub fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String,
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::sync::Arc;
+
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::{
         build_file_io_for_location, format_resolved_location, resolve_access_for_location,
         resolve_access_for_locations,
     };
+
+    fn local_test_binding(
+        object_store_config: Option<novarocks_fs::ObjectStoreConfig>,
+        runtime: tokio::runtime::Handle,
+    ) -> crate::access_binding::IcebergReadBinding {
+        crate::access_binding::IcebergReadBinding::new(
+            object_store_config,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime)),
+        )
+    }
 
     fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {
         novarocks_fs::ObjectStoreConfig {
@@ -501,7 +517,10 @@ mod tests {
         let file_path = dir.path().join("metadata.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let output = file_io.new_output(&location).expect("output file");
         output
             .write(Bytes::from_static(b"iceberg metadata"))
@@ -519,7 +538,10 @@ mod tests {
         let file_path = dir.path().join("metadata").join("00000.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         file_io
             .new_output(&location)
             .expect("output file")
@@ -544,7 +566,10 @@ mod tests {
         let file_path = dir.path().join("writer").join("00000.json");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let mut writer = file_io
             .new_output(&location)
             .expect("output file")
@@ -575,7 +600,10 @@ mod tests {
         std::fs::write(&file_path, b"0123456789").expect("write data");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let reader = file_io
             .new_input(&location)
             .expect("input file")
@@ -593,7 +621,10 @@ mod tests {
         std::fs::write(&file_path, b"0123456789").expect("write data");
         let location = format!("file://{}", file_path.display());
 
-        let file_io = build_file_io_for_location(&location, None);
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let reader = file_io
             .new_input(&location)
             .expect("input file")
@@ -617,7 +648,10 @@ mod tests {
     #[tokio::test]
     async fn s3_file_io_without_credentials_fails_on_first_io() {
         let location = "s3://bucket/table/metadata.json";
-        let file_io = build_file_io_for_location(location, None);
+        let file_io = build_file_io_for_location(
+            location,
+            local_test_binding(None, tokio::runtime::Handle::current()),
+        );
         let input = file_io.new_input(location).expect("input file");
 
         let err = input
@@ -632,7 +666,7 @@ mod tests {
         );
         assert!(
             err.to_string()
-                .contains("object-store location requires object store config"),
+                .contains("object-store location has no admitted exact credential binding"),
             "{err}"
         );
     }
@@ -651,8 +685,10 @@ mod tests {
                 "oss://bucket/warehouse/table/data/a.parquet",
             ),
         ] {
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            let binding = local_test_binding(Some(cfg.clone()), runtime.handle().clone());
             let access =
-                resolve_access_for_location(location, Some(&cfg)).expect("resolve object store");
+                resolve_access_for_location(location, &binding).expect("resolve object store");
             let formatted =
                 format_resolved_location(access.handle(), "warehouse/table/data/a.parquet")
                     .expect("format location");
@@ -673,7 +709,9 @@ mod tests {
             format!("file://{}", second.display()),
         ];
 
-        let access = resolve_access_for_locations(locations.iter().map(String::as_str), None)
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = local_test_binding(None, runtime.handle().clone());
+        let access = resolve_access_for_locations(locations.iter().map(String::as_str), &binding)
             .expect("access");
 
         assert_eq!(
@@ -684,11 +722,13 @@ mod tests {
 
     #[test]
     fn object_store_without_credentials_returns_resolver_error() {
-        let err = resolve_access_for_location("s3://bucket/table/metadata.json", None)
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = local_test_binding(None, runtime.handle().clone());
+        let err = resolve_access_for_location("s3://bucket/table/metadata.json", &binding)
             .expect_err("missing object-store config should fail");
 
         assert!(
-            err.ends_with("object-store location requires object store config"),
+            err.ends_with("object-store location has no admitted exact credential binding"),
             "unexpected resolver error: {err}"
         );
     }

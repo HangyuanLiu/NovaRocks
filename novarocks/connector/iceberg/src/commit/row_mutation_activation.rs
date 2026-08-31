@@ -206,7 +206,7 @@ fn activate_iceberg_cow_row_mutation(
     selection.validate()?;
     let (rewrite_rows, append_ordinals) = iceberg_cow_selection_groups(preparation, selection)?;
     let touched_files = rewrite_rows.keys().cloned().collect::<BTreeSet<_>>();
-    let frozen = freeze_iceberg_cow_base(preparation, &touched_files, runtime)?;
+    let frozen = freeze_iceberg_cow_base(preparation, &touched_files, context, runtime)?;
     activate_iceberg_cow_row_mutation_from_frozen(
         preparation,
         selection,
@@ -907,6 +907,7 @@ fn iceberg_cow_selection_groups(
 fn freeze_iceberg_cow_base(
     preparation: &ConnectorRowMutationPreparation,
     touched_files: &BTreeSet<String>,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
     runtime: &IcebergMetadataContext,
 ) -> Result<IcebergFrozenCowBase, ConnectorError> {
     let table_payload: IcebergTablePayload =
@@ -964,7 +965,10 @@ fn freeze_iceberg_cow_base(
     })?;
     let file_io = crate::fs_io::build_file_io_for_location(
         metadata.location(),
-        runtime.resources().planning_binding().object_store_config(),
+        runtime
+            .resources()
+            .planning_binding()
+            .for_request(context.clone()),
     );
     let table = crate::iceberg::table::Table::builder()
         .identifier(identifier)

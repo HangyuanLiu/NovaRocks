@@ -83,6 +83,7 @@ pub struct MvRefreshPublishOutcome {
 
 pub async fn publish_staging_branch_to_main(
     catalog: &dyn Catalog,
+    loaded: &crate::iceberg::table::Table,
     plan: &MvRefreshPublishPlan,
 ) -> Result<MvRefreshPublishOutcome, String> {
     let expected_staging_branch = format!(
@@ -97,11 +98,13 @@ pub async fn publish_staging_branch_to_main(
     }
     let ident = TableIdent::from_strs([plan.namespace.as_str(), plan.table.as_str()])
         .map_err(|e| format!("iceberg mv publish: invalid table identifier: {e}"))?;
-    let table = catalog
-        .load_table(&ident)
-        .await
-        .map_err(|e| format!("iceberg mv publish: load table failed: {e}"))?;
-    let metadata = table.metadata();
+    if loaded.identifier() != &ident {
+        return Err(
+            "iceberg mv publish: request-scoped table identity does not match publish plan"
+                .to_string(),
+        );
+    }
+    let metadata = loaded.metadata();
     let main_snapshot = metadata
         .current_snapshot()
         .map(|snapshot| snapshot.snapshot_id());

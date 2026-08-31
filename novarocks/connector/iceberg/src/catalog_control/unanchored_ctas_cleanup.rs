@@ -80,23 +80,18 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                 "unanchored CTAS cleanup warehouse has no list/stat/delete prefix support",
             ));
         }
-        if !matches!(parsed.scheme(), FsScheme::Local) {
+        if !matches!(parsed.scheme(), FsScheme::Local)
+            && !runtime
+                .resources()
+                .planning_binding()
+                .requires_request_storage_resolver()
+        {
             let access = crate::fs_io::resolve_access_for_location(
                 warehouse,
-                runtime.control_state().object_store_config(),
+                runtime.resources().planning_binding(),
             )
             .map_err(unavailable)?;
-            let capability = access.operator().info().full_capability();
-            if !capability.list
-                || !capability.list_with_recursive
-                || !capability.stat
-                || !capability.read
-                || !capability.delete
-            {
-                return Err(unsupported(
-                    "unanchored CTAS cleanup warehouse lacks recursive list, stat, read, or exact-delete support",
-                ));
-            }
+            Self::validate_cleanup_capabilities(&access)?;
         }
         Ok(Self {
             descriptor,
@@ -145,15 +140,65 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         Ok(())
     }
 
-    fn file_io(&self) -> crate::iceberg::io::FileIO {
-        crate::fs_io::build_file_io_for_location(
-            self.warehouse_root(),
-            self.runtime.control_state().object_store_config(),
-        )
+    fn validate_cleanup_capabilities(
+        access: &crate::fs_io::IcebergFsAccess,
+    ) -> Result<(), ConnectorError> {
+        let capability = access.operator().info().full_capability();
+        if !capability.list
+            || !capability.list_with_recursive
+            || !capability.stat
+            || !capability.read
+            || !capability.delete
+        {
+            return Err(unsupported(
+                "unanchored CTAS cleanup warehouse lacks recursive list, stat, read, or exact-delete support",
+            ));
+        }
+        Ok(())
     }
 
-    fn read_optional(&self, location: &str) -> Result<Option<Bytes>, ConnectorError> {
-        let file_io = self.file_io();
+    fn action_access(
+        &self,
+        location: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<crate::fs_io::IcebergFsAccess, ConnectorError> {
+        let access = crate::fs_io::resolve_access_for_location(
+            location,
+            &self
+                .runtime
+                .resources()
+                .planning_binding()
+                .for_request(context.clone()),
+        )
+        .map_err(unavailable)?;
+        Self::validate_cleanup_capabilities(&access)?;
+        Ok(access)
+    }
+
+    fn file_io(
+        &self,
+        location: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<crate::iceberg::io::FileIO, ConnectorError> {
+        let parsed = FsLocation::parse(location).map_err(|error| unavailable(error.to_string()))?;
+        if !matches!(parsed.scheme(), FsScheme::Local) {
+            self.action_access(location, context)?;
+        }
+        Ok(crate::fs_io::build_file_io_for_location(
+            location,
+            self.runtime
+                .resources()
+                .planning_binding()
+                .for_request(context.clone()),
+        ))
+    }
+
+    fn read_optional(
+        &self,
+        location: &str,
+        context: &ConnectorRequestContext,
+    ) -> Result<Option<Bytes>, ConnectorError> {
+        let file_io = self.file_io(location, context)?;
         let input = file_io
             .new_input(location)
             .map_err(|error| unavailable(error.to_string()))?;
@@ -206,7 +251,10 @@ impl IcebergUnanchoredCtasCleanupAdapter {
         unanchored_ctas_provenance_location(&table)
     }
 
-    fn sidecar_locations(&self) -> Result<Vec<String>, ConnectorError> {
+    fn sidecar_locations(
+        &self,
+        context: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, ConnectorError> {
         let warehouse = self.warehouse_root();
         let root = format!("{warehouse}/{CTAS_STAGING_NAMESPACE}");
         let parsed = FsLocation::parse(&root).map_err(|error| unavailable(error.to_string()))?;
@@ -236,11 +284,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
                 Ok(locations)
             }
             FsScheme::ObjectStore | FsScheme::Hdfs => {
-                let access = crate::fs_io::resolve_access_for_location(
-                    &root,
-                    self.runtime.control_state().object_store_config(),
-                )
-                .map_err(unavailable)?;
+                let access = self.action_access(&root, context)?;
                 let path = access
                     .single_relative_path()
                     .map_err(unavailable)?
@@ -294,8 +338,8 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
         }
         self.validate_warehouse(&request.warehouse_root)?;
         let mut candidates = Vec::new();
-        for sidecar in self.sidecar_locations()? {
-            let Some(bytes) = self.read_optional(&sidecar)? else {
+        for sidecar in self.sidecar_locations(&context)? {
+            let Some(bytes) = self.read_optional(&sidecar, &context)? else {
                 continue;
             };
             let Ok(provenance) = decode_unanchored_ctas_provenance(&bytes) else {
@@ -331,7 +375,7 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
             return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
         }
         let sidecar = self.sidecar_for(request.provenance.publication_id)?;
-        let Some(bytes) = self.read_optional(&sidecar)? else {
+        let Some(bytes) = self.read_optional(&sidecar, &context)? else {
             return Ok(ConnectorCtasUnanchoredCleanupOutcome::Retained);
         };
         let Ok(observed) = decode_unanchored_ctas_provenance(&bytes) else {
@@ -362,7 +406,7 @@ impl ConnectorUnanchoredCtasCleanup for IcebergUnanchoredCtasCleanupAdapter {
             Err((kind, message)) => return Err(ConnectorError::new(kind, message)),
         }
         let root = self.root_for(observed.publication_id)?;
-        let file_io = self.file_io();
+        let file_io = self.file_io(&root, &context)?;
         let delete = self
             .runtime
             .resources()

@@ -207,6 +207,7 @@ pub(super) struct PreReadyAttemptGuard {
     control: Arc<AttemptControl>,
     registry_binding: Option<ActiveQueryAttemptBinding>,
     supervisor: Option<std::thread::JoinHandle<()>>,
+    credential_lease_supervisor: Option<std::thread::JoinHandle<()>>,
     armed: bool,
 }
 
@@ -219,12 +220,18 @@ impl PreReadyAttemptGuard {
             control,
             registry_binding: Some(registry_binding),
             supervisor: None,
+            credential_lease_supervisor: None,
             armed: true,
         }
     }
 
     fn start_supervisor(&mut self) {
         self.supervisor = Some(spawn_supervisor(&self.control));
+    }
+
+    fn start_credential_lease_supervisor(&mut self) {
+        self.credential_lease_supervisor =
+            super::lease::spawn_credential_lease_supervisor(&self.control);
     }
 
     fn into_lease(mut self) -> QueryLifecycleLease {
@@ -236,9 +243,11 @@ impl PreReadyAttemptGuard {
             .supervisor
             .take()
             .expect("pre-ready lifecycle supervisor");
+        let credential_lease_supervisor = self.credential_lease_supervisor.take();
         let lease = FrontendQueryLifecycleLeaseGuard::lease(
             Arc::clone(&self.control),
             supervisor,
+            credential_lease_supervisor,
             registry_binding,
         );
         self.armed = false;
@@ -340,6 +349,13 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         plan: QueryInitPlan,
     ) -> Result<QueryLifecycleLease, DistributedQueryError> {
         let materialized = materialize(plan)?;
+        if !materialized.credential_leases.is_empty()
+            && !self.transport.permits_confidential_credential_leases()
+        {
+            return Err(contract_error(
+                "vended credential lease admission requires TLS Native transport",
+            ));
+        }
         let execution_id = materialized.execution_id;
         let fragment_participants = materialized
             .participants
@@ -372,6 +388,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
         if let Some((topology, admission_revision)) = &self.backend_topology {
             control.install_backend_topology(Arc::clone(topology), *admission_revision);
         }
+        control.install_credential_leases(materialized.credential_leases)?;
         let ownership = materialized
             .participants
             .iter()
@@ -426,6 +443,10 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             let message = control.abort_before_ready(primary.message.clone());
             return Err(primary.into_error(message));
         }
+        if let Err(error) = control.scrub_confidential_init_material() {
+            let message = control.abort_before_ready(error.message().to_string());
+            return Err(DistributedQueryError::new(error.kind(), message));
+        }
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
         }
@@ -451,6 +472,7 @@ impl QueryInitBarrier for FrontendQueryLifecycleBarrier {
             let message = control.abort_before_ready(error.message().to_string());
             return Err(DistributedQueryError::new(error.kind(), message));
         }
+        pre_ready_guard.start_credential_lease_supervisor();
         if let Some(reason) = self.cancellation_message() {
             return Err(failed(control.abort_before_ready(reason)));
         }
