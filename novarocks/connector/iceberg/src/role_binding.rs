@@ -22,6 +22,7 @@
 //! definition and builds local, lazy reader and writer factories; it does not
 //! create a catalog client or contact REST, HMS, or object storage.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
@@ -49,11 +50,20 @@ use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
 #[derive(Clone)]
 pub struct IcebergControlRoleBindingFactory {
     resources: IcebergMetadataResources,
+    blocking_materialization_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl IcebergControlRoleBindingFactory {
-    pub fn new(resources: IcebergMetadataResources) -> Self {
-        Self { resources }
+    pub fn new(
+        resources: IcebergMetadataResources,
+        max_blocking_materializations: NonZeroUsize,
+    ) -> Self {
+        Self {
+            resources,
+            blocking_materialization_permits: Arc::new(tokio::sync::Semaphore::new(
+                max_blocking_materializations.get(),
+            )),
+        }
     }
 }
 
@@ -77,10 +87,24 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
     ) -> BoxFuture<'static, Result<ConnectorControlRoleBinding, ConnectorMaterializationError>>
     {
         let resources = self.resources.clone();
+        let permits = Arc::clone(&self.blocking_materialization_permits);
         Box::pin(async move {
+            context.check_active()?;
+            // `JoinHandle` drop cannot stop `spawn_blocking`. Move this permit
+            // into the closure so a timed-out attempt continues to occupy one
+            // bounded slot until its actual blocking work exits; retries can
+            // wait, but they cannot accumulate detached workers or sockets.
+            let permit = permits.acquire_owned().await.map_err(|_| {
+                ConnectorMaterializationError::new(
+                    ConnectorMaterializationErrorClass::Internal,
+                    ConnectorMaterializationRetryDisposition::Transient,
+                    "Iceberg control materialization limiter is closed",
+                )
+            })?;
             context.check_active()?;
             let worker_context = context.clone();
             let binding = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 materialize_control_blocking(resources, properties, worker_context)
             })
             .await
@@ -351,10 +375,10 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(tokio::runtime::Handle::current())),
             Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current())),
         );
-        let factory = IcebergControlRoleBindingFactory::new(IcebergMetadataResources::new(
-            access,
-            tokio::runtime::Handle::current(),
-        ));
+        let factory = IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(access, tokio::runtime::Handle::current()),
+            NonZeroUsize::new(1).expect("nonzero blocking materialization limit"),
+        );
         let catalog_properties = CatalogProperties::new(
             CatalogHandle::new(
                 ConnectorInstanceId::parse("catalog.iceberg").expect("catalog"),

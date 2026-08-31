@@ -70,7 +70,6 @@ impl ControlHostState {
                 )
             })
     }
-
 }
 
 // Design: ADR-0017 (docs/adr/ADR-0017-connector-catalog-mutation-outcomes.md)
@@ -285,30 +284,13 @@ impl ConnectorControlHost {
     ) -> Result<ConnectorControlReadBinding, ConnectorError> {
         let runtime_id = planning_lease.binding().control_runtime_id();
         let state = self.lock_state()?;
-        let generation = state.generations.get(&runtime_id).or_else(|| {
-            // Fixture and topology-replan callers can retain an independently
-            // constructed SPI lease for the same immutable desired-state
-            // generation. Production composition uses the direct runtime-id
-            // branch above; this exact-handle fallback still rejects an
-            // ambiguous or cross-version typed group.
-            let handle = planning_lease.binding().catalog_handle().ok()?;
-            let mut matching = state.generations.values().filter(|candidate| {
-                candidate
-                    .role_binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.properties().handle() == handle)
-            });
-            let first = matching.next()?;
-            matching.next().is_none().then_some(first)
-        }).ok_or_else(|| {
+        let generation = state.generations.get(&runtime_id).ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::NotFound,
                 "no complete typed control generation is installed for the planning lease's exact catalog handle",
             )
         })?;
-        if generation.binding.control_runtime_id() == runtime_id
-            && !Arc::ptr_eq(&generation.binding, planning_lease.binding())
-        {
+        if !Arc::ptr_eq(&generation.binding, planning_lease.binding()) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector control planning lease does not match the host generation",

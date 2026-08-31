@@ -326,6 +326,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
             .selector,
         novarocks_spi::connector::ConnectorReadSelector::Current
     );
+    let typed_control = fixture_control_role_host(&plan, &admission_controls);
 
     // A second registration stands for a catalog that moved on. The re-plan
     // must retain the table handle and exact planning lease stored above, so
@@ -345,7 +346,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
         &context,
         Some(&bindings),
         None,
-        &fixture_scan_preparation_options(fixture_control_role_host(&plan, &admission_controls)),
+        &fixture_scan_preparation_options(Arc::clone(&typed_control)),
         &[],
     )
     .expect("first preparation must use its admitted binding");
@@ -361,7 +362,7 @@ fn topology_only_replanning_reuses_the_first_admitted_current_binding() {
             None,
         )
         .with_typed_connector_control(
-            fixture_control_role_host(&plan, &admission_controls),
+            typed_control,
             novarocks_spi::connector::read_stack::ConnectorSession::try_new(
                 "fixture-query",
                 "fixture-user",

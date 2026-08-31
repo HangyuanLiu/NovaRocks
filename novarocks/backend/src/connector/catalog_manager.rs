@@ -471,13 +471,22 @@ impl<T> CatalogManager<T> {
             return Ok(runtime);
         }
 
-        self.acquire_provider_bind(cell.properties.provider_kind(), &active)?;
-        let materialized = if active() {
-            materialize(&cell.properties)
-        } else {
-            Err(cancelled_catalog_install_error())
+        let provider = cell.properties.provider_kind();
+        let materialized = match self.acquire_provider_bind(provider, &active) {
+            Ok(()) => {
+                let result = if active() {
+                    materialize(&cell.properties)
+                } else {
+                    Err(cancelled_catalog_install_error())
+                };
+                self.release_provider_bind(provider);
+                result
+            }
+            // The cell is already visible to other queries. Complete it even
+            // when cancellation wins while waiting for the provider limiter,
+            // otherwise followers can wait forever on Materializing.
+            Err(error) => Err(error),
         };
-        self.release_provider_bind(cell.properties.provider_kind());
         let materialized = if active() {
             materialized
         } else {
@@ -1145,6 +1154,48 @@ mod tests {
         first.join().expect("first bind").expect("first Ready");
         second.join().expect("second bind").expect("second Ready");
         assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cancelled_provider_limiter_waiter_completes_cell_for_a_later_retry() {
+        let manager = Arc::new(
+            CatalogManager::<usize>::try_new(CatalogManagerConfig {
+                provider_max_concurrent_binds: 1,
+                transient_retry_cooldown: Duration::ZERO,
+                ..CatalogManagerConfig::default()
+            })
+            .expect("valid manager"),
+        );
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let first_manager = Arc::clone(&manager);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let first = thread::spawn(move || {
+            first_manager.ensure(query(1), properties(1), |_| {
+                first_entered.wait();
+                first_release.wait();
+                Ok(1)
+            })
+        });
+        entered.wait();
+
+        let cancelled = manager.ensure_while(query(2), properties(2), || false, |_| Ok(2));
+        assert!(cancelled.is_err(), "cancelled limiter waiter must fail");
+        let retry_manager = Arc::clone(&manager);
+        let retry = thread::spawn(move || retry_manager.ensure(query(3), properties(2), |_| Ok(3)));
+        release.wait();
+        first
+            .join()
+            .expect("first limited bind thread")
+            .expect("first limited bind completes");
+        assert_eq!(
+            *retry
+                .join()
+                .expect("retry bind thread")
+                .expect("the cancelled cell must be retryable"),
+            3
+        );
     }
 
     #[test]

@@ -722,10 +722,12 @@ pub fn compose_frontend_control_role_factories(
     let iceberg_binding =
         compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
     Ok(vec![std::sync::Arc::new(
-        IcebergControlRoleBindingFactory::new(IcebergMetadataResources::new(
-            iceberg_binding,
-            runtime,
-        )),
+        IcebergControlRoleBindingFactory::new(
+            IcebergMetadataResources::new(iceberg_binding, runtime),
+            NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight).ok_or_else(
+                || anyhow::anyhow!("catalog materialization max inflight must be nonzero"),
+            )?,
+        ),
     )])
 }
 
