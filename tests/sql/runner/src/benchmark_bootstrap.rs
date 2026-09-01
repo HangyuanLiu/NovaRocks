@@ -427,8 +427,6 @@ fn validate_ensure_result(
 fn validate_fixture_error(error: FixtureError, resolved: &ResolvedBenchmarkDataset) -> Result<()> {
     const KNOWN_ERRORS: &[&str] = &[
         "ready_invalid",
-        "wait_timeout",
-        "lease_lost",
         "writer_failed",
         "publication_conflict",
         "publication_failed",

@@ -33,8 +33,8 @@ The wrapper builds `target/release/novarocks`, exports that path as
 arguments to select a different workload or location:
 
 ```bash
-tools/benchmark/run-sql-benchmark.sh --suite tpc-h
-tools/benchmark/run-sql-benchmark.sh --suite all --output-dir /tmp/novarocks-benchmarks
+tools/benchmark/run-sql-benchmark.sh --suite tpc-h --backend-count 2
+tools/benchmark/run-sql-benchmark.sh --suite all --backend-count 4 --output-dir /tmp/novarocks-benchmarks
 ```
 
 Generated reports are written to `reports/sql-benchmarks/` by default and are
@@ -42,6 +42,13 @@ ignored by Git. Each report records result verification, one warmup pass, five
 serial measured passes, and one profile pass per query. Benchmark data is the
 shared immutable fixture resolved by the runner; a missing fixture may be built
 once, while an invalid published fixture fails closed.
+
+The benchmark process always uses the cross-process harness. `--backend-count`
+selects the BE count for a run (default: one); scenario files do not set it.
+An external controller can pass `--controller-environment <JSON_OBJECT>` and
+`--comparison-key <KEY>`. Those values are copied to `run.json` and
+`SUMMARY.md`; the runner does not collect or enforce CPU, memory, or OS
+requirements. The controller owns cross-machine comparison policy.
 
 Add a baseline only after review. Keep the captured environment, fixture
 identity, exact revision, and comparison conclusion alongside any committed

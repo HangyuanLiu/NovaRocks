@@ -48,8 +48,7 @@ export iceberg_object_store_credential_generation="v1"
 export NOVAROCKS_SPARK_DEFAULTS="$spark_defaults"
 export NOVA_ENV_ID="ci-prepared"
 export NOVA_ENV_SHARED_BENCHMARK_ROOT="s3://novarocks/shared/benchmarks"
-export NOVA_ENV_BENCHMARK_LEASE_NAMESPACE="ci-prepared-rest"
-export NOVA_ENV_BENCHMARK_LEASE_IMAGE="docker.io/library/busybox@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213"
+export NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS="3600"
 EOF
 
 # There deliberately is no workspace/docker/iceberg-rest/runtime/current/env.sh.

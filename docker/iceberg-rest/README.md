@@ -37,9 +37,11 @@ config, and allocated NovaRocks standalone MySQL / gRPC ports.
 
 Standard SSB, TPC-H, and TPC-DS fixtures are different: they are immutable,
 versioned objects under `s3://novarocks/shared/benchmarks`, owned by this
-shared MinIO volume. The generated environment exports the exact shared root
-and Docker-scoped lease settings. A worktree may read a READY fixture but must
-never delete or mutate it through normal cleanup.
+shared MinIO volume. The generated environment exports the exact shared root.
+Concurrent first writers use separate staging prefixes and an atomic `READY`
+publication; no helper image or Docker lease container is needed. A worktree
+may read a READY fixture but must never delete or mutate it through normal
+cleanup.
 
 Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
 `NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose

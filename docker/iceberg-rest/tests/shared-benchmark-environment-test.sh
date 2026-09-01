@@ -75,10 +75,6 @@ NOVA_ENV_MINIO_CONSOLE_PORT=19101
 NOVA_ENV_REST_PORT=19181
 NOVA_ENV_SPARK_UI_PORT=19404
 NOVA_ENV_SHARED_BENCHMARK_ROOT=s3://novarocks/shared/benchmarks
-NOVA_ENV_BENCHMARK_LEASE_IMAGE=docker.io/library/busybox@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213
-NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS=1
-NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS=4
-NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS=8
 NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS=16
 EOF
 
@@ -111,10 +107,8 @@ done
 
 for env_file in "$env_a" "$env_b"; do
   grep -Fx 'export NOVA_ENV_SHARED_BENCHMARK_ROOT="s3://novarocks/shared/benchmarks"' "$env_file" >/dev/null
-  grep -Fx 'export NOVA_ENV_BENCHMARK_LEASE_NAMESPACE="nr-tst10-environment-test"' "$env_file" >/dev/null
-  grep -Fx 'export NOVA_ENV_BENCHMARK_LEASE_IMAGE="docker.io/library/busybox@sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213"' "$env_file" >/dev/null
-  grep -Fx 'export NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS="1"' "$env_file" >/dev/null
-  grep -Fx 'export NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS="4"' "$env_file" >/dev/null
+  grep -Fx 'export NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS="16"' "$env_file" >/dev/null
+  ! grep -q 'NOVA_ENV_BENCHMARK_LEASE' "$env_file"
 done
 
 if cmp -s "$env_a" "$env_b"; then
@@ -124,7 +118,8 @@ fi
 
 for manifest in "$runtime_a/manifest.json" "$runtime_b/manifest.json"; do
   grep -F '"shared_root": "s3://novarocks/shared/benchmarks"' "$manifest" >/dev/null
-  grep -F '"lease_namespace": "nr-tst10-environment-test"' "$manifest" >/dev/null
+  grep -F '"build_timeout_seconds": 16' "$manifest" >/dev/null
+  ! grep -q 'lease_' "$manifest"
 done
 for runner_config in "$runtime_a/sql-test.toml" "$runtime_b/sql-test.toml"; do
   grep -Fx 'benchmark_shared_root = "s3://novarocks/shared/benchmarks"' "$runner_config" >/dev/null

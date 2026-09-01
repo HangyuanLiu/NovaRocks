@@ -33,6 +33,7 @@ done
 cargo build --release -p novarocks-server
 export NOVAROCKS_BIN="$repo_root/target/release/novarocks"
 
+# Keep topology and controller metadata as caller-owned benchmark arguments.
 if [[ "$has_suite" == false ]]; then
   exec cargo run --release --manifest-path tests/sql/runner/Cargo.toml \
     --bin novarocks-sql-benchmark -- --suite ssb "$@"

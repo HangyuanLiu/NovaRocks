@@ -39,7 +39,7 @@ mod engine_error_codes;
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
     TestLane, build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
-    load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
+    load_runner_config, placeholder_variables_with_run_id, resolve_config_path, resolve_path,
     resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
 use crate::parser::load_suite_hook;
@@ -511,6 +511,26 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     benchmark_profile_dir: Option<String>,
 
+    /// Reuse a benchmark-owned cross-process cluster supplied through --host/--port.
+    #[arg(long, hide = true)]
+    benchmark_external_cluster: bool,
+
+    /// Skip the suite init hook for a later phase of one benchmark protocol.
+    #[arg(long, hide = true)]
+    benchmark_skip_init: bool,
+
+    /// Skip the suite cleanup hook until the last phase of one benchmark protocol.
+    #[arg(long, hide = true)]
+    benchmark_skip_cleanup: bool,
+
+    /// Run only the suite cleanup hook after an earlier benchmark phase failed.
+    #[arg(long, hide = true)]
+    benchmark_cleanup_only: bool,
+
+    /// Freeze suite placeholder identity across all phases of one benchmark workload.
+    #[arg(long, hide = true)]
+    benchmark_run_id: Option<String>,
+
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
     #[arg(short = 'j', long, default_value_t = 0)]
@@ -642,6 +662,9 @@ struct SuiteRunContext {
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     benchmark_profile_dir: Option<PathBuf>,
+    benchmark_skip_init: bool,
+    benchmark_skip_cleanup: bool,
+    benchmark_cleanup_only: bool,
 }
 
 struct CaseOutcome {
@@ -3359,7 +3382,9 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
     let fail_count = AtomicUsize::new(0);
 
     // --- suite init hook ---
-    if let Some(hook) = ps.init_hook.as_ref() {
+    if !ctx.benchmark_skip_init
+        && let Some(hook) = ps.init_hook.as_ref()
+    {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -3492,26 +3517,33 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
         }
     };
 
-    // Run parallel cases first
-    let mut outcomes: Vec<CaseOutcome> = parallel_cases
-        .par_iter()
-        .map(|case| {
+    let outcomes: Vec<CaseOutcome> = if ctx.benchmark_cleanup_only {
+        Vec::new()
+    } else {
+        // Run parallel cases first.
+        let mut outcomes: Vec<CaseOutcome> = parallel_cases
+            .par_iter()
+            .map(|case| {
+                let outcome = run_case(ctx, case, abort);
+                report_outcome(&outcome);
+                outcome
+            })
+            .collect();
+
+        // Then run sequential cases one by one.
+        for case in &sequential_cases {
             let outcome = run_case(ctx, case, abort);
             report_outcome(&outcome);
-            outcome
-        })
-        .collect();
-
-    // Then run sequential cases one by one
-    for case in &sequential_cases {
-        let outcome = run_case(ctx, case, abort);
-        report_outcome(&outcome);
-        outcomes.push(outcome);
-    }
+            outcomes.push(outcome);
+        }
+        outcomes
+    };
 
     // --- suite cleanup hook ---
     let mut cleanup_errors = Vec::new();
-    if let Some(hook) = ps.cleanup_hook.as_ref() {
+    if !ctx.benchmark_skip_cleanup
+        && let Some(hook) = ps.cleanup_hook.as_ref()
+    {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -4190,14 +4222,30 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     } else {
         selected_cluster_size
     };
-    let server_handle = launch_server(
-        launch_cluster_mode,
-        launch_cluster_size,
-        &base_dir,
-        &runner_config,
-        query_lifecycle_faults_enabled,
-        cleanup_faults_enabled,
-    )?;
+    let server_handle = if cli.benchmark_external_cluster {
+        if lane != TestLane::Benchmark || cli.host.is_none() || cli.port.is_none() {
+            bail!(
+                "benchmark external cluster reuse requires the benchmark lane and explicit --host/--port"
+            );
+        }
+        launch_server(
+            ClusterMode::AllInOne,
+            1,
+            &base_dir,
+            &runner_config,
+            false,
+            false,
+        )?
+    } else {
+        launch_server(
+            launch_cluster_mode,
+            launch_cluster_size,
+            &base_dir,
+            &runner_config,
+            query_lifecycle_faults_enabled,
+            cleanup_faults_enabled,
+        )?
+    };
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
     let server_handle = Arc::new(Mutex::new(server_handle));
@@ -4300,7 +4348,11 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 suite.sql_glob.clone()
             };
 
-            let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
+            let placeholder_vars = placeholder_variables_with_run_id(
+                &runner_config,
+                &suite.name,
+                cli.benchmark_run_id.as_deref(),
+            );
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -4650,6 +4702,9 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                     cli.benchmark_profile_dir.as_deref(),
                     &base_dir,
                 ),
+                benchmark_skip_init: cli.benchmark_skip_init,
+                benchmark_skip_cleanup: cli.benchmark_skip_cleanup,
+                benchmark_cleanup_only: cli.benchmark_cleanup_only,
             };
 
             prepared_suites.push(PreparedSuite {

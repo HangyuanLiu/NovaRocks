@@ -227,15 +227,18 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
     );
 }
 
-pub fn placeholder_variables(
+pub fn placeholder_variables_with_run_id(
     runner_config: &RunnerConfig,
     suite_name: &str,
+    run_id_override: Option<&str>,
 ) -> HashMap<String, String> {
-    let nanos = std::time::SystemTime::now()
+    let generated_run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let run_id = format!("sqlt_{:x}_{}", nanos, std::process::id());
+    let run_id = run_id_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("sqlt_{generated_run_id:x}_{}", std::process::id()));
 
     let mut variables = runner_config.values.clone();
     apply_suite_placeholder_defaults(&mut variables, suite_name);
@@ -646,7 +649,7 @@ oss_endpoint = "http://127.0.0.1:9000"
             "/tmp/novarocks-sql-test/${suite_uuid0}/${run_id}/".to_string(),
         );
 
-        let variables = placeholder_variables(&runner_config, "iceberg");
+        let variables = placeholder_variables_with_run_id(&runner_config, "iceberg", None);
         let warehouse = variables
             .get("iceberg_catalog_warehouse")
             .expect("warehouse");
@@ -658,6 +661,21 @@ oss_endpoint = "http://127.0.0.1:9000"
             &format!("/tmp/novarocks-sql-test/{suite_uuid0}/{run_id}/")
         );
         assert!(!warehouse.contains("${"));
+    }
+
+    #[test]
+    fn placeholder_variables_preserve_explicit_benchmark_run_identity() {
+        let variables = placeholder_variables_with_run_id(
+            &RunnerConfig::default(),
+            "ssb",
+            Some("sqlb_ssb_stable"),
+        );
+
+        assert_eq!(variables.get("run_id"), Some(&"sqlb_ssb_stable".to_string()));
+        assert_eq!(
+            variables.get("suite_uuid0"),
+            Some(&"sqlb_ssb_stable_0".to_string())
+        );
     }
 
     #[test]
