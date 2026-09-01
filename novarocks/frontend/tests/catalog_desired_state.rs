@@ -32,7 +32,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::state_store_fixture;
@@ -44,7 +44,7 @@ use novarocks_frontend::catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
     CatalogDropCommand, CatalogRuntimeProjection, FrontendCatalogApplicationPort,
 };
-use novarocks_frontend::catalog_attachment::CatalogAttachmentRepository;
+use novarocks_frontend::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_frontend::{
@@ -68,6 +68,7 @@ use novarocks_spi::state_store::{
     StateRecord, StateStore, StateStoreError, StateStoreErrorKind, StateStoreLimits,
     StateStoreMetricsSnapshot, StoreIdentity, TransactionId, WriteTransaction,
 };
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -153,10 +154,13 @@ impl ConnectorExecutionDistribution for TestControl {
     }
 }
 
-fn binding(instance_id: ConnectorInstanceId, incarnation: u8) -> ConnectorControlBinding {
+fn binding(
+    instance_id: ConnectorInstanceId,
+    incarnation: ProviderBindingEpoch,
+) -> ConnectorControlBinding {
     let provider = Arc::new(TestControl {
         instance_id,
-        incarnation: ProviderBindingEpoch::from_bytes([incarnation; 16]),
+        incarnation,
     });
     ConnectorControlBinding::try_new(
         ConnectorInstanceDescriptor {
@@ -178,22 +182,43 @@ fn binding(instance_id: ConnectorInstanceId, incarnation: u8) -> ConnectorContro
 /// fails, so a single-catalog failure scope can be observed alongside healthy
 /// catalogs in one frontend.
 struct SelectivelyFailingFactory {
-    incarnations: AtomicU8,
+    incarnations: AtomicU64,
     poisoned: Option<&'static str>,
+    hanging: Option<HangingCatalog>,
+}
+
+struct HangingCatalog {
+    name: &'static str,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 impl SelectivelyFailingFactory {
     fn ready() -> Self {
         Self {
-            incarnations: AtomicU8::new(0),
+            incarnations: AtomicU64::new(0),
             poisoned: None,
+            hanging: None,
         }
     }
 
     fn failing_for(catalog: &'static str) -> Self {
         Self {
-            incarnations: AtomicU8::new(0),
+            incarnations: AtomicU64::new(0),
             poisoned: Some(catalog),
+            hanging: None,
+        }
+    }
+
+    fn hanging_for(catalog: &'static str, entered: Arc<Notify>, release: Arc<Notify>) -> Self {
+        Self {
+            incarnations: AtomicU64::new(0),
+            poisoned: None,
+            hanging: Some(HangingCatalog {
+                name: catalog,
+                entered,
+                release,
+            }),
         }
     }
 }
@@ -231,8 +256,23 @@ impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for Selecti
         use futures::FutureExt;
 
         let poisoned = self.poisoned;
-        let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+        let hanging = self.hanging.as_ref().and_then(|hanging| {
+            (hanging.name == properties.handle().catalog_name().as_str())
+                .then(|| (Arc::clone(&hanging.entered), Arc::clone(&hanging.release)))
+        });
+        let sequence = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut incarnation = [0_u8; 16];
+        incarnation[8..].copy_from_slice(&sequence.to_be_bytes());
         async move {
+            if let Some((entered, release)) = hanging {
+                entered.notify_one();
+                release.notified().await;
+                return Err(novarocks_connector_binding::ConnectorMaterializationError::new(
+                    novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
+                    novarocks_connector_binding::ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
+                    "injected hanging provider materialization",
+                ));
+            }
             if poisoned == Some(properties.handle().catalog_name().as_str()) {
                 return Err(novarocks_connector_binding::ConnectorMaterializationError::new(
                     novarocks_connector_binding::ConnectorMaterializationErrorClass::Unavailable,
@@ -240,7 +280,10 @@ impl novarocks_connector_binding::ConnectorControlRoleBindingFactory for Selecti
                     "injected provider materialization failure",
                 ));
             }
-            let binding = binding(properties.handle().catalog_name().clone(), incarnation)
+            let binding = binding(
+                properties.handle().catalog_name().clone(),
+                ProviderBindingEpoch::from_bytes(incarnation),
+            )
                 .with_catalog_properties(properties.as_catalog_properties().clone())
                 .map_err(novarocks_connector_binding::ConnectorMaterializationError::from)?;
             novarocks_connector_binding::ConnectorControlRoleBinding::try_new(
@@ -397,6 +440,30 @@ async fn shutdown(mut host: novarocks_frontend::StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");
+}
+
+async fn seed_ready_catalogs(
+    repository: &CatalogAttachmentRepository,
+    count: usize,
+) -> Vec<String> {
+    let mut names = Vec::with_capacity(count);
+    for index in 0..count {
+        let name = format!("catalog.scale-{count}-{index:04}");
+        repository
+            .create(CatalogAttachment {
+                attachment_id: Uuid::now_v7(),
+                instance_id: catalog(&name),
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+                display_name: name.clone(),
+                durable_properties: vec![("type".to_string(), "iceberg".to_string())],
+                credential_bindings: Vec::new(),
+                created_at_ms: 1,
+            })
+            .await
+            .expect("seed desired catalog");
+        names.push(name);
+    }
+    names
 }
 
 // ---------------------------------------------------------------------------
@@ -681,6 +748,24 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
         .await
         .expect_err("an incomplete enumeration must block frontend bootstrap");
 
+    // A cold frontend has no local projection to preserve. It must still fail
+    // closed before scheduling any provider work from the incomplete source.
+    let (cold_control, cold_port) = port_with(
+        CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
+        SelectivelyFailingFactory::ready(),
+    );
+    controller(Arc::clone(&store), &cold_port)
+        .bootstrap()
+        .await
+        .expect_err("an incomplete enumeration must block a cold frontend too");
+    assert!(
+        matches!(
+            cold_port.admit_catalog(&catalog("catalog.analytics")),
+            CatalogAdmission::Absent
+        ),
+        "an incomplete enumeration must not schedule a partial projection on a cold frontend"
+    );
+
     assert_eq!(
         ready_attachment_id(&port, "catalog.analytics").await,
         admitted,
@@ -689,6 +774,8 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
     );
 
     drop(catalog_controller);
+    drop(cold_port);
+    drop(cold_control);
     drop(port);
     drop(_control);
     drop(repository);
@@ -776,6 +863,121 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
     drop(repository);
     drop(store);
     shutdown(host).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_submits_63_healthy_catalogs_without_waiting_for_one_hanging_provider() {
+    const HANGING: &str = "catalog.hang";
+    let host = state_store_fixture::open(format!(
+        "catalog-desired-state-bootstrap-liveness-{}",
+        Uuid::now_v7()
+    ))
+    .await;
+    let store = host.state_store().expect("test StateStore");
+    let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+        .await
+        .expect("open attachment repository");
+
+    // Seed desired state through the normal CREATE path, then rebuild a fresh
+    // frontend whose one provider attempt intentionally never completes.
+    let (seeding_control, seeding_port) = port_with(
+        CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
+        SelectivelyFailingFactory::ready(),
+    );
+    seeding_port
+        .create_catalog(create_command(HANGING))
+        .expect("seed hanging catalog");
+    let healthy = (1..=63)
+        .map(|index| format!("catalog.z{index:03}"))
+        .collect::<Vec<_>>();
+    for name in &healthy {
+        seeding_port
+            .create_catalog(create_command(name))
+            .expect("seed healthy catalog");
+    }
+    drop(seeding_port);
+    drop(seeding_control);
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let (_control, port) = port_with(
+        CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
+        SelectivelyFailingFactory::hanging_for(HANGING, Arc::clone(&entered), Arc::clone(&release)),
+    );
+    let mut projection_config = CatalogProjectionConfig::default();
+    projection_config.worker_count = 1;
+    let catalog_controller =
+        FrontendCatalogController::new(Arc::clone(&store), Arc::clone(&port), projection_config)
+            .expect("one-worker catalog controller");
+
+    // The provider is held on an explicit Notify gate. The timeout prevents a
+    // regression from hanging the test; it is not used to order successful
+    // work or to paper over a race with a sleep.
+    tokio::time::timeout(Duration::from_secs(1), catalog_controller.bootstrap())
+        .await
+        .expect("bootstrap must complete after scheduler ownership")
+        .expect("provider failure is local, not a bootstrap failure");
+    entered.notified().await;
+    for name in &healthy {
+        let _ = ready_attachment_id(&port, name).await;
+    }
+
+    // Release the fixture before teardown so no background task is left
+    // intentionally waiting after the test has observed liveness.
+    release.notify_waiters();
+
+    drop(catalog_controller);
+    drop(port);
+    drop(_control);
+    drop(repository);
+    drop(store);
+    shutdown(host).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
+    // These are the intentional cardinality boundaries for the bootstrap
+    // scheduler. The fixture's factory constructs bindings locally, so this
+    // characterizes submission/completeness without remote metadata latency.
+    for catalog_count in [1, 64, 256, 1024] {
+        let host = state_store_fixture::open(format!(
+            "catalog-desired-state-bootstrap-scale-{catalog_count}-{}",
+            Uuid::now_v7()
+        ))
+        .await;
+        let store = host.state_store().expect("test StateStore");
+        let repository = CatalogAttachmentRepository::open(Arc::clone(&store))
+            .await
+            .expect("open attachment repository");
+        let names = seed_ready_catalogs(&repository, catalog_count).await;
+        let (_control, port) = port_with(
+            CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
+            SelectivelyFailingFactory::ready(),
+        );
+        let mut projection_config = CatalogProjectionConfig::default();
+        projection_config.worker_count = 1;
+        let catalog_controller = FrontendCatalogController::new(
+            Arc::clone(&store),
+            Arc::clone(&port),
+            projection_config,
+        )
+        .expect("one-worker catalog controller");
+
+        catalog_controller
+            .bootstrap()
+            .await
+            .expect("complete no-I/O snapshot must submit successfully");
+        for name in &names {
+            let _ = ready_attachment_id(&port, name).await;
+        }
+
+        drop(catalog_controller);
+        drop(port);
+        drop(_control);
+        drop(repository);
+        drop(store);
+        shutdown(host).await;
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -33,12 +33,14 @@ from pathlib import Path
 
 MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
+BINDING = "novarocks-connector-binding"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
 FRONTEND = "novarocks-frontend"
 BACKEND = "novarocks-backend"
 SERVER = "novarocks-server"
 FAILPOINT = "novarocks-failpoint"
+STARROCKS = "novarocks-connector-starrocks"
 
 PROTO_INTERNAL_NORMAL_DEPENDENCIES = {MODELS, SPI, TYPES}
 ROLE_DIRECT_REQUIREMENTS = {MODELS, PROTO}
@@ -59,10 +61,12 @@ FORBIDDEN_CODEC_CLOSURE = {
     "novarocks-state-store-sqlite",
 }
 
-# These crates are below the generated/codec wire layer.  Unlike the Server
-# composition root, their *normal transitive closure* cannot acquire wire
-# crates.  Server is checked separately for direct dependencies because it
-# intentionally composes the FE and BE, whose closures contain wire crates.
+# These crates are below the generated/codec wire layer. Their *normal
+# transitive closure* cannot acquire wire crates. Server is checked separately
+# for direct dependencies because it intentionally composes the FE and BE,
+# whose closures contain wire crates. StarRocks is excluded deliberately:
+# its provider-owned role-binding factory depends on the generic binding
+# contract, but it still must not gain application ownership.
 LOWER_LAYER_ROOTS = {
     SPI,
     TYPES,
@@ -71,8 +75,9 @@ LOWER_LAYER_ROOTS = {
     "novarocks-state-store-foundationdb",
     "novarocks-state-store-mysql",
     "novarocks-state-store-sqlite",
-    "novarocks-connector-starrocks",
 }
+
+STARROCKS_FORBIDDEN_CLOSURE = {FRONTEND, BACKEND, SERVER}
 
 
 def fail(message):
@@ -226,6 +231,28 @@ def verify_lower_layer_closures(metadata):
             )
 
 
+def verify_starrocks_provider_boundary(metadata):
+    starrocks = package_by_name(metadata, STARROCKS)
+    direct = normal_dependency_names(starrocks, include_optional=False)
+    if BINDING not in direct:
+        fail(f"{STARROCKS} must directly declare normal dependency on {BINDING}")
+
+    declared_direct = normal_dependency_names(starrocks, include_optional=True)
+    direct_wire = sorted(declared_direct & WIRE_PACKAGES)
+    if direct_wire:
+        fail(
+            f"{STARROCKS} must obtain wire packages only through {BINDING}: "
+            + ", ".join(direct_wire)
+        )
+
+    forbidden = sorted(normal_closure(metadata, STARROCKS) & STARROCKS_FORBIDDEN_CLOSURE)
+    if forbidden:
+        fail(
+            f"{STARROCKS} normal dependency closure contains application owners: "
+            + ", ".join(forbidden)
+        )
+
+
 def verify_server_direct_dependencies(metadata):
     direct = normal_dependency_names(package_by_name(metadata, SERVER))
     forbidden = sorted(direct & WIRE_PACKAGES)
@@ -288,6 +315,7 @@ def main():
     verify_role_direct_dependencies(metadata)
     verify_codec_closures(metadata)
     verify_lower_layer_closures(metadata)
+    verify_starrocks_provider_boundary(metadata)
     verify_server_direct_dependencies(metadata)
     verify_failpoint_typed_closure(metadata)
     print("native wire dependency boundary: PASS")

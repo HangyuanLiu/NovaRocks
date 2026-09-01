@@ -50,6 +50,12 @@ LEGACY_PATHS = (
     "novarocks/frontend/src/connector/typed_control_registry.rs",
     "novarocks/backend/src/connector/typed_registry.rs",
 )
+STARROCKS_PROVIDER_FACTORY = "novarocks/connector/starrocks/src/role_binding.rs"
+SERVER_STARROCKS_FACTORY_ADAPTER = "novarocks-server/src/connector_role_binding.rs"
+REQUIRED_STARROCKS_FACTORY_MARKERS = (
+    "impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory",
+    "impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFactory",
+)
 LEGACY_MARKERS = (
     "InstalledReadControlRegistry",
     "resolve_read_control",
@@ -156,6 +162,24 @@ def verify_source(source_root):
             for marker in LEGACY_MARKERS:
                 if marker in text:
                     fail(f"{source.relative_to(source_root)} contains legacy marker {marker!r}")
+
+    provider_factory = source_root / STARROCKS_PROVIDER_FACTORY
+    if not provider_factory.exists():
+        fail(f"provider-owned StarRocks role-binding factory is missing: {STARROCKS_PROVIDER_FACTORY}")
+    provider_source = provider_factory.read_text()
+    for marker in REQUIRED_STARROCKS_FACTORY_MARKERS:
+        if marker not in provider_source:
+            fail(
+                "provider-owned StarRocks role-binding factory is incomplete: "
+                f"{STARROCKS_PROVIDER_FACTORY} lacks {marker!r}"
+            )
+
+    server_adapter = source_root / SERVER_STARROCKS_FACTORY_ADAPTER
+    if server_adapter.exists():
+        fail(
+            "Server must not define a parallel StarRocks role-binding factory adapter: "
+            f"{SERVER_STARROCKS_FACTORY_ADAPTER}"
+        )
 
 
 def main():

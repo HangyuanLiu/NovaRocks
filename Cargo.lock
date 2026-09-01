@@ -3461,6 +3461,7 @@ dependencies = [
  "atty",
  "bytes",
  "chrono",
+ "futures",
  "libc",
  "mysql",
  "novarocks-backend",

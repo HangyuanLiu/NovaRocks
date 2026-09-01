@@ -501,9 +501,9 @@ impl FrontendCatalogApplicationPort {
     }
 
     /// Reconciles one complete source snapshot and returns its exact identity
-    /// together with this process's materialization counts.  The source is
-    /// enumerated exactly once; callers must not reread it merely to publish
-    /// bootstrap observability.
+    /// together with this process's materialization counts at the submission
+    /// boundary. The source is enumerated exactly once; callers must not
+    /// reread it merely to publish bootstrap observability.
     pub(crate) async fn reconcile_snapshot_with_page_size(
         self: &Arc<Self>,
         page_size: usize,
@@ -538,35 +538,42 @@ impl FrontendCatalogApplicationPort {
         self.retire_projections_absent_from(source, &snapshot)
             .await?;
 
-        let mut workers = tokio::task::JoinSet::new();
+        // Design: ADR-0131 (docs/adr/ADR-0131-server-composes-provider-role-bindings.md)
+        // `worker_count` bounds the local submission fanout only. Each task
+        // returns as soon as its exact key is owned by the scheduler; provider
+        // materialization and any completion waiter remain background work.
+        let mut submissions = tokio::task::JoinSet::new();
         let mode = snapshot.mode();
         for entry in snapshot.clone().into_entries() {
-            if workers.len() >= worker_count {
-                let completed = workers.join_next().await.ok_or_else(|| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        "catalog projection worker exited unexpectedly",
-                    )
-                })?;
-                completed.map_err(|error| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        format!("catalog projection worker failed: {error}"),
-                    )
-                })?;
+            if submissions.len() >= worker_count {
+                Self::join_submission(&mut submissions).await?;
             }
             let projection = Arc::clone(self);
-            workers.spawn_blocking(move || projection.materialize_entry(entry, mode));
+            submissions.spawn(async move {
+                projection.materialize_entry(entry, mode);
+            });
         }
-        while let Some(completed) = workers.join_next().await {
-            completed.map_err(|error| {
-                CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Internal,
-                    format!("catalog projection worker failed: {error}"),
-                )
-            })?;
+        while !submissions.is_empty() {
+            Self::join_submission(&mut submissions).await?;
         }
         Ok((snapshot, self.projection_counts()))
+    }
+
+    async fn join_submission(
+        submissions: &mut tokio::task::JoinSet<()>,
+    ) -> Result<(), CatalogApplicationError> {
+        let completed = submissions.join_next().await.ok_or_else(|| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog projection submission task exited unexpectedly",
+            )
+        })?;
+        completed.map_err(|error| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                format!("catalog projection submission task failed: {error}"),
+            )
+        })
     }
 
     /// Retires every local projection the snapshot no longer declares.
@@ -620,6 +627,7 @@ impl FrontendCatalogApplicationPort {
         Ok(())
     }
 
+    #[cfg(test)]
     fn enqueue_materialization(
         self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
@@ -886,13 +894,10 @@ impl FrontendCatalogApplicationPort {
         }
     }
 
-    /// Materializes one located entry into a local runtime generation.
-    ///
-    /// Returns nothing on purpose. The entry exists only because a complete
-    /// enumeration produced it, so its provider failing says nothing about the
-    /// snapshot; giving this function a `Result` would let one broken catalog
-    /// abort the reconcile of every healthy one, which is the failure scope
-    /// this design exists to keep separate.
+    /// Submits one located entry to the keyed scheduler without waiting for
+    /// provider I/O. A complete desired-state snapshot is the bootstrap
+    /// authority; individual materialization outcomes update projections
+    /// asynchronously and cannot hold the frontend serving barrier closed.
     fn materialize_entry(
         self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
@@ -919,22 +924,29 @@ impl FrontendCatalogApplicationPort {
             return;
         }
 
-        if self
-            .enqueue_materialization(entry.clone(), mode)
-            .unwrap_or_else(|error| {
+        let (submitted, work) = match self.submit_materialization(entry.clone(), mode, None) {
+            Ok(result) => result,
+            Err(error) => {
                 self.mark_unavailable(&instance_id, attachment_id, &provider_id, error.to_string());
-                true
-            })
-        {
+                tracing::warn!(%error, catalog = instance_id.as_str(), "catalog remains unavailable after projection submission");
+                return;
+            }
+        };
+        if !submitted {
+            self.mark_unavailable(
+                &instance_id,
+                attachment_id,
+                &provider_id,
+                "connector control role factory is not installed",
+            );
             return;
         }
-
-        self.mark_unavailable(
-            &instance_id,
-            attachment_id,
-            &provider_id,
-            "connector control role factory is not installed",
-        );
+        if let Some(work) = work {
+            let projection = Arc::clone(self);
+            self.runtime.spawn(async move {
+                projection.run_materialization(work).await;
+            });
+        }
     }
 
     /// Stops all local admission before retiring existing leases. Durable
