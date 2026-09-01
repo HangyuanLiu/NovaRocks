@@ -501,9 +501,9 @@ impl FrontendCatalogApplicationPort {
     }
 
     /// Reconciles one complete source snapshot and returns its exact identity
-    /// together with this process's materialization counts.  The source is
-    /// enumerated exactly once; callers must not reread it merely to publish
-    /// bootstrap observability.
+    /// together with this process's materialization counts at the submission
+    /// boundary. The source is enumerated exactly once; callers must not
+    /// reread it merely to publish bootstrap observability.
     pub(crate) async fn reconcile_snapshot_with_page_size(
         self: &Arc<Self>,
         page_size: usize,
@@ -538,37 +538,42 @@ impl FrontendCatalogApplicationPort {
         self.retire_projections_absent_from(source, &snapshot)
             .await?;
 
-        let mut workers = tokio::task::JoinSet::new();
+        // Design: ADR-0131 (docs/adr/ADR-0131-server-composes-provider-role-bindings.md)
+        // `worker_count` bounds the local submission fanout only. Each task
+        // returns as soon as its exact key is owned by the scheduler; provider
+        // materialization and any completion waiter remain background work.
+        let mut submissions = tokio::task::JoinSet::new();
         let mode = snapshot.mode();
         for entry in snapshot.clone().into_entries() {
-            if workers.len() >= worker_count {
-                let completed = workers.join_next().await.ok_or_else(|| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        "catalog projection worker exited unexpectedly",
-                    )
-                })?;
-                completed.map_err(|error| {
-                    CatalogApplicationError::new(
-                        CatalogApplicationErrorKind::Internal,
-                        format!("catalog projection worker failed: {error}"),
-                    )
-                })?;
+            if submissions.len() >= worker_count {
+                Self::join_submission(&mut submissions).await?;
             }
             let projection = Arc::clone(self);
-            workers.spawn(async move {
-                projection.materialize_entry_and_wait(entry, mode).await;
+            submissions.spawn(async move {
+                projection.materialize_entry(entry, mode);
             });
         }
-        while let Some(completed) = workers.join_next().await {
-            completed.map_err(|error| {
-                CatalogApplicationError::new(
-                    CatalogApplicationErrorKind::Internal,
-                    format!("catalog projection worker failed: {error}"),
-                )
-            })?;
+        while !submissions.is_empty() {
+            Self::join_submission(&mut submissions).await?;
         }
         Ok((snapshot, self.projection_counts()))
+    }
+
+    async fn join_submission(
+        submissions: &mut tokio::task::JoinSet<()>,
+    ) -> Result<(), CatalogApplicationError> {
+        let completed = submissions.join_next().await.ok_or_else(|| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                "catalog projection submission task exited unexpectedly",
+            )
+        })?;
+        completed.map_err(|error| {
+            CatalogApplicationError::new(
+                CatalogApplicationErrorKind::Internal,
+                format!("catalog projection submission task failed: {error}"),
+            )
+        })
     }
 
     /// Retires every local projection the snapshot no longer declares.
@@ -731,27 +736,6 @@ impl FrontendCatalogApplicationPort {
         ))
     }
 
-    fn attach_completion_waiter(
-        &self,
-        key: &CatalogHandle,
-        token: u64,
-        completion: tokio::sync::oneshot::Sender<
-            Result<CatalogRuntimeObservation, CatalogApplicationError>,
-        >,
-    ) -> bool {
-        let Ok(mut attempts) = self.scheduler.attempts.lock() else {
-            return false;
-        };
-        let Some(attempt) = attempts.get_mut(key) else {
-            return false;
-        };
-        if attempt.token != token {
-            return false;
-        }
-        attempt.completion_waiters.push(completion);
-        true
-    }
-
     fn token_is_current(&self, key: &CatalogHandle, token: u64) -> bool {
         self.scheduler
             .attempts
@@ -910,15 +894,11 @@ impl FrontendCatalogApplicationPort {
         }
     }
 
-    /// Materializes one located entry into a local runtime generation and
-    /// waits for the first attempt to report success or failure.
-    ///
-    /// The provider task remains responsible for its own transient retries;
-    /// reconciliation only needs the first outcome to publish an accurate
-    /// ready/unavailable bootstrap snapshot. The entry exists only because a
-    /// complete enumeration produced it, so a provider failure says nothing
-    /// about the snapshot and must not abort unrelated catalog projections.
-    async fn materialize_entry_and_wait(
+    /// Submits one located entry to the keyed scheduler without waiting for
+    /// provider I/O. A complete desired-state snapshot is the bootstrap
+    /// authority; individual materialization outcomes update projections
+    /// asynchronously and cannot hold the frontend serving barrier closed.
+    fn materialize_entry(
         self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
         mode: CatalogDesiredStateSourceMode,
@@ -961,32 +941,11 @@ impl FrontendCatalogApplicationPort {
             );
             return;
         }
-
-        // Reconcile owns the bootstrap observation boundary. Only await a
-        // newly submitted attempt; an existing attempt may be a permanent
-        // definition failure retained as the exact-key suppression marker,
-        // or an already-running transient retry owned by another caller.
-        let Some(work) = work else { return };
-        let (completion, ticket) = tokio::sync::oneshot::channel();
-        if !self.attach_completion_waiter(&work.key, work.token, completion) {
-            return;
-        }
-        let projection = Arc::clone(self);
-        self.runtime.spawn(async move {
-            projection.run_materialization(work).await;
-        });
-
-        match ticket.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, catalog = instance_id.as_str(), "catalog remains unavailable after projection attempt");
-            }
-            Err(_) => {
-                tracing::debug!(
-                    catalog = instance_id.as_str(),
-                    "catalog projection attempt stopped before completion"
-                );
-            }
+        if let Some(work) = work {
+            let projection = Arc::clone(self);
+            self.runtime.spawn(async move {
+                projection.run_materialization(work).await;
+            });
         }
     }
 
