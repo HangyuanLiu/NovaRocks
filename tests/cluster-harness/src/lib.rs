@@ -3178,6 +3178,33 @@ impl CrossProcessServerHandle {
         .with_context(|| format!("read BE[{index}] terminal fallback accepted count"))
     }
 
+    /// Read one labelled connector-write counter from a live backend.
+    ///
+    /// The write data plane's observability is metrics, not log strings. A
+    /// backend's `tracing` output goes to its own log files rather than the
+    /// stdout this harness captures, and a scenario that grepped for a log line
+    /// would be asserting on a formatting detail rather than on a published
+    /// contract. `absent` reads as zero, so a scenario can assert that a writer
+    /// was never opened as naturally as it asserts that one was.
+    pub fn backend_connector_write_metric(
+        &self,
+        index: usize,
+        metric: &str,
+        label_name: &str,
+        label_value: &str,
+    ) -> Result<f64> {
+        self.ensure_be_index(index)?;
+        let metrics = scrape_prometheus_metrics(self.runtime.be[index].http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+        match prometheus_labeled_gauge(&metrics, metric, label_name, label_value) {
+            Ok(value) => Ok(value),
+            Err(_) if !metrics.lines().any(|line| line.starts_with(metric)) => Ok(0.0),
+            Err(error) => Err(error).with_context(|| {
+                format!("read BE[{index}] {metric}{{{label_name}=\"{label_value}\"}}")
+            }),
+        }
+    }
+
     /// Directory containing generated process config and captured logs.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
