@@ -133,16 +133,32 @@ pub enum ConnectorWriteSessionFlavor {
 
 /// How a publication's rows reach it.
 ///
-/// This is the branch structure the publication commits, not a tuning knob: a
-/// `Data` publication seals one unrouted data branch, while a `RowMutation`
-/// publication seals the branches a row mutation needs and must freeze the old
-/// delete artifacts those branches supersede.
+/// This is the branch structure the publication commits, not a tuning knob.
+/// The three shapes differ in whether SQL routes change events at all, and in
+/// what the commit must supersede.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectorManagedPublicationShape {
-    /// The publication replaces rows wholesale; SQL sends data rows.
+    /// The publication replaces rows wholesale; SQL sends data rows to one
+    /// unrouted branch, and there is no change event to route.
     Data,
-    /// The publication applies a change stream; SQL routes change events to the
-    /// branches the provider seals.
+    /// The publication applies a change stream that only ever inserts.
+    ///
+    /// It seals one data branch like [`Self::Data`], but a *routed* one, because
+    /// its rows arrive as change events and SQL's change-stream compile requires
+    /// every branch to declare which effects it accepts. Nothing is superseded,
+    /// so no delete artifact is frozen.
+    ///
+    /// This is a distinct shape rather than a flag on [`Self::Data`] because the
+    /// two produce different plans: one is compiled as an ordinary write, the
+    /// other through the change-stream router.
+    ///
+    /// Note what this does NOT do: an effect no branch accepts is dropped by the
+    /// router, not refused, so declaring only Insert does not make "no deletes
+    /// can appear" an enforced invariant. It remains the caller's precondition.
+    InsertOnlyChangeStream,
+    /// The publication applies a change stream that supersedes rows; SQL routes
+    /// change events to the branches the provider seals, and the session freezes
+    /// the old delete artifacts those branches supersede.
     RowMutation,
 }
 

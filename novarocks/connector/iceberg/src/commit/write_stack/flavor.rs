@@ -215,6 +215,43 @@ pub(crate) fn plan_managed_publication_branches(
                 route: None,
             }]
         }
+        ConnectorManagedPublicationShape::InsertOnlyChangeStream => {
+            // A full refresh republishes every row, so it has no change stream
+            // to apply -- the same reason the row-mutation shape refuses it.
+            if publication.technique() != ConnectorManagedPublicationTechnique::Incremental {
+                return Err(unsupported(
+                    "Iceberg full-refresh publication republishes rows and does not apply a change stream",
+                ));
+            }
+            // An insert-only change stream supersedes nothing, so it seals a
+            // data branch exactly like the ordinary publication shape. What it
+            // needs beyond that is the route: its rows arrive as change events,
+            // and SQL's change-stream compile requires every branch to declare
+            // which effects it accepts.
+            if ordinary_delete_branch(&material.input).is_some() {
+                return Err(unsupported(
+                    "Iceberg insert-only publication publishes data files, not a row-level delete input",
+                ));
+            }
+            let ordinals = InputOrdinals::of(&material.input);
+            let data_fields = material.input.fields();
+            let route = route_facts(
+                &material.table,
+                RouteKey::new(
+                    IcebergWriteFlavor::ManagedPublication,
+                    IcebergWriteBranch::Data,
+                    0,
+                ),
+                vec![ConnectorRowMutationEffect::Insert],
+                &ordinals,
+                data_fields.iter().copied(),
+                &[],
+            )?;
+            vec![IcebergWriteBranchPlan::Data {
+                plan: material.data_plan(material.input.clone()),
+                route: Some(route),
+            }]
+        }
         ConnectorManagedPublicationShape::RowMutation => {
             // A full refresh replaces every live row, so nothing it publishes
             // has a prior version for a change event to supersede. Applying a

@@ -1781,6 +1781,77 @@ fn a_change_stream_publication_seals_the_branches_a_row_mutation_needs() {
 }
 
 #[test]
+fn an_insert_only_publication_seals_one_routed_data_branch() {
+    // A fast-append incremental refresh sends its rows as change events, so the
+    // wholesale-republication shape leaves them nowhere to be routed: SQL's
+    // change-stream compile requires every branch to declare which effects it
+    // accepts, and that shape seals an unrouted branch.
+    let adapter = adapter("publication_insert_only", 11);
+    let plan = plan_managed_publication_branches(
+        &session_material(data_input_shape()),
+        publication_facts_with_shape(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+        ),
+    )
+    .expect("plan an insert-only publication");
+    assert_eq!(plan.flavor, IcebergWriteFlavor::ManagedPublication);
+
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(
+        handle.expected_targets(),
+        vec![ordinal(0)],
+        "an insert-only publication supersedes nothing, so it seals no delete branch"
+    );
+    assert_eq!(handle.branch_of(ordinal(0)), Some(IcebergWriteBranch::Data));
+
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(
+        effects(&sealed.targets()[0]),
+        vec![ConnectorRowMutationEffect::Insert],
+        "the branch accepts only Insert; nothing it could supersede reaches it"
+    );
+}
+
+#[test]
+fn an_insert_only_publication_commits_as_an_append() {
+    // It seals no delete branch, so there is no artifact retiring a prior row
+    // version and a plain append is the whole commit.
+    let (handle, _) = flavor_session(
+        plan_managed_publication_branches(
+            &session_material(data_input_shape()),
+            publication_facts_with_shape(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+            ),
+        )
+        .expect("plan an insert-only publication"),
+    );
+    assert_eq!(handle.commit_op_kind(), CommitOpKind::FastAppend);
+}
+
+#[test]
+fn a_full_refresh_is_refused_as_an_insert_only_change_stream() {
+    // A full refresh republishes every row, so it has no change stream to
+    // apply -- the same reason the row-mutation shape refuses it.
+    let error = plan_managed_publication_branches(
+        &session_material(data_input_shape()),
+        publication_facts_with_shape(
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+        ),
+    )
+    .expect_err("a full refresh applies no change stream");
+    assert!(
+        error.to_string().contains("does not apply a change stream"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
     // The technique alone stopped being enough once a publication could apply a
     // change stream. An incremental refresh that seals a delete branch publishes
