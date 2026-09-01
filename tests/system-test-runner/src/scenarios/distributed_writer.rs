@@ -125,7 +125,18 @@ impl Scenario for DistributedWriterDataflow {
             ))
             .context("create distributed writer table")?;
 
+        // This cluster is this scenario's own, and nothing has written to it
+        // yet. The check below relies on that: the root's prepared-set gauge is
+        // a per-attempt peak, so comparing it across two writes in one process
+        // would compare unrelated attempts. Assert the precondition rather than
+        // let a later second write silently turn the root check into a no-op.
         let before = all_write_counters(context)?;
+        if before
+            .iter()
+            .any(|counters| *counters != WriteCounters::default())
+        {
+            bail!("distributed writer scenario expected a cluster with no prior write: {before:?}");
+        }
 
         context.action("append through the distributed write dataflow");
         control
@@ -154,13 +165,12 @@ impl Scenario for DistributedWriterDataflow {
 
         // Exactly one backend aggregated. Two roots would each hold a partial
         // set and each believe it complete.
-        let roots = before
+        let roots = after
             .iter()
-            .zip(&after)
-            .filter(|(before, after)| after.root_peak_entries > before.root_peak_entries)
+            .filter(|counters| counters.root_peak_entries > 0.0)
             .count();
-        if roots > 1 {
-            bail!("distributed append aggregated on {roots} root backends; expected at most one");
+        if roots != 1 {
+            bail!("distributed append aggregated on {roots} root backends; expected exactly one");
         }
 
         // Every row a writer accepted is accounted for across the cluster.
