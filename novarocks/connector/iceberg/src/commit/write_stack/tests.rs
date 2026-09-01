@@ -33,7 +33,8 @@ use novarocks_fs::{
     FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteRouteFacts, ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
+    ConnectorWriteRouteFacts, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteRuntimeAdapter,
@@ -76,9 +77,10 @@ use crate::commit::write_stack::planning::{
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRuntime};
 use crate::commit::write_stack::test_support::{
     binding, copy_on_write_input_shape, data_branch_plan, data_input_shape, delete_branch_plan,
-    delete_input_shape, dv_artifact, merge_on_read_input_shape, merge_target, parquet_ref,
-    publication_facts, publication_facts_with_shape, publication_flavor, publication_id,
-    sample_metrics, sample_partition, session_material, table_facts,
+    delete_input_shape, dv_artifact, equality_delete_input_shape, equality_delete_recipe,
+    merge_on_read_input_shape, merge_target, parquet_ref, publication_facts,
+    publication_facts_with_shape, publication_flavor, publication_id, sample_metrics,
+    sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
@@ -680,13 +682,11 @@ fn a_delete_artifact_must_supersede_exactly_the_frozen_references() {
         &handle.expected_targets(),
     );
     let validated = validate_prepared_set(&handle, &adapter, &matching).expect("valid");
-    crate::commit::write_stack::control::validate_merged_old_references(
-        &handle, &frozen, &validated,
-    )
-    .expect("the artifact superseded exactly the frozen references");
+    crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
+        .expect("the artifact superseded exactly the frozen references");
 
-    // A writer that merged nothing must not be committed: the old deletes would
-    // silently disappear from the table.
+    // A writer that merged nothing must not be committed: the new artifact
+    // replaces the old ones, so the old deletes would silently disappear.
     let dropped = prepared(
         &adapter,
         vec![(
@@ -700,29 +700,40 @@ fn a_delete_artifact_must_supersede_exactly_the_frozen_references() {
         &handle.expected_targets(),
     );
     let validated = validate_prepared_set(&handle, &adapter, &dropped).expect("valid shape");
-    let error = crate::commit::write_stack::control::validate_merged_old_references(
-        &handle, &frozen, &validated,
-    )
-    .expect_err("dropped old references");
+    let error =
+        crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
+            .expect_err("dropped old references");
     assert!(
         error.message().contains("merged 0 old references"),
         "{}",
         error.message()
     );
+}
 
-    // A data file whose frozen references were never superseded at all is the
-    // same loss, seen from the other side.
-    let missing = prepared(&adapter, Vec::new(), &handle.expected_targets());
-    let validated = validate_prepared_set(&handle, &adapter, &missing).expect("valid shape");
-    let error = crate::commit::write_stack::control::validate_merged_old_references(
-        &handle, &frozen, &validated,
-    )
-    .expect_err("no artifact supersedes the frozen references");
+/// A statement that deletes from some data files and not others is the normal
+/// case, not a corrupt one.
+///
+/// The session freezes old-delete references for *every* data file of the base
+/// snapshot, because `begin_write` cannot know which files the predicate will
+/// match. A writer stages an artifact only for the files it actually deleted a
+/// row from, and the commit carries every untouched file's delete manifest
+/// through unchanged -- so an unsuperseded frozen reference is a file this
+/// statement did not touch, and nothing is lost by committing.
+#[test]
+fn a_frozen_data_file_this_statement_never_touched_is_not_an_error() {
+    let (handle, adapter) = dv_session();
+    let frozen = handle.frozen_old_references();
     assert!(
-        error.message().contains("staged no artifact"),
-        "{}",
-        error.message()
+        frozen[&ordinal(1)].contains_key("s3://b/wh/db/t/data/a.parquet"),
+        "the fixture must freeze at least one data file carrying an old delete"
     );
+
+    // Nothing staged at all: a DELETE whose predicate matched no row of any
+    // frozen file.
+    let untouched = prepared(&adapter, Vec::new(), &handle.expected_targets());
+    let validated = validate_prepared_set(&handle, &adapter, &untouched).expect("valid shape");
+    crate::commit::write_stack::control::validate_merged_old_references(&frozen, &validated)
+        .expect("an untouched frozen data file keeps its existing deletes");
 }
 
 #[test]
@@ -2482,5 +2493,52 @@ fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
     assert!(matches!(
         outcome,
         ExternalMutationOutcome::KnownCommitted { .. }
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Equality delete
+// ---------------------------------------------------------------------------
+
+/// `ALTER TABLE ... ADD EQUALITY DELETE` seals exactly one branch, and it is
+/// not a data branch.
+///
+/// The statement writes delete files and nothing else. A data branch beside
+/// them would give SQL somewhere to send rows the statement never produces, and
+/// the sink would then be bound to a target no writer ever feeds.
+#[test]
+fn an_equality_delete_session_seals_one_equality_branch_and_no_data_branch() {
+    let adapter = adapter("equality_delete", 1);
+    let mut material = session_material(equality_delete_input_shape());
+    material.equality = Some(equality_delete_recipe());
+
+    let plan = plan_ordinary_branches(IcebergWriteFlavor::EqualityDelete, &material)
+        .expect("plan an equality delete");
+    assert_eq!(plan.flavor, IcebergWriteFlavor::EqualityDelete);
+    assert_eq!(plan.branches.len(), 1);
+
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(
+        handle.branch_of(ordinal(0)),
+        Some(IcebergWriteBranch::EqualityDelete)
+    );
+    // It appends delete files rather than superseding a data file's deletes, so
+    // it commits as an ordinary row delta.
+    assert_eq!(handle.commit_op_kind(), CommitOpKind::RowDelta);
+    // And it froze no old-delete reference, because it supersedes nothing.
+    assert!(handle.frozen_old_references().is_empty());
+
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
+    assert!(sealed.targets()[0].route().is_none());
+}
+
+/// An equality delete supersedes no existing artifact, so the session must not
+/// pay for -- or freeze -- an old-delete merge.
+#[test]
+fn an_equality_delete_session_freezes_no_old_deletes() {
+    assert!(!session_freezes_old_deletes(
+        &ConnectorWriteSessionFlavor::Ordinary,
+        &equality_delete_input_shape(),
     ));
 }

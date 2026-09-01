@@ -27,9 +27,9 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergContentRange, IcebergDataBranchRecipe,
-    IcebergDeletionVectorArtifact, IcebergManagedPublicationFacts,
-    IcebergManagedPublicationProvenance, IcebergWriteBranch, IcebergWriteTableFacts,
-    IcebergWriterOutput,
+    IcebergDeletionVectorArtifact, IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
+    IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance, IcebergWriteBranch,
+    IcebergWriteTableFacts, IcebergWriterOutput,
 };
 use crate::commit::write_stack::flavor::IcebergSessionMaterial;
 use crate::commit::write_stack::old_delete::{
@@ -322,6 +322,7 @@ pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessio
         data_output: data.output,
         data_recipe: data.recipe,
         merge_targets: Vec::new(),
+        equality: None,
     }
 }
 
@@ -346,6 +347,29 @@ pub(crate) fn delete_input_shape(branch: IcebergWriteBranch) -> ConnectorWriteIn
             partition_source_fields: Vec::new(),
         },
     }
+}
+
+/// The `ALTER TABLE ... ADD EQUALITY DELETE` input: the match columns and
+/// nothing else.
+pub(crate) fn equality_delete_input_shape() -> ConnectorWriteInputShape {
+    ConnectorWriteInputShape::EqualityDelete {
+        equality_fields: vec![binding("k1", 1, DataType::Int64)],
+    }
+}
+
+/// The match key `begin_write` resolves against the frozen schema, as branch
+/// planning receives it.
+pub(crate) fn equality_delete_recipe() -> IcebergEqualityDeleteRecipe {
+    IcebergEqualityDeleteRecipe::try_new(vec![
+        IcebergEqualityDeleteColumnFacts::try_new(
+            "k1".to_string(),
+            1,
+            format!("{:?}", DataType::Int64),
+            true,
+        )
+        .expect("equality column"),
+    ])
+    .expect("equality recipe")
 }
 
 pub(crate) fn data_branch_plan() -> IcebergDataBranchPlan {

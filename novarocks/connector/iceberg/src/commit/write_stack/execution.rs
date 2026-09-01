@@ -52,8 +52,8 @@ use crate::commit::report::{IcebergPartitionReport, partition_path_from_struct};
 use crate::commit::write_io::build_staged_file_io;
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitFragment, IcebergContentRange,
-    IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergPositionDeleteFileArtifact,
-    IcebergWriteBranch, IcebergWriterHandle,
+    IcebergDataFileArtifact, IcebergDeletionVectorArtifact, IcebergEqualityDeleteFileArtifact,
+    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriterHandle,
 };
 use crate::commit::write_stack::old_delete::read_and_merge_old_deletes;
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
@@ -117,6 +117,9 @@ impl ConnectorWriteExecution for IcebergWriteStackExecution {
             IcebergWriteBranch::PositionDelete | IcebergWriteBranch::DeletionVector => Ok(
                 Box::new(IcebergDeleteStackWriter::open(self, handle, request)?),
             ),
+            IcebergWriteBranch::EqualityDelete => Ok(Box::new(
+                IcebergEqualityDeleteStackWriter::open(self, handle, request)?,
+            )),
         }
     }
 }
@@ -725,10 +728,13 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
                 IcebergWriteBranch::PositionDelete => {
                     self.stage_position_delete(&data_file, &positions, merged_references)?
                 }
-                IcebergWriteBranch::Data => {
+                IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
                     return Err(error(
                         ConnectorErrorKind::CorruptData,
-                        "Iceberg delete writer opened on the data branch",
+                        format!(
+                            "Iceberg position-delete writer opened on the {} branch",
+                            self.handle.branch().as_str()
+                        ),
                     ));
                 }
             };
@@ -740,6 +746,203 @@ impl ConnectorBatchWriter for IcebergDeleteStackWriter {
     fn abort(&mut self) -> Result<(), ConnectorError> {
         self.pending.clear();
         self.cleanup()?;
+        self.terminal = true;
+        Ok(())
+    }
+}
+
+/// The per-driver equality-delete writer.
+///
+/// It is a separate writer from the position-delete one because the two share
+/// nothing but the word "delete": this one reads no old artifact, owns no data
+/// file, and stages a Parquet file whose rows *are* the match key. Its Arrow
+/// types come from the fragment's own frozen input schema; the handle carries
+/// only the field ids and the type rendering the frontend signed, and a
+/// disagreement between them is a refusal rather than a coercion.
+struct IcebergEqualityDeleteStackWriter {
+    adapter: IcebergWriteAdapter,
+    runtime: IcebergExecutionRuntime,
+    handle: IcebergWriterHandle,
+    request_context: ConnectorRequestContext,
+    file_io: crate::iceberg::io::FileIO,
+    staging_dir: String,
+    columns: Vec<crate::commit::EqualityDeleteColumn>,
+    equality_field_ids: Vec<i32>,
+    partition: IcebergArtifactPartition,
+    fragments: Vec<ConnectorCommitFragment>,
+    staged_paths: Vec<String>,
+    terminal: bool,
+}
+
+impl IcebergEqualityDeleteStackWriter {
+    fn open(
+        execution: &IcebergWriteStackExecution,
+        handle: IcebergWriterHandle,
+        request: ConnectorOpenWriterRequest,
+    ) -> Result<Self, ConnectorError> {
+        let recipe = handle.equality().ok_or_else(|| {
+            error(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg equality-delete writer handle carries no equality recipe",
+            )
+        })?;
+        let columns = resolve_equality_columns(recipe, &request.expected_schema)?;
+        let equality_field_ids = recipe.field_ids();
+        let binding = execution.binding.for_request(request.context.clone());
+        let file_io = build_staged_file_io(&binding, handle.table().data_location())
+            .map_err(|message| error(ConnectorErrorKind::InvalidRequest, message))?;
+        // One directory per query attempt, the same shape every other writer
+        // stages into, so an abort has one prefix to clean.
+        let staging_dir = format!(
+            "{}/_staging/{}",
+            handle.table().data_location().trim_end_matches('/'),
+            uuid::Uuid::from_bytes(request.physical.execution_query_id())
+        );
+        // An equality delete is admitted only on an unpartitioned table, so its
+        // artifact carries the empty partition of the table's default spec. The
+        // frontend still decodes that descriptor against the real metadata at
+        // commit, which is what makes the emptiness checked rather than assumed.
+        let partition = IcebergArtifactPartition::try_new(
+            String::new(),
+            String::new(),
+            handle.table().default_partition_spec_id(),
+            crate::write_descriptor::IcebergPartitionDescriptor { values: Vec::new() },
+        )?;
+        Ok(Self {
+            adapter: execution.adapter.clone(),
+            runtime: execution.runtime.clone(),
+            handle,
+            request_context: request.context,
+            file_io,
+            staging_dir,
+            columns,
+            equality_field_ids,
+            partition,
+            fragments: Vec::new(),
+            staged_paths: Vec::new(),
+            terminal: false,
+        })
+    }
+
+    fn cleanup(&mut self) -> Result<(), ConnectorError> {
+        if self.staged_paths.is_empty() {
+            return Ok(());
+        }
+        let paths = std::mem::take(&mut self.staged_paths);
+        let file_io = self.file_io.clone();
+        self.runtime
+            .block_on(async move {
+                for path in &paths {
+                    file_io.delete(path).await.map_err(|delete_error| {
+                        format!(
+                            "cleanup staged Iceberg equality-delete file {path}: {delete_error}"
+                        )
+                    })?;
+                }
+                Ok::<(), String>(())
+            })
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))
+    }
+}
+
+/// Bind the frozen match key to the Arrow types the fragment actually carries.
+///
+/// The handle names the columns and their field ids; the fragment's expected
+/// schema is the only place a real Arrow type exists on this side. Requiring
+/// them to agree exactly is what keeps an Arrow value off the FE/BE boundary
+/// without letting a writer invent a type.
+fn resolve_equality_columns(
+    recipe: &crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe,
+    expected_schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<crate::commit::EqualityDeleteColumn>, ConnectorError> {
+    if recipe.columns().len() != expected_schema.fields().len() {
+        return Err(error(
+            ConnectorErrorKind::InvalidRequest,
+            format!(
+                "Iceberg equality-delete handle names {} columns but its fragment input carries {}",
+                recipe.columns().len(),
+                expected_schema.fields().len()
+            ),
+        ));
+    }
+    recipe
+        .columns()
+        .iter()
+        .zip(expected_schema.fields())
+        .map(|(frozen, actual)| {
+            if frozen.name() != actual.name().as_str()
+                || frozen.data_type() != format!("{:?}", actual.data_type())
+                || frozen.nullable() != actual.is_nullable()
+            {
+                return Err(error(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "Iceberg equality-delete column `{}` does not match fragment input `{}`",
+                        frozen.name(),
+                        actual.name()
+                    ),
+                ));
+            }
+            Ok(crate::commit::EqualityDeleteColumn {
+                name: frozen.name().to_string(),
+                field_id: frozen.field_id(),
+                data_type: actual.data_type().clone(),
+                nullable: actual.is_nullable(),
+            })
+        })
+        .collect()
+}
+
+impl ConnectorBatchWriter for IcebergEqualityDeleteStackWriter {
+    fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
+        ensure_live(self.terminal, &self.request_context, "equality-delete")?;
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let written = self
+            .runtime
+            .block_on(crate::commit::write_equality_delete_file(
+                &self.file_io,
+                &self.staging_dir,
+                self.handle.table().default_partition_spec_id(),
+                self.columns.clone(),
+                batch,
+            ))
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?
+            .map_err(|message| error(ConnectorErrorKind::Internal, message))?;
+        let Some(written) = written else {
+            return Ok(());
+        };
+        self.staged_paths.push(written.path.clone());
+        let metrics = IcebergArtifactMetrics::try_new(
+            written.record_count,
+            written.file_size_in_bytes,
+            Vec::new(),
+            None,
+        )?;
+        let artifact = IcebergEqualityDeleteFileArtifact::try_new(
+            written.path,
+            self.partition.clone(),
+            metrics,
+            self.equality_field_ids.clone(),
+        )?;
+        self.fragments.push(
+            self.adapter
+                .wrap_commit_fragment(IcebergCommitFragment::equality_delete_file(artifact)),
+        );
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<Vec<ConnectorCommitFragment>, ConnectorError> {
+        ensure_live(self.terminal, &self.request_context, "equality-delete")?;
+        self.terminal = true;
+        Ok(std::mem::take(&mut self.fragments))
+    }
+
+    fn abort(&mut self) -> Result<(), ConnectorError> {
+        self.cleanup()?;
+        self.fragments.clear();
         self.terminal = true;
         Ok(())
     }

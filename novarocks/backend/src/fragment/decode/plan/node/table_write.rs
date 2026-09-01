@@ -35,6 +35,7 @@
 //! structural carrier validator and nothing else: no commit handle, no control
 //! binding, and no way to turn a fragment into a provider value.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -315,11 +316,15 @@ pub(super) fn lower_table_finish_node(
     // this only fires when a plan places them together. When it does, a writer
     // naming a target the finish node never expects is a self-contradictory
     // plan, not a runtime surprise.
-    let highest = expected.iter().map(|target| target.get()).max();
-    if let Some(highest) = highest {
+    //
+    // Membership is an exact set test: a query's expected set is the targets
+    // *this query's* writers feed and need not be dense from zero, so comparing
+    // against the highest ordinal would admit a target no writer here compiles.
+    let sealed = expected.iter().copied().collect::<BTreeSet<_>>();
+    if !sealed.is_empty() {
         let mut offender = None;
         for child in &node.children {
-            collect_out_of_set_writer(child, highest, &mut offender);
+            collect_out_of_set_writer(child, &sealed, &mut offender);
         }
         if let Some((writer_node_id, ordinal)) = offender {
             return Err(NativeFragmentDecodeError::inconsistent(
@@ -368,20 +373,21 @@ pub(super) fn lower_table_finish_node(
 /// dense set bounded by `highest`.
 fn collect_out_of_set_writer(
     node: &plan::DistributedNode,
-    highest: u32,
+    sealed: &BTreeSet<WriteTargetOrdinal>,
     offender: &mut Option<(i32, u32)>,
 ) {
     if offender.is_some() {
         return;
     }
     if let Some(plan::distributed_node::Payload::TableWriter(writer)) = node.payload.as_ref()
-        && writer.write_target_ordinal > highest
+        && !WriteTargetOrdinal::try_new(writer.write_target_ordinal)
+            .is_ok_and(|ordinal| sealed.contains(&ordinal))
     {
         *offender = Some((node.node_id, writer.write_target_ordinal));
         return;
     }
     for child in &node.children {
-        collect_out_of_set_writer(child, highest, offender);
+        collect_out_of_set_writer(child, sealed, offender);
     }
 }
 
@@ -650,7 +656,8 @@ mod tests {
         };
         assert_eq!(finish.inputs.len(), 2);
         assert_eq!(finish.expected_targets().len(), 1);
-        assert_eq!(finish.highest_expected_ordinal(), 0);
+        assert!(finish.accepts_target(WriteTargetOrdinal::try_new(0).expect("bounded ordinal")));
+        assert!(!finish.accepts_target(WriteTargetOrdinal::try_new(1).expect("bounded ordinal")));
         assert_eq!(
             decoded.output_schema,
             novarocks_execution::exec::node::table_write_relation::root_relation_chunk_schema()
@@ -749,15 +756,52 @@ mod tests {
     }
 
     #[test]
-    fn a_finish_node_with_sparse_expected_ordinals_is_refused() {
-        let node = finish_node(40, vec![0, 2], vec![simple_writer_plan(writer_payload())]);
+    fn a_finish_node_with_repeated_expected_ordinals_is_refused() {
+        let mut writer = writer_payload();
+        writer.write_target_ordinal = 1;
+        let node = finish_node(40, vec![1, 1], vec![simple_writer_plan(writer)]);
         let error = decode_error(&node);
         assert_protocol(
             &error,
             "plan_fragment.root.payload.table_finish.expected_target_ordinals",
             ProtocolErrorKind::InvalidValue,
         );
-        assert!(error.contains("dense"), "unexpected detail: {error}");
+        assert!(error.contains("repeats"), "unexpected detail: {error}");
+    }
+
+    /// A query set is the targets *this query's* writers feed, so it need not
+    /// be dense from zero: a copy-on-write statement compiles one writer per
+    /// query, at that group's own ordinal. Denseness stays a property of the
+    /// session's sealed set, checked where the session is sealed.
+    #[test]
+    fn a_finish_node_with_a_single_non_zero_expected_ordinal_decodes() {
+        let mut writer = writer_payload();
+        writer.write_target_ordinal = 2;
+        let node = finish_node(40, vec![2], vec![simple_writer_plan(writer)]);
+        let decoded = decode_with(&node, recording_execution()).expect("table finish decodes");
+        let ExecNodeKind::TableFinish(finish) = &decoded.node.kind else {
+            panic!("expected a table finish, got {:?}", decoded.node.kind);
+        };
+        assert!(finish.accepts_target(WriteTargetOrdinal::try_new(2).expect("bounded ordinal")));
+        // Exact membership, not a bound: ordinal 0 is below the highest
+        // expected one and is still not part of this query's set.
+        assert!(!finish.accepts_target(WriteTargetOrdinal::try_new(0).expect("bounded ordinal")));
+    }
+
+    /// A writer below the highest expected ordinal but outside the set is still
+    /// a self-contradictory plan.
+    #[test]
+    fn a_writer_below_the_highest_expected_ordinal_but_outside_the_set_is_refused() {
+        let mut writer = writer_payload();
+        writer.write_target_ordinal = 0;
+        let node = finish_node(40, vec![2], vec![simple_writer_plan(writer)]);
+        let error = decode_error(&node);
+        assert_protocol(
+            &error,
+            "plan_fragment.root.payload.table_finish.expected_target_ordinals",
+            ProtocolErrorKind::InconsistentFields,
+        );
+        assert!(error.contains("outside"), "unexpected detail: {error}");
     }
 
     #[test]

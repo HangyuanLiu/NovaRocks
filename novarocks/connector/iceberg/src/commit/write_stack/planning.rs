@@ -42,10 +42,10 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
-    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput,
-    IcebergManagedPublicationFacts, IcebergSealedWriteTarget, IcebergSessionFacts,
-    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteTableFacts,
-    IcebergWriterHandle, IcebergWriterOutput, invalid,
+    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergEqualityDeleteRecipe,
+    IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts, IcebergSealedWriteTarget,
+    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 
@@ -150,6 +150,18 @@ pub struct IcebergDeleteBranchPlan {
     pub input: ConnectorWriteInputShape,
 }
 
+/// An equality-delete branch: it appends delete files matched on column values.
+///
+/// It owns no data file and freezes no old-delete reference, which is exactly
+/// what separates it from [`IcebergDeleteBranchPlan`]: an equality delete
+/// supersedes nothing and merges nothing.
+#[derive(Clone, Debug)]
+pub struct IcebergEqualityDeleteBranchPlan {
+    pub output: IcebergWriterOutput,
+    pub recipe: IcebergEqualityDeleteRecipe,
+    pub input: ConnectorWriteInputShape,
+}
+
 /// Everything `begin_write` freezes before it seals a session.
 #[derive(Clone, Debug)]
 pub struct IcebergWriteSessionPlanInput {
@@ -181,6 +193,10 @@ pub enum IcebergWriteBranchPlan {
         plan: IcebergDeleteBranchPlan,
         route: Option<ConnectorWriteRouteFacts>,
     },
+    EqualityDelete {
+        plan: IcebergEqualityDeleteBranchPlan,
+        route: Option<ConnectorWriteRouteFacts>,
+    },
 }
 
 impl IcebergWriteBranchPlan {
@@ -188,12 +204,15 @@ impl IcebergWriteBranchPlan {
         match self {
             Self::Data { .. } => IcebergWriteBranch::Data,
             Self::Delete { plan, .. } => plan.branch,
+            Self::EqualityDelete { .. } => IcebergWriteBranch::EqualityDelete,
         }
     }
 
     fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         match self {
-            Self::Data { route, .. } | Self::Delete { route, .. } => route.as_ref(),
+            Self::Data { route, .. }
+            | Self::Delete { route, .. }
+            | Self::EqualityDelete { route, .. } => route.as_ref(),
         }
     }
 
@@ -201,6 +220,7 @@ impl IcebergWriteBranchPlan {
         match self {
             Self::Data { plan, .. } => &plan.input,
             Self::Delete { plan, .. } => &plan.input,
+            Self::EqualityDelete { plan, .. } => &plan.input,
         }
     }
 
@@ -208,7 +228,9 @@ impl IcebergWriteBranchPlan {
     /// exact old delete references it must supersede for each one.
     fn owned_data_files(&self) -> BTreeMap<String, Vec<String>> {
         match self {
-            Self::Data { .. } => BTreeMap::new(),
+            // An equality delete names no data file at all, so it owns no
+            // old-delete merge for the same reason a data branch does not.
+            Self::Data { .. } | Self::EqualityDelete { .. } => BTreeMap::new(),
             Self::Delete { plan, .. } => plan
                 .merge_targets
                 .iter()
@@ -240,6 +262,11 @@ impl IcebergWriteBranchPlan {
                 table.clone(),
                 plan.output.clone(),
                 plan.merge_targets.clone(),
+            ),
+            Self::EqualityDelete { plan, .. } => IcebergWriterHandle::try_new_equality_delete(
+                table.clone(),
+                plan.output.clone(),
+                plan.recipe.clone(),
             ),
         }
     }

@@ -51,12 +51,14 @@ use sha2::{Digest, Sha256};
 
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
-    IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts,
-    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteTableFacts, IcebergWriterOutput, invalid,
+    IcebergDataBranchRecipe, IcebergEqualityDeleteRecipe, IcebergFrozenRewriteBranchInput,
+    IcebergManagedPublicationFacts, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteTableFacts,
+    IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::commit::write_stack::planning::{
-    IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergWriteBranchPlan,
+    IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergEqualityDeleteBranchPlan,
+    IcebergWriteBranchPlan,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::distributed_rewrite::IcebergFrozenRewriteGroupV1;
@@ -89,6 +91,10 @@ pub(crate) struct IcebergSessionMaterial {
     /// The exact old delete artifacts a delete branch must supersede. Frozen by
     /// reference only: `begin_write` never opens one.
     pub merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    /// The match key an equality-delete branch writes its file on. Present
+    /// exactly when the signed input is an equality delete, because only then
+    /// is there a branch to attach it to.
+    pub equality: Option<IcebergEqualityDeleteRecipe>,
 }
 
 impl IcebergSessionMaterial {
@@ -122,9 +128,13 @@ fn delete_branch_format(branch: IcebergWriteBranch) -> Result<IcebergFileFormat,
     match branch {
         IcebergWriteBranch::DeletionVector => Ok(IcebergFileFormat::Puffin),
         IcebergWriteBranch::PositionDelete => Ok(IcebergFileFormat::Parquet),
-        IcebergWriteBranch::Data => Err(invalid(
-            "Iceberg data branch cannot be planned as a delete branch",
-        )),
+        // An equality delete is planned by `plan_equality_delete_branches`: it
+        // owns no old-delete merge, so it is not a position-delete branch even
+        // though both write delete files.
+        IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => Err(invalid(format!(
+            "Iceberg {} branch cannot be planned as a position-delete branch",
+            branch.as_str()
+        ))),
     }
 }
 
@@ -154,6 +164,15 @@ pub(crate) fn plan_ordinary_branches(
     flavor: IcebergWriteFlavor,
     material: &IcebergSessionMaterial,
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
+    // An equality delete writes delete files and nothing else, so it is the one
+    // ordinary shape with no data branch at all. Sealing one beside it would
+    // give SQL somewhere to send data rows the statement never produces.
+    if matches!(
+        material.input,
+        ConnectorWriteInputShape::EqualityDelete { .. }
+    ) {
+        return plan_equality_delete_branches(flavor, material);
+    }
     let mut branches = vec![IcebergWriteBranchPlan::Data {
         plan: material.data_plan(material.input.clone()),
         route: None,
@@ -170,6 +189,38 @@ pub(crate) fn plan_ordinary_branches(
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
         branches,
+    })
+}
+
+/// Plan the one branch an equality delete seals.
+///
+/// The match key was resolved against the frozen table generation by
+/// `begin_write`, because it needs the Iceberg schema to turn a column name into
+/// a field id. Here it is only attached to the branch that writes it.
+fn plan_equality_delete_branches(
+    flavor: IcebergWriteFlavor,
+    material: &IcebergSessionMaterial,
+) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
+    let recipe = material.equality.clone().ok_or_else(|| {
+        invalid("Iceberg equality-delete session has no frozen equality match key")
+    })?;
+    Ok(IcebergSessionFlavorPlan {
+        flavor,
+        publication: None,
+        rewrite_inputs: Vec::new(),
+        copy_on_write: Vec::new(),
+        branches: vec![IcebergWriteBranchPlan::EqualityDelete {
+            plan: IcebergEqualityDeleteBranchPlan {
+                output: IcebergWriterOutput::try_new(
+                    IcebergFileFormat::Parquet,
+                    parquet::basic::Compression::SNAPPY,
+                    None,
+                )?,
+                recipe,
+                input: material.input.clone(),
+            },
+            route: None,
+        }],
     })
 }
 

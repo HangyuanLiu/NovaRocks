@@ -280,8 +280,18 @@ pub(crate) fn validate_prepared_set<'a>(
 /// This is the commit-side half of the D10 contract: the backend proved it read
 /// the frozen references, and the frontend proves the artifact it is about to
 /// commit accounts for all of them.
+///
+/// The check runs over the *staged* artifacts, never over the frozen map. The
+/// frozen map is a superset by construction: `freeze_old_delete_references`
+/// walks every data file of the base snapshot, because at `begin_write` the
+/// frontend cannot know which of them the statement's predicate will match. A
+/// merge-on-read writer stages a delete artifact only for the data files it
+/// actually deleted a row from, and the commit action carries every other data
+/// file's delete manifest through verbatim, so a frozen data file with no
+/// staged artifact keeps its existing deletes rather than losing them.
+/// Demanding one artifact per frozen data file would therefore refuse every
+/// `DELETE` that does not happen to touch the whole table.
 pub(crate) fn validate_merged_old_references(
-    handle: &IcebergCommitHandle,
     plans: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
     validated: &[ValidatedFragment<'_>],
 ) -> Result<(), ConnectorError> {
@@ -307,24 +317,6 @@ pub(crate) fn validate_merged_old_references(
             )));
         }
     }
-    // A data file whose frozen references were never merged means its writer
-    // never ran; committing the others would silently drop old deletes.
-    let staged = validated
-        .iter()
-        .filter_map(|entry| entry.fragment.referenced_data_file())
-        .collect::<BTreeSet<_>>();
-    for (ordinal, files) in plans {
-        for (data_file, references) in files {
-            if !references.is_empty() && !staged.contains(data_file.as_str()) {
-                return Err(corrupt(format!(
-                    "Iceberg write target {} froze {} old delete references for data file {data_file} but staged no artifact that supersedes them",
-                    ordinal.get(),
-                    references.len()
-                )));
-            }
-        }
-    }
-    let _ = handle;
     Ok(())
 }
 
@@ -347,6 +339,7 @@ fn written_file_from_fragment(
         content_offset,
         content_size,
         cardinality,
+        equality_ids,
     ) = match fragment.artifact() {
         IcebergCommitArtifact::DataFile(file) => (
             DataFileFormat::Parquet,
@@ -356,11 +349,13 @@ fn written_file_from_fragment(
             None,
             None,
             None,
+            None,
         ),
         IcebergCommitArtifact::PositionDeleteFile(file) => (
             DataFileFormat::Parquet,
             DataContentType::PositionDeletes,
             Some(file.referenced_data_file().to_string()),
+            None,
             None,
             None,
             None,
@@ -374,6 +369,20 @@ fn written_file_from_fragment(
             Some(file.content_range().offset()),
             Some(file.content_range().size_in_bytes()),
             Some(file.cardinality()),
+            None,
+        ),
+        // An equality delete names no data file: Iceberg matches it against
+        // every row whose equality-column values agree, so the manifest carries
+        // the field ids instead of a referenced path.
+        IcebergCommitArtifact::EqualityDeleteFile(file) => (
+            DataFileFormat::Parquet,
+            DataContentType::EqualityDeletes,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(file.equality_field_ids().to_vec()),
         ),
     };
     Ok(WrittenFile {
@@ -393,7 +402,7 @@ fn written_file_from_fragment(
         upper_bounds: decode_bounds(&stats.upper_bounds, metadata)?,
         key_metadata: None,
         referenced_data_file,
-        equality_ids: None,
+        equality_ids,
         first_row_id,
         content_offset,
         content_size_in_bytes: content_size,
@@ -618,7 +627,7 @@ impl IcebergWriteSessionControl {
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         validate_context(context)?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
-        validate_merged_old_references(handle, frozen_old_references, &validated)?;
+        validate_merged_old_references(frozen_old_references, &validated)?;
 
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
@@ -688,7 +697,7 @@ impl IcebergWriteSessionControl {
             internal("Iceberg staged write session lost its frozen target metadata")
         })?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
-        validate_merged_old_references(handle, frozen_old_references, &validated)?;
+        validate_merged_old_references(frozen_old_references, &validated)?;
 
         // Claim the single terminal attempt before producing anything, so a
         // second finish cannot mint a second receipt for the same session.
@@ -1543,6 +1552,15 @@ impl IcebergWriteSessionControl {
             } else {
                 Vec::new()
             },
+            // The match key needs the frozen Iceberg schema to turn a column
+            // name into a field id, so it is resolved here rather than in the
+            // pure branch planner.
+            equality: match &signed {
+                ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+                    Some(equality_delete_recipe(writer_metadata, equality_fields)?)
+                }
+                _ => None,
+            },
             table: facts,
             input: signed,
         };
@@ -1966,10 +1984,16 @@ fn flavor_for(request: &ConnectorWriteBeginRequest) -> Result<IcebergWriteFlavor
         (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::RowLineage { .. }) => {
             IcebergWriteFlavor::RowMutationCopyOnWrite
         }
+        // `ALTER TABLE ... ADD EQUALITY DELETE`. It appends delete files rather
+        // than superseding a data file's deletes, so it commits as an ordinary
+        // row delta, the same op a Parquet position-delete mutation uses.
+        (ConnectorWriteIntent::RowDelta, ConnectorWriteInputRequest::EqualityDelete { .. }) => {
+            IcebergWriteFlavor::EqualityDelete
+        }
         (ConnectorWriteIntent::RowDelta, _) => {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
-                "Iceberg row-delta write requires a position-delete, deletion-vector, or row-lineage input",
+                "Iceberg row-delta write requires a position-delete, deletion-vector, equality-delete, or row-lineage input",
             ));
         }
     })
@@ -2031,15 +2055,64 @@ fn sign_input_shape(
             identity_fields: sign("deletion-vector-identity", identity_fields),
             partition_source_fields: sign("deletion-vector-partition", partition_source_fields),
         },
-        ConnectorWriteInputRequest::EqualityDelete { .. } => {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "Iceberg equality-delete writes are not part of the connector write stack",
-            ));
+        ConnectorWriteInputRequest::EqualityDelete { equality_fields } => {
+            ConnectorWriteInputShape::EqualityDelete {
+                equality_fields: sign("equality-delete", equality_fields),
+            }
         }
     };
     shape.validate()?;
     Ok(shape)
+}
+
+/// Resolve the equality-delete match key against the frozen table generation.
+///
+/// A column name alone is not a match key: Iceberg records the *field ids* on
+/// the manifest, and a reader applies the delete by id. Resolving them here,
+/// against the same metadata the session froze, is what makes a renamed or
+/// absent column a refusal instead of a delete that matches nothing.
+fn equality_delete_recipe(
+    metadata: &TableMetadata,
+    fields: &[ConnectorWriteFieldBinding],
+) -> Result<crate::commit::write_stack::domain::IcebergEqualityDeleteRecipe, ConnectorError> {
+    use crate::commit::write_stack::domain::{
+        IcebergEqualityDeleteColumnFacts, IcebergEqualityDeleteRecipe,
+    };
+
+    // A partitioned equality delete would have to decide which partition each
+    // matched row lives in without ever reading one, so it stays refused rather
+    // than written into an arbitrary partition.
+    if !metadata.default_partition_spec().is_unpartitioned() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg equality-delete writer supports only unpartitioned tables",
+        ));
+    }
+    let schema = metadata.current_schema();
+    let columns = fields
+        .iter()
+        .map(|binding| {
+            let field = binding.field();
+            let iceberg_field = schema
+                .as_struct()
+                .fields()
+                .iter()
+                .find(|candidate| candidate.name.eq_ignore_ascii_case(field.name()))
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "Iceberg equality-delete field `{}` is absent from the frozen schema",
+                        field.name()
+                    ))
+                })?;
+            IcebergEqualityDeleteColumnFacts::try_new(
+                field.name().to_string(),
+                iceberg_field.id,
+                format!("{:?}", field.data_type()),
+                field.is_nullable(),
+            )
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    IcebergEqualityDeleteRecipe::try_new(columns)
 }
 
 /// Derive the data branch's partitioning and schema recipe from the frozen

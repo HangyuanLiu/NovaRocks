@@ -67,6 +67,7 @@ pub const MAX_TRANSFORM_EXPR_BYTES: usize = 64 * 1024;
 pub const MAX_OLD_DELETE_MERGE_TARGETS: usize = 16_384;
 pub const MAX_OLD_DELETE_REFERENCES: usize = 1024;
 pub const MAX_MERGED_OLD_REFERENCES: usize = 1024;
+pub const MAX_EQUALITY_DELETE_COLUMNS: usize = 4096;
 
 pub(crate) fn missing(path: FieldPath, detail: &'static str) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::MissingField, detail)

@@ -100,6 +100,7 @@ mod tests {
                                         output: None,
                                         data: None,
                                         old_deletes: std::collections::BTreeMap::new(),
+                        equality: None,
                                     },
                                 ),
                             ),

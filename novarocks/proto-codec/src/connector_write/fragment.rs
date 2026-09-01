@@ -25,8 +25,9 @@ use super::shared::{
     validate_file_format,
 };
 use super::{
-    MAX_COMMIT_FRAGMENT_ENCODED_BYTES, MAX_MERGED_OLD_REFERENCES, MAX_PATH_BYTES, bounded_count,
-    bounded_text, inconsistent, missing, nonnegative_i64, out_of_range,
+    MAX_COMMIT_FRAGMENT_ENCODED_BYTES, MAX_EQUALITY_DELETE_COLUMNS, MAX_MERGED_OLD_REFERENCES,
+    MAX_PATH_BYTES, bounded_count, bounded_text, inconsistent, missing, nonnegative_i64,
+    out_of_range,
 };
 use crate::{FieldPath, ProtocolError};
 
@@ -172,6 +173,55 @@ fn validate_iceberg_commit_fragment(
                 &delete.merged_old_references,
                 path.field("merged_old_references"),
             )?;
+        }
+        dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(delete) => {
+            let path = path.field("equality_delete_file");
+            bounded_text(
+                &delete.path,
+                MAX_PATH_BYTES,
+                path.clone().field("path"),
+                false,
+            )?;
+            validate_artifact_partition(
+                delete.partition.as_ref(),
+                path.clone().field("partition"),
+            )?;
+            validate_artifact_metrics(delete.metrics.as_ref(), path.clone().field("metrics"))?;
+            let ids = &delete.equality_field_ids;
+            bounded_count(
+                ids.len(),
+                MAX_EQUALITY_DELETE_COLUMNS,
+                path.clone().field("equality_field_ids"),
+                "equality field id",
+            )?;
+            // A file that matches on nothing would delete every row a reader
+            // applies it to, so an empty id list is a refusal.
+            if ids.is_empty() {
+                return Err(inconsistent(
+                    path.clone().field("equality_field_ids"),
+                    "an equality delete file matches on at least one field id",
+                ));
+            }
+            let mut previous: Option<i32> = None;
+            for (index, field_id) in ids.iter().enumerate() {
+                let id_path = path.clone().field("equality_field_ids").index(index);
+                if *field_id < 0 {
+                    return Err(out_of_range(
+                        id_path,
+                        "an equality delete field id must be nonnegative",
+                    ));
+                }
+                // Iceberg reads these back as a set, so a duplicate is
+                // meaningless and an unstable order would make the same file
+                // look different on replay.
+                if previous.is_some_and(|previous| previous >= *field_id) {
+                    return Err(inconsistent(
+                        id_path,
+                        "equality delete field ids must be sorted and unique",
+                    ));
+                }
+                previous = Some(*field_id);
+            }
         }
         dto::iceberg_commit_fragment::Artifact::DeletionVector(vector) => {
             let path = path.field("deletion_vector");

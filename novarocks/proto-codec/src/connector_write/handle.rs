@@ -25,10 +25,10 @@ use super::shared::{
     validate_file_format,
 };
 use super::{
-    MAX_NAME_BYTES, MAX_OLD_DELETE_MERGE_TARGETS, MAX_OLD_DELETE_REFERENCES, MAX_PARTITION_COLUMNS,
-    MAX_PATH_BYTES, MAX_SCHEMA_JSON_BYTES, MAX_TRANSFORM_EXPR_BYTES, MAX_TRANSFORM_EXPRS,
-    MAX_WRITER_HANDLE_ENCODED_BYTES, bounded_count, bounded_text, inconsistent, invalid_enum,
-    missing, nonnegative_i64, out_of_range,
+    MAX_EQUALITY_DELETE_COLUMNS, MAX_NAME_BYTES, MAX_OLD_DELETE_MERGE_TARGETS,
+    MAX_OLD_DELETE_REFERENCES, MAX_PARTITION_COLUMNS, MAX_PATH_BYTES, MAX_SCHEMA_JSON_BYTES,
+    MAX_TRANSFORM_EXPR_BYTES, MAX_TRANSFORM_EXPRS, MAX_WRITER_HANDLE_ENCODED_BYTES, bounded_count,
+    bounded_text, inconsistent, invalid_enum, missing, nonnegative_i64, out_of_range,
 };
 use crate::{FieldPath, ProtocolError};
 
@@ -232,6 +232,56 @@ fn validate_data_recipe(
     Ok(())
 }
 
+fn validate_equality_recipe(
+    recipe: &dto::IcebergEqualityDeleteRecipe,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    bounded_count(
+        recipe.columns.len(),
+        MAX_EQUALITY_DELETE_COLUMNS,
+        path.clone().field("columns"),
+        "equality delete column",
+    )?;
+    // A file that matches on nothing would delete every row it is applied to.
+    if recipe.columns.is_empty() {
+        return Err(inconsistent(
+            path.clone().field("columns"),
+            "an equality delete matches on at least one column",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, column) in recipe.columns.iter().enumerate() {
+        let column_path = path.clone().field("columns").index(index);
+        bounded_text(
+            &column.name,
+            MAX_NAME_BYTES,
+            column_path.clone().field("name"),
+            false,
+        )?;
+        bounded_text(
+            &column.data_type,
+            MAX_NAME_BYTES,
+            column_path.clone().field("data_type"),
+            false,
+        )?;
+        if column.field_id < 0 {
+            return Err(out_of_range(
+                column_path.clone().field("field_id"),
+                "an equality delete column field id must be nonnegative",
+            ));
+        }
+        // A repeated field id would make the same column part of the match key
+        // twice, and Iceberg reads the ids back as a set.
+        if !seen.insert(column.field_id) {
+            return Err(inconsistent(
+                column_path.field("field_id"),
+                "equality delete columns must name distinct field ids",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_old_delete_reference(
     reference: &dto::IcebergOldDeleteArtifactRef,
     path: FieldPath,
@@ -406,8 +456,14 @@ fn validate_iceberg_writer_handle(
             validate_data_recipe(recipe, path.clone().field("data"))?;
             if !handle.old_deletes.is_empty() {
                 return Err(inconsistent(
-                    path.field("old_deletes"),
+                    path.clone().field("old_deletes"),
                     "a data branch never merges old delete artifacts",
+                ));
+            }
+            if handle.equality.is_some() {
+                return Err(inconsistent(
+                    path.field("equality"),
+                    "a data branch has no equality recipe",
                 ));
             }
         }
@@ -416,6 +472,12 @@ fn validate_iceberg_writer_handle(
                 return Err(inconsistent(
                     path.clone().field("data"),
                     "a delete branch has no data recipe",
+                ));
+            }
+            if handle.equality.is_some() {
+                return Err(inconsistent(
+                    path.clone().field("equality"),
+                    "a position-delete branch has no equality recipe",
                 ));
             }
             bounded_count(
@@ -428,6 +490,29 @@ fn validate_iceberg_writer_handle(
                 let target_path = path.clone().field("old_deletes").map_key(key.clone());
                 validate_old_delete_target(target, key, target_path)?;
             }
+        }
+        dto::IcebergWriteBranch::EqualityDelete => {
+            if handle.data.is_some() {
+                return Err(inconsistent(
+                    path.clone().field("data"),
+                    "an equality-delete branch has no data recipe",
+                ));
+            }
+            // An equality delete supersedes no existing artifact, so a frozen
+            // old-delete target here would name a merge it never performs.
+            if !handle.old_deletes.is_empty() {
+                return Err(inconsistent(
+                    path.clone().field("old_deletes"),
+                    "an equality-delete branch never merges old delete artifacts",
+                ));
+            }
+            let recipe = handle.equality.as_ref().ok_or_else(|| {
+                inconsistent(
+                    path.clone().field("equality"),
+                    "an equality-delete branch requires its equality recipe",
+                )
+            })?;
+            validate_equality_recipe(recipe, path.field("equality"))?;
         }
         dto::IcebergWriteBranch::Unspecified => unreachable!("validated above"),
     }
@@ -487,6 +572,7 @@ mod tests {
                         row_lineage: false,
                     }),
                     old_deletes: std::collections::BTreeMap::new(),
+                    equality: None,
                 },
             )),
         }
@@ -541,8 +627,35 @@ mod tests {
                     }),
                     data: None,
                     old_deletes,
+                    equality: None,
                 },
             )),
+        }
+    }
+
+    fn equality_handle(
+        columns: Vec<dto::IcebergEqualityDeleteColumn>,
+    ) -> dto::ConnectorWriterHandle {
+        dto::ConnectorWriterHandle {
+            handle: Some(dto::connector_writer_handle::Handle::Iceberg(
+                dto::IcebergWriterHandle {
+                    branch: dto::IcebergWriteBranch::EqualityDelete as i32,
+                    table: Some(table()),
+                    output: Some(output()),
+                    data: None,
+                    old_deletes: std::collections::BTreeMap::new(),
+                    equality: Some(dto::IcebergEqualityDeleteRecipe { columns }),
+                },
+            )),
+        }
+    }
+
+    fn equality_column(name: &str, field_id: i32) -> dto::IcebergEqualityDeleteColumn {
+        dto::IcebergEqualityDeleteColumn {
+            name: name.to_string(),
+            field_id,
+            data_type: "Int64".to_string(),
+            nullable: true,
         }
     }
 
@@ -713,6 +826,58 @@ mod tests {
                 "writer_handle.iceberg.table.format_version"
             );
         }
+    }
+
+    #[test]
+    fn an_equality_delete_branch_carries_its_own_recipe_and_nothing_else() {
+        let raw = equality_handle(vec![equality_column("id", 1), equality_column("k", 2)]);
+        let validated = parse(raw.clone()).expect("valid equality handle");
+        assert_eq!(validated.as_proto(), &raw);
+
+        // No recipe at all: the writer would have no match key.
+        let mut raw = equality_handle(vec![equality_column("id", 1)]);
+        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
+            raw.handle.as_mut().expect("variant");
+        iceberg.equality = None;
+        let error = parse(raw).expect_err("equality branch without a recipe");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(error.path().to_string(), "writer_handle.iceberg.equality");
+
+        // An equality delete supersedes nothing, so it never freezes an old
+        // delete merge target.
+        let mut raw = equality_handle(vec![equality_column("id", 1)]);
+        let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
+            raw.handle.as_mut().expect("variant");
+        iceberg.old_deletes.insert(
+            "s3://bucket/db/t/data/a.parquet".to_string(),
+            dto::IcebergOldDeleteMergeTarget {
+                data_file_path: "s3://bucket/db/t/data/a.parquet".to_string(),
+                data_file_record_count: 1,
+                data_file_sequence_number: None,
+                partition: Some(partition()),
+                base_snapshot_id: 1,
+                references: Vec::new(),
+            },
+        );
+        let error = parse(raw).expect_err("equality branch with old deletes");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            error.path().to_string(),
+            "writer_handle.iceberg.old_deletes"
+        );
+    }
+
+    #[test]
+    fn an_equality_recipe_needs_at_least_one_distinct_column() {
+        let error = parse(equality_handle(Vec::new())).expect_err("no equality column");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
+
+        let error = parse(equality_handle(vec![
+            equality_column("id", 1),
+            equality_column("also_id", 1),
+        ]))
+        .expect_err("repeated field id");
+        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
     }
 
     #[test]

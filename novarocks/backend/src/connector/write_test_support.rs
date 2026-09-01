@@ -366,6 +366,7 @@ pub(crate) fn iceberg_writer_handle(table_uuid: String) -> write_dto::ConnectorW
                     row_lineage: false,
                 }),
                 old_deletes: BTreeMap::new(),
+                equality: None,
             },
         )),
     }

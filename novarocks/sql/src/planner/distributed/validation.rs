@@ -488,15 +488,13 @@ fn validate_dataflow_write_shape(
             "lower_distributed_plan TableFinish fragment id={finish_fragment_id} expects write target ordinals {expected:?} but its writers carry {observed:?}"
         ));
     }
-    let dense = observed
-        .iter()
-        .enumerate()
-        .all(|(index, ordinal)| u32::try_from(index).is_ok_and(|index| index == *ordinal));
-    if !dense {
-        return Err(format!(
-            "lower_distributed_plan dataflow write target ordinals must be dense from 0, found {observed:?}"
-        ));
-    }
+    // Deliberately no denseness assertion. The ordinals a query's writers carry
+    // are the subset of the session's sealed targets *this query* feeds, and a
+    // copy-on-write statement compiles one writer per query at that group's own
+    // ordinal, so query `k` carries `{k}`. The set equality above is the real
+    // invariant: the finish node expects exactly the targets its writers feed.
+    // Denseness from zero belongs to the session's sealed set and is enforced by
+    // `ConnectorWriteSessionPlan::try_new`.
     Ok(())
 }
 

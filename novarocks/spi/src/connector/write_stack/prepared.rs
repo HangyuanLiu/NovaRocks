@@ -139,29 +139,36 @@ pub struct ConnectorPreparedWriteSet {
 impl ConnectorPreparedWriteSet {
     /// Build a prepared set from an already-complete aggregation.
     ///
-    /// `expected_targets` is the sealed logical target set from the begin
-    /// session. A fragment naming a target outside it means the plan and the
-    /// session disagree, so it fails closed rather than committing a partial or
-    /// foreign artifact.
+    /// `expected_targets` is the target set this set is allowed to name. A
+    /// fragment naming anything outside it means the plan and the session
+    /// disagree, so it fails closed rather than committing a partial or foreign
+    /// artifact.
+    ///
+    /// The expected set is checked for cardinality and duplicates, not for
+    /// denseness from zero. Denseness belongs to the *session's* sealed set
+    /// (`ConnectorWriteSessionPlan::try_new`), and restating it here would
+    /// refuse a legitimate single-query set: a copy-on-write statement drives
+    /// one query per rewritten file, and query `k` names only target `k`.
+    /// Membership is therefore an exact set test rather than a comparison
+    /// against the highest ordinal.
     pub fn try_new(
         row_count: u64,
         fragments: Vec<(WriteTargetOrdinal, ConnectorCommitFragment)>,
         expected_targets: &[WriteTargetOrdinal],
     ) -> Result<Self, ConnectorError> {
-        crate::connector::write_stack::target::validate_dense_target_ordinals(expected_targets)?;
+        crate::connector::write_stack::target::validate_query_target_ordinals(expected_targets)?;
         if fragments.len() > MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "connector prepared write set exceeds the frozen entry budget",
             ));
         }
-        let highest = expected_targets
+        let expected = expected_targets
             .iter()
-            .map(|target| target.get())
-            .max()
-            .unwrap_or_default();
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         for (target, _) in &fragments {
-            if target.get() > highest {
+            if !expected.contains(target) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "connector commit fragment names a write target outside the sealed set",
@@ -264,5 +271,14 @@ mod tests {
         let targets = [WriteTargetOrdinal::try_new(0).expect("bounded")];
         assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &targets).is_ok());
         assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &[]).is_err());
+    }
+
+    /// One query of a copy-on-write statement names exactly its own target,
+    /// which is not target zero. That set is a query fact, not a session one,
+    /// so it must be accepted here.
+    #[test]
+    fn prepared_set_accepts_a_single_target_query_set_at_a_non_zero_ordinal() {
+        let targets = [WriteTargetOrdinal::try_new(2).expect("bounded")];
+        assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &targets).is_ok());
     }
 }

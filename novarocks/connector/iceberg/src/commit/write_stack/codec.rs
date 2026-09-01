@@ -58,8 +58,10 @@ use crate::commit::report::IcebergColumnStats;
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergPositionDeleteFileArtifact, IcebergWriteBranch,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergDeletionVectorArtifact, IcebergEqualityDeleteColumnFacts,
+    IcebergEqualityDeleteFileArtifact, IcebergEqualityDeleteRecipe,
+    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteTableFacts,
+    IcebergWriterHandle, IcebergWriterOutput,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -184,6 +186,7 @@ impl IcebergWriteCodec {
             IcebergWriteBranch::Data => dto::IcebergWriteBranch::Data as i32,
             IcebergWriteBranch::PositionDelete => dto::IcebergWriteBranch::PositionDelete as i32,
             IcebergWriteBranch::DeletionVector => dto::IcebergWriteBranch::DeletionVector as i32,
+            IcebergWriteBranch::EqualityDelete => dto::IcebergWriteBranch::EqualityDelete as i32,
         }
     }
 
@@ -196,6 +199,7 @@ impl IcebergWriteCodec {
             Ok(dto::IcebergWriteBranch::Data) => Ok(IcebergWriteBranch::Data),
             Ok(dto::IcebergWriteBranch::PositionDelete) => Ok(IcebergWriteBranch::PositionDelete),
             Ok(dto::IcebergWriteBranch::DeletionVector) => Ok(IcebergWriteBranch::DeletionVector),
+            Ok(dto::IcebergWriteBranch::EqualityDelete) => Ok(IcebergWriteBranch::EqualityDelete),
             Ok(dto::IcebergWriteBranch::Unspecified) | Err(_) => Err(self.invalid(
                 path,
                 "an Iceberg writer handle requires a named write branch",
@@ -664,6 +668,52 @@ impl IcebergWriteCodec {
         .map_err(|error| self.rejected(path, &error))
     }
 
+    fn encode_equality_recipe(
+        &self,
+        recipe: &IcebergEqualityDeleteRecipe,
+    ) -> dto::IcebergEqualityDeleteRecipe {
+        dto::IcebergEqualityDeleteRecipe {
+            columns: recipe
+                .columns()
+                .iter()
+                .map(|column| dto::IcebergEqualityDeleteColumn {
+                    name: column.name().to_string(),
+                    field_id: column.field_id(),
+                    data_type: column.data_type().to_string(),
+                    nullable: column.nullable(),
+                })
+                .collect(),
+        }
+    }
+
+    fn decode_equality_recipe(
+        &self,
+        recipe: Option<&dto::IcebergEqualityDeleteRecipe>,
+        path: FieldPath,
+    ) -> Result<IcebergEqualityDeleteRecipe, ConnectorWriteCodecError> {
+        let recipe = recipe.ok_or_else(|| {
+            self.missing(
+                path.clone(),
+                "an Iceberg equality-delete branch requires its equality recipe",
+            )
+        })?;
+        let mut columns = Vec::with_capacity(recipe.columns.len());
+        for (index, column) in recipe.columns.iter().enumerate() {
+            columns.push(
+                IcebergEqualityDeleteColumnFacts::try_new(
+                    column.name.clone(),
+                    column.field_id,
+                    column.data_type.clone(),
+                    column.nullable,
+                )
+                .map_err(|error| {
+                    self.rejected(path.clone().field("columns").index(index), &error)
+                })?,
+            );
+        }
+        IcebergEqualityDeleteRecipe::try_new(columns).map_err(|error| self.rejected(path, &error))
+    }
+
     fn encode_writer_handle_value(
         &self,
         handle: &IcebergWriterHandle,
@@ -688,6 +738,9 @@ impl IcebergWriteCodec {
                     output: Some(self.encode_output(handle.output(), path.field("output"))?),
                     data,
                     old_deletes,
+                    equality: handle
+                        .equality()
+                        .map(|recipe| self.encode_equality_recipe(recipe)),
                 },
             )),
         })
@@ -723,6 +776,14 @@ impl IcebergWriteCodec {
                 IcebergWriterHandle::try_new_delete(branch, table, output, targets)
                     .map_err(|error| self.rejected(path, &error))
             }
+            IcebergWriteBranch::EqualityDelete => {
+                let recipe =
+                    self.decode_equality_recipe(iceberg.equality.as_ref(), path.field("equality"))?;
+                // `try_new_equality_delete` owns "an equality delete writes
+                // Parquet and freezes no old-delete reference".
+                IcebergWriterHandle::try_new_equality_delete(table, output, recipe)
+                    .map_err(|error| self.rejected(path, &error))
+            }
         }
     }
 
@@ -753,6 +814,16 @@ impl IcebergWriteCodec {
                         metrics: Some(self.encode_metrics(file.metrics())),
                         referenced_data_file: file.referenced_data_file().to_string(),
                         merged_old_references: file.merged_old_references().to_vec(),
+                    },
+                )
+            }
+            IcebergCommitArtifact::EqualityDeleteFile(file) => {
+                dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(
+                    dto::IcebergEqualityDeleteFileArtifact {
+                        path: file.path().to_string(),
+                        partition: Some(self.encode_partition(file.partition())),
+                        metrics: Some(self.encode_metrics(file.metrics())),
+                        equality_field_ids: file.equality_field_ids().to_vec(),
                     },
                 )
             }
@@ -814,6 +885,17 @@ impl IcebergWriteCodec {
                 )
                 .map_err(|error| self.rejected(path, &error))?;
                 Ok(IcebergCommitFragment::position_delete_file(artifact))
+            }
+            dto::iceberg_commit_fragment::Artifact::EqualityDeleteFile(file) => {
+                let path = path.field("equality_delete_file");
+                let artifact = IcebergEqualityDeleteFileArtifact::try_new(
+                    file.path.clone(),
+                    self.decode_partition(file.partition.as_ref(), path.field("partition"))?,
+                    self.decode_metrics(file.metrics.as_ref(), path.field("metrics"))?,
+                    file.equality_field_ids.clone(),
+                )
+                .map_err(|error| self.rejected(path, &error))?;
+                Ok(IcebergCommitFragment::equality_delete_file(artifact))
             }
             dto::iceberg_commit_fragment::Artifact::DeletionVector(file) => {
                 let path = path.field("deletion_vector");
@@ -962,7 +1044,8 @@ mod tests {
 
     use crate::commit::write_stack::runtime::build_write_adapter;
     use crate::commit::write_stack::test_support::{
-        merge_target, parquet_ref, puffin_ref, sample_metrics, sample_partition, table_facts,
+        equality_delete_recipe, merge_target, parquet_ref, puffin_ref, sample_metrics,
+        sample_partition, table_facts,
     };
     use crate::scan_model::IcebergSchemaFieldDef;
 
@@ -1551,5 +1634,128 @@ mod tests {
             .expect_err("an oversized commit fragment");
         assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
         assert_eq!(error.path().to_string(), "commit_fragment");
+    }
+    fn unpartitioned() -> IcebergArtifactPartition {
+        IcebergArtifactPartition::try_new(
+            String::new(),
+            String::new(),
+            0,
+            crate::write_descriptor::IcebergPartitionDescriptor { values: Vec::new() },
+        )
+        .expect("unpartitioned artifact partition")
+    }
+
+    /// The equality-delete recipe survives the FE -> BE carrier.
+    ///
+    /// The backend cannot invent a match key: the field ids only exist because
+    /// the frontend resolved them against the frozen schema, so a recipe that
+    /// did not round-trip would leave the writer with nothing to match on.
+    #[test]
+    fn an_equality_delete_writer_handle_round_trips_through_its_carrier() {
+        let facets = generation();
+        let handle = IcebergWriterHandle::try_new_equality_delete(
+            table_facts(),
+            IcebergWriterOutput::try_new(IcebergFileFormat::Parquet, Compression::SNAPPY, None)
+                .expect("output"),
+            equality_delete_recipe(),
+        )
+        .expect("equality delete handle");
+
+        let encoded = facets
+            .handle_encoder
+            .encode_writer_handle(&facets.adapter.wrap_writer_handle(handle.clone()))
+            .expect("encode");
+        let validated = ValidatedWriterHandle::parse(encoded, FieldPath::root("writer_handle"))
+            .expect("the carrier is structurally valid");
+        let recovered = facets
+            .handle_decoder
+            .decode_writer_handle(&validated)
+            .expect("decode");
+        let recovered = facets
+            .adapter
+            .writer_handle(&recovered)
+            .expect("provider handle");
+        assert_eq!(recovered.branch(), IcebergWriteBranch::EqualityDelete);
+        assert_eq!(recovered.equality(), handle.equality());
+        // It carries no old-delete merge and no data recipe: an equality delete
+        // supersedes nothing and writes no data file.
+        assert!(recovered.old_deletes().is_empty());
+        assert!(recovered.data().is_none());
+    }
+
+    /// The staged artifact survives the BE -> FE carrier, including the match
+    /// key Iceberg records on the manifest.
+    #[test]
+    fn an_equality_delete_artifact_round_trips_through_its_carrier() {
+        let facets = generation();
+        let artifact =
+            crate::commit::write_stack::domain::IcebergEqualityDeleteFileArtifact::try_new(
+                "s3://b/wh/db/t/data/_staging/eq-0.parquet".to_string(),
+                unpartitioned(),
+                sample_metrics(3, 128),
+                vec![1, 4],
+            )
+            .expect("equality delete artifact");
+
+        let encoded = facets
+            .fragment_encoder
+            .encode_commit_fragment(
+                &facets
+                    .adapter
+                    .wrap_commit_fragment(IcebergCommitFragment::equality_delete_file(artifact)),
+            )
+            .expect("encode");
+        let validated = ValidatedCommitFragment::parse(encoded, FieldPath::root("commit_fragment"))
+            .expect("the carrier is structurally valid");
+        let recovered = facets
+            .fragment_decoder
+            .decode_commit_fragment(&validated)
+            .expect("decode");
+        let recovered = facets
+            .adapter
+            .commit_fragment(&recovered)
+            .expect("provider value");
+        assert_eq!(recovered.branch(), IcebergWriteBranch::EqualityDelete);
+        // It names no data file and merges nothing -- that is exactly what
+        // separates it from a position delete.
+        assert_eq!(recovered.referenced_data_file(), None);
+        assert!(recovered.merged_old_references().is_empty());
+        let IcebergCommitArtifact::EqualityDeleteFile(file) = recovered.artifact() else {
+            panic!("expected an equality delete artifact");
+        };
+        assert_eq!(file.equality_field_ids(), &[1, 4]);
+    }
+
+    /// A match key must be a key. An empty one would delete every row the file
+    /// is applied to, and a repeated field id would say the same column twice.
+    #[test]
+    fn an_equality_delete_artifact_requires_a_sorted_unique_match_key() {
+        assert!(
+            crate::commit::write_stack::domain::IcebergEqualityDeleteFileArtifact::try_new(
+                "s3://b/wh/db/t/data/eq.parquet".to_string(),
+                unpartitioned(),
+                sample_metrics(3, 128),
+                Vec::new(),
+            )
+            .is_err()
+        );
+        assert!(
+            crate::commit::write_stack::domain::IcebergEqualityDeleteFileArtifact::try_new(
+                "s3://b/wh/db/t/data/eq.parquet".to_string(),
+                unpartitioned(),
+                sample_metrics(3, 128),
+                vec![4, 1],
+            )
+            .is_err()
+        );
+        assert!(
+            crate::commit::write_stack::domain::IcebergEqualityDeleteFileArtifact::try_new(
+                "s3://b/wh/db/t/data/eq.parquet".to_string(),
+                unpartitioned(),
+                sample_metrics(3, 128),
+                vec![1, 1],
+            )
+            .is_err()
+        );
     }
 }

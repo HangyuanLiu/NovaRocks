@@ -41,7 +41,7 @@
 use arrow::datatypes::SchemaRef;
 use novarocks_spi::connector::write_stack::{
     WRITE_RELATION_COLUMN_COUNT, WriteTargetOrdinal, root_output_schema,
-    validate_dense_target_ordinals, writer_output_schema,
+    validate_query_target_ordinals, writer_output_schema,
 };
 
 use crate::analysis::OutputColumn;
@@ -132,29 +132,38 @@ impl TableWriterNode {
 /// The single per-query write finish operator.
 ///
 /// It gathers the writer relation of every [`TableWriterNode`] in the query and
-/// emits the root relation. `expected_target_ordinals` is the dense `0..n` set
-/// of writer ordinals it must observe; it is the plan-level record of "how many
-/// logical write targets this query has", not a routing table.
+/// emits the root relation. `expected_target_ordinals` is the set of writer
+/// ordinals it must observe; it is the plan-level record of "which logical write
+/// targets *this query* feeds", not a routing table.
+///
+/// That set is not required to be dense from zero, and must not be: a
+/// copy-on-write statement drives one query per rewritten file against a single
+/// write session, and each of those queries compiles exactly one writer, at that
+/// group's own ordinal. Query `k` therefore expects `[k]`. Denseness is a
+/// property of the *session's* sealed target set and is enforced there, by
+/// `ConnectorWriteSessionPlan::try_new`.
 #[derive(Clone, Debug)]
 pub struct TableFinishNode {
     pub(crate) expected_target_ordinals: Vec<WriteTargetOrdinal>,
 }
 
 impl TableFinishNode {
-    /// Build a finish node over a dense-from-zero ordinal set. Density is
-    /// checked by the SPI owner of the ordinal vocabulary, not restated here.
+    /// Build a finish node over one query's expected ordinal set: non-empty,
+    /// duplicate-free, and inside the frozen target bound. Cardinality and
+    /// duplication are checked by the SPI owner of the ordinal vocabulary and
+    /// not restated here; the ascending listing below is this encoding's own
+    /// determinism rule.
     pub(crate) fn try_new(
         expected_target_ordinals: Vec<WriteTargetOrdinal>,
     ) -> Result<Self, String> {
-        validate_dense_target_ordinals(&expected_target_ordinals)
+        validate_query_target_ordinals(&expected_target_ordinals)
             .map_err(|error| format!("table finish write target ordinals rejected: {error}"))?;
-        for (index, ordinal) in expected_target_ordinals.iter().enumerate() {
-            let expected = u32::try_from(index)
-                .map_err(|_| "table finish write target ordinal space exhausted".to_string())?;
-            if ordinal.get() != expected {
+        for pair in expected_target_ordinals.windows(2) {
+            if pair[0].get() >= pair[1].get() {
                 return Err(format!(
-                    "table finish write target ordinals must be listed in ascending dense order: found {} at position {index}",
-                    ordinal.get()
+                    "table finish write target ordinals must be listed in strictly ascending order: found {} before {}",
+                    pair[0].get(),
+                    pair[1].get()
                 ));
             }
         }
@@ -238,22 +247,35 @@ mod tests {
     }
 
     #[test]
-    fn table_finish_rejects_non_dense_write_target_ordinals() {
+    fn table_finish_rejects_an_empty_repeated_or_unordered_write_target_set() {
         let ordinal = |value: u32| WriteTargetOrdinal::try_new(value).expect("bounded ordinal");
         assert!(TableFinishNode::try_new(vec![ordinal(0), ordinal(1), ordinal(2)]).is_ok());
 
-        let error =
-            TableFinishNode::try_new(vec![ordinal(0), ordinal(2)]).expect_err("sparse ordinals");
+        let error = TableFinishNode::try_new(Vec::new()).expect_err("empty ordinals");
         assert!(error.contains("rejected"), "unexpected error: {error}");
 
-        let error = TableFinishNode::try_new(Vec::new()).expect_err("empty ordinals");
+        let error =
+            TableFinishNode::try_new(vec![ordinal(1), ordinal(1)]).expect_err("repeated ordinal");
         assert!(error.contains("rejected"), "unexpected error: {error}");
 
         let error = TableFinishNode::try_new(vec![ordinal(1), ordinal(0)])
             .expect_err("descending ordinals");
         assert!(
-            error.contains("ascending dense order"),
+            error.contains("strictly ascending order"),
             "unexpected error: {error}"
         );
+    }
+
+    /// A copy-on-write statement runs one query per rewritten file against one
+    /// write session, and query `k` compiles exactly one writer -- the one at
+    /// ordinal `k`. Its finish node therefore sees `[k]`, which is correctly not
+    /// dense from zero.
+    #[test]
+    fn table_finish_accepts_a_single_writer_query_at_a_non_zero_ordinal() {
+        let ordinal = |value: u32| WriteTargetOrdinal::try_new(value).expect("bounded ordinal");
+        let node = TableFinishNode::try_new(vec![ordinal(2)]).expect("single non-zero target");
+        assert_eq!(node.expected_target_ordinals, vec![ordinal(2)]);
+        // A gap between two targets is the same kind of fact.
+        assert!(TableFinishNode::try_new(vec![ordinal(0), ordinal(2)]).is_ok());
     }
 }

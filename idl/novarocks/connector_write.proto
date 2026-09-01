@@ -58,6 +58,7 @@ enum IcebergWriteBranch {
   ICEBERG_WRITE_BRANCH_DATA = 1;
   ICEBERG_WRITE_BRANCH_POSITION_DELETE = 2;
   ICEBERG_WRITE_BRANCH_DELETION_VECTOR = 3;
+  ICEBERG_WRITE_BRANCH_EQUALITY_DELETE = 4;
 }
 
 enum IcebergCompression {
@@ -176,6 +177,28 @@ message IcebergOldDeleteArtifactRef {
   IcebergStorageRoute storage_route = 11;
 }
 
+// One column an equality-delete file matches rows on.
+//
+// The Arrow type is carried as its rendering, never as a type value: the
+// backend takes the real Arrow type from the fragment's own frozen input schema
+// and uses this only to prove the two agree. A mismatch is a refusal, never a
+// coercion.
+message IcebergEqualityDeleteColumn {
+  string name = 1;
+  int32 field_id = 2;
+  string data_type = 3;
+  bool nullable = 4;
+}
+
+// How an equality-delete branch writer builds its delete file.
+//
+// It carries no old delete reference: an equality delete appends a new delete
+// file that names no data file and supersedes no existing artifact, which is
+// exactly what distinguishes it from the position-delete branches.
+message IcebergEqualityDeleteRecipe {
+  repeated IcebergEqualityDeleteColumn columns = 1;
+}
+
 // Every old delete artifact that must be merged for one referenced data file.
 message IcebergOldDeleteMergeTarget {
   string data_file_path = 1;
@@ -199,6 +222,7 @@ message IcebergWriterHandle {
   optional IcebergDataBranchRecipe data = 4;
   // Keyed by referenced data file path.
   map<string, IcebergOldDeleteMergeTarget> old_deletes = 5;
+  optional IcebergEqualityDeleteRecipe equality = 6;
 }
 
 message ConnectorWriterHandle {
@@ -239,6 +263,20 @@ message IcebergDeletionVectorArtifact {
   repeated string merged_old_references = 7;
 }
 
+// One written Parquet equality-delete file.
+//
+// It names no data file: Iceberg applies an equality delete to every row whose
+// equality-column values match, across the files the delete's sequence number
+// covers. `equality_field_ids` is therefore part of the artifact rather than of
+// the recipe -- the manifest carries it, and a reader needs it to apply the
+// file at all.
+message IcebergEqualityDeleteFileArtifact {
+  string path = 1;
+  IcebergArtifactPartition partition = 2;
+  IcebergArtifactMetrics metrics = 3;
+  repeated int32 equality_field_ids = 4;
+}
+
 // Exactly one staged Iceberg artifact.
 //
 // A fragment carries no writer identity, no attempt id, and no aggregate
@@ -249,6 +287,7 @@ message IcebergCommitFragment {
     IcebergDataFileArtifact data_file = 1;
     IcebergPositionDeleteFileArtifact position_delete_file = 2;
     IcebergDeletionVectorArtifact deletion_vector = 3;
+    IcebergEqualityDeleteFileArtifact equality_delete_file = 4;
   }
 }
 

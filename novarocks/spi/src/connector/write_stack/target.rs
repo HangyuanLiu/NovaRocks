@@ -50,25 +50,44 @@ impl WriteTargetOrdinal {
     }
 }
 
+/// Validate one *query's* expected target set: non-empty, inside the frozen
+/// target bound, and free of duplicates.
+///
+/// This is deliberately weaker than [`validate_dense_target_ordinals`], and the
+/// two must not be merged. Denseness from zero is a property of the *session's*
+/// sealed target set, not of any single query: a copy-on-write statement drives
+/// several queries against one session and compiles exactly one writer per
+/// query, at that group's own ordinal. Query `k` therefore legitimately expects
+/// `[k]`, which is not dense from zero and never will be. What a query can still
+/// assert is that it feeds at least one target, names none of them twice, and
+/// stays inside the bound the session sealed -- the caller supplies the sealed
+/// set that bounds it.
+pub fn validate_query_target_ordinals(
+    ordinals: &[WriteTargetOrdinal],
+) -> Result<(), ConnectorError> {
+    validate_target_ordinal_cardinality(ordinals)?;
+    if ordinals.iter().copied().collect::<BTreeSet<_>>().len() != ordinals.len() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write query repeats a logical write target ordinal",
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that `ordinals` form the dense set `0..ordinals.len()` with no gap
 /// and no duplicate. A sparse or duplicated set means the begin session and the
 /// sealed plan disagree about which logical writers exist, so it fails closed
 /// before any fragment submission.
+///
+/// This belongs to the *session*: `begin_write` seals every logical target the
+/// statement may use at once, so their ordinals are the complete `0..n`. A
+/// single query inside that session sees only the subset its own writers feed
+/// and must be validated with [`validate_query_target_ordinals`] instead.
 pub fn validate_dense_target_ordinals(
     ordinals: &[WriteTargetOrdinal],
 ) -> Result<(), ConnectorError> {
-    if ordinals.is_empty() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector write session requires at least one logical write target",
-        ));
-    }
-    if ordinals.len() > MAX_CONNECTOR_WRITE_TARGETS {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "connector write session exceeds the frozen logical write target bound",
-        ));
-    }
+    validate_target_ordinal_cardinality(ordinals)?;
     let unique = ordinals.iter().copied().collect::<BTreeSet<_>>();
     if unique.len() != ordinals.len() {
         return Err(ConnectorError::new(
@@ -84,6 +103,26 @@ pub fn validate_dense_target_ordinals(
         return Err(ConnectorError::new(
             ConnectorErrorKind::InvalidRequest,
             "connector write session target ordinals are not dense from zero",
+        ));
+    }
+    Ok(())
+}
+
+/// The cardinality rules both target-set checks share: a write with no target
+/// writes nothing, and the frozen bound caps how many a session may seal.
+fn validate_target_ordinal_cardinality(
+    ordinals: &[WriteTargetOrdinal],
+) -> Result<(), ConnectorError> {
+    if ordinals.is_empty() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector write session requires at least one logical write target",
+        ));
+    }
+    if ordinals.len() > MAX_CONNECTOR_WRITE_TARGETS {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "connector write session exceeds the frozen logical write target bound",
         ));
     }
     Ok(())
@@ -121,5 +160,27 @@ mod tests {
         assert!(validate_dense_target_ordinals(&ordinals(&[0, 2])).is_err());
         assert!(validate_dense_target_ordinals(&ordinals(&[0, 0])).is_err());
         assert!(validate_dense_target_ordinals(&ordinals(&[1, 2])).is_err());
+    }
+
+    /// A copy-on-write statement drives one query per rewritten file against a
+    /// single session, and query `k` compiles exactly one writer -- the one at
+    /// ordinal `k`. Its expected set is `[k]`, which the session-level check
+    /// rejects and the query-level check must accept.
+    #[test]
+    fn a_single_writer_query_at_a_non_zero_ordinal_is_accepted() {
+        assert!(validate_query_target_ordinals(&ordinals(&[3])).is_ok());
+        assert!(
+            validate_dense_target_ordinals(&ordinals(&[3])).is_err(),
+            "the session-level check must stay exactly as strict as it was"
+        );
+        // A gap is likewise a query fact, not a session one: a merge-on-read
+        // statement can feed the delete branch without feeding the data branch.
+        assert!(validate_query_target_ordinals(&ordinals(&[0, 2])).is_ok());
+    }
+
+    #[test]
+    fn an_empty_or_duplicated_query_target_set_still_fails_closed() {
+        assert!(validate_query_target_ordinals(&[]).is_err());
+        assert!(validate_query_target_ordinals(&ordinals(&[1, 1])).is_err());
     }
 }

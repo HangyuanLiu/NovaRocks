@@ -53,7 +53,6 @@ use crate::runtime::runtime_state::RuntimeState;
 pub struct TableFinishOperatorFactory {
     name: String,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
-    highest_expected_ordinal: u32,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
 }
 
@@ -67,7 +66,6 @@ impl TableFinishOperatorFactory {
         Self {
             name,
             expected_targets: Arc::clone(node.expected_targets()),
-            highest_expected_ordinal: node.highest_expected_ordinal(),
             fragment_validator: Arc::clone(node.fragment_validator()),
         }
     }
@@ -93,7 +91,6 @@ impl OperatorFactory for TableFinishOperatorFactory {
         Box::new(TableFinishOperator {
             name: self.name.clone(),
             expected_targets: Arc::clone(&self.expected_targets),
-            highest_expected_ordinal: self.highest_expected_ordinal,
             fragment_validator: Arc::clone(&self.fragment_validator),
             parallelism_error,
             rows: WriteRowCountAccumulator::new(),
@@ -109,7 +106,6 @@ impl OperatorFactory for TableFinishOperatorFactory {
 struct TableFinishOperator {
     name: String,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
-    highest_expected_ordinal: u32,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     parallelism_error: Option<String>,
     rows: WriteRowCountAccumulator,
@@ -131,7 +127,10 @@ impl TableFinishOperator {
     fn target_in_sealed_set(&self, raw: i32) -> Result<WriteTargetOrdinal, String> {
         let target = target_ordinal_from_wire(raw)
             .map_err(|error| format!("table finish write target ordinal: {error}"))?;
-        if target.get() > self.highest_expected_ordinal {
+        // An exact set test, not a bound: the query's expected set need not be
+        // dense from zero, so "at or below the highest ordinal" would admit a
+        // target this query compiled no writer for.
+        if !self.expected_targets.contains(&target) {
             return Err(format!(
                 "table finish received a write target ordinal {raw} outside the sealed set of {} targets",
                 self.expected_targets.len()
@@ -897,16 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn table_finish_node_requires_a_dense_target_set() {
-        assert!(
-            TableFinishNode::try_new(
-                values_input(),
-                3,
-                vec![target(0), target(2)],
-                Arc::new(AcceptEveryCarrier::default()),
-            )
-            .is_err()
-        );
+    fn table_finish_node_requires_a_non_empty_duplicate_free_target_set() {
         assert!(
             TableFinishNode::try_new(
                 values_input(),
@@ -916,5 +906,48 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            TableFinishNode::try_new(
+                values_input(),
+                3,
+                vec![target(1), target(1)],
+                Arc::new(AcceptEveryCarrier::default()),
+            )
+            .is_err()
+        );
+    }
+
+    /// A copy-on-write statement drives one query per rewritten file against a
+    /// single write session, and each of those queries compiles exactly one
+    /// writer -- the one at that group's own ordinal. Query `k` therefore
+    /// expects `[k]`, which is correctly not dense from zero. Denseness belongs
+    /// to the session's sealed target set, not to any one query.
+    #[test]
+    fn table_finish_accepts_a_single_writer_query_at_a_non_zero_ordinal() {
+        let node = TableFinishNode::try_new(
+            values_input(),
+            3,
+            vec![target(2)],
+            Arc::new(AcceptEveryCarrier::default()),
+        )
+        .expect("a single-writer query at ordinal 2");
+        assert!(node.accepts_target(target(2)));
+        // Membership stays exact: a bound check would have admitted every
+        // ordinal below the one this query actually feeds.
+        assert!(!node.accepts_target(target(0)));
+        assert!(!node.accepts_target(target(1)));
+
+        let factory = TableFinishOperatorFactory::new(&node);
+        let mut operator = factory.create(1, 0);
+        operator.prepare().expect("prepare");
+        let state = RuntimeState::default();
+        let processor = operator.as_processor_mut().expect("processor");
+        processor
+            .push_chunk(&state, writer_rows(vec![row_count_row(2, 5)]))
+            .expect("its own writer's rows are accepted");
+        let error = processor
+            .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
+            .expect_err("a target this query never compiled a writer for");
+        assert!(error.contains("outside the sealed set"), "{error}");
     }
 }

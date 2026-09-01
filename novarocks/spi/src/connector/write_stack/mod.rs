@@ -85,7 +85,9 @@ pub use session::{
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
     ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
 };
-pub use target::{WriteTargetOrdinal, validate_dense_target_ordinals};
+pub use target::{
+    WriteTargetOrdinal, validate_dense_target_ordinals, validate_query_target_ordinals,
+};
 pub use writer::{
     ConnectorBatchWriter, ConnectorOpenWriterRequest, ConnectorWriteExecution,
     ConnectorWriteExecutionFactory, ConnectorWriterPhysicalContext,

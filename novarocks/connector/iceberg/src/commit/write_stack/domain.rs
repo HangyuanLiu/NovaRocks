@@ -104,9 +104,18 @@ pub enum IcebergWriteBranch {
     PositionDelete,
     /// Puffin deletion vectors, one blob per referenced data file.
     DeletionVector,
+    /// Parquet equality-delete files, matched on column values rather than on
+    /// row position.
+    EqualityDelete,
 }
 
 impl IcebergWriteBranch {
+    /// Whether this branch supersedes the pre-existing delete artifacts of the
+    /// data files it writes for, and therefore owns their old-delete merge.
+    ///
+    /// An equality delete does not: it appends a delete file that names no data
+    /// file, retires nothing, and merges nothing. Reporting it here would give
+    /// it an old-delete merge it has no data file to perform.
     pub const fn writes_deletes(self) -> bool {
         matches!(self, Self::PositionDelete | Self::DeletionVector)
     }
@@ -116,6 +125,7 @@ impl IcebergWriteBranch {
             Self::Data => "data",
             Self::PositionDelete => "position-delete",
             Self::DeletionVector => "deletion-vector",
+            Self::EqualityDelete => "equality-delete",
         }
     }
 }
@@ -137,6 +147,9 @@ pub enum IcebergWriteFlavor {
     RowMutationPositionDelete,
     /// Merge-on-read row mutation staging Puffin deletion vectors.
     RowMutationDeletionVector,
+    /// `ALTER TABLE ... ADD EQUALITY DELETE`: append Parquet equality-delete
+    /// files matched on column values.
+    EqualityDelete,
     /// Copy-on-write row mutation rewriting whole data files.
     RowMutationCopyOnWrite,
     /// `CREATE TABLE AS SELECT` publishing into a staged table.
@@ -165,6 +178,10 @@ impl IcebergWriteFlavor {
             Self::PartitionOverwrite => CommitOpKind::OverwritePartitions,
             Self::RowMutationPositionDelete => CommitOpKind::RowDelta,
             Self::RowMutationDeletionVector => CommitOpKind::RowDeltaDvFromFiles,
+            // The same op a Parquet position-delete row mutation commits: the
+            // delta is file-based only when the artifacts are Puffin, and an
+            // equality delete's are not.
+            Self::EqualityDelete => CommitOpKind::RowDelta,
             Self::RowMutationCopyOnWrite => CommitOpKind::CowUpdate,
             Self::DistributedRewrite => CommitOpKind::SelectedRewrite,
             Self::TableMaintenance => CommitOpKind::Truncate,
@@ -189,6 +206,10 @@ impl IcebergWriteFlavor {
             Self::RowMutationDeletionVector => {
                 &[IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
             }
+            // An equality delete writes delete files and nothing else. Sealing
+            // a data branch beside it would give SQL somewhere to send rows the
+            // statement never produces.
+            Self::EqualityDelete => &[IcebergWriteBranch::EqualityDelete],
         }
     }
 
@@ -399,6 +420,14 @@ impl IcebergManagedPublicationFacts {
                 ConnectorManagedPublicationTechnique::Incremental,
                 Some(IcebergWriteBranch::PositionDelete),
             ) => IcebergWriteFlavor::RowMutationPositionDelete.commit_op_kind(),
+            // `sealed_delete_branch` only ever reports a branch that supersedes
+            // the deletes of a data file, and an equality delete does not; a
+            // publication cannot seal one either, because
+            // `allowed_session_branches` never offers it.
+            (
+                ConnectorManagedPublicationTechnique::Incremental,
+                Some(IcebergWriteBranch::EqualityDelete),
+            ) => IcebergWriteFlavor::EqualityDelete.commit_op_kind(),
         }
     }
 
@@ -522,6 +551,7 @@ impl IcebergWriteFlavor {
             Self::ManagedPublication => "managed-publication",
             Self::DistributedRewrite => "distributed-rewrite",
             Self::TableMaintenance => "table-maintenance",
+            Self::EqualityDelete => "equality-delete",
         }
     }
 
@@ -537,7 +567,8 @@ impl IcebergWriteFlavor {
             Self::PartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
             Self::RowMutationPositionDelete
             | Self::RowMutationDeletionVector
-            | Self::RowMutationCopyOnWrite => ConnectorWriteIntent::RowDelta,
+            | Self::RowMutationCopyOnWrite
+            | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
         }
     }
 }
@@ -780,6 +811,7 @@ pub struct IcebergWriterHandle {
     output: IcebergWriterOutput,
     data: Option<IcebergDataBranchRecipe>,
     old_deletes: BTreeMap<String, IcebergOldDeleteMergeTarget>,
+    equality: Option<IcebergEqualityDeleteRecipe>,
 }
 
 impl IcebergWriterHandle {
@@ -798,6 +830,32 @@ impl IcebergWriterHandle {
             output,
             data: Some(data),
             old_deletes: BTreeMap::new(),
+            equality: None,
+        })
+    }
+
+    /// Build the equality-delete branch's recipe.
+    ///
+    /// It freezes no old-delete reference and needs no base snapshot: the file
+    /// it writes names no data file and supersedes no existing artifact, so
+    /// there is nothing for it to merge.
+    pub fn try_new_equality_delete(
+        table: IcebergWriteTableFacts,
+        output: IcebergWriterOutput,
+        equality: IcebergEqualityDeleteRecipe,
+    ) -> Result<Self, ConnectorError> {
+        if output.file_format() != IcebergFileFormat::Parquet {
+            return Err(invalid(
+                "Iceberg equality-delete writer must produce Parquet",
+            ));
+        }
+        Ok(Self {
+            branch: IcebergWriteBranch::EqualityDelete,
+            table,
+            output,
+            data: None,
+            old_deletes: BTreeMap::new(),
+            equality: Some(equality),
         })
     }
 
@@ -816,10 +874,11 @@ impl IcebergWriterHandle {
         let expected_format = match branch {
             IcebergWriteBranch::PositionDelete => IcebergFileFormat::Parquet,
             IcebergWriteBranch::DeletionVector => IcebergFileFormat::Puffin,
-            IcebergWriteBranch::Data => {
-                return Err(invalid(
-                    "Iceberg data branch cannot be built as a delete branch",
-                ));
+            IcebergWriteBranch::Data | IcebergWriteBranch::EqualityDelete => {
+                return Err(invalid(format!(
+                    "Iceberg {} branch cannot be built as a position-delete branch",
+                    branch.as_str()
+                )));
             }
         };
         if output.file_format() != expected_format {
@@ -853,6 +912,7 @@ impl IcebergWriterHandle {
             output,
             data: None,
             old_deletes: frozen,
+            equality: None,
         })
     }
 
@@ -867,6 +927,12 @@ impl IcebergWriterHandle {
     }
     pub fn data(&self) -> Option<&IcebergDataBranchRecipe> {
         self.data.as_ref()
+    }
+
+    /// The match key an equality-delete branch writes its file on, present
+    /// exactly on that branch.
+    pub const fn equality(&self) -> Option<&IcebergEqualityDeleteRecipe> {
+        self.equality.as_ref()
     }
 
     /// The exact old-delete artifacts a writer must re-read, keyed by the data
@@ -1162,6 +1228,177 @@ impl IcebergPositionDeleteFileArtifact {
     }
 }
 
+/// One column an equality-delete file matches rows on.
+///
+/// `data_type` is the caller's Arrow type *rendering*, not a type. The backend
+/// takes the real Arrow type from the fragment's own frozen input schema and
+/// uses this only to prove the two agree, which is what keeps an Arrow value off
+/// the FE/BE boundary while still making a mismatch a refusal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergEqualityDeleteColumnFacts {
+    name: String,
+    field_id: i32,
+    data_type: String,
+    nullable: bool,
+}
+
+impl IcebergEqualityDeleteColumnFacts {
+    pub fn try_new(
+        name: String,
+        field_id: i32,
+        data_type: String,
+        nullable: bool,
+    ) -> Result<Self, ConnectorError> {
+        if name.is_empty() {
+            return Err(invalid("Iceberg equality-delete column requires a name"));
+        }
+        if data_type.is_empty() {
+            return Err(invalid(format!(
+                "Iceberg equality-delete column `{name}` requires its frozen type rendering"
+            )));
+        }
+        if field_id < 0 {
+            return Err(invalid(format!(
+                "Iceberg equality-delete column `{name}` requires a nonnegative field id"
+            )));
+        }
+        Ok(Self {
+            name,
+            field_id,
+            data_type,
+            nullable,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub const fn field_id(&self) -> i32 {
+        self.field_id
+    }
+    pub fn data_type(&self) -> &str {
+        &self.data_type
+    }
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// How an equality-delete branch writer builds its delete file.
+///
+/// It carries no old-delete reference by construction: an equality delete
+/// appends a file that names no data file and retires no existing artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergEqualityDeleteRecipe {
+    columns: Vec<IcebergEqualityDeleteColumnFacts>,
+}
+
+impl IcebergEqualityDeleteRecipe {
+    pub fn try_new(columns: Vec<IcebergEqualityDeleteColumnFacts>) -> Result<Self, ConnectorError> {
+        // A file that matches on nothing would delete every row it is applied
+        // to, so an empty match key is refused rather than treated as "match
+        // all".
+        if columns.is_empty() {
+            return Err(invalid(
+                "Iceberg equality delete matches on at least one column",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for column in &columns {
+            if !seen.insert(column.field_id()) {
+                return Err(invalid(format!(
+                    "Iceberg equality-delete columns repeat field id {}",
+                    column.field_id()
+                )));
+            }
+        }
+        Ok(Self { columns })
+    }
+
+    pub fn columns(&self) -> &[IcebergEqualityDeleteColumnFacts] {
+        &self.columns
+    }
+
+    /// The match key as Iceberg records it on the manifest: sorted and unique.
+    pub fn field_ids(&self) -> Vec<i32> {
+        self.columns
+            .iter()
+            .map(IcebergEqualityDeleteColumnFacts::field_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+/// One written Parquet equality-delete file.
+///
+/// It names no data file: Iceberg applies an equality delete to every row whose
+/// equality-column values match, across the data files the delete's sequence
+/// number covers. That is also why it supersedes nothing and merges nothing.
+#[derive(Clone, Debug)]
+pub struct IcebergEqualityDeleteFileArtifact {
+    path: String,
+    partition: IcebergArtifactPartition,
+    metrics: IcebergArtifactMetrics,
+    equality_field_ids: Vec<i32>,
+}
+
+impl IcebergEqualityDeleteFileArtifact {
+    pub fn try_new(
+        path: String,
+        partition: IcebergArtifactPartition,
+        metrics: IcebergArtifactMetrics,
+        equality_field_ids: Vec<i32>,
+    ) -> Result<Self, ConnectorError> {
+        validate_location("staged equality-delete file", &path)?;
+        if metrics.record_count() == 0 {
+            return Err(invalid(
+                "Iceberg staged equality-delete file must carry at least one match row",
+            ));
+        }
+        if equality_field_ids.is_empty() {
+            return Err(invalid(
+                "Iceberg staged equality-delete file matches on at least one field id",
+            ));
+        }
+        // Iceberg reads these back as a set, so a duplicate is meaningless and
+        // an unstable order would make the same file look different on replay.
+        let mut previous: Option<i32> = None;
+        for field_id in &equality_field_ids {
+            if *field_id < 0 {
+                return Err(invalid(
+                    "Iceberg staged equality-delete field id must be nonnegative",
+                ));
+            }
+            if previous.is_some_and(|previous| previous >= *field_id) {
+                return Err(invalid(
+                    "Iceberg staged equality-delete field ids must be sorted and unique",
+                ));
+            }
+            previous = Some(*field_id);
+        }
+        Ok(Self {
+            path,
+            partition,
+            metrics,
+            equality_field_ids,
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub const fn partition(&self) -> &IcebergArtifactPartition {
+        &self.partition
+    }
+    pub const fn metrics(&self) -> &IcebergArtifactMetrics {
+        &self.metrics
+    }
+    pub fn equality_field_ids(&self) -> &[i32] {
+        &self.equality_field_ids
+    }
+}
+
 /// One written Puffin deletion vector.
 #[derive(Clone, Debug)]
 pub struct IcebergDeletionVectorArtifact {
@@ -1258,6 +1495,7 @@ pub enum IcebergCommitArtifact {
     DataFile(IcebergDataFileArtifact),
     PositionDeleteFile(IcebergPositionDeleteFileArtifact),
     DeletionVector(IcebergDeletionVectorArtifact),
+    EqualityDeleteFile(IcebergEqualityDeleteFileArtifact),
 }
 
 /// Exactly one staged Iceberg artifact.
@@ -1287,6 +1525,10 @@ impl IcebergCommitFragment {
         Self::new(IcebergCommitArtifact::DeletionVector(artifact))
     }
 
+    pub fn equality_delete_file(artifact: IcebergEqualityDeleteFileArtifact) -> Self {
+        Self::new(IcebergCommitArtifact::EqualityDeleteFile(artifact))
+    }
+
     pub const fn artifact(&self) -> &IcebergCommitArtifact {
         &self.artifact
     }
@@ -1297,6 +1539,7 @@ impl IcebergCommitFragment {
             IcebergCommitArtifact::DataFile(file) => file.path(),
             IcebergCommitArtifact::PositionDeleteFile(file) => file.path(),
             IcebergCommitArtifact::DeletionVector(file) => file.path(),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => file.path(),
         }
     }
 
@@ -1305,6 +1548,7 @@ impl IcebergCommitFragment {
             IcebergCommitArtifact::DataFile(file) => file.partition(),
             IcebergCommitArtifact::PositionDeleteFile(file) => file.partition(),
             IcebergCommitArtifact::DeletionVector(file) => file.partition(),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => file.partition(),
         }
     }
 
@@ -1313,13 +1557,19 @@ impl IcebergCommitFragment {
             IcebergCommitArtifact::DataFile(file) => file.metrics(),
             IcebergCommitArtifact::PositionDeleteFile(file) => file.metrics(),
             IcebergCommitArtifact::DeletionVector(file) => file.metrics(),
+            IcebergCommitArtifact::EqualityDeleteFile(file) => file.metrics(),
         }
     }
 
     /// The data file a delete artifact supersedes deletes for, if any.
     pub fn referenced_data_file(&self) -> Option<&str> {
         match &self.artifact {
-            IcebergCommitArtifact::DataFile(_) => None,
+            // A data file supersedes nothing, and an equality delete names no
+            // data file at all: it matches on column values across every file
+            // its sequence number covers.
+            IcebergCommitArtifact::DataFile(_) | IcebergCommitArtifact::EqualityDeleteFile(_) => {
+                None
+            }
             IcebergCommitArtifact::PositionDeleteFile(file) => Some(file.referenced_data_file()),
             IcebergCommitArtifact::DeletionVector(file) => Some(file.referenced_data_file()),
         }
@@ -1327,7 +1577,9 @@ impl IcebergCommitFragment {
 
     pub fn merged_old_references(&self) -> &[String] {
         match &self.artifact {
-            IcebergCommitArtifact::DataFile(_) => &[],
+            IcebergCommitArtifact::DataFile(_) | IcebergCommitArtifact::EqualityDeleteFile(_) => {
+                &[]
+            }
             IcebergCommitArtifact::PositionDeleteFile(file) => file.merged_old_references(),
             IcebergCommitArtifact::DeletionVector(file) => file.merged_old_references(),
         }
@@ -1339,6 +1591,7 @@ impl IcebergCommitFragment {
             IcebergCommitArtifact::DataFile(_) => IcebergWriteBranch::Data,
             IcebergCommitArtifact::PositionDeleteFile(_) => IcebergWriteBranch::PositionDelete,
             IcebergCommitArtifact::DeletionVector(_) => IcebergWriteBranch::DeletionVector,
+            IcebergCommitArtifact::EqualityDeleteFile(_) => IcebergWriteBranch::EqualityDelete,
         }
     }
 }

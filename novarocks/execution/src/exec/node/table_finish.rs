@@ -32,7 +32,7 @@
 
 use std::sync::Arc;
 
-use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_dense_target_ordinals};
+use novarocks_spi::connector::write_stack::{WriteTargetOrdinal, validate_query_target_ordinals};
 
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
@@ -60,7 +60,14 @@ impl TableFinishNode {
                 "table finish requires at least one writer input".to_string(),
             ));
         }
-        validate_dense_target_ordinals(&expected_targets).map_err(|error| {
+        // The expected set is the targets *this query's* writers feed, so it is
+        // validated as a query set: non-empty, inside the frozen bound, and
+        // free of duplicates. It is deliberately not required to be dense from
+        // zero -- a copy-on-write statement compiles one writer per query, at
+        // that group's own ordinal, so query `k` legitimately expects `[k]`.
+        // Denseness stays a property of the session's sealed set, where
+        // `ConnectorWriteSessionPlan::try_new` enforces it.
+        validate_query_target_ordinals(&expected_targets).map_err(|error| {
             ExecPlanBuildError::new(
                 ExecPlanInvariant::Node,
                 format!("table finish expected write targets: {error}"),
@@ -78,14 +85,13 @@ impl TableFinishNode {
         &self.expected_targets
     }
 
-    /// The highest legal ordinal in the sealed set. The set is dense from zero,
-    /// so a single comparison decides membership.
-    pub fn highest_expected_ordinal(&self) -> u32 {
-        self.expected_targets
-            .iter()
-            .map(|target| target.get())
-            .max()
-            .unwrap_or_default()
+    /// Whether `ordinal` is one of the targets this query's writers feed.
+    ///
+    /// This is an exact set test rather than a comparison against the highest
+    /// ordinal: a query set need not be dense from zero, so "at or below the
+    /// highest" would admit a target this query never compiled a writer for.
+    pub fn accepts_target(&self, ordinal: WriteTargetOrdinal) -> bool {
+        self.expected_targets.contains(&ordinal)
     }
 
     pub const fn fragment_validator(&self) -> &Arc<dyn ConnectorCommitFragmentCarrierValidator> {
