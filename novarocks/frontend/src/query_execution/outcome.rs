@@ -43,6 +43,10 @@ pub(crate) struct QueryExecutionResult {
     /// provider-neutral carrier.  It owns the exact control lease until the
     /// engine transaction layer makes the terminal decision.
     pub(crate) connector_completion: Option<ConnectorWriteCompletion>,
+    /// Present only when this write travelled the NCP-6 write-session data
+    /// plane. It carries the commit authority and the rows every writer
+    /// accepted; neither may be surfaced before the external commit succeeds.
+    pub(crate) write_session: Option<ConnectorWriteSessionCompletion>,
     pub(crate) fragment_profiles: Vec<RuntimeProfileTree>,
 }
 
@@ -57,6 +61,7 @@ impl std::fmt::Debug for QueryExecutionResult {
                 "has_connector_completion",
                 &self.connector_completion.is_some(),
             )
+            .field("has_write_session", &self.write_session.is_some())
             .field("fragment_profiles", &self.fragment_profiles)
             .finish()
     }
@@ -112,6 +117,15 @@ impl ConnectorWriteSessionCompletion {
         self.prepared.row_count()
     }
 
+    /// Whether the closed data plane produced no commit fragment at all.
+    ///
+    /// This is not "zero rows": a writer that accepted no row still emits its
+    /// fragment. An empty set means no writer produced anything, which is the
+    /// one case where committing would publish a snapshot describing nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.prepared.fragments().is_empty()
+    }
+
     pub(crate) fn into_parts(
         self,
     ) -> (
@@ -119,6 +133,17 @@ impl ConnectorWriteSessionCompletion {
         crate::query_execution::write_result::DecodedPreparedWriteSet,
     ) {
         (self.session, self.prepared)
+    }
+
+    /// Build a completion directly, for statement-flow tests that need one
+    /// without driving a whole distributed round. Production code has no such
+    /// constructor: only the coordinator's dual barrier produces one.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        prepared: crate::query_execution::write_result::DecodedPreparedWriteSet,
+    ) -> Self {
+        Self { session, prepared }
     }
 }
 
@@ -161,6 +186,24 @@ impl WriteExecutionOutcome {
             self.abort,
             self.connector_completion,
         )
+    }
+
+    /// Carry every write terminal this outcome holds into the role-neutral
+    /// execution result.
+    ///
+    /// Both write data planes converge here so a statement owner reads one
+    /// value: the write-session carrier and the staged-report carrier are
+    /// mutually exclusive by construction, and a caller that projected only
+    /// one of them would silently lose the other's commit authority.
+    pub(crate) fn into_execution_result(self) -> QueryExecutionResult {
+        QueryExecutionResult {
+            query_result: self.result,
+            write_commit: self.commit,
+            write_abort: self.abort,
+            connector_completion: self.connector_completion,
+            write_session: self.write_session,
+            fragment_profiles: Vec::new(),
+        }
     }
 
     /// Consume a native connector-write terminal without exposing a client row
@@ -710,6 +753,7 @@ impl QueryOutcomeFactory {
             write_commit,
             write_abort,
             connector_completion,
+            write_session,
             fragment_profiles,
         } = result;
         match self.intent {
@@ -720,6 +764,10 @@ impl QueryOutcomeFactory {
                         "Write outcome cannot contain fragment profiles",
                     ));
                 }
+                if let Some(completion) = write_session {
+                    let (session, prepared) = completion.into_parts();
+                    return self.write_session_outcome(session, prepared);
+                }
                 self.write_with_connector(
                     query_result,
                     write_commit,
@@ -728,7 +776,10 @@ impl QueryOutcomeFactory {
                 )
             }
             DistributedQueryIntent::Profile => {
-                if write_commit.is_some() || write_abort.is_some() || connector_completion.is_some()
+                if write_commit.is_some()
+                    || write_abort.is_some()
+                    || connector_completion.is_some()
+                    || write_session.is_some()
                 {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
@@ -741,6 +792,7 @@ impl QueryOutcomeFactory {
                 if write_commit.is_some()
                     || write_abort.is_some()
                     || connector_completion.is_some()
+                    || write_session.is_some()
                     || !fragment_profiles.is_empty()
                 {
                     return Err(DistributedQueryError::new(

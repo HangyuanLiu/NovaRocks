@@ -1537,6 +1537,33 @@ pub(crate) mod tests {
         .expect("control binding")
     }
 
+    /// StarRocks is read-only external data. Its control generation installs
+    /// no write capability, so a statement that tries to write to a StarRocks
+    /// catalog is refused as unsupported while it is still deriving its
+    /// write-stack lease -- before a plan is compiled, a recipe is sealed, or
+    /// a fragment is submitted.
+    #[test]
+    fn a_starrocks_catalog_has_no_distributed_write_capability() {
+        let host = ConnectorControlHost::new();
+        let instance_id = ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID");
+        host.register(starrocks_binding())
+            .expect("register StarRocks generation");
+        let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
+
+        let error =
+            crate::connector::write_target::derive_write_stack_lease(&host, &planning_lease)
+                .expect_err("StarRocks has no distributed write capability");
+        assert!(
+            error.contains("no distributed write capability"),
+            "unexpected error: {error}"
+        );
+
+        let typed_error = host
+            .acquire_exact_write_stack(planning_lease.control_runtime_id())
+            .expect_err("StarRocks has no distributed write capability");
+        assert_eq!(typed_error.kind(), ConnectorErrorKind::Unsupported);
+    }
+
     #[test]
     fn observing_current_binding_does_not_require_a_planning_lease() {
         let host = ConnectorControlHost::new();

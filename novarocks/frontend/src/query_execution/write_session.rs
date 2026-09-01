@@ -291,8 +291,73 @@ impl ConnectorWriteSession {
     }
 }
 
+/// Open one distributed write's session on a write stack already pinned to the
+/// generation that planned it.
+///
+/// The catalog identity comes from the same generation's write lease rather
+/// than from a fresh catalog resolution: the recipes the session seals are
+/// stamped into fragments beside this handle, and a handle from a different
+/// incarnation would name a runtime that never admitted them.
+pub(crate) fn begin_connector_write_session(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
+    let catalog_handle = write_lease
+        .catalog_properties()
+        .map(|properties| properties.handle().clone())
+        .ok_or_else(|| {
+            "connector write lease has no immutable catalog runtime identity".to_string()
+        })?;
+    ConnectorWriteSession::begin(lease, catalog_handle, request)
+        .map(std::sync::Arc::new)
+        .map_err(|error| format!("begin connector write session: {error}"))
+}
+
+/// The external commit of one completed write session, and the rows it made
+/// visible.
+///
+/// `affected_rows` exists only on `KnownCommitted`. That is the whole point of
+/// the type: the row count is known as soon as the data plane closes, but
+/// reporting it to a client before the commit succeeded would name rows that
+/// may never become visible -- and on `CommitUnknown` nobody yet knows whether
+/// they did.
+pub(crate) struct CommittedWriteSession {
+    outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    affected_rows: Option<u64>,
+}
+
+impl CommittedWriteSession {
+    /// The rows a client may be told about, present only after a commit that
+    /// is known to have succeeded.
+    pub(crate) const fn affected_rows(&self) -> Option<u64> {
+        self.affected_rows
+    }
+
+    pub(crate) fn into_outcome(self) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        self.outcome
+    }
+}
+
+/// Perform the one external commit for a write whose data plane closed and
+/// whose execution succeeded, then gate its affected-row count on the result.
+pub(crate) fn finish_write_session(
+    completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    context: ConnectorRequestContext,
+) -> Result<CommittedWriteSession, ConnectorError> {
+    let row_count = completion.row_count();
+    let (session, prepared) = completion.into_parts();
+    let outcome = session.finish(prepared, context)?;
+    let affected_rows =
+        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(row_count);
+    Ok(CommittedWriteSession {
+        outcome,
+        affected_rows,
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use novarocks_connector_binding::ConnectorControlWriteBinding;
@@ -361,10 +426,10 @@ mod tests {
     // ---- the session control under test ----------------------------------
 
     #[derive(Default)]
-    struct Recorded {
-        finish: usize,
-        abort: usize,
-        reconcile: usize,
+    pub(crate) struct Recorded {
+        pub(crate) finish: usize,
+        pub(crate) abort: usize,
+        pub(crate) reconcile: usize,
     }
 
     struct FakeSession {
@@ -433,10 +498,9 @@ mod tests {
             _request: ConnectorWriteSessionAbortRequest<'_>,
         ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
             self.recorded.lock().expect("recorded").abort += 1;
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Internal,
-                "abort outcome is not scripted in this test",
-            ))
+            Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            })
         }
 
         fn reconcile_write(
@@ -536,9 +600,9 @@ mod tests {
         }
     }
 
-    struct Fixture {
-        session: ConnectorWriteSession,
-        recorded: Arc<Mutex<Recorded>>,
+    pub(crate) struct Fixture {
+        pub(crate) session: Arc<ConnectorWriteSession>,
+        pub(crate) recorded: Arc<Mutex<Recorded>>,
     }
 
     fn fixture(targets: usize, payload_bytes: usize) -> Fixture {
@@ -554,7 +618,9 @@ mod tests {
         )
     }
 
-    fn fixture_with_outcome(
+    /// A write session on a scripted control, for tests in the statement flows
+    /// that need a real session but no real provider.
+    pub(crate) fn fixture_with_outcome(
         targets: usize,
         payload_bytes: usize,
         outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
@@ -583,8 +649,10 @@ mod tests {
             group,
             || {},
         );
-        let session = ConnectorWriteSession::begin(lease, catalog_handle(), begin_request())
-            .expect("begin write");
+        let session = Arc::new(
+            ConnectorWriteSession::begin(lease, catalog_handle(), begin_request())
+                .expect("begin write"),
+        );
         Fixture { session, recorded }
     }
 
@@ -605,7 +673,7 @@ mod tests {
         }
     }
 
-    fn request_context() -> ConnectorRequestContext {
+    pub(crate) fn request_context() -> ConnectorRequestContext {
         struct NotCancelled;
         impl novarocks_spi::connector::ConnectorCancellation for NotCancelled {
             fn is_cancelled(&self) -> bool {
@@ -621,7 +689,7 @@ mod tests {
         .expect("request context")
     }
 
-    fn empty_prepared() -> DecodedPreparedWriteSet {
+    pub(crate) fn empty_prepared() -> DecodedPreparedWriteSet {
         DecodedPreparedWriteSet::for_test(0, Vec::new())
     }
 
@@ -638,6 +706,110 @@ mod tests {
             bytes::Bytes::new(),
         )
         .expect("evidence")
+    }
+
+    /// Bytes a producer could actually emit, so a test that hands a fragment
+    /// to a session exercises the real decode path rather than a stub.
+    pub(crate) fn commit_fragment_bytes() -> Vec<u8> {
+        use prost::Message;
+        write_dto::ConnectorCommitFragment {
+            fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
+                write_dto::IcebergCommitFragment {
+                    artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
+                        write_dto::IcebergDataFileArtifact {
+                            path: "s3://bucket/db/t/data/new.parquet".to_string(),
+                            file_format: write_dto::IcebergFileFormat::Parquet as i32,
+                            partition: Some(write_dto::IcebergArtifactPartition {
+                                partition_path: String::new(),
+                                null_fingerprint: String::new(),
+                                partition_spec_id: 0,
+                                descriptor: Some(write_dto::IcebergPartitionDescriptor {
+                                    values: Vec::new(),
+                                }),
+                            }),
+                            metrics: Some(write_dto::IcebergArtifactMetrics {
+                                record_count: 7,
+                                file_size_in_bytes: 128,
+                                split_offsets: Vec::new(),
+                                column_stats: None,
+                            }),
+                            first_row_id: None,
+                        },
+                    )),
+                },
+            )),
+        }
+        .encode_to_vec()
+    }
+
+    pub(crate) fn known_committed() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::KnownCommitted {
+            effect: novarocks_spi::connector::ExternalMutationEffect::Applied,
+            receipt: ConnectorWriteReceipt::try_new(bytes::Bytes::from_static(b"receipt"))
+                .expect("receipt"),
+            finalization: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+        }
+    }
+
+    pub(crate) fn commit_unknown() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::CommitUnknown {
+            failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                "scripted commit outcome is unknown",
+            ),
+            evidence: evidence(),
+        }
+    }
+
+    fn completion(
+        session: &Arc<ConnectorWriteSession>,
+        row_count: u64,
+    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
+        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+            Arc::clone(session),
+            DecodedPreparedWriteSet::for_test(row_count, Vec::new()),
+        )
+    }
+
+    #[test]
+    fn affected_rows_are_reported_only_after_a_known_successful_commit() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
+            .expect("finish");
+
+        assert_eq!(committed.affected_rows(), Some(7));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn a_commit_unknown_outcome_reports_no_affected_rows() {
+        // The rows were accepted by every writer, so the count is known -- but
+        // whether they became visible is not, and reporting success here would
+        // tell a client about rows that may not exist.
+        let fixture = fixture_with_outcome(1, 16, commit_unknown());
+        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
+            .expect("finish");
+
+        assert!(committed.affected_rows().is_none());
+        assert!(matches!(
+            committed.into_outcome(),
+            ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+    }
+
+    #[test]
+    fn a_known_uncommitted_commit_reports_no_affected_rows() {
+        let fixture = fixture(1, 16);
+        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
+            .expect("finish");
+
+        assert!(committed.affected_rows().is_none());
+        assert!(matches!(
+            committed.into_outcome(),
+            ExternalMutationOutcome::KnownUncommitted { .. }
+        ));
     }
 
     #[test]

@@ -188,7 +188,8 @@ struct DistributedDeleteWriteExecutor {
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    /// The one commit authority for this statement.
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     /// Deletion vectors are written one per target data file, so the sink output
     /// is shuffled by its first column. Position deletes have no such
     /// requirement. Both follow from the provider-signed strategy.
@@ -214,7 +215,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
                 novarocks_sql::compiler::RootDistributionRequirement::Any
             };
             *assembly = Some(
-                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
                     &self.state,
                     Some(&self.target.catalog),
                     &self.target.namespace,
@@ -225,7 +226,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
                     distribution,
                     Some(&self.execution),
                     &self.connector_context,
-                    Some(self.connector_write.clone()),
+                    Arc::clone(&self.write_session),
                 )?,
             );
         }
@@ -246,19 +247,8 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             .finish(native_bundle)
     }
 
-    fn commit_terminal(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        completion
-            .session()
-            .commit(completion.terminal_request_context())
-            .map_err(|error| error.to_string())
+    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -330,14 +320,25 @@ fn prepare_delete_write(
         &write_input_columns(&preparation),
         target_ref,
     )?;
-    let connector_write =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-            connector_operation_id,
-            preparation,
+    // One row-mutation delete branch. The provider decides whether that branch
+    // writes position deletes or a deletion vector; the input shape it already
+    // signed is projected back so the session admits the same write.
+    let write_session = crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            state.typed_connector_control(),
+            &planning_lease,
+        )?,
+        write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            crate::connector::write_target::write_input_request_for_shape(preparation.input()),
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
             connector_context.clone(),
-            write_lease.clone(),
-        )
-        .map_err(|error| format!("activate Provider DELETE write: {error}"))?;
+        )?,
+    )?;
     let executor = DistributedDeleteWriteExecutor {
         state: state.clone(),
         target: target.clone(),
@@ -346,7 +347,7 @@ fn prepare_delete_write(
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
-        connector_write,
+        write_session,
         // Deletion vectors are written one per target data file, so the sink
         // output is shuffled by its first column; position deletes have no such
         // requirement.

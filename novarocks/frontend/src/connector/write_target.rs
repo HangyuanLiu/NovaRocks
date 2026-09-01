@@ -152,8 +152,7 @@ impl ConnectorWriteTargetBinding {
         &self,
         host: &crate::connector::control_host::ConnectorControlHost,
     ) -> Result<crate::connector::control_host::ConnectorWriteStackLease, String> {
-        host.acquire_exact_write_stack(self.lease.control_runtime_id())
-            .map_err(|error| format!("derive connector write-stack lease: {error}"))
+        derive_write_stack_lease(host, &self.lease)
     }
 
     /// Ask the exact generation that resolved this target to sign one row
@@ -237,4 +236,74 @@ pub fn load_write_target_binding(
         &lease, context, namespace, table, resolution,
     )?;
     Ok(ConnectorWriteTargetBinding::new(metadata, lease))
+}
+
+/// Derive the NCP-6 write-stack lease from a retained planning generation.
+///
+/// Statements that never build a [`ConnectorWriteTargetBinding`] -- the ones
+/// that resolve their target through a row-mutation, rewrite, or MV binding --
+/// reach the same generation through this function, so every write commits
+/// through the incarnation that planned it rather than through whichever one
+/// happens to be active at commit time.
+pub(crate) fn derive_write_stack_lease(
+    host: &crate::connector::control_host::ConnectorControlHost,
+    planning_lease: &ConnectorControlPlanningLease,
+) -> Result<crate::connector::control_host::ConnectorWriteStackLease, String> {
+    host.acquire_exact_write_stack(planning_lease.control_runtime_id())
+        .map_err(|error| format!("derive connector write-stack lease: {error}"))
+}
+
+/// Project a provider-signed input shape back into the request that produced
+/// it.
+///
+/// A begin session must describe the same input the admission already signed.
+/// Rebuilding the request from field names would let the two drift; projecting
+/// the signed shape cannot.
+pub(crate) fn write_input_request_for_shape(
+    shape: &novarocks_spi::connector::ConnectorWriteInputShape,
+) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+    use novarocks_spi::connector::{
+        ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    };
+
+    fn requests(
+        fields: &[novarocks_spi::connector::ConnectorWriteFieldBinding],
+    ) -> Vec<ConnectorWriteFieldRequest> {
+        fields
+            .iter()
+            .map(|field| ConnectorWriteFieldRequest::new(field.field().clone()))
+            .collect()
+    }
+
+    match shape {
+        ConnectorWriteInputShape::Data { fields } => ConnectorWriteInputRequest::Data {
+            fields: requests(fields),
+        },
+        ConnectorWriteInputShape::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => ConnectorWriteInputRequest::RowLineage {
+            data_fields: requests(data_fields),
+            row_identity_fields: requests(row_identity_fields),
+        },
+        ConnectorWriteInputShape::PositionDelete {
+            identity_fields,
+            partition_source_fields,
+        } => ConnectorWriteInputRequest::PositionDelete {
+            identity_fields: requests(identity_fields),
+            partition_source_fields: requests(partition_source_fields),
+        },
+        ConnectorWriteInputShape::DeletionVector {
+            identity_fields,
+            partition_source_fields,
+        } => ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: requests(identity_fields),
+            partition_source_fields: requests(partition_source_fields),
+        },
+        ConnectorWriteInputShape::EqualityDelete { equality_fields } => {
+            ConnectorWriteInputRequest::EqualityDelete {
+                equality_fields: requests(equality_fields),
+            }
+        }
+    }
 }

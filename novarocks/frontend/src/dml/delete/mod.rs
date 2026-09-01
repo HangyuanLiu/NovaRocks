@@ -55,7 +55,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
             .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?;
         let input = encoding.input().map_err(DmlError::executor)?;
         let native_bundle =
-            crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
+            crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input)
                 .map_err(DmlError::executor)?;
         drop(encoding);
         Ok(

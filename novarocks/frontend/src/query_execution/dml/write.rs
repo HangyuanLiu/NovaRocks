@@ -79,18 +79,11 @@ pub(crate) fn execute_bound_distributed_write_request(
     query_execution: &QueryExecutionService,
     request: DistributedQueryRequest,
 ) -> Result<QueryExecutionResult, String> {
-    let (query_result, write_commit, write_abort, connector_completion) = query_execution
+    query_execution
         .execute(request)
         .and_then(DistributedQueryOutcome::into_write)
-        .map(WriteExecutionOutcome::into_parts_with_connector)
-        .map_err(|error| error.to_string())?;
-    Ok(QueryExecutionResult {
-        query_result,
-        write_commit,
-        write_abort,
-        connector_completion,
-        fragment_profiles: Vec::new(),
-    })
+        .map(WriteExecutionOutcome::into_execution_result)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn scan_preparation_options(

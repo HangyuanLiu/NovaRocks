@@ -186,7 +186,8 @@ struct DistributedEqualityDeleteWriteExecutor {
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    /// The one commit authority for this statement.
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     native_assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
 }
 
@@ -203,7 +204,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
             .expect("prepared equality DELETE native assembly lock poisoned");
         if assembly.is_none() {
             *assembly = Some(
-                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
                     &self.state,
                     Some(&self.target.catalog),
                     &self.target.namespace,
@@ -214,7 +215,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                     novarocks_sql::compiler::RootDistributionRequirement::Any,
                     Some(&self.execution),
                     &self.connector_context,
-                    Some(self.connector_write.clone()),
+                    Arc::clone(&self.write_session),
                 )?,
             );
         }
@@ -236,28 +237,17 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                 "prepared equality DELETE native assembly was already consumed".to_string()
             })?
             .finish(native_bundle)?;
-        if result.write_abort.is_none() && result.connector_completion.is_none() {
+        if result.write_abort.is_none() && result.write_session.is_none() {
             return Err(
-                "ADD EQUALITY DELETE completed without a sealed connector write completion for non-empty input"
+                "ADD EQUALITY DELETE completed without a sealed connector write session for non-empty input"
                     .to_string(),
             );
         }
         Ok(result)
     }
 
-    fn commit_terminal(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        completion
-            .session()
-            .commit(completion.terminal_request_context())
-            .map_err(|error| error.to_string())
+    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -285,19 +275,39 @@ fn prepare_equality_delete_distributed_write(
     let write_lease = planning_lease
         .derive_write_lease()
         .map_err(|error| format!("derive equality-delete write lease: {error}"))?;
+    let input = ConnectorWriteInputRequest::EqualityDelete {
+        equality_fields: delete_columns
+            .iter()
+            .map(|column| ConnectorWriteFieldRequest::new(column.clone()))
+            .collect(),
+    };
     let preparation = crate::query_execution::dml::iceberg_writer::prepare_iceberg_connector_write(
         &write_lease,
         target,
         "main",
         ConnectorWriteIntent::RowDelta,
-        ConnectorWriteInputRequest::EqualityDelete {
-            equality_fields: delete_columns
-                .iter()
-                .map(|column| ConnectorWriteFieldRequest::new(column.clone()))
-                .collect(),
-        },
+        input.clone(),
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
         connector_context.clone(),
+    )?;
+    // One logical equality-delete branch on the generation that resolved the
+    // target. ADD EQUALITY DELETE appends delete files rather than mutating
+    // rows in place, so it is an ordinary write, not a row mutation.
+    let write_session = crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            state.typed_connector_control(),
+            &planning_lease,
+        )?,
+        &write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            "main",
+            ConnectorWriteIntent::RowDelta,
+            input,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
+            connector_context.clone(),
+        )?,
     )?;
     let target_binding = admit_prepared_frozen_connector_write_target(
         table_bindings.as_ref(),
@@ -306,7 +316,7 @@ fn prepare_equality_delete_distributed_write(
             target.namespace.clone(),
             target.table.clone(),
         ),
-        preparation.clone(),
+        preparation,
         planning_lease.clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
@@ -316,15 +326,8 @@ fn prepare_equality_delete_distributed_write(
         novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
-    let connector_operation_id = publication_id.into();
-    let connector_write =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-            connector_operation_id,
-            preparation,
-            connector_context.clone(),
-            write_lease,
-        )
-        .map_err(|error| format!("activate Provider equality-delete write: {error}"))?;
+    let connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId =
+        publication_id.into();
     let executor = DistributedEqualityDeleteWriteExecutor {
         state: state.clone(),
         target: target.clone(),
@@ -333,7 +336,7 @@ fn prepare_equality_delete_distributed_write(
         table_bindings,
         execution: execution.clone(),
         connector_context: connector_context.clone(),
-        connector_write,
+        write_session,
         native_assembly: Mutex::new(None),
     };
     Ok(prepared_delete(

@@ -49,6 +49,11 @@ pub struct NativeFragmentEncodingInput {
     distributed_plan: DistributedPlan,
     prepared: PreparedFragmentSet,
     provenance: u64,
+    /// Present exactly when this plan contains dataflow writer nodes. The
+    /// recipes travel with the plan they were sealed for so an encode can
+    /// never pair one round's plan with another round's session.
+    write_targets:
+        Option<crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets>,
 }
 
 impl NativeFragmentEncodingInput {
@@ -57,7 +62,24 @@ impl NativeFragmentEncodingInput {
             distributed_plan,
             prepared,
             provenance: next_native_encoding_provenance(),
+            write_targets: None,
         }
+    }
+
+    /// Attach the write targets one begin session sealed for exactly this plan.
+    pub(crate) fn with_sealed_write_targets(
+        mut self,
+        write_targets: crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets,
+    ) -> Self {
+        self.write_targets = Some(write_targets);
+        self
+    }
+
+    /// The sealed recipes, present only for a dataflow write plan.
+    pub(crate) const fn sealed_write_targets(
+        &self,
+    ) -> Option<&crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets> {
+        self.write_targets.as_ref()
     }
 
     pub fn distributed_plan(&self) -> &DistributedPlan {
