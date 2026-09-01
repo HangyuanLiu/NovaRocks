@@ -52,6 +52,7 @@ pub mod adapter;
 pub mod budget;
 pub mod limits;
 pub mod prepared;
+pub mod relation;
 pub mod runtime;
 pub mod session;
 pub mod target;
@@ -65,6 +66,13 @@ pub use limits::{
     MAX_CONNECTOR_WRITE_TARGETS, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
 };
 pub use prepared::{ConnectorPreparedWriteSet, PreparedWriteSetLedger, WriteRowCountAccumulator};
+pub use relation::{
+    RootRowKind, WRITE_RELATION_COLUMN_COUNT, WRITE_RELATION_FRAGMENT_COLUMN,
+    WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_COLUMN, WRITE_RELATION_KIND_INDEX,
+    WRITE_RELATION_ROW_COUNT_COLUMN, WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_COLUMN,
+    WRITE_RELATION_TARGET_INDEX, WriterRowKind, root_output_schema, validate_root_row,
+    validate_writer_row, writer_output_schema,
+};
 pub use runtime::{
     ConnectorCommitFragment, ConnectorWriteBinding, ConnectorWriteCommitHandle,
     ConnectorWriterHandle,
