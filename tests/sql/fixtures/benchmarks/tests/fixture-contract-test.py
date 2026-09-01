@@ -76,6 +76,48 @@ class FixtureContractTest(unittest.TestCase):
             target[field] = replacement
             self.assertNotEqual(baseline, self.resolve(model)["fixture_contract_id"], section)
 
+    def test_standard_layout_is_pinned_to_tested_p4_candidate(self):
+        layouts = {
+            (layout["suite"], layout["table"]): {
+                "range_partitions": layout["range_partitions"],
+                "target_file_size_bytes": layout["target_file_size_bytes"],
+            }
+            for layout in self.model["fixture"]["table_layouts"]
+        }
+        self.assertEqual(
+            layouts,
+            {
+                ("ssb", "lineorder"): {
+                    "range_partitions": 4,
+                    "target_file_size_bytes": 64 * 1024 * 1024,
+                },
+                ("tpc-h", "lineitem"): {
+                    "range_partitions": 4,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+                ("tpc-h", "orders"): {
+                    "range_partitions": 1,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+                ("tpc-ds", "store_sales"): {
+                    "range_partitions": 4,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+                ("tpc-ds", "catalog_sales"): {
+                    "range_partitions": 4,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+                ("tpc-ds", "web_sales"): {
+                    "range_partitions": 4,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+                ("tpc-ds", "inventory"): {
+                    "range_partitions": 1,
+                    "target_file_size_bytes": 256 * 1024 * 1024,
+                },
+            },
+        )
+
     def test_producer_file_bytes_change_the_key(self):
         with tempfile.TemporaryDirectory() as temporary:
             workspace = Path(temporary)

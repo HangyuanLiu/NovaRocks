@@ -45,6 +45,17 @@ The Spark conversion pins Parquet row group and page sizing. This keeps the
 generated benchmark files close to the physical layout expected by the current
 reader and avoids pathological tiny-page scans from Spark defaults.
 
+The standard SF1/1GB fixture also pins the tested `p4` table layout:
+
+| Suite | Tables | Range partitions | Target file size |
+|---|---|---:|---:|
+| SSB | `lineorder` | 4 | 64 MiB |
+| TPC-H | `lineitem` / `orders` | 4 / 1 | 256 MiB |
+| TPC-DS | `store_sales`, `catalog_sales`, `web_sales` / `inventory` | 4 / 1 | 256 MiB |
+
+These values are part of the immutable fixture contract. Changing them creates
+a new fixture key; it never mutates or deletes an existing READY fixture.
+
 ## Manual Bootstrap
 
 Start or reuse the shared Iceberg REST, MinIO, and Spark test fixture:
