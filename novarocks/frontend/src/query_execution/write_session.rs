@@ -41,8 +41,8 @@ use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishRequest,
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionPlan,
-    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, UniqueWriterHandleLedger,
-    WriteTargetOrdinal,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, PreparedWriteSetLedger,
+    UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
@@ -70,8 +70,27 @@ pub(crate) struct ConnectorWriteSession {
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
     catalog_handle: CatalogHandle,
+    accumulated: Mutex<AccumulatedWriteSet>,
     terminal: Mutex<Option<TerminalDecision>>,
     finish_invocations: AtomicUsize,
+}
+
+/// What a session has collected so far across the queries it drives.
+///
+/// Most writes are one query, but a copy-on-write mutation and a distributed
+/// rewrite drive several against one session and commit once at the end. Each
+/// query still produces a set that is complete for its own execution graph;
+/// what accumulates here is the statement's union.
+///
+/// The frozen budgets are charged on this union rather than per query. Charging
+/// them per query would let a statement hold an unbounded amount before commit
+/// while every individual query looked well inside its limit -- and the limits
+/// exist to bound exactly what the frontend holds.
+#[derive(Default)]
+struct AccumulatedWriteSet {
+    rows: WriteRowCountAccumulator,
+    ledger: PreparedWriteSetLedger,
+    fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
 }
 
 impl ConnectorWriteSession {
@@ -88,6 +107,7 @@ impl ConnectorWriteSession {
             lease,
             plan,
             catalog_handle,
+            accumulated: Mutex::new(AccumulatedWriteSet::default()),
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
         })
@@ -152,14 +172,23 @@ impl ConnectorWriteSession {
         &self,
         prepared: DecodedPreparedWriteSet,
     ) -> Result<ConnectorPreparedWriteSet, ConnectorError> {
+        let row_count = prepared.row_count();
+        self.interpret_parts(row_count, prepared.into_fragments())
+    }
+
+    /// Turn canonical fragments into provider values this generation owns.
+    fn interpret_parts(
+        &self,
+        row_count: u64,
+        fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    ) -> Result<ConnectorPreparedWriteSet, ConnectorError> {
         use novarocks_proto_codec::FieldPath;
         use novarocks_proto_codec::connector_write::ValidatedCommitFragment;
         use prost::Message;
 
         let decoder = self.lease.fragment_decoder();
-        let row_count = prepared.row_count();
-        let mut fragments = Vec::new();
-        for (index, (target, bytes)) in prepared.into_fragments().into_iter().enumerate() {
+        let mut decoded = Vec::with_capacity(fragments.len());
+        for (index, (target, bytes)) in fragments.into_iter().enumerate() {
             let raw =
                 write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
                     ConnectorError::new(
@@ -184,18 +213,100 @@ impl ConnectorWriteSession {
                 .map_err(|error| {
                     ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
                 })?;
-            fragments.push((target, fragment));
+            decoded.push((target, fragment));
         }
-        ConnectorPreparedWriteSet::try_new(row_count, fragments, &self.expected_targets())
+        ConnectorPreparedWriteSet::try_new(row_count, decoded, &self.expected_targets())
     }
 
-    /// Perform the one external commit.
+    /// Collect one query's complete prepared write set into this session.
     ///
-    /// The caller must already have established BOTH halves of the barrier: a
-    /// complete prepared write set, and a lifecycle terminal set in which every
-    /// participant succeeded. Neither implies the other, so neither is checked
-    /// here -- this method exists to be un-callable until both hold.
+    /// A statement that drives several queries against one session -- a
+    /// copy-on-write mutation, a distributed rewrite -- calls this once per
+    /// query and commits once at the end. Each set is complete for its own
+    /// execution graph; what accumulates is the statement's union.
+    ///
+    /// The frozen budgets are charged here, on the union. Charging them per
+    /// query would let a statement hold an unbounded amount before commit while
+    /// every individual query looked well inside its limit, and the limits
+    /// exist to bound exactly what the frontend holds.
+    pub(crate) fn accumulate(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+    ) -> Result<(), ConnectorError> {
+        // Refuse after a terminal decision: a set arriving then belongs to work
+        // this session already answered for.
+        if self.lock_terminal()?.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write session already reached a terminal decision",
+            ));
+        }
+        let mut accumulated = self.lock_accumulated()?;
+        accumulated.rows.add(prepared.row_count())?;
+        for (target, bytes) in prepared.into_fragments() {
+            accumulated.ledger.reserve_fragment(bytes.len())?;
+            accumulated.fragments.push((target, bytes));
+        }
+        Ok(())
+    }
+
+    /// Perform the one external commit over everything accumulated so far.
+    ///
+    /// The caller must already have established BOTH halves of the barrier for
+    /// every query it drove: a complete prepared write set each time, and a
+    /// lifecycle terminal set in which every participant succeeded. Neither
+    /// implies the other, so neither is checked here -- this method exists to be
+    /// un-callable until both hold.
+    pub(crate) fn finish_accumulated(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.claim_terminal(TerminalDecision::Committed)?;
+        let (row_count, fragments) = {
+            let mut accumulated = self.lock_accumulated()?;
+            (
+                accumulated.rows.get(),
+                std::mem::take(&mut accumulated.fragments),
+            )
+        };
+        let prepared = self.interpret_parts(row_count, fragments)?;
+        self.finish_invocations.fetch_add(1, Ordering::SeqCst);
+        let outcome = self
+            .lease
+            .session()
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: self.plan.commit_handle(),
+                prepared,
+                context,
+            })?;
+        if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
+            self.record_terminal(TerminalDecision::CommitUnknown);
+        }
+        Ok(outcome)
+    }
+
+    /// The rows accumulated so far. Report them to a client only after the
+    /// external commit is known to have succeeded.
+    pub(crate) fn accumulated_row_count(&self) -> Result<u64, ConnectorError> {
+        Ok(self.lock_accumulated()?.rows.get())
+    }
+
+    /// Accumulate one query's set and commit immediately. The shape almost
+    /// every write has.
     pub(crate) fn finish(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.accumulate(prepared)?;
+        self.finish_accumulated(context)
+    }
+
+    #[expect(
+        dead_code,
+        reason = "Retained beside finish_accumulated until every caller moves to the session."
+    )]
+    fn finish_single(
         &self,
         prepared: DecodedPreparedWriteSet,
         context: ConnectorRequestContext,
@@ -254,6 +365,17 @@ impl ConnectorWriteSession {
                 evidence,
                 context,
             })
+    }
+
+    fn lock_accumulated(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, AccumulatedWriteSet>, ConnectorError> {
+        self.accumulated.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write session accumulation is poisoned",
+            )
+        })
     }
 
     fn claim_terminal(&self, decision: TerminalDecision) -> Result<(), ConnectorError> {
@@ -689,6 +811,40 @@ pub(crate) mod tests {
         .expect("request context")
     }
 
+    /// A real canonical commit fragment. The session decodes what it commits,
+    /// so a test that fed it arbitrary bytes would never reach the connector.
+    fn fragment_bytes(path: &str) -> Vec<u8> {
+        use prost::Message;
+        write_dto::ConnectorCommitFragment {
+            fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
+                write_dto::IcebergCommitFragment {
+                    artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
+                        write_dto::IcebergDataFileArtifact {
+                            path: path.to_string(),
+                            file_format: write_dto::IcebergFileFormat::Parquet as i32,
+                            partition: Some(write_dto::IcebergArtifactPartition {
+                                partition_path: String::new(),
+                                null_fingerprint: String::new(),
+                                partition_spec_id: 0,
+                                descriptor: Some(write_dto::IcebergPartitionDescriptor {
+                                    values: Vec::new(),
+                                }),
+                            }),
+                            metrics: Some(write_dto::IcebergArtifactMetrics {
+                                record_count: 1,
+                                file_size_in_bytes: 16,
+                                split_offsets: Vec::new(),
+                                column_stats: None,
+                            }),
+                            first_row_id: None,
+                        },
+                    )),
+                },
+            )),
+        }
+        .encode_to_vec()
+    }
+
     pub(crate) fn empty_prepared() -> DecodedPreparedWriteSet {
         DecodedPreparedWriteSet::for_test(0, Vec::new())
     }
@@ -962,6 +1118,87 @@ pub(crate) mod tests {
         assert!(barrier.into_committable().is_err());
         assert_eq!(fixture.session.finish_invocations(), 0);
         assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+    }
+
+    /// A copy-on-write mutation and a distributed rewrite drive several
+    /// queries against one session and commit once. Each query's set is
+    /// complete for its own graph; the statement commits their union.
+    #[test]
+    fn a_session_commits_the_union_of_every_query_it_drove() {
+        let fixture = fixture(1, 16);
+        let target = WriteTargetOrdinal::try_new(0).expect("ordinal");
+
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test(
+                4,
+                vec![(target, fragment_bytes("s3://b/a.parquet"))],
+            ))
+            .expect("first query");
+        fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test(
+                6,
+                vec![
+                    (target, fragment_bytes("s3://b/b.parquet")),
+                    (target, fragment_bytes("s3://b/c.parquet")),
+                ],
+            ))
+            .expect("second query");
+
+        assert_eq!(
+            fixture
+                .session
+                .accumulated_row_count()
+                .expect("accumulated rows"),
+            10
+        );
+        assert_eq!(fixture.session.finish_invocations(), 0);
+
+        let _ = fixture.session.finish_accumulated(request_context());
+        // One commit for the whole statement, not one per query.
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn the_frozen_budgets_bound_the_union_rather_than_each_query() {
+        use novarocks_spi::connector::write_stack::MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES;
+
+        let fixture = fixture(1, 16);
+        let target = WriteTargetOrdinal::try_new(0).expect("ordinal");
+        // Each query stays far inside the entry budget; together they exceed
+        // it. Charging per query would have accepted every one of them.
+        let per_query = MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES / 2;
+        for _ in 0..2 {
+            fixture
+                .session
+                .accumulate(DecodedPreparedWriteSet::for_test(
+                    0,
+                    vec![(target, Vec::new()); per_query],
+                ))
+                .expect("within the union budget");
+        }
+        let error = fixture
+            .session
+            .accumulate(DecodedPreparedWriteSet::for_test(
+                0,
+                vec![(target, Vec::new())],
+            ))
+            .expect_err("over the union budget");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn a_set_arriving_after_the_terminal_decision_is_refused() {
+        let fixture = fixture(1, 16);
+        let _ = fixture.session.finish(empty_prepared(), request_context());
+        let error = fixture
+            .session
+            .accumulate(empty_prepared())
+            .expect_err("accumulate after terminal");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
     #[test]
