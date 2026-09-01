@@ -119,10 +119,26 @@ match contract、strategy、route id 并列为「provider 拥有的事实」。�
 仍存在于 writer 数据面，而它不再存在。把这句写在这里，是因为让下一个人自己去撞这个不一致，正是 ADR 库
 存在要避免的事。
 
+**distributed rewrite 失去了跨 FE 重启的持久化恢复。** 改造前，每个被接受或被取代的 rewrite attempt
+都会经 provider 落一份持久 checkpoint，FE durable state 才推进；`restore_for_abort` 据此在重启后回收
+孤儿对象。本次连同旧的 accepted-attempt 状态一起删除：rewrite 的 FE 重启后从头再来，孤儿回收退回到
+crash-only GC。接受它是因为 table maintenance 的 rewrite 本就是可重跑的后台操作，而保留这层要么继续
+依赖被删除的 cohort 身份，要么单独立一个 durable staged-manifest 项目——那正是本文非目标里明确不做的
+事。代价是真实的：一次跑了很久的 OPTIMIZE 在 FE 重启后白跑，且它已写出的对象要等 GC。
+
+**COW UPDATE/MERGE 的迁移需要 begin 契约的结构性扩展，本文的六字段请求表达不了。** 它的 rewrite set
+不是元数据事实：哪些文件被重写、其中哪些行被命中，是把语句谓词当成一次分布式读跑出来的物化结果，
+且这些 row id 会成为替换 manifest 的 `first_row_id`，编造值会损坏 v3 row lineage 而不是触发校验失败。
+因此 COW 的 flavor 必须携带该 selection，且每个 target 还要回带自己那个旧文件的读契约。这不是本文
+裁决的松动，而是本文裁决在这条流程上的必然展开；把它记在这里，是为了不让后来者误以为 COW 只是「还
+没轮到」。
+
 ## 何时重新评估
 
 - 真实 workload 经常逼近 prepared set 的字节或条目上界，或 Root BE 的聚合成为可测量的瓶颈；
 - 实测证明 handle fanout 的 wire bytes 成为瓶颈——此时才设计共享 handle table 或间接引用；
 - 出现「失败 attempt 后必须可靠回收已 staged 对象」的运维需求——此时才立 durable staged manifest 项目；
 - 需要在一个 attempt 内容忍 Root BE 失败——此时才设计 failover 与 partial-result recovery；
-- provider 的 read model 开始暴露 per-delete-file record count，届时应把那处可选约束收紧为必需。
+- provider 的 read model 开始暴露 per-delete-file record count，届时应把那处可选约束收紧为必需；
+- 运维上开始要求「长时间 rewrite 必须能跨 FE 重启续跑」——此时才重新引入 attempt 级持久恢复，且应作为
+  durable staged manifest 的一部分统一设计，而不是把删掉的 cohort checkpoint 换个名字接回来。
