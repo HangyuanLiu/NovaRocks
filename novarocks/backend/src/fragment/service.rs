@@ -371,6 +371,7 @@ impl NativeFragmentService {
         let storage_resolver = self.lifecycle.storage_resolver_for_query(execution_id);
 
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
+            execution_id,
             catalog_read_execution,
             catalog_write_execution,
             queues,
@@ -1941,6 +1942,222 @@ mod tests {
             .queries
             .unregister_fragment_execution(execution_id, sibling_finst);
         service.queries.finish_fragment(execution_id);
+    }
+
+    /// A single-fragment write dataflow: `Values -> TableWriter -> TableFinish`
+    /// into the ordinary RESULT sink. In production an exchange separates the
+    /// writer from the finish node, but the sink, the result buffer, and the
+    /// EOF the frontend reads are the same ones this exercises.
+    fn write_dataflow_result_request(
+        query_base: i64,
+        fragment_base: i64,
+        execution: Arc<crate::connector::write_test_support::RecordingWriteExecution>,
+    ) -> NativeFragmentRequest {
+        use crate::connector::write_test_support::{
+            finish_node, never_cancelled, table_writer_payload, test_write_scan_runtime,
+            writer_node,
+        };
+        use crate::fragment::decode::type_decode::encode_type;
+        use arrow::datatypes::DataType;
+
+        let fragment_id = 11;
+        let execution_id = QueryExecutionId::new(
+            ExecutionQueryId::new(query_base, query_base + 1),
+            ProtocolAttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("valid execution id");
+        let fragment_instance_id = UniqueId::new(fragment_base, fragment_base + 1);
+        let int_type = encode_type(&DataType::Int64).expect("encode int64");
+        let column = proto::common::OutputColumn {
+            column_id: 1,
+            name: "id".to_string(),
+            r#type: Some(int_type.clone()),
+            nullable: true,
+            is_internal: false,
+        };
+        let values = proto::plan::DistributedNode {
+            node_id: 40,
+            fragment_id,
+            limit: -1,
+            payload: Some(proto::plan::distributed_node::Payload::Physical(
+                proto::plan::PlanNode {
+                    output_columns: vec![column.clone()],
+                    kind: Some(proto::plan::plan_node::Kind::Values(
+                        proto::plan::ValuesNode {
+                            rows: vec![proto::plan::ExprList {
+                                values: vec![proto::expr::Expr {
+                                    r#type: Some(int_type.clone()),
+                                    nullable: false,
+                                    kind: Some(proto::expr::expr::Kind::Literal(
+                                        proto::expr::LiteralExpr {
+                                            value: Some(proto::common::LiteralValue {
+                                                value: Some(
+                                                    proto::common::literal_value::Value::IntValue(
+                                                        7,
+                                                    ),
+                                                ),
+                                            }),
+                                        },
+                                    )),
+                                }],
+                            }],
+                            columns: vec![column.clone()],
+                        },
+                    )),
+                },
+            )),
+            ..Default::default()
+        };
+        let writer = writer_node(
+            41,
+            table_writer_payload(
+                proto::expr::Expr {
+                    r#type: Some(int_type),
+                    nullable: true,
+                    kind: Some(proto::expr::expr::Kind::ColumnRef(proto::expr::ColumnRef {
+                        column_id: 1,
+                        qualifier: None,
+                        column: None,
+                    })),
+                },
+                vec![column],
+            ),
+            vec![values],
+        );
+        let root = finish_node(42, vec![0], vec![writer]);
+
+        NativeFragmentRequest::try_decode_with_runtime(
+            execution_id,
+            proto::plan::PlanFragment {
+                fragment_id,
+                root: Some(root),
+                sink: Some(proto::plan::DataSink {
+                    kind: Some(proto::plan::data_sink::Kind::Result(true)),
+                }),
+                output_columns: Vec::new(),
+                runtime_filter_bindings: Some(proto::plan::RuntimeFilterBindingTable {
+                    fragment_id,
+                    bindings: Vec::new(),
+                }),
+                ..Default::default()
+            },
+            proto::novarocks::InstanceParams {
+                query_id: Some(proto::common::UniqueId {
+                    hi: query_base,
+                    lo: query_base + 1,
+                }),
+                fragment_instance_id: Some(proto::common::UniqueId {
+                    hi: fragment_instance_id.high(),
+                    lo: fragment_instance_id.low(),
+                }),
+                backend_num: 3,
+                query_options: Some(proto::novarocks::QueryOptions {
+                    batch_size: 1024,
+                    pipeline_dop: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            never_cancelled(),
+            std::time::Duration::from_millis(120_000),
+            Some(test_write_scan_runtime(
+                execution_id,
+                fragment_instance_id,
+                execution,
+            )),
+        )
+        .expect("valid native write dataflow request")
+    }
+
+    #[test]
+    fn the_write_dataflow_root_relation_reaches_the_result_buffer_and_ends_with_eof() {
+        use crate::runtime::result_buffer::{TryFetchResult, try_fetch};
+
+        let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
+        let service = NativeFragmentService::with_lifecycle_observer(|_| {});
+        let execution =
+            Arc::new(crate::connector::write_test_support::RecordingWriteExecution::new());
+        let request = write_dataflow_result_request(86_000, 86_002, Arc::clone(&execution));
+        let finst_id = request.fragment_instance_id();
+
+        let handle = prepare_request_for_test(&service, request);
+        let outcome = handle.start().join();
+        assert!(
+            matches!(outcome.outcome(), FragmentOutcome::Succeeded),
+            "the write dataflow fragment must succeed: {outcome:?}"
+        );
+        assert_eq!(
+            execution.opened(),
+            vec![(0, 0, 0)],
+            "the single writer driver opened exactly one writer"
+        );
+        let terminals = execution.terminals();
+        assert_eq!(
+            terminals,
+            crate::connector::write_test_support::WriterTerminals {
+                finished: 1,
+                aborted: 0,
+                appended_rows: 1,
+            },
+            "the writer accepted its projected row and finished exactly once"
+        );
+
+        let TryFetchResult::Ready(first) = try_fetch(finst_id) else {
+            panic!("expected the root relation in the result buffer");
+        };
+        assert!(!first.eos, "the root relation arrives before EOF");
+        assert_eq!(
+            first.result_batch.rows.len(),
+            1,
+            "one SUMMARY row, and no prepared fragment because the writer staged nothing"
+        );
+        let TryFetchResult::Ready(eof) = try_fetch(finst_id) else {
+            panic!("expected EOF after the root relation");
+        };
+        assert!(
+            eof.eos,
+            "the frontend sees EOF once every sender reached EOS"
+        );
+    }
+
+    #[test]
+    fn an_aborted_write_dataflow_never_publishes_eof() {
+        use crate::runtime::result_buffer::{TryFetchResult, try_fetch};
+
+        let _service_guard = SERVICE_TEST_LOCK.lock().expect("service test lock");
+        let service = NativeFragmentService::with_lifecycle_observer(|_| {});
+        let execution =
+            Arc::new(crate::connector::write_test_support::RecordingWriteExecution::new());
+        let request = write_dataflow_result_request(86_100, 86_102, Arc::clone(&execution));
+        let finst_id = request.fragment_instance_id();
+
+        let handle = prepare_request_for_test(&service, request);
+        let outcome = handle
+            .start_failed("aborted before the write dataflow ran")
+            .join();
+        assert!(
+            matches!(outcome.outcome(), FragmentOutcome::Failed(_)),
+            "an aborted attempt never succeeds: {outcome:?}"
+        );
+        // Drivers, and therefore writers, are created while the fragment is
+        // prepared. What an abort must guarantee is not that no writer opened,
+        // but that none of them finished: a writer that never finished staged
+        // nothing the frontend could commit.
+        let terminals = execution.terminals();
+        assert_eq!(
+            terminals.finished, 0,
+            "an aborted attempt must never finish a writer: {terminals:?}"
+        );
+        match try_fetch(finst_id) {
+            TryFetchResult::Error(_) => {}
+            TryFetchResult::Ready(result) => panic!(
+                "an aborted attempt must not publish a result batch (eos={})",
+                result.eos
+            ),
+            TryFetchResult::NotReady => {
+                panic!("an aborted attempt must publish a terminal state, not stay pending")
+            }
+        }
     }
 
     #[test]

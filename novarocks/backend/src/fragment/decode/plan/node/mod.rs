@@ -33,6 +33,7 @@ mod repeat;
 mod set_op;
 mod sort;
 mod table_function;
+mod table_write;
 mod topn;
 mod values;
 mod window;
@@ -247,25 +248,27 @@ fn decode_node_inner(
             arena,
             ctx,
         ),
-        // The write dataflow nodes are decoded by the connector write path,
-        // which is introduced with the backend's write cutover. Until it lands,
-        // refusing them is correct: a plan carrying one cannot be executed by
-        // this decoder, and silently ignoring it would run a write that stages
-        // nothing.
-        plan::distributed_node::Payload::TableWriter(_) => Err(NativeFragmentDecodeError::missing(
-            path.clone().field("payload").field("table_writer"),
-            format!(
-                "native node_id={} carries a table writer the backend cannot decode yet",
-                node.node_id
-            ),
-        )),
-        plan::distributed_node::Payload::TableFinish(_) => Err(NativeFragmentDecodeError::missing(
-            path.clone().field("payload").field("table_finish"),
-            format!(
-                "native node_id={} carries a table finish the backend cannot decode yet",
-                node.node_id
-            ),
-        )),
+        // The write dataflow nodes reach their exact query-leased write role
+        // binding through the typed runtime; neither is a terminal sink, so
+        // both lower like any other relational node.
+        plan::distributed_node::Payload::TableWriter(writer) => {
+            table_write::lower_table_writer_node(
+                node,
+                writer,
+                path.clone().field("payload").field("table_writer"),
+                children,
+                ctx,
+            )
+        }
+        plan::distributed_node::Payload::TableFinish(finish) => {
+            table_write::lower_table_finish_node(
+                node,
+                finish,
+                path.clone().field("payload").field("table_finish"),
+                children,
+                ctx,
+            )
+        }
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
         attach_leaf_consumers(
@@ -1483,6 +1486,24 @@ fn apply_distributed_limit_if_needed(
     else {
         return Ok(lowered);
     };
+    // A limit over a write dataflow node would truncate the write relation, and
+    // the rows it dropped would be commit fragments the frontend must commit.
+    // Refuse it instead of silently losing staged artifacts.
+    if matches!(
+        node.payload.as_ref(),
+        Some(
+            plan::distributed_node::Payload::TableWriter(_)
+                | plan::distributed_node::Payload::TableFinish(_)
+        )
+    ) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.field("limit"),
+            format!(
+                "native node_id={} is a write dataflow node and cannot carry a limit",
+                node.node_id
+            ),
+        ));
+    }
     if matches!(
         lowered.node.kind,
         ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)

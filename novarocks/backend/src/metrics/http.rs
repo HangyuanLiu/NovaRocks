@@ -49,6 +49,9 @@ impl BackendMetricsRegistry {
             Box::new(Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_AUTHENTICATION_FAILURES).clone()),
             Box::new(Lazy::force(&BACKEND_NATIVE_TLS_FAILURES).clone()),
+            Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_OPENS).clone()),
+            Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_WRITER_TOTALS).clone()),
+            Box::new(Lazy::force(&BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK).clone()),
         ] {
             registry
                 .register(collector)
@@ -225,6 +228,45 @@ static BACKEND_QUERY_EXECUTION_RESOURCES: Lazy<IntGaugeVec> = Lazy::new(|| {
     .expect("construct novarocks_backend_query_execution_resources")
 });
 
+/// Writer opens attempted by this backend's connector write data plane, by
+/// outcome. One driver opens exactly one writer, so this counts drivers.
+static BACKEND_CONNECTOR_WRITE_WRITER_OPENS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_writer_opens_total",
+            "Cumulative connector write writer opens on this backend, by outcome.",
+        ),
+        &["outcome"],
+    )
+    .expect("construct novarocks_backend_connector_write_writer_opens_total")
+});
+
+/// Rows accepted by finished connector writers on this backend, and the
+/// commit fragments those writers produced.
+static BACKEND_CONNECTOR_WRITE_WRITER_TOTALS: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
+    prometheus::IntCounterVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_writer_totals",
+            "Cumulative connector write writer rows and commit fragments on this backend.",
+        ),
+        &["unit"],
+    )
+    .expect("construct novarocks_backend_connector_write_writer_totals")
+});
+
+/// High-water mark of the prepared write set observed by a root aggregation on
+/// this backend. Bytes and entries are the two frozen budgets the root bounds.
+static BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK: Lazy<IntGaugeVec> = Lazy::new(|| {
+    IntGaugeVec::new(
+        Opts::new(
+            "novarocks_backend_connector_write_root_prepared_set_peak",
+            "Peak prepared write set observed by a root aggregation on this backend.",
+        ),
+        &["dimension"],
+    )
+    .expect("construct novarocks_backend_connector_write_root_prepared_set_peak")
+});
+
 static BACKEND_NATIVE_AUTHENTICATION_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(|| {
     prometheus::IntCounterVec::new(
         Opts::new(
@@ -249,6 +291,38 @@ static BACKEND_NATIVE_TLS_FAILURES: Lazy<prometheus::IntCounterVec> = Lazy::new(
 
 static BACKEND_NATIVE_AUTH_FAILURE_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
 static BACKEND_NATIVE_TLS_FAILURE_LOG_SAMPLE: AtomicU64 = AtomicU64::new(0);
+
+/// One driver attempted to open its own connector writer. `outcome` is a
+/// closed vocabulary: `opened` or `failed`.
+pub(crate) fn record_connector_write_writer_open(outcome: &'static str) {
+    BACKEND_CONNECTOR_WRITE_WRITER_OPENS
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// One connector writer finished: it accepted `rows` rows and produced
+/// `fragments` commit fragments.
+pub(crate) fn record_connector_write_writer_finished(rows: u64, fragments: u64) {
+    BACKEND_CONNECTOR_WRITE_WRITER_TOTALS
+        .with_label_values(&["rows"])
+        .inc_by(rows);
+    BACKEND_CONNECTOR_WRITE_WRITER_TOTALS
+        .with_label_values(&["commit_fragments"])
+        .inc_by(fragments);
+}
+
+/// Publish the prepared write set a root aggregation has accepted so far. The
+/// gauge keeps the process-wide high-water mark, so a later, smaller write
+/// never erases the peak an operator needs in order to size the budgets.
+pub(crate) fn publish_connector_write_root_prepared_set_peak(bytes: u64, entries: u64) {
+    for (dimension, value) in [("bytes", bytes), ("entries", entries)] {
+        let gauge = BACKEND_CONNECTOR_WRITE_ROOT_SET_PEAK.with_label_values(&[dimension]);
+        let observed = i64::try_from(value).unwrap_or(i64::MAX);
+        if observed > gauge.get() {
+            gauge.set(observed);
+        }
+    }
+}
 
 pub(crate) fn record_backend_native_authentication_failure() {
     BACKEND_NATIVE_AUTHENTICATION_FAILURES

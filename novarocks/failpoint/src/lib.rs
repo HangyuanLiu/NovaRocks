@@ -66,10 +66,17 @@ pub enum QueryLifecycleFaultKind {
     StartDigestCorrupt,
     ObservationForeignParticipant,
     RuntimeFilterFeedbackForeignParticipant,
+    /// Fails one connector writer at commit-fragment egress. It only fails a
+    /// writer that already staged its artifacts; it never substitutes a
+    /// fabricated carrier, so it cannot become a production fallback.
+    ConnectorWriteWriterFailure,
+    /// Fails the single root aggregation at commit-fragment carrier
+    /// validation. Like the writer fault it only rejects, never repairs.
+    ConnectorWriteRootFailure,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -98,6 +105,8 @@ impl QueryLifecycleFaultKind {
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
         Self::RuntimeFilterFeedbackForeignParticipant,
+        Self::ConnectorWriteWriterFailure,
+        Self::ConnectorWriteRootFailure,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -134,6 +143,8 @@ impl QueryLifecycleFaultKind {
             Self::RuntimeFilterFeedbackForeignParticipant => {
                 "runtime-filter-feedback-foreign-participant"
             }
+            Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
+            Self::ConnectorWriteRootFailure => "connector-write-root-failure",
         }
     }
 
@@ -610,7 +621,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 28);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 30);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }

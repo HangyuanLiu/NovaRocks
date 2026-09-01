@@ -1419,6 +1419,7 @@ pub(crate) mod test_support {
         )
         .expect("session");
         crate::fragment::decode::plan::context::TypedScanRuntime::new(
+            execution_id,
             std::sync::Arc::new(move |handle| {
                 if handle == &catalog_handle {
                     Ok(execution.clone())
