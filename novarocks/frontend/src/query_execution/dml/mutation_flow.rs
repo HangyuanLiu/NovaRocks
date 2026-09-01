@@ -31,8 +31,10 @@ use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
+    admit_prepared_frozen_connector_write_target, admit_session_connector_write_target,
+    dml_write_plan_input_for_admitted_target,
 };
+use crate::query_execution::write_session::ConnectorWriteSession;
 use crate::runtime::query_result::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
@@ -42,13 +44,6 @@ use novarocks_sql::planning::dml::{
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
 use novarocks_sql::semantic::ObjectName;
-
-fn write_commit_has_files(write_commit: &crate::query_execution::write::WriteCommitInput) -> bool {
-    write_commit
-        .writers
-        .iter()
-        .any(|writer| !writer.connector_staged_report_frames.is_empty())
-}
 
 #[allow(
     dead_code,
@@ -151,33 +146,15 @@ enum DmlRowMutationEffectSet {
     },
 }
 
-/// Provider-signed row-mutation admission retained before stage. It is pure:
-/// routes are activated only after the frontend has persisted the operation
-/// intent that owns this exact operation id.
+/// Provider-signed row-mutation admission retained before stage.
+///
+/// It is pure: signing it decides the physical strategy and the base/written
+/// versions this statement runs against, and nothing external happens until the
+/// statement opens its write session or activates its copy-on-write plan.
 #[derive(Clone)]
 pub(crate) struct DmlChangeStreamPreparations {
-    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
     lease: novarocks_spi::connector::ConnectorWriteLease,
     preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-}
-
-/// Provider-signed opaque route set available only during post-intent staging.
-#[derive(Clone)]
-struct ActivatedDmlChangeStreamPreparations {
-    operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-    plan: novarocks_spi::connector::ConnectorRowMutationExecutionPlan,
-}
-
-struct ActivatedDmlChangeStreamWrite {
-    registration: Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
-    sealed_cohorts: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
-    registration_error: Option<String>,
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FAIL_MOR_REGISTRATION_AFTER_ACTIVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl DmlChangeStreamPreparations {
@@ -197,13 +174,8 @@ impl DmlChangeStreamPreparations {
             },
         };
         let (lease, preparation) =
-            target.prepare_row_mutation(target_ref, operation_id, intent, context.clone())?;
-        Ok(Self {
-            operation_id,
-            lease,
-            preparation,
-            context,
-        })
+            target.prepare_row_mutation(target_ref, operation_id, intent, context)?;
+        Ok(Self { lease, preparation })
     }
 
     /// Wrap a preparation this statement already obtained.
@@ -212,115 +184,11 @@ impl DmlChangeStreamPreparations {
     /// the strategy off it during admission reuse that same value here rather
     /// than asking the provider again, so one statement never carries two base
     /// versions or two digests.
-    fn from_signed(
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    const fn from_signed(
         lease: novarocks_spi::connector::ConnectorWriteLease,
         preparation: novarocks_spi::connector::ConnectorRowMutationPreparation,
-        context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
-        Self {
-            operation_id,
-            lease,
-            preparation,
-            context,
-        }
-    }
-}
-
-impl DmlChangeStreamPreparations {
-    fn activate(&self) -> Result<ActivatedDmlChangeStreamPreparations, String> {
-        let plan = self
-            .lease
-            .activate_row_mutation(
-                novarocks_spi::connector::ConnectorRowMutationActivationRequest::Direct {
-                    preparation: self.preparation.clone(),
-                    context: self.context.clone(),
-                },
-            )
-            .map_err(|error| {
-                format!("activate Iceberg row mutation after durable intent: {error}")
-            })?;
-        Ok(ActivatedDmlChangeStreamPreparations {
-            operation_id: self.operation_id,
-            plan,
-        })
-    }
-}
-
-impl ActivatedDmlChangeStreamPreparations {
-    fn routes(&self) -> &[novarocks_spi::connector::ConnectorRowMutationRoute] {
-        self.plan.routes()
-    }
-
-    fn activate_write(
-        &self,
-        write_lease: &novarocks_spi::connector::ConnectorWriteLease,
-        context: &novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<ActivatedDmlChangeStreamWrite, String> {
-        let activation = write_lease
-            .activate_write(novarocks_spi::connector::ConnectorWriteActivationRequest {
-                operation_id: self.operation_id,
-                source: novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(
-                    self.plan.clone(),
-                ),
-                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Publication(
-                    novarocks_spi::connector::LakePublicationFamily::DataMutation,
-                ),
-                context: context.clone(),
-            })
-            .map_err(|error| format!("activate exact MOR row-mutation plan: {error}"))?;
-        let sealed_cohorts = activation.sealed_cohorts().clone();
-        let registration = activation
-            .cohorts()
-            .iter()
-            .cloned()
-            .map(|cohort| {
-                crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
-                    cohort,
-                    context.clone(),
-                    write_lease.clone(),
-                )
-                .map_err(|error| format!("build activated MOR cohort template: {error}"))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(|templates| {
-                #[cfg(test)]
-                if FAIL_MOR_REGISTRATION_AFTER_ACTIVATION
-                    .with(|fail| fail.replace(false))
-                {
-                    return Err(
-                        "synthetic MOR registration failure after provider activation".to_string(),
-                    );
-                }
-                crate::query_execution::contract::ConnectorWriteOperationRegistration::try_new(
-                    templates,
-                )
-                .map_err(|error| error.to_string())
-            })
-            .and_then(|registration| {
-                let registered_sealed = registration.sealed_cohorts().map_err(|error| {
-                    format!("seal activated MOR cohorts before execution: {error}")
-                })?;
-                if registered_sealed != sealed_cohorts {
-                    return Err(
-                        "activated MOR registration changed the provider-sealed cohort set"
-                            .to_string(),
-                    );
-                }
-                Ok(registration)
-            });
-        match registration {
-            Ok(registration) => Ok(ActivatedDmlChangeStreamWrite {
-                registration: Some(registration),
-                sealed_cohorts,
-                registration_error: None,
-            }),
-            Err(error) => Ok(ActivatedDmlChangeStreamWrite {
-                registration: None,
-                sealed_cohorts,
-                registration_error: Some(error),
-            }),
-        }
+        Self { lease, preparation }
     }
 }
 
@@ -351,49 +219,122 @@ impl DmlRowMutationEffectSet {
     }
 }
 
-/// The dense, query-local write target ordinal of the route at `index`.
-fn change_stream_write_target_ordinal(
-    index: usize,
-) -> Result<novarocks_spi::connector::write_stack::WriteTargetOrdinal, String> {
-    let value = u32::try_from(index)
-        .map_err(|_| "row-mutation write target ordinal space exhausted".to_string())?;
-    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value)
-        .map_err(|error| format!("row-mutation write target ordinal {value} rejected: {error}"))
+/// Open the write session one merge-on-read change-stream statement writes
+/// through.
+///
+/// The producer emits one row stream carrying both halves of every change
+/// event: the `_file`/`_pos` identity of the row being superseded, and the
+/// after-image of the row replacing it. That is exactly a row-lineage input, so
+/// it is described as one, and the provider decides from it how many branches
+/// the mutation needs and what each accepts. The v3 lineage columns travel with
+/// the data half so an updated row keeps the identity it already had rather
+/// than being re-minted as a fresh row.
+fn begin_mor_change_stream_write_session(
+    state: &DmlExecutionKernel,
+    target: &crate::catalog_application::resolver::TargetBackend,
+    target_ref: &str,
+    target_columns: &[novarocks_types::schema::ColumnDef],
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Arc<ConnectorWriteSession>, String> {
+    use novarocks_execution::exec::row_position::{
+        ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
+        ICEBERG_ROW_POS_COL,
+    };
+    use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
+
+    let field = |name: &str, data_type: DataType, nullable: bool| {
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
+    };
+    let mut data_fields = target_columns
+        .iter()
+        .map(|column| field(&column.name, column.data_type.clone(), column.nullable))
+        .collect::<Vec<_>>();
+    data_fields.push(field(ICEBERG_ROW_ID_COL, DataType::Int64, true));
+    data_fields.push(field(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true));
+    crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            state.typed_connector_control(),
+            write_planning_lease,
+        )?,
+        write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            ConnectorWriteInputRequest::RowLineage {
+                data_fields,
+                row_identity_fields: vec![
+                    field(ICEBERG_FILE_PATH_COL, DataType::Utf8, false),
+                    field(ICEBERG_ROW_POS_COL, DataType::Int64, false),
+                ],
+            },
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+            connector_context.clone(),
+        )?,
+    )
 }
 
-/// Pair each sealed writer route with the activation cohort that signed it.
+/// Release a session whose plan never compiled.
 ///
-/// The legacy terminal-sink path still fences by cohort. Both sides of this
-/// lookup come from the same activation -- the route ids the DAG carries are
-/// the ones `preparations.routes()` produced -- so it is an exact join inside
-/// one derivation, not an alignment between two different ones. A route with
-/// no cohort fails closed rather than being dropped from the fence.
-fn writer_fragment_cohorts(
-    writer_routes: &[novarocks_sql::planning::dml::DmlChangeStreamWriterRoute],
-    preparations: &ActivatedDmlChangeStreamPreparations,
-) -> Result<
-    Vec<(
-        novarocks_sql::plan_read::FragmentId,
-        novarocks_spi::connector::ConnectorWriteCohortId,
-    )>,
-    String,
-> {
-    let cohorts = preparations
-        .routes()
+/// Nothing external has happened -- a begin performs reads only -- but the
+/// provider is holding a session for a plan that will never run, and the
+/// statement's one terminal decision is the only thing that releases it. The
+/// planning failure is what the caller reports, so a failure to release is
+/// logged rather than substituted for it.
+fn release_unplanned_write_session(
+    write_session: &ConnectorWriteSession,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    statement: &str,
+) {
+    if let Err(error) = write_session.abort(connector_context.clone()) {
+        tracing::warn!(
+            statement,
+            %error,
+            "releasing an unplanned row-mutation write session failed",
+        );
+    }
+}
+
+/// One logical write target of a row-mutation session paired with the routing
+/// facts the provider signed for it.
+type ChangeStreamRoutedTarget<'a> = (
+    &'a novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
+    &'a novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
+);
+
+/// The router's branches, in the order their write target ordinals put them.
+///
+/// Two facts are established here rather than assumed by the caller. A
+/// row-mutation session routes every branch, so a branch that arrived without
+/// routing facts is a contract violation and fails closed instead of being
+/// defaulted into one. And the branch order *is* the write target order, so the
+/// branches are sorted by their sealed ordinal rather than taken in whatever
+/// order the provider happened to hand them over -- the router gives branch `i`
+/// the writer holding ordinal `i`, so a permuted list would silently feed one
+/// branch another branch's rows.
+fn change_stream_routed_targets(
+    write_session: &ConnectorWriteSession,
+) -> Result<Vec<ChangeStreamRoutedTarget<'_>>, String> {
+    let mut routed = write_session
+        .targets()
         .iter()
-        .map(|route| (route.route_id(), route.cohort_id()))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    writer_routes
-        .iter()
-        .map(|route| {
-            cohorts
-                .get(&route.route_id)
-                .map(|cohort| (route.writer_fragment_id, *cohort))
+        .map(|write_target| {
+            write_target
+                .route()
+                .map(|route| (write_target, route))
                 .ok_or_else(|| {
-                    "sealed change-stream writer route has no activated provider cohort".to_string()
+                    format!(
+                        "row-mutation write target {} carries no provider routing facts",
+                        write_target.ordinal().get()
+                    )
                 })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    routed.sort_by_key(|(write_target, _)| write_target.ordinal());
+    Ok(routed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,7 +346,7 @@ fn compile_dml_change_stream_write(
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparations: &ActivatedDmlChangeStreamPreparations,
+    write_session: &ConnectorWriteSession,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -425,23 +366,26 @@ fn compile_dml_change_stream_write(
             state.catalog_application().map(Arc::as_ref),
         );
     let table_bindings = analyzer_provider.query_table_bindings();
-    let mut routes = Vec::new();
-    // The write target ordinal is this route's position in the sealed route
-    // set. Before NCP-6 the plan builder derived exactly the same value from
-    // the route's index internally; stating it here changes nothing about which
-    // writer a branch feeds, it only makes the identity explicit on the wire.
-    for (route_index, route) in preparations.routes().iter().enumerate() {
-        let target_binding = admit_prepared_frozen_connector_write_target(
+    // The recipes are sealed before the plan is compiled because the plan's
+    // writer nodes carry them: a plan and the session that sealed it must not be
+    // separable.
+    let sealed_write_targets = write_session
+        .seal_write_targets()
+        .map_err(|error| format!("seal row-mutation write targets: {error}"))?;
+    let routed_targets = change_stream_routed_targets(write_session)?;
+    let mut routes = Vec::with_capacity(routed_targets.len());
+    for (write_target, route) in routed_targets {
+        let target_binding = admit_session_connector_write_target(
             table_bindings.as_ref(),
             FrozenConnectorScanIdentity::new(
                 target.catalog.clone(),
                 target.namespace.clone(),
                 target.table.clone(),
             ),
-            route.preparation().clone(),
+            write_target,
             write_planning_lease.clone(),
         )?;
-        let mode = match route.input() {
+        let mode = match write_target.input() {
             ConnectorWriteInputShape::Data { .. } => DmlWriteSinkMode::Data,
             ConnectorWriteInputShape::RowLineage { .. } => DmlWriteSinkMode::RowLineageData,
             ConnectorWriteInputShape::PositionDelete { .. } => DmlWriteSinkMode::PositionDeletes,
@@ -455,7 +399,7 @@ fn compile_dml_change_stream_write(
             novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
-        let input_fields = route
+        let input_fields = write_target
             .input()
             .fields()
             .into_iter()
@@ -466,7 +410,9 @@ fn compile_dml_change_stream_write(
             .collect();
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
-            write_target_ordinal: change_stream_write_target_ordinal(route_index)?,
+            // The branch's identity is its sealed ordinal, never its position
+            // in this loop.
+            write_target_ordinal: write_target.ordinal(),
             accepted_effects: route.accepted_effects().to_vec(),
             input_fields,
             partition_input_tokens: route.partition_fields().to_vec(),
@@ -516,19 +462,28 @@ fn compile_dml_change_stream_write(
             kind,
             routes,
             pre_expand_keyed_assert,
-            // The dataflow shape is selected per caller as each one moves to
-            // the write session; this caller still uses the terminal sink.
-            shape: novarocks_sql::planning::dml::DmlWritePlanShape::TerminalSink,
+            // Every writer is an ordinary dataflow node whose rows gather into
+            // one Root finish fragment; the session, not a terminal sink, owns
+            // the commit.
+            shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         })?;
+    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
+        state.connector_control().as_ref(),
+        state.typed_connector_control(),
+        execution,
+        sealed,
+        table_bindings.as_ref(),
+        connector_context,
+    )?;
     Ok(
-        crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
-            state.connector_control().as_ref(),
-            state.typed_connector_control(),
-            execution,
-            sealed,
-            table_bindings.as_ref(),
-            connector_context,
-        )?,
+        crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
+            // The recipes travel with the plan they were sealed for, so an
+            // encode can never pair one round's plan with another's session.
+            encoding: planned
+                .encoding
+                .with_sealed_write_targets(sealed_write_targets),
+            writer_routes: planned.writer_routes,
+        },
     )
 }
 
@@ -549,19 +504,101 @@ pub(crate) trait MutationExecution: Send + Sync {
     fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext;
     fn commit_terminal(
         &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
+        completion: MutationCommitCompletion,
     ) -> Result<
         novarocks_spi::connector::ExternalMutationOutcome<
             novarocks_spi::connector::ConnectorWriteReceipt,
         >,
         String,
     > {
-        completion
-            .session()
-            .commit(completion.terminal_request_context())
-            .map_err(|error| error.to_string())
+        match completion {
+            MutationCommitCompletion::Operation(completion) => completion
+                .session()
+                .commit(completion.terminal_request_context())
+                .map_err(|error| error.to_string()),
+            MutationCommitCompletion::Session(completion) => {
+                crate::query_execution::write_session::finish_write_session(
+                    completion,
+                    self.terminal_context(),
+                )
+                .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome)
+                .map_err(|error| error.to_string())
+            }
+        }
     }
     fn finalize(&self) -> Result<(), String>;
+}
+
+/// The one commit authority a staged mutation hands its statement owner.
+///
+/// A merge-on-read change stream writes through the NCP-6 write session, while
+/// distributed copy-on-write still writes through the staged-report operation.
+/// They are two different data planes with two different commit authorities, so
+/// the carrier names which one it is instead of letting a caller guess.
+pub(crate) enum MutationCommitCompletion {
+    /// The staged-report carrier of a distributed copy-on-write mutation.
+    Operation(crate::query_execution::ConnectorWriteCompletion),
+    /// The write-session carrier of a merge-on-read change-stream mutation.
+    Session(crate::query_execution::outcome::ConnectorWriteSessionCompletion),
+}
+
+/// The authority that may resolve a commit whose external outcome is unknown.
+///
+/// It is captured beside the completion because the completion is consumed by
+/// the commit itself, and an unknown outcome must be adjudicated through the
+/// exact authority that issued that commit, never through a replacement.
+pub(crate) enum MutationPublicationAuthority {
+    Operation(crate::query_execution::write_operation::ConnectorWriteOperationSession),
+    Session(Arc<ConnectorWriteSession>),
+}
+
+impl MutationCommitCompletion {
+    pub(crate) fn publication_authority(&self) -> MutationPublicationAuthority {
+        match self {
+            Self::Operation(completion) => {
+                MutationPublicationAuthority::Operation(completion.session().clone())
+            }
+            Self::Session(completion) => {
+                MutationPublicationAuthority::Session(Arc::clone(completion.session()))
+            }
+        }
+    }
+}
+
+impl MutationPublicationAuthority {
+    /// Ask the issuing authority whether the write this evidence describes
+    /// became visible.
+    ///
+    /// `context` is the statement's own terminal context and is what the write
+    /// session reconciles under. A staged-report operation ignores it and uses
+    /// the context it was begun on, minus its vended credential sink: that
+    /// context is the one its attempts were accepted under, and adjudicating
+    /// under a different one would ask a different request.
+    pub(crate) fn adjudicate(
+        &self,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        match self {
+            Self::Operation(session) => session
+                .adjudicate_publication(
+                    evidence,
+                    session
+                        .request_context()
+                        .clone()
+                        .without_vended_credential_lease_sink(),
+                )
+                .map_err(|error| error.to_string()),
+            Self::Session(session) => session
+                .reconcile(evidence, context)
+                .map_err(|error| error.to_string()),
+        }
+    }
 }
 
 /// Result of the post-journal mutation staging phase.  The connector
@@ -575,7 +612,7 @@ pub(crate) enum MutationStagedWrite {
     },
     CommitRequired {
         execution: Arc<dyn MutationExecution>,
-        completion: crate::query_execution::ConnectorWriteCompletion,
+        completion: MutationCommitCompletion,
     },
 }
 
@@ -972,12 +1009,8 @@ pub(crate) fn prepare_update_mutation(
         &target_columns,
         &partition_source_columns,
     )?;
-    let signed_preparations = DmlChangeStreamPreparations::from_signed(
-        strategy_operation_id,
-        strategy_lease,
-        strategy_preparation,
-        connector_context.clone(),
-    );
+    let signed_preparations =
+        DmlChangeStreamPreparations::from_signed(strategy_lease, strategy_preparation);
     let cow_preparations = (mode
         == novarocks_spi::connector::ConnectorRowMutationStrategy::CopyOnWrite)
         .then(|| signed_preparations.clone());
@@ -1271,7 +1304,7 @@ pub(crate) fn stage_prepared_update_mutation(
             };
             Ok(MutationStagedWrite::CommitRequired {
                 execution: execution_handle,
-                completion,
+                completion: MutationCommitCompletion::Operation(completion),
             })
         }
         other @ (novarocks_spi::connector::ConnectorRowMutationStrategy::PositionDelete
@@ -1295,11 +1328,19 @@ pub(crate) fn stage_prepared_update_mutation(
                 .ok_or_else(|| {
                     "MOR UPDATE requires a provider-signed written version".to_string()
                 })?;
-            let preparations = preparations.activate()?;
             // The write lease was derived once at preparation so the
             // coordinator could fence it before dispatch; re-deriving here
             // would mint a fresh fence cell and silently discard that fence.
-            let planned = build_update_mor_change_stream_write_plan(
+            let write_session = begin_mor_change_stream_write_session(
+                state,
+                &target,
+                &target_ref,
+                &target_columns,
+                &write_lease,
+                &write_planning_lease,
+                &connector_context,
+            )?;
+            let planned = match build_update_mor_change_stream_write_plan(
                 state,
                 &target,
                 &stmt,
@@ -1309,27 +1350,26 @@ pub(crate) fn stage_prepared_update_mutation(
                 written_version,
                 &execution,
                 &connector_context,
-                &preparations,
+                &write_session,
                 write_planning_lease,
-            )?;
-            let ActivatedDmlChangeStreamWrite {
-                registration: write_registration,
-                sealed_cohorts: activated_sealed,
-                registration_error,
-            } = preparations.activate_write(&write_lease, &connector_context)?;
-            let cohort_fence = writer_fragment_cohorts(&planned.writer_routes, &preparations)?;
+            ) {
+                Ok(planned) => planned,
+                Err(error) => {
+                    release_unplanned_write_session(
+                        &write_session,
+                        &connector_context,
+                        "MOR UPDATE",
+                    );
+                    return Err(error);
+                }
+            };
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: state.clone(),
                 target: target.clone(),
                 planned: Mutex::new(Some(planned)),
-                writer_fragment_cohorts: cohort_fence,
-                write_registration,
-                registration_error,
                 execution,
                 connector_context,
-                write_lease,
-                activated_sealed,
-                operation_session: Mutex::new(None),
+                write_session,
             });
             let result = match execution_handle.run_stage(native_encoder) {
                 Ok(result) => result,
@@ -1343,53 +1383,29 @@ pub(crate) fn stage_prepared_update_mutation(
                     return Err(reason.into());
                 }
             };
-            if let Some(completion) = result.connector_completion.as_ref() {
-                let known_empty = match completion.is_known_empty() {
-                    Ok(known_empty) => known_empty,
-                    Err(error) => {
-                        return Ok(MutationStagedWrite::AbortRequired {
-                            reason: format!(
-                                "summarize MOR UPDATE change-stream aggregate: {error}"
-                            ),
-                            execution: execution_handle,
-                        });
-                    }
-                };
-                if known_empty {
-                    if let Err(reason) = execution_handle.finish_known_empty_noop(completion) {
-                        return Ok(MutationStagedWrite::AbortRequired {
-                            reason,
-                            execution: execution_handle,
-                        });
-                    }
-                    return Ok(MutationStagedWrite::NoOp);
-                }
-            } else if let Some(commit) = result.write_commit.as_ref()
-                && !write_commit_has_files(commit)
-            {
-                if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason:
-                            "MOR UPDATE change-stream write produced rows but no data or DV files"
-                                .to_string(),
-                        execution: execution_handle,
-                    });
-                }
+            let Some(completion) = result.write_session else {
                 return Ok(MutationStagedWrite::AbortRequired {
-                    reason: "MOR UPDATE missing connector completion for an empty aggregate"
-                        .to_string(),
-                    execution: execution_handle,
-                });
-            }
-            let Some(completion) = result.connector_completion else {
-                return Ok(MutationStagedWrite::AbortRequired {
-                    reason: "MOR UPDATE staged without a connector completion".to_string(),
+                    reason: "MOR UPDATE staged without a write-session completion".to_string(),
                     execution: execution_handle,
                 });
             };
+            // An UPDATE that matched nothing produced no commit fragment at
+            // all. Committing that would publish a snapshot describing nothing,
+            // so the session is released instead and the statement reports the
+            // same no-op terminal the staged-report path reached through its
+            // own known-empty check.
+            if completion.is_empty() {
+                if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
+                    return Ok(MutationStagedWrite::AbortRequired {
+                        reason,
+                        execution: execution_handle,
+                    });
+                }
+                return Ok(MutationStagedWrite::NoOp);
+            }
             Ok(MutationStagedWrite::CommitRequired {
                 execution: execution_handle,
-                completion,
+                completion: MutationCommitCompletion::Session(completion),
             })
         }
     }
@@ -1510,7 +1526,7 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparations: &ActivatedDmlChangeStreamPreparations,
+    write_session: &ConnectorWriteSession,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -1558,7 +1574,7 @@ fn build_update_mor_change_stream_write_plan(
         }),
         execution,
         connector_context,
-        preparations,
+        write_session,
         write_planning_lease,
     )
 }
@@ -1646,127 +1662,109 @@ struct MorUpdateChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
-    /// The legacy terminal-sink fence, paired with the activation that signed
-    /// it while both were still in scope.
-    writer_fragment_cohorts: Vec<(
-        novarocks_sql::plan_read::FragmentId,
-        novarocks_spi::connector::ConnectorWriteCohortId,
-    )>,
-    write_registration:
-        Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
-    registration_error: Option<String>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// Exact write authority derived during admission.  Staging must seal the
-    /// operation against this lease; it must not reacquire a current control
-    /// generation after frontend durable intent.
-    write_lease: novarocks_spi::connector::ConnectorWriteLease,
-    activated_sealed: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
-    operation_session:
-        Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
+    /// The one commit authority of this statement, opened on the exact
+    /// generation that admitted it. The plan's writer nodes carry the recipes
+    /// this session sealed, so the two travel together.
+    write_session: Arc<ConnectorWriteSession>,
 }
 
 struct MorMergeChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
-    /// The legacy terminal-sink fence, paired with the activation that signed
-    /// it while both were still in scope.
-    writer_fragment_cohorts: Vec<(
-        novarocks_sql::plan_read::FragmentId,
-        novarocks_spi::connector::ConnectorWriteCohortId,
-    )>,
-    write_registration:
-        Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
-    registration_error: Option<String>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    /// Exact write authority derived during admission.  See the corresponding
-    /// UPDATE executor for why this is retained through staging.
-    write_lease: novarocks_spi::connector::ConnectorWriteLease,
-    activated_sealed: novarocks_spi::connector::ConnectorSealedWriteCohortSet,
-    operation_session:
-        Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
+    /// See the corresponding UPDATE executor.
+    write_session: Arc<ConnectorWriteSession>,
+}
+
+/// Run one sealed change-stream plan through the write-session data plane.
+///
+/// The writers are ordinary dataflow nodes: their rows gather into the Root
+/// finish fragment, and the session that sealed their recipes rides along as the
+/// request's single commit authority. No operation, cohort, execution, or
+/// attempt identity reaches the writer data plane.
+fn run_change_stream_write_session_stage(
+    state: &DmlExecutionKernel,
+    execution: &QueryExecutionContext,
+    write_session: &Arc<ConnectorWriteSession>,
+    planned: crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
+    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
+    statement: &str,
+) -> Result<QueryExecutionResult, String> {
+    let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
+        encoding,
+        // The sealed routes are read only by the build observer; the plan the
+        // backends receive carries its writer identities itself.
+        writer_routes: _writer_routes,
+        ..
+    } = planned;
+    #[cfg(test)]
+    if let Some(result) =
+        crate::query_execution::compiler::observe_change_stream_write_build_for_test(
+            &_writer_routes,
+        )
+    {
+        return Ok(result);
+    }
+    let native_bundle = native_encoder.encode(&encoding)?;
+    if !encoding.matches_native_attachment(&native_bundle) {
+        return Err(format!(
+            "native fragment bundle does not match the sealed {statement} encoding input"
+        ));
+    }
+    let (_, prepared) = encoding.into_parts();
+    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
+        prepared,
+        native_bundle,
+        None,
+        crate::query_execution::contract::DistributedQueryIntent::Write,
+        execution,
+    )
+    .map_err(|error| error.to_string())?;
+    let request = crate::query_execution::contract::with_connector_write_session(
+        request,
+        Arc::clone(write_session),
+    )
+    .map_err(|error| error.to_string())?;
+    crate::query_execution::dml::write::execute_bound_distributed_write_request(
+        state.query_execution(),
+        request,
+    )
 }
 
 impl MorUpdateChangeStreamExecutor {
-    fn finish_known_empty_noop(
+    /// Release a session whose closed data plane produced no commit fragment.
+    fn release_empty_write_session(
         &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
+        completion: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
     ) -> Result<(), String> {
         completion
-            .finish_known_empty_noop()
-            .map_err(|error| format!("terminalize MOR UPDATE known-empty session: {error}"))
+            .session()
+            .abort(self.connector_context.clone())
+            .map(|_| ())
+            .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
     }
 
     fn run_stage(
         &self,
         native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
     ) -> Result<QueryExecutionResult, String> {
-        if let Some(error) = &self.registration_error {
-            return Err(error.clone());
-        }
-        let write_registration = self.write_registration.clone().ok_or_else(|| {
-            "MOR UPDATE has no registration after successful provider activation".to_string()
-        })?;
         let planned = self
             .planned
             .lock()
             .expect("MOR UPDATE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
-        let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            encoding,
-            // The sealed routes are read only by the build observer; the fence
-            // this stage submits was paired with its activation at construction.
-            writer_routes: _writer_routes,
-            ..
-        } = planned;
-        #[cfg(test)]
-        if let Some(result) =
-            crate::query_execution::compiler::observe_change_stream_write_build_for_test(
-                &_writer_routes,
-            )
-        {
-            return Ok(result);
-        }
-        let writer_fragment_cohorts = self.writer_fragment_cohorts.clone();
-        let native_bundle = native_encoder.encode(&encoding)?;
-        if !encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed MOR UPDATE encoding input".into(),
-            );
-        }
-        let (_, prepared) = encoding.into_parts();
-        let session = self
-            .state
-            .query_execution()
-            .begin_write_operation(write_registration.clone(), self.write_lease.clone())
-            .map_err(|error| error.to_string())?;
-        *self
-            .operation_session
-            .lock()
-            .expect("MOR UPDATE operation session lock poisoned") = Some(session.clone());
-        let prepared_request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new_with_writer_fragment_cohorts(
-            prepared,
-            native_bundle,
-            None,
-            write_registration,
-            writer_fragment_cohorts.clone(),
-            self.write_lease.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new_with_writer_fragment_cohorts(
-            session,
-            writer_fragment_cohorts,
-        )
-        .map_err(|error| error.to_string())?;
-        let request = prepared_request
-            .into_request(&self.execution, registration)
-            .map_err(|error| error.to_string())?;
-        crate::query_execution::dml::write::execute_bound_distributed_write_request(
-            self.state.query_execution(),
-            request,
+        run_change_stream_write_session_stage(
+            &self.state,
+            &self.execution,
+            &self.write_session,
+            planned,
+            native_encoder,
+            "MOR UPDATE",
         )
     }
 }
@@ -1783,23 +1781,9 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("MOR UPDATE operation session lock poisoned")
-            .clone();
-        match session {
-            Some(session) => session
-                .abort(self.connector_context.clone())
-                .map_err(|error| format!("abort MOR UPDATE connector operation: {error}")),
-            None => self
-                .write_lease
-                .abort_activated(
-                    self.activated_sealed.clone(),
-                    self.connector_context.clone(),
-                )
-                .map_err(|error| format!("abort activated MOR UPDATE operation: {error}")),
-        }
+        self.write_session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort MOR UPDATE write session: {error}"))
     }
 
     fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
@@ -1812,83 +1796,35 @@ impl MutationExecution for MorUpdateChangeStreamExecutor {
 }
 
 impl MorMergeChangeStreamExecutor {
-    fn finish_known_empty_noop(
+    /// Release a session whose closed data plane produced no commit fragment.
+    fn release_empty_write_session(
         &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
+        completion: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
     ) -> Result<(), String> {
         completion
-            .finish_known_empty_noop()
-            .map_err(|error| format!("terminalize MOR MERGE known-empty session: {error}"))
+            .session()
+            .abort(self.connector_context.clone())
+            .map(|_| ())
+            .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
     }
 
     fn run_stage(
         &self,
         native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
     ) -> Result<QueryExecutionResult, String> {
-        if let Some(error) = &self.registration_error {
-            return Err(error.clone());
-        }
-        let write_registration = self.write_registration.clone().ok_or_else(|| {
-            "MOR MERGE has no registration after successful provider activation".to_string()
-        })?;
         let planned = self
             .planned
             .lock()
             .expect("MOR MERGE change-stream plan lock poisoned")
             .take()
             .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
-        let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            encoding,
-            // The sealed routes are read only by the build observer; the fence
-            // this stage submits was paired with its activation at construction.
-            writer_routes: _writer_routes,
-            ..
-        } = planned;
-        #[cfg(test)]
-        if let Some(result) =
-            crate::query_execution::compiler::observe_change_stream_write_build_for_test(
-                &_writer_routes,
-            )
-        {
-            return Ok(result);
-        }
-        let writer_fragment_cohorts = self.writer_fragment_cohorts.clone();
-        let native_bundle = native_encoder.encode(&encoding)?;
-        if !encoding.matches_native_attachment(&native_bundle) {
-            return Err(
-                "native fragment bundle does not match the sealed MOR MERGE encoding input".into(),
-            );
-        }
-        let (_, prepared) = encoding.into_parts();
-        let session = self
-            .state
-            .query_execution()
-            .begin_write_operation(write_registration.clone(), self.write_lease.clone())
-            .map_err(|error| error.to_string())?;
-        *self
-            .operation_session
-            .lock()
-            .expect("MOR MERGE operation session lock poisoned") = Some(session.clone());
-        let prepared_request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new_with_writer_fragment_cohorts(
-            prepared,
-            native_bundle,
-            None,
-            write_registration,
-            writer_fragment_cohorts.clone(),
-            self.write_lease.clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        let registration = crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new_with_writer_fragment_cohorts(
-            session,
-            writer_fragment_cohorts,
-        )
-        .map_err(|error| error.to_string())?;
-        let request = prepared_request
-            .into_request(&self.execution, registration)
-            .map_err(|error| error.to_string())?;
-        crate::query_execution::dml::write::execute_bound_distributed_write_request(
-            self.state.query_execution(),
-            request,
+        run_change_stream_write_session_stage(
+            &self.state,
+            &self.execution,
+            &self.write_session,
+            planned,
+            native_encoder,
+            "MOR MERGE",
         )
     }
 }
@@ -1905,23 +1841,9 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
     fn abort_terminal(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorWriteAbortOutcome, String> {
-        let session = self
-            .operation_session
-            .lock()
-            .expect("MOR MERGE operation session lock poisoned")
-            .clone();
-        match session {
-            Some(session) => session
-                .abort(self.connector_context.clone())
-                .map_err(|error| format!("abort MOR MERGE connector operation: {error}")),
-            None => self
-                .write_lease
-                .abort_activated(
-                    self.activated_sealed.clone(),
-                    self.connector_context.clone(),
-                )
-                .map_err(|error| format!("abort activated MOR MERGE operation: {error}")),
-        }
+        self.write_session
+            .abort(self.connector_context.clone())
+            .map_err(|error| format!("abort MOR MERGE write session: {error}"))
     }
 
     fn terminal_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
@@ -3412,11 +3334,19 @@ pub(crate) fn stage_prepared_merge_mutation(
             .preparation
             .written_version_ordinal()
             .ok_or_else(|| "MOR MERGE requires a provider-signed written version".to_string())?;
-        let preparations = preparations.activate()?;
         // The write lease was derived once at preparation so the coordinator
         // could fence it before dispatch; re-deriving here would mint a fresh
         // fence cell and silently discard that fence.
-        let planned = build_merge_mor_change_stream_write_plan(
+        let write_session = begin_mor_change_stream_write_session(
+            state,
+            &target,
+            &target_ref,
+            &target_columns,
+            &write_lease,
+            &write_planning_lease,
+            &connector_context,
+        )?;
+        let planned = match build_merge_mor_change_stream_write_plan(
             state,
             &target,
             &stmt,
@@ -3427,27 +3357,22 @@ pub(crate) fn stage_prepared_merge_mutation(
             written_version,
             &execution,
             &connector_context,
-            &preparations,
+            &write_session,
             write_planning_lease,
-        )?;
-        let ActivatedDmlChangeStreamWrite {
-            registration: write_registration,
-            sealed_cohorts: activated_sealed,
-            registration_error,
-        } = preparations.activate_write(&write_lease, &connector_context)?;
-        let cohort_fence = writer_fragment_cohorts(&planned.writer_routes, &preparations)?;
+        ) {
+            Ok(planned) => planned,
+            Err(error) => {
+                release_unplanned_write_session(&write_session, &connector_context, "MOR MERGE");
+                return Err(error);
+            }
+        };
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: state.clone(),
             target: target.clone(),
             planned: Mutex::new(Some(planned)),
-            writer_fragment_cohorts: cohort_fence,
-            write_registration,
-            registration_error,
             execution,
             connector_context,
-            write_lease,
-            activated_sealed,
-            operation_session: Mutex::new(None),
+            write_session,
         });
         let result = match execution_handle.run_stage(native_encoder) {
             Ok(result) => result,
@@ -3461,49 +3386,27 @@ pub(crate) fn stage_prepared_merge_mutation(
                 return Err(reason.into());
             }
         };
-        if let Some(completion) = result.connector_completion.as_ref() {
-            let known_empty = match completion.is_known_empty() {
-                Ok(known_empty) => known_empty,
-                Err(error) => {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason: format!("summarize MOR MERGE change-stream aggregate: {error}"),
-                        execution: execution_handle,
-                    });
-                }
-            };
-            if known_empty {
-                if let Err(reason) = execution_handle.finish_known_empty_noop(completion) {
-                    return Ok(MutationStagedWrite::AbortRequired {
-                        reason,
-                        execution: execution_handle,
-                    });
-                }
-                return Ok(MutationStagedWrite::NoOp);
-            }
-        } else if let Some(commit) = result.write_commit.as_ref()
-            && !write_commit_has_files(commit)
-        {
-            if commit.writers.iter().any(|writer| writer.loaded_rows > 0) {
-                return Ok(MutationStagedWrite::AbortRequired {
-                    reason: "MOR MERGE change-stream write produced rows but no data or DV files"
-                        .to_string(),
-                    execution: execution_handle,
-                });
-            }
+        let Some(completion) = result.write_session else {
             return Ok(MutationStagedWrite::AbortRequired {
-                reason: "MOR MERGE missing connector completion for an empty aggregate".to_string(),
-                execution: execution_handle,
-            });
-        }
-        let Some(completion) = result.connector_completion else {
-            return Ok(MutationStagedWrite::AbortRequired {
-                reason: "MOR MERGE staged without an aggregate connector completion".to_string(),
+                reason: "MOR MERGE staged without a write-session completion".to_string(),
                 execution: execution_handle,
             });
         };
+        // See the MOR UPDATE path: a closed data plane that produced no commit
+        // fragment has nothing to publish, so the session is released rather
+        // than committed.
+        if completion.is_empty() {
+            if let Err(reason) = execution_handle.release_empty_write_session(&completion) {
+                return Ok(MutationStagedWrite::AbortRequired {
+                    reason,
+                    execution: execution_handle,
+                });
+            }
+            return Ok(MutationStagedWrite::NoOp);
+        }
         return Ok(MutationStagedWrite::CommitRequired {
             execution: execution_handle,
-            completion,
+            completion: MutationCommitCompletion::Session(completion),
         });
     }
     let cow_preparations = cow_preparations.ok_or_else(|| {
@@ -3576,7 +3479,7 @@ pub(crate) fn stage_prepared_merge_mutation(
     };
     Ok(MutationStagedWrite::CommitRequired {
         execution: execution_handle,
-        completion,
+        completion: MutationCommitCompletion::Operation(completion),
     })
 }
 pub(crate) struct MergeInsertColumns {
@@ -4081,7 +3984,7 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    preparations: &ActivatedDmlChangeStreamPreparations,
+    write_session: &ConnectorWriteSession,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -4224,7 +4127,7 @@ fn build_merge_mor_change_stream_write_plan(
         }),
         execution,
         connector_context,
-        preparations,
+        write_session,
         write_planning_lease,
     )
 }
@@ -4907,237 +4810,6 @@ mod tests {
         }
     }
 
-    struct RecordingDirectWriteControl {
-        owner: novarocks_spi::connector::ConnectorProviderBindingKey,
-        activate_calls: std::sync::atomic::AtomicUsize,
-        observed_source: std::sync::Mutex<Option<([u8; 32], usize, bool)>>,
-    }
-
-    impl novarocks_spi::connector::ConnectorWriteControl for RecordingDirectWriteControl {
-        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
-            &self.owner
-        }
-
-        fn activate_write(
-            &self,
-            request: novarocks_spi::connector::ConnectorWriteActivationRequest,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorWriteActivation,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            use std::sync::atomic::Ordering;
-
-            self.activate_calls.fetch_add(1, Ordering::SeqCst);
-            let novarocks_spi::connector::ConnectorWriteActivationSource::RowMutation(plan) =
-                &request.source
-            else {
-                return Err(novarocks_spi::connector::ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                    "test expected the complete row-mutation plan",
-                ));
-            };
-            *self
-                .observed_source
-                .lock()
-                .expect("recording write control lock") = Some((
-                plan.digest(),
-                plan.routes().len(),
-                plan.copy_on_write().is_some(),
-            ));
-            let cohorts = plan
-                .routes()
-                .iter()
-                .map(|route| (route.cohort_id(), route.preparation().clone()))
-                .collect();
-            novarocks_spi::connector::ConnectorWriteActivation::try_new(
-                self.owner.clone(),
-                &request,
-                cohorts,
-            )
-        }
-
-        fn plan_write(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorWritePlan,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "recording control does not plan writes",
-            ))
-        }
-
-        fn commit(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<
-                novarocks_spi::connector::ConnectorWriteReceipt,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "recording control does not commit writes",
-            ))
-        }
-
-        fn abort(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorWriteAbortOutcome,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Ok(
-                novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted {
-                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
-                },
-            )
-        }
-
-        fn reconcile(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<
-                novarocks_spi::connector::ConnectorWriteReceipt,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-                "recording control does not reconcile writes",
-            ))
-        }
-    }
-
-    #[test]
-    fn direct_replace_fanout_activates_full_plan_once_and_seals_both_cohorts() {
-        use novarocks_spi::connector::{
-            ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
-            ConnectorRowMutationPreparation, ConnectorRowMutationRoute,
-            ConnectorRowMutationStrategy, ConnectorWriteCohortId, ConnectorWriteLease,
-            ConnectorWriteRouteId,
-        };
-        use std::sync::atomic::Ordering;
-
-        let fixture = cow_rewrite_query_fixture(
-            vec![7],
-            vec![2],
-            Arc::new(StringArray::from(vec!["bb"])) as ArrayRef,
-            DataType::Utf8,
-        );
-        let source = fixture.preparation;
-        let preparation = ConnectorRowMutationPreparation::try_new(
-            source.owner().clone(),
-            source.operation_id(),
-            source.table().clone(),
-            source.match_source().clone(),
-            source.match_source_schema().clone(),
-            source.target_ref().clone(),
-            ConnectorRowMutationIntent::Update,
-            source.base_version().clone(),
-            source.match_contract().clone(),
-            ConnectorRowMutationStrategy::MergeOnRead,
-            source.base_version_ordinal(),
-            source.written_version_ordinal(),
-            bytes::Bytes::from_static(b"direct-replace-fanout"),
-        )
-        .expect("direct preparation");
-        let writer = fixture.route.preparation().clone();
-        let first =
-            ConnectorWriteCohortId::derive(preparation.operation_id(), b"replace-fanout", [1; 32])
-                .expect("first cohort");
-        let second =
-            ConnectorWriteCohortId::derive(preparation.operation_id(), b"replace-fanout", [2; 32])
-                .expect("second cohort");
-        let routes = [first, second]
-            .into_iter()
-            .enumerate()
-            .map(|(index, cohort_id)| {
-                ConnectorRowMutationRoute::try_new(
-                    ConnectorWriteRouteId::from_bytes([20 + index as u8; 32]),
-                    cohort_id,
-                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
-                    writer.input().clone(),
-                    fixture.route.input_ordinals().to_vec(),
-                    Vec::new(),
-                    writer.clone(),
-                )
-                .expect("replace route")
-            })
-            .collect::<Vec<_>>();
-        let plan = ConnectorRowMutationExecutionPlan::try_direct(preparation, routes)
-            .expect("direct fanout plan");
-        let expected_digest = plan.digest();
-        let control = Arc::new(RecordingDirectWriteControl {
-            owner: plan.owner().clone(),
-            activate_calls: std::sync::atomic::AtomicUsize::new(0),
-            observed_source: std::sync::Mutex::new(None),
-        });
-        let lease = ConnectorWriteLease::new(plan.owner().clone(), control.clone(), || {})
-            .expect("write lease");
-        let activated = ActivatedDmlChangeStreamPreparations {
-            operation_id: plan.operation_id(),
-            plan,
-        };
-        let activated_write = activated
-            .activate_write(&lease, &connector_context_for_test())
-            .expect("activate full Direct plan");
-        let registration = activated_write
-            .registration
-            .expect("build full Direct registration");
-
-        assert_eq!(control.activate_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *control.observed_source.lock().expect("recorded source"),
-            Some((expected_digest, 2, false))
-        );
-        let registered = registration
-            .clone()
-            .into_cohorts()
-            .into_iter()
-            .map(|template| template.cohort_id())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            registered,
-            std::collections::BTreeSet::from([first, second])
-        );
-        let session =
-            crate::query_execution::write_operation::ConnectorWriteOperationSession::try_begin(
-                registration,
-                lease.clone(),
-            )
-            .expect("seal exact two-cohort operation");
-        assert!(session.contains_cohort(first));
-        assert!(session.contains_cohort(second));
-
-        FAIL_MOR_REGISTRATION_AFTER_ACTIVATION.with(|fail| fail.set(true));
-        let failed = activated
-            .activate_write(&lease, &connector_context_for_test())
-            .expect("retain activated authority after local registration failure");
-        assert!(failed.registration.is_none());
-        assert_eq!(
-            failed.registration_error.as_deref(),
-            Some("synthetic MOR registration failure after provider activation")
-        );
-        assert_eq!(
-            failed.sealed_cohorts.cohorts().len(),
-            2,
-            "provider activation must preserve the complete abort authority"
-        );
-        let abort = lease
-            .abort_activated(failed.sealed_cohorts, connector_context_for_test())
-            .expect("abort exact post-activation authority");
-        assert!(matches!(
-            abort,
-            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted { .. }
-        ));
-    }
-
     struct AbortOutcomeExecution {
         outcome: novarocks_spi::connector::ConnectorWriteAbortOutcome,
         context: novarocks_spi::connector::ConnectorRequestContext,
@@ -5503,5 +5175,587 @@ mod tests {
         assert!(sql.contains("CAST((s.id) AS BIGINT) AS `id`"), "{sql}");
         assert!(sql.contains("CAST(NULL AS BIGINT) AS `v`"), "{sql}");
         assert!(sql.contains("(s.id > 0)"), "{sql}");
+    }
+
+    // ---- the merge-on-read write-session data plane ----------------------
+    //
+    // The session under test is scripted rather than provider-backed: what these
+    // cases are about is which branch a row reaches, how many times the
+    // connector is asked to commit, and whether it is asked at all -- none of
+    // which needs a real Iceberg table.
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeRowMutationCommit;
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeRowMutationWriter(u32);
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeRowMutationFragment;
+
+    struct FakeRowMutationProvider {
+        descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor,
+        catalog_handle: novarocks_spi::connector::CatalogHandle,
+    }
+
+    impl novarocks_spi::connector::write_stack::ProviderWriteRuntime for FakeRowMutationProvider {
+        type CommitHandle = FakeRowMutationCommit;
+        type WriterHandle = FakeRowMutationWriter;
+        type CommitFragment = FakeRowMutationFragment;
+
+        fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+            &self.catalog_handle
+        }
+    }
+
+    fn row_mutation_catalog_handle() -> novarocks_spi::connector::CatalogHandle {
+        novarocks_spi::connector::CatalogHandle::new(
+            novarocks_spi::connector::ConnectorInstanceId::parse("mor_session_unit")
+                .expect("instance id"),
+            novarocks_spi::connector::CatalogVersion::from_bytes([9; 32]),
+        )
+    }
+
+    fn row_mutation_adapter()
+    -> novarocks_spi::connector::write_stack::WriteRuntimeAdapter<FakeRowMutationProvider> {
+        let handle = row_mutation_catalog_handle();
+        novarocks_spi::connector::write_stack::WriteRuntimeAdapter::new(Arc::new(
+            FakeRowMutationProvider {
+                descriptor: novarocks_spi::connector::ConnectorInstanceDescriptor {
+                    provider_id: novarocks_spi::connector::ConnectorProviderId::parse("fake")
+                        .expect("provider id"),
+                    instance_id: handle.catalog_name().clone(),
+                },
+                catalog_handle: handle,
+            },
+        ))
+    }
+
+    #[derive(Default)]
+    struct RowMutationSessionCalls {
+        finish: usize,
+        abort: usize,
+    }
+
+    /// A row-mutation control that seals the merge-on-read branch pair.
+    ///
+    /// The branches are handed back in descending ordinal order on purpose: a
+    /// consumer that took a branch's identity from its position in this list
+    /// would give every route the other branch's writer.
+    struct FakeRowMutationControl {
+        adapter:
+            novarocks_spi::connector::write_stack::WriteRuntimeAdapter<FakeRowMutationProvider>,
+        binding_key: novarocks_spi::connector::ConnectorProviderBindingKey,
+        routed: bool,
+        calls: Arc<Mutex<RowMutationSessionCalls>>,
+        finish_outcome: Mutex<
+            Option<
+                novarocks_spi::connector::ExternalMutationOutcome<
+                    novarocks_spi::connector::ConnectorWriteReceipt,
+                >,
+            >,
+        >,
+    }
+
+    fn field_binding(
+        key: u8,
+        name: &str,
+        data_type: DataType,
+    ) -> novarocks_spi::connector::ConnectorWriteFieldBinding {
+        novarocks_spi::connector::ConnectorWriteFieldBinding::new(
+            novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([key; 32]),
+            arrow::datatypes::Field::new(name, data_type, false),
+        )
+    }
+
+    /// The data branch: after-image values, accepting replacements and inserts.
+    const MOR_DATA_ORDINAL: u32 = 0;
+    /// The deletion-vector branch: row identity, accepting deletes and the
+    /// before-image half of a replacement.
+    const MOR_DELETE_ORDINAL: u32 = 1;
+
+    fn mor_branch(
+        adapter: &novarocks_spi::connector::write_stack::WriteRuntimeAdapter<
+            FakeRowMutationProvider,
+        >,
+        ordinal: u32,
+        routed: bool,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        use novarocks_spi::connector::write_stack::{
+            ConnectorWriteRouteFacts, ConnectorWriteTargetPlan, WriteTargetOrdinal,
+        };
+
+        let (input, effects) = if ordinal == MOR_DATA_ORDINAL {
+            (
+                novarocks_spi::connector::ConnectorWriteInputShape::Data {
+                    fields: vec![field_binding(1, "v", DataType::Int64)],
+                },
+                vec![
+                    ConnectorRowMutationEffect::Replace,
+                    ConnectorRowMutationEffect::Insert,
+                ],
+            )
+        } else {
+            (
+                novarocks_spi::connector::ConnectorWriteInputShape::DeletionVector {
+                    identity_fields: vec![
+                        field_binding(2, "_file", DataType::Utf8),
+                        field_binding(3, "_pos", DataType::Int64),
+                    ],
+                    partition_source_fields: Vec::new(),
+                },
+                vec![
+                    ConnectorRowMutationEffect::Delete,
+                    ConnectorRowMutationEffect::Replace,
+                ],
+            )
+        };
+        let plan = ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(ordinal)?,
+            adapter.wrap_writer_handle(FakeRowMutationWriter(ordinal)),
+            input,
+        );
+        if !routed {
+            return Ok(plan);
+        }
+        Ok(plan.with_route(ConnectorWriteRouteFacts::try_new(
+            novarocks_spi::connector::ConnectorWriteRouteId::from_bytes(
+                [u8::try_from(ordinal).expect("bounded ordinal"); 32],
+            ),
+            effects,
+            Vec::new(),
+            Vec::new(),
+        )?))
+    }
+
+    impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeRowMutationControl {
+        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
+            &self.binding_key
+        }
+
+        fn begin_write(
+            &self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+        ) -> Result<
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionPlan::try_new(
+                self.adapter.wrap_commit_handle(FakeRowMutationCommit),
+                vec![
+                    mor_branch(&self.adapter, MOR_DELETE_ORDINAL, self.routed)?,
+                    mor_branch(&self.adapter, MOR_DATA_ORDINAL, self.routed)?,
+                ],
+            )
+        }
+
+        fn finish_write(
+            &self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteFinishRequest<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            self.calls.lock().expect("recorded calls").finish += 1;
+            self.finish_outcome
+                .lock()
+                .expect("scripted outcome")
+                .take()
+                .ok_or_else(|| {
+                    novarocks_spi::connector::ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::Internal,
+                        "no scripted commit outcome",
+                    )
+                })
+        }
+
+        fn abort_write(
+            &self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteSessionAbortRequest<'_>,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWriteAbortOutcome,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            self.calls.lock().expect("recorded calls").abort += 1;
+            Ok(
+                novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted {
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+                },
+            )
+        }
+
+        fn reconcile_write(
+            &self,
+            _request: novarocks_spi::connector::write_stack::ConnectorWriteSessionReconcileRequest<
+                '_,
+            >,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Internal,
+                "reconcile is not scripted in this test",
+            ))
+        }
+    }
+
+    struct FakeRowMutationEncoder;
+
+    impl novarocks_proto_codec::connector_write::ConnectorWriteHandleEncoder
+        for FakeRowMutationEncoder
+    {
+        fn owner(&self) -> &str {
+            "fake"
+        }
+
+        fn encode_writer_handle(
+            &self,
+            _handle: &novarocks_spi::connector::write_stack::ConnectorWriterHandle,
+        ) -> Result<
+            novarocks_proto_models::connector_write::ConnectorWriterHandle,
+            novarocks_proto_codec::connector_write::ConnectorWriteCodecError,
+        > {
+            Ok(novarocks_proto_models::connector_write::ConnectorWriterHandle {
+                handle: Some(
+                    novarocks_proto_models::connector_write::connector_writer_handle::Handle::Iceberg(
+                        novarocks_proto_models::connector_write::IcebergWriterHandle {
+                            branch: novarocks_proto_models::connector_write::IcebergWriteBranch::Data
+                                as i32,
+                            table: Some(Default::default()),
+                            output: None,
+                            data: None,
+                            old_deletes: std::collections::BTreeMap::new(),
+                        },
+                    ),
+                ),
+            })
+        }
+    }
+
+    struct FakeRowMutationDecoder {
+        adapter:
+            novarocks_spi::connector::write_stack::WriteRuntimeAdapter<FakeRowMutationProvider>,
+    }
+
+    impl novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder
+        for FakeRowMutationDecoder
+    {
+        fn owner(&self) -> &str {
+            "fake"
+        }
+
+        fn decode_commit_fragment(
+            &self,
+            _fragment: &novarocks_proto_codec::connector_write::ValidatedCommitFragment,
+        ) -> Result<
+            novarocks_spi::connector::write_stack::ConnectorCommitFragment,
+            novarocks_proto_codec::connector_write::ConnectorWriteCodecError,
+        > {
+            Ok(self.adapter.wrap_commit_fragment(FakeRowMutationFragment))
+        }
+    }
+
+    struct UnusedLegacyWriteControl;
+
+    impl novarocks_spi::connector::ConnectorWriteControl for UnusedLegacyWriteControl {
+        fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
+            unreachable!("the legacy control is not exercised by a write session")
+        }
+
+        fn plan_write(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWritePlan,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("the legacy control is not exercised by a write session")
+        }
+
+        fn commit(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("the legacy control is not exercised by a write session")
+        }
+
+        fn abort(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorWriteAbortOutcome,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("the legacy control is not exercised by a write session")
+        }
+
+        fn reconcile(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
+        ) -> Result<
+            novarocks_spi::connector::ExternalMutationOutcome<
+                novarocks_spi::connector::ConnectorWriteReceipt,
+            >,
+            novarocks_spi::connector::ConnectorError,
+        > {
+            unreachable!("the legacy control is not exercised by a write session")
+        }
+    }
+
+    struct RowMutationSessionFixture {
+        session: Arc<ConnectorWriteSession>,
+        calls: Arc<Mutex<RowMutationSessionCalls>>,
+    }
+
+    fn row_mutation_session_fixture(
+        routed: bool,
+        outcome: novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+    ) -> RowMutationSessionFixture {
+        let adapter = row_mutation_adapter();
+        let calls = Arc::new(Mutex::new(RowMutationSessionCalls::default()));
+        let control = Arc::new(FakeRowMutationControl {
+            adapter: adapter.clone(),
+            binding_key: novarocks_spi::connector::ConnectorProviderBindingKey {
+                instance_id: row_mutation_catalog_handle().catalog_name().clone(),
+                incarnation: novarocks_spi::connector::ProviderBindingEpoch::new(),
+            },
+            routed,
+            calls: Arc::clone(&calls),
+            finish_outcome: Mutex::new(Some(outcome)),
+        });
+        let lease = crate::connector::control_host::ConnectorWriteStackLease::new(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
+            novarocks_connector_binding::ConnectorControlWriteBinding::new(
+                Arc::new(UnusedLegacyWriteControl),
+                control,
+                Arc::new(FakeRowMutationEncoder),
+                Arc::new(FakeRowMutationDecoder { adapter }),
+            ),
+            || {},
+        );
+        let session = Arc::new(
+            ConnectorWriteSession::begin(
+                lease,
+                row_mutation_catalog_handle(),
+                novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+                    table: Arc::from("db1.t"),
+                    target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                    intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                    purpose:
+                        novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                    input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                        fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                            arrow::datatypes::Field::new("v", DataType::Int64, true),
+                        )],
+                    },
+                    base: None,
+                    flavor:
+                        novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+                    context: connector_context_for_test(),
+                },
+            )
+            .expect("begin row-mutation write session"),
+        );
+        RowMutationSessionFixture { session, calls }
+    }
+
+    fn known_uncommitted_outcome() -> novarocks_spi::connector::ExternalMutationOutcome<
+        novarocks_spi::connector::ConnectorWriteReceipt,
+    > {
+        novarocks_spi::connector::ExternalMutationOutcome::KnownUncommitted {
+            failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                "scripted",
+            ),
+        }
+    }
+
+    fn empty_session_completion(
+        session: &Arc<ConnectorWriteSession>,
+    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
+        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+            Arc::clone(session),
+            crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(0, Vec::new()),
+        )
+    }
+
+    fn mor_update_executor(
+        session: Arc<ConnectorWriteSession>,
+    ) -> Arc<MorUpdateChangeStreamExecutor> {
+        Arc::new(MorUpdateChangeStreamExecutor {
+            state: test_dml_kernel(),
+            target: iceberg_target(),
+            // No plan: this executor models a stage that never dispatched.
+            planned: Mutex::new(None),
+            execution: crate::common::admitted_query_context::QueryExecutionContext::new(
+                novarocks_types::ClusterRole::Fe,
+                crate::common::backend_topology::BackendTopologySnapshot::empty(3),
+                None,
+                crate::common::query_cancellation::QueryCancellationSource::new().view(),
+                novarocks_sql::compiler::SessionOptimizerSettings::default(),
+            ),
+            connector_context: connector_context_for_test(),
+            write_session: session,
+        })
+    }
+
+    /// Each merge-on-read branch feeds the writer holding its own sealed
+    /// ordinal, and the router sees them in ordinal order.
+    ///
+    /// The scripted provider returns its branches in descending ordinal order,
+    /// so a builder that read a branch's identity from its position in the list
+    /// would pair the delete route with the data writer and vice versa.
+    #[test]
+    fn a_row_mutation_session_routes_each_branch_to_its_own_write_target_ordinal() {
+        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
+        let routed = change_stream_routed_targets(&fixture.session).expect("routed branches");
+
+        assert_eq!(
+            routed
+                .iter()
+                .map(|(write_target, _)| write_target.ordinal().get())
+                .collect::<Vec<_>>(),
+            vec![MOR_DATA_ORDINAL, MOR_DELETE_ORDINAL],
+        );
+        for (write_target, route) in &routed {
+            // The route the branch carries is the one the provider signed for
+            // that exact ordinal, not the one sitting at the same position.
+            assert_eq!(
+                route.route_id(),
+                novarocks_spi::connector::ConnectorWriteRouteId::from_bytes(
+                    [u8::try_from(write_target.ordinal().get()).expect("bounded ordinal"); 32]
+                ),
+            );
+        }
+        let data_effects = routed[0].1.accepted_effects();
+        assert!(
+            data_effects.contains(&novarocks_spi::connector::ConnectorRowMutationEffect::Insert)
+        );
+        let delete_effects = routed[1].1.accepted_effects();
+        assert!(
+            delete_effects.contains(&novarocks_spi::connector::ConnectorRowMutationEffect::Delete)
+        );
+    }
+
+    /// A branch that reached the router without routing facts would leave SQL
+    /// with rows it has nowhere to send, so it is refused rather than defaulted.
+    #[test]
+    fn a_row_mutation_branch_without_routing_facts_fails_closed() {
+        let fixture = row_mutation_session_fixture(false, known_uncommitted_outcome());
+        let error = change_stream_routed_targets(&fixture.session)
+            .expect_err("an unrouted branch must fail closed");
+        assert!(
+            error.contains("carries no provider routing facts"),
+            "{error}"
+        );
+    }
+
+    /// A staged merge-on-read write commits its session once, and the terminal
+    /// is single-shot: the connector is not asked a second time.
+    #[test]
+    fn a_staged_mor_write_commits_its_session_exactly_once() {
+        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
+        let execution = mor_update_executor(Arc::clone(&fixture.session));
+        let completion =
+            MutationCommitCompletion::Session(empty_session_completion(&fixture.session));
+
+        execution
+            .commit_terminal(completion)
+            .expect("the session performs the one external commit");
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.calls.lock().expect("recorded calls").finish, 1);
+
+        // A second terminal decision on the same session is refused, and the
+        // connector is not asked again.
+        let error = execution
+            .abort_terminal()
+            .expect_err("a committed session cannot also abort");
+        assert!(error.contains("already reached"), "{error}");
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        let calls = fixture.calls.lock().expect("recorded calls");
+        assert_eq!(calls.finish, 1);
+        assert_eq!(calls.abort, 0);
+    }
+
+    /// A merge-on-read write whose data plane never closed reaches the provider
+    /// zero times.
+    ///
+    /// Staging fails before dispatch, the statement takes the abort branch, and
+    /// the session is released. `finish_invocations` is what makes "the
+    /// connector was never asked to commit" an assertable fact rather than an
+    /// inference.
+    #[test]
+    fn a_mor_write_whose_data_plane_never_closed_never_reaches_the_provider() {
+        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
+        let execution = mor_update_executor(Arc::clone(&fixture.session));
+
+        let reason = execution
+            .run_stage(&PanicOnEncodeNativeEncoder)
+            .expect_err("a stage with no dispatched plan fails");
+        assert!(reason.contains("already consumed"), "{reason}");
+        assert!(execution.needs_abort_on_stage_error());
+        assert_eq!(fixture.session.finish_invocations(), 0);
+
+        assert_eq!(
+            execution.abort_terminal().expect("release the session"),
+            novarocks_spi::connector::ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            },
+        );
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        let calls = fixture.calls.lock().expect("recorded calls");
+        assert_eq!(calls.finish, 0);
+        assert_eq!(calls.abort, 1);
+    }
+
+    /// A merge-on-read write that matched nothing produced no commit fragment.
+    /// Committing it would publish a snapshot describing nothing, so the session
+    /// is released and the connector is never asked to commit.
+    #[test]
+    fn an_empty_mor_write_releases_its_session_without_committing() {
+        let fixture = row_mutation_session_fixture(true, known_uncommitted_outcome());
+        let execution = mor_update_executor(Arc::clone(&fixture.session));
+        let completion = empty_session_completion(&fixture.session);
+        assert!(completion.is_empty());
+
+        execution
+            .release_empty_write_session(&completion)
+            .expect("release an empty write session");
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        let calls = fixture.calls.lock().expect("recorded calls");
+        assert_eq!(calls.finish, 0);
+        assert_eq!(calls.abort, 1);
+    }
+
+    struct PanicOnEncodeNativeEncoder;
+
+    impl crate::query_execution::dml::mutation::MutationNativeFragmentEncoder
+        for PanicOnEncodeNativeEncoder
+    {
+        fn encode(
+            &self,
+            _input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
+        ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String>
+        {
+            panic!("a stage that never reached dispatch must not encode a bundle")
+        }
     }
 }

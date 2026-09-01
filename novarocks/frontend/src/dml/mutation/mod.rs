@@ -50,7 +50,10 @@ impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
         &self,
         input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
     ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String> {
-        crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
+        // A merge-on-read change stream is a write-dataflow plan, so its
+        // writer nodes need the recipes the sealed input carries. The
+        // entrypoint reads that off the input rather than being chosen here.
+        crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input)
     }
 }
 

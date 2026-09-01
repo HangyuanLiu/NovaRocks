@@ -183,12 +183,19 @@ struct CoreMutationPrepared {
     state: AtomicU8,
 }
 
+/// One staged mutation's commit authority.
+///
+/// The completion is taken by the single commit, so a second attempt finds
+/// nothing rather than asking the connector twice. The publication authority
+/// stays beside it because a `CommitUnknown` must be resolved through the exact
+/// authority that issued the commit, never through a replacement -- and the
+/// completion itself is gone by then.
 struct CoreMutationCommit {
     kind: MutationStatementKind,
     attempt_id: String,
     execution: Arc<dyn crate::query_execution::dml::mutation_flow::MutationExecution>,
-    session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
-    completion: Mutex<Option<crate::query_execution::ConnectorWriteCompletion>>,
+    publication_authority: crate::query_execution::dml::mutation_flow::MutationPublicationAuthority,
+    completion: Mutex<Option<crate::query_execution::dml::mutation_flow::MutationCommitCompletion>>,
 }
 
 struct CoreMutationAbort {
@@ -607,7 +614,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
-                            session: completion.session().clone(),
+                            publication_authority: completion.publication_authority(),
                             completion: Mutex::new(Some(completion)),
                         },
                     ))),
@@ -639,7 +646,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
                             kind: prepared.operation.kind,
                             attempt_id: prepared.operation.attempt_id.clone(),
                             execution,
-                            session: completion.session().clone(),
+                            publication_authority: completion.publication_authority(),
                             completion: Mutex::new(Some(completion)),
                         },
                     ))),
@@ -704,7 +711,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
             .expect("mutation commit completion lock poisoned")
             .take()
             .ok_or_else(|| "mutation commit completion was already consumed".to_string())?;
-        commit.execution.commit_terminal(&completion)
+        commit.execution.commit_terminal(completion)
     }
 
     fn adjudicate_mutation_publication(
@@ -721,16 +728,8 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         let _prepared = prepared_handle(prepared)?;
         let commit = commit_handle(commit)?;
         commit
-            .session
-            .adjudicate_publication(
-                evidence,
-                commit
-                    .session
-                    .request_context()
-                    .clone()
-                    .without_vended_credential_lease_sink(),
-            )
-            .map_err(|error| error.to_string())
+            .publication_authority
+            .adjudicate(evidence, commit.execution.terminal_context())
     }
 
     fn finalize_mutation(&self, prepared: &dyn MutationPrepared) -> Result<(), String> {
