@@ -48,6 +48,7 @@ mod write;
 
 pub mod conformance;
 pub mod read_stack;
+pub mod write_stack;
 
 pub use catalog::{
     CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind,
