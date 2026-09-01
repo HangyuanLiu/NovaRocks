@@ -2219,7 +2219,7 @@ struct IdleMysqlConnection {
     thread: thread::JoinHandle<Result<()>>,
 }
 
-fn connector_reader_environment() -> CrossProcessChildEnvironment {
+pub(super) fn connector_reader_environment() -> CrossProcessChildEnvironment {
     let mut environment = CrossProcessChildEnvironment::default();
     // This is a generic child launch input, not a connector-specific harness
     // API. The runner uses the marker only to establish the observable
@@ -2243,7 +2243,7 @@ fn connector_reader_environment() -> CrossProcessChildEnvironment {
     environment
 }
 
-fn connector_launch_config() -> ScenarioLaunchConfig {
+pub(super) fn connector_launch_config() -> ScenarioLaunchConfig {
     ScenarioLaunchConfig {
         child_environment: connector_reader_environment(),
         config_overlay: CrossProcessConfigOverlay {
@@ -2397,7 +2397,7 @@ fn write_access_domain_collision_snapshot(
     })
 }
 
-fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
+pub(super) fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let count = context.handle().be_count();
     if count != 3 {
         bail!(
@@ -2408,18 +2408,20 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn mysql_endpoint(context: &ScenarioContext) -> (String, u16) {
+pub(super) fn mysql_endpoint(context: &ScenarioContext) -> (String, u16) {
     (context.mysql_user().to_string(), context.mysql_port())
 }
 
-fn resource_baseline(context: &mut ScenarioContext) -> Result<QueryExecutionResourceSnapshot> {
+pub(super) fn resource_baseline(
+    context: &mut ScenarioContext,
+) -> Result<QueryExecutionResourceSnapshot> {
     context
         .handle()
         .query_execution_resource_snapshot()?
         .context("cross-process system scenario requires the query resource oracle")
 }
 
-fn await_resource_convergence(
+pub(super) fn await_resource_convergence(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
     operation: &str,
@@ -2434,7 +2436,10 @@ fn await_resource_convergence(
         .with_context(|| format!("resource convergence after {operation}"))
 }
 
-fn create_warehouse(context: &ScenarioContext, name: &str) -> Result<std::path::PathBuf> {
+pub(super) fn create_warehouse(
+    context: &ScenarioContext,
+    name: &str,
+) -> Result<std::path::PathBuf> {
     let warehouse = context.runtime_dir().join("warehouses").join(name);
     std::fs::create_dir_all(&warehouse)
         .with_context(|| format!("create Iceberg warehouse {}", warehouse.display()))?;
@@ -2605,7 +2610,7 @@ fn create_catalog_table_and_dense_data(
     Ok(())
 }
 
-fn create_catalog(
+pub(super) fn create_catalog(
     control: &mut mysql::Conn,
     catalog: &str,
     warehouse: &std::path::Path,
