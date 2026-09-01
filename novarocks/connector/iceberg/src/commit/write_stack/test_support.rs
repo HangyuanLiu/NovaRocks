@@ -27,7 +27,9 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergContentRange, IcebergDataBranchRecipe,
-    IcebergDeletionVectorArtifact, IcebergWriteBranch, IcebergWriteTableFacts, IcebergWriterOutput,
+    IcebergDeletionVectorArtifact, IcebergManagedPublicationFacts,
+    IcebergManagedPublicationProvenance, IcebergWriteBranch, IcebergWriteTableFacts,
+    IcebergWriterOutput,
 };
 use crate::commit::write_stack::flavor::IcebergSessionMaterial;
 use crate::commit::write_stack::old_delete::{
@@ -81,6 +83,40 @@ pub(crate) fn staged_table_metadata() -> std::sync::Arc<crate::iceberg::spec::Ta
     .expect("staged metadata")
     .metadata;
     std::sync::Arc::new(metadata)
+}
+
+/// The durable publication a managed session publishes under.
+///
+/// It is one fixed id so a test can assert that exactly this id reaches the
+/// committed snapshot's summary, which is where the publication fence looks
+/// for it.
+pub(crate) fn publication_id() -> novarocks_spi::connector::LakePublicationId {
+    novarocks_spi::connector::LakePublicationId::try_from_uuid(
+        uuid::Uuid::parse_str("019200aa-0000-7000-8000-0000000000ab").expect("publication uuid"),
+    )
+    .expect("publication id")
+}
+
+pub(crate) fn publication_provenance() -> IcebergManagedPublicationProvenance {
+    IcebergManagedPublicationProvenance::try_new(
+        publication_id(),
+        vec![crate::commit::ProvenanceBase {
+            table_fqn: "db.base".to_string(),
+            uuid: "6f7c3a0e-0000-4000-8000-000000000002".to_string(),
+            from_snapshot: Some(11),
+            to_snapshot: 12,
+        }],
+        "fingerprint".to_string(),
+        "ZGlnZXN0".to_string(),
+    )
+    .expect("publication provenance")
+}
+
+pub(crate) fn publication_facts(
+    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+    empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
+) -> IcebergManagedPublicationFacts {
+    IcebergManagedPublicationFacts::new(technique, empty_input, publication_provenance())
 }
 
 pub(crate) fn sample_partition() -> IcebergArtifactPartition {

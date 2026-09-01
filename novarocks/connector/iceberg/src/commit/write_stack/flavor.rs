@@ -46,8 +46,8 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 
 use crate::commit::write_stack::domain::{
-    IcebergDataBranchRecipe, IcebergManagedPublicationFacts, IcebergWriteBranch,
-    IcebergWriteFlavor, IcebergWriteTableFacts, IcebergWriterOutput, invalid,
+    IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts,
+    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteTableFacts, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::commit::write_stack::planning::{
@@ -130,6 +130,9 @@ pub(crate) struct IcebergSessionFlavorPlan {
     pub flavor: IcebergWriteFlavor,
     /// Present exactly on a managed publication.
     pub publication: Option<IcebergManagedPublicationFacts>,
+    /// Present exactly on a distributed rewrite: the exact input files each
+    /// branch replaces, in the same order as `branches`.
+    pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
     /// The branches, in ordinal order.
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
@@ -156,6 +159,7 @@ pub(crate) fn plan_ordinary_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        rewrite_inputs: Vec::new(),
         branches,
     })
 }
@@ -189,6 +193,7 @@ pub(crate) fn plan_managed_publication_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor: IcebergWriteFlavor::ManagedPublication,
         publication: Some(publication),
+        rewrite_inputs: Vec::new(),
         branches: vec![IcebergWriteBranchPlan::Data {
             plan: material.data_plan(material.input.clone()),
             route: None,
@@ -213,9 +218,18 @@ pub(crate) fn plan_distributed_rewrite_branches(
     }
     // A rewrite that found nothing to rewrite still seals one branch: the
     // session has to exist so it can terminate, and its empty prepared set is
-    // what makes it a no-op rather than a failure.
-    let branch_count = groups.len().max(1);
-    let branches = (0..branch_count)
+    // what makes it a no-op rather than a failure. Its frozen input is empty
+    // for the same reason, and the branch count stays one per input.
+    let rewrite_inputs = if groups.is_empty() {
+        vec![IcebergFrozenRewriteBranchInput::default()]
+    } else {
+        groups
+            .iter()
+            .map(frozen_rewrite_branch_input)
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let branches = rewrite_inputs
+        .iter()
         .map(|_| IcebergWriteBranchPlan::Data {
             plan: material.data_plan(material.input.clone()),
             route: None,
@@ -224,8 +238,28 @@ pub(crate) fn plan_distributed_rewrite_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor: IcebergWriteFlavor::DistributedRewrite,
         publication: None,
+        rewrite_inputs,
         branches,
     })
+}
+
+/// The exact live files one frozen group's branch replaces.
+///
+/// A data rewrite retires the group's data files together with the delete
+/// artifacts the group was proven to own, because the rows those deletions
+/// removed are already absent from the files the branch writes. Leaving an
+/// owned delete artifact live would re-apply it to rows that no longer exist.
+fn frozen_rewrite_branch_input(
+    group: &IcebergFrozenRewriteGroupV1,
+) -> Result<IcebergFrozenRewriteBranchInput, ConnectorError> {
+    IcebergFrozenRewriteBranchInput::try_new(
+        group
+            .data_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect(),
+        group.owned_data_delete_files.iter().cloned().collect(),
+    )
 }
 
 /// How many branches a row mutation needs, and what each one accepts.
@@ -272,6 +306,7 @@ pub(crate) fn plan_row_mutation_branches(
             Ok(IcebergSessionFlavorPlan {
                 flavor,
                 publication: None,
+                rewrite_inputs: Vec::new(),
                 branches: vec![IcebergWriteBranchPlan::Delete {
                     plan: material.delete_plan(branch, material.input.clone())?,
                     route: Some(route),
@@ -354,6 +389,7 @@ fn plan_merge_on_read_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        rewrite_inputs: Vec::new(),
         branches: vec![
             IcebergWriteBranchPlan::Data {
                 plan: material.data_plan(data_input),
@@ -388,6 +424,7 @@ fn plan_copy_on_write_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        rewrite_inputs: Vec::new(),
         branches: vec![IcebergWriteBranchPlan::Data {
             plan: material.data_plan(material.input.clone()),
             route: Some(route),

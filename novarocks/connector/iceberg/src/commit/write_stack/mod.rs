@@ -47,6 +47,7 @@ pub mod execution;
 pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;
+pub(crate) mod repartition;
 pub(crate) mod runtime;
 
 #[cfg(test)]

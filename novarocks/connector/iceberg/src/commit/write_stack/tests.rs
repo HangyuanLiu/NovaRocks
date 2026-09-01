@@ -57,8 +57,8 @@ use crate::commit::write_stack::control::{
 };
 use crate::commit::write_stack::domain::{
     IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
-    IcebergManagedPublicationFacts, IcebergPositionDeleteFileArtifact, IcebergWriteBranch,
-    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteFlavor,
+    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
     IcebergSessionFlavorPlan, plan_distributed_rewrite_branches, plan_managed_publication_branches,
@@ -75,7 +75,8 @@ use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRunti
 use crate::commit::write_stack::test_support::{
     binding, copy_on_write_input_shape, data_branch_plan, data_input_shape, delete_branch_plan,
     delete_input_shape, dv_artifact, merge_on_read_input_shape, merge_target, parquet_ref,
-    sample_metrics, sample_partition, session_material, table_facts,
+    publication_facts, publication_id, sample_metrics, sample_partition, session_material,
+    table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
@@ -892,6 +893,9 @@ fn flavor_session(
             base_version_digest: None,
             publication: plan.publication,
             staged_metadata: None,
+            rewrite_inputs: plan.rewrite_inputs,
+            repartition: None,
+            writer_table: None,
             branches: plan.branches,
         },
     )
@@ -1097,6 +1101,9 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             base_version_digest: None,
             publication: None,
             staged_metadata: None,
+            rewrite_inputs: Vec::new(),
+            repartition: None,
+            writer_table: None,
             branches: vec![
                 IcebergWriteBranchPlan::Data {
                     plan: data_branch_plan(),
@@ -1183,6 +1190,114 @@ fn a_distributed_rewrite_yields_one_target_per_rewrite_group() {
 }
 
 #[test]
+fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
+    // The rewrite commit replaces files it named at planning time. Nothing in
+    // the prepared write set can say which those are -- a fragment describes
+    // what a writer produced, and a group whose rows were all compacted away
+    // produces nothing at all while still having to be retired.
+    //
+    // `run_iceberg_commit` refuses `CommitOpKind::SelectedRewrite` outright
+    // when its frozen file set is absent, so before the session carried its
+    // frozen groups every rewrite commit failed with "requires its frozen file
+    // set". This asserts the session now supplies exactly the union it froze.
+    let live_deletes = std::collections::BTreeSet::from([
+        "s3://b/wh/db/t/data/d0.puffin".to_string(),
+        "s3://b/wh/db/t/data/d1.puffin".to_string(),
+    ]);
+    let groups = crate::distributed_rewrite::plan_data_file_groups(
+        ["a", "b"]
+            .iter()
+            .map(|partition| DataFileWithStats {
+                path: format!("s3://b/wh/db/t/data/{partition}/f.parquet"),
+                size: 1,
+                record_count: Some(1),
+                column_stats: None,
+                partition_spec_id: Some(0),
+                partition_key: Some((*partition).to_string()),
+                partition_values: None,
+                manifest_path: None,
+                partition_field_values: Vec::new(),
+                first_row_id: None,
+                data_sequence_number: Some(4),
+                delete_files: Vec::new(),
+            })
+            .collect(),
+        &live_deletes,
+    )
+    .expect("plan rewrite groups");
+    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
+        .expect("plan a distributed rewrite");
+    let (handle, _) = flavor_session(plan);
+
+    let files = crate::commit::write_stack::control::selected_rewrite_files(&handle)
+        .expect("a rewrite session commits the file set it froze");
+    files
+        .validate()
+        .expect("the frozen file set satisfies the rewrite action");
+    assert_eq!(
+        files.data_paths,
+        std::collections::BTreeSet::from([
+            "s3://b/wh/db/t/data/a/f.parquet".to_string(),
+            "s3://b/wh/db/t/data/b/f.parquet".to_string(),
+        ])
+    );
+    // Every live delete artifact is retired with the data it applied to: the
+    // rewritten files no longer contain the rows it removed.
+    assert_eq!(files.delete_paths, live_deletes);
+}
+
+#[test]
+fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
+    // A frozen input set retires live files. Handing one to a commit op that
+    // does not replace files would delete data nothing superseded, so the
+    // session seals it on exactly one flavor and offers it to exactly one
+    // commit op.
+    let (append, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .expect("plan an append"),
+    );
+    assert!(crate::commit::write_stack::control::selected_rewrite_files(&append).is_none());
+
+    let error = IcebergCommitHandle::try_new_sealed(
+        IcebergWriteSessionId::new(),
+        table_facts(),
+        IcebergWriteFlavor::Append,
+        crate::commit::write_stack::domain::IcebergSessionFacts {
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            base_version_digest: None,
+            publication: None,
+            staged_metadata: None,
+            rewrite_inputs: vec![
+                crate::commit::write_stack::domain::IcebergFrozenRewriteBranchInput::try_new(
+                    std::collections::BTreeSet::from(["s3://b/wh/db/t/data/a.parquet".to_string()]),
+                    std::collections::BTreeSet::new(),
+                )
+                .expect("frozen rewrite input"),
+            ],
+            repartition: None,
+        },
+        vec![
+            crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
+                ordinal(0),
+                IcebergWriteBranch::Data,
+                std::collections::BTreeMap::new(),
+            ),
+        ],
+    )
+    .expect_err("an append cannot freeze a rewrite input");
+    assert!(
+        error
+            .message()
+            .contains("must carry a frozen rewrite input per branch"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+#[test]
 fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
     // swap `dispatch_commit` already performs against the frozen snapshot, so
@@ -1236,7 +1351,7 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
     ] {
         let plan = plan_managed_publication_branches(
             &session_material(data_input_shape()),
-            IcebergManagedPublicationFacts::new(
+            publication_facts(
                 technique,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             ),
@@ -1253,6 +1368,196 @@ fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
         );
         assert_eq!(handle.commit_op_kind(), op_kind);
     }
+}
+
+#[test]
+fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_current_one() {
+    // The two generations are deliberately different. A writer has to stage
+    // files under the spec the commit is about to establish, because that spec
+    // and the snapshot land together; the session's own compare-and-swap has to
+    // match the generation the table still holds, because that is what the
+    // catalog will be asked to move from. Collapsing them either stamps
+    // artifacts with a spec id the table has never had or refuses every commit
+    // as a stale generation.
+    let session_table = table_facts();
+    let prospective = IcebergWriteTableFacts::try_new(
+        session_table.table_uuid().to_string(),
+        session_table.namespace().to_string(),
+        session_table.table_name().to_string(),
+        session_table.table_location().to_string(),
+        session_table.data_location().to_string(),
+        session_table.target_ref().to_string(),
+        session_table.base_snapshot_id(),
+        session_table.base_sequence_number(),
+        session_table.schema_id(),
+        session_table.default_partition_spec_id() + 1,
+        3,
+    )
+    .expect("prospective table facts");
+
+    let (handle, plans) = plan_branch_session(
+        IcebergWriteSessionId::new(),
+        IcebergBranchSessionPlanInput {
+            flavor: IcebergWriteFlavor::ManagedPublication,
+            purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            table: session_table.clone(),
+            base_version_digest: None,
+            publication: Some(publication_facts(
+                ConnectorManagedPublicationTechnique::Full,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            )),
+            staged_metadata: None,
+            rewrite_inputs: Vec::new(),
+            repartition: None,
+            writer_table: Some(prospective.clone()),
+            branches: vec![IcebergWriteBranchPlan::Data {
+                plan: data_branch_plan(),
+                route: None,
+            }],
+        },
+    )
+    .expect("seal a repartitioning publication");
+
+    assert_eq!(
+        plans[0].handle().table().default_partition_spec_id(),
+        prospective.default_partition_spec_id(),
+        "the writer stamps its artifacts with the spec the commit establishes"
+    );
+    assert_eq!(
+        handle.table().default_partition_spec_id(),
+        session_table.default_partition_spec_id(),
+        "the session compares and swaps against the generation the table holds"
+    );
+}
+
+#[test]
+fn only_a_managed_publication_projects_the_committed_row_count() {
+    // A publication's caller records the row count the refresh published, so
+    // its receipt has to carry one and the projection has to reload -- the
+    // table this generation already holds is the pre-commit view by
+    // construction. No ordinary DML receipt carries a row count at all.
+    //
+    // The catalog behind this generation is unreachable, so a reload cannot
+    // succeed. An ordinary session answering `None` is therefore proof that it
+    // never reloads, and the publication's failure is proof that it does.
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        ProviderBindingEpoch::new(),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+
+    let (append, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .expect("plan an ordinary append"),
+    );
+    assert_eq!(
+        control
+            .publication_row_count(&append, 300, &request_context())
+            .expect("an ordinary write claims no row count"),
+        None
+    );
+
+    let (publication, _) = flavor_session(
+        plan_managed_publication_branches(
+            &session_material(data_input_shape()),
+            publication_facts(
+                ConnectorManagedPublicationTechnique::Full,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ),
+        )
+        .expect("plan a managed publication"),
+    );
+    control
+        .publication_row_count(&publication, 300, &request_context())
+        .expect_err("a publication reloads to read its committed row count");
+}
+
+#[test]
+fn a_managed_publication_stamps_its_publication_id_onto_the_snapshot_it_commits() {
+    // The publication fence fast-forwards a staged refresh only after reading
+    // `MV_PUBLICATION_ID_PROP` back off the staging snapshot's own summary
+    // (`catalog_control::catalog_mutation` -> `snapshot_matches_publication_marker`).
+    // Before the session retained the publication id, its commit wrote only the
+    // write-session marker, so every refresh it published was a snapshot the
+    // fence could never claim -- and silently, because nothing before the fence
+    // looks for the property.
+    let (handle, _) = flavor_session(
+        plan_managed_publication_branches(
+            &session_material(data_input_shape()),
+            publication_facts(
+                ConnectorManagedPublicationTechnique::Full,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ),
+        )
+        .expect("plan a managed publication"),
+    );
+    let properties = crate::commit::write_stack::control::session_snapshot_properties(&handle, 9)
+        .expect("build the commit's snapshot properties");
+
+    // The reconciliation marker stays: an unknown outcome still has to be
+    // adjudicable.
+    assert_eq!(
+        properties
+            .get(crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY)
+            .map(String::as_str),
+        Some(handle.session_id().to_string().as_str())
+    );
+
+    let snapshot = crate::iceberg::spec::Snapshot::builder()
+        .with_snapshot_id(300)
+        .with_sequence_number(1)
+        .with_timestamp_ms(1)
+        .with_manifest_list("file:/tmp/manifest-list.avro".to_string())
+        .with_summary(crate::iceberg::spec::Summary {
+            operation: crate::iceberg::spec::Operation::Overwrite,
+            additional_properties: properties.clone().into_iter().collect(),
+        })
+        .with_schema_id(0)
+        .build();
+    assert!(
+        crate::commit::snapshot_matches_publication_marker(
+            &snapshot,
+            &crate::commit::MvPublicationSnapshotMarker {
+                publication_id: publication_id(),
+            },
+        ),
+        "the fence must be able to claim the snapshot this commit creates"
+    );
+
+    // The provenance rides along on the same snapshot, seeded with the rows
+    // this write staged; the commit action refines it to `total-records`.
+    let provenance = crate::commit::MvPublicationProvenanceV2::from_snapshot_summary(&snapshot)
+        .expect("decode the provenance")
+        .expect("a publication snapshot carries provenance");
+    assert_eq!(provenance.publication_id, publication_id());
+    assert_eq!(provenance.technique, crate::commit::RefreshTechnique::Full);
+    assert_eq!(provenance.rows, 9);
+
+    // An ordinary write carries no publication facts at all: the id belongs to
+    // the one session that publishes under it.
+    let (append, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .expect("plan an ordinary append"),
+    );
+    assert_eq!(
+        crate::commit::write_stack::control::session_snapshot_properties(&append, 9)
+            .expect("build the commit's snapshot properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec![crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY]
+    );
 }
 
 #[test]
@@ -1276,10 +1581,7 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
         flavor_session(
             plan_managed_publication_branches(
                 &session_material(data_input_shape()),
-                IcebergManagedPublicationFacts::new(
-                    ConnectorManagedPublicationTechnique::Full,
-                    empty_input,
-                ),
+                publication_facts(ConnectorManagedPublicationTechnique::Full, empty_input),
             )
             .expect("plan a managed publication"),
         )

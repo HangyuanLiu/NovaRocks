@@ -39,9 +39,10 @@ use novarocks_spi::connector::{
 };
 
 use crate::commit::write_stack::domain::{
-    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergManagedPublicationFacts,
-    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
+    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput,
+    IcebergManagedPublicationFacts, IcebergSealedWriteTarget, IcebergSessionFacts,
+    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteTableFacts,
+    IcebergWriterHandle, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 
@@ -242,6 +243,20 @@ pub struct IcebergBranchSessionPlanInput {
     /// Present exactly on the staged-create flavor: the frozen metadata of a
     /// target that has no catalog entry to load.
     pub staged_metadata: Option<std::sync::Arc<crate::iceberg::spec::TableMetadata>>,
+    /// Present exactly on the distributed-rewrite flavor: the exact input files
+    /// each sealed branch replaces, in the same order as `branches`.
+    pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// Present only on a managed publication that replaces the target's default
+    /// partitioning in the same external commit.
+    pub(crate) repartition:
+        Option<crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
+    /// The exact table generation every *writer* is built against.
+    ///
+    /// It differs from `table` only under an atomic partition replacement,
+    /// where the writers must already write under the spec the commit is about
+    /// to establish while the session's own compare-and-swap still has to match
+    /// the generation the table currently holds.
+    pub writer_table: Option<IcebergWriteTableFacts>,
     /// The branches this session seals, in ordinal order.
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
@@ -309,25 +324,30 @@ pub fn plan_branch_session(
     }
     prove_unique_delete_owner(&sealed)?;
 
+    let writer_table = input.writer_table.as_ref().unwrap_or(&input.table);
     let mut plans = Vec::with_capacity(sealed.len());
     for (index, plan) in input.branches.iter().enumerate() {
         plans.push(IcebergWriteTargetPlan {
             ordinal: sealed[index].ordinal(),
             branch: plan.branch(),
-            handle: plan.writer_handle(&input.table)?,
+            handle: plan.writer_handle(writer_table)?,
             input: plan.input().clone(),
             route: plan.route().cloned(),
         });
     }
 
-    let handle = IcebergCommitHandle::try_new_with_publication(
+    let handle = IcebergCommitHandle::try_new_sealed(
         session_id,
         input.table,
         input.flavor,
-        input.purpose,
-        input.base_version_digest,
-        input.publication,
-        input.staged_metadata,
+        IcebergSessionFacts {
+            purpose: input.purpose,
+            base_version_digest: input.base_version_digest,
+            publication: input.publication,
+            staged_metadata: input.staged_metadata,
+            rewrite_inputs: input.rewrite_inputs,
+            repartition: input.repartition,
+        },
         sealed,
     )?;
     Ok((handle, plans))
@@ -353,6 +373,19 @@ pub fn plan_write_session(
             route: None,
         });
     }
+    // The canonical shape freezes no rewrite input, because it is cut from the
+    // flavor alone rather than from a planned group set. A rewrite sealed this
+    // way therefore replaces nothing: its empty prepared set terminates it as a
+    // no-op, and a non-empty one is refused by the commit action rather than
+    // retiring files no group named.
+    let rewrite_inputs = if input.flavor == IcebergWriteFlavor::DistributedRewrite {
+        branches
+            .iter()
+            .map(|_| IcebergFrozenRewriteBranchInput::default())
+            .collect()
+    } else {
+        Vec::new()
+    };
     plan_branch_session(
         session_id,
         IcebergBranchSessionPlanInput {
@@ -362,6 +395,9 @@ pub fn plan_write_session(
             base_version_digest: input.base_version_digest,
             publication: None,
             staged_metadata: input.staged_metadata,
+            rewrite_inputs,
+            repartition: None,
+            writer_table: None,
             branches,
         },
     )

@@ -227,33 +227,124 @@ impl IcebergWriteFlavor {
 
 /// The publication facts one managed write session keeps.
 ///
-/// Deliberately *not* the publication: the `LakePublicationId` that names it
-/// stays in the frontend layer that owns it. Nothing here reaches a writer
-/// recipe, a commit fragment, or a backend — the provider needs only the
-/// technique it must commit as, and what an empty input means.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// The boundary here is about *where* a publication identity may travel, not
+/// about whether the provider may hold it. The `LakePublicationId` must not
+/// reach a writer recipe, a commit fragment, or a backend — nothing that
+/// executes needs it, and putting it there would make a durable frontend
+/// identity part of the execution contract.
+///
+/// It does legitimately reach one place: the snapshot this session's own commit
+/// creates. The publication fence adjudicates a staged refresh by reading
+/// `MV_PUBLICATION_ID_PROP` off that snapshot's summary
+/// (`commit::snapshot_matches_publication_marker`), so a session that dropped
+/// the id would publish a snapshot no publication could ever claim. Holding it
+/// on the frontend-only session, and writing it only into the snapshot summary,
+/// is what keeps both halves true.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergManagedPublicationFacts {
     technique: ConnectorManagedPublicationTechnique,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+    provenance: IcebergManagedPublicationProvenance,
+}
+
+/// The durable publication facts the single commit stamps onto its snapshot.
+///
+/// Every field is already in its Iceberg form: the session converts the neutral
+/// intent once, at admission, so a conversion failure is refused before any
+/// external effect rather than after a writer has staged.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergManagedPublicationProvenance {
+    publication_id: novarocks_spi::connector::LakePublicationId,
+    bases: Vec<crate::commit::ProvenanceBase>,
+    definition_fingerprint: String,
+    descriptor_properties_digest_base64: String,
+}
+
+impl IcebergManagedPublicationProvenance {
+    pub fn try_new(
+        publication_id: novarocks_spi::connector::LakePublicationId,
+        bases: Vec<crate::commit::ProvenanceBase>,
+        definition_fingerprint: String,
+        descriptor_properties_digest_base64: String,
+    ) -> Result<Self, ConnectorError> {
+        if bases.is_empty() {
+            return Err(invalid(
+                "Iceberg managed publication requires at least one provenance base",
+            ));
+        }
+        if definition_fingerprint.is_empty() {
+            return Err(invalid(
+                "Iceberg managed publication requires a definition fingerprint",
+            ));
+        }
+        Ok(Self {
+            publication_id,
+            bases,
+            definition_fingerprint,
+            descriptor_properties_digest_base64,
+        })
+    }
+
+    pub const fn publication_id(&self) -> novarocks_spi::connector::LakePublicationId {
+        self.publication_id
+    }
+
+    /// The snapshot summary properties this publication's commit must carry.
+    ///
+    /// `rows` is the count of rows this write staged. The commit action
+    /// overwrites it with the committed snapshot's real `total-records` once
+    /// the manifest is written, so it is a lower bound here, not a claim.
+    pub fn to_summary_properties(
+        &self,
+        technique: ConnectorManagedPublicationTechnique,
+        rows: u64,
+    ) -> Result<BTreeMap<String, String>, ConnectorError> {
+        let rows = i64::try_from(rows)
+            .map_err(|_| invalid("Iceberg managed publication row count exceeds i64"))?;
+        crate::commit::MvPublicationProvenanceV2 {
+            provenance_version: crate::commit::MV_PUBLICATION_PROVENANCE_VERSION,
+            publication_id: self.publication_id,
+            technique: match technique {
+                ConnectorManagedPublicationTechnique::Full => crate::commit::RefreshTechnique::Full,
+                ConnectorManagedPublicationTechnique::Incremental => {
+                    crate::commit::RefreshTechnique::Incremental
+                }
+            },
+            bases: self.bases.clone(),
+            definition_fingerprint: self.definition_fingerprint.clone(),
+            descriptor_properties_digest_base64: Some(
+                self.descriptor_properties_digest_base64.clone(),
+            ),
+            rows,
+        }
+        .to_summary_properties()
+        .map_err(invalid)
+    }
 }
 
 impl IcebergManagedPublicationFacts {
     pub const fn new(
         technique: ConnectorManagedPublicationTechnique,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+        provenance: IcebergManagedPublicationProvenance,
     ) -> Self {
         Self {
             technique,
             empty_input,
+            provenance,
         }
     }
 
-    pub const fn technique(self) -> ConnectorManagedPublicationTechnique {
+    pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
         self.technique
     }
 
-    pub const fn empty_input(self) -> ConnectorManagedPublicationEmptyInputDisposition {
+    pub const fn empty_input(&self) -> ConnectorManagedPublicationEmptyInputDisposition {
         self.empty_input
+    }
+
+    pub const fn provenance(&self) -> &IcebergManagedPublicationProvenance {
+        &self.provenance
     }
 
     /// The single external commit op a publication of this technique performs.
@@ -261,7 +352,7 @@ impl IcebergManagedPublicationFacts {
     /// A full refresh republishes the whole target, so it replaces what the ref
     /// already holds; an incremental refresh adds to it. Committing a full
     /// refresh as an append would leave the superseded rows live.
-    pub const fn commit_op_kind(self) -> CommitOpKind {
+    pub const fn commit_op_kind(&self) -> CommitOpKind {
         match self.technique {
             ConnectorManagedPublicationTechnique::Full => CommitOpKind::Overwrite,
             ConnectorManagedPublicationTechnique::Incremental => CommitOpKind::FastAppend,
@@ -270,11 +361,60 @@ impl IcebergManagedPublicationFacts {
 
     /// The neutral write intent a publication of this technique is admitted
     /// as.
-    pub const fn connector_intent(self) -> ConnectorWriteIntent {
+    pub const fn connector_intent(&self) -> ConnectorWriteIntent {
         match self.technique {
             ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
             ConnectorManagedPublicationTechnique::Incremental => ConnectorWriteIntent::Append,
         }
+    }
+}
+
+/// The exact input files one distributed-rewrite branch replaces.
+///
+/// A rewrite names its inputs at planning time: the frozen base snapshot says
+/// which data files and which attached delete artifacts the new files supersede.
+/// Freezing them here is what keeps the commit's replaced set a planning fact
+/// instead of something recovered from whatever the writers happened to produce
+/// — a writer that produced nothing for its group must still retire that
+/// group's inputs.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IcebergFrozenRewriteBranchInput {
+    data_paths: BTreeSet<String>,
+    delete_paths: BTreeSet<String>,
+}
+
+impl IcebergFrozenRewriteBranchInput {
+    /// An empty input is admissible: a rewrite that found nothing to rewrite
+    /// still seals one branch so its session can terminate. An empty *path* is
+    /// not, because it would name no file while claiming to replace one.
+    pub fn try_new(
+        data_paths: BTreeSet<String>,
+        delete_paths: BTreeSet<String>,
+    ) -> Result<Self, ConnectorError> {
+        for path in data_paths.iter().chain(&delete_paths) {
+            validate_location("rewrite input path", path)?;
+        }
+        if !data_paths.is_disjoint(&delete_paths) {
+            return Err(invalid(
+                "Iceberg rewrite branch input names one path as both data and delete",
+            ));
+        }
+        Ok(Self {
+            data_paths,
+            delete_paths,
+        })
+    }
+
+    pub const fn data_paths(&self) -> &BTreeSet<String> {
+        &self.data_paths
+    }
+
+    pub const fn delete_paths(&self) -> &BTreeSet<String> {
+        &self.delete_paths
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data_paths.is_empty() && self.delete_paths.is_empty()
     }
 }
 
@@ -1202,7 +1342,58 @@ pub struct IcebergCommitHandle {
     /// flavor performs, and the seal reads its schema and partition spec to
     /// interpret the artifacts the backends staged.
     staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
+    /// The frozen input file set of every sealed rewrite branch, in ordinal
+    /// order. Present exactly on a distributed rewrite, which is the one flavor
+    /// whose commit replaces files it named before any writer ran.
+    rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// The partition replacement this session's single external commit applies
+    /// ahead of its snapshot. Present only on a managed publication that was
+    /// admitted with one.
+    repartition: Option<crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
+}
+
+/// Everything a sealed session carries besides its identity, its table
+/// generation and its logical targets.
+///
+/// It is one value rather than a parameter list because these facts are
+/// cross-validated against each other and against the flavor: a publication
+/// technique, frozen staged metadata and a frozen rewrite input set are each
+/// admissible on exactly one flavor, and stating them together is what makes
+/// that checkable in one place.
+#[derive(Clone, Debug)]
+pub struct IcebergSessionFacts {
+    pub purpose: ConnectorWriteAdmissionPurpose,
+    pub base_version_digest: Option<[u8; 32]>,
+    /// Present exactly on the managed-publication flavor.
+    pub publication: Option<IcebergManagedPublicationFacts>,
+    /// Present exactly on the staged-create flavor.
+    pub staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
+    /// Present exactly on the distributed-rewrite flavor, one entry per sealed
+    /// branch and in the same order.
+    pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// Present only on a managed publication that replaces the target's default
+    /// partitioning in the same external commit that publishes its rows.
+    pub(crate) repartition:
+        Option<crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
+}
+
+impl IcebergSessionFacts {
+    /// The facts of a session that carries none of the flavor-specific ones:
+    /// no publication, no staged target, nothing frozen to rewrite.
+    pub const fn ordinary(
+        purpose: ConnectorWriteAdmissionPurpose,
+        base_version_digest: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            purpose,
+            base_version_digest,
+            publication: None,
+            staged_metadata: None,
+            rewrite_inputs: Vec::new(),
+            repartition: None,
+        }
+    }
 }
 
 /// The terminal state a write session may reach. It mirrors the provider's
@@ -1246,34 +1437,38 @@ impl IcebergCommitHandle {
         base_version_digest: Option<[u8; 32]>,
         targets: Vec<IcebergSealedWriteTarget>,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_publication(
+        Self::try_new_sealed(
             session_id,
             table,
             flavor,
-            purpose,
-            base_version_digest,
-            None,
-            None,
+            IcebergSessionFacts::ordinary(purpose, base_version_digest),
             targets,
         )
     }
 
-    /// Seal a begin session that also carries its managed publication facts.
+    /// Seal a begin session together with the facts only its own flavor
+    /// carries.
     ///
-    /// The facts are admissible only on the managed-publication flavor: a
-    /// session that carried a technique it does not publish under would decide
-    /// its commit op from a fact its own flavor contradicts.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new_with_publication(
+    /// Each of those facts is admissible on exactly one flavor: a session that
+    /// carried a publication technique it does not publish under would decide
+    /// its commit op from a fact its own flavor contradicts, and one carrying a
+    /// frozen rewrite input set it does not replace would retire live files no
+    /// writer superseded.
+    pub fn try_new_sealed(
         session_id: IcebergWriteSessionId,
         table: IcebergWriteTableFacts,
         flavor: IcebergWriteFlavor,
-        purpose: ConnectorWriteAdmissionPurpose,
-        base_version_digest: Option<[u8; 32]>,
-        publication: Option<IcebergManagedPublicationFacts>,
-        staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
+        facts: IcebergSessionFacts,
         targets: Vec<IcebergSealedWriteTarget>,
     ) -> Result<Self, ConnectorError> {
+        let IcebergSessionFacts {
+            purpose,
+            base_version_digest,
+            publication,
+            staged_metadata,
+            rewrite_inputs,
+            repartition,
+        } = facts;
         if publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
             return Err(invalid(format!(
                 "Iceberg {} write session cannot carry managed publication facts",
@@ -1288,6 +1483,34 @@ impl IcebergCommitHandle {
             return Err(invalid(format!(
                 "Iceberg {} write session must carry frozen staged metadata exactly when it stages a create",
                 flavor.as_str()
+            )));
+        }
+        // The rewrite input set is per branch, so a session holding a different
+        // number of entries than it sealed branches could not say which files
+        // any one branch replaces. The two directions are both errors for the
+        // same reason as the staged metadata above.
+        if rewrite_inputs.is_empty() == (flavor == IcebergWriteFlavor::DistributedRewrite) {
+            return Err(invalid(format!(
+                "Iceberg {} write session must carry a frozen rewrite input per branch exactly when it rewrites a frozen file set",
+                flavor.as_str()
+            )));
+        }
+        // A partition replacement changes what the target *is*, and only a
+        // managed publication is admitted to do that. Every other flavor
+        // carrying one would apply a spec change its own caller never asked
+        // for, in a commit that is not the publication's.
+        if repartition.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
+            return Err(invalid(format!(
+                "Iceberg {} write session cannot carry an atomic partition replacement",
+                flavor.as_str()
+            )));
+        }
+        if !rewrite_inputs.is_empty() && rewrite_inputs.len() != targets.len() {
+            return Err(invalid(format!(
+                "Iceberg {} write session froze {} rewrite inputs for {} sealed branches",
+                flavor.as_str(),
+                rewrite_inputs.len(),
+                targets.len()
             )));
         }
         let ordinals = targets
@@ -1321,8 +1544,31 @@ impl IcebergCommitHandle {
             targets,
             delete_owner,
             staged_metadata,
+            rewrite_inputs,
+            repartition,
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
+    }
+
+    /// The frozen input files this session's commit replaces, unioned across
+    /// every sealed branch.
+    ///
+    /// The union, not the per-branch sets, is what the commit needs: one
+    /// snapshot replaces the whole planned set at once. Reading it off the
+    /// session keeps it a planning fact — a branch whose writer produced
+    /// nothing still retires its inputs, which is exactly what makes a rewrite
+    /// that compacted rows away correct.
+    pub fn frozen_rewrite_input(&self) -> IcebergFrozenRewriteBranchInput {
+        let mut data_paths = BTreeSet::new();
+        let mut delete_paths = BTreeSet::new();
+        for input in &self.rewrite_inputs {
+            data_paths.extend(input.data_paths().iter().cloned());
+            delete_paths.extend(input.delete_paths().iter().cloned());
+        }
+        IcebergFrozenRewriteBranchInput {
+            data_paths,
+            delete_paths,
+        }
     }
 
     pub const fn session_id(&self) -> IcebergWriteSessionId {
@@ -1341,9 +1587,21 @@ impl IcebergCommitHandle {
         self.base_version_digest
     }
     /// The managed publication facts, present exactly on a publication session.
-    pub const fn publication(&self) -> Option<IcebergManagedPublicationFacts> {
-        self.publication
+    pub const fn publication(&self) -> Option<&IcebergManagedPublicationFacts> {
+        self.publication.as_ref()
     }
+    /// The partition replacement this session's commit applies, present only on
+    /// a managed publication admitted with one.
+    ///
+    /// It carries the prospective metadata every writer already wrote under, so
+    /// the commit interprets the staged artifacts against the same spec that
+    /// produced them rather than against the one the table still has.
+    pub(crate) const fn repartition(
+        &self,
+    ) -> Option<&crate::commit::write_stack::repartition::IcebergPreparedRepartition> {
+        self.repartition.as_ref()
+    }
+
     /// The frozen metadata a staged-create session interprets its artifacts
     /// against. Absent on every other flavor, which loads its target instead.
     pub fn staged_metadata(&self) -> Option<&crate::iceberg::spec::TableMetadata> {
@@ -1360,7 +1618,7 @@ impl IcebergCommitHandle {
     /// replaces, an incremental one appends — and every other session decides
     /// it from its flavor alone.
     pub fn commit_op_kind(&self) -> CommitOpKind {
-        match self.publication {
+        match &self.publication {
             Some(publication) => publication.commit_op_kind(),
             None => self.flavor.commit_op_kind(),
         }
@@ -1390,6 +1648,7 @@ impl IcebergCommitHandle {
         }
         match self
             .publication
+            .as_ref()
             .map(IcebergManagedPublicationFacts::empty_input)
         {
             Some(ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit) => {
