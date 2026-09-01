@@ -70,102 +70,13 @@ ci_native_cross_process_suites() {
   ci_native_cross_process_core_suites
 }
 
-ci_suite_is_explicit_only() {
-  local repo_root="$1"
-  local suite="$2"
-  local manifest="$repo_root/tests/sql/suites/$suite/suite.toml"
-  local explicit_only
-  local status
-
-  case "$suite" in
-    *[!A-Za-z0-9_.+-]*|""|"."|"..")
-      echo "error: invalid SQL suite name: $suite" >&2
-      return 2
-      ;;
-  esac
-
-  if [ ! -f "$manifest" ]; then
-    return 1
-  fi
-
-  explicit_only="$(awk '
-      function trim(value) {
-        sub(/^[[:space:]]+/, "", value)
-        sub(/[[:space:]]+$/, "", value)
-        return value
-      }
-
-      BEGIN {
-        in_table = 0
-        assignments = 0
-        invalid = 0
-        value = "false"
-      }
-
-      {
-        line = $0
-        sub(/\r$/, "", line)
-        line = trim(line)
-
-        if (line == "" || line ~ /^#/) {
-          next
-        }
-        if (line ~ /^\[/) {
-          in_table = 1
-          next
-        }
-        if (!in_table && line ~ /^explicit_only[[:space:]]*=/) {
-          assignments++
-          sub(/^explicit_only[[:space:]]*=[[:space:]]*/, "", line)
-          sub(/[[:space:]]*#.*/, "", line)
-          line = trim(line)
-          if (line != "true" && line != "false") {
-            invalid = 1
-          }
-          value = line
-        }
-      }
-
-      END {
-        if (assignments != 1 || invalid) {
-          exit 2
-        }
-        print value
-      }
-    ' "$manifest")" || {
-    status=$?
-    echo "error: invalid explicit_only metadata in $manifest" >&2
-    return "$status"
-  }
-
-  [ "$explicit_only" = "true" ]
-}
-
 ci_discover_sql_suites() {
   local repo_root="$1"
-  local dir
-  local suite
-  local status
-  local -a suites=()
 
-  for dir in "$repo_root"/tests/sql/suites/*/sql; do
-    [ -d "$dir" ] || continue
-    suite="${dir%/sql}"
-    suite="${suite##*/}"
-    if ci_suite_is_explicit_only "$repo_root" "$suite"; then
-      continue
-    else
-      status=$?
-    fi
-    if [ "$status" -ne 1 ]; then
-      return "$status"
-    fi
-    suites+=("$suite")
-  done
-
-  if [ "${#suites[@]}" -gt 0 ]; then
-    printf "%s\n" "${suites[@]}" | sort
-  fi
+  cargo run --quiet \
+    --manifest-path "$repo_root/tests/sql/runner/Cargo.toml" \
+    --profile "${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
+    --bin novarocks-sql-test -- --list-suites
 }
 
 ci_suite_exists() {
@@ -178,5 +89,5 @@ ci_suite_exists() {
       ;;
   esac
 
-  [ -d "$repo_root/tests/sql/suites/$suite/sql" ]
+  [ -d "$repo_root/tests/sql/correctness/$suite/sql" ]
 }

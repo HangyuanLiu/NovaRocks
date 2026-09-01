@@ -71,7 +71,7 @@ ANALYZE TABLE ${case_db}.rf_dist_part_build;
 -- Force a Shuffle (PARTITIONED) hash join: make broadcast prohibitively
 -- expensive, and relax the RF build-size/selectivity gates so the M2 probe
 -- placement is exercised deterministically regardless of ANALYZE stats
--- shape (mirrors tests/sql/suites/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql).
+-- shape (mirrors tests/sql/correctness/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql).
 SET global_runtime_filter_build_max_size = 10737418240;
 SET global_runtime_filter_probe_min_selectivity = 0.0;
 SET cbo_broadcast_node_mem_budget_bytes = 0;

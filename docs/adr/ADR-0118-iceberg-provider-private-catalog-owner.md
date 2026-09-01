@@ -130,7 +130,7 @@ exception、backend-specific stage-create fallback 与未闭合的 rollback clea
 - **view 枚举的诚实化是一次真实的用户可见回归，不是纯粹的正确性收紧。** Hadoop/Hive 上目标 namespace
   存在时的 `DROP DATABASE ... FORCE` 与 view 列举，从静默成功变成报 `Unsupported`。此前那个空集合是
   **有意**加的，注释写明就是为了不让 DROP DATABASE FORCE 被一个用户没问过的 catalog kind 变成硬错误。
-  我们推翻它，代价是已知打到 `tests/sql/suites/complex-type` 的 13 个用例（它们在默认
+  我们推翻它，代价是已知打到 `tests/sql/correctness/complex-type` 的 13 个用例（它们在默认
   `iceberg_catalog_type = "hadoop"` 上以 FORCE 收尾），这些用例的 teardown 随本次改动一并改写。
 - **我们有意不区分「结构上存不了 view」与「答不上来」。** Hadoop catalog 确实无法承载 view，因此
   「零个 view」在那里其实是真事实，返回 authoritative empty 在技术上说得通。我们仍然选择一律

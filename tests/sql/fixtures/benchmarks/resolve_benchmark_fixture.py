@@ -34,8 +34,6 @@ ERROR_SCHEMA_VERSION = 1
 VALID_ENSURE_STATES = {"ReadyValid"}
 VALID_ERROR_CODES = {
     "ready_invalid",
-    "wait_timeout",
-    "lease_lost",
     "writer_failed",
     "publication_conflict",
     "publication_failed",
@@ -160,7 +158,6 @@ def resolve_fixture(model, workspace_root, suite, scale, shared_root=None):
     contract_id = digest_bytes(canonical_json(contract).encode())[:24]
     dataset_root = f"{root}/{suite}/{normalized.lower()}/{contract_id}"
     dataset_key = {"suite": suite, "scale": normalized, "fixture_contract_id": contract_id}
-    lease_key = canonical_json(dataset_key)
     return {
         "schema_version": RESOLVED_SCHEMA_VERSION,
         "dataset_key": dataset_key,
@@ -171,7 +168,6 @@ def resolve_fixture(model, workspace_root, suite, scale, shared_root=None):
         "ready_uri": f"{dataset_root}/{fixture['ready_filename']}",
         "manifest_filename": fixture["manifest_filename"],
         "staging_parent": f"{dataset_root}/staging",
-        "lease": {"key": lease_key, "name": f"nr-benchmark-{digest_bytes(lease_key.encode())[:24]}"},
     }
 
 

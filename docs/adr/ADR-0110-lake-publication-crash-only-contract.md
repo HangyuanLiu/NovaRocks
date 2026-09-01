@@ -13,7 +13,7 @@ code-anchors:
   - "novarocks/spi/src/connector/external_mutation.rs (ExternalMutationOutcome)"
   - "novarocks/frontend/src/dml/attempt.rs (DmlPublicationAttempt)"
   - "novarocks/frontend/src/dml/runner.rs (StatementWriteTransactionRunner)"
-  - "tests/sql/suites/lake-publication/sql/standard_rest_ctas.sql (native REST publication acceptance)"
+  - "tests/sql/correctness/lake-publication/sql/standard_rest_ctas.sql (native REST publication acceptance)"
   - "novarocks/connector/iceberg/src/catalog_control/cleanup_maintenance.rs (IcebergCleanupMaintenance)"
 ---
 

@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$repo_root"
+
+has_suite=false
+for arg in "$@"; do
+  case "$arg" in
+    --suite|--suite=*)
+      has_suite=true
+      ;;
+  esac
+done
+
+cargo build --release -p novarocks-server
+export NOVAROCKS_BIN="$repo_root/target/release/novarocks"
+
+# Keep topology and controller metadata as caller-owned benchmark arguments.
+if [[ "$has_suite" == false ]]; then
+  exec cargo run --release --manifest-path tests/sql/runner/Cargo.toml \
+    --bin novarocks-sql-benchmark -- --suite ssb "$@"
+fi
+
+exec cargo run --release --manifest-path tests/sql/runner/Cargo.toml \
+  --bin novarocks-sql-benchmark -- "$@"

@@ -28,10 +28,15 @@ name = "novarocks-sql-test-runner"
 version = "0.1.0"
 edition = "2024"
 default-run = "novarocks-sql-test"
+autobins = false
 
 [[bin]]
 name = "novarocks-sql-test"
-path = "src/main.rs"
+path = "src/bin/novarocks-sql-test.rs"
+
+[[bin]]
+name = "novarocks-sql-benchmark"
+path = "src/bin/novarocks-sql-benchmark.rs"
 
 [[bin]]
 name = "publication-catalog-fixture"

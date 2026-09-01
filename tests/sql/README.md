@@ -19,7 +19,10 @@ under the License.
 
 # SQL Tests
 
-`tests/sql/suites/` is the standalone SQL regression suite for NovaRocks.
+SQL tests have two physical roots:
+
+- `tests/sql/correctness/` contains the small-data correctness corpus used by development and full CI.
+- `tests/sql/benchmarks/` contains fixed-data performance workloads. They are not selected by correctness CI.
 
 ## Object Store Prerequisite
 
@@ -59,7 +62,7 @@ NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 
 Then run a suite:
 
 ```bash
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
   --suite filter --mode verify
 ```
 
@@ -67,13 +70,47 @@ The runner defaults to `tests/sql/runner/conf/default.toml` when no explicit
 `--config` is provided. Suites that need an Iceberg fixture should
 pass the generated environment config or an explicit fixture config.
 
+## Benchmark Flow
+
+Benchmarks are deliberately separate from correctness suites. Use the local
+wrapper, which builds the release server binary and defaults to SSB:
+
+```bash
+tools/benchmark/run-sql-benchmark.sh
+```
+
+Pass benchmark-runner options after the script name to choose a workload or an
+output location. Benchmarks always use the cross-process FE/BE harness; choose
+the number of BEs for this run with `--backend-count` (the default is one):
+
+```bash
+tools/benchmark/run-sql-benchmark.sh --suite tpc-ds --backend-count 2
+tools/benchmark/run-sql-benchmark.sh --suite all --backend-count 4 --output-dir /tmp/novarocks-benchmarks
+```
+
+The benchmark runner resolves the fixed shared fixture before any suite hook.
+It verifies results, performs one warmup pass, records five serial measured
+passes, and captures a profile pass. Generated reports go to
+`reports/sql-benchmarks/` and do not belong in correctness CI.
+
+An external controller may attach an opaque environment JSON object and a
+comparison key. The runner does not inspect host CPU, memory, or OS details;
+it records these controller-provided values unchanged in both `run.json` and
+`SUMMARY.md` for the controller's cross-machine comparison policy:
+
+```bash
+tools/benchmark/run-sql-benchmark.sh --backend-count 3 \
+  --controller-environment '{"machine_pool":"nightly-a","storage":"local-minio"}' \
+  --comparison-key nightly-a-release
+```
+
 ## Explicit Iceberg Config
 
 For Docker-backed Iceberg suites, prefer the generated fixture config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite materialized-view --mode verify
 ```

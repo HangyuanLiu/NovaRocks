@@ -16,7 +16,8 @@
 // under the License.
 
 mod be_log_directive;
-mod benchmark_bootstrap;
+pub mod benchmark;
+pub(crate) mod benchmark_bootstrap;
 mod cluster;
 mod config;
 mod extension_manifest;
@@ -35,14 +36,10 @@ mod types;
 #[path = "../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
 
-use crate::benchmark_bootstrap::{
-    BenchmarkBootstrapOptions, ReadyBenchmarkFixture, dry_run_benchmark_fixture,
-    ensure_benchmark_data, parse_scale_overrides,
-};
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
-    load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
+    TestLane, build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
+    load_runner_config, placeholder_variables_with_run_id, resolve_config_path, resolve_path,
     resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
 use crate::parser::load_suite_hook;
@@ -66,7 +63,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::net::TcpStream;
@@ -380,16 +377,20 @@ fn expected_engine_error_code_diff_result(
 #[derive(Debug, Parser)]
 #[command(
     name = "novarocks-sql-test",
-    about = "Run SQL correctness tests for suite directories under tests/sql/suites/"
+    about = "Run SQL correctness tests for suite directories under tests/sql/correctness/"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Suite name(s), comma-separated.  Use "all" to run every discovered suite.
-    #[arg(long, required_unless_present = "list_extensions")]
+    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites"])]
     suite: Option<String>,
 
     /// Print the deterministic manifest derived from @nova_extension annotations and exit.
     #[arg(long, action = ArgAction::SetTrue)]
     list_extensions: bool,
+
+    /// Print the deterministic correctness suite names and exit.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "list_extensions")]
+    list_suites: bool,
 
     #[arg(long)]
     config: Option<String>,
@@ -498,14 +499,37 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
 
-    #[arg(long, action = ArgAction::SetTrue)]
-    no_auto_bootstrap_benchmark_data: bool,
+    /// Internal machine-readable case timing output used by the benchmark lane.
+    #[arg(long, hide = true)]
+    case_timing_output: Option<String>,
 
-    #[arg(long = "benchmark-scale", value_name = "BENCHMARK_SCALE", action = ArgAction::Append)]
-    benchmark_scale: Vec<String>,
+    /// Internal fixture warehouse override used by the benchmark lane.
+    #[arg(long, hide = true)]
+    benchmark_warehouse: Option<String>,
 
-    #[arg(long, action = ArgAction::SetTrue)]
-    benchmark_bootstrap_rebuild: bool,
+    /// Internal destination for per-query EXPLAIN ANALYZE benchmark profiles.
+    #[arg(long, hide = true)]
+    benchmark_profile_dir: Option<String>,
+
+    /// Reuse a benchmark-owned cross-process cluster supplied through --host/--port.
+    #[arg(long, hide = true)]
+    benchmark_external_cluster: bool,
+
+    /// Skip the suite init hook for a later phase of one benchmark protocol.
+    #[arg(long, hide = true)]
+    benchmark_skip_init: bool,
+
+    /// Skip the suite cleanup hook until the last phase of one benchmark protocol.
+    #[arg(long, hide = true)]
+    benchmark_skip_cleanup: bool,
+
+    /// Run only the suite cleanup hook after an earlier benchmark phase failed.
+    #[arg(long, hide = true)]
+    benchmark_cleanup_only: bool,
+
+    /// Freeze suite placeholder identity across all phases of one benchmark workload.
+    #[arg(long, hide = true)]
+    benchmark_run_id: Option<String>,
 
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
@@ -608,19 +632,6 @@ fn ensure_iceberg_object_store_prereqs(runner_config: &RunnerConfig) -> Result<(
     );
 }
 
-fn inject_benchmark_fixture_placeholder(
-    variables: &mut HashMap<String, String>,
-    fixture: Option<&ReadyBenchmarkFixture>,
-) {
-    let Some(fixture) = fixture else {
-        return;
-    };
-    variables.insert(
-        "benchmark_iceberg_catalog_warehouse".to_string(),
-        fixture.exact_warehouse.clone(),
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Parallel execution types
 // ---------------------------------------------------------------------------
@@ -650,6 +661,10 @@ struct SuiteRunContext {
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
+    benchmark_profile_dir: Option<PathBuf>,
+    benchmark_skip_init: bool,
+    benchmark_skip_cleanup: bool,
+    benchmark_cleanup_only: bool,
 }
 
 struct CaseOutcome {
@@ -1726,7 +1741,9 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
         .and_then(|mut server| {
-            server.kill_fe().context("kill frontend during publication response hold")?;
+            server
+                .kill_fe()
+                .context("kill frontend during publication response hold")?;
             server
                 .restart_fe_until(deadline)
                 .context("restart frontend after in-flight publication kill")
@@ -1743,7 +1760,10 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
             ),
         );
     }
-    let _ = writeln!(log, "    @publication_catalog_fault in-flight FE kill/restart PASS");
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_fault in-flight FE kill/restart PASS"
+    );
 
     let (query_ok, query_execution, query_error) = match query_thread.join() {
         Ok(result) => result,
@@ -1868,6 +1888,27 @@ fn finish_expected_error_step(
 
 // Per-case execution
 // ---------------------------------------------------------------------------
+
+fn benchmark_profile_statement(sql: &str, enabled: bool) -> String {
+    if enabled {
+        format!("EXPLAIN ANALYZE {sql}")
+    } else {
+        sql.to_string()
+    }
+}
+
+fn write_benchmark_profile(
+    dir: &PathBuf,
+    case_id: &str,
+    query_number: usize,
+    execution: &QueryExecution,
+) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create benchmark profile directory {}", dir.display()))?;
+    let path = dir.join(format!("{case_id}.{query_number}.profile.txt"));
+    fs::write(&path, &execution.text_output)
+        .with_context(|| format!("write benchmark profile {}", path.display()))
+}
 
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut log = String::with_capacity(2048);
@@ -2365,6 +2406,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let mut passed_execution: Option<QueryExecution> = None;
                 let mut last_execution: Option<QueryExecution> = None;
                 let mut last_failure = String::new();
+                let target_sql = benchmark_profile_statement(
+                    &step.sql,
+                    ctx.benchmark_profile_dir.is_some() && !shell::is_shell_step(&step.sql),
+                );
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
@@ -2375,7 +2420,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
                     {
                         let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
-                            unreachable!("in-flight publication kill requires an armed fixture guard");
+                            unreachable!(
+                                "in-flight publication kill requires an armed fixture guard"
+                            );
                         };
                         execute_target_query_with_inflight_publication_frontend_kill(
                             InflightPublicationFrontendKill {
@@ -2397,7 +2444,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &ctx.server_handle,
                             &mut target_session,
                             ctx.query_timeout,
-                            &step.sql,
+                            &target_sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
                         )
@@ -2548,6 +2595,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         }
                     }
                 } else if let Some(execution) = passed_execution {
+                    if let Some(profile_dir) = ctx.benchmark_profile_dir.as_ref()
+                        && let Err(error) = write_benchmark_profile(
+                            profile_dir,
+                            &case.case_id,
+                            step.query_number,
+                            &execution,
+                        )
+                    {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        continue;
+                    }
                     if let Err(error) = restart_frontend_after_step(
                         step,
                         &ctx.server_handle,
@@ -3323,7 +3382,9 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
     let fail_count = AtomicUsize::new(0);
 
     // --- suite init hook ---
-    if let Some(hook) = ps.init_hook.as_ref() {
+    if !ctx.benchmark_skip_init
+        && let Some(hook) = ps.init_hook.as_ref()
+    {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -3456,26 +3517,33 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
         }
     };
 
-    // Run parallel cases first
-    let mut outcomes: Vec<CaseOutcome> = parallel_cases
-        .par_iter()
-        .map(|case| {
+    let outcomes: Vec<CaseOutcome> = if ctx.benchmark_cleanup_only {
+        Vec::new()
+    } else {
+        // Run parallel cases first.
+        let mut outcomes: Vec<CaseOutcome> = parallel_cases
+            .par_iter()
+            .map(|case| {
+                let outcome = run_case(ctx, case, abort);
+                report_outcome(&outcome);
+                outcome
+            })
+            .collect();
+
+        // Then run sequential cases one by one.
+        for case in &sequential_cases {
             let outcome = run_case(ctx, case, abort);
             report_outcome(&outcome);
-            outcome
-        })
-        .collect();
-
-    // Then run sequential cases one by one
-    for case in &sequential_cases {
-        let outcome = run_case(ctx, case, abort);
-        report_outcome(&outcome);
-        outcomes.push(outcome);
-    }
+            outcomes.push(outcome);
+        }
+        outcomes
+    };
 
     // --- suite cleanup hook ---
     let mut cleanup_errors = Vec::new();
-    if let Some(hook) = ps.cleanup_hook.as_ref() {
+    if !ctx.benchmark_skip_cleanup
+        && let Some(hook) = ps.cleanup_hook.as_ref()
+    {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -3539,6 +3607,26 @@ fn format_case_timings(timings: &[CaseTiming]) -> String {
         );
     }
     out
+}
+
+fn write_case_timing_csv(path: &std::path::Path, timings: &[CaseTiming]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("case timing output path must have a parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create case timing output directory {}", parent.display()))?;
+    let mut csv = String::from("suite,case,status,elapsed_seconds\n");
+    for timing in timings {
+        let _ = writeln!(
+            csv,
+            "{},{},{},{:.9}",
+            timing.suite_name,
+            timing.case_id,
+            case_status_label(timing.status),
+            timing.elapsed.as_secs_f64(),
+        );
+    }
+    fs::write(path, csv).with_context(|| format!("write case timings to {}", path.display()))
 }
 
 fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
@@ -3760,7 +3848,9 @@ fn validate_lake_publication_preflight(
         bail!("lake publication suites require --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("lake publication suites require -j 1 because their fixtures own one destructive token");
+        bail!(
+            "lake publication suites require -j 1 because their fixtures own one destructive token"
+        );
     }
     Ok(())
 }
@@ -3771,7 +3861,10 @@ fn validate_lnp_3c_runtime_cut_preflight(
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    if !suite_names.iter().any(|suite| suite == "lnp-3c-runtime-cut") {
+    if !suite_names
+        .iter()
+        .any(|suite| suite == "lnp-3c-runtime-cut")
+    {
         return Ok(());
     }
     if mode != ClusterMode::CrossProcess || cluster_size != 3 {
@@ -3799,7 +3892,9 @@ fn validate_lnp_3d_mv_accelerator_preflight(
         bail!("lnp-3d-mv-accelerator requires --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("lnp-3d-mv-accelerator requires -j 1 because it wipes and restarts the shared frontend");
+        bail!(
+            "lnp-3d-mv-accelerator requires -j 1 because it wipes and restarts the shared frontend"
+        );
     }
     Ok(())
 }
@@ -3939,8 +4034,8 @@ fn selected_cases_require_cleanup_faults(
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
-    let exit_code = run()?;
+pub fn run_correctness() -> Result<()> {
+    let exit_code = run_cli(Cli::parse(), TestLane::Correctness, "correctness")?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -3990,13 +4085,22 @@ fn finish_run_with_server_cleanup(
     }
 }
 
-fn run() -> Result<i32> {
-    let cli = Cli::parse();
+pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
-    let suite_configs = build_suite_configs(&base_dir)?;
+    let suite_configs = build_suite_configs(&base_dir, lane)?;
     if suite_configs.is_empty() {
-        println!("❌ ERROR: no suite directories found under tests/sql/suites");
+        println!(
+            "❌ ERROR: no suite directories found under {}",
+            lane.suite_root(&base_dir).display()
+        );
         return Ok(1);
+    }
+
+    if cli.list_suites {
+        for suite_name in suite_configs.keys() {
+            println!("{suite_name}");
+        }
+        return Ok(0);
     }
 
     if cli.list_extensions {
@@ -4013,6 +4117,12 @@ fn run() -> Result<i32> {
 
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let mut runner_config = load_runner_config(config_path.as_deref())?;
+    if let Some(warehouse) = cli.benchmark_warehouse.as_deref() {
+        runner_config.values.insert(
+            "benchmark_iceberg_catalog_warehouse".to_string(),
+            warehouse.to_string(),
+        );
+    }
 
     let suite_names = match select_suite_names(
         cli.suite
@@ -4092,11 +4202,6 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    let benchmark_bootstrap_options = BenchmarkBootstrapOptions {
-        enabled: !cli.no_auto_bootstrap_benchmark_data,
-        rebuild: cli.benchmark_bootstrap_rebuild,
-        scales: parse_scale_overrides(&cli.benchmark_scale)?,
-    };
     let query_lifecycle_faults_enabled = !cli.dry_run
         && selected_cases_require_query_lifecycle_faults(
             &cli,
@@ -4117,14 +4222,30 @@ fn run() -> Result<i32> {
     } else {
         selected_cluster_size
     };
-    let server_handle = launch_server(
-        launch_cluster_mode,
-        launch_cluster_size,
-        &base_dir,
-        &runner_config,
-        query_lifecycle_faults_enabled,
-        cleanup_faults_enabled,
-    )?;
+    let server_handle = if cli.benchmark_external_cluster {
+        if lane != TestLane::Benchmark || cli.host.is_none() || cli.port.is_none() {
+            bail!(
+                "benchmark external cluster reuse requires the benchmark lane and explicit --host/--port"
+            );
+        }
+        launch_server(
+            ClusterMode::AllInOne,
+            1,
+            &base_dir,
+            &runner_config,
+            false,
+            false,
+        )?
+    } else {
+        launch_server(
+            launch_cluster_mode,
+            launch_cluster_size,
+            &base_dir,
+            &runner_config,
+            query_lifecycle_faults_enabled,
+            cleanup_faults_enabled,
+        )?
+    };
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
     let server_handle = Arc::new(Mutex::new(server_handle));
@@ -4227,23 +4348,11 @@ fn run() -> Result<i32> {
                 suite.sql_glob.clone()
             };
 
-            let benchmark_fixture = if cli.dry_run {
-                dry_run_benchmark_fixture(
-                    &runner_config,
-                    &base_dir,
-                    &suite.name,
-                    &benchmark_bootstrap_options,
-                )?
-            } else {
-                ensure_benchmark_data(
-                    &benchmark_bootstrap_options,
-                    &runner_config,
-                    &base_dir,
-                    &suite.name,
-                )?
-            };
-            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
-            inject_benchmark_fixture_placeholder(&mut placeholder_vars, benchmark_fixture.as_ref());
+            let placeholder_vars = placeholder_variables_with_run_id(
+                &runner_config,
+                &suite.name,
+                cli.benchmark_run_id.as_deref(),
+            );
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -4483,8 +4592,9 @@ fn run() -> Result<i32> {
             // Print suite header
             println!("{}", "=".repeat(72));
             println!(
-                "📋 {} correctness runner (jobs={})",
+                "📋 {} {} runner (jobs={})",
                 suite.name.to_uppercase(),
+                lane_label,
                 jobs
             );
             println!("{}", "=".repeat(72));
@@ -4505,23 +4615,6 @@ fn run() -> Result<i32> {
                 println!("result_dir={}", dir.display());
             }
             println!("query_timeout={}s", query_timeout);
-            if let Some(fixture) = benchmark_fixture.as_ref() {
-                println!(
-                    "benchmark_fixture.key={}",
-                    serde_json::to_string(&fixture.dataset_key)
-                        .expect("BTreeMap serializes to JSON")
-                );
-                println!("benchmark_fixture.ready_uri={}", fixture.ready_uri);
-                println!(
-                    "benchmark_fixture.publication_identity={}",
-                    fixture.publication_identity
-                );
-                println!("benchmark_fixture.reused={}", fixture.reused);
-                println!("benchmark_fixture.built={}", fixture.built);
-                if cli.dry_run {
-                    println!("benchmark_fixture.warehouse=unresolved");
-                }
-            }
             println!("{}", summarize_connection("target", &target_conn_base));
             if cli.mode == Mode::Diff
                 || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
@@ -4605,6 +4698,13 @@ fn run() -> Result<i32> {
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
                 publication_catalog_control: publication_catalog_control.clone(),
+                benchmark_profile_dir: resolve_path(
+                    cli.benchmark_profile_dir.as_deref(),
+                    &base_dir,
+                ),
+                benchmark_skip_init: cli.benchmark_skip_init,
+                benchmark_skip_cleanup: cli.benchmark_skip_cleanup,
+                benchmark_cleanup_only: cli.benchmark_cleanup_only,
             };
 
             prepared_suites.push(PreparedSuite {
@@ -4722,6 +4822,9 @@ fn run() -> Result<i32> {
                 .then_with(|| b.elapsed.cmp(&a.elapsed))
                 .then_with(|| a.case_id.cmp(&b.case_id))
         });
+        if let Some(path) = cli.case_timing_output.as_deref() {
+            write_case_timing_csv(PathBuf::from(path).as_path(), &all_case_timings)?;
+        }
         print!("{}", format_case_timings(&all_case_timings));
 
         if !all_failed_cases.is_empty() {
@@ -4751,9 +4854,9 @@ fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
 ) -> Result<Option<publication_catalog::FixtureHandle>> {
-    if !selected_suites.iter().any(|suite| {
-        matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator")
-    })
+    if !selected_suites
+        .iter()
+        .any(|suite| matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator"))
     {
         return Ok(None);
     }
@@ -4803,8 +4906,7 @@ mod tests {
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
-        validate_selected_suite_cluster,
-        verify_runtime_filter_structured_assertion,
+        validate_selected_suite_cluster, verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
     use regex::Regex;
@@ -5507,14 +5609,15 @@ mod tests {
     }
 
     #[test]
-    fn help_includes_benchmark_bootstrap_options() {
+    fn correctness_help_excludes_benchmark_bootstrap_options() {
         let help = <crate::Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("--no-auto-bootstrap-benchmark-data"));
-        assert!(help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
-        assert!(help.contains("--benchmark-bootstrap-rebuild"));
+        assert!(!help.contains("--no-auto-bootstrap-benchmark-data"));
+        assert!(!help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
+        assert!(!help.contains("--benchmark-bootstrap-rebuild"));
+        assert!(help.contains("--list-suites"));
     }
 
     #[test]
@@ -5533,6 +5636,15 @@ mod tests {
             .expect("extension listing should not require a suite");
 
         assert!(cli.list_extensions);
+        assert_eq!(cli.suite, None);
+    }
+
+    #[test]
+    fn cli_allows_correctness_suite_listing_without_a_suite() {
+        let cli = crate::Cli::try_parse_from(["novarocks-sql-test", "--list-suites"])
+            .expect("suite listing should not require a suite");
+
+        assert!(cli.list_suites);
         assert_eq!(cli.suite, None);
     }
 

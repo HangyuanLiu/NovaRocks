@@ -32,7 +32,7 @@ pub struct BenchmarkBootstrapOptions {
     pub scales: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReadyBenchmarkFixture {
     pub dataset_key: BTreeMap<String, String>,
     pub exact_warehouse: String,
@@ -88,14 +88,6 @@ struct FixtureError {
     message: String,
 }
 
-pub fn is_benchmark_suite(suite: &str) -> bool {
-    matches!(suite, "ssb" | "tpc-h" | "tpc-ds")
-}
-
-pub fn is_auto_bootstrap_supported_suite(suite: &str) -> bool {
-    matches!(suite, "ssb" | "tpc-h" | "tpc-ds")
-}
-
 pub fn parse_benchmark_scale_override(
     raw: &str,
     options: &mut BenchmarkBootstrapOptions,
@@ -106,10 +98,7 @@ pub fn parse_benchmark_scale_override(
     let suite = suite.trim();
     let scale = scale.trim();
 
-    if !is_benchmark_suite(suite) {
-        bail!("unknown benchmark suite in scale override: {suite}");
-    }
-    if scale.is_empty() {
+    if suite.is_empty() || scale.is_empty() {
         bail!("benchmark scale override for {suite} must not be empty");
     }
     if scale.contains('=') {
@@ -132,24 +121,11 @@ pub fn benchmark_scale_for_suite(
     options: &BenchmarkBootstrapOptions,
     suite: &str,
 ) -> Result<String> {
-    if !is_benchmark_suite(suite) {
-        bail!("unknown benchmark suite: {suite}");
-    }
-
-    Ok(options
+    options
         .scales
         .get(suite)
         .cloned()
-        .unwrap_or_else(|| default_benchmark_scale(suite).to_string()))
-}
-
-pub fn default_benchmark_scale(suite: &str) -> &'static str {
-    match suite {
-        "ssb" => "1",
-        "tpc-h" => "1",
-        "tpc-ds" => "1GB",
-        _ => "",
-    }
+        .with_context(|| format!("benchmark scale is required for discovered workload {suite}"))
 }
 
 fn build_benchmark_bootstrap_command(
@@ -209,10 +185,6 @@ pub fn ensure_benchmark_data(
     base_dir: &Path,
     suite: &str,
 ) -> Result<Option<ReadyBenchmarkFixture>> {
-    if !is_auto_bootstrap_supported_suite(suite) {
-        return Ok(None);
-    }
-
     let script_path = benchmark_bootstrap_script_path(runner_config, base_dir);
     let scale = benchmark_scale_for_suite(options, suite)?;
     let resolved = resolve_benchmark_dataset(runner_config, base_dir, suite, &scale)?;
@@ -360,9 +332,6 @@ pub fn dry_run_benchmark_fixture(
     suite: &str,
     options: &BenchmarkBootstrapOptions,
 ) -> Result<Option<ReadyBenchmarkFixture>> {
-    if !is_auto_bootstrap_supported_suite(suite) {
-        return Ok(None);
-    }
     let scale = benchmark_scale_for_suite(options, suite)?;
     let resolved = resolve_benchmark_dataset(runner_config, base_dir, suite, &scale)?;
     Ok(Some(ReadyBenchmarkFixture {
@@ -458,8 +427,6 @@ fn validate_ensure_result(
 fn validate_fixture_error(error: FixtureError, resolved: &ResolvedBenchmarkDataset) -> Result<()> {
     const KNOWN_ERRORS: &[&str] = &[
         "ready_invalid",
-        "wait_timeout",
-        "lease_lost",
         "writer_failed",
         "publication_conflict",
         "publication_failed",
@@ -519,33 +486,14 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn recognizes_supported_benchmark_suites() {
-        assert!(is_benchmark_suite("ssb"));
-        assert!(is_benchmark_suite("tpc-h"));
-        assert!(is_benchmark_suite("tpc-ds"));
-        assert!(!is_benchmark_suite("join"));
-    }
-
-    #[test]
-    fn auto_bootstrap_supports_standard_benchmark_suites() {
-        assert!(is_auto_bootstrap_supported_suite("ssb"));
-        assert!(is_auto_bootstrap_supported_suite("tpc-h"));
-        assert!(is_auto_bootstrap_supported_suite("tpc-ds"));
-        assert!(!is_auto_bootstrap_supported_suite("join"));
-    }
-
-    #[test]
-    fn parses_scale_overrides_and_defaults() {
+    fn parses_scale_overrides_for_discovered_workloads() {
         let mut options = BenchmarkBootstrapOptions::default();
         parse_benchmark_scale_override("ssb=10", &mut options).unwrap();
         parse_benchmark_scale_override("tpc-h=100", &mut options).unwrap();
 
         assert_eq!(benchmark_scale_for_suite(&options, "ssb").unwrap(), "10");
         assert_eq!(benchmark_scale_for_suite(&options, "tpc-h").unwrap(), "100");
-        assert_eq!(
-            benchmark_scale_for_suite(&options, "tpc-ds").unwrap(),
-            "1GB"
-        );
+        assert!(benchmark_scale_for_suite(&options, "tpc-ds").is_err());
     }
 
     #[test]
@@ -566,7 +514,8 @@ mod tests {
         assert!(parse_benchmark_scale_override("ssb", &mut options).is_err());
         assert!(parse_benchmark_scale_override("ssb=", &mut options).is_err());
         assert!(parse_benchmark_scale_override("ssb=1=2", &mut options).is_err());
-        assert!(parse_benchmark_scale_override("unknown=1", &mut options).is_err());
+        parse_benchmark_scale_override("future-workload=1", &mut options)
+            .expect("discovery, not a hard-coded name list, owns workload admission");
         assert!(parse_benchmark_scale_override("=1", &mut options).is_err());
     }
 
@@ -576,7 +525,9 @@ mod tests {
         resolved
             .dataset_key
             .insert("suite".to_string(), "tpc-ds".to_string());
-        resolved.dataset_key.insert("scale".to_string(), "1GB".to_string());
+        resolved
+            .dataset_key
+            .insert("scale".to_string(), "1GB".to_string());
 
         validate_resolved_dataset(&resolved, "tpc-ds", "1gb")
             .expect("the resolver owns scale normalization");
@@ -701,7 +652,7 @@ mod tests {
         let options = BenchmarkBootstrapOptions {
             enabled: true,
             rebuild: false,
-            scales: BTreeMap::new(),
+            scales: BTreeMap::from([("ssb".to_string(), "1".to_string())]),
         };
 
         let fixture = ensure_benchmark_data(&options, &config, temp.path(), "ssb")

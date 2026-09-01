@@ -3154,7 +3154,7 @@ mod tests {
     // not the partition's first non-null value.
     #[test]
     fn first_value_ignore_nulls_default_frame_returns_null_for_leading_null() {
-        // Partition layout matches v1=2 in tests/sql/suites/analytic/analytic_test_ignore_nulls:
+        // Partition layout matches v1=2 in tests/sql/correctness/analytic/analytic_test_ignore_nulls:
         // v2: 1 2 3 4 5 6
         // v3: NULL 2 NULL 4 NULL 6
         let values = Arc::new(Int32Array::from(vec![

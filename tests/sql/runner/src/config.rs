@@ -26,6 +26,22 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestLane {
+    Correctness,
+    Benchmark,
+}
+
+impl TestLane {
+    pub fn suite_root(self, base_dir: &Path) -> PathBuf {
+        let lane = match self {
+            Self::Correctness => "correctness",
+            Self::Benchmark => "benchmarks",
+        };
+        base_dir.join("tests").join("sql").join(lane)
+    }
+}
+
 pub fn env_or_default(key: &str, default: &str) -> String {
     env::var(key)
         .ok()
@@ -211,15 +227,18 @@ pub fn apply_suite_placeholder_defaults(variables: &mut HashMap<String, String>,
     );
 }
 
-pub fn placeholder_variables(
+pub fn placeholder_variables_with_run_id(
     runner_config: &RunnerConfig,
     suite_name: &str,
+    run_id_override: Option<&str>,
 ) -> HashMap<String, String> {
-    let nanos = std::time::SystemTime::now()
+    let generated_run_id = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let run_id = format!("sqlt_{:x}_{}", nanos, std::process::id());
+    let run_id = run_id_override
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("sqlt_{generated_run_id:x}_{}", std::process::id()));
 
     let mut variables = runner_config.values.clone();
     apply_suite_placeholder_defaults(&mut variables, suite_name);
@@ -356,7 +375,10 @@ pub fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig)
 pub fn resolve_repo_root() -> Result<PathBuf> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if dir.join("tests/sql/suites").is_dir() && dir.join("Cargo.toml").is_file() {
+        if dir.join("tests/sql/correctness").is_dir()
+            && dir.join("tests/sql/benchmarks").is_dir()
+            && dir.join("Cargo.toml").is_file()
+        {
             return Ok(dir);
         }
         if !dir.pop() {
@@ -429,7 +451,7 @@ pub fn suite_default_catalog(suite_name: &str) -> String {
         // The optimizer suite uses iceberg base tables so that ANALYZE-derived
         // NDV (Puffin statistics) reaches the cost-based optimizer. Native
         // internal tables do not exist. The
-        // `iceberg_opt` catalog is created by `tests/sql/suites/optimizer/init.sql`. A
+        // `iceberg_opt` catalog is created by `tests/sql/correctness/optimizer/init.sql`. A
         // stable catalog name is safe: each worktree's standalone has its
         // own in-memory catalog registry, and per-case `${case_db}` reset
         // isolates data between cases.
@@ -449,8 +471,11 @@ pub fn suite_default_query_timeout(suite_name: &str) -> u64 {
     }
 }
 
-pub fn build_suite_configs(base_dir: &Path) -> Result<BTreeMap<String, SuiteConfig>> {
-    let suites_dir = base_dir.join("tests").join("sql").join("suites");
+pub fn build_suite_configs(
+    base_dir: &Path,
+    lane: TestLane,
+) -> Result<BTreeMap<String, SuiteConfig>> {
+    let suites_dir = lane.suite_root(base_dir);
     let entries = fs::read_dir(&suites_dir)
         .with_context(|| format!("failed to read {}", suites_dir.display()))?;
 
@@ -542,6 +567,33 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn suite_discovery_is_scoped_to_the_selected_physical_lane() {
+        let temp = tempdir().expect("temporary repository root");
+        let correctness_sql = temp.path().join("tests/sql/correctness/filter/sql");
+        let benchmark_sql = temp.path().join("tests/sql/benchmarks/ssb/sql");
+        fs::create_dir_all(&correctness_sql).expect("create correctness suite");
+        fs::create_dir_all(&benchmark_sql).expect("create benchmark workload");
+
+        let correctness = build_suite_configs(temp.path(), TestLane::Correctness)
+            .expect("discover correctness suites");
+        let benchmarks = build_suite_configs(temp.path(), TestLane::Benchmark)
+            .expect("discover benchmark workloads");
+
+        assert_eq!(correctness.keys().collect::<Vec<_>>(), vec!["filter"]);
+        assert_eq!(benchmarks.keys().collect::<Vec<_>>(), vec!["ssb"]);
+    }
+
+    #[test]
+    fn suite_discovery_fails_when_the_selected_lane_root_is_absent() {
+        let temp = tempdir().expect("temporary repository root");
+
+        let error = build_suite_configs(temp.path(), TestLane::Correctness)
+            .expect_err("missing correctness root must not fall back");
+
+        assert!(format!("{error:#}").contains("tests/sql/correctness"));
+    }
+
+    #[test]
     fn loads_toml_config_and_flattens_nested_environment_values() {
         let directory = tempdir().expect("temporary config directory");
         let path = directory.path().join("runner.toml");
@@ -597,7 +649,7 @@ oss_endpoint = "http://127.0.0.1:9000"
             "/tmp/novarocks-sql-test/${suite_uuid0}/${run_id}/".to_string(),
         );
 
-        let variables = placeholder_variables(&runner_config, "iceberg");
+        let variables = placeholder_variables_with_run_id(&runner_config, "iceberg", None);
         let warehouse = variables
             .get("iceberg_catalog_warehouse")
             .expect("warehouse");
@@ -609,6 +661,21 @@ oss_endpoint = "http://127.0.0.1:9000"
             &format!("/tmp/novarocks-sql-test/{suite_uuid0}/{run_id}/")
         );
         assert!(!warehouse.contains("${"));
+    }
+
+    #[test]
+    fn placeholder_variables_preserve_explicit_benchmark_run_identity() {
+        let variables = placeholder_variables_with_run_id(
+            &RunnerConfig::default(),
+            "ssb",
+            Some("sqlb_ssb_stable"),
+        );
+
+        assert_eq!(variables.get("run_id"), Some(&"sqlb_ssb_stable".to_string()));
+        assert_eq!(
+            variables.get("suite_uuid0"),
+            Some(&"sqlb_ssb_stable_0".to_string())
+        );
     }
 
     #[test]

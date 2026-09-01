@@ -24,8 +24,6 @@ WORKSPACE_ROOT="$(cd "${NOVAROCKS_WORKSPACE_ROOT:-$SCRIPT_DIR/../..}" && pwd)"
 # their isolated fixtures. Prefer that stable entry over the mutable `current`
 # symlink, while keeping the normal interactive default unchanged.
 ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$WORKSPACE_ROOT/docker/iceberg-rest/runtime/current/env.sh}"
-# shellcheck source=benchmark_fixture_lease.sh
-source "$SCRIPT_DIR/benchmark_fixture_lease.sh"
 # shellcheck source=benchmark_fixture_publication.sh
 source "$SCRIPT_DIR/benchmark_fixture_publication.sh"
 
@@ -226,8 +224,6 @@ source_env() {
   : "${NOVA_ENV_COMPOSE_PROJECT:?missing NOVA_ENV_COMPOSE_PROJECT in $ENV_FILE}"
   : "${NOVA_ENV_COMPOSE_FILE:?missing NOVA_ENV_COMPOSE_FILE in $ENV_FILE}"
   : "${NOVA_ENV_SHARED_BENCHMARK_ROOT:?missing NOVA_ENV_SHARED_BENCHMARK_ROOT in $ENV_FILE}"
-  : "${NOVA_ENV_BENCHMARK_LEASE_NAMESPACE:?missing NOVA_ENV_BENCHMARK_LEASE_NAMESPACE in $ENV_FILE}"
-  : "${NOVA_ENV_BENCHMARK_LEASE_IMAGE:?missing NOVA_ENV_BENCHMARK_LEASE_IMAGE in $ENV_FILE}"
   : "${AWS_S3_ENDPOINT:?missing AWS_S3_ENDPOINT in $ENV_FILE}"
   : "${AWS_S3_ACCESS_KEY_ID:?missing AWS_S3_ACCESS_KEY_ID in $ENV_FILE}"
   : "${AWS_S3_SECRET_ACCESS_KEY:?missing AWS_S3_SECRET_ACCESS_KEY in $ENV_FILE}"
@@ -334,7 +330,7 @@ validate_ready_json() {
   python3 - "$resolved_dataset_file" "$ready_json" <<'PY'
 import json, sys
 r=json.load(open(sys.argv[1], encoding='utf-8')); value=json.loads(sys.argv[2])
-required={'schema_version','dataset_key','state','exact_warehouse','manifest_uri','contract','producer_fingerprint','publication','lease'}
+required={'schema_version','dataset_key','state','exact_warehouse','manifest_uri','contract','producer_fingerprint','publication'}
 if set(value) < required or value['schema_version'] != 1 or value['dataset_key'] != r['dataset_key'] or value['state'] != 'ReadyValid': raise SystemExit(1)
 if value['contract'] != r['contract'] or value['producer_fingerprint'] != r['producer_fingerprint']: raise SystemExit(1)
 if value['publication'].get('ready_uri') != r['ready_uri'] or not value['publication'].get('identity'): raise SystemExit(1)
@@ -684,36 +680,24 @@ new_identity() {
   printf '%s-%s' "$(date +%s)" "$random"
 }
 
-lease_is_live() {
-  fixture_lease_matches "$lease_id" "$dataset_key_json" "$owner_token" "$staging_identity" || return 1
-  fixture_lease_heartbeat "$lease_id" >/dev/null
-}
-
-run_with_lease() {
-  # Keep the exact fencing token alive while an expensive child is running.
-  # This wrapper is also the only place that kills owner-local children.
-  local started now interval expiry deadline child_status
-  interval="${NOVA_ENV_BENCHMARK_LEASE_HEARTBEAT_SECONDS:-30}"
-  expiry="${NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS:-180}"
+run_with_timeout() {
+  # Each writer has a unique staging prefix. The conditional READY publication
+  # below is the only shared mutation and decides the immutable winner.
+  local started deadline child_status
   deadline="${NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS:-7200}"
-  [[ "$interval" =~ ^[0-9]+$ && "$expiry" =~ ^[0-9]+$ && "$deadline" =~ ^[0-9]+$ ]] || return 64
-  (( interval * 3 < expiry )) || return 64
+  [[ "$deadline" =~ ^[1-9][0-9]*$ ]] || return 64
   "$@" &
   owner_child_pid="$!"
-  started="$(fixture_lease_now)"
+  started="$SECONDS"
   while kill -0 "$owner_child_pid" 2>/dev/null; do
-    sleep "$interval"
-    now="$(fixture_lease_now)"
-    if (( now - started > deadline )); then
+    sleep 1
+    if (( SECONDS - started > deadline )); then
       stop_owner_child
       return 124
     fi
-    if ! lease_is_live; then
-      stop_owner_child
-      return 75
-    fi
   done
-  wait "$owner_child_pid"; child_status="$?"
+  child_status=0
+  wait "$owner_child_pid" || child_status="$?"
   owner_child_pid=""
   return "$child_status"
 }
@@ -751,7 +735,6 @@ stop_owner_child() {
 
 cleanup_owner() {
   stop_owner_child
-  [[ -z "${lease_id:-}" ]] || fixture_lease_release "$lease_id"
   [[ -z "${fixture_contract_file:-}" ]] || rm -f "$fixture_contract_file"
   [[ -z "${candidate:-}" ]] || rm -f "$candidate"
 }
@@ -763,7 +746,6 @@ handle_owner_signal() {
 
 publish_ready() {
   local candidate="$1" mode="$2" observed_etag="${3:-}" status
-  lease_is_live || return 3
   status="$(fixture_publication_put_conditional "$ready_uri" "$candidate" "$mode" "$observed_etag")" || return 4
   case "$status" in
     200|201) return 0 ;;
@@ -778,39 +760,15 @@ publish_ready() {
 
 write_ready_candidate() {
   local candidate="$1"
-  python3 - "$resolved_dataset_file" "$exact_warehouse" "$manifest_uri" "$lease_id" "$owner_token" "$staging_identity" > "$candidate" <<'PY'
+  python3 - "$resolved_dataset_file" "$exact_warehouse" "$manifest_uri" "$staging_identity" > "$candidate" <<'PY'
 import json, sys
 r=json.load(open(sys.argv[1], encoding='utf-8'))
-warehouse, manifest, lease_id, owner, staging = sys.argv[2:]
+warehouse, manifest, staging = sys.argv[2:]
 value={"schema_version": 1, "dataset_key": r["dataset_key"], "state": "ReadyValid", "exact_warehouse": warehouse,
        "manifest_uri": manifest, "contract": r["contract"], "producer_fingerprint": r["producer_fingerprint"],
-       "publication": {"ready_uri": r["ready_uri"], "identity": staging},
-       "lease": {"container_id": lease_id, "owner": owner, "staging_identity": staging}}
+       "publication": {"ready_uri": r["ready_uri"], "identity": staging}}
 print(json.dumps(value, sort_keys=True, separators=(',', ':')))
 PY
-}
-
-wait_or_takeover() {
-  local started now observed old_id old_key old_owner old_staging
-  started="$(fixture_lease_now)"
-  while :; do
-    if check_readiness; then return 10; fi
-    observed="$(fixture_lease_inspect "$lease_name" 2>/dev/null || true)"
-    if [[ -n "$observed" ]]; then
-      read -r old_id old_key old_owner old_staging <<<"$observed"
-      if [[ "$old_key" == "$dataset_key_json" ]]; then
-        now="$(fixture_lease_now)"
-        if (( now - started >= ${NOVA_ENV_BENCHMARK_LEASE_WAIT_SECONDS:-900} )); then return 1; fi
-        # The exact-id recheck and delete are deliberately inside the lease module.
-        if fixture_lease_takeover_stale "$old_id" "$dataset_key_json" "${NOVA_ENV_BENCHMARK_LEASE_EXPIRY_SECONDS:-180}" "$old_owner" "$old_staging"; then
-          return 0
-        fi
-      else
-        return 1
-      fi
-    fi
-    sleep "${NOVA_ENV_BENCHMARK_LEASE_POLL_SECONDS:-2}"
-  done
 }
 
 main() {
@@ -854,30 +812,13 @@ main() {
   fi
 
   staging_identity="$(new_identity)"
-  owner_token="$(new_identity)"
-  lease_name="$(fixture_lease_name "$NOVA_ENV_BENCHMARK_LEASE_NAMESPACE" "$dataset_key_json")"
-  lease_id=""
   fixture_contract_file="$(mktemp)"; chmod 600 "$fixture_contract_file"; cp "$resolved_dataset_file" "$fixture_contract_file"
   trap cleanup_owner EXIT
   trap 'handle_owner_signal 130' INT
   trap 'handle_owner_signal 143' TERM
-  while [[ -z "$lease_id" ]]; do
-    if lease_id="$(fixture_lease_acquire "$lease_name" "$dataset_key_json" "$owner_token" "$staging_identity" "$NOVA_ENV_BENCHMARK_LEASE_IMAGE")"; then
-      break
-    else
-      acquire_status="$?"
-    fi
-    if [[ "$acquire_status" != 75 ]]; then emit_error writer_failed "unable to acquire fixture lease"; exit 1; fi
-    if wait_or_takeover; then
-      continue
-    else
-      wait_status="$?"
-    fi
-    if [[ "$wait_status" == 10 ]] && check_readiness; then emit_result true false "$ready_etag"; exit 0; fi
-    emit_error wait_timeout "timed out waiting for the exact fixture lease"; exit 1
-  done
-
-  # The lease holder must always recheck: another writer can publish while we waited.
+  # A concurrent absent writer can finish while this process allocates its
+  # private staging prefix. Reuse the exact READY instead of coordinating via
+  # a Docker resource.
   if check_readiness; then
     if [[ "$rebuild" != 1 ]]; then emit_result true false "$ready_etag"; exit 0; fi
   else
@@ -894,9 +835,9 @@ main() {
   fixture_publication_curl_capable || [[ -n "${BENCHMARK_FIXTURE_STORAGE_DIR:-}" ]] || { emit_error publication_failed "curl lacks --aws-sigv4"; exit 1; }
   extract_generator_source || { emit_error writer_failed "generator setup failed"; exit 1; }
   patch_generator_source || { emit_error writer_failed "generator patch failed"; exit 1; }
-  run_with_lease generate_raw_files || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during raw generation" || emit_error writer_failed "raw generation failed"; exit 1; }
-  run_with_lease upload_raw_files || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during raw upload" || emit_error writer_failed "raw upload failed"; exit 1; }
-  run_with_lease run_spark_loader || { [[ "$?" == 75 ]] && emit_error lease_lost "lease lost during Spark load" || emit_error writer_failed "Spark loader failed"; exit 1; }
+  run_with_timeout generate_raw_files || { emit_error writer_failed "raw generation failed"; exit 1; }
+  run_with_timeout upload_raw_files || { emit_error writer_failed "raw upload failed"; exit 1; }
+  run_with_timeout run_spark_loader || { emit_error writer_failed "Spark loader failed"; exit 1; }
   fixture_publication_head "$manifest_uri/_SUCCESS" || { emit_error ready_invalid "candidate manifest is incomplete"; exit 1; }
   candidate="$(mktemp)"; chmod 600 "$candidate"
   write_ready_candidate "$candidate"
@@ -906,7 +847,7 @@ main() {
   else
     publish_status="$?"
   fi
-  if [[ "$publish_status" == 3 ]]; then emit_error lease_lost "lease fencing failed before READY publication";
+  if [[ "$publish_status" == 10 ]] && check_readiness; then emit_result true false "$ready_etag";
   elif [[ "$publish_status" == 5 ]]; then emit_error publication_conflict "conditional READY publication lost without a valid winner";
   else emit_error publication_failed "conditional READY publication failed"; fi
   exit 1
