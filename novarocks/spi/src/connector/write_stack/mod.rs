@@ -70,7 +70,8 @@ pub use relation::{
     RootRowKind, WRITE_RELATION_COLUMN_COUNT, WRITE_RELATION_FRAGMENT_COLUMN,
     WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_COLUMN, WRITE_RELATION_KIND_INDEX,
     WRITE_RELATION_ROW_COUNT_COLUMN, WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_COLUMN,
-    WRITE_RELATION_TARGET_INDEX, WriterRowKind, root_output_schema, validate_root_row,
+    WRITE_RELATION_TARGET_INDEX, WriterRowKind, root_output_schema, row_count_from_wire,
+    row_count_to_wire, target_ordinal_from_wire, target_ordinal_to_wire, validate_root_row,
     validate_writer_row, writer_output_schema,
 };
 pub use runtime::{

@@ -33,6 +33,14 @@
 //! | `row_count` | non-null exactly on `ROW_COUNT` | non-null exactly on `SUMMARY` |
 //! | `commit_fragment` | non-null exactly on `COMMIT_FRAGMENT` | non-null exactly on `PREPARED_FRAGMENT` |
 //!
+//! The Arrow types are **signed** — `Int8`, `Int32`, `Int64`, `Binary` — because these columns are
+//! declared on a fragment's `OutputColumn`s and therefore cross the FE/BE plan boundary through
+//! the engine's native `TypeDesc` mapping, which has no unsigned arm
+//! (`frontend/src/native/fragment_encoder/plan/type_mapping.rs:118-179` maps `Int8..Int64` and
+//! rejects everything it does not name). Carrying `UInt*` here would be exactly the implicit type
+//! downgrade the native contract forbids. The values themselves are non-negative by construction,
+//! and the constructors below reject a negative one rather than reinterpreting it.
+//!
 //! The `kind` column and the nullable columns must always agree. An unknown
 //! kind, two non-null payloads, two null payloads, or an ordinal outside the
 //! sealed target set is rejected at the nearest ingress — never repaired.
@@ -65,10 +73,10 @@ pub enum WriterRowKind {
 }
 
 impl WriterRowKind {
-    pub const ROW_COUNT: u8 = 1;
-    pub const COMMIT_FRAGMENT: u8 = 2;
+    pub const ROW_COUNT: i8 = 1;
+    pub const COMMIT_FRAGMENT: i8 = 2;
 
-    pub fn from_wire(kind: u8) -> Result<Self, ConnectorError> {
+    pub fn from_wire(kind: i8) -> Result<Self, ConnectorError> {
         match kind {
             Self::ROW_COUNT => Ok(Self::RowCount),
             Self::COMMIT_FRAGMENT => Ok(Self::CommitFragment),
@@ -79,7 +87,7 @@ impl WriterRowKind {
         }
     }
 
-    pub const fn to_wire(self) -> u8 {
+    pub const fn to_wire(self) -> i8 {
         match self {
             Self::RowCount => Self::ROW_COUNT,
             Self::CommitFragment => Self::COMMIT_FRAGMENT,
@@ -97,10 +105,10 @@ pub enum RootRowKind {
 }
 
 impl RootRowKind {
-    pub const SUMMARY: u8 = 1;
-    pub const PREPARED_FRAGMENT: u8 = 2;
+    pub const SUMMARY: i8 = 1;
+    pub const PREPARED_FRAGMENT: i8 = 2;
 
-    pub fn from_wire(kind: u8) -> Result<Self, ConnectorError> {
+    pub fn from_wire(kind: i8) -> Result<Self, ConnectorError> {
         match kind {
             Self::SUMMARY => Ok(Self::Summary),
             Self::PREPARED_FRAGMENT => Ok(Self::PreparedFragment),
@@ -111,7 +119,7 @@ impl RootRowKind {
         }
     }
 
-    pub const fn to_wire(self) -> u8 {
+    pub const fn to_wire(self) -> i8 {
         match self {
             Self::Summary => Self::SUMMARY,
             Self::PreparedFragment => Self::PREPARED_FRAGMENT,
@@ -121,15 +129,65 @@ impl RootRowKind {
 
 fn relation_schema(target_nullable: bool) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(WRITE_RELATION_KIND_COLUMN, DataType::UInt8, false),
+        Field::new(WRITE_RELATION_KIND_COLUMN, DataType::Int8, false),
         Field::new(
             WRITE_RELATION_TARGET_COLUMN,
-            DataType::UInt32,
+            DataType::Int32,
             target_nullable,
         ),
-        Field::new(WRITE_RELATION_ROW_COUNT_COLUMN, DataType::UInt64, true),
+        Field::new(WRITE_RELATION_ROW_COUNT_COLUMN, DataType::Int64, true),
         Field::new(WRITE_RELATION_FRAGMENT_COLUMN, DataType::Binary, true),
     ]))
+}
+
+/// Narrow a checked row count into the relation's signed carrier.
+///
+/// A row count above `i64::MAX` is not physically reachable, but it must fail
+/// loudly rather than wrap: the value becomes the statement's user-visible
+/// affected row count.
+pub fn row_count_to_wire(rows: u64) -> Result<i64, ConnectorError> {
+    i64::try_from(rows).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "connector write row count exceeds the relation's signed carrier",
+        )
+    })
+}
+
+/// Widen a row count read back off the relation, rejecting a negative one.
+pub fn row_count_from_wire(rows: i64) -> Result<u64, ConnectorError> {
+    u64::try_from(rows).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "connector write row count is negative",
+        )
+    })
+}
+
+/// Narrow a validated target ordinal into the relation's signed carrier.
+pub fn target_ordinal_to_wire(
+    target: crate::connector::write_stack::target::WriteTargetOrdinal,
+) -> Result<i32, ConnectorError> {
+    i32::try_from(target.get()).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "connector write target ordinal exceeds the relation's signed carrier",
+        )
+    })
+}
+
+/// Read a target ordinal back off the relation, rejecting a negative or
+/// out-of-bounds one.
+pub fn target_ordinal_from_wire(
+    target: i32,
+) -> Result<crate::connector::write_stack::target::WriteTargetOrdinal, ConnectorError> {
+    let target = u32::try_from(target).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "connector write target ordinal is negative",
+        )
+    })?;
+    crate::connector::write_stack::target::WriteTargetOrdinal::try_new(target)
 }
 
 /// The schema every `TableWriter` operator emits. `write_target_ordinal` is
@@ -147,7 +205,7 @@ pub fn root_output_schema() -> SchemaRef {
 /// Check one writer row's payload against its kind.
 pub fn validate_writer_row(
     kind: WriterRowKind,
-    row_count: Option<u64>,
+    row_count: Option<i64>,
     fragment_len: Option<usize>,
 ) -> Result<(), ConnectorError> {
     let consistent = match kind {
@@ -167,8 +225,8 @@ pub fn validate_writer_row(
 /// target ordinal precisely because it aggregates every target.
 pub fn validate_root_row(
     kind: RootRowKind,
-    target: Option<u32>,
-    row_count: Option<u64>,
+    target: Option<i32>,
+    row_count: Option<i64>,
     fragment_len: Option<usize>,
 ) -> Result<(), ConnectorError> {
     let consistent = match kind {
@@ -196,16 +254,16 @@ mod tests {
             assert_eq!(schema.fields().len(), WRITE_RELATION_COLUMN_COUNT);
             assert_eq!(
                 schema.field(WRITE_RELATION_KIND_INDEX).data_type(),
-                &DataType::UInt8
+                &DataType::Int8
             );
             assert!(!schema.field(WRITE_RELATION_KIND_INDEX).is_nullable());
             assert_eq!(
                 schema.field(WRITE_RELATION_TARGET_INDEX).data_type(),
-                &DataType::UInt32
+                &DataType::Int32
             );
             assert_eq!(
                 schema.field(WRITE_RELATION_ROW_COUNT_INDEX).data_type(),
-                &DataType::UInt64
+                &DataType::Int64
             );
             assert!(schema.field(WRITE_RELATION_ROW_COUNT_INDEX).is_nullable());
             assert_eq!(
@@ -232,7 +290,7 @@ mod tests {
 
     #[test]
     fn unknown_row_kinds_are_corrupt_data() {
-        for kind in [0_u8, 3, 255] {
+        for kind in [0_i8, 3, -1, i8::MAX] {
             assert_eq!(
                 WriterRowKind::from_wire(kind).expect_err("unknown").kind(),
                 ConnectorErrorKind::CorruptData
@@ -263,6 +321,42 @@ mod tests {
         assert!(validate_writer_row(WriterRowKind::CommitFragment, None, None).is_err());
         // payload belongs to the other kind
         assert!(validate_writer_row(WriterRowKind::CommitFragment, Some(7), None).is_err());
+    }
+
+    #[test]
+    fn the_signed_carrier_rejects_rather_than_reinterprets_out_of_range_values() {
+        assert_eq!(row_count_to_wire(0).expect("zero"), 0);
+        assert_eq!(
+            row_count_to_wire(i64::MAX as u64).expect("largest representable"),
+            i64::MAX
+        );
+        assert_eq!(
+            row_count_to_wire(i64::MAX as u64 + 1)
+                .expect_err("beyond the signed carrier")
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+
+        assert_eq!(row_count_from_wire(7).expect("positive"), 7);
+        // A negative row count must not be reinterpreted as a huge unsigned one.
+        assert_eq!(
+            row_count_from_wire(-1).expect_err("negative").kind(),
+            ConnectorErrorKind::CorruptData
+        );
+
+        let target = crate::connector::write_stack::target::WriteTargetOrdinal::try_new(3)
+            .expect("bounded ordinal");
+        assert_eq!(target_ordinal_to_wire(target).expect("narrow"), 3);
+        assert_eq!(
+            target_ordinal_from_wire(3).expect("widen").get(),
+            target.get()
+        );
+        assert_eq!(
+            target_ordinal_from_wire(-1).expect_err("negative").kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        // Beyond the sealed target bound the ordinal owner rejects it.
+        assert!(target_ordinal_from_wire(i32::MAX).is_err());
     }
 
     #[test]
