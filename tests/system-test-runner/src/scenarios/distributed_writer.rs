@@ -263,7 +263,7 @@ impl Scenario for DistributedWriterFaults {
             ("a failing writer", "connector-write-writer-failure"),
             ("a failing root aggregation", "connector-write-root-failure"),
         ] {
-            context.action(&format!("inject {case} and require no snapshot"));
+            context.action(format!("inject {case} and require no snapshot"));
             for index in 0..context.handle().be_count() {
                 context
                     .handle()
