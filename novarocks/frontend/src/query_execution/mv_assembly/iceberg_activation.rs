@@ -30,12 +30,13 @@ use novarocks_spi::connector::{
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::mv::domain::application::MvIncrementalWriteMode;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::storage_observation::{MvLakePublishedProjection, observe_lake_package};
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
-    MvRefreshCommittedFacts, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
-    MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+    MvIncrementalWriteRequest, MvRefreshCommittedFacts, MvRefreshPublicationIntent,
+    MvRefreshPublicationTechnique, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
@@ -267,6 +268,162 @@ pub(crate) fn begin_first_refresh_connector_write_session(
     )
 }
 
+/// The write intent, signed input, and branch shape one incremental refresh mode
+/// declares.
+///
+/// The shape is the whole decision this function exists to make, and it cannot
+/// be inferred from the input: a row-lineage input with a `_file`/`_pos`
+/// identity is exactly what ordinary DML row mutation sends, so the provider
+/// reading the input alone could not tell a publication from DML -- and that
+/// difference decides whether the single commit is a publication.
+fn incremental_publication_write_input(
+    mode: MvIncrementalWriteMode,
+    target_write_fields: &[arrow::datatypes::Field],
+) -> Result<
+    (
+        novarocks_spi::connector::ConnectorWriteIntent,
+        ConnectorWriteInputRequest,
+        novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
+    ),
+    String,
+> {
+    use novarocks_execution::exec::row_position::{
+        ICEBERG_FILE_PATH_COL, ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
+        ICEBERG_ROW_POS_COL,
+    };
+    use novarocks_spi::connector::ConnectorWriteFieldRequest;
+    use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
+
+    if target_write_fields.is_empty() {
+        return Err("MV incremental write has no target write fields".to_string());
+    }
+    let field = |name: &str, data_type: arrow::datatypes::DataType, nullable: bool| {
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
+    };
+    let mut data_fields = target_write_fields
+        .iter()
+        .map(|target_field| ConnectorWriteFieldRequest::new(target_field.clone()))
+        .collect::<Vec<_>>();
+    Ok(match mode {
+        MvIncrementalWriteMode::FastAppend => (
+            novarocks_spi::connector::ConnectorWriteIntent::Append,
+            ConnectorWriteInputRequest::Data {
+                fields: data_fields,
+            },
+            ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+        ),
+        MvIncrementalWriteMode::RowDelta => {
+            // The v3 lineage columns travel with the after-image so a replaced
+            // row keeps the identity it already had instead of being re-minted
+            // as a fresh row. They are nullable because an inserted row has no
+            // prior identity to carry.
+            data_fields.push(field(
+                ICEBERG_ROW_ID_COL,
+                arrow::datatypes::DataType::Int64,
+                true,
+            ));
+            data_fields.push(field(
+                ICEBERG_LAST_UPDATED_SEQ_COL,
+                arrow::datatypes::DataType::Int64,
+                true,
+            ));
+            (
+                novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                ConnectorWriteInputRequest::RowLineage {
+                    data_fields,
+                    row_identity_fields: vec![
+                        field(
+                            ICEBERG_FILE_PATH_COL,
+                            arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
+                        field(
+                            ICEBERG_ROW_POS_COL,
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+                    ],
+                },
+                ConnectorManagedPublicationShape::RowMutation,
+            )
+        }
+    })
+}
+
+/// Open the write session one MV incremental refresh publishes through.
+///
+/// An incremental refresh applies a change stream, so its rows arrive as change
+/// events and SQL routes them to the branches the publication seals. Which
+/// branches those are is declared here and cannot be inferred: an incremental
+/// merge-on-read refresh arrives as a `RowLineage` input with a `_file`/`_pos`
+/// identity, which is indistinguishable from an ordinary DML row mutation by
+/// input shape alone, and the difference decides whether the commit is a
+/// publication or DML.
+///
+/// * A fast-append refresh only ever inserts, so it supersedes nothing. It sends
+///   plain data rows and declares `InsertOnlyChangeStream`, which seals one
+///   *routed* data branch accepting only `Insert` and freezes no delete
+///   artifact. Note what the declaration does not do: an effect no branch
+///   accepts is dropped by the router rather than refused, so "no delete
+///   appears" stays this mode's own precondition -- established upstream by the
+///   write-mode policy -- and is not made an enforced invariant by the routing.
+/// * A row-delta refresh replaces and retires rows, so it declares `RowMutation`
+///   and sends row-lineage change events. The session then seals the branches a
+///   row mutation needs and freezes the old delete artifacts they supersede.
+///
+/// The publication id travels inside the managed intent and nowhere else. It
+/// reaches the snapshot the commit writes -- that is what the publication fence
+/// reads back -- but no writer recipe, commit fragment, or backend sees it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Opening an incremental publication session needs each independently frozen request, publication, schema, and lease fact."
+)]
+pub(crate) fn begin_incremental_connector_write_session(
+    request: &MvIncrementalWriteRequest,
+    publication_intent: &MvRefreshPublicationIntent,
+    mode: MvIncrementalWriteMode,
+    target_write_fields: &[arrow::datatypes::Field],
+    connector_context: ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+    planning_lease: &ConnectorControlPlanningLease,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+    let target = crate::catalog_application::resolver::TargetBackend {
+        backend_name: "iceberg",
+        catalog: request.target_catalog.clone(),
+        namespace: request.target_namespace.clone(),
+        table: request.target_name.clone(),
+    };
+    let (intent, input, shape) = incremental_publication_write_input(mode, target_write_fields)?;
+    // An incremental window that materialized nothing has nothing to publish,
+    // and its staging branch still points at the old, unmarked target snapshot.
+    // The provider applies this at finish, so the frontend commits either way
+    // and reads the effect back.
+    let managed_publication = managed_publication_activation_intent(
+        publication_intent,
+        ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
+    )?;
+    crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            typed_connector_control,
+            planning_lease,
+        )?,
+        exact_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            &target,
+            &request.staging_branch,
+            intent,
+            input,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
+                intent: managed_publication,
+                shape,
+            },
+            connector_context,
+        )?,
+    )
+}
+
 /// Release a session that will never reach its commit.
 ///
 /// Nothing external has happened -- a begin performs reads only, and a session
@@ -361,7 +518,115 @@ pub(crate) fn managed_publication_activation_intent(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{MvLakePublishedProjection, require_exact_published_projection};
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_spi::connector::ConnectorWriteIntent;
+    use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
+
+    use super::{
+        ConnectorWriteInputRequest, MvIncrementalWriteMode, MvLakePublishedProjection,
+        incremental_publication_write_input, require_exact_published_projection,
+    };
+
+    fn target_write_fields() -> Vec<Field> {
+        vec![
+            Field::new("k1", DataType::Int64, false),
+            Field::new("v1", DataType::Utf8, true),
+        ]
+    }
+
+    fn field_names(fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest]) -> Vec<String> {
+        fields
+            .iter()
+            .map(|field| field.field().name().to_string())
+            .collect()
+    }
+
+    /// A fast-append refresh only ever inserts, so it supersedes nothing. It
+    /// must declare the shape that seals ONE routed data branch accepting only
+    /// `Insert`: the wholesale-republication shape seals an unrouted branch, and
+    /// SQL's change-stream compile requires every branch to declare which
+    /// effects it accepts, so its rows would have nowhere to be routed.
+    #[test]
+    fn a_fast_append_refresh_declares_the_insert_only_change_stream_shape() {
+        let (intent, input, shape) = incremental_publication_write_input(
+            MvIncrementalWriteMode::FastAppend,
+            &target_write_fields(),
+        )
+        .expect("fast-append declares its publication shape");
+
+        assert_eq!(
+            shape,
+            ConnectorManagedPublicationShape::InsertOnlyChangeStream
+        );
+        assert_eq!(intent, ConnectorWriteIntent::Append);
+        // Plain data rows: nothing is superseded, so no row identity is signed
+        // and the session freezes no old delete artifact.
+        let ConnectorWriteInputRequest::Data { fields } = input else {
+            panic!("an insert-only publication publishes data files");
+        };
+        assert_eq!(field_names(&fields), vec!["k1", "v1"]);
+    }
+
+    /// A row-delta refresh retires the row versions it replaces, so it must
+    /// declare the shape that seals the branches a row mutation needs -- the
+    /// delete branch included. That is also what makes the session freeze the
+    /// old delete artifacts those branches supersede; the insert-only shape
+    /// freezes none.
+    #[test]
+    fn a_row_delta_refresh_declares_the_row_mutation_shape_with_a_file_pos_identity() {
+        let (intent, input, shape) = incremental_publication_write_input(
+            MvIncrementalWriteMode::RowDelta,
+            &target_write_fields(),
+        )
+        .expect("row-delta declares its publication shape");
+
+        assert_eq!(shape, ConnectorManagedPublicationShape::RowMutation);
+        assert_eq!(intent, ConnectorWriteIntent::RowDelta);
+        let ConnectorWriteInputRequest::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } = input
+        else {
+            panic!("a change-stream publication sends row-lineage change events");
+        };
+        // `_file`/`_pos` is what makes this a merge-on-read mutation. A
+        // `_row_id`/`_last_updated_sequence_number` identity would be
+        // copy-on-write, which a publication carries no match selection for and
+        // the provider refuses outright.
+        assert_eq!(field_names(&row_identity_fields), vec!["_file", "_pos"]);
+        assert!(
+            row_identity_fields
+                .iter()
+                .all(|field| !field.field().is_nullable()),
+            "a row identity that could be null would name no row"
+        );
+        // The v3 lineage columns ride with the after-image so a replaced row
+        // keeps the identity it already had. They are nullable because an
+        // inserted row has no prior identity to carry.
+        assert_eq!(
+            field_names(&data_fields),
+            vec!["k1", "v1", "_row_id", "_last_updated_sequence_number"]
+        );
+        assert!(
+            data_fields[2..]
+                .iter()
+                .all(|field| field.field().is_nullable())
+        );
+    }
+
+    /// A signed input with no fields would seal a branch no row could satisfy.
+    #[test]
+    fn an_incremental_refresh_without_target_write_fields_is_refused() {
+        for mode in [
+            MvIncrementalWriteMode::FastAppend,
+            MvIncrementalWriteMode::RowDelta,
+        ] {
+            assert!(
+                incremental_publication_write_input(mode, &[]).is_err(),
+                "{mode:?} must not sign an empty write input"
+            );
+        }
+    }
 
     fn published(snapshot_id: i64) -> MvLakePublishedProjection {
         MvLakePublishedProjection::Published {

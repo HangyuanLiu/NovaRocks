@@ -2198,28 +2198,6 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     ))
 }
 
-/// Convert an already planned MV change-stream writer into an inert native
-/// assembly handoff. The caller retains responsibility for the exact connector
-/// write lease and Frontend later encodes the sealed pair before submission.
-pub(crate) fn prepare_planned_iceberg_change_stream_write(
-    encoding: NativeFragmentEncodingInput,
-    query_opts: Option<QueryOptions>,
-    connector_write: Option<DistributedConnectorWrite>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
-        return Err("prepared connector write requires an unsealed write template".to_string());
-    };
-    let cohort_id = template.cohort_id();
-    let exact_lease = template.lease();
-    Ok(PreparedMvNativeWriteAssembly::operation(
-        encoding,
-        query_opts,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
-        cohort_id,
-        exact_lease,
-    ))
-}
-
 #[allow(
     dead_code,
     reason = "Test-only bound-write assembly remains available to exercise sealed request construction."

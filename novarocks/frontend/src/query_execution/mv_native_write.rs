@@ -26,69 +26,34 @@
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
-    MvLakePackageObservation,
+    ConnectorWriteLease, ConnectorWriteReceipt, MvLakePackageObservation,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 
 /// Exact Core-retained inputs for one Frontend-owned MV native assembly.
 ///
 /// The frontend may read the immutable input only to encode the native
 /// fragment bundle.  Finishing consumes the same retained pair, so neither a
 /// newer binding nor a replacement prepared fragment set can reach dispatch.
+///
+/// Every MV data write -- first refresh and incremental alike -- commits through
+/// the write session that admitted it. The session sealed the recipes this
+/// plan's writer nodes carry, so the two travel together and no operation,
+/// cohort, or attempt identity reaches the writer data plane.
 pub struct PreparedMvNativeWriteAssembly {
     encoding: NativeFragmentEncodingInput,
     query_options: Option<QueryOptions>,
-    terminal: MvNativeWriteTerminal,
-}
-
-/// The one commit authority a prepared MV write carries.
-///
-/// A first refresh writes through the NCP-6 write session; an incremental
-/// refresh still writes through the staged-report operation. Those are two data
-/// planes with two different commit authorities, so the carrier names which one
-/// it is instead of letting the terminal guess. Each individual write still has
-/// exactly one.
-enum MvNativeWriteTerminal {
-    /// The staged-report operation carrier of an incremental refresh.
-    Operation {
-        registration: ConnectorWriteOperationRegistration,
-        cohort_id: ConnectorWriteCohortId,
-        lease: ConnectorWriteLease,
-    },
-    /// The write-session carrier of a first refresh. The session sealed the
-    /// recipes this plan's writer node carries, so the two travel together.
-    Session(std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>),
+    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedMvNativeWriteAssembly {
-    pub(crate) fn operation(
-        encoding: NativeFragmentEncodingInput,
-        query_options: Option<QueryOptions>,
-        registration: ConnectorWriteOperationRegistration,
-        cohort_id: ConnectorWriteCohortId,
-        lease: ConnectorWriteLease,
-    ) -> Self {
-        Self {
-            encoding,
-            query_options,
-            terminal: MvNativeWriteTerminal::Operation {
-                registration,
-                cohort_id,
-                lease,
-            },
-        }
-    }
-
     pub(crate) fn session(
         encoding: NativeFragmentEncodingInput,
         query_options: Option<QueryOptions>,
@@ -97,7 +62,7 @@ impl PreparedMvNativeWriteAssembly {
         Self {
             encoding,
             query_options,
-            terminal: MvNativeWriteTerminal::Session(write_session),
+            session: write_session,
         }
     }
 
@@ -105,81 +70,32 @@ impl PreparedMvNativeWriteAssembly {
         &self.encoding
     }
 
-    /// The staged-report operation identity, present exactly on a write that
-    /// still binds one.
-    ///
-    /// A session-driven write deliberately has none: its branch identity is the
-    /// sealed write target ordinal, and no operation or cohort id reaches its
-    /// writer data plane.
-    pub fn operation_identity(
-        &self,
-    ) -> Option<(ConnectorWriteOperationId, ConnectorWriteCohortId)> {
-        match &self.terminal {
-            MvNativeWriteTerminal::Operation {
-                registration,
-                cohort_id,
-                ..
-            } => Some((registration.operation_id(), *cohort_id)),
-            MvNativeWriteTerminal::Session(_) => None,
-        }
-    }
-
-    /// The commit authority of a session-driven write, so a caller that fails
-    /// between assembly and dispatch can release it rather than leaving the
-    /// provider holding a session for a plan that will never run.
+    /// The commit authority of this write, so a caller that fails between
+    /// assembly and dispatch can release it rather than leaving the provider
+    /// holding a session for a plan that will never run.
     pub(crate) fn write_session(
         &self,
-    ) -> Option<&std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>> {
-        match &self.terminal {
-            MvNativeWriteTerminal::Session(session) => Some(session),
-            MvNativeWriteTerminal::Operation { .. } => None,
-        }
+    ) -> &std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession> {
+        &self.session
     }
 
     pub fn finish(
         self,
         native_bundle: NativeFragmentAttachment,
-    ) -> Result<PreparedMvNativeWrite, String> {
+    ) -> Result<PreparedMvSessionWrite, String> {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed MV encoding input".into(),
             );
         }
         let (_, prepared) = self.encoding.into_parts();
-        match self.terminal {
-            MvNativeWriteTerminal::Operation {
-                registration,
-                cohort_id,
-                lease,
-            } => PreparedDistributedWriteRequest::new(
-                prepared,
-                native_bundle,
-                self.query_options,
-                registration,
-                cohort_id,
-                lease,
-            )
-            .map(PreparedMvNativeWrite::Operation)
-            .map_err(|error| error.to_string()),
-            MvNativeWriteTerminal::Session(session) => {
-                Ok(PreparedMvNativeWrite::Session(PreparedMvSessionWrite {
-                    prepared,
-                    native_bundle,
-                    query_options: self.query_options,
-                    session,
-                }))
-            }
-        }
+        Ok(PreparedMvSessionWrite {
+            prepared,
+            native_bundle,
+            query_options: self.query_options,
+            session: self.session,
+        })
     }
-}
-
-/// One MV write sealed against its native bundle, still naming its own commit
-/// authority.
-pub enum PreparedMvNativeWrite {
-    /// Awaits the staged-report operation session the terminal begins for it.
-    Operation(PreparedDistributedWriteRequest),
-    /// Already bound to the write session that admitted it.
-    Session(PreparedMvSessionWrite),
 }
 
 /// A session-driven MV write, one step away from dispatch.
