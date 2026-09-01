@@ -938,6 +938,7 @@ impl FrontendDistributedQueryCoordinator {
             .connector_write
             .as_ref()
             .map(|registration| registration.session().clone());
+        let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
         // Statistics collection enters only with its Core-owned typed program.
         // It never falls through to client-result construction.
@@ -1160,6 +1161,11 @@ impl FrontendDistributedQueryCoordinator {
 
         let deadline = statement_deadline;
         let mut batches = Vec::new();
+        // Recorded rather than inferred. Every other exit from the loop below
+        // returns an error, so "we got here" would imply end of stream -- but a
+        // write commits on the strength of this fact, and a fact that important
+        // should not rest on a future edit preserving a control-flow accident.
+        let mut observed_result_eof = false;
         if root_fetch.uses_result_buffer() {
             loop {
                 if parts.cancellation.is_cancelled() {
@@ -1203,7 +1209,10 @@ impl FrontendDistributedQueryCoordinator {
                 match fetch {
                     FetchOutcome::Ready(batch) => batches.push(batch),
                     FetchOutcome::NotReady => continue,
-                    FetchOutcome::Eof => break,
+                    FetchOutcome::Eof => {
+                        observed_result_eof = true;
+                        break;
+                    }
                     FetchOutcome::Err(error) => {
                         return Err(self.fail_cancel_then_abort_query_lifecycle(
                             query_id,
@@ -1293,6 +1302,56 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Result => parts
                 .completion
                 .result(expected_output.into_query_result(batches)?),
+            DistributedQueryIntent::Write if write_stack_session.is_some() => {
+                let session = write_stack_session.expect("checked by the guard");
+                // The write relation is engine machinery: the client's result
+                // is empty, and the rows are decoded by position against the
+                // frozen relation instead.
+                let mut decoder =
+                    crate::query_execution::write_result::RootWriteResultDecoder::new(
+                        &session.expected_targets(),
+                    )
+                    .map_err(|error| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
+                for batch in batches {
+                    decoder.apply_chunk(&batch.into_chunk()).map_err(|error| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            error,
+                        )
+                    })?;
+                }
+
+                let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
+                // Only an observed end of stream can produce a complete set. A
+                // prefix is not most of a write; it is no write at all.
+                if observed_result_eof {
+                    barrier.observe_prepared_write_set(decoder.finish_at_eof().map_err(
+                        |error| {
+                            DistributedQueryError::new(
+                                DistributedQueryErrorKind::ContractViolation,
+                                error,
+                            )
+                        },
+                    )?);
+                }
+                barrier.observe_execution_terminals(terminal_set.is_success());
+                if parts.cancellation.is_cancelled() {
+                    barrier.observe_cancelled();
+                }
+
+                let prepared = barrier.into_committable().map_err(|blocked| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        blocked.as_str(),
+                    )
+                })?;
+                parts.completion.write_session_outcome(session, prepared)
+            }
             DistributedQueryIntent::Write => {
                 let result = expected_output.into_query_result(batches)?;
                 let mut builder = WriteTerminalBuilder::new(writer_registrations)?;

@@ -668,6 +668,10 @@ pub struct DistributedQueryRequest {
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
     connector_write: Option<ConnectorWriteExecutionRegistration>,
+    /// The NCP-6 write session, present exactly when this query's plan carries
+    /// the dataflow write shape. Both fields exist while callers move over one
+    /// at a time; a query never carries both.
+    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -700,6 +704,12 @@ impl DistributedQueryRequest {
         self.connector_write.as_ref()
     }
 
+    pub(crate) fn write_stack_session(
+        &self,
+    ) -> Option<&Arc<crate::query_execution::write_session::ConnectorWriteSession>> {
+        self.write_stack_session.as_ref()
+    }
+
     pub fn statistics_program(&self) -> Option<&StatisticsCollectionProgram> {
         self.statistics_program.as_ref()
     }
@@ -713,6 +723,7 @@ impl DistributedQueryRequest {
             cancellation: self.cancellation,
             completion: self.completion,
             connector_write: self.connector_write,
+            write_stack_session: self.write_stack_session,
             statistics_program: self.statistics_program,
         }
     }
@@ -728,6 +739,8 @@ pub struct DistributedQueryRequestParts {
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
     pub connector_write: Option<ConnectorWriteExecutionRegistration>,
+    pub write_stack_session:
+        Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -755,6 +768,7 @@ pub(crate) fn build_distributed_query_request_with_execution(
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
         connector_write: None,
+        write_stack_session: None,
         statistics_program: None,
     })
 }
@@ -778,6 +792,7 @@ pub(crate) fn build_statistics_query_request_with_execution(
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(DistributedQueryIntent::Statistics),
         connector_write: None,
+        write_stack_session: None,
         statistics_program: Some(program),
     }
 }
@@ -801,7 +816,44 @@ pub(crate) fn with_connector_write_operation(
             "distributed query already has a connector write planning template",
         ));
     }
+    if request.write_stack_session.is_some() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "distributed query already has a connector write session",
+        ));
+    }
     request.connector_write = Some(registration);
+    Ok(request)
+}
+
+/// Attach the NCP-6 write session to a sealed distributed write request.
+///
+/// A query carries this or the placement-deferred writer template, never both:
+/// they describe the same write through two different data planes, and a query
+/// that claimed both would have two answers to "did this commit".
+pub(crate) fn with_connector_write_session(
+    mut request: DistributedQueryRequest,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    if request.intent() != DistributedQueryIntent::Write {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "a connector write session is only valid for a distributed write request",
+        ));
+    }
+    if request.connector_write.is_some() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "distributed query already has a placement-deferred connector write template",
+        ));
+    }
+    if request.write_stack_session.is_some() {
+        return Err(DistributedQueryError::new(
+            DistributedQueryErrorKind::ContractViolation,
+            "distributed query already has a connector write session",
+        ));
+    }
+    request.write_stack_session = Some(session);
     Ok(request)
 }
 

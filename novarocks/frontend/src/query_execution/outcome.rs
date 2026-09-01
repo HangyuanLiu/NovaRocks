@@ -84,9 +84,55 @@ pub struct WriteExecutionOutcome {
     commit: Option<WriteCommitInput>,
     abort: Option<WriteAbortInput>,
     connector_completion: Option<ConnectorWriteCompletion>,
+    write_session: Option<ConnectorWriteSessionCompletion>,
+}
+
+/// A write whose data plane closed and whose execution succeeded, carried to
+/// the statement owner so it can perform the one external commit.
+///
+/// The coordinator has already checked both halves of the gate; what it has not
+/// done, and must not do, is commit. Affected rows stay inside here until the
+/// commit is known to have succeeded, because reporting them earlier would tell
+/// a client about rows that may never become visible.
+pub struct ConnectorWriteSessionCompletion {
+    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    prepared: crate::query_execution::write_result::DecodedPreparedWriteSet,
+}
+
+impl ConnectorWriteSessionCompletion {
+    pub(crate) const fn session(
+        &self,
+    ) -> &std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession> {
+        &self.session
+    }
+
+    /// The rows every writer accepted. Report them to a client only after the
+    /// external commit is known to have succeeded.
+    pub(crate) fn row_count(&self) -> u64 {
+        self.prepared.row_count()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        crate::query_execution::write_result::DecodedPreparedWriteSet,
+    ) {
+        (self.session, self.prepared)
+    }
 }
 
 impl WriteExecutionOutcome {
+    /// The NCP-6 session completion, present exactly when this query used the
+    /// write-session data plane.
+    pub(crate) fn into_write_session(self) -> Option<ConnectorWriteSessionCompletion> {
+        self.write_session
+    }
+
+    pub(crate) const fn write_session(&self) -> Option<&ConnectorWriteSessionCompletion> {
+        self.write_session.as_ref()
+    }
+
     #[allow(
         dead_code,
         reason = "Retained for staged query-execution contract and lifecycle integration."
@@ -594,6 +640,30 @@ impl QueryOutcomeFactory {
         self.write_with_connector(result, commit, abort, None)
     }
 
+    /// Hand a completed write session to its statement owner.
+    ///
+    /// The client result is deliberately empty: the root write relation is
+    /// engine machinery, and exposing its shape -- even with no rows -- would
+    /// make an internal contract part of the user-visible one. The statement
+    /// owner builds the affected-row result after its commit succeeds.
+    pub(crate) fn write_session_outcome(
+        self,
+        session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        prepared: crate::query_execution::write_result::DecodedPreparedWriteSet,
+    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
+        self.require_intent(DistributedQueryIntent::Write)?;
+        Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
+            result: QueryResult {
+                columns: Vec::new(),
+                chunks: Vec::new(),
+            },
+            commit: None,
+            abort: None,
+            connector_completion: None,
+            write_session: Some(ConnectorWriteSessionCompletion { session, prepared }),
+        }))
+    }
+
     pub fn write_with_connector(
         self,
         result: QueryResult,
@@ -616,6 +686,7 @@ impl QueryOutcomeFactory {
         }
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
             result,
+            write_session: None,
             commit,
             abort,
             connector_completion,
