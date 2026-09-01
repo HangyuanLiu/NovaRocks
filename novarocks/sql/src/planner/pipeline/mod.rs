@@ -74,6 +74,26 @@ pub(crate) fn build_connector_write_distributed_plan(
     )
 }
 
+/// The NCP-6 dataflow twin of [`build_connector_write_distributed_plan`].
+///
+/// Same input, different terminal shape: the writer becomes an ordinary node
+/// whose rows gather into a single Root finish fragment. Both exist while
+/// callers move over one at a time; the terminal-sink form is removed once none
+/// remain.
+pub(crate) fn build_connector_write_dataflow_plan(
+    mut physical: PhysicalPlanNode,
+    sink: crate::planner::distributed::write::sink::ConnectorWritePlanInput,
+    settings: &crate::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    crate::planner::distributed::write::plan::build_table_writer_finish_distributed_plan(
+        &physical, sink,
+    )
+}
+
 /// Compile a SQL-owned terminal write contract.  Provider metadata and writer
 /// handles are intentionally absent; application code resolves those from the
 /// request-local binding token after this plan has been sealed.
@@ -87,6 +107,21 @@ pub(crate) fn build_sql_write_distributed_plan_with_settings(
         settings,
     );
     crate::planner::distributed::write::plan::build_sql_write_distributed_plan(&physical, sink)
+}
+
+/// The NCP-6 dataflow twin of [`build_sql_write_distributed_plan_with_settings`].
+pub(crate) fn build_sql_write_dataflow_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
+    settings: &crate::optimizer::options::SessionOptimizerSettings,
+) -> Result<DistributedPlan, String> {
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    crate::planner::distributed::write::plan::build_sql_table_writer_finish_distributed_plan(
+        &physical, sink,
+    )
 }
 
 #[allow(
@@ -122,6 +157,28 @@ pub(crate) fn build_sql_change_stream_distributed_plan_with_settings(
         settings,
     );
     crate::planner::distributed::write::plan::build_sql_change_stream_distributed_plan(
+        &physical, dag,
+    )
+}
+
+/// The NCP-6 dataflow twin of
+/// [`build_sql_change_stream_distributed_plan_with_settings`]. Every route's
+/// writer gathers into the same single Root finish fragment.
+pub(crate) fn build_sql_change_stream_dataflow_plan_with_settings(
+    mut physical: PhysicalPlanNode,
+    dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    keyed_assert: Option<PreExpandKeyedAssertSpec>,
+    settings: &crate::optimizer::options::SessionOptimizerSettings,
+) -> Result<crate::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan, String>
+{
+    if let Some(keyed_assert) = keyed_assert {
+        insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
+    }
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    crate::planner::distributed::write::plan::build_sql_change_stream_table_writer_finish_distributed_plan(
         &physical, dag,
     )
 }

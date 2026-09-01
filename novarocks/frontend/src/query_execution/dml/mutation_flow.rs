@@ -467,6 +467,9 @@ fn compile_dml_change_stream_write(
             kind,
             routes,
             pre_expand_keyed_assert,
+            // The dataflow shape is selected per caller as each one moves to
+            // the write session; this caller still uses the terminal sink.
+            shape: novarocks_sql::planning::dml::DmlWritePlanShape::TerminalSink,
         })?;
     Ok(
         crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(

@@ -441,6 +441,23 @@ pub fn build_frozen_connector_write_distributed_plan(
     )
 }
 
+/// The NCP-6 dataflow form of [`build_frozen_connector_write_distributed_plan`].
+///
+/// The writer becomes an ordinary node emitting the write relation, and every
+/// writer gathers into one Root finish fragment whose terminal is the ordinary
+/// result sink. Both forms exist while callers move over one at a time.
+pub fn build_frozen_connector_write_dataflow_plan(
+    source: crate::planning::query_execution::FrozenConnectorScanPlan,
+    sink: DmlWritePlanInput,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
+        source.into_physical(),
+        sink.0,
+        settings,
+    )
+}
+
 /// Compile an immutable SQL request into a sealed connector-write plan.
 /// Application code supplies only the already-admitted request context and
 /// opaque terminal sink; optimizer and physical planner artifacts do not
@@ -456,6 +473,22 @@ pub fn compile_connector_write_distributed_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
+        physical, sink.0, settings,
+    )
+}
+
+/// The NCP-6 dataflow form of [`compile_connector_write_distributed_plan`].
+pub fn compile_connector_write_dataflow_plan(
+    request: crate::compiler::SqlOptimizeRequest<'_>,
+    sink: DmlWritePlanInput,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
         physical, sink.0, settings,
     )
 }
@@ -553,6 +586,24 @@ pub fn build_ctas_connector_write_distributed_plan(
     )
 }
 
+/// The NCP-6 dataflow form of [`build_ctas_connector_write_distributed_plan`].
+pub fn build_ctas_connector_write_dataflow_plan(
+    source: &DmlCtasSourcePlan,
+    target_schema: arrow::datatypes::SchemaRef,
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
+    crate::planner::pipeline::build_connector_write_dataflow_plan(
+        physical,
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput {
+            target_schema,
+            input: crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            root_output_exprs: None,
+        },
+        settings,
+    )
+}
+
 /// Test-only sealed connector-write fixture for application encoder tests.
 /// The distributed graph remains opaque; callers receive only its read model.
 #[doc(hidden)]
@@ -612,6 +663,24 @@ pub struct DmlChangeStreamCompileRequest<'a> {
     pub kind: DmlChangeStreamKind,
     pub routes: Vec<DmlChangeStreamRoute>,
     pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    pub shape: DmlWritePlanShape,
+}
+
+/// Which terminal shape a sealed write plan should take.
+///
+/// Both exist only while callers move from the terminal-sink form to the NCP-6
+/// dataflow form one at a time. A caller states it explicitly rather than
+/// inheriting a default, because the two shapes need different frontend and
+/// backend handling and a silently wrong default would surface as a runtime
+/// failure rather than a compile error.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DmlWritePlanShape {
+    /// The writer terminates its fragment in a connector sink.
+    #[default]
+    TerminalSink,
+    /// The writer is an ordinary node whose rows gather into one Root finish
+    /// fragment ending in the ordinary result sink.
+    Dataflow,
 }
 
 /// Optimizer policy for generated mutation change streams.  This stays in the
@@ -703,7 +772,12 @@ pub fn compile_dml_change_stream(
             not_matched_insert,
         )?,
     };
-    seal_change_stream_producer(producer, request.routes, request.pre_expand_keyed_assert)
+    seal_change_stream_producer(
+        producer,
+        request.routes,
+        request.pre_expand_keyed_assert,
+        request.shape,
+    )
 }
 
 /// Seal an SQL-owned generated change-stream producer after a specialized
@@ -714,12 +788,14 @@ pub(crate) fn seal_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
     routes: Vec<DmlChangeStreamRoute>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    shape: DmlWritePlanShape,
 ) -> Result<DmlChangeStreamPlan, String> {
     seal_change_stream_producer_with_effect_column(
         producer,
         routes,
         crate::common::ROW_MUTATION_EFFECT_COLUMN,
         pre_expand_keyed_assert,
+        shape,
     )
 }
 
@@ -731,6 +807,7 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
     routes: Vec<DmlChangeStreamRoute>,
     effect_output_name: &str,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    shape: DmlWritePlanShape,
 ) -> Result<DmlChangeStreamPlan, String> {
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_name)?;
     let keyed_assert = pre_expand_keyed_assert.map(|assertion| {
@@ -742,12 +819,24 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
     });
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
     let settings = dml_change_stream_optimizer_settings();
-    let planned = crate::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
-        physical,
-        dag,
-        keyed_assert,
-        &settings,
-    )?;
+    let planned = match shape {
+        DmlWritePlanShape::TerminalSink => {
+            crate::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
+                physical,
+                dag,
+                keyed_assert,
+                &settings,
+            )?
+        }
+        DmlWritePlanShape::Dataflow => {
+            crate::planner::pipeline::build_sql_change_stream_dataflow_plan_with_settings(
+                physical,
+                dag,
+                keyed_assert,
+                &settings,
+            )?
+        }
+    };
     let writer_routes = planned
         .topology
         .writer_routes

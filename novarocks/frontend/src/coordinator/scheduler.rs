@@ -335,36 +335,12 @@ fn bind_query_lifecycle_fault_scopes(
         let process_id = target
             .process_id()
             .map_err(|error| contract_error(error.to_string()))?;
-        for kind in [
-            QueryLifecycleFaultKind::InitAckDrop,
-            QueryLifecycleFaultKind::StageAckDrop,
-            QueryLifecycleFaultKind::StartAckDrop,
-            QueryLifecycleFaultKind::StartAckSuppress,
-            QueryLifecycleFaultKind::HeartbeatStop,
-            QueryLifecycleFaultKind::HeartbeatStopAfterStage,
-            QueryLifecycleFaultKind::RestartAfterInitAck,
-            QueryLifecycleFaultKind::TerminalAckDrop,
-            QueryLifecycleFaultKind::TerminalSnapshotStreamDrop,
-            QueryLifecycleFaultKind::TerminalSnapshotConflict,
-            QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
-            QueryLifecycleFaultKind::ObservationP2BudgetPressure,
-            QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
-            QueryLifecycleFaultKind::TerminalP0BytesExhausted,
-            QueryLifecycleFaultKind::TerminalP0DeliveryPermitExhausted,
-            QueryLifecycleFaultKind::TerminalP1EncodeFailure,
-            QueryLifecycleFaultKind::TerminalP1RetentionExhausted,
-            QueryLifecycleFaultKind::TerminalProofStreamDrop,
-            QueryLifecycleFaultKind::TerminalAttestationStreamDrop,
-            QueryLifecycleFaultKind::TerminalOutcomeSuppress,
-            QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
-            QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
-            QueryLifecycleFaultKind::StageConflictAfterApply,
-            QueryLifecycleFaultKind::StartDigestCorrupt,
-            QueryLifecycleFaultKind::ObservationForeignParticipant,
-            QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
-        ] {
+        // Every declared fault kind is bound, rather than a hand-maintained
+        // subset. A literal list here silently leaves a newly added kind inert
+        // -- armable by a harness, never bound to an attempt, and therefore
+        // never firing -- which reads exactly like a fault that did not
+        // reproduce.
+        for kind in QueryLifecycleFaultKind::ALL {
             if let Some(scope) = bind_armed_fault(
                 &root,
                 kind,

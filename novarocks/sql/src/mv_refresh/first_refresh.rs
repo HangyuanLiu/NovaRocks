@@ -584,6 +584,7 @@ pub fn compile_join_incremental_refresh_change_stream(
         analyzed.routes,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
+        crate::planning::dml::DmlWritePlanShape::TerminalSink,
     )
 }
 
@@ -676,6 +677,7 @@ pub fn compile_mv_incremental_refresh_change_stream(
         analyzed.routes,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
+        crate::planning::dml::DmlWritePlanShape::TerminalSink,
     )
 }
 
