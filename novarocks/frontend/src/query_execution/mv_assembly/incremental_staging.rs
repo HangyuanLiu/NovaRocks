@@ -160,9 +160,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         .first()
         .map(|route| route.cohort_id())
         .ok_or_else(|| "MV incremental provider plan has no writer routes".to_string())?;
+    // The write target ordinal is the route's position in this sealed route
+    // set, which is the same value the change-stream plan builder used to
+    // derive from the route index internally.
     let sealed_change_stream_routes = provider_routes
         .iter()
-        .map(|route| {
+        .enumerate()
+        .map(|(route_index, route)| {
             let target_binding = crate::query_execution::planning::write_sink::admit_prepared_connector_write_target(
                 target_bindings.as_ref(),
                 novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
@@ -196,9 +200,17 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                 mode,
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
+            let write_target_ordinal = u32::try_from(route_index)
+                .map_err(|_| "MV incremental write target ordinal space exhausted".to_string())
+                .and_then(|value| {
+                    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value)
+                        .map_err(|error| {
+                            format!("MV incremental write target ordinal {value} rejected: {error}")
+                        })
+                })?;
             Ok(novarocks_sql::planning::dml::DmlChangeStreamRoute {
                 route_id: route.route_id(),
-                cohort_id: route.cohort_id(),
+                write_target_ordinal,
                 accepted_effects: route.accepted_effects().to_vec(),
                 input_fields: route
                     .input()

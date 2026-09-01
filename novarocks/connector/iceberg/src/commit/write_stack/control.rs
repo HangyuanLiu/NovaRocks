@@ -502,6 +502,87 @@ impl IcebergWriteSessionControl {
         outcome
     }
 
+    /// Seal a staged write into the receipt its publication will consume.
+    ///
+    /// The validation above the seal is the *same* validation the committing
+    /// path runs, and deliberately so: a staged artifact that would have been
+    /// rejected before a snapshot must be rejected before a publication too,
+    /// or the create would carry files the ordinary path would never have
+    /// admitted.
+    ///
+    /// What differs is everything after it. Nothing here touches the catalog,
+    /// writes a manifest, or creates a snapshot; the validated artifacts are
+    /// folded into the receipt payload and the session settles as sealed. The
+    /// single `NotExist` assert-create that makes them visible stays with the
+    /// staged-create capability that owns the target.
+    ///
+    /// An empty prepared write set reaches this the same way a non-empty one
+    /// does. Whether an empty staged create publishes an empty table or refuses
+    /// is a decision for the publication, which can see the target; it must not
+    /// be inferred here from "there were no fragments".
+    fn seal_staged_prepared_set(
+        &self,
+        handle: &IcebergCommitHandle,
+        prepared: &ConnectorPreparedWriteSet,
+        frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        context: &ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        validate_context(context)?;
+        let metadata = handle.staged_metadata().ok_or_else(|| {
+            internal("Iceberg staged write session lost its frozen target metadata")
+        })?;
+        let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
+        validate_merged_old_references(handle, frozen_old_references, &validated)?;
+
+        // Claim the single terminal attempt before producing anything, so a
+        // second finish cannot mint a second receipt for the same session.
+        handle.begin_commit()?;
+        let sealed = validated
+            .iter()
+            .map(|entry| {
+                let file = written_file_from_fragment(entry.fragment, metadata)?;
+                crate::commit::report::writer_report_from_written_file(&file, metadata)
+                    .map_err(corrupt)
+            })
+            .collect::<Result<Vec<_>, ConnectorError>>();
+        let sealed = match sealed {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                handle.settle(IcebergWriteSessionState::KnownUncommitted {
+                    message: error.message().to_string(),
+                })?;
+                return Err(error);
+            }
+        };
+        let payload = match crate::write_codec::encode_writer_reports(&sealed, metadata) {
+            Ok(payload) => payload,
+            Err(error) => {
+                handle.settle(IcebergWriteSessionState::KnownUncommitted {
+                    message: error.clone(),
+                })?;
+                return Err(internal(format!("seal staged Iceberg write set: {error}")));
+            }
+        };
+        let receipt = match ConnectorWriteReceipt::try_new(payload) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                handle.settle(IcebergWriteSessionState::KnownUncommitted {
+                    message: error.message().to_string(),
+                })?;
+                return Err(error);
+            }
+        };
+        handle.settle(IcebergWriteSessionState::Sealed)?;
+        // `NoOp` is the honest effect: this session applied nothing externally,
+        // and it is `KnownCommitted` only in the sense the caller needs -- the
+        // sealing is finished and its result is not in doubt.
+        Ok(ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt,
+            finalization: ExternalMutationFinalization::Complete,
+        })
+    }
+
     fn dispatch_commit(
         &self,
         handle: &IcebergCommitHandle,
@@ -792,6 +873,13 @@ pub(crate) fn release_session_state(
                     cleanup: ExternalMutationFinalization::Complete,
                 })
             }
+            // A sealed staged write never reached the catalog, so releasing it
+            // is proven-uncommitted. The staged objects it wrote belong to the
+            // staged target, and the publication that owns that target is what
+            // deletes them; this session has no authority over them at all.
+            IcebergWriteSessionState::Sealed => Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
+                cleanup: ExternalMutationFinalization::Complete,
+            }),
             IcebergWriteSessionState::KnownCommitted { snapshot_id } => {
                 // Abort cannot undo a proven commit.
                 let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
@@ -905,6 +993,13 @@ impl IcebergWriteSessionControl {
             IcebergWriteSessionState::Active => {
                 return Err(invalid(
                     "Iceberg write reconciliation requires a prior commit-unknown outcome",
+                ));
+            }
+            // A seal performs no external commit, so its outcome was never in
+            // doubt and there is nothing for reconciliation to resolve.
+            IcebergWriteSessionState::Sealed => {
+                return Err(invalid(
+                    "Iceberg staged write session has no external commit to reconcile",
                 ));
             }
             IcebergWriteSessionState::Committing => {
@@ -1029,17 +1124,51 @@ impl IcebergWriteSessionControl {
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
         })?;
-        let physical = self
-            .runtime
-            .load_table_for_request(namespace, table_name, &request.context)
-            .map_err(|error| unavailable(error.to_string()))?;
-        let table = physical.into_table();
-        let metadata = table.metadata().clone();
+        // A staged target is the one target that cannot be looked up: the
+        // catalog will not know it until the publication that owns it commits.
+        // So its frozen facts arrive with the request, and this branch reads
+        // them instead of loading. It is deliberately the only place a session
+        // accepts caller-supplied metadata, and it accepts it only for the
+        // flavor whose whole definition is "there is nothing to load".
+        let staged = match &request.flavor {
+            ConnectorWriteSessionFlavor::StagedCreate(target) => Some(
+                crate::metadata::staged_target_metadata(&self.key.instance_id, target)?,
+            ),
+            _ => None,
+        };
+        let (table, metadata) = match &staged {
+            Some(staged) => {
+                if staged.namespace != namespace || staged.table != table_name {
+                    return Err(invalid(
+                        "Iceberg staged write target names a different table than its frozen facts",
+                    ));
+                }
+                (None, staged.metadata.clone())
+            }
+            None => {
+                let physical = self
+                    .runtime
+                    .load_table_for_request(namespace, table_name, &request.context)
+                    .map_err(|error| unavailable(error.to_string()))?;
+                let table = physical.into_table();
+                let metadata = table.metadata().clone();
+                (Some(table), metadata)
+            }
+        };
         let target_ref = request.target_ref.as_str();
-        let base_snapshot_id =
-            crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
-                .map_err(|error| invalid(error.to_string()))?;
+        let base_snapshot_id = match &staged {
+            // A staged target holds no snapshot, and resolving a branch head
+            // against it would either invent one or fail on an absent ref.
+            Some(_) => None,
+            None => crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
+                .map_err(|error| invalid(error.to_string()))?,
+        };
         if let Some(base) = &request.base {
+            if staged.is_some() {
+                return Err(invalid(
+                    "Iceberg staged write target has no base version to compare against",
+                ));
+            }
             base.validate()?;
         }
         let facts = IcebergWriteTableFacts::try_new(
@@ -1075,7 +1204,10 @@ impl IcebergWriteSessionControl {
                 let snapshot_id = base_snapshot_id.ok_or_else(|| {
                     invalid("Iceberg row-level write requires a frozen target snapshot")
                 })?;
-                self.freeze_old_delete_references(&table, &metadata, snapshot_id)?
+                let table = table.as_ref().ok_or_else(|| {
+                    invalid("Iceberg row-level write requires a loaded target table")
+                })?;
+                self.freeze_old_delete_references(table, &metadata, snapshot_id)?
             } else {
                 Vec::new()
             },
@@ -1084,7 +1216,12 @@ impl IcebergWriteSessionControl {
         };
 
         let plan = match &request.flavor {
-            ConnectorWriteSessionFlavor::Ordinary => {
+            // A staged create writes data into an empty target, which is the
+            // same branch shape an append has -- one data branch. What differs
+            // is where the commit happens, and that is the flavor's business,
+            // not the branch planner's.
+            ConnectorWriteSessionFlavor::Ordinary
+            | ConnectorWriteSessionFlavor::StagedCreate(_) => {
                 plan_ordinary_branches(flavor_for(request)?, &material)?
             }
             ConnectorWriteSessionFlavor::ManagedPublication(intent) => {
@@ -1092,7 +1229,10 @@ impl IcebergWriteSessionControl {
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite => {
-                let groups = self.freeze_rewrite_groups(&table, base_snapshot_id)?;
+                let table = table.as_ref().ok_or_else(|| {
+                    invalid("Iceberg distributed rewrite requires a loaded target table")
+                })?;
+                let groups = self.freeze_rewrite_groups(table, base_snapshot_id)?;
                 plan_distributed_rewrite_branches(&material, &groups)?
             }
         };
@@ -1109,6 +1249,7 @@ impl IcebergWriteSessionControl {
                 table: material.table,
                 base_version_digest: request.base.as_ref().map(|base| base.digest()),
                 publication,
+                staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 branches,
             },
         )
@@ -1330,7 +1471,10 @@ fn session_freezes_old_deletes(
             signed,
             ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::EqualityDelete { .. }
         ),
-        ConnectorWriteSessionFlavor::ManagedPublication(_)
+        // A staged target has no base snapshot and therefore no old delete
+        // artifact to supersede: it is a table nobody has ever written to.
+        ConnectorWriteSessionFlavor::StagedCreate(_)
+        | ConnectorWriteSessionFlavor::ManagedPublication(_)
         | ConnectorWriteSessionFlavor::DistributedRewrite => false,
     }
 }
@@ -1341,6 +1485,13 @@ fn session_freezes_old_deletes(
 /// nearest supported one.
 fn flavor_for(request: &ConnectorWriteBeginRequest) -> Result<IcebergWriteFlavor, ConnectorError> {
     use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+    // A staged create is decided by the flavor alone. Its intent is an append
+    // and its input is data, so reading intent and input would answer
+    // `Append` -- correct as far as it goes, and wrong about the one thing
+    // that matters: the target does not exist yet.
+    if matches!(request.flavor, ConnectorWriteSessionFlavor::StagedCreate(_)) {
+        return Ok(IcebergWriteFlavor::StagedCreate);
+    }
     if request.purpose == ConnectorWriteAdmissionPurpose::MaterializedViewRefresh {
         return Ok(IcebergWriteFlavor::ManagedPublication);
     }
@@ -1490,6 +1641,18 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let handle = self.adapter.commit_handle(request.commit)?;
         let frozen = self.frozen_references_of(handle);
+        // A staged create is the one flavor that finishes without committing:
+        // its single external effect belongs to the publication that owns the
+        // staged target, and performing one here would create a snapshot on a
+        // table the catalog does not yet have.
+        if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+            return self.seal_staged_prepared_set(
+                handle,
+                &request.prepared,
+                &frozen,
+                &request.context,
+            );
+        }
         self.commit_prepared_set(handle, &request.prepared, &frozen, &request.context)
     }
 

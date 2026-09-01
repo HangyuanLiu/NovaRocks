@@ -247,10 +247,9 @@ impl IcebergConnectorFactory {
         // The adapters therefore attach for every generation, and whether a
         // specific request is supported is decided by the catalog owner at
         // admission, before the first side effect.
-        let staged_create = Some(Arc::new(IcebergStagedCreateAdapter::try_new(
-            Arc::clone(&provider),
-            Arc::clone(&write_control),
-        )?));
+        let staged_create = Some(Arc::new(IcebergStagedCreateAdapter::try_new(Arc::clone(
+            &provider,
+        ))?));
         let unanchored_ctas_cleanup = match IcebergUnanchoredCtasCleanupAdapter::try_new(
             descriptor.clone(),
             incarnation,

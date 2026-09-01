@@ -39,8 +39,7 @@ use crate::query_execution::dml::ctas::{
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
-    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
-    ExternalMutationFinalization, LakePublicationFamily, LakePublicationId,
+    CreatePolicy, ExternalMutationFinalization, LakePublicationFamily, LakePublicationId,
     LakePublicationStatementTag, LakePublicationTarget,
 };
 
@@ -162,17 +161,13 @@ fn execute_standard_ctas_operation(
         return Err(pre_dispatch_failure(&mut attempt, source_text, error));
     }
 
-    let prepared_write = match engine.prepare_standard_ctas_write(
-        prepared_source.handle.as_ref(),
-        target.handle.as_ref(),
-        ConnectorWriteOperationId::from(publication_id),
-    ) {
+    let prepared_write = match engine
+        .prepare_standard_ctas_write(prepared_source.handle.as_ref(), target.handle.as_ref())
+    {
         Ok(write) => write,
         Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
     };
-    if let Err(error) =
-        validate_prepared_write(&prepared_source, &target, &prepared_write, publication_id)
-    {
+    if let Err(error) = validate_prepared_write(&prepared_source, &target, &prepared_write) {
         return Err(pre_dispatch_failure(&mut attempt, source_text, error));
     }
     let native_bundle = match standard_native_bundle(&prepared_write) {
@@ -185,22 +180,17 @@ fn execute_standard_ctas_operation(
         return Err(pre_dispatch_failure(&mut attempt, source_text, failure));
     }
 
-    let completion = match engine.execute_standard_ctas_write(prepared_write.handle.as_ref()) {
+    let write = match engine.execute_standard_ctas_write(prepared_write.handle.as_ref()) {
         StandardCtasWriteOutcome::Completed {
-            completion,
+            write,
             execution_identity,
         } => {
-            if let Err(error) = validate_completion(
-                &prepared_source,
-                &target,
-                &prepared_write,
-                &completion,
-                execution_identity,
-                publication_id,
-            ) {
+            if let Err(error) =
+                validate_sealed_write(&prepared_source, &prepared_write, execution_identity)
+            {
                 return Err(pre_dispatch_failure(&mut attempt, source_text, error));
             }
-            completion
+            write
         }
         StandardCtasWriteOutcome::KnownUncommitted { failure }
         | StandardCtasWriteOutcome::CommitUnknown { failure, .. } => {
@@ -208,14 +198,11 @@ fn execute_standard_ctas_operation(
         }
     };
 
-    let publish = match engine.prepare_standard_publish_ctas(
-        target.handle.as_ref(),
-        publication_id,
-        completion,
-    ) {
-        Ok(publish) => publish,
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
-    };
+    let publish =
+        match engine.prepare_standard_publish_ctas(target.handle.as_ref(), publication_id, write) {
+            Ok(publish) => publish,
+            Err(failure) => return Err(pre_dispatch_failure(&mut attempt, source_text, failure)),
+        };
     finish_standard_publication(engine, &mut attempt, target, publish)
 }
 
@@ -443,10 +430,8 @@ fn validate_prepared_write(
     source: &PreparedCtasSource,
     target: &PreparedStandardCtasTarget,
     write: &PreparedStandardCtasWrite,
-    publication_id: LakePublicationId,
 ) -> Result<(), CtasFailure> {
-    if write.write_operation_id.to_bytes() == publication_id.to_bytes()
-        && write.execution_identity == source.facts.execution_identity
+    if write.execution_identity == source.facts.execution_identity
         && write.handle.execution_identity() == source.facts.execution_identity
         && write.target_facts == target.facts
     {
@@ -458,24 +443,24 @@ fn validate_prepared_write(
     }
 }
 
-fn validate_completion(
+/// Check that the sealed write came from the execution this statement started.
+///
+/// There is nothing else left to check here. The write proof is a receipt and a
+/// row count; whether it belongs to *this* staged target is decided by the
+/// target itself, which bound one receipt and refuses to publish another. This
+/// layer knows only which execution produced it.
+fn validate_sealed_write(
     source: &PreparedCtasSource,
-    target: &PreparedStandardCtasTarget,
     prepared: &PreparedStandardCtasWrite,
-    completion: &ConnectorWriteOperationCompletion,
     execution_identity: [u8; 32],
-    publication_id: LakePublicationId,
 ) -> Result<(), CtasFailure> {
-    let matching = execution_identity == source.facts.execution_identity
+    if execution_identity == source.facts.execution_identity
         && execution_identity == prepared.execution_identity
-        && completion.owner().instance_id.as_str() == target.facts.instance_id
-        && completion.sealed().operation_id().to_bytes() == publication_id.to_bytes()
-        && completion.sealed().cohorts().len() == 1;
-    if matching {
+    {
         Ok(())
     } else {
         Err(internal_failure(
-            "standard CTAS writer completion conflicts with source or staged target identity",
+            "standard CTAS sealed write came from a different execution",
         ))
     }
 }
@@ -485,7 +470,7 @@ fn standard_native_bundle(
 ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, CtasFailure> {
     let encoding = prepared.handle.native_encoding()?;
     let input = encoding.input()?;
-    crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view()).map_err(
+    crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input).map_err(
         |message| CtasFailure {
             kind: CtasFailureKind::Internal,
             message,

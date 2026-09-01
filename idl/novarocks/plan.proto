@@ -1279,15 +1279,17 @@ message IcebergPartitionValue {
 // Owner: produced by the future FE/native plan encoder and consumed by the
 // future BE/native plan prepare layer.
 message ChangeStreamBranchRoute {
-  reserved 1, 2, 5;
-  reserved "branch_id", "branch_kind", "output_ordinals";
+  reserved 1, 2, 5, 10;
+  reserved "branch_id", "branch_kind", "output_ordinals", "cohort_id";
   uint32 target_fragment_id = 3;             // target writer fragment id.
   int32 target_exchange_node_id = 4;         // target writer exchange node id.
   repeated uint64 output_partition_ordinals = 6; // output ordinals used for partitioning.
   DataPartition output_partition = 7;        // runtime partition kind + native hash exprs.
   StreamDestinationList destinations = 8;    // runtime destinations for this branch.
   bytes route_id = 9;                        // opaque 32-byte provider route id.
-  bytes cohort_id = 10;                      // opaque 32-byte write cohort id.
   repeated RowMutationEffect accepted_effects = 11;
   repeated uint64 input_ordinals = 12;
+  // Dense, query-local logical write target this branch feeds. It is the
+  // branch's identity inside one sealed plan, not a cohort or an operation.
+  uint32 write_target_ordinal = 13;
 }

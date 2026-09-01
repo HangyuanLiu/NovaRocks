@@ -38,10 +38,10 @@ use crate::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
 };
 use crate::connector::{
-    ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorWriteAbortOutcome,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteInputRequest,
-    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteReceipt, ConnectorWriteRouteId,
-    ConnectorWriteTargetRef,
+    ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorTableHandle,
+    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
+    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
 };
 use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
 use crate::connector::{ExternalMutationEvidence, ExternalMutationOutcome};
@@ -76,6 +76,15 @@ pub struct ConnectorWriteBeginRequest {
 pub enum ConnectorWriteSessionFlavor {
     /// One logical target writing data.
     Ordinary,
+    /// A write into a target the provider has staged but has not registered.
+    ///
+    /// Every other flavor names its target and lets the provider look it up.
+    /// A staged target has no catalog entry to look up -- that is what makes it
+    /// staged -- so the caller hands the session the provider-frozen target
+    /// facts a catalog load would otherwise have returned. They stay opaque:
+    /// this is the same provider-owned table value the staged-create capability
+    /// vends, and it names no publication, operation, or attempt.
+    StagedCreate(ConnectorTableHandle),
     /// A durable publication whose identity belongs to the upper layer that
     /// owns it. The provider needs only the technique and what an empty input
     /// means; the publication id never reaches a writer recipe or a fragment.

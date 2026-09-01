@@ -1210,6 +1210,60 @@ impl IcebergMetadata {
     }
 }
 
+/// Read back the frozen facts a staged write target carries.
+///
+/// This is the exact inverse of [`IcebergMetadata::staged_write_table_handle`]:
+/// a staged CTAS target has no catalog entry, so the metadata a write session
+/// would otherwise have loaded travels inside the handle the staged-create
+/// capability minted. Decoding it here is the only way that metadata is ever
+/// read back, and the handle's owner is checked first so one catalog's staged
+/// target cannot be opened against another's generation.
+pub(crate) fn staged_target_metadata(
+    owner: &ConnectorInstanceId,
+    table: &ConnectorTableHandle,
+) -> Result<IcebergStagedTargetMetadata, ConnectorError> {
+    if table.owner() != owner {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "staged Iceberg write target belongs to another connector instance",
+        ));
+    }
+    let payload: IcebergTablePayload = decode_payload(table.payload(), "staged table handle")?;
+    if payload.metadata_table_type.is_some() {
+        return Err(corrupt(
+            "Iceberg metadata tables cannot be staged write targets",
+        ));
+    }
+    let table_info = payload.table_info.ok_or_else(|| {
+        corrupt("staged Iceberg write target is missing its frozen table descriptor")
+    })?;
+    let serialized = table_info
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| corrupt("staged Iceberg write target is missing frozen metadata"))?;
+    let metadata: crate::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized).map_err(|error| {
+            corrupt(format!(
+                "decode staged Iceberg write target metadata: {error}"
+            ))
+        })?;
+    Ok(IcebergStagedTargetMetadata {
+        namespace: payload.namespace,
+        table: payload.table,
+        metadata,
+    })
+}
+
+/// The frozen target one staged write session opens on.
+///
+/// A registered table is loaded from the catalog on every session; a staged one
+/// cannot be, so this is what a staged handle stands in for.
+pub(crate) struct IcebergStagedTargetMetadata {
+    pub namespace: String,
+    pub table: String,
+    pub metadata: crate::iceberg::spec::TableMetadata,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct IcebergTablePayload {
     pub namespace: String,

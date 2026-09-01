@@ -453,6 +453,7 @@ fn dv_session() -> (IcebergCommitHandle, IcebergWriteAdapter) {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             table: table_facts(),
             base_version_digest: None,
+            staged_metadata: None,
             data: data_branch_plan(),
             deletes: vec![delete_branch_plan(
                 IcebergWriteBranch::DeletionVector,
@@ -825,6 +826,10 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 table: table_facts(),
                 base_version_digest: None,
+                // Exactly the staged flavor carries frozen metadata; every
+                // other one loads its target instead.
+                staged_metadata: (flavor == IcebergWriteFlavor::StagedCreate)
+                    .then(crate::commit::write_stack::test_support::staged_table_metadata),
                 data: data_branch_plan(),
                 deletes: Vec::new(),
             },
@@ -851,6 +856,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 table: table_facts(),
                 base_version_digest: None,
+                staged_metadata: None,
                 data: data_branch_plan(),
                 deletes: vec![delete_branch_plan(
                     branch,
@@ -885,6 +891,7 @@ fn flavor_session(
             table: table_facts(),
             base_version_digest: None,
             publication: plan.publication,
+            staged_metadata: None,
             branches: plan.branches,
         },
     )
@@ -1089,6 +1096,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             table: table_facts(),
             base_version_digest: None,
             publication: None,
+            staged_metadata: None,
             branches: vec![
                 IcebergWriteBranchPlan::Data {
                     plan: data_branch_plan(),
@@ -1323,4 +1331,272 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
 
 fn _assert_error_is_send_sync(error: ConnectorError) -> impl Send + Sync {
     error
+}
+
+// -------------------------------------------------------------------------
+// Staged create: a target that has no catalog entry yet.
+// -------------------------------------------------------------------------
+
+/// A REST generation whose endpoint refuses every connection.
+///
+/// That is the point: any code path that reaches the catalog fails loudly here,
+/// so a test that succeeds against it has demonstrably not reached one.
+fn unreachable_rest_runtime() -> (
+    tokio::runtime::Runtime,
+    Arc<crate::metadata_context::IcebergMetadataContext>,
+) {
+    let executor = tokio::runtime::Runtime::new().expect("runtime");
+    let handle = executor.handle().clone();
+    let configuration = crate::catalog_config::parse_catalog_configuration(
+        "unit",
+        &[
+            ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+        ],
+    )
+    .expect("configuration");
+    let binding = IcebergReadBinding::new(
+        None,
+        FsAccessResolver::new(),
+        Arc::new(TokioFileIoRuntime::new(handle.clone())),
+        Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+    );
+    let runtime = crate::metadata_context::IcebergMetadataContext::try_new(
+        crate::catalog_control::IcebergCatalogControlState::new(configuration),
+        crate::resources::IcebergMetadataResources::new(binding, handle),
+    )
+    .expect("control runtime");
+    (executor, Arc::new(runtime))
+}
+
+/// The opaque target facts a staged-create capability vends: an Iceberg table
+/// that exists as metadata and nowhere else.
+fn staged_target_handle(
+    runtime: &Arc<crate::metadata_context::IcebergMetadataContext>,
+    incarnation: ProviderBindingEpoch,
+) -> novarocks_spi::connector::ConnectorTableHandle {
+    let location = "file:///tmp/novarocks-staged-session/table";
+    let schema = crate::iceberg::spec::Schema::builder()
+        .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+            1,
+            "id",
+            crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+        ))])
+        .build()
+        .expect("schema");
+    let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+        schema,
+        crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+        crate::iceberg::spec::SortOrder::unsorted_order(),
+        location.to_string(),
+        crate::iceberg::spec::FormatVersion::V2,
+        std::collections::HashMap::new(),
+    )
+    .expect("metadata builder")
+    .build()
+    .expect("metadata")
+    .metadata;
+    let table = crate::iceberg::table::Table::builder()
+        .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).expect("identifier"))
+        .file_io(crate::fs_io::build_file_io_for_location(
+            location,
+            runtime.resources().planning_binding().clone(),
+        ))
+        .metadata(metadata)
+        .build()
+        .expect("table");
+    let provider =
+        crate::metadata::IcebergMetadata::new(descriptor("unit"), incarnation, Arc::clone(runtime));
+    provider
+        .staged_write_table_handle(
+            &table,
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            &request_context(),
+        )
+        .expect("staged write table handle")
+}
+
+fn staged_begin_request(
+    target: novarocks_spi::connector::ConnectorTableHandle,
+) -> novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
+    novarocks_spi::connector::write_stack::session::ConnectorWriteBeginRequest {
+        table: Arc::from("db.staged"),
+        target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+        intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
+        purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+            fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                Field::new("id", DataType::Int64, false),
+            )],
+        },
+        base: None,
+        flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
+            target,
+        ),
+        context: request_context(),
+    }
+}
+
+/// A staged begin admits entirely from the facts it was handed.
+///
+/// The catalog behind this generation is unreachable, so a `load_table` would
+/// fail. Admission succeeding is therefore proof that a staged target is never
+/// looked up -- which is the whole reason the flavor exists.
+#[test]
+fn a_staged_begin_admits_without_reaching_the_catalog() {
+    use novarocks_spi::connector::write_stack::session::ConnectorWriteControl;
+
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+
+    // The same generation refuses an ordinary write against the same name,
+    // because that one does have to load the table.
+    let mut ordinary = staged_begin_request(staged_target_handle(&runtime, incarnation));
+    ordinary.flavor = novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary;
+    control
+        .begin_write(ordinary)
+        .expect_err("an ordinary write must resolve its target through the catalog");
+
+    let plan = control
+        .begin_write(staged_begin_request(staged_target_handle(
+            &runtime,
+            incarnation,
+        )))
+        .expect("a staged begin needs no catalog");
+    assert_eq!(plan.expected_targets(), vec![ordinal(0)]);
+}
+
+/// A staged finish seals its artifacts and commits nothing.
+///
+/// It runs against the same unreachable catalog, so a snapshot commit could not
+/// have happened; and the receipt it returns carries no committed version,
+/// because there is no version to name until the publication creates the table.
+#[test]
+fn a_staged_finish_seals_its_artifacts_without_committing() {
+    use novarocks_spi::connector::write_stack::session::{
+        ConnectorWriteControl, ConnectorWriteFinishRequest,
+    };
+
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+    let plan = control
+        .begin_write(staged_begin_request(staged_target_handle(
+            &runtime,
+            incarnation,
+        )))
+        .expect("staged begin");
+    let adapter = crate::commit::write_stack::runtime::build_write_adapter(
+        descriptor("unit"),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+    );
+    let set = prepared(
+        &adapter,
+        vec![(
+            ordinal(0),
+            data_fragment("file:///tmp/novarocks-staged-session/table/data/a.parquet"),
+        )],
+        &[ordinal(0)],
+    );
+
+    let outcome = control
+        .finish_write(ConnectorWriteFinishRequest {
+            commit: plan.commit_handle(),
+            prepared: set,
+            context: request_context(),
+        })
+        .expect("a staged finish needs no catalog");
+
+    let ExternalMutationOutcome::KnownCommitted {
+        effect, receipt, ..
+    } = outcome
+    else {
+        panic!("sealing is not in doubt: nothing external was attempted");
+    };
+    // Nothing was applied out there, and the receipt names no version because
+    // the target has none until it is published.
+    assert_eq!(effect, ExternalMutationEffect::NoOp);
+    assert!(receipt.committed_version().is_none());
+    assert!(!receipt.payload().is_empty());
+
+    // The single terminal is claimed, so a second finish cannot mint a second
+    // receipt for the same sealed artifacts.
+    control
+        .finish_write(ConnectorWriteFinishRequest {
+            commit: plan.commit_handle(),
+            prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
+            context: request_context(),
+        })
+        .expect_err("a sealed session is finished");
+}
+
+/// A staged write that produced no artifact still reaches the provider.
+///
+/// The empty-write shortcut settles against the version the target already
+/// holds, and a staged target holds none. Taking it here would fail a CTAS that
+/// selected no rows; the provider gets an empty seal instead and the
+/// publication decides what an empty table means.
+#[test]
+fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
+    use novarocks_spi::connector::write_stack::session::{
+        ConnectorWriteControl, ConnectorWriteFinishRequest,
+    };
+
+    let incarnation = ProviderBindingEpoch::new();
+    let (_executor, runtime) = unreachable_rest_runtime();
+    let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+        descriptor("unit"),
+        incarnation,
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        Arc::clone(&runtime),
+    );
+    let plan = control
+        .begin_write(staged_begin_request(staged_target_handle(
+            &runtime,
+            incarnation,
+        )))
+        .expect("staged begin");
+    let adapter = crate::commit::write_stack::runtime::build_write_adapter(
+        descriptor("unit"),
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("unit").expect("instance id"),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+    );
+
+    let outcome = control
+        .finish_write(ConnectorWriteFinishRequest {
+            commit: plan.commit_handle(),
+            prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
+            context: request_context(),
+        })
+        .expect("an empty staged write still seals");
+
+    assert!(matches!(
+        outcome,
+        ExternalMutationOutcome::KnownCommitted { .. }
+    ));
 }

@@ -1888,14 +1888,17 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     // independent caller choices that could disagree.
     let (distributed_plan, sealed_write_targets) = match connector_write.as_ref() {
         Some(DistributedConnectorWrite::Session(session)) => {
-            let plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
-                optimize_request,
-                sink,
-                &optimizer_settings,
-            )?;
             let targets = session
                 .seal_write_targets()
                 .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
+            let plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
+                optimize_request,
+                sink,
+                targets
+                    .sole_target_ordinal()
+                    .map_err(crate::dml::error::DmlExecutionError::from)?,
+                &optimizer_settings,
+            )?;
             (plan, Some(targets))
         }
         _ => (

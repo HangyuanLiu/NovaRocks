@@ -140,6 +140,9 @@ pub struct IcebergWriteSessionPlanInput {
     pub purpose: ConnectorWriteAdmissionPurpose,
     pub table: IcebergWriteTableFacts,
     pub base_version_digest: Option<[u8; 32]>,
+    /// Present exactly on the staged-create flavor, whose target has no catalog
+    /// entry to load.
+    pub staged_metadata: Option<std::sync::Arc<crate::iceberg::spec::TableMetadata>>,
     pub data: IcebergDataBranchPlan,
     pub deletes: Vec<IcebergDeleteBranchPlan>,
 }
@@ -236,6 +239,9 @@ pub struct IcebergBranchSessionPlanInput {
     /// Present exactly on the managed-publication flavor, and never carrying
     /// the publication id that names it.
     pub publication: Option<IcebergManagedPublicationFacts>,
+    /// Present exactly on the staged-create flavor: the frozen metadata of a
+    /// target that has no catalog entry to load.
+    pub staged_metadata: Option<std::sync::Arc<crate::iceberg::spec::TableMetadata>>,
     /// The branches this session seals, in ordinal order.
     pub branches: Vec<IcebergWriteBranchPlan>,
 }
@@ -321,6 +327,7 @@ pub fn plan_branch_session(
         input.purpose,
         input.base_version_digest,
         input.publication,
+        input.staged_metadata,
         sealed,
     )?;
     Ok((handle, plans))
@@ -354,6 +361,7 @@ pub fn plan_write_session(
             table: input.table,
             base_version_digest: input.base_version_digest,
             publication: None,
+            staged_metadata: input.staged_metadata,
             branches,
         },
     )
@@ -424,6 +432,7 @@ mod tests {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 table: table_facts(),
                 base_version_digest: None,
+                staged_metadata: None,
                 data: data_branch_plan(),
                 deletes: vec![delete_branch_plan(
                     IcebergWriteBranch::DeletionVector,
@@ -450,6 +459,7 @@ mod tests {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 table: table_facts(),
                 base_version_digest: None,
+                staged_metadata: None,
                 data: data_branch_plan(),
                 deletes: vec![delete_branch_plan(
                     IcebergWriteBranch::DeletionVector,
@@ -473,6 +483,7 @@ mod tests {
                 purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
                 table: table_facts(),
                 base_version_digest: None,
+                staged_metadata: None,
                 data: data_branch_plan(),
                 deletes: vec![
                     delete_branch_plan(

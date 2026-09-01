@@ -728,6 +728,10 @@ impl IcebergWriteControl {
     /// operation without dispatching the ordinary table commit.  CTAS owns the
     /// later atomic create-table publication, but it must not bypass the same
     /// generation/cohort/control-payload admission used by ordinary writes.
+    #[allow(
+        dead_code,
+        reason = "Retained beside the write-operation aggregate until it is removed as one cut."
+    )]
     pub(crate) fn validate_staged_completion(
         &self,
         completion: &ConnectorWriteOperationCompletion,
@@ -785,6 +789,10 @@ impl IcebergWriteControl {
     /// Release the generation-local write reservation only after staged-create
     /// publication or abort has a known terminal outcome.  Unknown publication
     /// deliberately retains the operation for exact-generation reconcile.
+    #[allow(
+        dead_code,
+        reason = "Retained beside the write-operation aggregate until it is removed as one cut."
+    )]
     pub(crate) fn finish_staged_terminal(
         &self,
         operation_id: ConnectorWriteOperationId,

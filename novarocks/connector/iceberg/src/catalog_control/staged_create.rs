@@ -38,15 +38,14 @@ use novarocks_spi::connector::{
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
     ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorVendedS3CredentialLeaseRefresher, ConnectorWriteControl,
-    ConnectorWriteOperationCompletion, CreatePolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ProviderBindingEpoch,
+    ConnectorStagedWriteProof, ConnectorVendedS3CredentialLeaseRefresher, CreatePolicy,
+    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
 use crate::commit::{
-    AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, IcebergWriteControl,
-    build_staged_fast_append_action,
+    AbortLog, CommitCtx, CommitOpKind, IcebergCommitCollector, build_staged_fast_append_action,
 };
 use crate::iceberg::{Catalog, TableCommit, TableCreation, TableRequirement, TableUpdate};
 use crate::loaded_table::{IcebergPhysicalTable, IcebergRestVendedS3LeaseRefresher};
@@ -465,7 +464,6 @@ pub struct IcebergStagedCreateAdapter {
     descriptor: ConnectorInstanceDescriptor,
     incarnation: ProviderBindingEpoch,
     provider: Arc<IcebergMetadata>,
-    write_control: Arc<IcebergWriteControl>,
     runtime: Arc<IcebergMetadataContext>,
     operations: Arc<Mutex<HashMap<ConnectorStagedCreateOperationId, OperationState>>>,
 }
@@ -492,11 +490,39 @@ struct PreparedOperation {
 
 #[derive(Clone)]
 struct StagedWrite {
-    completion: ConnectorWriteOperationCompletion,
+    write: ConnectorStagedWriteProof,
     updates: Vec<TableUpdate>,
     expected_snapshot_id: Option<i64>,
     abort_handle: Arc<AbortLog>,
     action_built: bool,
+}
+
+impl PreparedOperation {
+    /// The staged target's operation identity. `prepare` proves it equal to the
+    /// publication ID, so deriving it here cannot drift from the value the
+    /// writers were handed.
+    fn operation_id(&self) -> ConnectorStagedCreateOperationId {
+        ConnectorStagedCreateOperationId::from_bytes(self.publication_id.to_bytes())
+    }
+}
+
+/// Read the artifacts a write session sealed into its receipt.
+///
+/// The payload is provider-private in both directions: this catalog generation
+/// minted it in `finish_write` and is the only thing that reads it back. A
+/// receipt from anywhere else fails to decode rather than being interpreted
+/// loosely.
+fn sealed_artifacts(
+    write: &ConnectorStagedWriteProof,
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Vec<crate::commit::report::IcebergWriterReport>, ConnectorError> {
+    crate::write_codec::decode_writer_reports(write.receipt().payload(), metadata).map_err(
+        |error| {
+            corrupt(format!(
+                "decode the artifacts sealed into a staged-create write receipt: {error}"
+            ))
+        },
+    )
 }
 
 #[derive(Clone)]
@@ -519,25 +545,12 @@ struct PublishEvidenceV1 {
 }
 
 impl IcebergStagedCreateAdapter {
-    pub fn try_new(
-        provider: Arc<IcebergMetadata>,
-        write_control: Arc<IcebergWriteControl>,
-    ) -> Result<Self, ConnectorError> {
-        let owner = ConnectorProviderBindingKey {
-            instance_id: provider.descriptor().instance_id.clone(),
-            incarnation: provider.incarnation(),
-        };
-        if write_control.binding_key() != &owner {
-            return Err(invalid(
-                "Iceberg staged-create and write control generations do not match",
-            ));
-        }
+    pub fn try_new(provider: Arc<IcebergMetadata>) -> Result<Self, ConnectorError> {
         Ok(Self {
             descriptor: provider.descriptor().clone(),
             incarnation: provider.incarnation(),
             runtime: Arc::clone(provider.runtime()),
             provider,
-            write_control,
             operations: Arc::new(Mutex::new(HashMap::new())),
         })
     }
@@ -668,17 +681,19 @@ impl IcebergStagedCreateAdapter {
         })
     }
 
+    /// Turn the sealed write into the updates one assert-create commit carries.
+    ///
+    /// The artifacts come from the receipt the write session minted, which is
+    /// the only thing that crosses from that session to this publication. There
+    /// is deliberately no walk over cohorts, attempts, or writer reports here:
+    /// a publication has no use for who wrote a file, only for which files
+    /// exist.
     fn build_action(
         &self,
         prepared: &PreparedOperation,
-        completion: &ConnectorWriteOperationCompletion,
+        write: &ConnectorStagedWriteProof,
         context: &ConnectorRequestContext,
     ) -> Result<StagedCreateAction, ConnectorError> {
-        if completion.owner() != &self.owner() {
-            return Err(invalid(
-                "staged-create writer completion has a foreign owner",
-            ));
-        }
         let metadata = prepared.staged.table.metadata().clone();
         let collector = Arc::new(
             IcebergCommitCollector::new(
@@ -688,50 +703,19 @@ impl IcebergStagedCreateAdapter {
                 metadata.last_sequence_number(),
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().clone(),
-                format!(
-                    "{}/data/_staging/{}",
-                    metadata.location().trim_end_matches('/'),
-                    completion.sealed().operation_id()
-                ),
+                staged_write_data_prefix(metadata.location(), prepared.operation_id()),
             )
             .with_table_metadata(metadata.clone()),
         );
-        for cohort in completion.cohorts() {
-            if let Some(accepted) = cohort.accepted() {
-                for report in accepted.reports() {
-                    report.validate()?;
-                    if report.state()
-                        != novarocks_spi::connector::ConnectorWriterTerminalState::Staged
-                    {
-                        return Err(invalid(
-                            "accepted staged-create writer report is not in the staged state",
-                        ));
-                    }
-                    let reports =
-                        crate::write_codec::decode_writer_reports(report.payload(), &metadata)
-                            .map_err(corrupt)?;
-                    collector.inject_writer_reports(reports).map_err(corrupt)?;
-                }
-            }
-            for attempt in cohort.superseded() {
-                for report in attempt.reports() {
-                    report.validate()?;
-                    for decoded in
-                        crate::write_codec::decode_writer_reports(report.payload(), &metadata)
-                            .map_err(corrupt)?
-                    {
-                        let file = collector.convert_writer_report(decoded).map_err(corrupt)?;
-                        collector.abort_log.record_data_file(file.path);
-                    }
-                }
-            }
-        }
+        collector
+            .inject_writer_reports(sealed_artifacts(write, &metadata)?)
+            .map_err(corrupt)?;
 
         let abort_handle = prepared
             .write
             .as_ref()
             .map(|write| Arc::clone(&write.abort_handle))
-            .ok_or_else(|| invalid("staged-create action requires a bound writer aggregate"))?;
+            .ok_or_else(|| invalid("staged-create action requires a bound write"))?;
         // Never drive a later action through the table/FileIO captured by
         // prepare. In particular, a vended response must resolve through this
         // action's request-local capability, not through another action's.
@@ -773,10 +757,12 @@ impl IcebergStagedCreateAdapter {
         Ok((updates, expected_snapshot_id, built.abort_handle))
     }
 
-    fn completion_abort_log(
+    /// The objects a staged write left behind, so aborting the target can
+    /// delete exactly them.
+    fn staged_write_abort_log(
         &self,
         prepared: &PreparedOperation,
-        completion: &ConnectorWriteOperationCompletion,
+        write: &ConnectorStagedWriteProof,
     ) -> Result<Arc<AbortLog>, ConnectorError> {
         let metadata = prepared.staged.table.metadata().clone();
         let collector = IcebergCommitCollector::new(
@@ -786,45 +772,12 @@ impl IcebergStagedCreateAdapter {
             metadata.last_sequence_number(),
             metadata.current_schema().clone(),
             metadata.default_partition_spec().clone(),
-            format!(
-                "{}/data/_staging/{}",
-                metadata.location().trim_end_matches('/'),
-                completion.sealed().operation_id()
-            ),
+            staged_write_data_prefix(metadata.location(), prepared.operation_id()),
         )
         .with_table_metadata(metadata.clone());
-        for cohort in completion.cohorts() {
-            if let Some(accepted) = cohort.accepted() {
-                for report in accepted.reports() {
-                    report.validate()?;
-                    if report.state()
-                        != novarocks_spi::connector::ConnectorWriterTerminalState::Staged
-                    {
-                        return Err(invalid(
-                            "accepted staged-create writer report is not in the staged state",
-                        ));
-                    }
-                    for decoded in
-                        crate::write_codec::decode_writer_reports(report.payload(), &metadata)
-                            .map_err(corrupt)?
-                    {
-                        let file = collector.convert_writer_report(decoded).map_err(corrupt)?;
-                        collector.abort_log.record_data_file(file.path);
-                    }
-                }
-            }
-            for attempt in cohort.superseded() {
-                for report in attempt.reports() {
-                    report.validate()?;
-                    for decoded in
-                        crate::write_codec::decode_writer_reports(report.payload(), &metadata)
-                            .map_err(corrupt)?
-                    {
-                        let file = collector.convert_writer_report(decoded).map_err(corrupt)?;
-                        collector.abort_log.record_data_file(file.path);
-                    }
-                }
-            }
+        for report in sealed_artifacts(write, &metadata)? {
+            let file = collector.convert_writer_report(report).map_err(corrupt)?;
+            collector.abort_log.record_data_file(file.path);
         }
         Ok(collector.abort_log)
     }
@@ -884,31 +837,6 @@ impl IcebergStagedCreateAdapter {
                 "staged-create cleanup failed for {} artifact(s): {paths}",
                 cleanup.len()
             ))
-        }
-    }
-
-    fn finish_write_terminal(
-        &self,
-        prepared: &PreparedOperation,
-        finalization: ExternalMutationFinalization,
-    ) -> ExternalMutationFinalization {
-        let Some(write) = &prepared.write else {
-            return finalization;
-        };
-        match self
-            .write_control
-            .finish_staged_terminal(write.completion.sealed().operation_id())
-        {
-            Ok(()) => finalization,
-            Err(error) => match finalization {
-                ExternalMutationFinalization::Complete => {
-                    cleanup_failed(format!("release staged-create write reservation: {error}"))
-                }
-                ExternalMutationFinalization::Failed(existing) => cleanup_failed(format!(
-                    "{}; release staged-create write reservation: {error}",
-                    existing.message()
-                )),
-            },
         }
     }
 }
@@ -1121,18 +1049,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             ));
         }
         if let Some(existing) = &prepared.planning {
-            if existing.operation_id() == request.operation_id
-                && existing.intent() == request.intent
-                && existing.input_schema().as_ref() == request.input_schema.as_ref()
-            {
-                let existing = existing.clone();
-                self.record_terminal(target_operation_id, OperationState::Prepared(prepared));
-                return Ok(existing);
-            }
+            // Vending the same target twice is harmless -- the binding is a
+            // pure function of the staged target -- so it is returned rather
+            // than refused.
+            let existing = existing.clone();
             self.record_terminal(target_operation_id, OperationState::Prepared(prepared));
-            return Err(invalid(
-                "Iceberg staged target already has a different writer planning binding",
-            ));
+            return Ok(existing);
         }
         let result = self
             .provider
@@ -1144,9 +1066,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             .and_then(|table| {
                 ConnectorStagedWritePlanningBinding::try_new(
                     &request.handle,
-                    request.operation_id,
-                    request.intent,
-                    Arc::clone(&request.input_schema),
                     table,
                     Bytes::new(),
                     request.context.clone(),
@@ -1168,9 +1087,9 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
     fn bind_write(
         &self,
         handle: ConnectorStagedTableHandle,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), ConnectorError> {
-        if handle.owner() != &self.owner() || completion.owner() != &self.owner() {
+        if handle.owner() != &self.owner() {
             return Err(invalid(
                 "Iceberg staged-create write binding has a foreign owner",
             ));
@@ -1179,20 +1098,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let mut prepared = take_prepared(&self.operations, operation_id)?;
         if prepared.handle_digest != handle.digest()
             || prepared.write.is_some()
-            || prepared.planning.as_ref().is_none_or(|planning| {
-                planning.operation_id() != completion.sealed().operation_id()
-            })
+            || prepared.planning.is_none()
         {
             self.record_terminal(operation_id, OperationState::Prepared(prepared));
             return Err(invalid(
                 "Iceberg staged-create write binding is stale, unplanned, or already bound",
             ));
         }
-        if let Err(error) = self.write_control.validate_staged_completion(&completion) {
-            self.record_terminal(operation_id, OperationState::Prepared(prepared));
-            return Err(error);
-        }
-        let abort_handle = match self.completion_abort_log(&prepared, &completion) {
+        // Decoding the receipt here is the binding check: a receipt this
+        // generation did not mint, or one whose artifacts do not fit this
+        // target's schema, is refused before the target records a write at all.
+        let abort_handle = match self.staged_write_abort_log(&prepared, &write) {
             Ok(abort_handle) => abort_handle,
             Err(error) => {
                 self.record_terminal(operation_id, OperationState::Prepared(prepared));
@@ -1200,7 +1116,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             }
         };
         prepared.write = Some(StagedWrite {
-            completion,
+            write,
             updates: Vec::new(),
             expected_snapshot_id: None,
             abort_handle,
@@ -1214,7 +1130,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         &self,
         request: ConnectorStagedCreatePublishRequest,
     ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
-        if request.handle.owner() != &self.owner() || request.completion.owner() != &self.owner() {
+        if request.handle.owner() != &self.owner() {
             return Err(invalid("Iceberg staged-create publish has a foreign owner"));
         }
         let operation_id = request.handle.operation_id();
@@ -1228,16 +1144,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let Some(write) = prepared.write.as_ref() else {
             self.record_terminal(operation_id, OperationState::Prepared(prepared));
             return Err(invalid(
-                "Iceberg staged-create publish requires a bound writer aggregate",
+                "Iceberg staged-create publish requires a bound write",
             ));
         };
-        if write.completion.aggregate_digest() != request.completion.aggregate_digest()
-            || write.completion.sealed().operation_id()
-                != request.completion.sealed().operation_id()
-        {
+        if write.write != request.write {
             self.record_terminal(operation_id, OperationState::Prepared(prepared));
             return Err(invalid(
-                "Iceberg staged-create publish completion is not bound to this target",
+                "Iceberg staged-create publish write is not bound to this target",
             ));
         }
         if let Err(error) = Self::validate_context(&request.context) {
@@ -1247,7 +1160,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             });
         }
         if !write.action_built {
-            match self.build_action(&prepared, &request.completion, &request.context) {
+            match self.build_action(&prepared, &request.write, &request.context) {
                 Ok((updates, expected_snapshot_id, abort_handle)) => {
                     let write = prepared.write.as_mut().expect("validated staged write");
                     write.updates = updates;
@@ -1303,12 +1216,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 let receipt =
                     publication_receipt(self, request.operation_id, &table, expected_snapshot_id)?;
                 invalidate_prepared(&self.runtime, &prepared);
-                let finalization =
-                    self.finish_write_terminal(&prepared, ExternalMutationFinalization::Complete);
                 self.record_terminal(operation_id, OperationState::Published);
                 Ok(ConnectorStagedCreatePublishOutcome::Applied {
                     receipt,
-                    finalization,
+                    finalization: ExternalMutationFinalization::Complete,
                 })
             }
             Ok(Ok(_)) => {
@@ -1330,7 +1241,6 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             Ok(Err(crate::iceberg_catalog_rest::StagedCommitError::Conflict(error))) => {
                 if prepared.policy == CreatePolicy::NoOpIfExists {
                     let finalization = self.abort_prepared(&prepared, &request.context);
-                    let finalization = self.finish_write_terminal(&prepared, finalization);
                     self.record_terminal(operation_id, OperationState::Published);
                     Ok(ConnectorStagedCreatePublishOutcome::NoOp {
                         receipt: self.receipt(
@@ -1386,19 +1296,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     Bytes::copy_from_slice(&operation_id.to_bytes()),
                 )?;
                 invalidate_prepared(&self.runtime, &prepared);
-                let finalization = self.finish_write_terminal(
-                    &prepared,
-                    ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
-                        ConnectorMutationFailureKind::Unavailable,
-                        format!(
-                            "REST staged-create publication committed but response finalization failed: {error}"
-                        ),
-                    )),
-                );
                 self.record_terminal(operation_id, OperationState::Published);
                 Ok(ConnectorStagedCreatePublishOutcome::Applied {
                     receipt,
-                    finalization,
+                    finalization: ExternalMutationFinalization::Failed(
+                        ConnectorMutationFailure::new(
+                            ConnectorMutationFailureKind::Unavailable,
+                            format!(
+                                "REST staged-create publication committed but response finalization failed: {error}"
+                            ),
+                        ),
+                    ),
                 })
             }
             Err(error) => {
@@ -1440,18 +1348,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create abort handle digest mismatch",
             ));
         }
-        if request.completion.as_ref().is_some_and(|completion| {
-            prepared.write.as_ref().is_none_or(|write| {
-                write.completion.aggregate_digest() != completion.aggregate_digest()
-                    || write.completion.sealed().operation_id()
-                        != completion.sealed().operation_id()
-            })
+        if request.write.as_ref().is_some_and(|offered| {
+            prepared
+                .write
+                .as_ref()
+                .is_none_or(|bound| &bound.write != offered)
         }) {
             self.record_terminal(operation_id, OperationState::Prepared(prepared));
-            return Err(invalid("Iceberg staged-create abort completion mismatch"));
+            return Err(invalid("Iceberg staged-create abort write mismatch"));
         }
         let finalization = self.abort_prepared(&prepared, &request.context);
-        let finalization = self.finish_write_terminal(&prepared, finalization);
         self.record_terminal(operation_id, OperationState::Aborted);
         Ok(ConnectorStagedCreateAbortOutcome::Aborted {
             receipt: self.receipt(
@@ -1540,13 +1446,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     evidence.expected_snapshot_id,
                 )?;
                 invalidate_prepared(&self.runtime, &prepared);
-                let finalization =
-                    self.finish_write_terminal(&prepared, ExternalMutationFinalization::Complete);
                 self.record_terminal(operation_id, OperationState::Published);
                 Ok(
                     ConnectorStagedCreatePublicationAdjudicationOutcome::Published {
                         receipt,
-                        finalization,
+                        finalization: ExternalMutationFinalization::Complete,
                     },
                 )
             }
@@ -1837,12 +1741,7 @@ mod tests {
             ProviderBindingEpoch::new(),
             Arc::clone(&runtime),
         ));
-        let write = Arc::new(IcebergWriteControl::new(
-            descriptor,
-            provider.incarnation(),
-            runtime,
-        ));
-        IcebergStagedCreateAdapter::try_new(provider, write).expect("staged-create adapter")
+        IcebergStagedCreateAdapter::try_new(provider).expect("staged-create adapter")
     }
 
     fn warehouseless_rest_adapter() -> (
@@ -2062,12 +1961,7 @@ mod tests {
             ProviderBindingEpoch::new(),
             Arc::clone(&runtime),
         ));
-        let write = Arc::new(IcebergWriteControl::new(
-            descriptor,
-            provider.incarnation(),
-            runtime,
-        ));
-        IcebergStagedCreateAdapter::try_new(provider, write)
+        IcebergStagedCreateAdapter::try_new(provider)
             .expect("the staged-create adapter attaches on a Hadoop generation");
     }
 
@@ -2240,5 +2134,43 @@ mod tests {
         };
         assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unavailable);
         assert!(failure.message().contains("staged manifest"));
+    }
+
+    /// The receipt is the only thing that crosses from the write session to the
+    /// publication, so it is also the only thing that can be forged. A payload
+    /// this generation did not mint fails to decode rather than being
+    /// interpreted as "no artifacts", which would publish an empty table over a
+    /// write that actually staged files.
+    #[test]
+    fn a_foreign_receipt_is_refused_rather_than_read_as_an_empty_write() {
+        let runtime = rest_runtime();
+        let prepared = prepared_operation(&runtime);
+        let metadata = prepared.staged.table.metadata().clone();
+
+        let foreign = ConnectorStagedWriteProof::try_new(
+            novarocks_spi::connector::ConnectorWriteReceipt::try_new(Bytes::from_static(
+                b"not an Iceberg staged-create seal",
+            ))
+            .expect("receipt"),
+            7,
+        )
+        .expect("write proof");
+        let error = sealed_artifacts(&foreign, &metadata).expect_err("a foreign receipt");
+        assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+
+        // The real payload this generation's seal produces round-trips, so the
+        // refusal above is about provenance and not about the decoder being
+        // unable to read anything at all.
+        let sealed = crate::write_codec::encode_writer_reports(&[], &metadata).expect("seal");
+        let mine = ConnectorStagedWriteProof::try_new(
+            novarocks_spi::connector::ConnectorWriteReceipt::try_new(sealed).expect("receipt"),
+            0,
+        )
+        .expect("write proof");
+        assert!(
+            sealed_artifacts(&mine, &metadata)
+                .expect("own receipt")
+                .is_empty()
+        );
     }
 }

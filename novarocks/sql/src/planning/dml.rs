@@ -449,11 +449,13 @@ pub fn build_frozen_connector_write_distributed_plan(
 pub fn build_frozen_connector_write_dataflow_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
         source.into_physical(),
         sink.0,
+        write_target_ordinal,
         settings,
     )
 }
@@ -481,6 +483,7 @@ pub fn compile_connector_write_distributed_plan(
 pub fn compile_connector_write_dataflow_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(request)
@@ -489,7 +492,10 @@ pub fn compile_connector_write_dataflow_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     crate::planner::pipeline::build_sql_write_dataflow_plan_with_settings(
-        physical, sink.0, settings,
+        physical,
+        sink.0,
+        write_target_ordinal,
+        settings,
     )
 }
 
@@ -590,6 +596,7 @@ pub fn build_ctas_connector_write_distributed_plan(
 pub fn build_ctas_connector_write_dataflow_plan(
     source: &DmlCtasSourcePlan,
     target_schema: arrow::datatypes::SchemaRef,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
@@ -600,6 +607,7 @@ pub fn build_ctas_connector_write_dataflow_plan(
             input: crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
             root_output_exprs: None,
         },
+        write_target_ordinal,
         settings,
     )
 }
@@ -617,7 +625,10 @@ pub fn native_encoder_test_fixture_plan() -> Result<crate::plan_read::Distribute
 #[derive(Clone, Debug)]
 pub struct DmlChangeStreamRoute {
     pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
-    pub cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+    /// The begin session's dense, query-local ordinal for the logical write
+    /// target this branch feeds. It is the branch's whole identity: nothing
+    /// downstream recovers a cohort, an operation, or a placement from it.
+    pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
     pub input_fields: Vec<DmlChangeStreamRouteField>,
     pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
@@ -710,7 +721,7 @@ pub fn optimizer_settings_stable_digest_material(
 #[derive(Clone, Debug)]
 pub struct DmlChangeStreamWriterRoute {
     pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
-    pub cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
+    pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
     pub writer_fragment_id: crate::plan_read::FragmentId,
 }
@@ -843,7 +854,7 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
         .iter()
         .map(|route| DmlChangeStreamWriterRoute {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects.clone(),
             writer_fragment_id: route.writer_fragment_id,
         })
@@ -899,7 +910,7 @@ fn bind_route_layout(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ChangeStreamWriteLayoutRoute {
                 route_id: route.route_id,
-                cohort_id: route.cohort_id,
+                write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects,
                 input_ordinals,
                 partition_input_tokens: route.partition_input_tokens,

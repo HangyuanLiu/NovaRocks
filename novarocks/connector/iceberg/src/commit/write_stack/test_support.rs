@@ -54,6 +54,35 @@ pub(crate) fn table_facts() -> IcebergWriteTableFacts {
     .expect("table facts")
 }
 
+/// A frozen staged target, as the staged-create capability would hand one to a
+/// session. It carries no snapshot, because nothing has ever been written to a
+/// staged table.
+pub(crate) fn staged_table_metadata() -> std::sync::Arc<crate::iceberg::spec::TableMetadata> {
+    let schema = crate::iceberg::spec::Schema::builder()
+        .with_fields(vec![std::sync::Arc::new(
+            crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+            ),
+        )])
+        .build()
+        .expect("staged schema");
+    let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+        schema,
+        crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+        crate::iceberg::spec::SortOrder::unsorted_order(),
+        "s3://b/wh/_novarocks/ctas-staging/v1/staged/table".to_string(),
+        crate::iceberg::spec::FormatVersion::V2,
+        std::collections::HashMap::new(),
+    )
+    .expect("staged metadata builder")
+    .build()
+    .expect("staged metadata")
+    .metadata;
+    std::sync::Arc::new(metadata)
+}
+
 pub(crate) fn sample_partition() -> IcebergArtifactPartition {
     IcebergArtifactPartition::try_new(
         String::new(),

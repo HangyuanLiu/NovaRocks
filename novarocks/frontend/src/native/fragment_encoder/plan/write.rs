@@ -105,7 +105,7 @@ pub(super) fn encode_change_stream_router_sink(
                     )?),
                     destinations: None,
                     route_id: route.route_id().to_bytes().to_vec(),
-                    cohort_id: route.cohort_id().to_bytes().to_vec(),
+                    write_target_ordinal: route.write_target_ordinal().get(),
                     accepted_effects: route
                         .accepted_effects()
                         .iter()

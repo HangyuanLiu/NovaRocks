@@ -33,6 +33,7 @@
 //!   document and carries no writer identity.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
@@ -1196,6 +1197,11 @@ pub struct IcebergCommitHandle {
     publication: Option<IcebergManagedPublicationFacts>,
     targets: Vec<IcebergSealedWriteTarget>,
     delete_owner: BTreeMap<String, WriteTargetOrdinal>,
+    /// The frozen metadata of a staged target, present exactly on a
+    /// staged-create session. It stands in for the catalog load every other
+    /// flavor performs, and the seal reads its schema and partition spec to
+    /// interpret the artifacts the backends staged.
+    staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
 }
 
@@ -1211,6 +1217,11 @@ pub enum IcebergWriteSessionState {
     Committing,
     /// The external commit is proven to have happened.
     KnownCommitted { snapshot_id: i64 },
+    /// The prepared write set was sealed into a receipt and no external commit
+    /// was attempted. Only a staged-create session reaches this: the single
+    /// external effect belongs to the publication that owns the staged target,
+    /// so this session is finished without ever having touched the catalog.
+    Sealed,
     /// The external commit is proven not to have happened.
     KnownUncommitted { message: String },
     /// The external outcome is unknown and staged files were deliberately left
@@ -1242,6 +1253,7 @@ impl IcebergCommitHandle {
             purpose,
             base_version_digest,
             None,
+            None,
             targets,
         )
     }
@@ -1259,11 +1271,22 @@ impl IcebergCommitHandle {
         purpose: ConnectorWriteAdmissionPurpose,
         base_version_digest: Option<[u8; 32]>,
         publication: Option<IcebergManagedPublicationFacts>,
+        staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
         targets: Vec<IcebergSealedWriteTarget>,
     ) -> Result<Self, ConnectorError> {
         if publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
             return Err(invalid(format!(
                 "Iceberg {} write session cannot carry managed publication facts",
+                flavor.as_str()
+            )));
+        }
+        // The two directions are both errors, and for the same reason: a staged
+        // session with no frozen metadata has nothing to interpret its
+        // artifacts against, and any other flavor carrying staged metadata
+        // would have two disagreeing sources for its target's schema.
+        if staged_metadata.is_some() != (flavor == IcebergWriteFlavor::StagedCreate) {
+            return Err(invalid(format!(
+                "Iceberg {} write session must carry frozen staged metadata exactly when it stages a create",
                 flavor.as_str()
             )));
         }
@@ -1297,6 +1320,7 @@ impl IcebergCommitHandle {
             publication,
             targets,
             delete_owner,
+            staged_metadata,
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
     }
@@ -1320,6 +1344,12 @@ impl IcebergCommitHandle {
     pub const fn publication(&self) -> Option<IcebergManagedPublicationFacts> {
         self.publication
     }
+    /// The frozen metadata a staged-create session interprets its artifacts
+    /// against. Absent on every other flavor, which loads its target instead.
+    pub fn staged_metadata(&self) -> Option<&crate::iceberg::spec::TableMetadata> {
+        self.staged_metadata.as_deref()
+    }
+
     pub fn targets(&self) -> &[IcebergSealedWriteTarget] {
         &self.targets
     }
@@ -1442,6 +1472,9 @@ impl IcebergCommitHandle {
             IcebergWriteSessionState::KnownCommitted { .. } => {
                 Err(invalid("Iceberg write session is already known committed"))
             }
+            IcebergWriteSessionState::Sealed => Err(invalid(
+                "Iceberg write session is already sealed for its publication",
+            )),
             IcebergWriteSessionState::KnownUncommitted { .. } => Err(invalid(
                 "Iceberg write session is already known uncommitted",
             )),

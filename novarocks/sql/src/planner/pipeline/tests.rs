@@ -131,7 +131,9 @@ fn row_mutation_dag(
         effect_output_ordinal,
         vec![crate::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32]),
-            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes([8; 32]),
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+                    .expect("bounded ordinal"),
             accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
             input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
                 novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([9; 32]),

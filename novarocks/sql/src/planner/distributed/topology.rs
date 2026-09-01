@@ -396,8 +396,8 @@ mod tests {
     use crate::planner::payload::PlanValuesNode;
     use crate::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use novarocks_spi::connector::{
-        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-        ConnectorWriteFieldToken, ConnectorWriteRouteId,
+        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+        ConnectorWriteRouteId,
     };
 
     use super::{
@@ -685,7 +685,8 @@ mod tests {
         );
         let dag = ChangeStreamWriteDagSpec::for_test(0, vec![ChangeStreamWriteRouteSpec {
             route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+            write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+                .expect("bounded ordinal"),
             accepted_effects: vec![ConnectorRowMutationEffect::Delete],
             input_ordinals: vec![ConnectorMutationRouteInput::new(
                 ConnectorWriteFieldToken::from_bytes([9; 32]),

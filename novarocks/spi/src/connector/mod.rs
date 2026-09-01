@@ -265,7 +265,7 @@ pub use staged_create::{
     ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
     ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
-    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
+    ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
 pub use statistics::{
     ConnectorStatistics, ConnectorStatisticsLease, ConnectorStatisticsResolver,

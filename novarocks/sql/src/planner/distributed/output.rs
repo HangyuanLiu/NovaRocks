@@ -3452,14 +3452,17 @@ mod tests {
 
     fn route_for_test(
         route_byte: u8,
+        write_target_ordinal: u32,
         input_ordinals: Vec<usize>,
         output_partition_ordinals: Vec<usize>,
     ) -> ChangeStreamRoute {
         ChangeStreamRoute {
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([route_byte; 32]),
-            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(
-                [route_byte.wrapping_add(1); 32],
-            ),
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(
+                    write_target_ordinal,
+                )
+                .expect("bounded ordinal"),
             accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
             input_ordinals: input_ordinals
                 .into_iter()
@@ -3617,7 +3620,7 @@ mod tests {
                 output_col(2, "route"),
                 output_col(3, "bucket"),
             ],
-            vec![route_for_test(7, vec![2], vec![5])],
+            vec![route_for_test(7, 0, vec![2], vec![5])],
         );
         let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
             .expect_err("out-of-range router partition ordinal must not finalize");
@@ -3735,8 +3738,8 @@ mod tests {
                     output_col(3, "bucket"),
                 ],
                 vec![
-                    route_for_test(7, vec![2], vec![2]),
-                    route_for_test(8, vec![2], Vec::new()),
+                    route_for_test(7, 0, vec![2], vec![2]),
+                    route_for_test(8, 1, vec![2], Vec::new()),
                 ],
             )],
             Some(0),

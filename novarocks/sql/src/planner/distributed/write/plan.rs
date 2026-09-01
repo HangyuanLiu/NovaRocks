@@ -273,7 +273,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_write(
 
         routes.push(ChangeStreamRoute {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects.clone(),
             input_ordinals: route.input_ordinals,
             target_fragment_id: writer_fragment_id,
@@ -282,7 +282,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_write(
         });
         writer_routes.push(SqlChangeStreamWriterRoute {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             writer_fragment_id,
             sink,
@@ -336,9 +336,10 @@ pub(crate) fn finalize_sql_change_stream_test_plan(
 pub(crate) fn build_table_writer_finish_distributed_plan(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: ConnectorWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
 ) -> Result<DistributedPlan, String> {
     let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let draft = with_table_writer_finish(draft, sink)?;
+    let draft = with_table_writer_finish(draft, sink, write_target_ordinal)?;
     crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
@@ -352,10 +353,12 @@ pub(crate) fn build_table_writer_finish_distributed_plan(
 pub(crate) fn build_sql_table_writer_finish_distributed_plan(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: SqlWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
 ) -> Result<DistributedPlan, String> {
     build_table_writer_finish_distributed_plan(
         physical,
         ConnectorWritePlanInput::from_sql_write_plan_input(sink),
+        write_target_ordinal,
     )
 }
 
@@ -390,17 +393,22 @@ pub(crate) fn build_sql_change_stream_table_writer_finish_distributed_plan(
 pub(in crate::planner::distributed) fn with_sql_table_writer_finish(
     plan: DistributedPlanDraft,
     sink: SqlWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
 ) -> Result<DistributedPlanDraft, String> {
     with_table_writer_finish(
         plan,
         ConnectorWritePlanInput::from_sql_write_plan_input(sink),
+        write_target_ordinal,
     )
 }
 
 /// Rewrite a result-rooted draft into the NCP-6 writer/finish shape.
 ///
 /// The draft root becomes the writer fragment: its existing tree becomes the
-/// child of a `TableWriter` with `write_target_ordinal = 0`, its sink drops from
+/// child of a `TableWriter` carrying the caller's `write_target_ordinal`, which
+/// is the target this query writes within its write session -- a session that
+/// spans several queries (COW cohorts, distributed rewrite) gives each query a
+/// different ordinal, so it must not be derived from this plan. Its sink drops from
 /// `Result` to `Noop`, and a freshly created finish fragment (Exchange receiver
 /// -> `TableFinish` -> `DataSink::Result`) becomes the plan root. Even a
 /// single-fragment INSERT gets its own Root finish fragment; there is
@@ -408,6 +416,7 @@ pub(in crate::planner::distributed) fn with_sql_table_writer_finish(
 pub(in crate::planner::distributed) fn with_table_writer_finish(
     mut plan: DistributedPlanDraft,
     sink: ConnectorWritePlanInput,
+    write_target_ordinal: WriteTargetOrdinal,
 ) -> Result<DistributedPlanDraft, String> {
     let root_fragment_id = plan
         .root_fragment_id
@@ -435,7 +444,7 @@ pub(in crate::planner::distributed) fn with_table_writer_finish(
 
     let writer_fragment = into_table_writer_fragment(
         plan.fragments.remove(root_index),
-        write_target_ordinal(0)?,
+        write_target_ordinal,
         sink.input,
         output_contract,
         &mut ids,
@@ -444,8 +453,10 @@ pub(in crate::planner::distributed) fn with_table_writer_finish(
     let writer_fragment_id = writer_fragment.fragment_id;
     plan.fragments.insert(root_index, writer_fragment);
 
-    let (finish_fragment, finish_edges) =
-        build_table_finish_fragment(&[(writer_fragment_id, writer_stats)], &mut ids)?;
+    let (finish_fragment, finish_edges) = build_table_finish_fragment(
+        &[(writer_fragment_id, writer_stats, write_target_ordinal)],
+        &mut ids,
+    )?;
     plan.root_fragment_id = Some(finish_fragment.fragment_id);
     plan.fragments.push(finish_fragment);
     plan.edges.extend(finish_edges);
@@ -497,8 +508,11 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
     let mut router_edges = Vec::with_capacity(dag.routes.len());
     let mut writers = Vec::with_capacity(dag.routes.len());
 
-    for (route_index, route) in dag.routes.into_iter().enumerate() {
-        let route_write_target_ordinal = write_target_ordinal(route_index)?;
+    // `dag.validate()` already established that route `i` carries write target
+    // ordinal `i`, which is what makes the finish node's expected ordinals and
+    // this loop's writer order describe the same writers.
+    for route in dag.routes.into_iter() {
+        let route_write_target_ordinal = route.write_target_ordinal;
         let stream_output_ordinals = route_output_ordinals(&route);
         validate_output_ordinals(
             &source_fragment.output_columns,
@@ -584,7 +598,11 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
             output_contract,
             &mut ids,
         );
-        writers.push((writer_fragment_id, writer_fragment.root.stats.clone()));
+        writers.push((
+            writer_fragment_id,
+            writer_fragment.root.stats.clone(),
+            route.write_target_ordinal,
+        ));
         writer_fragments.push(writer_fragment);
 
         router_edges.push(FragmentEdge {
@@ -602,7 +620,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
 
         routes.push(ChangeStreamRoute {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects.clone(),
             input_ordinals: route.input_ordinals,
             target_fragment_id: writer_fragment_id,
@@ -611,7 +629,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
         });
         writer_routes.push(SqlChangeStreamWriterRoute {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             writer_fragment_id,
             sink,
@@ -641,12 +659,6 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
 ///
 /// The ordinal vocabulary and its bound are owned by SPI; this only projects a
 /// planner-side position into it.
-fn write_target_ordinal(index: usize) -> Result<WriteTargetOrdinal, String> {
-    let value =
-        u32::try_from(index).map_err(|_| "write target ordinal space exhausted".to_string())?;
-    WriteTargetOrdinal::try_new(value)
-        .map_err(|error| format!("write target ordinal {value} rejected: {error}"))
-}
 
 /// One monotonic id source shared by every fragment, node, and tuple the write
 /// overlay creates. Allocating from a single cursor keeps the overlay's ids
@@ -729,13 +741,18 @@ fn into_table_writer_fragment(
 }
 
 /// Build the single Root finish fragment plus one gather stream edge per writer
-/// fragment. `writers` must be in write-target-ordinal order: `writers[i]` is
+/// fragment. `writers` carries each writer's own target ordinal rather than
+/// deriving one from position: `writers[i]` is
 /// the writer whose `write_target_ordinal` is `i`.
 fn build_table_finish_fragment(
-    writers: &[(FragmentId, crate::planner::physical::PhysicalPlanStats)],
+    writers: &[(
+        FragmentId,
+        crate::planner::physical::PhysicalPlanStats,
+        WriteTargetOrdinal,
+    )],
     ids: &mut WriteOverlayIds,
 ) -> Result<(PlanFragment, Vec<FragmentEdge>), String> {
-    let Some((_, first_stats)) = writers.first() else {
+    let Some((_, first_stats, _)) = writers.first() else {
         return Err("table finish requires at least one table writer fragment".to_string());
     };
     let finish_fragment_id = ids.alloc_fragment();
@@ -745,8 +762,8 @@ fn build_table_finish_fragment(
     let mut children = Vec::with_capacity(writers.len());
     let mut edges = Vec::with_capacity(writers.len());
     let mut expected_target_ordinals = Vec::with_capacity(writers.len());
-    for (ordinal, (writer_fragment_id, writer_stats)) in writers.iter().enumerate() {
-        expected_target_ordinals.push(write_target_ordinal(ordinal)?);
+    for (writer_fragment_id, writer_stats, target_ordinal) in writers.iter() {
+        expected_target_ordinals.push(*target_ordinal);
         let exchange_node_id = ids.alloc_node();
         let exchange_tuple_id = ids.alloc_tuple();
         children.push(DistributedNode {
@@ -805,12 +822,21 @@ fn build_table_finish_fragment(
     Ok((fragment, edges))
 }
 
+/// Build a target ordinal for a fixture. Fixtures are single-target unless a
+/// test says otherwise, so this is the one place the literal 0 is spelled.
+#[cfg(any(test, feature = "test-support"))]
+fn target_ordinal_for_test(value: u32) -> WriteTargetOrdinal {
+    WriteTargetOrdinal::try_new(value).expect("test write target ordinal is within the bound")
+}
+
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn finalize_sql_table_writer_finish_test_plan(
     builder: crate::planner::distributed::test_support::DistributedPlanDraftBuilder,
     sink: SqlWritePlanInput,
 ) -> Result<DistributedPlan, String> {
-    let draft = with_sql_table_writer_finish(builder.into_draft(), sink)?;
+    // Test fixtures are single-target, so ordinal 0 is the whole target set.
+    let draft =
+        with_sql_table_writer_finish(builder.into_draft(), sink, target_ordinal_for_test(0))?;
     crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
 }
 
@@ -972,6 +998,8 @@ fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKi
 mod tests {
     use arrow::datatypes::DataType;
 
+    use super::target_ordinal_for_test;
+
     use super::super::change_stream::ChangeStreamWriteDagSpec;
     use super::super::contract::{ConnectorWriteInputBinding, test_support};
 
@@ -1048,15 +1076,18 @@ mod tests {
 
     fn test_route(
         route_byte: u8,
+        write_target_ordinal: u32,
         effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
         input_ordinal: u32,
         partition_ordinals: Vec<usize>,
     ) -> super::super::change_stream::ChangeStreamWriteRouteSpec {
         super::super::change_stream::ChangeStreamWriteRouteSpec {
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([route_byte; 32]),
-            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(
-                [route_byte.wrapping_add(1); 32],
-            ),
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(
+                    write_target_ordinal,
+                )
+                .expect("bounded ordinal"),
             accepted_effects: effects,
             input_ordinals: vec![novarocks_spi::connector::ConnectorMutationRouteInput::new(
                 novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
@@ -1083,6 +1114,7 @@ mod tests {
             vec![
                 test_route(
                     7,
+                    0,
                     vec![
                         novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                         novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
@@ -1092,6 +1124,7 @@ mod tests {
                 ),
                 test_route(
                     8,
+                    1,
                     vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
                     2,
                     Vec::new(),
@@ -1141,6 +1174,7 @@ mod tests {
             7,
             vec![test_route(
                 7,
+                0,
                 vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
                 0,
                 Vec::new(),
@@ -1165,6 +1199,7 @@ mod tests {
             0,
             vec![test_route(
                 7,
+                0,
                 vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
                 0,
                 Vec::new(),
@@ -1257,6 +1292,7 @@ mod tests {
             test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
+            target_ordinal_for_test(0),
         )
         .expect("attach dataflow table writer");
         crate::planner::distributed::seal::seal_draft(draft).expect("dataflow write draft seals")
@@ -1274,6 +1310,7 @@ mod tests {
             vec![
                 test_route(
                     7,
+                    0,
                     vec![
                         novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
                         novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
@@ -1283,6 +1320,7 @@ mod tests {
                 ),
                 test_route(
                     8,
+                    1,
                     vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
                     2,
                     Vec::new(),
@@ -1571,6 +1609,7 @@ mod tests {
             test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
+            target_ordinal_for_test(0),
         )
         .expect("attach dataflow table writer");
         draft.edges.clear();
@@ -1598,12 +1637,14 @@ mod tests {
                 vec![
                     test_route(
                         7,
+                        0,
                         vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
                         1,
                         Vec::new(),
                     ),
                     test_route(
                         8,
+                        1,
                         vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
                         2,
                         Vec::new(),
@@ -1656,6 +1697,7 @@ mod tests {
             test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
+            target_ordinal_for_test(0),
         )
         .expect("attach dataflow table writer");
         let finish_fragment_id = draft.root_fragment_id.expect("finish root");
@@ -1688,6 +1730,7 @@ mod tests {
             test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
+            target_ordinal_for_test(0),
         )
         .expect("attach dataflow table writer");
         let writer = draft

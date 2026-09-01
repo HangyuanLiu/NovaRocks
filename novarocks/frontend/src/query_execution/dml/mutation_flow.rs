@@ -351,6 +351,51 @@ impl DmlRowMutationEffectSet {
     }
 }
 
+/// The dense, query-local write target ordinal of the route at `index`.
+fn change_stream_write_target_ordinal(
+    index: usize,
+) -> Result<novarocks_spi::connector::write_stack::WriteTargetOrdinal, String> {
+    let value = u32::try_from(index)
+        .map_err(|_| "row-mutation write target ordinal space exhausted".to_string())?;
+    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value)
+        .map_err(|error| format!("row-mutation write target ordinal {value} rejected: {error}"))
+}
+
+/// Pair each sealed writer route with the activation cohort that signed it.
+///
+/// The legacy terminal-sink path still fences by cohort. Both sides of this
+/// lookup come from the same activation -- the route ids the DAG carries are
+/// the ones `preparations.routes()` produced -- so it is an exact join inside
+/// one derivation, not an alignment between two different ones. A route with
+/// no cohort fails closed rather than being dropped from the fence.
+fn writer_fragment_cohorts(
+    writer_routes: &[novarocks_sql::planning::dml::DmlChangeStreamWriterRoute],
+    preparations: &ActivatedDmlChangeStreamPreparations,
+) -> Result<
+    Vec<(
+        novarocks_sql::plan_read::FragmentId,
+        novarocks_spi::connector::ConnectorWriteCohortId,
+    )>,
+    String,
+> {
+    let cohorts = preparations
+        .routes()
+        .iter()
+        .map(|route| (route.route_id(), route.cohort_id()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    writer_routes
+        .iter()
+        .map(|route| {
+            cohorts
+                .get(&route.route_id)
+                .map(|cohort| (route.writer_fragment_id, *cohort))
+                .ok_or_else(|| {
+                    "sealed change-stream writer route has no activated provider cohort".to_string()
+                })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_dml_change_stream_write(
     state: &DmlExecutionKernel,
@@ -381,7 +426,11 @@ fn compile_dml_change_stream_write(
         );
     let table_bindings = analyzer_provider.query_table_bindings();
     let mut routes = Vec::new();
-    for route in preparations.routes() {
+    // The write target ordinal is this route's position in the sealed route
+    // set. Before NCP-6 the plan builder derived exactly the same value from
+    // the route's index internally; stating it here changes nothing about which
+    // writer a branch feeds, it only makes the identity explicit on the wire.
+    for (route_index, route) in preparations.routes().iter().enumerate() {
         let target_binding = admit_prepared_frozen_connector_write_target(
             table_bindings.as_ref(),
             FrozenConnectorScanIdentity::new(
@@ -417,7 +466,7 @@ fn compile_dml_change_stream_write(
             .collect();
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
-            cohort_id: route.cohort_id(),
+            write_target_ordinal: change_stream_write_target_ordinal(route_index)?,
             accepted_effects: route.accepted_effects().to_vec(),
             input_fields,
             partition_input_tokens: route.partition_fields().to_vec(),
@@ -1268,10 +1317,12 @@ pub(crate) fn stage_prepared_update_mutation(
                 sealed_cohorts: activated_sealed,
                 registration_error,
             } = preparations.activate_write(&write_lease, &connector_context)?;
+            let cohort_fence = writer_fragment_cohorts(&planned.writer_routes, &preparations)?;
             let execution_handle = Arc::new(MorUpdateChangeStreamExecutor {
                 state: state.clone(),
                 target: target.clone(),
                 planned: Mutex::new(Some(planned)),
+                writer_fragment_cohorts: cohort_fence,
                 write_registration,
                 registration_error,
                 execution,
@@ -1595,6 +1646,12 @@ struct MorUpdateChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
+    /// The legacy terminal-sink fence, paired with the activation that signed
+    /// it while both were still in scope.
+    writer_fragment_cohorts: Vec<(
+        novarocks_sql::plan_read::FragmentId,
+        novarocks_spi::connector::ConnectorWriteCohortId,
+    )>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
     registration_error: Option<String>,
@@ -1613,6 +1670,12 @@ struct MorMergeChangeStreamExecutor {
     state: DmlExecutionKernel,
     target: crate::catalog_application::resolver::TargetBackend,
     planned: Mutex<Option<crate::query_execution::compiler::PlannedIcebergChangeStreamWrite>>,
+    /// The legacy terminal-sink fence, paired with the activation that signed
+    /// it while both were still in scope.
+    writer_fragment_cohorts: Vec<(
+        novarocks_sql::plan_read::FragmentId,
+        novarocks_spi::connector::ConnectorWriteCohortId,
+    )>,
     write_registration:
         Option<crate::query_execution::contract::ConnectorWriteOperationRegistration>,
     registration_error: Option<String>,
@@ -1654,21 +1717,20 @@ impl MorUpdateChangeStreamExecutor {
             .ok_or_else(|| "MOR UPDATE change-stream plan was already consumed".to_string())?;
         let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             encoding,
-            writer_routes,
+            // The sealed routes are read only by the build observer; the fence
+            // this stage submits was paired with its activation at construction.
+            writer_routes: _writer_routes,
             ..
         } = planned;
         #[cfg(test)]
         if let Some(result) =
             crate::query_execution::compiler::observe_change_stream_write_build_for_test(
-                &writer_routes,
+                &_writer_routes,
             )
         {
             return Ok(result);
         }
-        let writer_fragment_cohorts = writer_routes
-            .iter()
-            .map(|route| (route.writer_fragment_id, route.cohort_id))
-            .collect::<Vec<_>>();
+        let writer_fragment_cohorts = self.writer_fragment_cohorts.clone();
         let native_bundle = native_encoder.encode(&encoding)?;
         if !encoding.matches_native_attachment(&native_bundle) {
             return Err(
@@ -1777,21 +1839,20 @@ impl MorMergeChangeStreamExecutor {
             .ok_or_else(|| "MOR MERGE change-stream plan was already consumed".to_string())?;
         let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             encoding,
-            writer_routes,
+            // The sealed routes are read only by the build observer; the fence
+            // this stage submits was paired with its activation at construction.
+            writer_routes: _writer_routes,
             ..
         } = planned;
         #[cfg(test)]
         if let Some(result) =
             crate::query_execution::compiler::observe_change_stream_write_build_for_test(
-                &writer_routes,
+                &_writer_routes,
             )
         {
             return Ok(result);
         }
-        let writer_fragment_cohorts = writer_routes
-            .iter()
-            .map(|route| (route.writer_fragment_id, route.cohort_id))
-            .collect::<Vec<_>>();
+        let writer_fragment_cohorts = self.writer_fragment_cohorts.clone();
         let native_bundle = native_encoder.encode(&encoding)?;
         if !encoding.matches_native_attachment(&native_bundle) {
             return Err(
@@ -3374,10 +3435,12 @@ pub(crate) fn stage_prepared_merge_mutation(
             sealed_cohorts: activated_sealed,
             registration_error,
         } = preparations.activate_write(&write_lease, &connector_context)?;
+        let cohort_fence = writer_fragment_cohorts(&planned.writer_routes, &preparations)?;
         let execution_handle = Arc::new(MorMergeChangeStreamExecutor {
             state: state.clone(),
             target: target.clone(),
             planned: Mutex::new(Some(planned)),
+            writer_fragment_cohorts: cohort_fence,
             write_registration,
             registration_error,
             execution,

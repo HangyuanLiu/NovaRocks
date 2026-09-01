@@ -130,8 +130,11 @@ impl ChangeStreamRouterRouteRead<'_> {
         self.0.route_id
     }
 
-    pub fn cohort_id(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        self.0.cohort_id
+    /// The dense, query-local logical write target this branch feeds.
+    pub const fn write_target_ordinal(
+        &self,
+    ) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        self.0.write_target_ordinal
     }
 
     pub fn accepted_effects(&self) -> &[ConnectorRowMutationEffect] {

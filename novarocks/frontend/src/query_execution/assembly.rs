@@ -906,9 +906,9 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorWriteCohortId,
-        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriteRouteId,
-        ConnectorWriterHandle, ConnectorWriterIdentity, ProviderBindingEpoch,
+        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorWriteExecutionId,
+        ConnectorWriteOperationId, ConnectorWriteRouteId, ConnectorWriterHandle,
+        ConnectorWriterIdentity, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -965,9 +965,7 @@ mod tests {
                             }),
                             destinations: None,
                             route_id: vec![7; 32],
-                            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32])
-                                .to_bytes()
-                                .to_vec(),
+                            write_target_ordinal: 0,
                             accepted_effects: vec![native_plan::RowMutationEffect::Delete as i32],
                             input_ordinals: vec![0],
                         }],

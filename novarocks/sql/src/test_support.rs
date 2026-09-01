@@ -64,8 +64,8 @@ use crate::planner::table::{
     SqlMvTargetStateScan, SqlScanKind, SqlTableVersionSelector, TableDef, test_sql_scan_source,
 };
 use novarocks_spi::connector::{
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-    ConnectorWriteFieldToken, ConnectorWriteRouteId,
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+    ConnectorWriteRouteId,
 };
 
 /// Closed fixture catalog for native encoder consumers.
@@ -195,6 +195,14 @@ pub enum NativeWriteDataflowFixture {
 
 /// Build one sealed NCP-6 dataflow write plan through the production builder
 /// and the production seal path.
+/// The dense, query-local write target ordinal a fixture branch feeds.
+fn write_target_ordinal_for_test(
+    value: u32,
+) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value)
+        .expect("bounded write target ordinal")
+}
+
 pub fn native_write_dataflow_plan(
     fixture: NativeWriteDataflowFixture,
 ) -> Result<DistributedPlan, String> {
@@ -260,12 +268,13 @@ fn native_change_stream_table_writer_plan() -> Result<DistributedPlan, String> {
         Default::default(),
     );
     let route = |route_byte: u8,
+                 write_target_ordinal: u32,
                  effects: Vec<ConnectorRowMutationEffect>,
                  input_ordinal: u32,
                  output_partition_ordinals: Vec<usize>| {
         ChangeStreamWriteRouteSpec {
             route_id: ConnectorWriteRouteId::from_bytes([route_byte; 32]),
-            cohort_id: ConnectorWriteCohortId::from_bytes([route_byte.wrapping_add(1); 32]),
+            write_target_ordinal: write_target_ordinal_for_test(write_target_ordinal),
             accepted_effects: effects,
             input_ordinals: vec![ConnectorMutationRouteInput::new(
                 ConnectorWriteFieldToken::from_bytes([route_byte.wrapping_add(2); 32]),
@@ -278,8 +287,14 @@ fn native_change_stream_table_writer_plan() -> Result<DistributedPlan, String> {
     let dag = ChangeStreamWriteDagSpec {
         effect_output_ordinal: 0,
         routes: vec![
-            route(7, vec![ConnectorRowMutationEffect::Delete], 1, vec![1]),
-            route(8, vec![ConnectorRowMutationEffect::Replace], 2, Vec::new()),
+            route(7, 0, vec![ConnectorRowMutationEffect::Delete], 1, vec![1]),
+            route(
+                8,
+                1,
+                vec![ConnectorRowMutationEffect::Replace],
+                2,
+                Vec::new(),
+            ),
         ],
     };
     finalize_sql_change_stream_table_writer_finish_test_plan(draft, dag)
@@ -747,7 +762,7 @@ fn native_change_stream_router_plan() -> Result<DistributedPlan, String> {
             effect_output_ordinal: 0,
             routes: vec![ChangeStreamRoute {
                 route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-                cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+                write_target_ordinal: write_target_ordinal_for_test(0),
                 accepted_effects: vec![ConnectorRowMutationEffect::Delete],
                 input_ordinals: vec![ConnectorMutationRouteInput::new(
                     ConnectorWriteFieldToken::from_bytes([9; 32]),
@@ -1604,7 +1619,7 @@ fn native_router_stream_plan() -> Result<DistributedPlan, String> {
         effect_output_ordinal: 0,
         routes: vec![ChangeStreamWriteRouteSpec {
             route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32]),
+            write_target_ordinal: write_target_ordinal_for_test(0),
             accepted_effects: vec![ConnectorRowMutationEffect::Delete],
             input_ordinals: vec![ConnectorMutationRouteInput::new(
                 ConnectorWriteFieldToken::from_bytes([9; 32]),

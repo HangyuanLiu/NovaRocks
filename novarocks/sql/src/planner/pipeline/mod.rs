@@ -83,6 +83,7 @@ pub(crate) fn build_connector_write_distributed_plan(
 pub(crate) fn build_connector_write_dataflow_plan(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::sink::ConnectorWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -90,7 +91,9 @@ pub(crate) fn build_connector_write_dataflow_plan(
         settings,
     );
     crate::planner::distributed::write::plan::build_table_writer_finish_distributed_plan(
-        &physical, sink,
+        &physical,
+        sink,
+        write_target_ordinal,
     )
 }
 
@@ -113,6 +116,7 @@ pub(crate) fn build_sql_write_distributed_plan_with_settings(
 pub(crate) fn build_sql_write_dataflow_plan_with_settings(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
@@ -120,7 +124,9 @@ pub(crate) fn build_sql_write_dataflow_plan_with_settings(
         settings,
     );
     crate::planner::distributed::write::plan::build_sql_table_writer_finish_distributed_plan(
-        &physical, sink,
+        &physical,
+        sink,
+        write_target_ordinal,
     )
 }
 

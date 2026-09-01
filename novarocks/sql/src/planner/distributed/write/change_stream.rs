@@ -23,9 +23,10 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-    ConnectorWriteFieldToken, ConnectorWriteRouteId,
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+    ConnectorWriteRouteId,
 };
 
 use crate::analysis::OutputColumn;
@@ -39,7 +40,9 @@ use super::contract::SqlWritePlanInput;
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteLayoutRoute {
     pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) cohort_id: ConnectorWriteCohortId,
+    /// The dense, query-local logical write target this branch feeds. It is the
+    /// branch's identity inside one sealed plan.
+    pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     /// In provider input-field order, map each token to a producer output
     /// ordinal. SQL never recovers that mapping from an internal column name.
@@ -62,7 +65,7 @@ pub(crate) struct ChangeStreamWriteLayoutRequest<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamWriteRouteSpec {
     pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
     pub(crate) output_partition_ordinals: Vec<usize>,
@@ -85,7 +88,7 @@ pub struct ChangeStreamRouterSink {
 #[derive(Clone, Debug)]
 pub(crate) struct ChangeStreamRoute {
     pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
     pub(crate) target_fragment_id: FragmentId,
@@ -101,7 +104,7 @@ pub(crate) struct SqlChangeStreamWriteTopology {
 #[derive(Clone, Debug)]
 pub(crate) struct SqlChangeStreamWriterRoute {
     pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) cohort_id: ConnectorWriteCohortId,
+    pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) writer_fragment_id: FragmentId,
     #[allow(
@@ -133,9 +136,21 @@ pub(crate) fn validate_route_set(routes: &[ChangeStreamWriteRouteSpec]) -> Resul
         return Err("row-mutation router requires at least one route".to_string());
     }
     let mut route_ids = BTreeSet::new();
-    for route in routes {
+    for (index, route) in routes.iter().enumerate() {
         if !route_ids.insert(route.route_id) {
             return Err("row-mutation router contains a duplicate opaque route id".to_string());
+        }
+        // The router's branch order *is* the write target order: branch `i`
+        // streams into the writer this DAG will give ordinal `i`, and the finish
+        // node expects exactly `0..routes.len()`. A permuted or gapped set would
+        // still build a legal-looking plan whose rows reach the wrong writer, so
+        // the disagreement is refused here rather than discovered as data.
+        if !usize::try_from(route.write_target_ordinal.get()).is_ok_and(|value| value == index) {
+            return Err(format!(
+                "row-mutation route {index} carries write target ordinal {} but the router's \
+                 write targets are dense from zero in route order",
+                route.write_target_ordinal.get()
+            ));
         }
         validate_effects(&route.accepted_effects)?;
         validate_input_ordinals(&route.input_ordinals)?;
@@ -195,13 +210,18 @@ pub(crate) fn bind_change_stream_write_layout(
             .collect::<Result<Vec<_>, _>>()?;
         routes.push(ChangeStreamWriteRouteSpec {
             route_id: route.route_id,
-            cohort_id: route.cohort_id,
+            write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             input_ordinals: route.input_ordinals,
             output_partition_ordinals,
             sink: route.sink,
         });
     }
+    // A begin session's targets are dense but not necessarily handed over in
+    // ordinal order, and the router's branch order is what the finish node's
+    // expected ordinals are built from. Ordering here makes the two agree
+    // without asking every caller to remember it.
+    routes.sort_by_key(|route| route.write_target_ordinal);
 
     let dag = ChangeStreamWriteDagSpec {
         effect_output_ordinal: request.effect_output_ordinal,
@@ -297,10 +317,22 @@ mod tests {
         ]
     }
 
+    fn ordinal(value: u32) -> WriteTargetOrdinal {
+        WriteTargetOrdinal::try_new(value).expect("bounded ordinal")
+    }
+
     fn route(byte: u8, effects: Vec<ConnectorRowMutationEffect>) -> ChangeStreamWriteLayoutRoute {
+        route_at(byte, 0, effects)
+    }
+
+    fn route_at(
+        byte: u8,
+        write_target_ordinal: u32,
+        effects: Vec<ConnectorRowMutationEffect>,
+    ) -> ChangeStreamWriteLayoutRoute {
         ChangeStreamWriteLayoutRoute {
             route_id: ConnectorWriteRouteId::from_bytes([byte; 32]),
-            cohort_id: ConnectorWriteCohortId::from_bytes([byte.wrapping_add(1); 32]),
+            write_target_ordinal: ordinal(write_target_ordinal),
             accepted_effects: effects,
             input_ordinals: vec![ConnectorMutationRouteInput::new(
                 ConnectorWriteFieldToken::from_bytes([byte; 32]),
@@ -317,8 +349,8 @@ mod tests {
             producer_output_columns: &output_columns(),
             effect_output_ordinal: 1,
             routes: vec![
-                route(1, vec![ConnectorRowMutationEffect::Replace]),
-                route(2, vec![ConnectorRowMutationEffect::Replace]),
+                route_at(1, 0, vec![ConnectorRowMutationEffect::Replace]),
+                route_at(2, 1, vec![ConnectorRowMutationEffect::Replace]),
             ],
         })
         .expect("replace fanout is valid");
@@ -336,8 +368,8 @@ mod tests {
             producer_output_columns: &output_columns(),
             effect_output_ordinal: 1,
             routes: vec![
-                route(1, vec![ConnectorRowMutationEffect::Delete]),
-                route(1, vec![ConnectorRowMutationEffect::Insert]),
+                route_at(1, 0, vec![ConnectorRowMutationEffect::Delete]),
+                route_at(1, 1, vec![ConnectorRowMutationEffect::Insert]),
             ],
         })
         .expect_err("duplicate route id");
@@ -355,5 +387,50 @@ mod tests {
         })
         .expect_err("foreign partition token");
         assert!(error.contains("partition token is not bound"));
+    }
+
+    /// A begin session may hand its targets over in any order. Binding puts the
+    /// router's branches back into write-target order so branch `i` is the
+    /// writer the finish node will expect at ordinal `i`.
+    #[test]
+    fn bind_layout_orders_routes_by_write_target_ordinal() {
+        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![
+                route_at(2, 1, vec![ConnectorRowMutationEffect::Insert]),
+                route_at(1, 0, vec![ConnectorRowMutationEffect::Delete]),
+            ],
+        })
+        .expect("routes are dense even though they arrived out of order");
+        assert_eq!(
+            dag.routes
+                .iter()
+                .map(|route| route.write_target_ordinal.get())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            dag.routes[0].route_id,
+            ConnectorWriteRouteId::from_bytes([1; 32])
+        );
+    }
+
+    /// A gapped target set means the session and the plan disagree about which
+    /// writers exist; routing rows against it would silently feed the wrong
+    /// branch, so it fails at bind.
+    #[test]
+    fn bind_layout_rejects_a_write_target_ordinal_outside_the_dense_set() {
+        let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![
+                route_at(1, 0, vec![ConnectorRowMutationEffect::Delete]),
+                route_at(2, 7, vec![ConnectorRowMutationEffect::Insert]),
+            ],
+        })
+        .expect_err("gapped write target ordinals");
+        assert!(error.contains("write target ordinal 7"), "{error}");
+        assert!(error.contains("dense from zero in route order"), "{error}");
     }
 }

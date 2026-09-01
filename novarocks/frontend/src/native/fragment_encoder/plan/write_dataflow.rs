@@ -74,6 +74,21 @@ impl SealedWriteTargets {
     pub fn ordinals(&self) -> impl Iterator<Item = u32> + '_ {
         self.handles.keys().copied()
     }
+
+    /// The one target this session sealed, for a plan shape that has exactly one
+    /// writer. A single-writer plan cannot express a session with several
+    /// targets, so a session that sealed more than one is refused here rather
+    /// than silently having its extra targets written by nobody.
+    pub fn sole_target_ordinal(&self) -> Result<WriteTargetOrdinal, String> {
+        let mut ordinals = self.handles.keys().copied();
+        let (Some(ordinal), None) = (ordinals.next(), ordinals.next()) else {
+            return Err(format!(
+                "a single-writer plan requires a write session with exactly one target, but the session sealed {}",
+                self.handles.len()
+            ));
+        };
+        WriteTargetOrdinal::try_new(ordinal).map_err(|error| error.to_string())
+    }
 }
 
 pub(super) fn encode_table_writer_node(
@@ -303,5 +318,34 @@ mod tests {
             .expect("one finish node");
         let encoded = encode_table_finish_node(finish);
         assert_eq!(encoded.expected_target_ordinals, vec![0, 1]);
+    }
+
+    #[test]
+    fn a_single_writer_plan_reads_its_target_ordinal_off_the_session() {
+        let targets =
+            SealedWriteTargets::new(catalog_handle(), BTreeMap::from([(3, handle_for(3))]));
+        assert_eq!(
+            targets
+                .sole_target_ordinal()
+                .expect("one sealed target is a sole target")
+                .get(),
+            3,
+            "the ordinal must come from the session, not from the plan's position"
+        );
+    }
+
+    #[test]
+    fn a_single_writer_plan_refuses_a_session_that_sealed_several_targets() {
+        let targets = SealedWriteTargets::new(
+            catalog_handle(),
+            BTreeMap::from([(0, handle_for(0)), (1, handle_for(1))]),
+        );
+        let error = targets
+            .sole_target_ordinal()
+            .expect_err("a two-target session cannot be served by one writer");
+        assert!(
+            error.contains("exactly one target") && error.contains('2'),
+            "the refusal must name the disagreement it found: {error}"
+        );
     }
 }

@@ -341,10 +341,12 @@ pub fn compile_mv_first_refresh_connector_write(
 pub fn compile_mv_first_refresh_connector_write_dataflow(
     analyzed: SqlMvFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
         analyzed.sink,
+        write_target_ordinal,
         &analyzed.settings,
     )
 }
@@ -464,10 +466,12 @@ pub fn compile_join_first_refresh_connector_write(
 pub fn compile_join_first_refresh_connector_write_dataflow(
     analyzed: SqlMvJoinFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
         analyzed.sink,
+        write_target_ordinal,
         &analyzed.settings,
     )
 }

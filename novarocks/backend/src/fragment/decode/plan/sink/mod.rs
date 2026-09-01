@@ -35,6 +35,7 @@ use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as native_proto;
 use novarocks_proto_models::{common, expr, plan};
+use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
     ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorRowMutationEffect,
     ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
@@ -760,6 +761,51 @@ fn decode_output_slot_ids(
         .collect()
 }
 
+/// Decode every branch's logical write target and check it against the set this
+/// plan sealed.
+///
+/// A change-stream router's branches are exactly the plan's logical write
+/// targets, dense from zero. An ordinal outside that set names a writer this
+/// plan does not contain, and the rows routed to it would be staged against the
+/// wrong writer handle -- or none -- with nothing downstream able to notice. It
+/// is refused here, at the wire boundary, with the exact field that carried it.
+fn decode_router_write_target_ordinals(
+    router: &plan::ChangeStreamRouterSink,
+) -> Result<(), NativeFragmentLeafDecodeError> {
+    let sealed_target_count = router.routes.len();
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, branch) in router.routes.iter().enumerate() {
+        let at = |kind, message: String| {
+            NativeFragmentLeafDecodeError::at_field(kind, "write_target_ordinal", message)
+                .prepend_index(index)
+                .prepend_field("routes")
+        };
+        let ordinal = WriteTargetOrdinal::try_new(branch.write_target_ordinal)
+            .map_err(|error| at(ProtocolErrorKind::InvalidValue, error.to_string()))?;
+        if usize::try_from(ordinal.get()).is_ok_and(|value| value < sealed_target_count) {
+            if !seen.insert(ordinal) {
+                return Err(at(
+                    ProtocolErrorKind::InconsistentFields,
+                    format!(
+                        "native CHANGE_STREAM_ROUTER_SINK repeats write target ordinal {}",
+                        ordinal.get()
+                    ),
+                ));
+            }
+            continue;
+        }
+        return Err(at(
+            ProtocolErrorKind::InvalidValue,
+            format!(
+                "native CHANGE_STREAM_ROUTER_SINK route write target ordinal {} is outside the \
+                 sealed set of {sealed_target_count} write targets",
+                branch.write_target_ordinal
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn decode_change_stream_router_program(
     router: &plan::ChangeStreamRouterSink,
     output_exprs: &[expr::Expr],
@@ -779,6 +825,7 @@ fn decode_change_stream_router_program(
             error,
         )
     })?;
+    decode_router_write_target_ordinals(router)?;
     let mut partition_arena = ExprArena::default();
     let branches = router
         .routes
@@ -1568,6 +1615,88 @@ mod tests {
         assert_eq!(
             protocol.detail(),
             "native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: 1"
+        );
+    }
+
+    /// The router's branches are the plan's logical write targets. A branch
+    /// naming a target this plan never sealed would stage its rows against the
+    /// wrong writer handle, so decode refuses it and says which field carried
+    /// the value.
+    #[test]
+    fn router_write_target_ordinal_outside_the_sealed_set_uses_exact_indexed_path() {
+        let error = decode_fragment_sink_program(
+            &router_fragment(plan::ChangeStreamBranchRoute {
+                route_id: vec![1; 32],
+                accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                input_ordinals: vec![0],
+                write_target_ordinal: 3,
+                ..Default::default()
+            }),
+            &Layout::default(),
+        )
+        .expect_err("a write target outside the sealed set must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[0].write_target_ordinal"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            protocol.detail(),
+            concat!(
+                "native CHANGE_STREAM_ROUTER_SINK route write target ordinal 3 ",
+                "is outside the sealed set of 1 write targets"
+            )
+        );
+    }
+
+    /// Two branches claiming one write target make the plan's target map
+    /// ambiguous and leave one sealed writer with no branch at all.
+    #[test]
+    fn router_repeated_write_target_ordinal_is_rejected() {
+        let fragment = plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
+                    plan::ChangeStreamRouterSink {
+                        routes: vec![
+                            plan::ChangeStreamBranchRoute {
+                                route_id: vec![1; 32],
+                                accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+                                input_ordinals: vec![0],
+                                write_target_ordinal: 0,
+                                ..Default::default()
+                            },
+                            plan::ChangeStreamBranchRoute {
+                                route_id: vec![2; 32],
+                                accepted_effects: vec![plan::RowMutationEffect::Delete as i32],
+                                input_ordinals: vec![0],
+                                write_target_ordinal: 0,
+                                ..Default::default()
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                )),
+            }),
+            output_columns: vec![common::OutputColumn {
+                column_id: 1,
+                name: "effect".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+            .expect_err("a repeated write target must fail");
+        let protocol = error.protocol().expect("typed protocol error");
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.sink.change_stream_router.routes[1].write_target_ordinal"
+        );
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+        assert_eq!(
+            protocol.detail(),
+            "native CHANGE_STREAM_ROUTER_SINK repeats write target ordinal 0"
         );
     }
 }
