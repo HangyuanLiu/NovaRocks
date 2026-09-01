@@ -17,7 +17,7 @@
 
 mod be_log_directive;
 pub mod benchmark;
-mod benchmark_bootstrap;
+pub(crate) mod benchmark_bootstrap;
 mod cluster;
 mod config;
 mod extension_manifest;
@@ -379,7 +379,7 @@ fn expected_engine_error_code_diff_result(
     name = "novarocks-sql-test",
     about = "Run SQL correctness tests for suite directories under tests/sql/correctness/"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Suite name(s), comma-separated.  Use "all" to run every discovered suite.
     #[arg(long, required_unless_present_any = ["list_extensions", "list_suites"])]
     suite: Option<String>,
@@ -498,6 +498,18 @@ struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
+
+    /// Internal machine-readable case timing output used by the benchmark lane.
+    #[arg(long, hide = true)]
+    case_timing_output: Option<String>,
+
+    /// Internal fixture warehouse override used by the benchmark lane.
+    #[arg(long, hide = true)]
+    benchmark_warehouse: Option<String>,
+
+    /// Internal destination for per-query EXPLAIN ANALYZE benchmark profiles.
+    #[arg(long, hide = true)]
+    benchmark_profile_dir: Option<String>,
 
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
@@ -629,6 +641,7 @@ struct SuiteRunContext {
     fail_fast: bool,
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
+    benchmark_profile_dir: Option<PathBuf>,
 }
 
 struct CaseOutcome {
@@ -1853,6 +1866,27 @@ fn finish_expected_error_step(
 // Per-case execution
 // ---------------------------------------------------------------------------
 
+fn benchmark_profile_statement(sql: &str, enabled: bool) -> String {
+    if enabled {
+        format!("EXPLAIN ANALYZE {sql}")
+    } else {
+        sql.to_string()
+    }
+}
+
+fn write_benchmark_profile(
+    dir: &PathBuf,
+    case_id: &str,
+    query_number: usize,
+    execution: &QueryExecution,
+) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create benchmark profile directory {}", dir.display()))?;
+    let path = dir.join(format!("{case_id}.{query_number}.profile.txt"));
+    fs::write(&path, &execution.text_output)
+        .with_context(|| format!("write benchmark profile {}", path.display()))
+}
+
 fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOutcome {
     let mut log = String::with_capacity(2048);
 
@@ -2349,6 +2383,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let mut passed_execution: Option<QueryExecution> = None;
                 let mut last_execution: Option<QueryExecution> = None;
                 let mut last_failure = String::new();
+                let target_sql = benchmark_profile_statement(
+                    &step.sql,
+                    ctx.benchmark_profile_dir.is_some() && !shell::is_shell_step(&step.sql),
+                );
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
@@ -2383,7 +2421,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &ctx.server_handle,
                             &mut target_session,
                             ctx.query_timeout,
-                            &step.sql,
+                            &target_sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
                         )
@@ -2534,6 +2572,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         }
                     }
                 } else if let Some(execution) = passed_execution {
+                    if let Some(profile_dir) = ctx.benchmark_profile_dir.as_ref()
+                        && let Err(error) = write_benchmark_profile(
+                            profile_dir,
+                            &case.case_id,
+                            step.query_number,
+                            &execution,
+                        )
+                    {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ {error:#}");
+                        continue;
+                    }
                     if let Err(error) = restart_frontend_after_step(
                         step,
                         &ctx.server_handle,
@@ -3527,6 +3577,26 @@ fn format_case_timings(timings: &[CaseTiming]) -> String {
     out
 }
 
+fn write_case_timing_csv(path: &std::path::Path, timings: &[CaseTiming]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("case timing output path must have a parent directory")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create case timing output directory {}", parent.display()))?;
+    let mut csv = String::from("suite,case,status,elapsed_seconds\n");
+    for timing in timings {
+        let _ = writeln!(
+            csv,
+            "{},{},{},{:.9}",
+            timing.suite_name,
+            timing.case_id,
+            case_status_label(timing.status),
+            timing.elapsed.as_secs_f64(),
+        );
+    }
+    fs::write(path, csv).with_context(|| format!("write case timings to {}", path.display()))
+}
+
 fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
     cases
         .iter()
@@ -3933,7 +4003,7 @@ fn selected_cases_require_cleanup_faults(
 // ---------------------------------------------------------------------------
 
 pub fn run_correctness() -> Result<()> {
-    let exit_code = run()?;
+    let exit_code = run_cli(Cli::parse(), TestLane::Correctness, "correctness")?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -3983,12 +4053,14 @@ fn finish_run_with_server_cleanup(
     }
 }
 
-fn run() -> Result<i32> {
-    let cli = Cli::parse();
+pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
-    let suite_configs = build_suite_configs(&base_dir, TestLane::Correctness)?;
+    let suite_configs = build_suite_configs(&base_dir, lane)?;
     if suite_configs.is_empty() {
-        println!("❌ ERROR: no suite directories found under tests/sql/correctness");
+        println!(
+            "❌ ERROR: no suite directories found under {}",
+            lane.suite_root(&base_dir).display()
+        );
         return Ok(1);
     }
 
@@ -4013,6 +4085,12 @@ fn run() -> Result<i32> {
 
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let mut runner_config = load_runner_config(config_path.as_deref())?;
+    if let Some(warehouse) = cli.benchmark_warehouse.as_deref() {
+        runner_config.values.insert(
+            "benchmark_iceberg_catalog_warehouse".to_string(),
+            warehouse.to_string(),
+        );
+    }
 
     let suite_names = match select_suite_names(
         cli.suite
@@ -4462,8 +4540,9 @@ fn run() -> Result<i32> {
             // Print suite header
             println!("{}", "=".repeat(72));
             println!(
-                "📋 {} correctness runner (jobs={})",
+                "📋 {} {} runner (jobs={})",
                 suite.name.to_uppercase(),
+                lane_label,
                 jobs
             );
             println!("{}", "=".repeat(72));
@@ -4567,6 +4646,10 @@ fn run() -> Result<i32> {
                 fail_fast: cli.fail_fast,
                 server_handle: Arc::clone(&server_handle),
                 publication_catalog_control: publication_catalog_control.clone(),
+                benchmark_profile_dir: resolve_path(
+                    cli.benchmark_profile_dir.as_deref(),
+                    &base_dir,
+                ),
             };
 
             prepared_suites.push(PreparedSuite {
@@ -4684,6 +4767,9 @@ fn run() -> Result<i32> {
                 .then_with(|| b.elapsed.cmp(&a.elapsed))
                 .then_with(|| a.case_id.cmp(&b.case_id))
         });
+        if let Some(path) = cli.case_timing_output.as_deref() {
+            write_case_timing_csv(PathBuf::from(path).as_path(), &all_case_timings)?;
+        }
         print!("{}", format_case_timings(&all_case_timings));
 
         if !all_failed_cases.is_empty() {

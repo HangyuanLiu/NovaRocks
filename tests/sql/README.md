@@ -70,6 +70,28 @@ The runner defaults to `tests/sql/runner/conf/default.toml` when no explicit
 `--config` is provided. Suites that need an Iceberg fixture should
 pass the generated environment config or an explicit fixture config.
 
+## Benchmark Flow
+
+Benchmarks are deliberately separate from correctness suites. Use the local
+wrapper, which builds the release server binary and defaults to SSB:
+
+```bash
+tools/benchmark/run-sql-benchmark.sh
+```
+
+Pass benchmark-runner options after the script name to choose a workload or an
+output location:
+
+```bash
+tools/benchmark/run-sql-benchmark.sh --suite tpc-ds
+tools/benchmark/run-sql-benchmark.sh --suite all --output-dir /tmp/novarocks-benchmarks
+```
+
+The benchmark runner resolves the fixed shared fixture before any suite hook.
+It verifies results, performs one warmup pass, records five serial measured
+passes, and captures a profile pass. Generated reports go to
+`reports/sql-benchmarks/` and do not belong in correctness CI.
+
 ## Explicit Iceberg Config
 
 For Docker-backed Iceberg suites, prefer the generated fixture config:
