@@ -31,7 +31,10 @@ pub mod runtime_filter;
 pub mod scan;
 pub mod set_op;
 pub mod sort;
+pub mod table_finish;
 pub mod table_function;
+pub mod table_write_relation;
+pub mod table_writer;
 pub mod union_all;
 pub mod values;
 
@@ -54,17 +57,22 @@ use crate::exec::node::repeat::RepeatNode;
 use crate::exec::node::scan::ScanNode;
 use crate::exec::node::set_op::SetOpNode;
 use crate::exec::node::sort::SortNode;
+use crate::exec::node::table_finish::TableFinishNode;
 use crate::exec::node::table_function::TableFunctionNode;
+use crate::exec::node::table_writer::TableWriterNode;
 use crate::exec::node::union_all::UnionAllNode;
 use crate::exec::node::values::ValuesNode;
 
 pub type ExecResult = Result<Chunk, String>;
 pub type BoxedExecIter = Box<dyn Iterator<Item = ExecResult> + Send>;
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Execution nodes intentionally retain typed plans inline to avoid indirection during lowering."
-)]
+// Execution nodes intentionally retain typed plans inline rather than boxing
+// them, so lowering never pays for indirection. That used to trip
+// `large_enum_variant` and carried an `expect` for it; adding `TableWriter`
+// narrowed the gap between the largest and second-largest variant enough that
+// the lint no longer fires, so there is nothing left to suppress. If a later
+// change makes it fire again, re-add the expectation with a fresh reason rather
+// than blanket-allowing it.
 #[derive(Clone, Debug)]
 pub enum ExecNodeKind {
     AssertNumRows(AssertNumRowsNode),
@@ -87,6 +95,10 @@ pub enum ExecNodeKind {
     Analytic(AnalyticNode),
     SetOp(SetOpNode),
     RuntimeFilterConsumer(runtime_filter::RuntimeFilterConsumerNode),
+    /// A normal unary processor with output: one writer per pipeline driver.
+    TableWriter(TableWriterNode),
+    /// The single-driver bounded aggregation of one distributed write.
+    TableFinish(TableFinishNode),
 }
 
 #[derive(Clone, Debug)]

@@ -77,8 +77,8 @@ use crate::exec::operators::{
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
     LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
     ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
-    TableFunctionProcessorFactory, UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory,
-    ValuesSourceFactory,
+    TableFinishOperatorFactory, TableFunctionProcessorFactory, TableWriterOperatorFactory,
+    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -651,6 +651,12 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         }
         ExecNodeKind::Analytic(analytic) => Some(Arc::clone(&analytic.output_chunk_schema)),
         ExecNodeKind::SetOp(set_op) => Some(Arc::clone(&set_op.output_chunk_schema)),
+        ExecNodeKind::TableWriter(_) => {
+            Some(crate::exec::node::table_write_relation::writer_relation_chunk_schema())
+        }
+        ExecNodeKind::TableFinish(_) => {
+            Some(crate::exec::node::table_write_relation::root_relation_chunk_schema())
+        }
     }
 }
 
@@ -1974,6 +1980,32 @@ fn build_pipeline_for_node(
                 extra_pipelines: Vec::new(),
                 stream: StreamDesc::any(ctx.pipeline_dop),
             })
+        }
+        ExecNodeKind::TableWriter(node) => {
+            // A table writer is an ordinary unary processor: every driver of the
+            // upstream pipeline keeps writing at its own degree of parallelism
+            // and reports what it wrote downstream. No gather, no shared state.
+            let mut build = build_pipeline_for_node(&node.input, ctx)?;
+            build
+                .pipeline
+                .factories
+                .push(Box::new(TableWriterOperatorFactory::new(node)));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
+        ExecNodeKind::TableFinish(node) => {
+            // A prepared write set is complete or it does not exist, so exactly
+            // one driver must see every writer row. Gather the local drivers
+            // into one before the finish operator is installed; the remote
+            // senders are already gathered by the Exchange above this node.
+            let build = build_pipeline_for_node(&node.input, ctx)?;
+            let mut build = gather_to_one(build, ctx, node.node_id);
+            build
+                .pipeline
+                .factories
+                .push(Box::new(TableFinishOperatorFactory::new(node)));
+            build.stream = StreamDesc::single();
+            Ok(build)
         }
         ExecNodeKind::Fetch(fetch) => {
             let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;

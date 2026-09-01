@@ -429,6 +429,8 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::Analytic(node) => node.node_id,
         ExecNodeKind::SetOp(node) => node.node_id,
         ExecNodeKind::RuntimeFilterConsumer(node) => node.owner_node_id,
+        ExecNodeKind::TableWriter(node) => node.node_id,
+        ExecNodeKind::TableFinish(node) => node.node_id,
     }
 }
 
