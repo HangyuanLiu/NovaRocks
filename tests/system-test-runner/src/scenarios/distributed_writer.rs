@@ -44,7 +44,10 @@ const WRITER_TOTALS: &str = "novarocks_backend_connector_write_writer_totals";
 const ROOT_PEAK: &str = "novarocks_backend_connector_write_root_prepared_set_peak";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(DistributedWriterDataflow)]
+    vec![
+        Box::new(DistributedWriterDataflow),
+        Box::new(DistributedWriterFaults),
+    ]
 }
 
 /// One backend-count-wide observation of the write data plane.
@@ -205,6 +208,86 @@ impl Scenario for DistributedWriterDataflow {
         }
 
         await_resource_convergence(context, &baseline, "distributed writer dataflow")?;
+        Ok(())
+    }
+}
+
+/// A failed write must leave nothing behind.
+///
+/// This is the claim the whole dual barrier exists to make: whatever goes wrong
+/// in the data plane, the connector is never asked to commit, so no snapshot
+/// appears. Asserting it needs a real cluster because the failure has to happen
+/// on a backend while the frontend is deciding.
+struct DistributedWriterFaults;
+
+impl Scenario for DistributedWriterFaults {
+    fn name(&self) -> &'static str {
+        "connector/distributed-writer-faults"
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_launch_config())
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect distributed writer fault control session")?,
+        )?;
+
+        const CATALOG: &str = "distributed_writer_faults";
+        const DATABASE: &str = "distributed_writer_fault_db";
+        const TABLE: &str = "distributed_writer_fault_data";
+        let warehouse = create_warehouse(context, "distributed-writer-faults")?;
+        create_catalog(&mut control, CATALOG, &warehouse)?;
+        control
+            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+            .context("create distributed writer fault database")?;
+        control
+            .query_drop(format!(
+                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
+            ))
+            .context("create distributed writer fault table")?;
+
+        // A committed row would prove the frontend committed despite a failed
+        // writer, so seed nothing and require the table to stay empty.
+        for (case, kind) in [
+            ("a failing writer", "connector-write-writer-failure"),
+            ("a failing root aggregation", "connector-write-root-failure"),
+        ] {
+            context.action(&format!("inject {case} and require no snapshot"));
+            for index in 0..context.handle().be_count() {
+                context
+                    .handle()
+                    .arm_query_lifecycle_fault(index, kind)
+                    .with_context(|| format!("arm {kind} on BE[{index}]"))?;
+            }
+
+            let outcome = control.query_drop(format!(
+                "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} \
+                 SELECT generate_series FROM TABLE(generate_series(1, 100))"
+            ));
+            if outcome.is_ok() {
+                bail!("{case} did not fail the write");
+            }
+
+            let rows: Option<i64> = control
+                .query_first(format!("SELECT COUNT(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .with_context(|| format!("read back the table after {case}"))?;
+            if rows != Some(0) {
+                bail!("{case} left {rows:?} committed rows; expected none");
+            }
+        }
+
+        await_resource_convergence(context, &baseline, "distributed writer faults")?;
         Ok(())
     }
 }
