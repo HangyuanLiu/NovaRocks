@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! StarRocks role-binding factories.
+//! Server-owned StarRocks role-binding composition.
 //!
-//! Control materialization owns only metadata generation construction. The
-//! current connector has no typed worker read or write contract, so its
-//! execution factory publishes an explicit all-`None` binding.
+//! Role-binding factories combine a provider implementation with the generic
+//! binding contract and are therefore composition-root glue. Keeping this
+//! module in Server lets the StarRocks provider remain below the native wire
+//! layer; its current execution binding deliberately publishes no capability.
 
 use std::sync::Arc;
 
@@ -30,11 +31,11 @@ use novarocks_connector_binding::{
     ConnectorMaterializationErrorClass, ConnectorMaterializationRetryDisposition,
     MaterializationContext, NormalizedCatalogProperties,
 };
+use novarocks_connector_starrocks::{
+    STARROCKS_PROVIDER_ID, StarRocksConnectorConfig, StarRocksControlGeneration,
+    StarRocksLocalBindingRef, StarRocksMetadataSource,
+};
 use novarocks_spi::connector::{CatalogProperties, CatalogProviderKind};
-
-use crate::STARROCKS_PROVIDER_ID;
-use crate::control::{StarRocksControlGeneration, StarRocksMetadataSource};
-use crate::domain::StarRocksLocalBindingRef;
 
 /// FE-only StarRocks control factory. Metadata I/O stays behind the returned
 /// control generation and uses each metadata request's existing context.
@@ -82,7 +83,7 @@ impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {
             let catalog_properties = properties.as_catalog_properties().clone();
             ensure_starrocks(&catalog_properties)?;
             let control = StarRocksControlGeneration::try_new(
-                crate::StarRocksConnectorConfig::new(
+                StarRocksConnectorConfig::new(
                     catalog_properties.handle().catalog_name().clone(),
                     local_binding,
                 ),
@@ -184,8 +185,10 @@ mod tests {
             _namespace: &str,
             _table: &str,
             _context: &ConnectorRequestContext,
-        ) -> Result<crate::StarRocksResolvedTable, novarocks_spi::connector::ConnectorError>
-        {
+        ) -> Result<
+            novarocks_connector_starrocks::StarRocksResolvedTable,
+            novarocks_spi::connector::ConnectorError,
+        > {
             panic!("control role materialization must not call StarRocks metadata")
         }
     }

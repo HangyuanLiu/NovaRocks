@@ -556,7 +556,9 @@ impl FrontendCatalogApplicationPort {
                 })?;
             }
             let projection = Arc::clone(self);
-            workers.spawn_blocking(move || projection.materialize_entry(entry, mode));
+            workers.spawn(async move {
+                projection.materialize_entry_and_wait(entry, mode).await;
+            });
         }
         while let Some(completed) = workers.join_next().await {
             completed.map_err(|error| {
@@ -620,6 +622,7 @@ impl FrontendCatalogApplicationPort {
         Ok(())
     }
 
+    #[cfg(test)]
     fn enqueue_materialization(
         self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
@@ -726,6 +729,27 @@ impl FrontendCatalogApplicationPort {
                 context,
             }),
         ))
+    }
+
+    fn attach_completion_waiter(
+        &self,
+        key: &CatalogHandle,
+        token: u64,
+        completion: tokio::sync::oneshot::Sender<
+            Result<CatalogRuntimeObservation, CatalogApplicationError>,
+        >,
+    ) -> bool {
+        let Ok(mut attempts) = self.scheduler.attempts.lock() else {
+            return false;
+        };
+        let Some(attempt) = attempts.get_mut(key) else {
+            return false;
+        };
+        if attempt.token != token {
+            return false;
+        }
+        attempt.completion_waiters.push(completion);
+        true
     }
 
     fn token_is_current(&self, key: &CatalogHandle, token: u64) -> bool {
@@ -886,14 +910,15 @@ impl FrontendCatalogApplicationPort {
         }
     }
 
-    /// Materializes one located entry into a local runtime generation.
+    /// Materializes one located entry into a local runtime generation and
+    /// waits for the first attempt to report success or failure.
     ///
-    /// Returns nothing on purpose. The entry exists only because a complete
-    /// enumeration produced it, so its provider failing says nothing about the
-    /// snapshot; giving this function a `Result` would let one broken catalog
-    /// abort the reconcile of every healthy one, which is the failure scope
-    /// this design exists to keep separate.
-    fn materialize_entry(
+    /// The provider task remains responsible for its own transient retries;
+    /// reconciliation only needs the first outcome to publish an accurate
+    /// ready/unavailable bootstrap snapshot. The entry exists only because a
+    /// complete enumeration produced it, so a provider failure says nothing
+    /// about the snapshot and must not abort unrelated catalog projections.
+    async fn materialize_entry_and_wait(
         self: &Arc<Self>,
         entry: CatalogDesiredStateEntry,
         mode: CatalogDesiredStateSourceMode,
@@ -919,22 +944,50 @@ impl FrontendCatalogApplicationPort {
             return;
         }
 
-        if self
-            .enqueue_materialization(entry.clone(), mode)
-            .unwrap_or_else(|error| {
+        let (submitted, work) = match self.submit_materialization(entry.clone(), mode, None) {
+            Ok(result) => result,
+            Err(error) => {
                 self.mark_unavailable(&instance_id, attachment_id, &provider_id, error.to_string());
-                true
-            })
-        {
+                tracing::warn!(%error, catalog = instance_id.as_str(), "catalog remains unavailable after projection submission");
+                return;
+            }
+        };
+        if !submitted {
+            self.mark_unavailable(
+                &instance_id,
+                attachment_id,
+                &provider_id,
+                "connector control role factory is not installed",
+            );
             return;
         }
 
-        self.mark_unavailable(
-            &instance_id,
-            attachment_id,
-            &provider_id,
-            "connector control role factory is not installed",
-        );
+        // Reconcile owns the bootstrap observation boundary. Only await a
+        // newly submitted attempt; an existing attempt may be a permanent
+        // definition failure retained as the exact-key suppression marker,
+        // or an already-running transient retry owned by another caller.
+        let Some(work) = work else { return };
+        let (completion, ticket) = tokio::sync::oneshot::channel();
+        if !self.attach_completion_waiter(&work.key, work.token, completion) {
+            return;
+        }
+        let projection = Arc::clone(self);
+        self.runtime.spawn(async move {
+            projection.run_materialization(work).await;
+        });
+
+        match ticket.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, catalog = instance_id.as_str(), "catalog remains unavailable after projection attempt");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    catalog = instance_id.as_str(),
+                    "catalog projection attempt stopped before completion"
+                );
+            }
+        }
     }
 
     /// Stops all local admission before retiring existing leases. Durable

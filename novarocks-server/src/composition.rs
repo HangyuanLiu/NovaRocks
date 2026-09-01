@@ -19,6 +19,7 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
+use crate::connector_role_binding::StarRocksExecutionRoleBindingFactory;
 use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
@@ -36,7 +37,6 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
 };
-use novarocks_connector_starrocks::StarRocksExecutionRoleBindingFactory;
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };

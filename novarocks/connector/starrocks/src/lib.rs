@@ -54,8 +54,6 @@ mod domain;
 pub mod control;
 pub mod execution;
 pub mod remote_control;
-pub mod role_binding;
-
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 pub use control::{StarRocksControlGeneration, StarRocksMetadataSource};
@@ -68,8 +66,6 @@ pub use remote_control::{
     StarRocksHttpRequest, StarRocksHttpTransport, StarRocksRemoteControlClient,
     StarRocksRemoteControlConfig, StarRocksRemoteMetadataSource,
 };
-pub use role_binding::{StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory};
-
 pub const STARROCKS_PROVIDER_ID: &str = "starrocks";
 pub const STARROCKS_CONTRACT_VERSION: u16 = 1;
 
