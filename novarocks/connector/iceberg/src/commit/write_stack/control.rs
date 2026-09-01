@@ -557,6 +557,17 @@ fn unsigned_counts(
         .collect()
 }
 
+/// Whether a field id is one of the row-lineage columns Iceberg reserves.
+///
+/// These ids live outside the table schema on purpose: `annotate_schema_from_scan_model`
+/// stamps them onto the Arrow field directly so a lineage column can ride with
+/// the data without being a table column.
+const fn is_reserved_row_lineage_field(field_id: i32) -> bool {
+    field_id == crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID
+        || field_id
+            == crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER
+}
+
 fn decode_bounds(
     bounds: &BTreeMap<i32, Vec<u8>>,
     metadata: &TableMetadata,
@@ -564,6 +575,13 @@ fn decode_bounds(
     let schema = metadata.current_schema();
     bounds
         .iter()
+        // A row-lineage column is stamped with a reserved field id that is
+        // deliberately absent from the table schema -- that absence is what
+        // lets it travel beside the table's own columns. It therefore has no
+        // schema type to decode a bound against, and Iceberg prunes on no
+        // lineage column, so its bound is dropped rather than treated as a
+        // corrupt artifact. Any other unknown id still is one.
+        .filter(|(field_id, _)| !is_reserved_row_lineage_field(**field_id))
         .map(|(field_id, raw)| {
             let field = schema.field_by_id(*field_id).ok_or_else(|| {
                 corrupt(format!(
