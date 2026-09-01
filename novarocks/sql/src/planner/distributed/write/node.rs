@@ -50,21 +50,13 @@ use crate::planner::distributed::output::ConnectorWriteOutputContract;
 
 use super::contract::ConnectorWriteInputBinding;
 
-/// First [`ColumnId`] of the write relations.
-///
-/// The analyzer's `ColumnRefFactory` allocates densely from 1, so reserving the
-/// top of the *signed* id space keeps these ids clear of any analyzer-allocated
-/// column while still fitting the `i32` wire slot-id space that stream edges
-/// use (`output_slot_ids`).
-const WRITE_RELATION_FIRST_COLUMN_ID: u32 =
-    (i32::MAX as u32) - (WRITE_RELATION_COLUMN_COUNT as u32) + 1;
-
 /// The planner [`ColumnId`] of the write relation column at `index`.
 ///
-/// Both relations share one id per position, so a writer's output column and
-/// the matching finish output column are the same logical column.
+/// The number itself is frozen by the write contract, not chosen here: the same
+/// value is the execution slot id, because the exchange edge carrying this
+/// relation is where the two must agree.
 pub(crate) const fn write_relation_column_id(index: usize) -> ColumnId {
-    ColumnId(WRITE_RELATION_FIRST_COLUMN_ID + index as u32)
+    ColumnId(novarocks_spi::connector::write_stack::write_relation_column_id(index))
 }
 
 /// The `TableWriter` output relation, as planner output columns.

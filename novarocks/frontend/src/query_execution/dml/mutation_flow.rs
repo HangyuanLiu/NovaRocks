@@ -5471,6 +5471,17 @@ mod tests {
         )
     }
 
+    fn row_mutation_catalog_properties() -> novarocks_spi::connector::CatalogProperties {
+        novarocks_spi::connector::CatalogProperties::new(
+            row_mutation_catalog_handle(),
+            novarocks_spi::connector::CatalogProviderKind::Iceberg,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test catalog properties")
+    }
+
     fn row_mutation_adapter()
     -> novarocks_spi::connector::write_stack::WriteRuntimeAdapter<FakeRowMutationProvider> {
         let handle = row_mutation_catalog_handle();
@@ -5807,7 +5818,7 @@ mod tests {
         let session = Arc::new(
             ConnectorWriteSession::begin(
                 lease,
-                row_mutation_catalog_handle(),
+                row_mutation_catalog_properties(),
                 novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
                     table: Arc::from("db1.t"),
                     target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),

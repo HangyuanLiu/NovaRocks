@@ -40,20 +40,29 @@ use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::write_stack::{
     ConnectorCommitFragment, WRITE_RELATION_FRAGMENT_INDEX, WRITE_RELATION_KIND_INDEX,
     WRITE_RELATION_ROW_COUNT_INDEX, WRITE_RELATION_TARGET_INDEX, WriteTargetOrdinal,
-    root_output_schema, writer_output_schema,
+    root_output_schema, write_relation_column_id, writer_output_schema,
 };
 use novarocks_types::SlotId;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
 
 /// Slot id of the `kind` column in both write relations.
-pub const WRITE_RELATION_KIND_SLOT: SlotId = SlotId::new(1);
+///
+/// These are the ids the write contract reserves, not a fresh tuple layout:
+/// the exchange edge from a writer fragment to the root carries this relation
+/// and declares those ids as its `output_slot_ids`, so a chunk numbered any
+/// other way would not line up with the plan that routes it.
+pub const WRITE_RELATION_KIND_SLOT: SlotId =
+    SlotId::new(write_relation_column_id(WRITE_RELATION_KIND_INDEX));
 /// Slot id of the `write_target_ordinal` column in both write relations.
-pub const WRITE_RELATION_TARGET_SLOT: SlotId = SlotId::new(2);
+pub const WRITE_RELATION_TARGET_SLOT: SlotId =
+    SlotId::new(write_relation_column_id(WRITE_RELATION_TARGET_INDEX));
 /// Slot id of the `row_count` column in both write relations.
-pub const WRITE_RELATION_ROW_COUNT_SLOT: SlotId = SlotId::new(3);
+pub const WRITE_RELATION_ROW_COUNT_SLOT: SlotId =
+    SlotId::new(write_relation_column_id(WRITE_RELATION_ROW_COUNT_INDEX));
 /// Slot id of the `commit_fragment` column in both write relations.
-pub const WRITE_RELATION_FRAGMENT_SLOT: SlotId = SlotId::new(4);
+pub const WRITE_RELATION_FRAGMENT_SLOT: SlotId =
+    SlotId::new(write_relation_column_id(WRITE_RELATION_FRAGMENT_INDEX));
 
 /// The slot ids of both write relations, in the column order SPI froze.
 pub const WRITE_RELATION_SLOT_IDS: [SlotId; 4] = [

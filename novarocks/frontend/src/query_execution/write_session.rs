@@ -69,7 +69,11 @@ enum TerminalDecision {
 pub(crate) struct ConnectorWriteSession {
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
-    catalog_handle: CatalogHandle,
+    /// The catalog runtime this session's writers execute against, kept whole
+    /// rather than reduced to its handle: the backend leases a catalog from its
+    /// properties, and a writer node that named a handle the query never leased
+    /// cannot resolve a write runtime on the backend at all.
+    catalog_properties: novarocks_spi::connector::CatalogProperties,
     accumulated: Mutex<AccumulatedWriteSet>,
     terminal: Mutex<Option<TerminalDecision>>,
     finish_invocations: AtomicUsize,
@@ -99,14 +103,14 @@ impl ConnectorWriteSession {
     /// nothing was started.
     pub(crate) fn begin(
         lease: ConnectorWriteStackLease,
-        catalog_handle: CatalogHandle,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
     ) -> Result<Self, ConnectorError> {
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             lease,
             plan,
-            catalog_handle,
+            catalog_properties,
             accumulated: Mutex::new(AccumulatedWriteSet::default()),
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
@@ -137,6 +141,12 @@ impl ConnectorWriteSession {
     /// same canonical bytes to more backends causes no additional provider
     /// planning, so charging per copy would refuse writes that cost nothing
     /// extra to plan.
+    /// The catalog this write executes against, as the backend must materialize
+    /// it. It belongs in the query's Init catalog set beside every typed read's.
+    pub(crate) const fn catalog_properties(&self) -> &novarocks_spi::connector::CatalogProperties {
+        &self.catalog_properties
+    }
+
     pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
         let encoder = self.lease.handle_encoder();
         let mut ledger = UniqueWriterHandleLedger::new();
@@ -161,7 +171,7 @@ impl ConnectorWriteSession {
             }
         }
         Ok(SealedWriteTargets::new(
-            self.catalog_handle.clone(),
+            self.catalog_properties.handle().clone(),
             handles,
         ))
     }
@@ -425,13 +435,10 @@ pub(crate) fn begin_connector_write_session(
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     request: ConnectorWriteBeginRequest,
 ) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
-    let catalog_handle = write_lease
-        .catalog_properties()
-        .map(|properties| properties.handle().clone())
-        .ok_or_else(|| {
-            "connector write lease has no immutable catalog runtime identity".to_string()
-        })?;
-    ConnectorWriteSession::begin(lease, catalog_handle, request)
+    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
+        "connector write lease has no immutable catalog runtime identity".to_string()
+    })?;
+    ConnectorWriteSession::begin(lease, catalog_properties, request)
         .map(std::sync::Arc::new)
         .map_err(|error| format!("begin connector write session: {error}"))
 }
@@ -532,6 +539,17 @@ pub(crate) mod tests {
             ConnectorInstanceId::parse("write_session_unit").expect("instance id"),
             CatalogVersion::from_bytes([3; 32]),
         )
+    }
+
+    fn catalog_properties() -> novarocks_spi::connector::CatalogProperties {
+        novarocks_spi::connector::CatalogProperties::new(
+            catalog_handle(),
+            novarocks_spi::connector::CatalogProviderKind::Iceberg,
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("test catalog properties")
     }
 
     fn adapter() -> WriteRuntimeAdapter<FakeProvider> {
@@ -772,7 +790,7 @@ pub(crate) mod tests {
             || {},
         );
         let session = Arc::new(
-            ConnectorWriteSession::begin(lease, catalog_handle(), begin_request())
+            ConnectorWriteSession::begin(lease, catalog_properties(), begin_request())
                 .expect("begin write"),
         );
         Fixture { session, recorded }

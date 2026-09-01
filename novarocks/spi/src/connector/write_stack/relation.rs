@@ -53,6 +53,29 @@ use crate::connector::{ConnectorError, ConnectorErrorKind};
 
 pub const WRITE_RELATION_COLUMN_COUNT: usize = 4;
 
+/// The first reserved id of the write relation's columns.
+///
+/// They sit at the top of the *signed* id space so they cannot collide with an
+/// analyzer-allocated column, while still fitting the `i32` wire slot-id space
+/// that stream edges use.
+pub const WRITE_RELATION_FIRST_COLUMN_ID: u32 =
+    (i32::MAX as u32) - (WRITE_RELATION_COLUMN_COUNT as u32) + 1;
+
+/// The reserved id of the write relation column at `index`.
+///
+/// This is one number serving two roles that must agree: the planner's column
+/// id and the execution slot id. The exchange edge from a writer fragment to
+/// the root carries this relation, so a plan that declared one numbering while
+/// the runtime chunk used another would fail to line up at exactly the boundary
+/// where the two meet -- which is why they are defined here once rather than
+/// once per side.
+///
+/// Both relations share one id per position, so a writer's output column and
+/// the matching finish output column are the same logical column.
+pub const fn write_relation_column_id(index: usize) -> u32 {
+    WRITE_RELATION_FIRST_COLUMN_ID + index as u32
+}
+
 pub const WRITE_RELATION_KIND_COLUMN: &str = "kind";
 pub const WRITE_RELATION_TARGET_COLUMN: &str = "write_target_ordinal";
 pub const WRITE_RELATION_ROW_COUNT_COLUMN: &str = "row_count";

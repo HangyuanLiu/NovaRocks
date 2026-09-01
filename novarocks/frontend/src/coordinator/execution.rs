@@ -1107,6 +1107,24 @@ impl FrontendDistributedQueryCoordinator {
             self.report_endpoint.resolve()?,
         )?
         .with_credential_leases(credential_leases);
+        // A write session's catalog is a materialization input like any typed
+        // scan's. Nothing else contributes it: a writer node names its catalog
+        // by handle, and the backend leases a catalog from its properties, so a
+        // query whose only use of a catalog is writing to it would reach a
+        // backend that never materialized it and could not resolve a write
+        // runtime for the handle its own plan carries.
+        let init_options = match write_stack_session.as_ref() {
+            Some(session) => {
+                let catalog_set = novarocks_proto_codec::catalog::CatalogSet::new([session
+                    .catalog_properties()
+                    .clone()])
+                .map_err(|error| {
+                    failed(format!("write session catalog set is invalid: {error}"))
+                })?;
+                init_options.with_catalog_set(catalog_set)
+            }
+            None => init_options,
+        };
         let connector_binding_ready = runtime_filter_ready
             .initialize_query(init_options, &lifecycle_barrier)
             .map_err(|error| {
