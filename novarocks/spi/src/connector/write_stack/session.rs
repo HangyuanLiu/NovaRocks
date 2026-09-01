@@ -38,10 +38,12 @@ use crate::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
 };
 use crate::connector::{
-    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
-    ConnectorWriteReceipt, ConnectorWriteTargetRef,
+    ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorWriteAbortOutcome,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion, ConnectorWriteInputRequest,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWriteReceipt, ConnectorWriteRouteId,
+    ConnectorWriteTargetRef,
 };
+use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
 use crate::connector::{ExternalMutationEvidence, ExternalMutationOutcome};
 
 /// The frozen intent a frontend hands to `begin_write`.
@@ -58,7 +60,37 @@ pub struct ConnectorWriteBeginRequest {
     pub purpose: ConnectorWriteAdmissionPurpose,
     pub input: ConnectorWriteInputRequest,
     pub base: Option<ConnectorWriteBaseVersion>,
+    /// What kind of write this is, and the facts only that kind needs.
+    pub flavor: ConnectorWriteSessionFlavor,
     pub context: ConnectorRequestContext,
+}
+
+/// The write flavors a session admits.
+///
+/// This selects how the provider plans its logical branches. It is deliberately
+/// not a writer identity and carries no operation, cohort, attempt, or
+/// placement: two writes of the same flavor against the same table are the same
+/// kind of write, and what distinguishes them belongs to whoever owns their
+/// external effect.
+#[derive(Clone, Debug)]
+pub enum ConnectorWriteSessionFlavor {
+    /// One logical target writing data.
+    Ordinary,
+    /// A durable publication whose identity belongs to the upper layer that
+    /// owns it. The provider needs only the technique and what an empty input
+    /// means; the publication id never reaches a writer recipe or a fragment.
+    ManagedPublication(ConnectorManagedPublicationIntent),
+    /// A row mutation. The provider decides how many branches the mutation
+    /// needs and what each accepts; SQL routes rows to them.
+    RowMutation,
+    /// A rewrite arbitrated by the provider's ordinary base-state compare and
+    /// swap rather than by the distributed-write external fence.
+    ///
+    /// It is a distinct flavor rather than a flag because the difference is not
+    /// a tuning knob: a rewrite that took the external fence would serialize
+    /// against ordinary DML it does not conflict with, and a DML write that
+    /// skipped it would lose the fence's protection.
+    DistributedRewrite,
 }
 
 /// One logical write target and its immutable recipe.
@@ -71,6 +103,62 @@ pub struct ConnectorWriteTargetPlan {
     ordinal: WriteTargetOrdinal,
     handle: ConnectorWriterHandle,
     input: ConnectorWriteInputShape,
+    route: Option<ConnectorWriteRouteFacts>,
+}
+
+/// What SQL needs to route rows to one row-mutation branch.
+///
+/// These are routing facts, not identity: they say which change events a branch
+/// accepts and where in the input row its columns live. The branch's identity is
+/// its [`WriteTargetOrdinal`], and its recipe is the opaque writer handle beside
+/// it -- neither is derivable from these facts, and none of them reaches a
+/// commit fragment.
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteRouteFacts {
+    route_id: ConnectorWriteRouteId,
+    accepted_effects: Vec<ConnectorRowMutationEffect>,
+    input_ordinals: Vec<ConnectorMutationRouteInput>,
+    partition_fields: Vec<ConnectorWriteFieldToken>,
+}
+
+impl ConnectorWriteRouteFacts {
+    /// A branch that accepts no change event would silently drop every row
+    /// routed to it, so an empty effect set is refused.
+    pub fn try_new(
+        route_id: ConnectorWriteRouteId,
+        accepted_effects: Vec<ConnectorRowMutationEffect>,
+        input_ordinals: Vec<ConnectorMutationRouteInput>,
+        partition_fields: Vec<ConnectorWriteFieldToken>,
+    ) -> Result<Self, ConnectorError> {
+        if accepted_effects.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "a row-mutation route must accept at least one change event",
+            ));
+        }
+        Ok(Self {
+            route_id,
+            accepted_effects,
+            input_ordinals,
+            partition_fields,
+        })
+    }
+
+    pub const fn route_id(&self) -> ConnectorWriteRouteId {
+        self.route_id
+    }
+
+    pub fn accepted_effects(&self) -> &[ConnectorRowMutationEffect] {
+        &self.accepted_effects
+    }
+
+    pub fn input_ordinals(&self) -> &[ConnectorMutationRouteInput] {
+        &self.input_ordinals
+    }
+
+    pub fn partition_fields(&self) -> &[ConnectorWriteFieldToken] {
+        &self.partition_fields
+    }
 }
 
 impl ConnectorWriteTargetPlan {
@@ -83,7 +171,19 @@ impl ConnectorWriteTargetPlan {
             ordinal,
             handle,
             input,
+            route: None,
         }
+    }
+
+    /// Attach the routing facts of a row-mutation branch.
+    pub fn with_route(mut self, route: ConnectorWriteRouteFacts) -> Self {
+        self.route = Some(route);
+        self
+    }
+
+    /// Present exactly for a row-mutation branch.
+    pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
+        self.route.as_ref()
     }
 
     pub const fn ordinal(&self) -> WriteTargetOrdinal {
@@ -129,6 +229,33 @@ impl ConnectorWriteSessionPlan {
                 ));
             }
             target.input().validate()?;
+        }
+        // Routing is a property of the whole session, not of individual
+        // branches: if some branches carry routing facts and others do not, SQL
+        // can route rows to part of the write and silently has nowhere to send
+        // the rest.
+        let routed = targets
+            .iter()
+            .filter(|target| target.route().is_some())
+            .count();
+        if routed != 0 && routed != targets.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "a connector write session routes either every branch or none",
+            ));
+        }
+        // Two branches sharing a route key would make the router's choice
+        // ambiguous, and the loser's rows would vanish.
+        let mut seen = std::collections::BTreeSet::new();
+        for target in &targets {
+            if let Some(route) = target.route()
+                && !seen.insert(route.route_id())
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "a connector write session repeats a row-mutation route key",
+                ));
+            }
         }
         Ok(Self { commit, targets })
     }
@@ -216,4 +343,147 @@ pub trait ConnectorWriteControl: Send + Sync {
         &self,
         request: ConnectorWriteSessionReconcileRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connector::write_stack::adapter::{ProviderWriteRuntime, WriteRuntimeAdapter};
+    use crate::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    };
+
+    #[derive(Clone, Debug)]
+    struct Value(u32);
+
+    struct FakeProvider {
+        descriptor: ConnectorInstanceDescriptor,
+        catalog_handle: CatalogHandle,
+    }
+
+    impl ProviderWriteRuntime for FakeProvider {
+        type CommitHandle = Value;
+        type WriterHandle = Value;
+        type CommitFragment = Value;
+
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn catalog_handle(&self) -> &CatalogHandle {
+            &self.catalog_handle
+        }
+    }
+
+    fn adapter() -> WriteRuntimeAdapter<FakeProvider> {
+        let instance_id = ConnectorInstanceId::parse("session_unit").expect("instance id");
+        WriteRuntimeAdapter::new(std::sync::Arc::new(FakeProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("fake").expect("provider id"),
+                instance_id: instance_id.clone(),
+            },
+            catalog_handle: CatalogHandle::new(instance_id, CatalogVersion::from_bytes([2; 32])),
+        }))
+    }
+
+    fn input_shape() -> ConnectorWriteInputShape {
+        ConnectorWriteInputShape::Data {
+            fields: vec![ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+            )],
+        }
+    }
+
+    fn route(key: u8) -> ConnectorWriteRouteFacts {
+        ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([key; 32]),
+            vec![ConnectorRowMutationEffect::Delete],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("route facts")
+    }
+
+    fn target(
+        adapter: &WriteRuntimeAdapter<FakeProvider>,
+        ordinal: u32,
+    ) -> ConnectorWriteTargetPlan {
+        ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(ordinal).expect("bounded ordinal"),
+            adapter.wrap_writer_handle(Value(ordinal)),
+            input_shape(),
+        )
+    }
+
+    #[test]
+    fn a_route_that_accepts_nothing_would_silently_drop_its_rows() {
+        assert_eq!(
+            ConnectorWriteRouteFacts::try_new(
+                ConnectorWriteRouteId::from_bytes([1; 32]),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect_err("no accepted effects")
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn a_session_routes_every_branch_or_none() {
+        let adapter = adapter();
+        let commit = adapter.wrap_commit_handle(Value(0));
+
+        // None routed: an ordinary write.
+        assert!(ConnectorWriteSessionPlan::try_new(commit, vec![target(&adapter, 0)]).is_ok());
+
+        // All routed: a row mutation.
+        let commit = adapter.wrap_commit_handle(Value(0));
+        assert!(
+            ConnectorWriteSessionPlan::try_new(
+                commit,
+                vec![
+                    target(&adapter, 0).with_route(route(1)),
+                    target(&adapter, 1).with_route(route(2)),
+                ],
+            )
+            .is_ok()
+        );
+
+        // Half routed: SQL would have nowhere to send the rest.
+        let commit = adapter.wrap_commit_handle(Value(0));
+        assert_eq!(
+            ConnectorWriteSessionPlan::try_new(
+                commit,
+                vec![
+                    target(&adapter, 0).with_route(route(1)),
+                    target(&adapter, 1)
+                ],
+            )
+            .expect_err("partially routed")
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn two_branches_cannot_share_a_route_key() {
+        let adapter = adapter();
+        let commit = adapter.wrap_commit_handle(Value(0));
+        assert_eq!(
+            ConnectorWriteSessionPlan::try_new(
+                commit,
+                vec![
+                    target(&adapter, 0).with_route(route(1)),
+                    target(&adapter, 1).with_route(route(1)),
+                ],
+            )
+            .expect_err("duplicate route key")
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
 }

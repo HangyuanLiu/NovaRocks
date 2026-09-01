@@ -600,6 +600,7 @@ mod tests {
                 )],
             },
             base: None,
+            flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
             context: request_context(),
         }
     }

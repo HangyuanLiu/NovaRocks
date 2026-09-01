@@ -868,22 +868,34 @@ impl ConnectorControlHost {
         .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
 
+    /// Acquire the complete typed write group of the generation a caller has
+    /// already retained.
+    ///
+    /// A write must commit through the same incarnation that planned it, so the
+    /// generation is named explicitly rather than resolved as "whatever is
+    /// active now": between planning and commit the active generation can be
+    /// replaced, and committing through the replacement would attach staged
+    /// work to a runtime that never admitted it. Callers pass the runtime id of
+    /// the planning lease they are already holding.
+    fn acquire_exact_write_stack(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        self.acquire_write_stack_inner(control_runtime_id, false)
+    }
+
     /// Acquire the complete typed write group of the currently active
     /// generation.
     ///
-    /// It resolves from the same exact role generation the typed read group
-    /// comes from, so a write cannot be planned against one generation's
-    /// recipe and committed through another's authority. The generation is
-    /// held for the lease's lifetime by the same write-lease counter the
-    /// legacy path uses, because both describe the same thing: an in-flight
-    /// write on this generation.
-    fn acquire_write_stack(
+    /// Only for a caller that has not already pinned one; anything that planned
+    /// against a retained generation must use [`Self::acquire_exact_write_stack`].
+    fn acquire_current_write_stack(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteStackLease, ConnectorError> {
-        let (group, control_runtime_id) = {
-            let mut state = self.lock_state()?;
-            let runtime_id = state.active.get(instance_id).copied().ok_or_else(|| {
+        let control_runtime_id = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).copied().ok_or_else(|| {
                 ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     format!(
@@ -891,14 +903,28 @@ impl ConnectorControlHost {
                         instance_id.as_str()
                     ),
                 )
-            })?;
-            let generation = state.generations.get_mut(&runtime_id).ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "active connector control generation is missing",
-                )
-            })?;
-            if generation.state != ControlGenerationState::Active {
+            })?
+        };
+        self.acquire_write_stack_inner(control_runtime_id, true)
+    }
+
+    fn acquire_write_stack_inner(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+        require_active: bool,
+    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        let group = {
+            let mut state = self.lock_state()?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
+            if require_active && generation.state != ControlGenerationState::Active {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Unavailable,
                     "connector control generation is retiring",
@@ -915,7 +941,7 @@ impl ConnectorControlHost {
                     )
                 })?;
             generation.write_leases = generation.write_leases.saturating_add(1);
-            (group, runtime_id)
+            group
         };
         let state = Arc::downgrade(&self.state);
         Ok(ConnectorWriteStackLease::new(
