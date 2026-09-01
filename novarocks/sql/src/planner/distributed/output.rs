@@ -526,6 +526,15 @@ fn node_execution_output_columns(
         DistributedNodeKind::Exchange(exchange) => {
             exchange_execution_output_columns(exchange, fragment_roots)
         }
+        // The NCP-6 write nodes replace their input with the frozen
+        // write-result relation, so their execution output never depends on a
+        // child. `write::node` is the single definition point of both shapes.
+        DistributedNodeKind::TableWriter(_) => {
+            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
+        }
+        DistributedNodeKind::TableFinish(_) => {
+            Ok(crate::planner::distributed::write::node::table_finish_output_columns())
+        }
         DistributedNodeKind::Repeat(_) => Err(NodeOutputError::NonDerivableChildOutput {
             fragment_id: node.fragment_id,
             node_id: node.node_id,
@@ -1402,6 +1411,14 @@ fn wire_node_output_columns(
             sealed_covered_output(node, fragment_id, node_outputs, &set_op.output_columns)
         }
         DistributedNodeKind::Exchange(exchange) => Ok(exchange.output_columns.clone()),
+        // The NCP-6 write nodes emit the frozen write-result relation on the
+        // wire exactly as they emit it at execution.
+        DistributedNodeKind::TableWriter(_) => {
+            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
+        }
+        DistributedNodeKind::TableFinish(_) => {
+            Ok(crate::planner::distributed::write::node::table_finish_output_columns())
+        }
         DistributedNodeKind::Repeat(_) => Err(NodeOutputError::NonDerivableChildOutput {
             fragment_id,
             node_id: node.node_id,

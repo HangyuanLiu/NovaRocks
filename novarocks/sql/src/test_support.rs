@@ -39,7 +39,10 @@ use crate::planner::distributed::write::change_stream::{
 use crate::planner::distributed::write::contract::{
     ConnectorWriteInputBinding, test_support::simple_sql_write_plan_input,
 };
-use crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
+use crate::planner::distributed::write::plan::{
+    finalize_sql_change_stream_table_writer_finish_test_plan, finalize_sql_change_stream_test_plan,
+    finalize_sql_table_writer_finish_test_plan,
+};
 use crate::planner::distributed::write::sink::ConnectorWriteFragmentSink;
 use crate::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
@@ -174,6 +177,113 @@ pub enum NativePreparationFixture {
     ResultOutput,
     TerminalWrite,
     MissingResultOutput,
+}
+
+/// Closed sealed NCP-6 dataflow write shapes: `TableWriter` fragments gathering
+/// into one Root `TableFinish` fragment.
+///
+/// These are the only fixtures downstream crates need for the dataflow write
+/// plan; draft construction and the writer/finish builders stay SQL-private.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWriteDataflowFixture {
+    /// One writer fragment gathering into the Root finish fragment.
+    SingleWriter,
+    /// A change-stream router driving two route writer fragments, both
+    /// gathering into the same Root finish fragment.
+    ChangeStreamTwoWriters,
+}
+
+/// Build one sealed NCP-6 dataflow write plan through the production builder
+/// and the production seal path.
+pub fn native_write_dataflow_plan(
+    fixture: NativeWriteDataflowFixture,
+) -> Result<DistributedPlan, String> {
+    match fixture {
+        NativeWriteDataflowFixture::SingleWriter => native_single_table_writer_plan(),
+        NativeWriteDataflowFixture::ChangeStreamTwoWriters => {
+            native_change_stream_table_writer_plan()
+        }
+    }
+}
+
+fn native_single_table_writer_plan() -> Result<DistributedPlan, String> {
+    let output_columns = vec![output_column(1, "order_id", DataType::Int64)];
+    let draft = crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![PlanFragment {
+            fragment_id: 0,
+            root: values_node(0, 10, output_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }],
+        Some(0),
+        Vec::new(),
+        Default::default(),
+    );
+    finalize_sql_table_writer_finish_test_plan(
+        draft,
+        simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+    )
+    .map_err(|error| format!("native table writer fixture must seal: {error}"))
+}
+
+fn native_change_stream_table_writer_plan() -> Result<DistributedPlan, String> {
+    let output_columns = vec![
+        OutputColumn {
+            column_id: ColumnId(1),
+            name: "__row_mutation_effect".to_string(),
+            data_type: DataType::Int8,
+            nullable: false,
+            is_internal: true,
+        },
+        output_column(3, "delete_id", DataType::Int64),
+        output_column(4, "replacement", DataType::Int64),
+    ];
+    let draft = crate::planner::distributed::test_support::DistributedPlanDraftBuilder::new(
+        vec![PlanFragment {
+            fragment_id: 0,
+            root: values_node(0, 10, output_columns.clone()),
+            data_partition: DataPartition::unpartitioned(),
+            output_partition: DataPartition::unpartitioned(),
+            sink: DataSink::Result,
+            output_exprs: None,
+            output_columns,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }],
+        Some(0),
+        Vec::new(),
+        Default::default(),
+    );
+    let route = |route_byte: u8,
+                 effects: Vec<ConnectorRowMutationEffect>,
+                 input_ordinal: u32,
+                 output_partition_ordinals: Vec<usize>| {
+        ChangeStreamWriteRouteSpec {
+            route_id: ConnectorWriteRouteId::from_bytes([route_byte; 32]),
+            cohort_id: ConnectorWriteCohortId::from_bytes([route_byte.wrapping_add(1); 32]),
+            accepted_effects: effects,
+            input_ordinals: vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([route_byte.wrapping_add(2); 32]),
+                input_ordinal,
+            )],
+            output_partition_ordinals,
+            sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+        }
+    };
+    let dag = ChangeStreamWriteDagSpec {
+        effect_output_ordinal: 0,
+        routes: vec![
+            route(7, vec![ConnectorRowMutationEffect::Delete], 1, vec![1]),
+            route(8, vec![ConnectorRowMutationEffect::Replace], 2, Vec::new()),
+        ],
+    };
+    finalize_sql_change_stream_table_writer_finish_test_plan(draft, dag)
+        .map_err(|error| format!("native change-stream table writer fixture must seal: {error}"))
 }
 
 /// Build one complete preparation fixture. Each normal case is sealed through
@@ -2463,6 +2573,7 @@ mod tests {
     };
     use super::{NativePlanEncodingFixture, native_plan_encoding_plan};
     use super::{NativeScanFixture, native_scan_plan};
+    use super::{NativeWriteDataflowFixture, native_write_dataflow_plan};
 
     #[test]
     fn native_mv_data_current_scan_fixture_remains_tokenized() {
@@ -2565,6 +2676,39 @@ mod tests {
             NativePreparationFixture::MissingResultOutput,
         ] {
             native_preparation_plan(fixture).expect("closed preparation fixture");
+        }
+    }
+
+    #[test]
+    fn write_dataflow_fixtures_seal_into_one_table_finish_root() {
+        for (fixture, expected_writers) in [
+            (NativeWriteDataflowFixture::SingleWriter, 1),
+            (NativeWriteDataflowFixture::ChangeStreamTwoWriters, 2),
+        ] {
+            let plan = native_write_dataflow_plan(fixture).expect("closed write dataflow fixture");
+            let finish_fragments = plan
+                .fragments()
+                .iter()
+                .filter(|fragment| {
+                    matches!(
+                        fragment.root.payload,
+                        crate::planner::distributed::DistributedNodeKind::TableFinish(_)
+                    )
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(finish_fragments.len(), 1);
+            assert_eq!(finish_fragments[0].fragment_id, plan.root_fragment_id());
+            let writers = plan
+                .fragments()
+                .iter()
+                .filter(|fragment| {
+                    matches!(
+                        fragment.root.payload,
+                        crate::planner::distributed::DistributedNodeKind::TableWriter(_)
+                    )
+                })
+                .count();
+            assert_eq!(writers, expected_writers);
         }
     }
 }

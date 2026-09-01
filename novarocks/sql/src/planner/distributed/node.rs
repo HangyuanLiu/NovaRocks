@@ -30,6 +30,7 @@ use crate::planner::physical::{
 use crate::planner::runtime_filter::contract::BindingId;
 
 use super::fragment::{DataPartition, FragmentId};
+use super::write::node::{TableFinishNode, TableWriterNode};
 
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
@@ -64,9 +65,11 @@ pub enum ExchangeFlavor {
 ///
 /// This shares leaf payload structs with `PhysicalPlanKind`, but excludes
 /// `Limit`, `CTEAnchor`, `CTEProduce`, `CTEConsume`, and `Redistribute` because
-/// those payloads are consumed or expanded while cutting fragments. `Exchange`
-/// is overlay-only. `SetOp { UnionDistinct }` is still rejected during M1
-/// conversion and must be rewritten before fragmentation.
+/// those payloads are consumed or expanded while cutting fragments. `Exchange`,
+/// `TableWriter`, and `TableFinish` are overlay-only: they exist solely in the
+/// distributed stage and have no `PhysicalPlanKind` twin. `SetOp {
+/// UnionDistinct }` is still rejected during M1 conversion and must be
+/// rewritten before fragmentation.
 #[allow(dead_code)]
 #[expect(
     private_interfaces,
@@ -95,9 +98,20 @@ pub enum DistributedNodeKind {
     SetOp(PhysicalSetOpNode),
     ChangeEventExpand(DistributedChangeEventExpandNode),
     Exchange(ExchangeReceiver),
+    /// Overlay-only NCP-6 dataflow writer: it consumes its child's rows and
+    /// emits the frozen write-result relation instead of terminating the plan.
+    TableWriter(TableWriterNode),
+    /// Overlay-only NCP-6 write finish: the single per-query operator that
+    /// gathers every writer's write-result relation and emits the query result.
+    TableFinish(TableFinishNode),
 }
 
 impl DistributedNodeKind {
+    /// The variants that share a payload struct with `PhysicalPlanKind`.
+    ///
+    /// The overlay-only variants (`Exchange`, `TableWriter`, `TableFinish`) are
+    /// deliberately absent: they have no physical twin, so the coverage guard
+    /// below must not expect one.
     #[cfg(test)]
     pub(crate) fn shared_variant_names_for_test() -> &'static [&'static str] {
         &[
@@ -186,6 +200,12 @@ pub fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanK
         }
         DistributedNodeKind::Exchange(_) => unreachable!(
             "DistributedNodeKind::Exchange is overlay-only; callers must handle Exchange separately"
+        ),
+        DistributedNodeKind::TableWriter(_) => unreachable!(
+            "DistributedNodeKind::TableWriter is overlay-only; callers must handle TableWriter separately"
+        ),
+        DistributedNodeKind::TableFinish(_) => unreachable!(
+            "DistributedNodeKind::TableFinish is overlay-only; callers must handle TableFinish separately"
         ),
     }
 }
