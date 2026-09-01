@@ -914,7 +914,10 @@ fn the_connector_write_carriers_are_closed_single_provider_oneofs() {
             .oneofs()
             .find(|oneof| oneof.name() == oneof_name)
             .unwrap_or_else(|| panic!("{message_name}.{oneof_name} oneof"));
-        let arms = oneof.fields().map(|field| field.name().to_string()).collect::<Vec<_>>();
+        let arms = oneof
+            .fields()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(arms, vec![arm_name.to_string()]);
         let arm = message
             .get_field_by_name(arm_name)
@@ -936,7 +939,10 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
         .oneofs()
         .find(|oneof| oneof.name() == "artifact")
         .expect("IcebergCommitFragment.artifact oneof");
-    let arms = artifact.fields().map(|field| field.name().to_string()).collect::<Vec<_>>();
+    let arms = artifact
+        .fields()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
     assert_eq!(
         arms,
         vec![
@@ -952,7 +958,13 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
     assert_eq!(field_names.len(), 3);
-    for forbidden in ["writer", "operation_id", "cohort_id", "summary", "row_count"] {
+    for forbidden in [
+        "writer",
+        "operation_id",
+        "cohort_id",
+        "summary",
+        "row_count",
+    ] {
         assert!(
             !field_names.iter().any(|name| name.contains(forbidden)),
             "commit fragment must not carry {forbidden}"
