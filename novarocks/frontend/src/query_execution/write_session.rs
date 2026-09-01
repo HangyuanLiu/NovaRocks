@@ -1,0 +1,697 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The frontend-only write session.
+//!
+//! One `begin_write` on one exact control generation returns the commit handle
+//! and the complete set of logical writer recipes the sealed plan may use.
+//! Everything else about a distributed write hangs off that: the plan encodes
+//! the recipes, the backends execute them, and this session -- and only this
+//! session -- can turn the result into an external commit.
+//!
+//! What it deliberately is not: there is no operation id, no cohort, no
+//! execution attempt, no expected-physical-writer manifest, and no report
+//! coverage. Those existed because a writer handle used to be bound to a
+//! placement. It no longer is, so completeness comes from the execution graph
+//! closing rather than from a pre-enumerated identity tree.
+//!
+//! The terminal decision is single-shot. A session that has committed cannot
+//! abort, one that has aborted cannot commit, and the invocation counter makes
+//! "the connector was never asked to commit" an assertable fact rather than an
+//! inference.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use novarocks_proto_models::connector_write as write_dto;
+use novarocks_spi::connector::write_stack::{
+    ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishRequest,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, UniqueWriterHandleLedger,
+    WriteTargetOrdinal,
+};
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEvidence,
+    ExternalMutationOutcome,
+};
+
+use crate::connector::control_host::ConnectorWriteStackLease;
+use crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets;
+use crate::query_execution::write_result::DecodedPreparedWriteSet;
+
+/// What a session has already decided. Recorded so a second, different
+/// decision is refused rather than silently issuing two external effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalDecision {
+    Committed,
+    Aborted,
+    /// The commit may or may not have taken effect externally. Neither a
+    /// retry nor an abort is safe from here; only reconcile is.
+    CommitUnknown,
+}
+
+/// One distributed write's frontend session.
+pub(crate) struct ConnectorWriteSession {
+    lease: ConnectorWriteStackLease,
+    plan: ConnectorWriteSessionPlan,
+    catalog_handle: CatalogHandle,
+    terminal: Mutex<Option<TerminalDecision>>,
+    finish_invocations: AtomicUsize,
+}
+
+impl ConnectorWriteSession {
+    /// Admit the write and freeze its recipes. On return either a session
+    /// exists and nothing external has happened yet, or an error was raised and
+    /// nothing was started.
+    pub(crate) fn begin(
+        lease: ConnectorWriteStackLease,
+        catalog_handle: CatalogHandle,
+        request: ConnectorWriteBeginRequest,
+    ) -> Result<Self, ConnectorError> {
+        let plan = lease.session().begin_write(request)?;
+        Ok(Self {
+            lease,
+            plan,
+            catalog_handle,
+            terminal: Mutex::new(None),
+            finish_invocations: AtomicUsize::new(0),
+        })
+    }
+
+    /// The sealed ordinal set a prepared write set may not exceed.
+    pub(crate) fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
+        self.plan.expected_targets()
+    }
+
+    pub(crate) fn targets(&self) -> &[ConnectorWriteTargetPlan] {
+        self.plan.targets()
+    }
+
+    /// How many times this session actually asked the connector to commit.
+    ///
+    /// The dual barrier's whole point is that some outcomes must leave this at
+    /// zero, and "zero" is only meaningful if it is observable.
+    pub(crate) fn finish_invocations(&self) -> usize {
+        self.finish_invocations.load(Ordering::SeqCst)
+    }
+
+    /// Encode every logical recipe once and charge the query's unique-handle
+    /// budget.
+    ///
+    /// A recipe is charged per logical target, not per placement: copying the
+    /// same canonical bytes to more backends causes no additional provider
+    /// planning, so charging per copy would refuse writes that cost nothing
+    /// extra to plan.
+    pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
+        let encoder = self.lease.handle_encoder();
+        let mut ledger = UniqueWriterHandleLedger::new();
+        let mut handles = std::collections::BTreeMap::new();
+        for target in self.plan.targets() {
+            let encoded = encoder
+                .encode_writer_handle(target.handle())
+                .map_err(|error| {
+                    ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+                })?;
+            let canonical = encoder
+                .canonical_writer_handle_bytes(target.handle())
+                .map_err(|error| {
+                    ConnectorError::new(ConnectorErrorKind::Internal, error.to_string())
+                })?;
+            ledger.charge(target.ordinal(), canonical.len())?;
+            if handles.insert(target.ordinal().get(), encoded).is_some() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector write session sealed one logical target twice",
+                ));
+            }
+        }
+        Ok(SealedWriteTargets::new(
+            self.catalog_handle.clone(),
+            handles,
+        ))
+    }
+
+    /// Turn the canonical fragments the backends reported into provider values
+    /// this generation owns.
+    fn interpret(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+    ) -> Result<ConnectorPreparedWriteSet, ConnectorError> {
+        use novarocks_proto_codec::FieldPath;
+        use novarocks_proto_codec::connector_write::ValidatedCommitFragment;
+        use prost::Message;
+
+        let decoder = self.lease.fragment_decoder();
+        let row_count = prepared.row_count();
+        let mut fragments = Vec::new();
+        for (index, (target, bytes)) in prepared.into_fragments().into_iter().enumerate() {
+            let raw =
+                write_dto::ConnectorCommitFragment::decode(bytes.as_slice()).map_err(|error| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::CorruptData,
+                        format!(
+                            "prepared write set fragment {index} is not a commit fragment: {error}"
+                        ),
+                    )
+                })?;
+            // Re-validated at the trust boundary even though the producer and
+            // the root already did: a frontend that trusted a backend's
+            // validation could not notice a backend that got it wrong.
+            let validated = ValidatedCommitFragment::parse(
+                raw,
+                FieldPath::root("prepared_write_set").index(index),
+            )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+            })?;
+            let fragment = decoder
+                .decode_commit_fragment(&validated)
+                .map_err(|error| {
+                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+                })?;
+            fragments.push((target, fragment));
+        }
+        ConnectorPreparedWriteSet::try_new(row_count, fragments, &self.expected_targets())
+    }
+
+    /// Perform the one external commit.
+    ///
+    /// The caller must already have established BOTH halves of the barrier: a
+    /// complete prepared write set, and a lifecycle terminal set in which every
+    /// participant succeeded. Neither implies the other, so neither is checked
+    /// here -- this method exists to be un-callable until both hold.
+    pub(crate) fn finish(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        self.claim_terminal(TerminalDecision::Committed)?;
+        let prepared = self.interpret(prepared)?;
+        self.finish_invocations.fetch_add(1, Ordering::SeqCst);
+        let outcome = self
+            .lease
+            .session()
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: self.plan.commit_handle(),
+                prepared,
+                context,
+            })?;
+        if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
+            self.record_terminal(TerminalDecision::CommitUnknown);
+        }
+        Ok(outcome)
+    }
+
+    /// Release a session that never reached a complete prepared write set.
+    pub(crate) fn abort(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+        self.claim_terminal(TerminalDecision::Aborted)?;
+        self.lease
+            .session()
+            .abort_write(ConnectorWriteSessionAbortRequest {
+                commit: self.plan.commit_handle(),
+                context,
+            })
+    }
+
+    /// Resolve a commit whose external outcome is unknown. Only reachable after
+    /// a commit that reported exactly that.
+    pub(crate) fn reconcile(
+        &self,
+        evidence: ExternalMutationEvidence,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        {
+            let terminal = self.lock_terminal()?;
+            if *terminal != Some(TerminalDecision::CommitUnknown) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "connector write session has no unknown commit outcome to reconcile",
+                ));
+            }
+        }
+        self.lease
+            .session()
+            .reconcile_write(ConnectorWriteSessionReconcileRequest {
+                commit: self.plan.commit_handle(),
+                evidence,
+                context,
+            })
+    }
+
+    fn claim_terminal(&self, decision: TerminalDecision) -> Result<(), ConnectorError> {
+        let mut terminal = self.lock_terminal()?;
+        match *terminal {
+            None => {
+                *terminal = Some(decision);
+                Ok(())
+            }
+            Some(existing) if existing == decision => Ok(()),
+            Some(existing) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "connector write session already reached {existing:?} and cannot also reach {decision:?}"
+                ),
+            )),
+        }
+    }
+
+    fn record_terminal(&self, decision: TerminalDecision) {
+        if let Ok(mut terminal) = self.terminal.lock() {
+            *terminal = Some(decision);
+        }
+    }
+
+    fn lock_terminal(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<TerminalDecision>>, ConnectorError> {
+        self.terminal.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write session terminal state is poisoned",
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_connector_binding::ConnectorControlWriteBinding;
+    use novarocks_proto_codec::connector_write::{
+        ConnectorWriteCodecError, ConnectorWriteFragmentDecoder, ConnectorWriteHandleEncoder,
+        ValidatedCommitFragment,
+    };
+    use novarocks_spi::connector::write_stack::{
+        ConnectorCommitFragment, ConnectorWriterHandle, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES,
+        ProviderWriteRuntime, WriteRuntimeAdapter,
+    };
+    use novarocks_spi::connector::{
+        CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorWriteControl as LegacyWriteControl,
+    };
+
+    use super::*;
+
+    // ---- a minimal provider whose only job is to be recoverable -----------
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeCommit;
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeHandle(u32);
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct FakeFragment(u32);
+
+    struct FakeProvider {
+        descriptor: ConnectorInstanceDescriptor,
+        catalog_handle: CatalogHandle,
+    }
+
+    impl ProviderWriteRuntime for FakeProvider {
+        type CommitHandle = FakeCommit;
+        type WriterHandle = FakeHandle;
+        type CommitFragment = FakeFragment;
+
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn catalog_handle(&self) -> &CatalogHandle {
+            &self.catalog_handle
+        }
+    }
+
+    fn catalog_handle() -> CatalogHandle {
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("write_session_unit").expect("instance id"),
+            CatalogVersion::from_bytes([3; 32]),
+        )
+    }
+
+    fn adapter() -> WriteRuntimeAdapter<FakeProvider> {
+        let handle = catalog_handle();
+        WriteRuntimeAdapter::new(Arc::new(FakeProvider {
+            descriptor: ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("fake").expect("provider id"),
+                instance_id: handle.catalog_name().clone(),
+            },
+            catalog_handle: handle,
+        }))
+    }
+
+    // ---- the session control under test ----------------------------------
+
+    #[derive(Default)]
+    struct Recorded {
+        finish: usize,
+        abort: usize,
+        reconcile: usize,
+    }
+
+    struct FakeSession {
+        adapter: WriteRuntimeAdapter<FakeProvider>,
+        binding_key: ConnectorProviderBindingKey,
+        targets: usize,
+        recorded: Arc<Mutex<Recorded>>,
+        finish_outcome: Mutex<Option<ExternalMutationOutcome<ConnectorWriteReceipt>>>,
+    }
+
+    impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeSession {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
+            &self.binding_key
+        }
+
+        fn begin_write(
+            &self,
+            _request: ConnectorWriteBeginRequest,
+        ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+            let commit = self.adapter.wrap_commit_handle(FakeCommit);
+            let targets = (0..self.targets)
+                .map(|index| {
+                    let ordinal = WriteTargetOrdinal::try_new(
+                        u32::try_from(index).expect("bounded ordinal"),
+                    )?;
+                    let handle = self.adapter.wrap_writer_handle(FakeHandle(ordinal.get()));
+                    Ok(ConnectorWriteTargetPlan::new(
+                        ordinal,
+                        handle,
+                        novarocks_spi::connector::ConnectorWriteInputShape::Data {
+                            fields: vec![
+                                novarocks_spi::connector::ConnectorWriteFieldBinding::new(
+                                    novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes(
+                                        [1; 32],
+                                    ),
+                                    arrow::datatypes::Field::new(
+                                        "v",
+                                        arrow::datatypes::DataType::Int64,
+                                        true,
+                                    ),
+                                ),
+                            ],
+                        },
+                    ))
+                })
+                .collect::<Result<Vec<_>, ConnectorError>>()?;
+            ConnectorWriteSessionPlan::try_new(commit, targets)
+        }
+
+        fn finish_write(
+            &self,
+            _request: ConnectorWriteFinishRequest<'_>,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            self.recorded.lock().expect("recorded").finish += 1;
+            self.finish_outcome
+                .lock()
+                .expect("outcome")
+                .take()
+                .ok_or_else(|| {
+                    ConnectorError::new(ConnectorErrorKind::Internal, "no scripted outcome")
+                })
+        }
+
+        fn abort_write(
+            &self,
+            _request: ConnectorWriteSessionAbortRequest<'_>,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            self.recorded.lock().expect("recorded").abort += 1;
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "abort outcome is not scripted in this test",
+            ))
+        }
+
+        fn reconcile_write(
+            &self,
+            _request: ConnectorWriteSessionReconcileRequest<'_>,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            self.recorded.lock().expect("recorded").reconcile += 1;
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "reconcile outcome is not scripted in this test",
+            ))
+        }
+    }
+
+    // ---- codec facets -----------------------------------------------------
+
+    struct FakeEncoder {
+        payload_bytes: usize,
+    }
+
+    impl ConnectorWriteHandleEncoder for FakeEncoder {
+        fn owner(&self) -> &str {
+            "fake"
+        }
+
+        fn encode_writer_handle(
+            &self,
+            _handle: &ConnectorWriterHandle,
+        ) -> Result<write_dto::ConnectorWriterHandle, ConnectorWriteCodecError> {
+            Ok(write_dto::ConnectorWriterHandle {
+                handle: Some(write_dto::connector_writer_handle::Handle::Iceberg(
+                    write_dto::IcebergWriterHandle {
+                        branch: write_dto::IcebergWriteBranch::Data as i32,
+                        table: Some(write_dto::IcebergWriteTableFacts {
+                            table_uuid: "u".repeat(self.payload_bytes),
+                            ..Default::default()
+                        }),
+                        output: None,
+                        data: None,
+                        old_deletes: std::collections::BTreeMap::new(),
+                    },
+                )),
+            })
+        }
+    }
+
+    struct FakeDecoder {
+        adapter: WriteRuntimeAdapter<FakeProvider>,
+    }
+
+    impl ConnectorWriteFragmentDecoder for FakeDecoder {
+        fn owner(&self) -> &str {
+            "fake"
+        }
+
+        fn decode_commit_fragment(
+            &self,
+            _fragment: &ValidatedCommitFragment,
+        ) -> Result<ConnectorCommitFragment, ConnectorWriteCodecError> {
+            Ok(self.adapter.wrap_commit_fragment(FakeFragment(0)))
+        }
+    }
+
+    struct UnusedLegacyControl;
+
+    impl LegacyWriteControl for UnusedLegacyControl {
+        fn binding_key(&self) -> &ConnectorProviderBindingKey {
+            unreachable!("the legacy control is not exercised by the write session")
+        }
+
+        fn plan_write(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
+        ) -> Result<novarocks_spi::connector::ConnectorWritePlan, ConnectorError> {
+            unreachable!("the legacy control is not exercised by the write session")
+        }
+
+        fn commit(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            unreachable!("the legacy control is not exercised by the write session")
+        }
+
+        fn abort(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
+        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
+            unreachable!("the legacy control is not exercised by the write session")
+        }
+
+        fn reconcile(
+            &self,
+            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
+        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+            unreachable!("the legacy control is not exercised by the write session")
+        }
+    }
+
+    struct Fixture {
+        session: ConnectorWriteSession,
+        recorded: Arc<Mutex<Recorded>>,
+    }
+
+    fn fixture(targets: usize, payload_bytes: usize) -> Fixture {
+        fixture_with_outcome(
+            targets,
+            payload_bytes,
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "scripted",
+                ),
+            },
+        )
+    }
+
+    fn fixture_with_outcome(
+        targets: usize,
+        payload_bytes: usize,
+        outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    ) -> Fixture {
+        let adapter = adapter();
+        let binding_key = ConnectorProviderBindingKey {
+            instance_id: catalog_handle().catalog_name().clone(),
+            incarnation: novarocks_spi::connector::ProviderBindingEpoch::new(),
+        };
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let session_control = Arc::new(FakeSession {
+            adapter: adapter.clone(),
+            binding_key,
+            targets,
+            recorded: Arc::clone(&recorded),
+            finish_outcome: Mutex::new(Some(outcome)),
+        });
+        let group = ConnectorControlWriteBinding::new(
+            Arc::new(UnusedLegacyControl),
+            session_control,
+            Arc::new(FakeEncoder { payload_bytes }),
+            Arc::new(FakeDecoder { adapter }),
+        );
+        let lease = ConnectorWriteStackLease::new(
+            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
+            group,
+            || {},
+        );
+        let session = ConnectorWriteSession::begin(lease, catalog_handle(), begin_request())
+            .expect("begin write");
+        Fixture { session, recorded }
+    }
+
+    fn begin_request() -> ConnectorWriteBeginRequest {
+        ConnectorWriteBeginRequest {
+            table: Arc::from("db.t"),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+            intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
+            purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                fields: vec![novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                    arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Int64, true),
+                )],
+            },
+            base: None,
+            context: request_context(),
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        struct NotCancelled;
+        impl novarocks_spi::connector::ConnectorCancellation for NotCancelled {
+            fn is_cancelled(&self) -> bool {
+                false
+            }
+        }
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+            Arc::new(NotCancelled),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request context")
+    }
+
+    fn empty_prepared() -> DecodedPreparedWriteSet {
+        DecodedPreparedWriteSet::for_test(0, Vec::new())
+    }
+
+    fn evidence() -> ExternalMutationEvidence {
+        ExternalMutationEvidence::try_new(
+            1,
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("fake").expect("provider id"),
+                instance_id: catalog_handle().catalog_name().clone(),
+            },
+            novarocks_spi::connector::ProviderBindingEpoch::new(),
+            novarocks_spi::connector::ConnectorMutationOperationId::new(),
+            "write",
+            bytes::Bytes::new(),
+        )
+        .expect("evidence")
+    }
+
+    #[test]
+    fn a_session_seals_one_recipe_per_logical_target() {
+        let fixture = fixture(3, 16);
+        let sealed = fixture
+            .session
+            .seal_write_targets()
+            .expect("sealed targets");
+        assert_eq!(sealed.ordinals().collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert_eq!(fixture.session.expected_targets().len(), 3);
+    }
+
+    #[test]
+    fn the_unique_handle_budget_refuses_a_query_whose_recipes_do_not_fit() {
+        // Each target's recipe is deliberately enormous, so a handful of
+        // logical targets is enough to exceed the whole-query budget.
+        let per_handle = 4 * 1024 * 1024;
+        let targets = MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES / per_handle + 1;
+        let fixture = fixture(targets, per_handle);
+        let error = fixture
+            .session
+            .seal_write_targets()
+            .expect_err("over the unique handle budget");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn a_session_reaches_exactly_one_terminal_decision() {
+        let fixture = fixture(1, 16);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+
+        let prepared = empty_prepared();
+        let _ = fixture.session.finish(prepared, request_context());
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+
+        // A second, different decision is refused, and the connector is not
+        // asked again.
+        let error = fixture
+            .session
+            .abort(request_context())
+            .expect_err("abort after commit");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.recorded.lock().expect("recorded").abort, 0);
+    }
+
+    #[test]
+    fn reconcile_is_unreachable_until_a_commit_reported_an_unknown_outcome() {
+        let fixture = fixture(1, 16);
+        let error = fixture
+            .session
+            .reconcile(evidence(), request_context())
+            .expect_err("nothing to reconcile");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.recorded.lock().expect("recorded").reconcile, 0);
+    }
+}

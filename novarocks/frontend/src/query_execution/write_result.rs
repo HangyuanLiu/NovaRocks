@@ -58,6 +58,20 @@ pub(crate) struct DecodedPreparedWriteSet {
 }
 
 impl DecodedPreparedWriteSet {
+    /// Build a set directly, for tests that need a complete set without
+    /// driving a whole root relation through the decoder. Production code has
+    /// no such constructor: the only way to obtain one is to observe EOF.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        row_count: u64,
+        fragments: Vec<(WriteTargetOrdinal, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            row_count,
+            fragments,
+        }
+    }
+
     pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
     }

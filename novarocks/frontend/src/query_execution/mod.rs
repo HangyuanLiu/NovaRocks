@@ -91,6 +91,7 @@ pub mod write;
 pub mod write_operation;
 pub mod write_plan;
 pub(crate) mod write_result;
+pub(crate) mod write_session;
 pub(crate) mod write_transaction;
 
 pub mod compiler;

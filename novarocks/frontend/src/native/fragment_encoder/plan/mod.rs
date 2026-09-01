@@ -37,7 +37,7 @@ mod scan;
 mod topology;
 mod type_mapping;
 mod write;
-mod write_dataflow;
+pub(crate) mod write_dataflow;
 
 type ContextRef<'a, T> = Option<&'a T>;
 

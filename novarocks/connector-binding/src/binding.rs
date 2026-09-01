@@ -19,9 +19,17 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, ConnectorReadEncoder};
+use novarocks_proto_codec::connector_write::{
+    ConnectorWriteFragmentDecoder, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
+    ConnectorWriteHandleEncoder,
+};
 use novarocks_spi::connector::read_stack::{
     ConnectorReadMetadata, ConnectorReadProviderFactory, ConnectorReadRequestControlFactory,
     ConnectorReadSplitManager,
+};
+use novarocks_spi::connector::write_stack::{
+    ConnectorWriteControl as ConnectorWriteSessionControl,
+    ConnectorWriteExecution as ConnectorWriteStackExecution,
 };
 use novarocks_spi::connector::{
     CatalogProviderKind, CatalogWriteExecution, ConnectorControlBinding, ConnectorError,
@@ -71,20 +79,59 @@ impl ConnectorControlReadBinding {
     }
 }
 
-/// The named FE write group. It exists separately from generic control so a
-/// caller cannot discover optional write authority through typed-read state.
+/// The complete FE write group for one exact control generation.
+///
+/// It exists separately from generic control so a caller cannot discover
+/// optional write authority through typed-read state.
+///
+/// Every member is required rather than optional, so a provider structurally
+/// cannot publish write behaviour with half a codec: a generation that could
+/// encode a writer handle but not decode the commit fragments that come back
+/// would produce writes it could never commit. Completeness is therefore a
+/// property of the type, not a runtime check a caller might skip.
+///
+/// The directions here are the frontend's half of the pair: it encodes the
+/// handles it sends and decodes the fragments it receives. It is given no way
+/// to forge a fragment or to interpret a handle.
 #[derive(Clone)]
 pub struct ConnectorControlWriteBinding {
     write: Arc<dyn ConnectorWriteControl>,
+    session: Arc<dyn ConnectorWriteSessionControl>,
+    handle_encoder: Arc<dyn ConnectorWriteHandleEncoder>,
+    fragment_decoder: Arc<dyn ConnectorWriteFragmentDecoder>,
 }
 
 impl ConnectorControlWriteBinding {
-    pub fn new(write: Arc<dyn ConnectorWriteControl>) -> Self {
-        Self { write }
+    pub fn new(
+        write: Arc<dyn ConnectorWriteControl>,
+        session: Arc<dyn ConnectorWriteSessionControl>,
+        handle_encoder: Arc<dyn ConnectorWriteHandleEncoder>,
+        fragment_decoder: Arc<dyn ConnectorWriteFragmentDecoder>,
+    ) -> Self {
+        Self {
+            write,
+            session,
+            handle_encoder,
+            fragment_decoder,
+        }
     }
 
     pub fn write(&self) -> Arc<dyn ConnectorWriteControl> {
         Arc::clone(&self.write)
+    }
+
+    /// The begin/finish/abort/reconcile authority for this generation. It is
+    /// the only path to an external commit, and it lives on the frontend only.
+    pub fn session(&self) -> Arc<dyn ConnectorWriteSessionControl> {
+        Arc::clone(&self.session)
+    }
+
+    pub fn handle_encoder(&self) -> Arc<dyn ConnectorWriteHandleEncoder> {
+        Arc::clone(&self.handle_encoder)
+    }
+
+    pub fn fragment_decoder(&self) -> Arc<dyn ConnectorWriteFragmentDecoder> {
+        Arc::clone(&self.fragment_decoder)
     }
 }
 
@@ -122,6 +169,18 @@ impl ConnectorControlRoleBinding {
             return Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                 "typed read binding does not have an exact catalog handle",
+            ));
+        }
+        // Write parity, mirroring the read parity the execution side already
+        // enforces. A generation that advertises generic write behaviour but
+        // publishes no typed write group would leave a caller able to admit a
+        // write it could never encode; the reverse would publish a codec for
+        // behaviour that does not exist. `write: None` on both sides stays a
+        // real "this provider cannot write".
+        if write.is_some() != control.write().is_some() {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "control role binding write group does not match generic control capability",
             ));
         }
         Ok(Self {
@@ -191,18 +250,51 @@ impl ConnectorExecutionReadBinding {
     }
 }
 
+/// The complete BE write group for one exact execution generation.
+///
+/// Like its frontend counterpart every member is required, so a backend cannot
+/// open writers it has no way to describe the results of. The directions are
+/// the mirror image: the backend decodes the handles it is given and encodes
+/// the fragments it produces, and it is given no commit authority at all.
 #[derive(Clone)]
 pub struct ConnectorExecutionWriteBinding {
     write: Arc<dyn CatalogWriteExecution>,
+    execution: Arc<dyn ConnectorWriteStackExecution>,
+    handle_decoder: Arc<dyn ConnectorWriteHandleDecoder>,
+    fragment_encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
 }
 
 impl ConnectorExecutionWriteBinding {
-    pub fn new(write: Arc<dyn CatalogWriteExecution>) -> Self {
-        Self { write }
+    pub fn new(
+        write: Arc<dyn CatalogWriteExecution>,
+        execution: Arc<dyn ConnectorWriteStackExecution>,
+        handle_decoder: Arc<dyn ConnectorWriteHandleDecoder>,
+        fragment_encoder: Arc<dyn ConnectorWriteFragmentEncoder>,
+    ) -> Self {
+        Self {
+            write,
+            execution,
+            handle_decoder,
+            fragment_encoder,
+        }
     }
 
     pub fn write(&self) -> Arc<dyn CatalogWriteExecution> {
         Arc::clone(&self.write)
+    }
+
+    /// Opens one writer per driver. It has no begin, finish, abort, or
+    /// reconcile: a backend never holds a commit handle.
+    pub fn execution(&self) -> Arc<dyn ConnectorWriteStackExecution> {
+        Arc::clone(&self.execution)
+    }
+
+    pub fn handle_decoder(&self) -> Arc<dyn ConnectorWriteHandleDecoder> {
+        Arc::clone(&self.handle_decoder)
+    }
+
+    pub fn fragment_encoder(&self) -> Arc<dyn ConnectorWriteFragmentEncoder> {
+        Arc::clone(&self.fragment_encoder)
     }
 }
 
@@ -242,6 +334,17 @@ impl ConnectorExecutionRoleBinding {
             return Err(ConnectorError::new(
                 novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
                 "execution role binding read group does not match generic execution capability",
+            ));
+        }
+        if write.is_some()
+            != execution
+                .as_ref()
+                .and_then(ConnectorExecutionBinding::write)
+                .is_some()
+        {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                "execution role binding write group does not match generic execution capability",
             ));
         }
         Ok(Self {
