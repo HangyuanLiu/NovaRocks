@@ -62,6 +62,7 @@ pub mod write_fence;
 pub mod write_io;
 mod write_preparation;
 mod write_shared;
+pub mod write_stack;
 
 pub use abort::{AbortLog, CleanupError};
 pub use equality_delete_writer::{EqualityDeleteColumn, write_equality_delete_file};

@@ -1,0 +1,72 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Iceberg's implementation of the provider-neutral connector write stack.
+//!
+//! ```text
+//! FE begin_write   -> IcebergCommitHandle + [WriteTargetOrdinal -> IcebergWriterHandle]
+//! BE open_writer   -> one writer per driver
+//!    writer.finish -> zero or more IcebergCommitFragment values, one per artifact
+//! FE finish_write  -> exactly one Iceberg snapshot commit
+//! ```
+//!
+//! Two properties distinguish this from the write path it will replace:
+//!
+//! * a writer's result is a set of independent artifact descriptions rather
+//!   than one opaque report document, so the transport never splits a provider
+//!   document across frames; and
+//! * a delete branch's handle freezes *references* to the old delete artifacts
+//!   instead of an already-read bitmap, and the backend does the reading
+//!   through its own query-leased storage resolver (NCP-6 D10).
+//!
+//! The adapter that converts between these concrete values and the neutral
+//! `ConnectorWriteCommitHandle` / `ConnectorWriterHandle` /
+//! `ConnectorCommitFragment` is `pub(crate)` and is never handed to a role
+//! host.
+
+pub mod control;
+pub mod domain;
+pub mod execution;
+pub mod old_delete;
+pub mod planning;
+pub(crate) mod runtime;
+
+#[cfg(test)]
+pub(crate) mod test_support;
+#[cfg(test)]
+mod tests;
+
+pub use control::{
+    ICEBERG_WRITE_SESSION_EVIDENCE_VERSION, ICEBERG_WRITE_SESSION_MARKER_PROPERTY,
+    ICEBERG_WRITE_SESSION_OPERATION_KIND, IcebergWriteSessionControl,
+};
+pub use domain::{
+    IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
+    IcebergCommitHandle, IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
+    IcebergDeletionVectorArtifact, IcebergPositionDeleteFileArtifact, IcebergSealedWriteTarget,
+    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+};
+pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
+pub use old_delete::{
+    IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeOutcome, IcebergOldDeleteMergeTarget,
+    IcebergStorageRoute, read_and_merge_old_deletes,
+};
+pub use planning::{
+    IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergWriteSessionPlanInput,
+    IcebergWriteTargetPlan, plan_write_session,
+};
