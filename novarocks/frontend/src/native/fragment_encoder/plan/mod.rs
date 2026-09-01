@@ -104,6 +104,19 @@ fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
     value
 }
 
+/// Encode a plan whose writer nodes are stamped from the begin session's
+/// sealed targets.
+pub(super) fn encode_distributed_plan_with_write_targets(
+    src: &DistributedPlan,
+    scan_facts: NativeScanFactsView<'_>,
+    write_targets: &write_dataflow::SealedWriteTargets,
+) -> Result<plan::DistributedPlan, String> {
+    encode_distributed_plan_with_context_inner(
+        src,
+        NativePlanEncodeContext::complete(src, scan_facts).with_write_targets(write_targets),
+    )
+}
+
 pub(super) fn encode_distributed_plan(
     src: &DistributedPlan,
     scan_facts: NativeScanFactsView<'_>,

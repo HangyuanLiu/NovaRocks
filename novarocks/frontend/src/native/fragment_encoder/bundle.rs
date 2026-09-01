@@ -29,3 +29,20 @@ pub fn encode_native_fragment_bundle(
     let encoded = super::plan::encode_distributed_plan(plan, scan_facts)?;
     source.seal(encoded.fragments)
 }
+
+/// Encode a plan that contains write dataflow nodes.
+///
+/// The sealed targets come from the begin session and are stamped into every
+/// writer node, so a recipe never has to be patched in after placement. A plan
+/// with a writer node and no sealed targets fails to encode rather than
+/// submitting a writer the backend could not bind.
+pub(crate) fn encode_native_fragment_bundle_with_write_targets(
+    source: NativeFragmentEncodingView<'_>,
+    write_targets: &super::plan::write_dataflow::SealedWriteTargets,
+) -> Result<NativeFragmentAttachment, String> {
+    let plan = source.distributed_plan();
+    let scan_facts = source.scan_facts();
+    let encoded =
+        super::plan::encode_distributed_plan_with_write_targets(plan, scan_facts, write_targets)?;
+    source.seal(encoded.fragments)
+}
