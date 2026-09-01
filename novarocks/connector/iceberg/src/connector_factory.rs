@@ -188,15 +188,20 @@ impl IcebergConnectorFactory {
     }
 }
 
-impl ConnectorControlFactory for IcebergConnectorFactory {
-    fn provider_id(&self) -> &ConnectorProviderId {
-        self.provider_id()
-    }
-
-    fn create_control(
+impl IcebergConnectorFactory {
+    /// Create one control generation and keep a handle on the catalog runtime
+    /// it minted.
+    ///
+    /// `create_control` is the SPI shape and can only return the creation, but
+    /// Iceberg's own role-binding factory needs the *same* generation's runtime
+    /// to build its frontend write session. Preparing a second unpublished
+    /// control would mint a second catalog client and a second generation, so
+    /// the runtime is handed out here instead. It stays crate-private: no role
+    /// host, registry, or installer ever sees it.
+    pub(crate) fn create_control_with_runtime(
         &self,
         request: ConnectorControlFactoryRequest,
-    ) -> Result<ConnectorControlCreation, ConnectorError> {
+    ) -> Result<(ConnectorControlCreation, Arc<IcebergMetadataContext>), ConnectorError> {
         let unpublished = self.prepare_unpublished(&request)?;
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: self.provider_id.clone(),
@@ -318,12 +323,27 @@ impl ConnectorControlFactory for IcebergConnectorFactory {
                 provider.install_read_registration_lease(lease)
             }));
         }
+        let runtime = Arc::clone(unpublished.runtime());
         let creation = ConnectorControlCreation::try_new(
             &request,
             binding,
             unpublished.durable_properties().to_vec(),
         )?;
-        Ok(creation)
+        Ok((creation, runtime))
+    }
+}
+
+impl ConnectorControlFactory for IcebergConnectorFactory {
+    fn provider_id(&self) -> &ConnectorProviderId {
+        self.provider_id()
+    }
+
+    fn create_control(
+        &self,
+        request: ConnectorControlFactoryRequest,
+    ) -> Result<ConnectorControlCreation, ConnectorError> {
+        self.create_control_with_runtime(request)
+            .map(|(creation, _runtime)| creation)
     }
 }
 

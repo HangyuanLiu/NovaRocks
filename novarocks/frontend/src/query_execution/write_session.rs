@@ -684,6 +684,113 @@ mod tests {
         assert_eq!(fixture.recorded.lock().expect("recorded").abort, 0);
     }
 
+    /// The frontend half of the write, composed the way production composes
+    /// it: begin, seal the recipes into the plan, read the root result back,
+    /// gate on both facts, commit.
+    ///
+    /// Each piece has its own tests; this one exists because they have to fit
+    /// together, and a mismatch between them -- a target the encoder cannot
+    /// find, a relation the decoder cannot read, a set the session refuses --
+    /// is exactly the kind of defect no single unit test can see.
+    #[test]
+    fn the_frontend_write_path_composes_from_begin_to_commit() {
+        use crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets;
+        use crate::query_execution::write_barrier::WriteCommitBarrier;
+
+        let fixture = fixture_with_outcome(
+            1,
+            16,
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                    "scripted",
+                ),
+            },
+        );
+
+        // 1. The session seals one recipe per logical target, and the sealed
+        //    targets are what the plan encoder consumes.
+        let sealed: SealedWriteTargets = fixture
+            .session
+            .seal_write_targets()
+            .expect("sealed targets");
+        assert_eq!(sealed.ordinals().collect::<Vec<_>>(), vec![0]);
+
+        // 2. The backends report their fragments through the root relation.
+        //    Round-trip a real canonical fragment so the decoder is exercised
+        //    against bytes a producer could actually emit.
+        let fragment_bytes = {
+            use prost::Message;
+            write_dto::ConnectorCommitFragment {
+                fragment: Some(write_dto::connector_commit_fragment::Fragment::Iceberg(
+                    write_dto::IcebergCommitFragment {
+                        artifact: Some(write_dto::iceberg_commit_fragment::Artifact::DataFile(
+                            write_dto::IcebergDataFileArtifact {
+                                path: "s3://bucket/db/t/data/new.parquet".to_string(),
+                                file_format: write_dto::IcebergFileFormat::Parquet as i32,
+                                partition: Some(write_dto::IcebergArtifactPartition {
+                                    partition_path: String::new(),
+                                    null_fingerprint: String::new(),
+                                    partition_spec_id: 0,
+                                    descriptor: Some(write_dto::IcebergPartitionDescriptor {
+                                        values: Vec::new(),
+                                    }),
+                                }),
+                                metrics: Some(write_dto::IcebergArtifactMetrics {
+                                    record_count: 7,
+                                    file_size_in_bytes: 128,
+                                    split_offsets: Vec::new(),
+                                    column_stats: None,
+                                }),
+                                first_row_id: None,
+                            },
+                        )),
+                    },
+                )),
+            }
+            .encode_to_vec()
+        };
+        let prepared = DecodedPreparedWriteSet::for_test(
+            7,
+            vec![(
+                WriteTargetOrdinal::try_new(0).expect("ordinal"),
+                fragment_bytes,
+            )],
+        );
+
+        // 3. Both facts, then and only then the commit.
+        let mut barrier = WriteCommitBarrier::new();
+        barrier.observe_prepared_write_set(prepared);
+        barrier.observe_execution_terminals(true);
+        let committable = barrier.into_committable().expect("both facts hold");
+        assert_eq!(committable.row_count(), 7);
+
+        let outcome = fixture
+            .session
+            .finish(committable, request_context())
+            .expect("finish reaches the connector");
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownUncommitted { .. }
+        ));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+    }
+
+    /// The same composition, stopped by a failed participant. The connector is
+    /// never asked to commit, which is the whole point of splitting the gate.
+    #[test]
+    fn a_failed_participant_stops_the_composed_path_before_the_connector() {
+        use crate::query_execution::write_barrier::WriteCommitBarrier;
+
+        let fixture = fixture(1, 16);
+        let mut barrier = WriteCommitBarrier::new();
+        barrier.observe_prepared_write_set(empty_prepared());
+        barrier.observe_execution_terminals(false);
+        assert!(barrier.into_committable().is_err());
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+    }
+
     #[test]
     fn reconcile_is_unreachable_until_a_commit_reported_an_unknown_outcome() {
         let fixture = fixture(1, 16);

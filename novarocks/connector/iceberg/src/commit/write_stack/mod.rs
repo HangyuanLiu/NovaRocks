@@ -36,8 +36,11 @@
 //! The adapter that converts between these concrete values and the neutral
 //! `ConnectorWriteCommitHandle` / `ConnectorWriterHandle` /
 //! `ConnectorCommitFragment` is `pub(crate)` and is never handed to a role
-//! host.
+//! host. `codec` holds it privately too: it is the only module that turns a
+//! central-IDL write carrier into one of these values, and it does so only
+//! through the domain constructors above.
 
+pub(crate) mod codec;
 pub mod control;
 pub mod domain;
 pub mod execution;

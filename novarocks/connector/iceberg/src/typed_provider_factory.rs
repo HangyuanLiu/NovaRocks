@@ -405,7 +405,7 @@ impl IcebergExecutionReadBinding {
 /// provider is static because this factory is installed only in Iceberg's
 /// sealed provider-kind slot; only the catalog name belongs in this diagnostic
 /// descriptor. The full 32-byte content version remains in `CatalogHandle`.
-fn iceberg_descriptor(catalog_handle: &CatalogHandle) -> ConnectorInstanceDescriptor {
+pub(crate) fn iceberg_descriptor(catalog_handle: &CatalogHandle) -> ConnectorInstanceDescriptor {
     ConnectorInstanceDescriptor {
         provider_id: ConnectorProviderId::parse(crate::PROVIDER_ID)
             .expect("static Iceberg provider ID is valid"),
