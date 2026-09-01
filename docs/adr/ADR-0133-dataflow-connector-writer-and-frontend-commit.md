@@ -99,6 +99,15 @@ staged-manifest/ACK 项目，不能伪装成一个简单的 terminal 字段。
 per-delete-file 的 record count，改动它超出本次范围，所以冻结「未知」而不是编造一个数字。
 fail-closed 检查不依赖它，但这确实是一处比设计意图更弱的约束。
 
+**一条语句可以驱动多个 query，提交仍只有一次。** copy-on-write mutation 与 distributed rewrite 今天
+就是「一个 provider write session 驱动 N 个 distributed query，最后提交一次」。把它们重构成单 query、
+N 个 writer fragment 更贴合上面描述的拓扑，但需要一个接受 N 个独立冻结 source 的 plan builder 并重写
+两处驱动循环。选择让 session 累积这 N 个 prepared set 并提交一次：每个 query 仍产出对自己执行图完整的
+集合，累积的是语句级并集，冻结上界改由 session 跨 query 承担——按 query 收费会让语句在提交前持有无界
+数据而每个 query 看起来都在限内。代价是外部提交接受的是「本 session 驱动的并集」而不是单个集合；本文
+描述的拓扑是**单个 query** 的，不是单条语句的。这是为了不重写两条已验证的复杂流程而接受的，不是因为
+它更干净。
+
 **这是一次大规模不兼容切换。** 旧的 operation/cohort/activation/report 贯穿多个 crate 与全部
 DML/MV/maintenance caller。因为没有历史用户与兼容承诺，选择一次原子切换而不是长期双栈——如果存在
 历史用户，这个选择会完全不同。
