@@ -113,6 +113,12 @@ if ! grep -q "minio/warehouse/$env_id/" "$DOCKER_CALLS"; then
   exit 1
 fi
 
+if grep -q "minio/novarocks/shared/benchmarks" "$DOCKER_CALLS"; then
+  echo "runtime-only purge must never remove the shared benchmark root" >&2
+  cat "$DOCKER_CALLS" >&2
+  exit 1
+fi
+
 if grep -q " down " "$DOCKER_CALLS"; then
   echo "runtime-only purge must not stop shared Docker services" >&2
   cat "$DOCKER_CALLS" >&2

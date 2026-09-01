@@ -551,11 +551,15 @@ endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
 Workspace cleanup uses `docker/iceberg-rest/down.sh --runtime-only --purge`,
-which removes only this worktree's generated runtime entry. It deliberately
+which removes only this worktree's generated runtime entry and private object
+prefixes. It deliberately preserves `s3://novarocks/shared/benchmarks/` and
 leaves the shared Docker services running because other worktrees may be using
-them. Use `docker/iceberg-rest/down.sh --docker` only when you explicitly want
-to stop the shared Docker project, and `--docker --volumes` only when you also
-want to delete its shared MinIO volume.
+them. Standard SSB/TPC-H/TPC-DS data is an immutable READY-published fixture:
+the runner resolves it before suite hooks, and only the bootstrap's exact-key
+Docker lease may build it. Use `docker/iceberg-rest/down.sh --docker` only when
+you explicitly want to stop the shared Docker project. `--docker --volumes`
+always rejects the canonical project; it requires an exact task-created project
+and volume confirmation for an isolated reset.
 
 ---
 

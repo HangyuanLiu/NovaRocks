@@ -62,20 +62,30 @@ cargo run -p novarocks-server -- standalone --role all-in-one \
   --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
 ```
 
-In another shell, source the same environment and run the bootstrap script:
+In another shell, resolve the immutable fixture key and run the bootstrap
+driver with that exact resolver output. This path does not connect to the
+NovaRocks MySQL endpoint or create an external catalog:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
+resolved_dataset="$(mktemp)"
+python3 tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py \
+  --suite ssb --scale 1 \
+  --shared-root "$NOVA_ENV_SHARED_BENCHMARK_ROOT" > "$resolved_dataset"
 tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh \
   --suite ssb \
   --scale 1 \
-  --mysql-port "$NOVA_ENV_MYSQL_PORT"
+  --resolved-dataset "$resolved_dataset" \
+  --ensure
+rm -f "$resolved_dataset"
 ```
 
 Use `--suite tpc-h --scale 1` for TPC-H SF1 and `--suite tpc-ds --scale 1GB`
 for TPC-DS 1GB. The TPC-DS `1GB` label is passed to `dsdgen` as scale `1`.
 
-Use `--rebuild` to regenerate even when the readiness check succeeds.
+`--check` reports a typed READY result without building. `--ensure` builds only
+when READY is absent; a malformed READY fixture fails closed. `--rebuild` is an
+explicit exact-key repair operation and preserves every sibling contract key.
 
 ## Runner Auto Bootstrap
 

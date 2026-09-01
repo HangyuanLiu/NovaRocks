@@ -24,7 +24,7 @@ archive_root = "ssb-dbgen-d006a6c49ff1a145a7d4ac7d837427627b213091"
 build_command = "make dbgen"
 binary = "dbgen"
 default_scale = "1"
-raw_tables = ["customer", "date", "lineorder", "part", "supplier"]
+raw_tables = ["customer", "dates", "lineorder", "part", "supplier"]
 
 [tpc-h]
 name = "tpch-dbgen"
@@ -74,3 +74,92 @@ raw_tables = [
   "web_site",
 ]
 schema_ddl = "tools/tpcds.sql"
+
+[fixture]
+schema_version = 1
+contract_schema_version = 1
+ready_filename = "READY.json"
+manifest_filename = "manifest.json"
+shared_root = "s3://novarocks/shared/benchmarks"
+
+[fixture.loader]
+schema_version = "2026-05-26"
+iceberg_format_version = "3"
+statistics_contract = "spark_compute_table_stats"
+
+[fixture.loader.parquet_write_properties]
+"write.parquet.row-group-size-bytes" = "134217728"
+"write.parquet.page-size-bytes" = "16777216"
+"write.parquet.page-row-limit" = "1048576"
+
+[fixture.loader.parquet_hadoop_properties]
+"parquet.block.size" = "134217728"
+"parquet.page.size" = "16777216"
+"parquet.page.row.count.limit" = "1048576"
+
+[fixture.spark_runtime]
+spark_version = "3.5.5-java17"
+iceberg_version = "1.11.0"
+hadoop_version = "3.3.4"
+aws_sdk_version = "1.12.262"
+
+[[fixture.table_layouts]]
+suite = "ssb"
+table = "lineorder"
+range_partitions = 64
+sort_columns = ["lo_discount", "lo_quantity", "lo_orderdate"]
+target_file_size_bytes = 4194304
+
+[[fixture.table_layouts]]
+suite = "tpc-h"
+table = "lineitem"
+range_partitions = 64
+sort_columns = ["l_shipdate", "l_discount", "l_quantity"]
+target_file_size_bytes = 16777216
+
+[[fixture.table_layouts]]
+suite = "tpc-h"
+table = "orders"
+range_partitions = 16
+sort_columns = ["o_orderdate", "o_orderkey"]
+target_file_size_bytes = 16777216
+
+[[fixture.table_layouts]]
+suite = "tpc-ds"
+table = "store_sales"
+range_partitions = 64
+sort_columns = ["ss_sold_date_sk", "ss_item_sk"]
+target_file_size_bytes = 16777216
+
+[[fixture.table_layouts]]
+suite = "tpc-ds"
+table = "catalog_sales"
+range_partitions = 64
+sort_columns = ["cs_sold_date_sk", "cs_item_sk"]
+target_file_size_bytes = 16777216
+
+[[fixture.table_layouts]]
+suite = "tpc-ds"
+table = "web_sales"
+range_partitions = 64
+sort_columns = ["ws_sold_date_sk", "ws_item_sk"]
+target_file_size_bytes = 16777216
+
+[[fixture.table_layouts]]
+suite = "tpc-ds"
+table = "inventory"
+range_partitions = 16
+sort_columns = ["inv_date_sk", "inv_item_sk"]
+target_file_size_bytes = 16777216
+
+[fixture.producer_inputs]
+resolver = "tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py"
+loader = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
+bootstrap = "tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"
+lease_helper = "tests/sql/fixtures/benchmarks/benchmark_fixture_lease.sh"
+publication_helper = "tests/sql/fixtures/benchmarks/benchmark_fixture_publication.sh"
+spark_dockerfile = "docker/iceberg-rest/spark/Dockerfile"
+spark_build_environment = "docker/iceberg-rest/shared.env"
+ssb_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
+tpch_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"
+tpcds_schema = "tests/sql/fixtures/benchmarks/spark/write_standard_benchmark.py"

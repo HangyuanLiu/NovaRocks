@@ -35,6 +35,12 @@ MinIO console `9001`, Iceberg REST `8181`, and Spark UI `4040`. Each worktree
 still gets its own generated runtime entry, object-store prefixes, SQL test
 config, and allocated NovaRocks standalone MySQL / gRPC ports.
 
+Standard SSB, TPC-H, and TPC-DS fixtures are different: they are immutable,
+versioned objects under `s3://novarocks/shared/benchmarks`, owned by this
+shared MinIO volume. The generated environment exports the exact shared root
+and Docker-scoped lease settings. A worktree may read a READY fixture but must
+never delete or mutate it through normal cleanup.
+
 Defaults live in `docker/iceberg-rest/shared.env`. Edit that file, or set
 `NOVA_ENV_CONFIG_FILE=/path/to/file.env`, to override the shared compose
 project, service ports, credentials, or NovaRocks port allocation range.
@@ -163,6 +169,17 @@ Remove the shared Docker volume as well:
 docker/iceberg-rest/down.sh --docker --volumes
 ```
 
+The canonical `nr-iceberg-rest` volume is deliberately protected and this
+command rejects it. It is only available for a task-created, noncanonical
+project when all of the following exact confirmations are set:
+
+```bash
+NOVA_ENV_ALLOW_VOLUME_DELETE=true \
+NOVA_ENV_EXPECTED_COMPOSE_PROJECT=nr-tst10-example \
+NOVA_ENV_EXPECTED_MINIO_VOLUME=nr-tst10-example_minio-data \
+docker/iceberg-rest/down.sh --docker --volumes
+```
+
 `down.sh --runtime-only --purge` deletes
 `docker/iceberg-rest/runtime/<env-id>/` and removes
 `docker/iceberg-rest/runtime/current` when that entry points at the purged
@@ -229,7 +246,8 @@ designed to be safe to call from CI:
   `NOVA_ENV_BE_GRPC_PORT_START`, and `NOVA_ENV_BE_HTTP_PORT_START` (with their
   corresponding `_RANGE` settings).
 - `down.sh --runtime-only --purge` removes only the per-worktree runtime
-  directory.
+  directory and its two private object prefixes. It never removes the shared
+  benchmark fixture root.
 - The runtime directory (`docker/iceberg-rest/runtime/`) is gitignored.
 
 A typical CI step:

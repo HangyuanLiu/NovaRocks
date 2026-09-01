@@ -18,16 +18,74 @@
 
 use crate::types::RunnerConfig;
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tempfile::NamedTempFile;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BenchmarkBootstrapOptions {
     pub enabled: bool,
     pub rebuild: bool,
     pub scales: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyBenchmarkFixture {
+    pub dataset_key: BTreeMap<String, String>,
+    pub exact_warehouse: String,
+    pub manifest_uri: String,
+    pub ready_uri: String,
+    pub publication_identity: String,
+    pub publication_etag: String,
+    pub reused: bool,
+    pub built: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapMode {
+    Check,
+    Ensure,
+    Rebuild,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ResolvedBenchmarkDataset {
+    schema_version: u32,
+    dataset_key: BTreeMap<String, String>,
+    dataset_root: String,
+    ready_uri: String,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EnsureResult {
+    schema_version: u32,
+    dataset_key: BTreeMap<String, String>,
+    state: String,
+    reused: bool,
+    built: bool,
+    exact_warehouse: String,
+    manifest_uri: String,
+    publication: Publication,
+}
+
+#[derive(Debug, Deserialize)]
+struct Publication {
+    ready_uri: String,
+    etag: String,
+    identity: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureError {
+    schema_version: u32,
+    error: String,
+    dataset_key: BTreeMap<String, String>,
+    message: String,
 }
 
 pub fn is_benchmark_suite(suite: &str) -> bool {
@@ -94,18 +152,12 @@ pub fn default_benchmark_scale(suite: &str) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn build_benchmark_bootstrap_command(
+fn build_benchmark_bootstrap_command(
     script_path: &Path,
     suite: &str,
     scale: &str,
-    target_catalog: &str,
-    mysql_host: &str,
-    mysql_port: &str,
-    mysql_user: &str,
-    mysql_password: Option<&str>,
-    check: bool,
-    rebuild: bool,
+    resolved_dataset_path: &Path,
+    mode: BootstrapMode,
 ) -> Command {
     let mut command = Command::new(script_path);
     command
@@ -113,24 +165,13 @@ pub fn build_benchmark_bootstrap_command(
         .arg(suite)
         .arg("--scale")
         .arg(scale)
-        .arg("--target-catalog")
-        .arg(target_catalog)
-        .arg("--mysql-host")
-        .arg(mysql_host)
-        .arg("--mysql-port")
-        .arg(mysql_port)
-        .arg("--mysql-user")
-        .arg(mysql_user);
-
-    if let Some(password) = mysql_password.filter(|password| !password.is_empty()) {
-        command.arg("--mysql-password").arg(password);
-    }
-    if check {
-        command.arg("--check");
-    }
-    if rebuild {
-        command.arg("--rebuild");
-    }
+        .arg("--resolved-dataset")
+        .arg(resolved_dataset_path);
+    command.arg(match mode {
+        BootstrapMode::Check => "--check",
+        BootstrapMode::Ensure => "--ensure",
+        BootstrapMode::Rebuild => "--rebuild",
+    });
 
     command
 }
@@ -155,87 +196,282 @@ pub fn command_preview(command: &Command) -> String {
     parts.join(" ")
 }
 
-pub fn run_benchmark_bootstrap_command(command: &mut Command) -> Result<bool> {
+fn run_benchmark_bootstrap_command(command: &mut Command) -> Result<std::process::Output> {
     let preview = command_preview(command);
-    let status = command
-        .status()
-        .with_context(|| format!("failed to run benchmark bootstrap command: {preview}"))?;
-    Ok(status.success())
+    command
+        .output()
+        .with_context(|| format!("failed to run benchmark bootstrap command: {preview}"))
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn ensure_benchmark_data(
     options: &BenchmarkBootstrapOptions,
     runner_config: &RunnerConfig,
     base_dir: &Path,
     suite: &str,
-    target_catalog: &str,
-    mysql_host: &str,
-    mysql_port: &str,
-    mysql_user: &str,
-    mysql_password: Option<&str>,
-) -> Result<()> {
-    if !options.enabled || !is_auto_bootstrap_supported_suite(suite) {
-        return Ok(());
+) -> Result<Option<ReadyBenchmarkFixture>> {
+    if !is_auto_bootstrap_supported_suite(suite) {
+        return Ok(None);
     }
 
     let script_path = benchmark_bootstrap_script_path(runner_config, base_dir);
     let scale = benchmark_scale_for_suite(options, suite)?;
-    let mut check_command = build_benchmark_bootstrap_command(
-        &script_path,
-        suite,
-        &scale,
-        target_catalog,
-        mysql_host,
-        mysql_port,
-        mysql_user,
-        mysql_password,
-        true,
-        options.rebuild,
-    );
-    if run_benchmark_bootstrap_command(&mut check_command)? {
+    let resolved = resolve_benchmark_dataset(runner_config, base_dir, suite, &scale)?;
+    let mut resolved_file =
+        NamedTempFile::new().context("create resolved benchmark dataset file")?;
+    serde_json::to_writer(&mut resolved_file, &resolved)
+        .context("write resolved benchmark dataset")?;
+    resolved_file
+        .as_file_mut()
+        .sync_all()
+        .context("sync resolved benchmark dataset")?;
+
+    let mode = if options.rebuild {
+        BootstrapMode::Rebuild
+    } else if options.enabled {
+        BootstrapMode::Ensure
+    } else {
+        BootstrapMode::Check
+    };
+    let mut command =
+        build_benchmark_bootstrap_command(&script_path, suite, &scale, resolved_file.path(), mode);
+    let preview = command_preview(&command);
+    let output = run_benchmark_bootstrap_command(&mut command)?;
+    validate_typed_bootstrap_output(runner_config, base_dir, suite, &scale, &output)?;
+    parse_bootstrap_output(&output, &resolved, &preview)
+        .with_context(|| format!("failed to prepare benchmark data for {suite}"))
+        .map(Some)
+}
+
+fn resolve_benchmark_dataset(
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
+    suite: &str,
+    scale: &str,
+) -> Result<ResolvedBenchmarkDataset> {
+    let resolver_path = benchmark_fixture_resolver_path(runner_config, base_dir);
+    let mut command = Command::new("python3");
+    command
+        .arg(&resolver_path)
+        .arg("--workspace-root")
+        .arg(base_dir)
+        .arg("--suite")
+        .arg(suite)
+        .arg("--scale")
+        .arg(scale);
+    if let Some(shared_root) = benchmark_fixture_shared_root(runner_config) {
+        command.arg("--shared-root").arg(shared_root);
+    }
+    let preview = command_preview(&command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run benchmark fixture resolver: {preview}"))?;
+    if !output.status.success() {
+        bail!(
+            "benchmark fixture resolver failed: {preview}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let resolved: ResolvedBenchmarkDataset =
+        serde_json::from_slice(&output.stdout).with_context(|| {
+            format!("benchmark fixture resolver returned malformed JSON: {preview}")
+        })?;
+    validate_resolved_dataset(&resolved, suite, scale)?;
+    Ok(resolved)
+}
+
+fn benchmark_fixture_resolver_path(runner_config: &RunnerConfig, base_dir: &Path) -> PathBuf {
+    runner_config
+        .values
+        .get("benchmark_fixture_resolver")
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                base_dir.join(path)
+            }
+        })
+        .unwrap_or_else(|| {
+            base_dir.join("tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py")
+        })
+}
+
+fn benchmark_fixture_shared_root(runner_config: &RunnerConfig) -> Option<String> {
+    runner_config
+        .values
+        .get("benchmark_shared_root")
+        .or_else(|| runner_config.values.get("benchmark_fixture_shared_root"))
+        .cloned()
+        .or_else(|| std::env::var("NOVA_ENV_SHARED_BENCHMARK_ROOT").ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn validate_typed_bootstrap_output(
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
+    suite: &str,
+    scale: &str,
+    output: &std::process::Output,
+) -> Result<()> {
+    let mut output_file = NamedTempFile::new().context("create bootstrap result file")?;
+    use std::io::Write;
+    output_file
+        .write_all(&output.stdout)
+        .context("write bootstrap result")?;
+    output_file
+        .as_file_mut()
+        .sync_all()
+        .context("sync bootstrap result")?;
+
+    let mut command = Command::new("python3");
+    command
+        .arg(benchmark_fixture_resolver_path(runner_config, base_dir))
+        .arg("--workspace-root")
+        .arg(base_dir)
+        .arg("--suite")
+        .arg(suite)
+        .arg("--scale")
+        .arg(scale)
+        .arg(if output.status.success() {
+            "--validate-ensure-result"
+        } else {
+            "--validate-error"
+        })
+        .arg(output_file.path());
+    if let Some(shared_root) = benchmark_fixture_shared_root(runner_config) {
+        command.arg("--shared-root").arg(shared_root);
+    }
+    let preview = command_preview(&command);
+    let validation = command
+        .output()
+        .with_context(|| format!("failed to validate benchmark fixture result: {preview}"))?;
+    if validation.status.success() {
         return Ok(());
     }
+    bail!(
+        "benchmark bootstrap emitted an invalid typed result: {preview}: {}",
+        String::from_utf8_lossy(&validation.stderr).trim()
+    )
+}
 
-    let mut bootstrap_command = build_benchmark_bootstrap_command(
-        &script_path,
-        suite,
-        &scale,
-        target_catalog,
-        mysql_host,
-        mysql_port,
-        mysql_user,
-        mysql_password,
-        false,
-        options.rebuild,
-    );
-    if !run_benchmark_bootstrap_command(&mut bootstrap_command)? {
-        bail!(
-            "benchmark bootstrap failed: {}",
-            command_preview(&bootstrap_command)
-        );
+pub fn dry_run_benchmark_fixture(
+    runner_config: &RunnerConfig,
+    base_dir: &Path,
+    suite: &str,
+    options: &BenchmarkBootstrapOptions,
+) -> Result<Option<ReadyBenchmarkFixture>> {
+    if !is_auto_bootstrap_supported_suite(suite) {
+        return Ok(None);
     }
+    let scale = benchmark_scale_for_suite(options, suite)?;
+    let resolved = resolve_benchmark_dataset(runner_config, base_dir, suite, &scale)?;
+    Ok(Some(ReadyBenchmarkFixture {
+        dataset_key: resolved.dataset_key,
+        exact_warehouse: "unresolved://benchmark-fixture-ready-required".to_string(),
+        manifest_uri: "unresolved://benchmark-fixture-ready-required".to_string(),
+        ready_uri: resolved.ready_uri,
+        publication_identity: "unresolved".to_string(),
+        publication_etag: "unresolved".to_string(),
+        reused: false,
+        built: false,
+    }))
+}
 
-    let mut recheck_command = build_benchmark_bootstrap_command(
-        &script_path,
-        suite,
-        &scale,
-        target_catalog,
-        mysql_host,
-        mysql_port,
-        mysql_user,
-        mysql_password,
-        true,
-        false,
-    );
-    if !run_benchmark_bootstrap_command(&mut recheck_command)? {
-        bail!(
-            "benchmark bootstrap recheck failed: {}",
-            command_preview(&recheck_command)
-        );
+fn validate_resolved_dataset(
+    resolved: &ResolvedBenchmarkDataset,
+    suite: &str,
+    _requested_scale: &str,
+) -> Result<()> {
+    if resolved.schema_version != 1 {
+        bail!("ResolvedBenchmarkDataset has an unknown schema_version");
     }
-
+    if resolved.dataset_key.get("suite").map(String::as_str) != Some(suite)
+        || resolved
+            .dataset_key
+            .get("scale")
+            .is_none_or(|scale| scale.trim().is_empty())
+        || resolved
+            .dataset_key
+            .get("fixture_contract_id")
+            .is_none_or(String::is_empty)
+    {
+        bail!("ResolvedBenchmarkDataset has an invalid dataset_key");
+    }
+    if !resolved.dataset_root.starts_with("s3://") || !resolved.ready_uri.starts_with("s3://") {
+        bail!("ResolvedBenchmarkDataset has a non-S3 dataset location");
+    }
     Ok(())
+}
+
+fn parse_bootstrap_output(
+    output: &std::process::Output,
+    resolved: &ResolvedBenchmarkDataset,
+    preview: &str,
+) -> Result<ReadyBenchmarkFixture> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!("benchmark bootstrap did not emit a typed JSON result: {preview}")
+    })?;
+    if output.status.success() {
+        let result: EnsureResult = serde_json::from_value(value)
+            .context("benchmark bootstrap emitted malformed EnsureResult")?;
+        return validate_ensure_result(result, resolved);
+    }
+
+    if let Ok(error) = serde_json::from_value::<FixtureError>(value) {
+        validate_fixture_error(error, resolved)?;
+    }
+    bail!(
+        "benchmark bootstrap failed: {preview}: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
+}
+
+fn validate_ensure_result(
+    result: EnsureResult,
+    resolved: &ResolvedBenchmarkDataset,
+) -> Result<ReadyBenchmarkFixture> {
+    if result.schema_version != 1
+        || result.state != "ReadyValid"
+        || result.reused == result.built
+        || result.dataset_key != resolved.dataset_key
+        || result.publication.ready_uri != resolved.ready_uri
+        || result.publication.etag.trim().is_empty()
+        || result.publication.identity.trim().is_empty()
+        || !result.exact_warehouse.starts_with("s3://")
+        || !result.manifest_uri.starts_with("s3://")
+    {
+        bail!("benchmark bootstrap emitted an invalid EnsureResult");
+    }
+    Ok(ReadyBenchmarkFixture {
+        dataset_key: result.dataset_key,
+        exact_warehouse: result.exact_warehouse,
+        manifest_uri: result.manifest_uri,
+        ready_uri: result.publication.ready_uri,
+        publication_identity: result.publication.identity,
+        publication_etag: result.publication.etag,
+        reused: result.reused,
+        built: result.built,
+    })
+}
+
+fn validate_fixture_error(error: FixtureError, resolved: &ResolvedBenchmarkDataset) -> Result<()> {
+    const KNOWN_ERRORS: &[&str] = &[
+        "ready_invalid",
+        "wait_timeout",
+        "lease_lost",
+        "writer_failed",
+        "publication_conflict",
+        "publication_failed",
+    ];
+    if error.schema_version != 1
+        || error.dataset_key != resolved.dataset_key
+        || !KNOWN_ERRORS.contains(&error.error.as_str())
+        || error.message.trim().is_empty()
+    {
+        bail!("benchmark bootstrap emitted an invalid FixtureError");
+    }
+    bail!("benchmark fixture {}: {}", error.error, error.message)
 }
 
 fn benchmark_bootstrap_script_path(runner_config: &RunnerConfig, base_dir: &Path) -> PathBuf {
@@ -277,7 +513,10 @@ fn shell_quote(value: &OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use tempfile::tempdir;
 
     #[test]
     fn recognizes_supported_benchmark_suites() {
@@ -293,60 +532,6 @@ mod tests {
         assert!(is_auto_bootstrap_supported_suite("tpc-h"));
         assert!(is_auto_bootstrap_supported_suite("tpc-ds"));
         assert!(!is_auto_bootstrap_supported_suite("join"));
-    }
-
-    #[test]
-    fn ensure_benchmark_data_runs_bootstrap_for_tpc_h() {
-        let options = BenchmarkBootstrapOptions {
-            enabled: true,
-            rebuild: false,
-            scales: BTreeMap::new(),
-        };
-        let mut runner_config = RunnerConfig::default();
-        runner_config.values.insert(
-            "benchmark_bootstrap_script".to_string(),
-            "/definitely/missing/bootstrap_benchmark_data.sh".to_string(),
-        );
-
-        ensure_benchmark_data(
-            &options,
-            &runner_config,
-            Path::new("."),
-            "tpc-h",
-            "iceberg_cat",
-            "127.0.0.1",
-            "23223",
-            "root",
-            Some("secret"),
-        )
-        .expect_err("supported suite should attempt to run the configured bootstrap script");
-    }
-
-    #[test]
-    fn ensure_benchmark_data_runs_bootstrap_for_tpc_ds() {
-        let options = BenchmarkBootstrapOptions {
-            enabled: true,
-            rebuild: false,
-            scales: BTreeMap::new(),
-        };
-        let mut runner_config = RunnerConfig::default();
-        runner_config.values.insert(
-            "benchmark_bootstrap_script".to_string(),
-            "/definitely/missing/bootstrap_benchmark_data.sh".to_string(),
-        );
-
-        ensure_benchmark_data(
-            &options,
-            &runner_config,
-            Path::new("."),
-            "tpc-ds",
-            "iceberg_cat",
-            "127.0.0.1",
-            "23223",
-            "root",
-            Some("secret"),
-        )
-        .expect_err("supported suite should attempt to run the configured bootstrap script");
     }
 
     #[test]
@@ -386,18 +571,25 @@ mod tests {
     }
 
     #[test]
-    fn builds_check_and_rebuild_command_arguments() {
+    fn resolver_normalizes_scale_without_runner_reimplementing_the_contract() {
+        let mut resolved = resolved_fixture();
+        resolved
+            .dataset_key
+            .insert("suite".to_string(), "tpc-ds".to_string());
+        resolved.dataset_key.insert("scale".to_string(), "1GB".to_string());
+
+        validate_resolved_dataset(&resolved, "tpc-ds", "1gb")
+            .expect("the resolver owns scale normalization");
+    }
+
+    #[test]
+    fn bootstrap_command_uses_resolved_dataset_without_mysql_or_catalog_arguments() {
         let command = build_benchmark_bootstrap_command(
             Path::new("tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"),
             "ssb",
             "1",
-            "iceberg_cat",
-            "127.0.0.1",
-            "23223",
-            "root",
-            Some("secret"),
-            true,
-            true,
+            Path::new("/tmp/resolved.json"),
+            BootstrapMode::Rebuild,
         );
 
         let program = command.get_program().to_string_lossy();
@@ -417,36 +609,19 @@ mod tests {
                 "ssb",
                 "--scale",
                 "1",
-                "--target-catalog",
-                "iceberg_cat",
-                "--mysql-host",
-                "127.0.0.1",
-                "--mysql-port",
-                "23223",
-                "--mysql-user",
-                "root",
-                "--mysql-password",
-                "secret",
-                "--check",
+                "--resolved-dataset",
+                "/tmp/resolved.json",
                 "--rebuild",
             ]
         );
+        assert!(!args.iter().any(|arg| arg.contains("mysql")));
+        assert!(!args.iter().any(|arg| arg.contains("catalog")));
     }
 
     #[test]
-    fn command_preview_redacts_mysql_password() {
-        let command = build_benchmark_bootstrap_command(
-            Path::new("tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"),
-            "ssb",
-            "1",
-            "iceberg_cat",
-            "127.0.0.1",
-            "23223",
-            "root",
-            Some("very-secret-password"),
-            true,
-            false,
-        );
+    fn command_preview_still_redacts_generic_password_arguments() {
+        let mut command = Command::new("fixture-driver");
+        command.arg("--mysql-password").arg("very-secret-password");
 
         let preview = command_preview(&command);
 
@@ -455,25 +630,99 @@ mod tests {
     }
 
     #[test]
-    fn skips_empty_mysql_password_argument() {
-        let command = build_benchmark_bootstrap_command(
-            Path::new("tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"),
-            "ssb",
-            "1",
-            "iceberg_cat",
-            "127.0.0.1",
-            "23223",
-            "root",
-            Some(""),
-            true,
-            false,
+    fn typed_ensure_result_requires_resolved_key_and_ready_uri() {
+        let resolved = resolved_fixture();
+        let stdout = r#"{
+          "schema_version": 1,
+          "dataset_key": {"suite":"ssb","scale":"1","fixture_contract_id":"abc"},
+          "state":"ReadyValid",
+          "reused":true,
+          "built":false,
+          "exact_warehouse":"s3://novarocks/shared/benchmarks/ssb/1/abc/warehouse",
+          "manifest_uri":"s3://novarocks/shared/benchmarks/ssb/1/abc/manifest.json",
+          "publication":{"ready_uri":"s3://novarocks/shared/benchmarks/ssb/1/abc/READY.json","etag":"etag","identity":"identity"}
+        }"#;
+        let output = Command::new("true").output().expect("run true");
+        let output = std::process::Output {
+            stdout: stdout.as_bytes().to_vec(),
+            ..output
+        };
+
+        let fixture = parse_bootstrap_output(&output, &resolved, "fixture-driver").unwrap();
+
+        assert_eq!(
+            fixture.exact_warehouse,
+            "s3://novarocks/shared/benchmarks/ssb/1/abc/warehouse"
         );
+        assert!(fixture.reused);
+        assert!(!fixture.built);
+    }
 
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+    #[test]
+    fn ready_invalid_error_fails_closed_without_an_ensure_retry() {
+        let resolved = resolved_fixture();
+        let stdout = r#"{
+          "schema_version":1,
+          "error":"ready_invalid",
+          "dataset_key":{"suite":"ssb","scale":"1","fixture_contract_id":"abc"},
+          "message":"READY manifest mismatch"
+        }"#;
+        let output = Command::new("false").output().expect("run false");
+        let output = std::process::Output {
+            stdout: stdout.as_bytes().to_vec(),
+            ..output
+        };
 
-        assert!(!args.iter().any(|arg| arg == "--mysql-password"));
+        let error = parse_bootstrap_output(&output, &resolved, "fixture-driver")
+            .expect_err("ReadyInvalid must fail closed");
+
+        assert!(error.to_string().contains("ready_invalid"));
+    }
+
+    #[test]
+    fn ensure_passes_full_resolved_contract_to_driver_and_validates_result() {
+        let temp = tempdir().expect("tempdir");
+        let resolver = temp.path().join("resolver.py");
+        let driver = temp.path().join("driver.sh");
+        fs::write(&resolver, "import json\nimport sys\na=sys.argv[1:]\nif '--validate-ensure-result' in a:\n p=json.load(open(a[a.index('--validate-ensure-result')+1])); assert p['state']=='ReadyValid'; raise SystemExit(0)\nif '--validate-error' in a: raise SystemExit(0)\nprint(json.dumps({'schema_version':1,'dataset_key':{'suite':'ssb','scale':'1','fixture_contract_id':'abc'},'dataset_root':'s3://novarocks/shared/benchmarks/ssb/1/abc','ready_uri':'s3://novarocks/shared/benchmarks/ssb/1/abc/READY.json','contract':{'preserved_for_driver':True}}))\n").expect("write resolver");
+        fs::write(&driver, "#!/usr/bin/env bash\nset -euo pipefail\ntest \"$1\" = --suite; test \"$2\" = ssb; test \"$3\" = --scale; test \"$4\" = 1; test \"$5\" = --resolved-dataset\npython3 - \"$6\" <<'PY'\nimport json,sys\nassert json.load(open(sys.argv[1]))['contract']['preserved_for_driver'] is True\nPY\ntest \"$7\" = --ensure\nprintf '%s\\n' '{\"schema_version\":1,\"dataset_key\":{\"suite\":\"ssb\",\"scale\":\"1\",\"fixture_contract_id\":\"abc\"},\"state\":\"ReadyValid\",\"reused\":false,\"built\":true,\"exact_warehouse\":\"s3://novarocks/shared/benchmarks/ssb/1/abc/warehouse\",\"manifest_uri\":\"s3://novarocks/shared/benchmarks/ssb/1/abc/manifest.json\",\"publication\":{\"ready_uri\":\"s3://novarocks/shared/benchmarks/ssb/1/abc/READY.json\",\"etag\":\"etag\",\"identity\":\"identity\"}}'\n").expect("write driver");
+        fs::set_permissions(&driver, fs::Permissions::from_mode(0o755))
+            .expect("make driver executable");
+
+        let mut config = RunnerConfig::default();
+        config.values.insert(
+            "benchmark_fixture_resolver".to_string(),
+            resolver.display().to_string(),
+        );
+        config.values.insert(
+            "benchmark_bootstrap_script".to_string(),
+            driver.display().to_string(),
+        );
+        let options = BenchmarkBootstrapOptions {
+            enabled: true,
+            rebuild: false,
+            scales: BTreeMap::new(),
+        };
+
+        let fixture = ensure_benchmark_data(&options, &config, temp.path(), "ssb")
+            .expect("ensure succeeds")
+            .expect("benchmark suite returns fixture");
+
+        assert!(fixture.built);
+        assert_eq!(fixture.dataset_key["fixture_contract_id"], "abc");
+    }
+
+    fn resolved_fixture() -> ResolvedBenchmarkDataset {
+        ResolvedBenchmarkDataset {
+            schema_version: 1,
+            dataset_key: BTreeMap::from([
+                ("suite".to_string(), "ssb".to_string()),
+                ("scale".to_string(), "1".to_string()),
+                ("fixture_contract_id".to_string(), "abc".to_string()),
+            ]),
+            dataset_root: "s3://novarocks/shared/benchmarks/ssb/1/abc".to_string(),
+            ready_uri: "s3://novarocks/shared/benchmarks/ssb/1/abc/READY.json".to_string(),
+            extra: BTreeMap::new(),
+        }
     }
 }

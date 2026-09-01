@@ -45,6 +45,14 @@ fi
 
 shared_docker="${NOVA_ENV_SHARED_DOCKER:-true}"
 configured_compose_project="${NOVA_ENV_SHARED_COMPOSE_PROJECT:-nr-iceberg-rest}"
+canonical_compose_project="nr-iceberg-rest"
+shared_benchmark_root="${NOVA_ENV_SHARED_BENCHMARK_ROOT:-s3://novarocks/shared/benchmarks}"
+if [[ ! "$shared_benchmark_root" =~ ^s3://[^/[:space:]]+/[^[:space:]]+$ ]]; then
+  echo "NOVA_ENV_SHARED_BENCHMARK_ROOT must be a non-empty s3://bucket/prefix URI" >&2
+  exit 2
+fi
+shared_benchmark_mc_prefix="minio/${shared_benchmark_root#s3://}"
+shared_benchmark_mc_prefix="${shared_benchmark_mc_prefix%/}/"
 if [[ "$shared_docker" == "true" ]]; then
   compose_project="$configured_compose_project"
   stop_docker=false
@@ -67,6 +75,7 @@ fi
 down_args=()
 remove_runtime=false
 purge_requested=false
+volume_delete_requested=false
 for arg in "$@"; do
   case "$arg" in
     --docker)
@@ -78,6 +87,7 @@ for arg in "$@"; do
     -v|--volumes)
       down_args+=("--volumes")
       stop_docker=true
+      volume_delete_requested=true
       ;;
     --purge)
       remove_runtime=true
@@ -92,7 +102,29 @@ for arg in "$@"; do
 done
 
 if [[ "$purge_requested" == true && "$stop_docker" == true ]]; then
+  # `--docker --purge` has always meant a full Docker teardown. Treat its
+  # implied volume deletion exactly like an explicit `--volumes` request.
   down_args+=("--volumes")
+  volume_delete_requested=true
+fi
+
+if [[ "$volume_delete_requested" == true ]]; then
+  expected_project="${NOVA_ENV_EXPECTED_COMPOSE_PROJECT:-}"
+  expected_volume="${NOVA_ENV_EXPECTED_MINIO_VOLUME:-}"
+  actual_volume="${compose_project}_minio-data"
+  if [[ "$compose_project" == "$canonical_compose_project" ]]; then
+    echo "refusing to delete canonical shared Docker volume for project: $compose_project" >&2
+    exit 2
+  fi
+  if [[ "${NOVA_ENV_ALLOW_VOLUME_DELETE:-}" != "true" ]]; then
+    echo "refusing volume deletion without NOVA_ENV_ALLOW_VOLUME_DELETE=true" >&2
+    exit 2
+  fi
+  if [[ "$expected_project" != "$compose_project" || "$expected_volume" != "$actual_volume" ]]; then
+    echo "refusing volume deletion without exact task-owned project and volume confirmation" >&2
+    exit 2
+  fi
+  echo "Volume deletion authorized for exact project: $compose_project; volume: $actual_volume"
 fi
 
 purge_object_store_prefixes() {
@@ -114,6 +146,12 @@ purge_object_store_prefixes() {
 
   local target
   for target in "minio/novarocks/$env_id/" "minio/warehouse/$env_id/"; do
+    case "$target" in
+      "$shared_benchmark_mc_prefix"*)
+        echo "refusing to purge shared benchmark root: $target" >&2
+        return 1
+        ;;
+    esac
     echo "Purging object-store prefix: $target"
     docker compose \
       --env-file "$compose_env" \
@@ -132,6 +170,9 @@ if [[ "$stop_docker" == true ]]; then
   if [[ ! -f "$compose_env" ]]; then
     echo "environment is not initialized: $runtime_dir" >&2
   else
+    if [[ "$volume_delete_requested" != true ]]; then
+      echo "Stopping Docker project: $compose_project (preserving volume: ${compose_project}_minio-data)"
+    fi
     docker compose \
       --env-file "$compose_env" \
       -p "$compose_project" \
