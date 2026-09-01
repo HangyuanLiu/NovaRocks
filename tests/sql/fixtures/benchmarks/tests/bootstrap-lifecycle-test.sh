@@ -34,6 +34,10 @@ cat > "$TMP/fake-docker" <<'EOF'
 set -euo pipefail
 state="${FAKE_DOCKER_STATE:?}"; mkdir -p "$state"
 cmd="$1"; shift
+if [[ "$cmd" == image ]]; then
+  [[ "$1" == inspect ]] || exit 64
+  exit 0
+fi
 [[ "$cmd" == container ]] || exit 64
 sub="$1"; shift
 case "$sub" in

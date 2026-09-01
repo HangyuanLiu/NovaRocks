@@ -64,13 +64,24 @@ fixture_lease_acquire() {
   # stdout is exactly the immutable container id.  A 409/name conflict exits 75.
   local lease_name="$1" dataset_key="$2" owner="$3" staging="$4" image="$5"
   [[ "$image" == *@sha256:* ]] || { echo 'lease image must be digest-pinned' >&2; return 64; }
+  # Docker container create implicitly pulls a missing image and can block for
+  # minutes without exposing a useful owner/lease state.  A benchmark fixture
+  # must fail closed before it claims the writer election when the local image
+  # is unavailable; callers can explicitly provision the pinned image first.
+  fixture_lease_docker image inspect "$image" >/dev/null 2>&1 || return 1
   local id
   if ! id="$(fixture_lease_docker container create --name "$lease_name" \
       --label "novarocks.fixture.dataset-key=$dataset_key" \
       --label "novarocks.fixture.owner=$owner" \
       --label "novarocks.fixture.staging=$staging" \
       "$image" /bin/sh -ceu 'trap : TERM INT; while :; do sleep 3600; done' 2>/dev/null)"; then
-    return 75
+    # A 409 name conflict is a normal concurrent-writer condition.  An image
+    # pull/create failure is not: treating both as a conflict makes callers
+    # wait for the full lease timeout even though no writer owns the fixture.
+    if fixture_lease_inspect "$lease_name" >/dev/null 2>&1; then
+      return 75
+    fi
+    return 1
   fi
   if ! fixture_lease_docker container start "$id" >/dev/null; then
     fixture_lease_docker container rm -f "$id" >/dev/null 2>&1 || true
