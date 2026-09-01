@@ -36,6 +36,7 @@
 //!
 //! Cancellation and deadline are a third, independent veto. They do not prove
 //! anything happened; they only forbid starting an external effect.
+// Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
 

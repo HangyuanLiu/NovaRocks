@@ -2,9 +2,9 @@
 id: ADR-0023
 title: "Connector distributed writer contract"
 domain: [provider-spi, distributed-execution]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0133
 date: 2026-07-31
 provenance:
   - "discussion: 2026-07-31 SPI-4C1 provider-neutral distributed writer contract"

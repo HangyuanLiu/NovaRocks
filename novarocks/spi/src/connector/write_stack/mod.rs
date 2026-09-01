@@ -47,6 +47,7 @@
 //! | exact provider generation | [`ConnectorWriteBinding`] | query / commit session |
 //! | logical target association | [`WriteTargetOrdinal`] | one sealed query plan |
 //! | physical execution context | [`ConnectorWriterPhysicalContext`] | one execution attempt |
+// Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 
 pub mod adapter;
 pub mod budget;

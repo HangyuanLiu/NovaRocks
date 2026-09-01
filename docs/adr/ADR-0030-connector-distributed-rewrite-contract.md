@@ -2,9 +2,9 @@
 id: ADR-0030
 title: "Connector distributed rewrite contract"
 domain: [provider-spi, table-maintenance]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0133
 date: 2026-08-02
 provenance:
   - "discussion: 2026-08-02 connector distributed rewrite"

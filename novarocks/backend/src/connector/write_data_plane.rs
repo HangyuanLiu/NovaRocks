@@ -115,6 +115,7 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
 /// It proves a carrier is a canonical, in-bounds commit fragment of a provider
 /// the closed carrier vocabulary names, and stops there. It never produces a
 /// provider value, and it holds no provider binding that could produce one.
+// Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 pub(crate) struct RootCommitFragmentCarrierValidator {
     execution_id: QueryExecutionId,
     node_id: i32,
