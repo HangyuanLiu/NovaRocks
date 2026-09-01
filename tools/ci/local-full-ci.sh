@@ -28,7 +28,7 @@ source "$SCRIPT_DIR/lib/known_failures.sh"
 source "$SCRIPT_DIR/lib/server.sh"
 source "$SCRIPT_DIR/lib/system_scenarios.sh"
 
-STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-sql-suites.txt"
+STABLE_SUITES_FILE="$SCRIPT_DIR/suites/stable-correctness-suites.txt"
 KNOWN_FAILURES_FILE="$SCRIPT_DIR/baselines/known-failures.toml"
 RUN_MODE="stable"
 CI_TIER="full"
@@ -79,7 +79,7 @@ full-suite matrix, and NOVA_CI_NATIVE_CROSS_PROCESS_REQUIRED=1 to make failures
 in an appended matrix fail CI.
 
 Options:
-  --all-discovered      Run every suite discovered from tests/sql/suites/*/sql.
+  --all-discovered      Run every correctness suite through typed runner discovery.
   --suite <name>        Run only the named SQL suite. May be repeated.
   --tier <name>         Stable tier: smoke, targeted, or full. Default: full.
   --from <run-dir>      Reclassify an existing logs/ci-full run without rerun.
@@ -588,7 +588,7 @@ resolve_suites() {
     local suite
     for suite in "${REQUESTED_SUITES[@]}"; do
       if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
-        echo "error: SQL suite does not exist: $suite" >&2
+        echo "error: correctness SQL suite does not exist: $suite; benchmark workloads use tools/benchmark/run-sql-benchmark.sh" >&2
         exit 2
       fi
       SUITES+=("$suite")
@@ -613,7 +613,7 @@ resolve_suites() {
   while IFS= read -r suite; do
     [ -n "$suite" ] || continue
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
-      echo "error: tier '$CI_TIER' SQL suite does not exist: $suite" >&2
+      echo "error: tier '$CI_TIER' correctness SQL suite does not exist: $suite" >&2
       exit 2
     fi
     SUITES+=("$suite")
@@ -631,7 +631,7 @@ validate_explicit_suites_early() {
   for suite in "${REQUESTED_SUITES[@]}"; do
     if ! ci_suite_exists "$REPO_ROOT" "$suite"; then
       log_path="$CI_RUN_DIR/validation.log"
-      echo "error: SQL suite does not exist: $suite" | tee "$log_path" >&2
+      echo "error: correctness SQL suite does not exist: $suite; benchmark workloads use tools/benchmark/run-sql-benchmark.sh" | tee "$log_path" >&2
       ci_record_stage "validate SQL suites" "FAIL" "0" "$log_path"
       ci_mark_failure_tail "SQL suite validation failed" "$log_path"
       ci_render_summary "FAIL"
@@ -920,10 +920,7 @@ run_sql_suites() {
     suite_cluster_mode="$(ci_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_suite_cluster_size "$suite")"
     case "$suite" in
-      tpc-ds|tpc-h)
-        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
-        ;;
-      complex-type|ssb)
+      complex-type)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
         ;;
       optimizer-dist)
@@ -947,7 +944,7 @@ run_sql_suites() {
       NOVAROCKS_BIN="$novarocks_bin" \
       NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
       NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_RUNTIME_DIR/env.sh" \
-      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
+      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --bin novarocks-sql-test -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \

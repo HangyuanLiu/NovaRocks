@@ -32,7 +32,7 @@
 -- cannot read data from a table whose schema contains timestamp_ns columns
 -- (runtime error: "Cannot convert unsupported type to Spark: timestamp_ns").
 -- Direction A combined with the NovaRocks-only roundtrip in
--- tests/sql/suites/iceberg-rest/timestamp_ns_roundtrip.sql provides full read+write
+-- tests/sql/correctness/iceberg-rest/timestamp_ns_roundtrip.sql provides full read+write
 -- correctness coverage.
 
 -- query 1

@@ -19,7 +19,10 @@ under the License.
 
 # SQL Tests
 
-`tests/sql/suites/` is the standalone SQL regression suite for NovaRocks.
+SQL tests have two physical roots:
+
+- `tests/sql/correctness/` contains the small-data correctness corpus used by development and full CI.
+- `tests/sql/benchmarks/` contains fixed-data performance workloads. They are not selected by correctness CI.
 
 ## Object Store Prerequisite
 
@@ -59,7 +62,7 @@ NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 
 Then run a suite:
 
 ```bash
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
   --suite filter --mode verify
 ```
 
@@ -73,7 +76,7 @@ For Docker-backed Iceberg suites, prefer the generated fixture config:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
-cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
+cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite materialized-view --mode verify
 ```

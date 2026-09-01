@@ -346,7 +346,7 @@ error instead of silently absorbing or overwriting the foreign change.
 
 ### Verifying with Spark
 
-`tests/sql/suites/iceberg-compatibility/sql/novarocks_rest_minio_mv_table_read_by_spark.sql`
+`tests/sql/correctness/iceberg-compatibility/sql/novarocks_rest_minio_mv_table_read_by_spark.sql`
 is the CI-gated recipe for this contract: NovaRocks creates and refreshes an
 Iceberg MV in the REST `ice_rest`-backed catalog, then two Spark `spark-sql.sh`
 steps read the MV table's visible materialized columns and verify that

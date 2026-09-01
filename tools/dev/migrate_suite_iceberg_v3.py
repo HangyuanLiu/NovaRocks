@@ -24,7 +24,7 @@ clauses from <tail> and appends/merges TBLPROPERTIES("format-version"="3").
 `CREATE TABLE ... AS SELECT` is left untouched. Every change is printed for
 human diff review; the record/verify gate is the real safety net.
 
-Usage:  python3 tools/dev/migrate_suite_iceberg_v3.py tests/sql/suites/<suite>/sql
+Usage:  python3 tools/dev/migrate_suite_iceberg_v3.py tests/sql/correctness/<suite>/sql
 """
 import re
 import sys

@@ -1,4 +1,4 @@
-# Stable SQL suites for tools/ci/local-full-ci.sh default daily mode.
+# Stable correctness suites for tools/ci/local-full-ci.sh default daily mode.
 # Keep this list conservative. Add a suite only after a serial local run
 # (`novarocks-sql-test -j 1`) has passed in the current environment.
 filter
@@ -20,9 +20,6 @@ analytic
 optimizer
 optimizer-dist
 statistics
-ssb
-tpc-h
-tpc-ds
 iceberg
 iceberg-compatibility
 iceberg-ddl

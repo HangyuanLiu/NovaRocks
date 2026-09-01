@@ -22,7 +22,7 @@
 -- 3. Verify add-field for an already-existing field is rejected.
 -- 4. Verify drop-field for a non-existent field is rejected.
 -- Note: NovaRocks's standalone INSERT path does not currently support STRUCT
--- column writes (see tests/sql/suites/iceberg/sql/iceberg_schema_evolution_nested.sql),
+-- column writes (see tests/sql/correctness/iceberg/sql/iceberg_schema_evolution_nested.sql),
 -- so this test is DDL-only.
 
 -- query 1

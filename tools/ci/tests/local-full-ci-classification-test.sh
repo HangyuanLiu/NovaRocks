@@ -79,29 +79,15 @@ fi
 
 grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
 
-targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt")"
+targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-correctness-suites.txt")"
 grep -qx "optimizer-dist" <<<"$targeted_suites"
 
-resolve_root="$tmpdir/resolve-malformed"
-mkdir -p \
-  "$resolve_root/tests/sql/suites/a-valid/sql" \
-  "$resolve_root/tests/sql/suites/z-malformed/sql"
-printf '%s\n' 'explicit_only = false' \
-  >"$resolve_root/tests/sql/suites/a-valid/suite.toml"
-printf '%s\n' 'explicit_only = "false"' \
-  >"$resolve_root/tests/sql/suites/z-malformed/suite.toml"
-resolve_status=0
-(
-  REPO_ROOT="$resolve_root"
-  RUN_MODE="all-discovered"
-  resolve_suites
-) 2>"$resolve_root/resolve.err" || resolve_status=$?
-if [ "$resolve_status" -eq 0 ]; then
-  echo "all-discovered resolution must propagate malformed metadata failure" >&2
+if ci_suite_exists "$REPO_ROOT" ssb; then
+  echo "benchmark workload must not be accepted as an explicit correctness suite" >&2
   exit 1
 fi
-if [ "$resolve_status" -ne 2 ]; then
-  echo "all-discovered resolution returned $resolve_status instead of discovery status 2" >&2
+if ! ci_suite_exists "$REPO_ROOT" filter; then
+  echo "correctness suite must remain selectable" >&2
   exit 1
 fi
 
@@ -129,7 +115,7 @@ if [ "$(ci_suite_cluster_size distributed-resilience)" != "3" ]; then
   echo "distributed-resilience must run with 3 BEs" >&2
   exit 1
 fi
-if ! grep -qx 'distributed-resilience' "$REPO_ROOT/tools/ci/suites/stable-sql-suites.txt"; then
+if ! grep -qx 'distributed-resilience' "$REPO_ROOT/tools/ci/suites/stable-correctness-suites.txt"; then
   echo "distributed-resilience must be part of the stable SQL suite set" >&2
   exit 1
 fi

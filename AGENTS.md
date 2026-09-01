@@ -606,7 +606,8 @@ only for performance measurement and benchmarks.
 
 ### 8.4 SQL Regression Tests
 
-The unified runner is under `tests/sql/runner`, with suites under `tests/sql/suites`.
+The unified runner is under `tests/sql/runner`, with correctness suites under `tests/sql/correctness`
+and benchmark workloads under `tests/sql/benchmarks`.
 It requires a running NovaRocks
 MySQL-compatible standalone server. Do not assume a fixed port in Codex
 workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
@@ -697,7 +698,7 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   follow-up. Verbose/Costs/Analyze append a stable `stats={rows=N}`
   trailer to each physical node. `SET disable_optimizer_rules = 'RuleA,RuleB'`
   (alias `cbo_disabled_rules`) bisects optimizer rules at session level;
-  see `src/sql/optimizer/options.rs`. Use the `tests/sql/suites/optimizer/` suite
+  see `src/sql/optimizer/options.rs`. Use the `tests/sql/correctness/optimizer/` suite
   for plan-golden cases, and `-- @explain_contains=<substr>` /
   `-- @normalize_explain_timing` in any sql-test case to assert plan-shape
   facts alongside the result golden.
@@ -707,7 +708,7 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   bucketing predicts a real row-count reduction. White-list functions
   are SUM/MIN/MAX/COUNT(col). Disable via
   `SET disable_optimizer_rules = 'AggregatePushdown'`. Plan-shape
-  cases live under `tests/sql/suites/optimizer/aggregate_pushdown_*.sql`. The
+  cases live under `tests/sql/correctness/optimizer/aggregate_pushdown_*.sql`. The
   idempotency guard is `AggregateNode::already_pushed` — other rules
   must preserve the flag when cloning.
 

@@ -92,7 +92,7 @@ ANALYZE TABLE ${case_db}.rf_dist_bi_t3;
 -- Force Shuffle (PARTITIONED) hash joins on both levels and relax the RF
 -- build-size/selectivity gates so the M3 bilateral placement is exercised
 -- deterministically regardless of ANALYZE stats shape (mirrors
--- tests/sql/suites/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql for the
+-- tests/sql/correctness/optimizer/sql/runtime_filter_cross_fragment_shuffle.sql for the
 -- single-join case). JoinAssociativity/JoinCommutativity are disabled below
 -- (both legs) to pin the join order to the literal left-deep chain written.
 SET global_runtime_filter_build_max_size = 10737418240;

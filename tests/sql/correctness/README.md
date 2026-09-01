@@ -19,7 +19,7 @@ under the License.
 
 # SQL Conformance Corpus
 
-`tests/sql/suites/` is NovaRocks' executable SQL conformance corpus.  Its
+`tests/sql/correctness/` is NovaRocks' executable small-data SQL conformance corpus. Its
 three manifests are derived from runnable cases rather than maintained as a
 separate compatibility spreadsheet.
 

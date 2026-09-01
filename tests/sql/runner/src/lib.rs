@@ -16,6 +16,7 @@
 // under the License.
 
 mod be_log_directive;
+pub mod benchmark;
 mod benchmark_bootstrap;
 mod cluster;
 mod config;
@@ -35,13 +36,9 @@ mod types;
 #[path = "../../../../novarocks/types/src/engine_error_codes.rs"]
 mod engine_error_codes;
 
-use crate::benchmark_bootstrap::{
-    BenchmarkBootstrapOptions, ReadyBenchmarkFixture, dry_run_benchmark_fixture,
-    ensure_benchmark_data, parse_scale_overrides,
-};
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
+    TestLane, build_suite_configs, case_auto_db_name, env_optional, env_or_default, list_sql_files,
     load_runner_config, placeholder_variables, resolve_config_path, resolve_path,
     resolve_reference_port, resolve_repo_root, resolve_target_port, suite_default_query_timeout,
 };
@@ -66,7 +63,7 @@ use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::net::TcpStream;
@@ -380,16 +377,20 @@ fn expected_engine_error_code_diff_result(
 #[derive(Debug, Parser)]
 #[command(
     name = "novarocks-sql-test",
-    about = "Run SQL correctness tests for suite directories under tests/sql/suites/"
+    about = "Run SQL correctness tests for suite directories under tests/sql/correctness/"
 )]
 struct Cli {
     /// Suite name(s), comma-separated.  Use "all" to run every discovered suite.
-    #[arg(long, required_unless_present = "list_extensions")]
+    #[arg(long, required_unless_present_any = ["list_extensions", "list_suites"])]
     suite: Option<String>,
 
     /// Print the deterministic manifest derived from @nova_extension annotations and exit.
     #[arg(long, action = ArgAction::SetTrue)]
     list_extensions: bool,
+
+    /// Print the deterministic correctness suite names and exit.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "list_extensions")]
+    list_suites: bool,
 
     #[arg(long)]
     config: Option<String>,
@@ -498,15 +499,6 @@ struct Cli {
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
 
-    #[arg(long, action = ArgAction::SetTrue)]
-    no_auto_bootstrap_benchmark_data: bool,
-
-    #[arg(long = "benchmark-scale", value_name = "BENCHMARK_SCALE", action = ArgAction::Append)]
-    benchmark_scale: Vec<String>,
-
-    #[arg(long, action = ArgAction::SetTrue)]
-    benchmark_bootstrap_rebuild: bool,
-
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
     #[arg(short = 'j', long, default_value_t = 0)]
@@ -605,19 +597,6 @@ fn ensure_iceberg_object_store_prereqs(runner_config: &RunnerConfig) -> Result<(
          hint: start it with:\n  \
          mkdir -p ~/minio-data && minio server ~/minio-data --console-address :9001 &",
         endpoint
-    );
-}
-
-fn inject_benchmark_fixture_placeholder(
-    variables: &mut HashMap<String, String>,
-    fixture: Option<&ReadyBenchmarkFixture>,
-) {
-    let Some(fixture) = fixture else {
-        return;
-    };
-    variables.insert(
-        "benchmark_iceberg_catalog_warehouse".to_string(),
-        fixture.exact_warehouse.clone(),
     );
 }
 
@@ -1726,7 +1705,9 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         .lock()
         .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
         .and_then(|mut server| {
-            server.kill_fe().context("kill frontend during publication response hold")?;
+            server
+                .kill_fe()
+                .context("kill frontend during publication response hold")?;
             server
                 .restart_fe_until(deadline)
                 .context("restart frontend after in-flight publication kill")
@@ -1743,7 +1724,10 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
             ),
         );
     }
-    let _ = writeln!(log, "    @publication_catalog_fault in-flight FE kill/restart PASS");
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_fault in-flight FE kill/restart PASS"
+    );
 
     let (query_ok, query_execution, query_error) = match query_thread.join() {
         Ok(result) => result,
@@ -2375,7 +2359,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .is_some_and(|directive| directive.fault.requires_inflight_frontend_kill())
                     {
                         let Some(fault_guard) = publication_catalog_fault_guard.as_mut() else {
-                            unreachable!("in-flight publication kill requires an armed fixture guard");
+                            unreachable!(
+                                "in-flight publication kill requires an armed fixture guard"
+                            );
                         };
                         execute_target_query_with_inflight_publication_frontend_kill(
                             InflightPublicationFrontendKill {
@@ -3760,7 +3746,9 @@ fn validate_lake_publication_preflight(
         bail!("lake publication suites require --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("lake publication suites require -j 1 because their fixtures own one destructive token");
+        bail!(
+            "lake publication suites require -j 1 because their fixtures own one destructive token"
+        );
     }
     Ok(())
 }
@@ -3771,7 +3759,10 @@ fn validate_lnp_3c_runtime_cut_preflight(
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    if !suite_names.iter().any(|suite| suite == "lnp-3c-runtime-cut") {
+    if !suite_names
+        .iter()
+        .any(|suite| suite == "lnp-3c-runtime-cut")
+    {
         return Ok(());
     }
     if mode != ClusterMode::CrossProcess || cluster_size != 3 {
@@ -3799,7 +3790,9 @@ fn validate_lnp_3d_mv_accelerator_preflight(
         bail!("lnp-3d-mv-accelerator requires --cluster-mode cross-process --cluster-size 3");
     }
     if jobs != 1 {
-        bail!("lnp-3d-mv-accelerator requires -j 1 because it wipes and restarts the shared frontend");
+        bail!(
+            "lnp-3d-mv-accelerator requires -j 1 because it wipes and restarts the shared frontend"
+        );
     }
     Ok(())
 }
@@ -3939,7 +3932,7 @@ fn selected_cases_require_cleanup_faults(
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
+pub fn run_correctness() -> Result<()> {
     let exit_code = run()?;
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -3993,10 +3986,17 @@ fn finish_run_with_server_cleanup(
 fn run() -> Result<i32> {
     let cli = Cli::parse();
     let base_dir = resolve_repo_root()?;
-    let suite_configs = build_suite_configs(&base_dir)?;
+    let suite_configs = build_suite_configs(&base_dir, TestLane::Correctness)?;
     if suite_configs.is_empty() {
-        println!("❌ ERROR: no suite directories found under tests/sql/suites");
+        println!("❌ ERROR: no suite directories found under tests/sql/correctness");
         return Ok(1);
+    }
+
+    if cli.list_suites {
+        for suite_name in suite_configs.keys() {
+            println!("{suite_name}");
+        }
+        return Ok(0);
     }
 
     if cli.list_extensions {
@@ -4092,11 +4092,6 @@ fn run() -> Result<i32> {
         return Ok(1);
     }
 
-    let benchmark_bootstrap_options = BenchmarkBootstrapOptions {
-        enabled: !cli.no_auto_bootstrap_benchmark_data,
-        rebuild: cli.benchmark_bootstrap_rebuild,
-        scales: parse_scale_overrides(&cli.benchmark_scale)?,
-    };
     let query_lifecycle_faults_enabled = !cli.dry_run
         && selected_cases_require_query_lifecycle_faults(
             &cli,
@@ -4227,23 +4222,7 @@ fn run() -> Result<i32> {
                 suite.sql_glob.clone()
             };
 
-            let benchmark_fixture = if cli.dry_run {
-                dry_run_benchmark_fixture(
-                    &runner_config,
-                    &base_dir,
-                    &suite.name,
-                    &benchmark_bootstrap_options,
-                )?
-            } else {
-                ensure_benchmark_data(
-                    &benchmark_bootstrap_options,
-                    &runner_config,
-                    &base_dir,
-                    &suite.name,
-                )?
-            };
-            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
-            inject_benchmark_fixture_placeholder(&mut placeholder_vars, benchmark_fixture.as_ref());
+            let placeholder_vars = placeholder_variables(&runner_config, &suite.name);
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -4505,23 +4484,6 @@ fn run() -> Result<i32> {
                 println!("result_dir={}", dir.display());
             }
             println!("query_timeout={}s", query_timeout);
-            if let Some(fixture) = benchmark_fixture.as_ref() {
-                println!(
-                    "benchmark_fixture.key={}",
-                    serde_json::to_string(&fixture.dataset_key)
-                        .expect("BTreeMap serializes to JSON")
-                );
-                println!("benchmark_fixture.ready_uri={}", fixture.ready_uri);
-                println!(
-                    "benchmark_fixture.publication_identity={}",
-                    fixture.publication_identity
-                );
-                println!("benchmark_fixture.reused={}", fixture.reused);
-                println!("benchmark_fixture.built={}", fixture.built);
-                if cli.dry_run {
-                    println!("benchmark_fixture.warehouse=unresolved");
-                }
-            }
             println!("{}", summarize_connection("target", &target_conn_base));
             if cli.mode == Mode::Diff
                 || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
@@ -4751,9 +4713,9 @@ fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
 ) -> Result<Option<publication_catalog::FixtureHandle>> {
-    if !selected_suites.iter().any(|suite| {
-        matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator")
-    })
+    if !selected_suites
+        .iter()
+        .any(|suite| matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator"))
     {
         return Ok(None);
     }
@@ -4803,8 +4765,7 @@ mod tests {
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
         statement_starts_dml_operation, validate_dml_cluster_jobs, validate_fault_injection_jobs,
         validate_lake_publication_preflight, validate_lnp_3d_mv_accelerator_preflight,
-        validate_selected_suite_cluster,
-        verify_runtime_filter_structured_assertion,
+        validate_selected_suite_cluster, verify_runtime_filter_structured_assertion,
     };
     use clap::Parser;
     use regex::Regex;
@@ -5507,14 +5468,15 @@ mod tests {
     }
 
     #[test]
-    fn help_includes_benchmark_bootstrap_options() {
+    fn correctness_help_excludes_benchmark_bootstrap_options() {
         let help = <crate::Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
 
-        assert!(help.contains("--no-auto-bootstrap-benchmark-data"));
-        assert!(help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
-        assert!(help.contains("--benchmark-bootstrap-rebuild"));
+        assert!(!help.contains("--no-auto-bootstrap-benchmark-data"));
+        assert!(!help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
+        assert!(!help.contains("--benchmark-bootstrap-rebuild"));
+        assert!(help.contains("--list-suites"));
     }
 
     #[test]
@@ -5533,6 +5495,15 @@ mod tests {
             .expect("extension listing should not require a suite");
 
         assert!(cli.list_extensions);
+        assert_eq!(cli.suite, None);
+    }
+
+    #[test]
+    fn cli_allows_correctness_suite_listing_without_a_suite() {
+        let cli = crate::Cli::try_parse_from(["novarocks-sql-test", "--list-suites"])
+            .expect("suite listing should not require a suite");
+
+        assert!(cli.list_suites);
         assert_eq!(cli.suite, None);
     }
 

@@ -4,8 +4,8 @@
 
 This audit is the migration gate for moving SSB, TPC-H, and TPC-DS out of the
 blocking SQL correctness lane.  It covers the 13 SSB queries, 22 TPC-H queries,
-and 99 TPC-DS queries that existed at the time of the audit under
-`tests/sql/suites/{ssb,tpc-h,tpc-ds}/sql/`: **134 queries in total**.
+and 99 TPC-DS queries under
+`tests/sql/benchmarks/{ssb,tpc-h,tpc-ds}/sql/`: **134 queries in total**.
 
 The conclusion is that no benchmark-scale SQL needs to remain in the
 correctness lane and no new micro-case is required by this audit.  The relevant
@@ -14,10 +14,9 @@ already have deterministic, small-data owners.  This is not a claim that a
 benchmark query has an identical plan to a small test; it is a claim that
 removing the workload does not remove a unique *correctness* contract.
 
-The physical paths in this document are deliberately the pre-migration paths.
-T02 moves the files; when it does so it must update the path prefixes in this
-audit to `tests/sql/benchmarks/` and `tests/sql/correctness/` without changing
-the mapping or restoring the old root.
+The paths below are the post-migration physical roots. Benchmark and correctness
+ownership is expressed by those roots, not by a metadata tag or a suite-name
+allowlist.
 
 ## Method
 
@@ -37,25 +36,25 @@ the mapping or restoring the old root.
 ## Existing correctness evidence
 
 The shorthand used in the per-query tables refers to these source-controlled
-small-data cases.  Paths are pre-migration paths for the same reason as above.
+small-data cases.
 
 | ID | Correctness contract and direct evidence |
 | --- | --- |
-| E-J | Inner, chained and composite/null-key joins: `tests/sql/suites/join/sql/join_inner_basic.sql`, `join_three_table_chain.sql`, `join_multi_key_null_semantics.sql` |
-| E-JO | Outer join null-extension and residual predicates: `tests/sql/suites/join/sql/join_left_outer_null_fill.sql`, `join_left_outer_residual_nullable.sql`, `join_full_outer_null_fill.sql` |
-| E-D | Distributed join/exchange shape: `tests/sql/suites/join/sql/join_partition_hash.sql`, `join_bucket_shuffle_right_outer_equivalence.sql`; optimizer distribution contracts in `tests/sql/suites/optimizer/sql/distribution_join_shuffle_reuse.sql` |
-| E-RF | Runtime-filter construction/consumption and cross-process transport: `tests/sql/suites/runtime-filter/sql/runtime_filter_three_table_chain.sql`, `runtime_filter_multi_columns.sql`; `tests/sql/suites/runtime-filter-distributed/sql/runtime_filter_distributed_cross_process.sql`, `runtime_filter_distributed_partitioned_probe.sql` |
-| E-A | Grouped/scalar aggregates, HAVING and multi-phase execution: `tests/sql/suites/aggregate/sql/agg_group_sum_count_avg.sql`, `agg_having_threshold.sql`, `agg_test_agg_split_two_phase.sql` |
-| E-AD | DISTINCT and multi-column distinct aggregation: `tests/sql/suites/aggregate/sql/agg_count_distinct_single.sql`, `agg_count_distinct_multi_column.sql`, `agg_sum_distinct.sql` |
-| E-G | GROUPING SETS/ROLLUP/GROUPING: `tests/sql/suites/aggregate/sql/agg_grouping_sets_v1.sql`, `agg_grouping_sets_v2.sql`, `agg_test_grouping_set.sql` |
-| E-W | Window aggregate/rank/order/frame semantics: `tests/sql/suites/analytic/sql/analytic_row_rank_dense.sql`, `analytic_sum_rows_cumulative.sql`, `analytic_test_basic_multi_window_function.sql`, `analytic_filter_topn_with_window.sql` |
-| E-S | Scalar, correlated, IN/EXISTS and null-aware anti-subquery semantics: `tests/sql/suites/join/sql/join_exists_subquery_semantics.sql`, `join_not_exists_subquery_semantics.sql`, `join_not_in_correlated_conjunct_null_aware.sql`; lowering guards in `tests/sql/suites/optimizer/sql/subquery_scalar_to_window.sql`, `subquery_exists_to_join.sql` |
-| E-C | CTE alias, scope and recursive contract: `tests/sql/suites/cte/sql/cte_multi_alias.sql`, `cte_in_where_subquery.sql`, `cte_recursive.sql` |
-| E-X | UNION ALL/DISTINCT, INTERSECT and EXCEPT null/duplicate semantics: `tests/sql/suites/set-op/sql/set_union_all_projection_alignment.sql`, `set_union_distinct_dedup.sql`, `set_intersect_multi_column_null.sql`, `set_except_three_stage_null_duplicates.sql` |
-| E-P | CASE/COALESCE, arithmetic, cast, date and string projection semantics: `tests/sql/suites/project/sql/project_case_coalesce.sql`, `project_arithmetic_cast.sql`, `project_date_function_semantics.sql`, `project_string_functions.sql` |
-| E-F | BETWEEN/IN/LIKE, OR and three-valued/null predicate semantics: `tests/sql/suites/filter/sql/filter_in_between_like.sql`, `filter_null_or_predicate.sql`, `filter_nullable_three_valued_logic.sql` |
-| E-L | ORDER BY, LIMIT/OFFSET and TopN ties/null ordering: `tests/sql/suites/sort/sql/sort_multi_key.sql`, `topn_order_limit.sql`, `topn_null_order_limit_offset.sql` |
-| E-O | Projection/output pruning and optimizer expression equivalence: `tests/sql/suites/optimizer/sql/oq1a_aggregate_output_pruning.sql`, `oq1c_cte_receive_column_remap.sql`, `cse_projection.sql`, `runtime_filter_project_setop_remap.sql` |
+| E-J | Inner, chained and composite/null-key joins: `tests/sql/correctness/join/sql/join_inner_basic.sql`, `join_three_table_chain.sql`, `join_multi_key_null_semantics.sql` |
+| E-JO | Outer join null-extension and residual predicates: `tests/sql/correctness/join/sql/join_left_outer_null_fill.sql`, `join_left_outer_residual_nullable.sql`, `join_full_outer_null_fill.sql` |
+| E-D | Distributed join/exchange shape: `tests/sql/correctness/join/sql/join_partition_hash.sql`, `join_bucket_shuffle_right_outer_equivalence.sql`; optimizer distribution contracts in `tests/sql/correctness/optimizer/sql/distribution_join_shuffle_reuse.sql` |
+| E-RF | Runtime-filter construction/consumption and cross-process transport: `tests/sql/correctness/runtime-filter/sql/runtime_filter_three_table_chain.sql`, `runtime_filter_multi_columns.sql`; `tests/sql/correctness/runtime-filter-distributed/sql/runtime_filter_distributed_cross_process.sql`, `runtime_filter_distributed_partitioned_probe.sql` |
+| E-A | Grouped/scalar aggregates, HAVING and multi-phase execution: `tests/sql/correctness/aggregate/sql/agg_group_sum_count_avg.sql`, `agg_having_threshold.sql`, `agg_test_agg_split_two_phase.sql` |
+| E-AD | DISTINCT and multi-column distinct aggregation: `tests/sql/correctness/aggregate/sql/agg_count_distinct_single.sql`, `agg_count_distinct_multi_column.sql`, `agg_sum_distinct.sql` |
+| E-G | GROUPING SETS/ROLLUP/GROUPING: `tests/sql/correctness/aggregate/sql/agg_grouping_sets_v1.sql`, `agg_grouping_sets_v2.sql`, `agg_test_grouping_set.sql` |
+| E-W | Window aggregate/rank/order/frame semantics: `tests/sql/correctness/analytic/sql/analytic_row_rank_dense.sql`, `analytic_sum_rows_cumulative.sql`, `analytic_test_basic_multi_window_function.sql`, `analytic_filter_topn_with_window.sql` |
+| E-S | Scalar, correlated, IN/EXISTS and null-aware anti-subquery semantics: `tests/sql/correctness/join/sql/join_exists_subquery_semantics.sql`, `join_not_exists_subquery_semantics.sql`, `join_not_in_correlated_conjunct_null_aware.sql`; lowering guards in `tests/sql/correctness/optimizer/sql/subquery_scalar_to_window.sql`, `subquery_exists_to_join.sql` |
+| E-C | CTE alias, scope and recursive contract: `tests/sql/correctness/cte/sql/cte_multi_alias.sql`, `cte_in_where_subquery.sql`, `cte_recursive.sql` |
+| E-X | UNION ALL/DISTINCT, INTERSECT and EXCEPT null/duplicate semantics: `tests/sql/correctness/set-op/sql/set_union_all_projection_alignment.sql`, `set_union_distinct_dedup.sql`, `set_intersect_multi_column_null.sql`, `set_except_three_stage_null_duplicates.sql` |
+| E-P | CASE/COALESCE, arithmetic, cast, date and string projection semantics: `tests/sql/correctness/project/sql/project_case_coalesce.sql`, `project_arithmetic_cast.sql`, `project_date_function_semantics.sql`, `project_string_functions.sql` |
+| E-F | BETWEEN/IN/LIKE, OR and three-valued/null predicate semantics: `tests/sql/correctness/filter/sql/filter_in_between_like.sql`, `filter_null_or_predicate.sql`, `filter_nullable_three_valued_logic.sql` |
+| E-L | ORDER BY, LIMIT/OFFSET and TopN ties/null ordering: `tests/sql/correctness/sort/sql/sort_multi_key.sql`, `topn_order_limit.sql`, `topn_null_order_limit_offset.sql` |
+| E-O | Projection/output pruning and optimizer expression equivalence: `tests/sql/correctness/optimizer/sql/oq1a_aggregate_output_pruning.sql`, `oq1c_cte_receive_column_remap.sql`, `cse_projection.sql`, `runtime_filter_project_setop_remap.sql` |
 
 `E-J` and `E-D` are the result/distribution preconditions for `E-RF`; the
 dedicated runtime-filter tests assert filter semantics explicitly.  A standard
@@ -231,17 +230,17 @@ suites:
 
 ## Reproducible static review commands
 
-Run from repository root before T02 moves the paths:
+Run from repository root:
 
 ```bash
-find tests/sql/suites/ssb/sql -name '*.sql' | wc -l
-find tests/sql/suites/tpc-h/sql -name '*.sql' | wc -l
-find tests/sql/suites/tpc-ds/sql -name '*.sql' | wc -l
+find tests/sql/benchmarks/ssb/sql -name '*.sql' | wc -l
+find tests/sql/benchmarks/tpc-h/sql -name '*.sql' | wc -l
+find tests/sql/benchmarks/tpc-ds/sql -name '*.sql' | wc -l
 
-rg --files tests/sql/suites/{optimizer,runtime-filter,runtime-filter-distributed,project,join,aggregate,analytic,subquery,cte,set-op,filter,sort}
+rg --files tests/sql/correctness/{optimizer,runtime-filter,runtime-filter-distributed,project,join,aggregate,analytic,subquery,cte,set-op,filter,sort}
 ```
 
 Expected counts are `13`, `22`, and `99`; the three tables above contain one
 data row per source query.  No correctness suite was changed, so there is no
-new SQL case to run for this audit.  T02 must rerun the counts against the new
-benchmark root and retain the named evidence cases in the correctness root.
+new SQL case to run for this audit. Retain the named evidence cases in the
+correctness root when the corpus evolves.
