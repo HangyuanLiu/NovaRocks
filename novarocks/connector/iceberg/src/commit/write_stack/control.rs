@@ -41,33 +41,36 @@ use std::sync::Arc;
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteBeginRequest, ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest,
-    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
+    ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{ConnectorPreparedWriteSet, WriteTargetOrdinal};
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorMutationFailure, ConnectorMutationFailureKind, ConnectorMutationOperationId,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorWriteAbortOutcome,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorManagedPublicationIntent, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorWriteAbortOutcome, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
-    IcebergContentRange, IcebergDataBranchRecipe, IcebergWriteBranch, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterOutput,
-    corrupt, invalid,
+    IcebergContentRange, IcebergDataBranchRecipe, IcebergEmptyWriteDecision,
+    IcebergManagedPublicationFacts, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterOutput, corrupt, invalid,
+};
+use crate::commit::write_stack::flavor::{
+    IcebergSessionFlavorPlan, IcebergSessionMaterial, plan_distributed_rewrite_branches,
+    plan_managed_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
 };
-use crate::commit::write_stack::planning::{
-    IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergWriteSessionPlanInput,
-};
+use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{
     CommitServiceError, IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
@@ -461,6 +464,12 @@ impl IcebergWriteSessionControl {
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
         validate_merged_old_references(handle, frozen_old_references, &validated)?;
 
+        if validated.is_empty()
+            && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
+        {
+            return settle_empty_write_without_commit(handle);
+        }
+
         handle.begin_commit()?;
         let outcome = self.dispatch_commit(handle, &validated, context);
         match &outcome {
@@ -527,7 +536,7 @@ impl IcebergWriteSessionControl {
         let table_ident =
             crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()])
                 .map_err(|error| invalid(error.to_string()))?;
-        let op_kind = handle.flavor().commit_op_kind();
+        let op_kind = handle.commit_op_kind();
         let collector = Arc::new(
             IcebergCommitCollector::new(
                 op_kind,
@@ -711,6 +720,52 @@ impl IcebergWriteSessionControl {
     }
 }
 
+/// Terminate a session whose empty prepared write set means "do nothing".
+///
+/// This is the provider's own decision, taken from the session's flavor and —
+/// for a publication — the disposition its caller declared. It is deliberately
+/// not derivable from "there were no fragments": a zero-row `INSERT` reaches
+/// `finish_write` exactly the same way and still publishes an empty snapshot.
+///
+/// Nothing external is touched here: no snapshot is created, the target ref
+/// keeps the head the session froze, and the outcome names the version the
+/// target already held so a caller records an unchanged result rather than a
+/// failure. It needs no catalog at all, because every fact it uses was frozen
+/// at `begin_write`.
+///
+/// A session whose target holds no snapshot has no version to report, so it
+/// fails closed there instead of claiming a commit against nothing.
+pub(crate) fn settle_empty_write_without_commit(
+    handle: &IcebergCommitHandle,
+) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+    let Some(unchanged_snapshot_id) = handle.table().base_snapshot_id() else {
+        let message = format!(
+            "Iceberg {} write produced no artifact and its target holds no snapshot to report",
+            handle.flavor().as_str()
+        );
+        handle.settle(IcebergWriteSessionState::KnownUncommitted {
+            message: message.clone(),
+        })?;
+        return Ok(ExternalMutationOutcome::KnownUncommitted {
+            failure: failure(ConnectorMutationFailureKind::Conflict, message),
+        });
+    };
+    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+        unchanged_snapshot_id,
+        None,
+        None,
+    )
+    .map_err(invalid)?;
+    handle.settle(IcebergWriteSessionState::KnownCommitted {
+        snapshot_id: unchanged_snapshot_id,
+    })?;
+    Ok(ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::NoOp,
+        receipt,
+        finalization: ExternalMutationFinalization::Complete,
+    })
+}
+
 /// The terminal verdict a release produces, decided purely from the session's
 /// own state so it can be reasoned about without a catalog.
 pub(crate) fn release_session_state(
@@ -771,7 +826,7 @@ pub(crate) fn release_session_state(
                                 handle.table().namespace(),
                                 handle.table().table_name()
                             ),
-                            op_kind: handle.flavor().commit_op_kind(),
+                            op_kind: handle.commit_op_kind(),
                             base_snapshot_id: handle.table().base_snapshot_id(),
                             base_sequence_number: handle.table().base_sequence_number(),
                             staging_dir,
@@ -921,6 +976,10 @@ impl IcebergWriteSessionControl {
 }
 
 /// Assemble the neutral session plan from the provider's sealed targets.
+///
+/// A branch's routing facts travel with it; its writer recipe stays opaque. The
+/// two are deliberately separate: the recipe is what a backend executes, and the
+/// route facts are what SQL needs to decide which branch a row belongs to.
 pub(crate) fn session_plan_from_targets(
     adapter: &IcebergWriteAdapter,
     handle: IcebergCommitHandle,
@@ -930,8 +989,13 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (ordinal, writer, input) = target.into_parts();
-            ConnectorWriteTargetPlan::new(ordinal, adapter.wrap_writer_handle(writer), input)
+            let (ordinal, writer, input, route) = target.into_parts();
+            let plan =
+                ConnectorWriteTargetPlan::new(ordinal, adapter.wrap_writer_handle(writer), input);
+            match route {
+                Some(route) => plan.with_route(route),
+                None => plan,
+            }
         })
         .collect::<Vec<_>>();
     ConnectorWriteSessionPlan::try_new(commit, plans)
@@ -991,67 +1055,101 @@ impl IcebergWriteSessionControl {
             metadata.default_partition_spec_id(),
             format_version_number(&metadata),
         )?;
-        let flavor = flavor_for(request)?;
         let signed = sign_input_shape(&facts, &request.input)?;
-        let data = IcebergDataBranchPlan {
-            output: IcebergWriterOutput::try_new(
+        let material = IcebergSessionMaterial {
+            data_output: IcebergWriterOutput::try_new(
                 crate::delete_file::IcebergFileFormat::Parquet,
                 parquet::basic::Compression::SNAPPY,
                 crate::commit::data_writer::parquet_row_group_size_bytes(metadata.properties())
                     .map_err(invalid)?
                     .map(|size| size as u64),
             )?,
-            recipe: data_branch_recipe(
+            data_recipe: data_branch_recipe(
                 &metadata,
                 matches!(signed, ConnectorWriteInputShape::RowLineage { .. }),
             )?,
-            input: signed.clone(),
-        };
-        let deletes = match &signed {
-            ConnectorWriteInputShape::PositionDelete { .. }
-            | ConnectorWriteInputShape::DeletionVector { .. } => {
-                let branch = if matches!(signed, ConnectorWriteInputShape::DeletionVector { .. }) {
-                    IcebergWriteBranch::DeletionVector
-                } else {
-                    IcebergWriteBranch::PositionDelete
-                };
-                let output = IcebergWriterOutput::try_new(
-                    match branch {
-                        IcebergWriteBranch::DeletionVector => {
-                            crate::delete_file::IcebergFileFormat::Puffin
-                        }
-                        _ => crate::delete_file::IcebergFileFormat::Parquet,
-                    },
-                    parquet::basic::Compression::SNAPPY,
-                    None,
-                )?;
+            // A delete branch's frozen old-delete references are the one piece
+            // of material that costs an external read, so it is taken only when
+            // the request's own shape says a delete branch exists.
+            merge_targets: if session_freezes_old_deletes(&request.flavor, &signed) {
                 let snapshot_id = base_snapshot_id.ok_or_else(|| {
                     invalid("Iceberg row-level write requires a frozen target snapshot")
                 })?;
-                vec![IcebergDeleteBranchPlan {
-                    branch,
-                    output,
-                    merge_targets: self.freeze_old_delete_references(
-                        &table,
-                        &metadata,
-                        snapshot_id,
-                    )?,
-                    input: signed,
-                }]
-            }
-            _ => Vec::new(),
+                self.freeze_old_delete_references(&table, &metadata, snapshot_id)?
+            } else {
+                Vec::new()
+            },
+            table: facts,
+            input: signed,
         };
-        crate::commit::write_stack::planning::plan_write_session(
+
+        let plan = match &request.flavor {
+            ConnectorWriteSessionFlavor::Ordinary => {
+                plan_ordinary_branches(flavor_for(request)?, &material)?
+            }
+            ConnectorWriteSessionFlavor::ManagedPublication(intent) => {
+                plan_managed_publication_branches(&material, publication_facts(intent))?
+            }
+            ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
+            ConnectorWriteSessionFlavor::DistributedRewrite => {
+                let groups = self.freeze_rewrite_groups(&table, base_snapshot_id)?;
+                plan_distributed_rewrite_branches(&material, &groups)?
+            }
+        };
+        let IcebergSessionFlavorPlan {
+            flavor,
+            publication,
+            branches,
+        } = plan;
+        plan_branch_session(
             IcebergWriteSessionId::new(),
-            IcebergWriteSessionPlanInput {
+            IcebergBranchSessionPlanInput {
                 flavor,
                 purpose: request.purpose,
-                table: facts,
+                table: material.table,
                 base_version_digest: request.base.as_ref().map(|base| base.digest()),
-                data,
-                deletes,
+                publication,
+                branches,
             },
         )
+    }
+
+    /// Freeze the rewrite groups a distributed rewrite seals one branch each
+    /// for.
+    ///
+    /// Grouping is the provider's decision and reuses the existing rewrite
+    /// planner, so a group here is the same group the rewrite path already
+    /// cuts. Everything this touches is a read of the frozen base snapshot.
+    fn freeze_rewrite_groups(
+        &self,
+        table: &crate::iceberg::table::Table,
+        base_snapshot_id: Option<i64>,
+    ) -> Result<Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1>, ConnectorError> {
+        // Without a base snapshot there is nothing to rewrite at all, and a
+        // rewrite that silently became an append would republish rows it never
+        // read.
+        let Some(snapshot_id) = base_snapshot_id else {
+            return Ok(Vec::new());
+        };
+        let owned = table.clone();
+        let files = self
+            .runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+            })
+            .map_err(|error| unavailable(error.to_string()))?
+            .map_err(unavailable)?;
+        if files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let live = crate::distributed_rewrite::live_delete_file_paths_at(
+            &self.runtime,
+            table,
+            snapshot_id,
+        )?;
+        crate::distributed_rewrite::plan_data_file_groups(files, &live)
     }
 
     /// Freeze exact references to every old delete artifact attached to the
@@ -1203,7 +1301,41 @@ fn format_version_number(metadata: &TableMetadata) -> u8 {
     }
 }
 
-/// Pick the flavor a begin request describes.
+/// The technique and empty-input disposition a publication needs the session to
+/// know.
+///
+/// The publication id is deliberately dropped here: it names a durable object
+/// the frontend owns, and the provider's session, its writer recipes, and its
+/// commit fragments have no use for it. Reading exactly these two facts off the
+/// intent is what keeps the id from travelling further.
+const fn publication_facts(
+    intent: &ConnectorManagedPublicationIntent,
+) -> IcebergManagedPublicationFacts {
+    IcebergManagedPublicationFacts::new(intent.technique(), intent.empty_input())
+}
+
+/// Whether this session will seal a delete branch, and therefore has to freeze
+/// the old delete artifacts that branch must supersede.
+fn session_freezes_old_deletes(
+    flavor: &ConnectorWriteSessionFlavor,
+    signed: &ConnectorWriteInputShape,
+) -> bool {
+    match flavor {
+        ConnectorWriteSessionFlavor::Ordinary => {
+            crate::commit::write_stack::flavor::ordinary_delete_branch(signed).is_some()
+        }
+        // A merge-on-read mutation seals a deletion-vector branch from a
+        // row-lineage input, so the delete-shaped-input test is not enough here.
+        ConnectorWriteSessionFlavor::RowMutation => !matches!(
+            signed,
+            ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::EqualityDelete { .. }
+        ),
+        ConnectorWriteSessionFlavor::ManagedPublication(_)
+        | ConnectorWriteSessionFlavor::DistributedRewrite => false,
+    }
+}
+
+/// Pick the flavor an *ordinary* begin request describes.
 ///
 /// An unsupported combination fails here rather than being coerced into the
 /// nearest supported one.

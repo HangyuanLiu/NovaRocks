@@ -44,6 +44,7 @@ pub(crate) mod codec;
 pub mod control;
 pub mod domain;
 pub mod execution;
+pub(crate) mod flavor;
 pub mod old_delete;
 pub mod planning;
 pub(crate) mod runtime;
@@ -60,9 +61,10 @@ pub use control::{
 pub use domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment,
     IcebergCommitHandle, IcebergContentRange, IcebergDataBranchRecipe, IcebergDataFileArtifact,
-    IcebergDeletionVectorArtifact, IcebergPositionDeleteFileArtifact, IcebergSealedWriteTarget,
-    IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    IcebergDeletionVectorArtifact, IcebergEmptyWriteDecision, IcebergManagedPublicationFacts,
+    IcebergPositionDeleteFileArtifact, IcebergSealedWriteTarget, IcebergWriteBranch,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
+    IcebergWriterHandle, IcebergWriterOutput,
 };
 pub use execution::{IcebergWriteStackExecution, IcebergWriteStackExecutionFactory};
 pub use old_delete::{
@@ -70,6 +72,7 @@ pub use old_delete::{
     IcebergStorageRoute, read_and_merge_old_deletes,
 };
 pub use planning::{
-    IcebergDataBranchPlan, IcebergDeleteBranchPlan, IcebergWriteSessionPlanInput,
-    IcebergWriteTargetPlan, plan_write_session,
+    IcebergBranchSessionPlanInput, IcebergDataBranchPlan, IcebergDeleteBranchPlan,
+    IcebergWriteBranchPlan, IcebergWriteSessionPlanInput, IcebergWriteTargetPlan,
+    plan_branch_session, plan_write_session,
 };

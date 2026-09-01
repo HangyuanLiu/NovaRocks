@@ -32,33 +32,53 @@ use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
+use novarocks_spi::connector::write_stack::session::{
+    ConnectorWriteRouteFacts, ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
+};
 use novarocks_spi::connector::write_stack::{
     ConnectorPreparedWriteSet, WriteRuntimeAdapter, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
-    ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ProviderBindingEpoch,
+    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
+    ConnectorMutationRouteInput, ConnectorProviderId, ConnectorRequestContext,
+    ConnectorRowMutationEffect, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteInputShape, ConnectorWriteRouteId, ExternalMutationEffect,
+    ExternalMutationOutcome, ProviderBindingEpoch,
 };
 use parquet::arrow::ArrowWriter;
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::write_stack::control::{release_session_state, validate_prepared_set};
+use crate::commit::CommitOpKind;
+use crate::commit::write_stack::control::{
+    release_session_state, session_plan_from_targets, settle_empty_write_without_commit,
+    validate_prepared_set,
+};
 use crate::commit::write_stack::domain::{
-    IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact,
-    IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteSessionState,
+    IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
+    IcebergManagedPublicationFacts, IcebergPositionDeleteFileArtifact, IcebergWriteBranch,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState,
+};
+use crate::commit::write_stack::flavor::{
+    IcebergSessionFlavorPlan, plan_distributed_rewrite_branches, plan_managed_publication_branches,
+    plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteMergeTarget, read_and_merge_old_deletes,
 };
-use crate::commit::write_stack::planning::{IcebergWriteSessionPlanInput, plan_write_session};
+use crate::commit::write_stack::planning::{
+    IcebergBranchSessionPlanInput, IcebergWriteBranchPlan, IcebergWriteSessionPlanInput,
+    IcebergWriteTargetPlan, plan_branch_session, plan_write_session,
+};
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRuntime};
 use crate::commit::write_stack::test_support::{
-    data_branch_plan, delete_branch_plan, dv_artifact, merge_target, parquet_ref, sample_metrics,
-    sample_partition, table_facts,
+    binding, copy_on_write_input_shape, data_branch_plan, data_input_shape, delete_branch_plan,
+    delete_input_shape, dv_artifact, merge_on_read_input_shape, merge_target, parquet_ref,
+    sample_metrics, sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
+use crate::manifest::DataFileWithStats;
 use crate::position_delete::{FILE_PATH_COLUMN, POS_COLUMN};
 
 struct NeverCancelled;
@@ -848,6 +868,457 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         seen.insert(flavor, plans.len());
     }
     assert_eq!(seen.len(), 10, "every flavor must be covered");
+}
+
+// -------------------------------------------------------------------------
+// Session flavors: how each one plans its logical branches.
+// -------------------------------------------------------------------------
+
+fn flavor_session(
+    plan: IcebergSessionFlavorPlan,
+) -> (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>) {
+    plan_branch_session(
+        IcebergWriteSessionId::new(),
+        IcebergBranchSessionPlanInput {
+            flavor: plan.flavor,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            table: table_facts(),
+            base_version_digest: None,
+            publication: plan.publication,
+            branches: plan.branches,
+        },
+    )
+    .expect("seal the flavor's branches")
+}
+
+/// Take the neutral session plan the frontend actually receives, so a route the
+/// provider attached is asserted where SQL would read it.
+fn neutral_plan(
+    adapter: &IcebergWriteAdapter,
+    sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
+) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+    let (handle, targets) = sealed;
+    session_plan_from_targets(adapter, handle, targets)
+}
+
+fn effects(target: &ConnectorWriteTargetPlan) -> Vec<ConnectorRowMutationEffect> {
+    target
+        .route()
+        .expect("branch is routed")
+        .accepted_effects()
+        .to_vec()
+}
+
+#[test]
+fn an_ordinary_session_yields_unrouted_targets() {
+    // An ordinary write has exactly one thing to do with every row it is
+    // given, so nothing needs routing, and the branch structure is the one this
+    // stack has always sealed.
+    let adapter = adapter("ordinary", 1);
+    let plan = plan_ordinary_branches(
+        IcebergWriteFlavor::Append,
+        &session_material(data_input_shape()),
+    )
+    .expect("plan an ordinary append");
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    assert_eq!(sealed.targets().len(), 1);
+    assert!(
+        sealed
+            .targets()
+            .iter()
+            .all(|target| target.route().is_none())
+    );
+
+    let mut material = session_material(delete_input_shape(IcebergWriteBranch::DeletionVector));
+    material.merge_targets = vec![merge_target(
+        "s3://b/wh/db/t/data/a.parquet",
+        10,
+        Vec::new(),
+    )];
+    let plan = plan_ordinary_branches(IcebergWriteFlavor::RowMutationDeletionVector, &material)
+        .expect("plan an ordinary row-level write");
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    assert_eq!(sealed.targets().len(), 2);
+    assert!(
+        sealed
+            .targets()
+            .iter()
+            .all(|target| target.route().is_none())
+    );
+}
+
+#[test]
+fn a_row_mutation_yields_one_routed_target_per_branch() {
+    // A merge-on-read mutation carries both halves of a change event in one
+    // row: the delete branch consumes the before-image identity and the data
+    // branch consumes the after-image values, so a Replace reaches both.
+    let adapter = adapter("row_mutation", 2);
+    let mut material = session_material(merge_on_read_input_shape());
+    material.merge_targets = vec![merge_target(
+        "s3://b/wh/db/t/data/a.parquet",
+        10,
+        Vec::new(),
+    )];
+    let plan = plan_row_mutation_branches(&material).expect("plan a merge-on-read mutation");
+    assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationDeletionVector);
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(handle.branch_of(ordinal(0)), Some(IcebergWriteBranch::Data));
+    assert_eq!(
+        handle.branch_of(ordinal(1)),
+        Some(IcebergWriteBranch::DeletionVector)
+    );
+
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(sealed.expected_targets(), vec![ordinal(0), ordinal(1)]);
+    assert!(
+        sealed
+            .targets()
+            .iter()
+            .all(|target| target.route().is_some())
+    );
+    assert_eq!(
+        effects(&sealed.targets()[0]),
+        vec![
+            ConnectorRowMutationEffect::Replace,
+            ConnectorRowMutationEffect::Insert
+        ]
+    );
+    assert_eq!(
+        effects(&sealed.targets()[1]),
+        vec![
+            ConnectorRowMutationEffect::Delete,
+            ConnectorRowMutationEffect::Replace
+        ]
+    );
+    // Two branches cannot share a route key, and the ordinals are dense.
+    assert_ne!(
+        sealed.targets()[0].route().expect("routed").route_id(),
+        sealed.targets()[1].route().expect("routed").route_id()
+    );
+    // Each branch reads its own columns out of the one input row: the data
+    // branch the two after-image values, the delete branch the two identity
+    // columns that follow them.
+    let positions = |target: &ConnectorWriteTargetPlan| {
+        target
+            .route()
+            .expect("routed")
+            .input_ordinals()
+            .iter()
+            .map(ConnectorMutationRouteInput::input_ordinal)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(positions(&sealed.targets()[0]), vec![0, 1]);
+    assert_eq!(positions(&sealed.targets()[1]), vec![2, 3]);
+}
+
+#[test]
+fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
+    // A deletion-vector input carries no after-image half, so the mutation
+    // needs exactly one branch, and that branch accepts only a delete. Its
+    // partition source fields travel as routing facts because SQL, not the
+    // writer, supplies them.
+    let adapter = adapter("delete_only", 3);
+    let mut material = session_material(ConnectorWriteInputShape::DeletionVector {
+        identity_fields: vec![
+            binding("_file", 2, DataType::Utf8),
+            binding("_pos", 3, DataType::Int64),
+        ],
+        partition_source_fields: vec![binding("k1", 1, DataType::Int64)],
+    });
+    material.merge_targets = vec![merge_target(
+        "s3://b/wh/db/t/data/a.parquet",
+        10,
+        Vec::new(),
+    )];
+    let plan = plan_row_mutation_branches(&material).expect("plan a delete-only mutation");
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
+    assert_eq!(
+        effects(&sealed.targets()[0]),
+        vec![ConnectorRowMutationEffect::Delete]
+    );
+    assert_eq!(
+        sealed.targets()[0]
+            .route()
+            .expect("routed")
+            .partition_fields()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn a_copy_on_write_row_mutation_seals_one_rewriting_data_branch() {
+    // A copy-on-write mutation rewrites whole files, so its one branch sees
+    // every change event that touches a file it rewrites.
+    let adapter = adapter("copy_on_write", 4);
+    let plan = plan_row_mutation_branches(&session_material(copy_on_write_input_shape()))
+        .expect("plan a copy-on-write mutation");
+    assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationCopyOnWrite);
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
+    assert_eq!(
+        effects(&sealed.targets()[0]),
+        vec![
+            ConnectorRowMutationEffect::Delete,
+            ConnectorRowMutationEffect::Replace,
+            ConnectorRowMutationEffect::Insert
+        ]
+    );
+}
+
+#[test]
+fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
+    // Two branches sharing a route key would make the router's choice
+    // ambiguous, and the loser's rows would vanish. The provider's own route
+    // key is derived per branch and never collides, so the refusal is proven by
+    // sealing a mutation whose two branches were given the same key.
+    let adapter = adapter("route_collision", 5);
+    let collided = ConnectorWriteRouteFacts::try_new(
+        ConnectorWriteRouteId::from_bytes([9; 32]),
+        vec![ConnectorRowMutationEffect::Delete],
+        Vec::new(),
+        Vec::new(),
+    )
+    .expect("route facts");
+    let sealed = plan_branch_session(
+        IcebergWriteSessionId::new(),
+        IcebergBranchSessionPlanInput {
+            flavor: IcebergWriteFlavor::RowMutationDeletionVector,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            table: table_facts(),
+            base_version_digest: None,
+            publication: None,
+            branches: vec![
+                IcebergWriteBranchPlan::Data {
+                    plan: data_branch_plan(),
+                    route: Some(collided.clone()),
+                },
+                IcebergWriteBranchPlan::Delete {
+                    plan: delete_branch_plan(
+                        IcebergWriteBranch::DeletionVector,
+                        vec![merge_target(
+                            "s3://b/wh/db/t/data/a.parquet",
+                            10,
+                            Vec::new(),
+                        )],
+                    ),
+                    route: Some(collided),
+                },
+            ],
+        },
+    )
+    .expect("seal two branches");
+    let error = neutral_plan(&adapter, sealed).expect_err("duplicate route key");
+    assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    assert!(
+        error.message().contains("repeats a row-mutation route key"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+/// Cut real rewrite groups, one per partition key, through the rewrite
+/// planner the rewrite path already uses.
+fn rewrite_groups(
+    partitions: &[&str],
+) -> Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1> {
+    let files = partitions
+        .iter()
+        .map(|partition| DataFileWithStats {
+            path: format!("s3://b/wh/db/t/data/{partition}/f.parquet"),
+            size: 1,
+            record_count: Some(1),
+            column_stats: None,
+            partition_spec_id: Some(0),
+            partition_key: Some((*partition).to_string()),
+            partition_values: None,
+            manifest_path: None,
+            partition_field_values: Vec::new(),
+            first_row_id: None,
+            data_sequence_number: Some(4),
+            delete_files: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    crate::distributed_rewrite::plan_data_file_groups(files, &std::collections::BTreeSet::new())
+        .expect("plan rewrite groups")
+}
+
+#[test]
+fn a_distributed_rewrite_yields_one_target_per_rewrite_group() {
+    let adapter = adapter("rewrite", 6);
+    let groups = rewrite_groups(&["a", "b", "c"]);
+    assert_eq!(groups.len(), 3);
+    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
+        .expect("plan a distributed rewrite");
+    assert_eq!(plan.flavor, IcebergWriteFlavor::DistributedRewrite);
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(
+        handle.expected_targets(),
+        vec![ordinal(0), ordinal(1), ordinal(2)]
+    );
+    assert!(
+        handle
+            .targets()
+            .iter()
+            .all(|target| target.branch() == IcebergWriteBranch::Data)
+    );
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(sealed.targets().len(), 3);
+    // A rewrite routes nothing: it does not split rows by change event.
+    assert!(
+        sealed
+            .targets()
+            .iter()
+            .all(|target| target.route().is_none())
+    );
+}
+
+#[test]
+fn a_rewrite_is_not_gated_by_the_external_write_fence() {
+    // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
+    // swap `dispatch_commit` already performs against the frozen snapshot, so
+    // it must not also take the distributed external write fence. Every other
+    // flavor keeps it.
+    for flavor in [
+        IcebergWriteFlavor::Append,
+        IcebergWriteFlavor::Overwrite,
+        IcebergWriteFlavor::PartitionOverwrite,
+        IcebergWriteFlavor::RowMutationPositionDelete,
+        IcebergWriteFlavor::RowMutationDeletionVector,
+        IcebergWriteFlavor::RowMutationCopyOnWrite,
+        IcebergWriteFlavor::StagedCreate,
+        IcebergWriteFlavor::ManagedPublication,
+        IcebergWriteFlavor::TableMaintenance,
+    ] {
+        assert!(
+            flavor.requires_external_write_fence(),
+            "{} must keep the fence",
+            flavor.as_str()
+        );
+    }
+    assert!(!IcebergWriteFlavor::DistributedRewrite.requires_external_write_fence());
+
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(data_input_shape()),
+        &rewrite_groups(&["a"]),
+    )
+    .expect("plan a distributed rewrite");
+    let (handle, _) = flavor_session(plan);
+    assert!(!handle.requires_external_write_fence());
+    // The compare-and-swap input the commit dispatch checks the loaded table
+    // against, and the rewrite commit action it dispatches.
+    assert_eq!(handle.table().base_snapshot_id(), Some(77));
+    assert_eq!(handle.commit_op_kind(), CommitOpKind::SelectedRewrite);
+}
+
+#[test]
+fn a_managed_publication_carries_its_technique_and_disposition_into_finish() {
+    // A full refresh republishes the whole target, so it must commit as a
+    // replacement; an incremental one adds to what is live.
+    for (technique, op_kind) in [
+        (
+            ConnectorManagedPublicationTechnique::Full,
+            CommitOpKind::Overwrite,
+        ),
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            CommitOpKind::FastAppend,
+        ),
+    ] {
+        let plan = plan_managed_publication_branches(
+            &session_material(data_input_shape()),
+            IcebergManagedPublicationFacts::new(
+                technique,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ),
+        )
+        .expect("plan a managed publication");
+        let (handle, _) = flavor_session(plan);
+        let publication = handle
+            .publication()
+            .expect("publication facts reach finish");
+        assert_eq!(publication.technique(), technique);
+        assert_eq!(
+            publication.empty_input(),
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+        );
+        assert_eq!(handle.commit_op_kind(), op_kind);
+    }
+}
+
+#[test]
+fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
+    // The decision is the caller's declared disposition, not an inference from
+    // "there were no fragments": a zero-row INSERT reaches finish exactly the
+    // same way and still publishes.
+    let (append, _) = flavor_session(
+        plan_ordinary_branches(
+            IcebergWriteFlavor::Append,
+            &session_material(data_input_shape()),
+        )
+        .expect("plan an ordinary append"),
+    );
+    assert_eq!(
+        append.empty_write_decision(),
+        IcebergEmptyWriteDecision::Commit
+    );
+
+    let publication = |empty_input| {
+        flavor_session(
+            plan_managed_publication_branches(
+                &session_material(data_input_shape()),
+                IcebergManagedPublicationFacts::new(
+                    ConnectorManagedPublicationTechnique::Full,
+                    empty_input,
+                ),
+            )
+            .expect("plan a managed publication"),
+        )
+        .0
+    };
+
+    let commits = publication(ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite);
+    assert_eq!(
+        commits.empty_write_decision(),
+        IcebergEmptyWriteDecision::Commit
+    );
+
+    let aborts =
+        publication(ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit);
+    assert_eq!(
+        aborts.empty_write_decision(),
+        IcebergEmptyWriteDecision::SkipExternalCommit
+    );
+    // Terminating without an external commit needs no catalog at all: every
+    // fact it reports was frozen at begin.
+    let outcome = settle_empty_write_without_commit(&aborts).expect("settle the empty write");
+    match outcome {
+        ExternalMutationOutcome::KnownCommitted {
+            effect, receipt, ..
+        } => {
+            assert_eq!(effect, ExternalMutationEffect::NoOp);
+            assert_eq!(
+                receipt
+                    .committed_version()
+                    .and_then(ConnectorCommittedVersion::snapshot_id),
+                Some(77),
+                "the target keeps the head the session froze"
+            );
+        }
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+
+    // A rewrite with nothing to rewrite is the same no-op, and it is decided by
+    // the flavor rather than by a publication disposition.
+    let (rewrite, _) = flavor_session(
+        plan_distributed_rewrite_branches(&session_material(data_input_shape()), &[])
+            .expect("plan an empty distributed rewrite"),
+    );
+    assert_eq!(
+        rewrite.empty_write_decision(),
+        IcebergEmptyWriteDecision::SkipExternalCommit
+    );
 }
 
 fn _assert_error_is_send_sync(error: ConnectorError) -> impl Send + Sync {

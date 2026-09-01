@@ -29,6 +29,7 @@ use crate::commit::write_stack::domain::{
     IcebergArtifactMetrics, IcebergArtifactPartition, IcebergContentRange, IcebergDataBranchRecipe,
     IcebergDeletionVectorArtifact, IcebergWriteBranch, IcebergWriteTableFacts, IcebergWriterOutput,
 };
+use crate::commit::write_stack::flavor::IcebergSessionMaterial;
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
 };
@@ -146,11 +147,54 @@ pub(crate) fn merge_target(
     .expect("merge target")
 }
 
-fn binding(name: &str, seed: u8, data_type: DataType) -> ConnectorWriteFieldBinding {
+pub(crate) fn binding(name: &str, seed: u8, data_type: DataType) -> ConnectorWriteFieldBinding {
     ConnectorWriteFieldBinding::new(
         ConnectorWriteFieldToken::from_bytes([seed; 32]),
         Field::new(name, data_type, false),
     )
+}
+
+/// A row-lineage input whose identity is `_file`/`_pos`: the merge-on-read
+/// shape, carrying both halves of a change event in one row.
+pub(crate) fn merge_on_read_input_shape() -> ConnectorWriteInputShape {
+    ConnectorWriteInputShape::RowLineage {
+        data_fields: vec![
+            binding("k1", 1, DataType::Int64),
+            binding("v1", 4, DataType::Utf8),
+        ],
+        row_identity_fields: vec![
+            binding("_file", 2, DataType::Utf8),
+            binding("_pos", 3, DataType::Int64),
+        ],
+    }
+}
+
+/// A row-lineage input whose identity is `_row_id`/`_last_updated_sequence_number`:
+/// the copy-on-write shape.
+pub(crate) fn copy_on_write_input_shape() -> ConnectorWriteInputShape {
+    ConnectorWriteInputShape::RowLineage {
+        data_fields: vec![binding("k1", 1, DataType::Int64)],
+        row_identity_fields: vec![
+            binding("_row_id", 5, DataType::Int64),
+            binding("_last_updated_sequence_number", 6, DataType::Int64),
+        ],
+    }
+}
+
+/// The frozen material a flavor's branch planning is cut from.
+///
+/// It is deliberately built the same way `begin_write` builds it, so a test
+/// perturbs only the input shape or the merge targets and asserts that the
+/// branch structure is what changes.
+pub(crate) fn session_material(input: ConnectorWriteInputShape) -> IcebergSessionMaterial {
+    let data = data_branch_plan();
+    IcebergSessionMaterial {
+        table: table_facts(),
+        input,
+        data_output: data.output,
+        data_recipe: data.recipe,
+        merge_targets: Vec::new(),
+    }
 }
 
 pub(crate) fn data_input_shape() -> ConnectorWriteInputShape {

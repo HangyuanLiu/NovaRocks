@@ -33,14 +33,15 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
 };
 
 use crate::commit::write_stack::domain::{
-    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergSealedWriteTarget, IcebergWriteBranch,
-    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle,
-    IcebergWriterOutput, invalid,
+    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergManagedPublicationFacts,
+    IcebergSealedWriteTarget, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
+    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 
@@ -82,6 +83,7 @@ pub struct IcebergWriteTargetPlan {
     branch: IcebergWriteBranch,
     handle: IcebergWriterHandle,
     input: ConnectorWriteInputShape,
+    route: Option<ConnectorWriteRouteFacts>,
 }
 
 impl IcebergWriteTargetPlan {
@@ -97,14 +99,20 @@ impl IcebergWriteTargetPlan {
     pub const fn input(&self) -> &ConnectorWriteInputShape {
         &self.input
     }
+    /// The routing facts of one row-mutation branch, present exactly when the
+    /// session routes rows by change event.
+    pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
+        self.route.as_ref()
+    }
     pub fn into_parts(
         self,
     ) -> (
         WriteTargetOrdinal,
         IcebergWriterHandle,
         ConnectorWriteInputShape,
+        Option<ConnectorWriteRouteFacts>,
     ) {
-        (self.ordinal, self.handle, self.input)
+        (self.ordinal, self.handle, self.input, self.route)
     }
 }
 
@@ -136,6 +144,188 @@ pub struct IcebergWriteSessionPlanInput {
     pub deletes: Vec<IcebergDeleteBranchPlan>,
 }
 
+/// One logical branch a session seals, in ordinal order.
+///
+/// [`plan_write_session`] seals a flavor's canonical data-plus-delete shape.
+/// A flavor whose branch structure is decided per request — a row mutation
+/// whose branch count follows the change events it must route, a distributed
+/// rewrite with one branch per frozen group — states its branches here instead,
+/// and the same unique-owner proof runs over them.
+#[derive(Clone, Debug)]
+pub enum IcebergWriteBranchPlan {
+    Data {
+        plan: IcebergDataBranchPlan,
+        route: Option<ConnectorWriteRouteFacts>,
+    },
+    Delete {
+        plan: IcebergDeleteBranchPlan,
+        route: Option<ConnectorWriteRouteFacts>,
+    },
+}
+
+impl IcebergWriteBranchPlan {
+    pub const fn branch(&self) -> IcebergWriteBranch {
+        match self {
+            Self::Data { .. } => IcebergWriteBranch::Data,
+            Self::Delete { plan, .. } => plan.branch,
+        }
+    }
+
+    fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
+        match self {
+            Self::Data { route, .. } | Self::Delete { route, .. } => route.as_ref(),
+        }
+    }
+
+    fn input(&self) -> &ConnectorWriteInputShape {
+        match self {
+            Self::Data { plan, .. } => &plan.input,
+            Self::Delete { plan, .. } => &plan.input,
+        }
+    }
+
+    /// The old data files this branch claims exclusive ownership of, with the
+    /// exact old delete references it must supersede for each one.
+    fn owned_data_files(&self) -> BTreeMap<String, Vec<String>> {
+        match self {
+            Self::Data { .. } => BTreeMap::new(),
+            Self::Delete { plan, .. } => plan
+                .merge_targets
+                .iter()
+                .map(|target| {
+                    let mut references = target
+                        .references()
+                        .iter()
+                        .map(|reference| reference.path().to_string())
+                        .collect::<Vec<_>>();
+                    references.sort();
+                    (target.data_file_path().to_string(), references)
+                })
+                .collect(),
+        }
+    }
+
+    fn writer_handle(
+        &self,
+        table: &IcebergWriteTableFacts,
+    ) -> Result<IcebergWriterHandle, ConnectorError> {
+        match self {
+            Self::Data { plan, .. } => IcebergWriterHandle::try_new_data(
+                table.clone(),
+                plan.output.clone(),
+                plan.recipe.clone(),
+            ),
+            Self::Delete { plan, .. } => IcebergWriterHandle::try_new_delete(
+                plan.branch,
+                table.clone(),
+                plan.output.clone(),
+                plan.merge_targets.clone(),
+            ),
+        }
+    }
+}
+
+/// Everything a flavor that plans its own branches freezes before it seals a
+/// session.
+#[derive(Clone, Debug)]
+pub struct IcebergBranchSessionPlanInput {
+    pub flavor: IcebergWriteFlavor,
+    pub purpose: ConnectorWriteAdmissionPurpose,
+    pub table: IcebergWriteTableFacts,
+    pub base_version_digest: Option<[u8; 32]>,
+    /// Present exactly on the managed-publication flavor, and never carrying
+    /// the publication id that names it.
+    pub publication: Option<IcebergManagedPublicationFacts>,
+    /// The branches this session seals, in ordinal order.
+    pub branches: Vec<IcebergWriteBranchPlan>,
+}
+
+/// Seal one write session's logical target map from an explicit branch list.
+///
+/// Ordinals are assigned by position, so the branch order *is* the ordinal
+/// order. The unique-owner proof runs before any handle is built, which is what
+/// makes an unprovable routing fail with nothing written.
+pub fn plan_branch_session(
+    session_id: IcebergWriteSessionId,
+    input: IcebergBranchSessionPlanInput,
+) -> Result<(IcebergCommitHandle, Vec<IcebergWriteTargetPlan>), ConnectorError> {
+    if input.branches.is_empty() {
+        return Err(invalid(format!(
+            "Iceberg {} write session must seal at least one branch",
+            input.flavor.as_str()
+        )));
+    }
+    let allowed = input.flavor.branches();
+    for plan in &input.branches {
+        if !allowed.contains(&plan.branch()) {
+            return Err(invalid(format!(
+                "Iceberg {} flavor does not own a {} branch",
+                input.flavor.as_str(),
+                plan.branch().as_str()
+            )));
+        }
+        if let IcebergWriteBranchPlan::Delete { plan, .. } = plan
+            && !plan.branch.writes_deletes()
+        {
+            return Err(invalid(
+                "Iceberg delete branch plan must name a delete branch",
+            ));
+        }
+    }
+    // Routing is a property of the whole session: a partially routed session
+    // gives SQL somewhere to send some rows and nowhere to send the rest. The
+    // neutral session refuses it too, but refusing here keeps the provider from
+    // building handles for a plan that can never be sealed.
+    let routed = input
+        .branches
+        .iter()
+        .filter(|plan| plan.route().is_some())
+        .count();
+    if routed != 0 && routed != input.branches.len() {
+        return Err(invalid(format!(
+            "Iceberg {} write session routes some branches but not all",
+            input.flavor.as_str()
+        )));
+    }
+
+    // Assemble the ordinal map first, then prove the routing, then build the
+    // handles. Proving before building is what makes the failure pre-staging:
+    // no writer recipe reaches a driver when the proof fails.
+    let mut sealed = Vec::with_capacity(input.branches.len());
+    for (index, plan) in input.branches.iter().enumerate() {
+        let ordinal = u32::try_from(index)
+            .map_err(|_| invalid("Iceberg write session exceeds its logical target bound"))?;
+        sealed.push(IcebergSealedWriteTarget::new(
+            WriteTargetOrdinal::try_new(ordinal)?,
+            plan.branch(),
+            plan.owned_data_files(),
+        ));
+    }
+    prove_unique_delete_owner(&sealed)?;
+
+    let mut plans = Vec::with_capacity(sealed.len());
+    for (index, plan) in input.branches.iter().enumerate() {
+        plans.push(IcebergWriteTargetPlan {
+            ordinal: sealed[index].ordinal(),
+            branch: plan.branch(),
+            handle: plan.writer_handle(&input.table)?,
+            input: plan.input().clone(),
+            route: plan.route().cloned(),
+        });
+    }
+
+    let handle = IcebergCommitHandle::try_new_with_publication(
+        session_id,
+        input.table,
+        input.flavor,
+        input.purpose,
+        input.base_version_digest,
+        input.publication,
+        sealed,
+    )?;
+    Ok((handle, plans))
+}
+
 /// Seal one write session's logical target map.
 ///
 /// Ordinal assignment follows [`IcebergWriteFlavor::branches`] exactly, so the
@@ -145,89 +335,28 @@ pub fn plan_write_session(
     session_id: IcebergWriteSessionId,
     input: IcebergWriteSessionPlanInput,
 ) -> Result<(IcebergCommitHandle, Vec<IcebergWriteTargetPlan>), ConnectorError> {
-    let allowed = input.flavor.branches();
-    for delete in &input.deletes {
-        if !delete.branch.writes_deletes() {
-            return Err(invalid(
-                "Iceberg delete branch plan must name a delete branch",
-            ));
-        }
-        if !allowed.contains(&delete.branch) {
-            return Err(invalid(format!(
-                "Iceberg {} flavor does not own a {} branch",
-                input.flavor.as_str(),
-                delete.branch.as_str()
-            )));
-        }
-    }
-
-    // Assemble the ordinal map first, then prove the routing, then build the
-    // handles. Proving before building is what makes the failure pre-staging:
-    // no writer recipe reaches a driver when the proof fails.
-    let mut sealed = Vec::with_capacity(1 + input.deletes.len());
-    sealed.push(IcebergSealedWriteTarget::new(
-        WriteTargetOrdinal::try_new(0)?,
-        IcebergWriteBranch::Data,
-        BTreeMap::new(),
-    ));
-    for (index, delete) in input.deletes.iter().enumerate() {
-        let ordinal = u32::try_from(index + 1)
-            .map_err(|_| invalid("Iceberg write session exceeds its logical target bound"))?;
-        let owned = delete
-            .merge_targets
-            .iter()
-            .map(|target| {
-                let mut references = target
-                    .references()
-                    .iter()
-                    .map(|reference| reference.path().to_string())
-                    .collect::<Vec<_>>();
-                references.sort();
-                (target.data_file_path().to_string(), references)
-            })
-            .collect();
-        sealed.push(IcebergSealedWriteTarget::new(
-            WriteTargetOrdinal::try_new(ordinal)?,
-            delete.branch,
-            owned,
-        ));
-    }
-    prove_unique_delete_owner(&sealed)?;
-
-    let mut plans = Vec::with_capacity(sealed.len());
-    plans.push(IcebergWriteTargetPlan {
-        ordinal: sealed[0].ordinal(),
-        branch: IcebergWriteBranch::Data,
-        handle: IcebergWriterHandle::try_new_data(
-            input.table.clone(),
-            input.data.output.clone(),
-            input.data.recipe.clone(),
-        )?,
-        input: input.data.input.clone(),
+    let mut branches = Vec::with_capacity(1 + input.deletes.len());
+    branches.push(IcebergWriteBranchPlan::Data {
+        plan: input.data,
+        route: None,
     });
-    for (index, delete) in input.deletes.iter().enumerate() {
-        plans.push(IcebergWriteTargetPlan {
-            ordinal: sealed[index + 1].ordinal(),
-            branch: delete.branch,
-            handle: IcebergWriterHandle::try_new_delete(
-                delete.branch,
-                input.table.clone(),
-                delete.output.clone(),
-                delete.merge_targets.clone(),
-            )?,
-            input: delete.input.clone(),
+    for delete in input.deletes {
+        branches.push(IcebergWriteBranchPlan::Delete {
+            plan: delete,
+            route: None,
         });
     }
-
-    let handle = IcebergCommitHandle::try_new(
+    plan_branch_session(
         session_id,
-        input.table,
-        input.flavor,
-        input.purpose,
-        input.base_version_digest,
-        sealed,
-    )?;
-    Ok((handle, plans))
+        IcebergBranchSessionPlanInput {
+            flavor: input.flavor,
+            purpose: input.purpose,
+            table: input.table,
+            base_version_digest: input.base_version_digest,
+            publication: None,
+            branches,
+        },
+    )
 }
 
 #[cfg(test)]

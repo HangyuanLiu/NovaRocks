@@ -1351,7 +1351,7 @@ fn live_delete_file_paths(
 }
 
 /// The delete files alive at one exact snapshot of a relation.
-fn live_delete_file_paths_at(
+pub(crate) fn live_delete_file_paths_at(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,

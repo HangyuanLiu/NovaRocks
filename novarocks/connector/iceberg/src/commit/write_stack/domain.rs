@@ -36,7 +36,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorWriteAdmissionPurpose, ConnectorWriteIntent,
+    ConnectorError, ConnectorErrorKind, ConnectorManagedPublicationEmptyInputDisposition,
+    ConnectorManagedPublicationTechnique, ConnectorWriteAdmissionPurpose, ConnectorWriteIntent,
 };
 use parquet::basic::Compression;
 
@@ -198,6 +199,101 @@ impl IcebergWriteFlavor {
         true
     }
 
+    /// Whether one sealed session may seal the same physical branch more than
+    /// once.
+    ///
+    /// Only a distributed rewrite may. Its logical targets are all data
+    /// branches — one per frozen rewrite group — and the ordinal, not the
+    /// branch, is what tells the group apart. Every other flavor keeps the
+    /// stricter rule, because a repeated delete branch would make the old-delete
+    /// merge owner ambiguous.
+    pub const fn seals_one_target_per_branch(self) -> bool {
+        !matches!(self, Self::DistributedRewrite)
+    }
+
+    /// Whether this flavor's write must be serialized behind the distributed
+    /// external write fence.
+    ///
+    /// A distributed rewrite must not be: it is arbitrated by the ordinary
+    /// Iceberg base-state compare and swap that `dispatch_commit` already
+    /// performs, and taking the fence would serialize it against ordinary DML
+    /// it does not conflict with. Every other flavor keeps the fence, because a
+    /// DML write that skipped it would lose that protection.
+    pub const fn requires_external_write_fence(self) -> bool {
+        !matches!(self, Self::DistributedRewrite)
+    }
+}
+
+/// The publication facts one managed write session keeps.
+///
+/// Deliberately *not* the publication: the `LakePublicationId` that names it
+/// stays in the frontend layer that owns it. Nothing here reaches a writer
+/// recipe, a commit fragment, or a backend — the provider needs only the
+/// technique it must commit as, and what an empty input means.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcebergManagedPublicationFacts {
+    technique: ConnectorManagedPublicationTechnique,
+    empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+}
+
+impl IcebergManagedPublicationFacts {
+    pub const fn new(
+        technique: ConnectorManagedPublicationTechnique,
+        empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+    ) -> Self {
+        Self {
+            technique,
+            empty_input,
+        }
+    }
+
+    pub const fn technique(self) -> ConnectorManagedPublicationTechnique {
+        self.technique
+    }
+
+    pub const fn empty_input(self) -> ConnectorManagedPublicationEmptyInputDisposition {
+        self.empty_input
+    }
+
+    /// The single external commit op a publication of this technique performs.
+    ///
+    /// A full refresh republishes the whole target, so it replaces what the ref
+    /// already holds; an incremental refresh adds to it. Committing a full
+    /// refresh as an append would leave the superseded rows live.
+    pub const fn commit_op_kind(self) -> CommitOpKind {
+        match self.technique {
+            ConnectorManagedPublicationTechnique::Full => CommitOpKind::Overwrite,
+            ConnectorManagedPublicationTechnique::Incremental => CommitOpKind::FastAppend,
+        }
+    }
+
+    /// The neutral write intent a publication of this technique is admitted
+    /// as.
+    pub const fn connector_intent(self) -> ConnectorWriteIntent {
+        match self.technique {
+            ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
+            ConnectorManagedPublicationTechnique::Incremental => ConnectorWriteIntent::Append,
+        }
+    }
+}
+
+/// What an *empty* prepared write set means for one sealed session.
+///
+/// The decision stays inside the provider on purpose. A generic frontend that
+/// guessed from "there were no fragments" would have to invent a policy for a
+/// publication that asked to abort, and would turn a rewrite with nothing to
+/// rewrite into a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IcebergEmptyWriteDecision {
+    /// Publish the empty write as an ordinary snapshot. This is what a zero-row
+    /// `INSERT` has always done.
+    Commit,
+    /// Terminate the session with no external commit at all. The target ref
+    /// keeps the head the session was frozen against.
+    SkipExternalCommit,
+}
+
+impl IcebergWriteFlavor {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Append => "append",
@@ -1097,6 +1193,7 @@ pub struct IcebergCommitHandle {
     flavor: IcebergWriteFlavor,
     purpose: ConnectorWriteAdmissionPurpose,
     base_version_digest: Option<[u8; 32]>,
+    publication: Option<IcebergManagedPublicationFacts>,
     targets: Vec<IcebergSealedWriteTarget>,
     delete_owner: BTreeMap<String, WriteTargetOrdinal>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
@@ -1138,6 +1235,38 @@ impl IcebergCommitHandle {
         base_version_digest: Option<[u8; 32]>,
         targets: Vec<IcebergSealedWriteTarget>,
     ) -> Result<Self, ConnectorError> {
+        Self::try_new_with_publication(
+            session_id,
+            table,
+            flavor,
+            purpose,
+            base_version_digest,
+            None,
+            targets,
+        )
+    }
+
+    /// Seal a begin session that also carries its managed publication facts.
+    ///
+    /// The facts are admissible only on the managed-publication flavor: a
+    /// session that carried a technique it does not publish under would decide
+    /// its commit op from a fact its own flavor contradicts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_publication(
+        session_id: IcebergWriteSessionId,
+        table: IcebergWriteTableFacts,
+        flavor: IcebergWriteFlavor,
+        purpose: ConnectorWriteAdmissionPurpose,
+        base_version_digest: Option<[u8; 32]>,
+        publication: Option<IcebergManagedPublicationFacts>,
+        targets: Vec<IcebergSealedWriteTarget>,
+    ) -> Result<Self, ConnectorError> {
+        if publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
+            return Err(invalid(format!(
+                "Iceberg {} write session cannot carry managed publication facts",
+                flavor.as_str()
+            )));
+        }
         let ordinals = targets
             .iter()
             .map(IcebergSealedWriteTarget::ordinal)
@@ -1145,7 +1274,7 @@ impl IcebergCommitHandle {
         novarocks_spi::connector::write_stack::validate_dense_target_ordinals(&ordinals)?;
         let mut branches = BTreeSet::new();
         for target in &targets {
-            if !branches.insert(target.branch()) {
+            if !branches.insert(target.branch()) && flavor.seals_one_target_per_branch() {
                 return Err(invalid(
                     "Iceberg write session repeats a physical write branch",
                 ));
@@ -1165,6 +1294,7 @@ impl IcebergCommitHandle {
             flavor,
             purpose,
             base_version_digest,
+            publication,
             targets,
             delete_owner,
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
@@ -1186,8 +1316,57 @@ impl IcebergCommitHandle {
     pub const fn base_version_digest(&self) -> Option<[u8; 32]> {
         self.base_version_digest
     }
+    /// The managed publication facts, present exactly on a publication session.
+    pub const fn publication(&self) -> Option<IcebergManagedPublicationFacts> {
+        self.publication
+    }
     pub fn targets(&self) -> &[IcebergSealedWriteTarget] {
         &self.targets
+    }
+
+    /// The single external commit op this session performs.
+    ///
+    /// A managed publication decides it from its technique — a full refresh
+    /// replaces, an incremental one appends — and every other session decides
+    /// it from its flavor alone.
+    pub fn commit_op_kind(&self) -> CommitOpKind {
+        match self.publication {
+            Some(publication) => publication.commit_op_kind(),
+            None => self.flavor.commit_op_kind(),
+        }
+    }
+
+    /// Whether this session must be serialized behind the distributed external
+    /// write fence.
+    ///
+    /// Read off the sealed session rather than re-derived, so the exemption a
+    /// rewrite relies on is stated once and cannot drift from what the session
+    /// actually is.
+    pub const fn requires_external_write_fence(&self) -> bool {
+        self.flavor.requires_external_write_fence()
+    }
+
+    /// What an empty prepared write set means for this session.
+    ///
+    /// Two sessions terminate without any external commit: a managed
+    /// publication whose caller declared `AbortWithoutExternalCommit`, and a
+    /// distributed rewrite that found nothing to rewrite. Neither is a failure,
+    /// and neither is derivable from "there were no fragments" alone — the
+    /// first depends on a disposition only the publication carries, and the
+    /// second differs from a zero-row `INSERT`, which still publishes.
+    pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
+        if self.flavor == IcebergWriteFlavor::DistributedRewrite {
+            return IcebergEmptyWriteDecision::SkipExternalCommit;
+        }
+        match self
+            .publication
+            .map(IcebergManagedPublicationFacts::empty_input)
+        {
+            Some(ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit) => {
+                IcebergEmptyWriteDecision::SkipExternalCommit
+            }
+            _ => IcebergEmptyWriteDecision::Commit,
+        }
     }
 
     /// The proven route from an old data file routed to a delete branch to its
