@@ -29,6 +29,12 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
+
+use crate::connector::handle::ConnectorPinnedFileSet;
+use crate::connector::row_mutation::{
+    ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
+};
 use crate::connector::write_stack::prepared::ConnectorPreparedWriteSet;
 use crate::connector::write_stack::runtime::{
     ConnectorWriteBinding, ConnectorWriteCommitHandle, ConnectorWriterHandle,
@@ -99,9 +105,22 @@ pub enum ConnectorWriteSessionFlavor {
         intent: ConnectorManagedPublicationIntent,
         shape: ConnectorManagedPublicationShape,
     },
-    /// A row mutation. The provider decides how many branches the mutation
-    /// needs and what each accepts; SQL routes rows to them.
+    /// A merge-on-read row mutation. The provider decides how many branches
+    /// the mutation needs and what each accepts; SQL routes rows to them.
     RowMutation,
+    /// A copy-on-write row mutation, which rewrites whole data files.
+    ///
+    /// It carries the match selection because a copy-on-write session cannot be
+    /// planned without it: which files are rewritten, and which rows inside them
+    /// were matched, is the materialized result of running the statement's
+    /// predicate as a distributed read over the pinned base snapshot. That is a
+    /// runtime fact, so no provider-internal freeze can stand in for it -- and
+    /// carrying it in the flavor is what makes a session without it
+    /// unconstructible rather than merely refused.
+    ///
+    /// This is a separate flavor from [`Self::RowMutation`] for that reason
+    /// alone: the two differ by an input one of them cannot be opened without.
+    CopyOnWrite(ConnectorRowMutationSelection),
     /// A rewrite arbitrated by the provider's ordinary base-state compare and
     /// swap rather than by the distributed-write external fence.
     ///
@@ -138,6 +157,80 @@ pub struct ConnectorWriteTargetPlan {
     handle: ConnectorWriterHandle,
     input: ConnectorWriteInputShape,
     route: Option<ConnectorWriteRouteFacts>,
+    rewrite_source: Option<ConnectorWriteRewriteSource>,
+}
+
+/// What one copy-on-write target must read to produce its rows.
+///
+/// A copy-on-write branch rewrites whole data files, so its input is not a
+/// projection of the statement's source: it re-reads exactly the files this
+/// target replaces. The read contract travels with the target because the two
+/// are one decision -- a target that replaced one file set while reading
+/// another would silently drop or duplicate rows -- and it is provider-owned
+/// throughout: the engine passes it to the read side without interpreting it.
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteRewriteSource {
+    source: ConnectorTableHandle,
+    /// Exactly the files this target rewrites. Its commit replaces precisely
+    /// these, so the read that produces its rows is defined by the same set
+    /// rather than by anything re-derived.
+    pinned_source: ConnectorPinnedFileSet,
+    base_version_digest: [u8; 32],
+    scan_schema: SchemaRef,
+    scan_bindings: Vec<ConnectorRowMutationScanBinding>,
+    match_tokens: Vec<ConnectorWriteFieldToken>,
+    written_version_token: Option<ConnectorWriteFieldToken>,
+}
+
+impl ConnectorWriteRewriteSource {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        source: ConnectorTableHandle,
+        pinned_source: ConnectorPinnedFileSet,
+        base_version_digest: [u8; 32],
+        scan_schema: SchemaRef,
+        scan_bindings: Vec<ConnectorRowMutationScanBinding>,
+        match_tokens: Vec<ConnectorWriteFieldToken>,
+        written_version_token: Option<ConnectorWriteFieldToken>,
+    ) -> Self {
+        Self {
+            source,
+            pinned_source,
+            base_version_digest,
+            scan_schema,
+            scan_bindings,
+            match_tokens,
+            written_version_token,
+        }
+    }
+
+    pub const fn source(&self) -> &ConnectorTableHandle {
+        &self.source
+    }
+
+    pub const fn pinned_source(&self) -> &ConnectorPinnedFileSet {
+        &self.pinned_source
+    }
+
+    pub const fn base_version_digest(&self) -> [u8; 32] {
+        self.base_version_digest
+    }
+
+    pub const fn scan_schema(&self) -> &SchemaRef {
+        &self.scan_schema
+    }
+
+    pub fn scan_bindings(&self) -> &[ConnectorRowMutationScanBinding] {
+        &self.scan_bindings
+    }
+
+    pub fn match_tokens(&self) -> &[ConnectorWriteFieldToken] {
+        &self.match_tokens
+    }
+
+    pub const fn written_version_token(&self) -> Option<ConnectorWriteFieldToken> {
+        self.written_version_token
+    }
 }
 
 /// What SQL needs to route rows to one row-mutation branch.
@@ -206,6 +299,7 @@ impl ConnectorWriteTargetPlan {
             handle,
             input,
             route: None,
+            rewrite_source: None,
         }
     }
 
@@ -215,9 +309,20 @@ impl ConnectorWriteTargetPlan {
         self
     }
 
+    /// Attach the read contract of a copy-on-write branch.
+    pub fn with_rewrite_source(mut self, source: ConnectorWriteRewriteSource) -> Self {
+        self.rewrite_source = Some(source);
+        self
+    }
+
     /// Present exactly for a row-mutation branch.
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
+    }
+
+    /// Present exactly for a copy-on-write branch that rewrites files.
+    pub const fn rewrite_source(&self) -> Option<&ConnectorWriteRewriteSource> {
+        self.rewrite_source.as_ref()
     }
 
     pub const fn ordinal(&self) -> WriteTargetOrdinal {

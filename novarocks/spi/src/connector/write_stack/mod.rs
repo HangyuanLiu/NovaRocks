@@ -81,9 +81,9 @@ pub use runtime::{
 };
 pub use session::{
     ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteControl,
-    ConnectorWriteFinishRequest, ConnectorWriteRouteFacts, ConnectorWriteSessionAbortRequest,
-    ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
-    ConnectorWriteTargetPlan,
+    ConnectorWriteFinishRequest, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
 };
 pub use target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 pub use writer::{

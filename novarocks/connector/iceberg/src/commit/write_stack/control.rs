@@ -52,10 +52,11 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedPublicationIntent, ConnectorMutationFailure, ConnectorMutationFailureKind,
     ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorWriteAbortOutcome, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
-    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorWriteAbortOutcome, ConnectorWriteBaseVersion, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldRequest, ConnectorWriteFieldToken, ConnectorWriteInputRequest,
+    ConnectorWriteInputShape, ConnectorWriteReceipt, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    ProviderBindingEpoch,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,8 +69,9 @@ use crate::commit::write_stack::domain::{
     corrupt, invalid,
 };
 use crate::commit::write_stack::flavor::{
-    IcebergSessionFlavorPlan, IcebergSessionMaterial, plan_distributed_rewrite_branches,
-    plan_managed_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
+    IcebergSessionFlavorPlan, IcebergSessionMaterial, plan_copy_on_write_branches,
+    plan_distributed_rewrite_branches, plan_managed_publication_branches, plan_ordinary_branches,
+    plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -77,8 +79,8 @@ use crate::commit::write_stack::old_delete::{
 use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
 use crate::commit::{
-    CommitOpKind, CommitServiceError, IcebergCommitCollector, RunInput, WrittenFile,
-    run_iceberg_commit,
+    CommitOpKind, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
+    IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
 };
 use crate::iceberg::spec::{DataContentType, DataFileFormat, TableMetadata};
 use crate::metadata_context::IcebergMetadataContext;
@@ -450,6 +452,72 @@ pub(crate) fn session_snapshot_properties(
     Ok(properties)
 }
 
+/// The replacement record one copy-on-write commit applies.
+///
+/// The join key is the write target ordinal and nothing else. Branch `i`
+/// replaces exactly the file its frozen recipe named, and the artifacts the
+/// backends staged for target `i` are that file's replacement — so a
+/// statement that rewrote three files produces three touched files, each with
+/// its own artifacts, rather than one merged claim. No cohort, operation,
+/// execution, or attempt identity takes part.
+///
+/// The matched row ids come off the frozen recipe rather than off anything the
+/// writers reported: their minimum becomes the replacement manifest's
+/// `first_row_id`, which is what stops the v3 manifest-list writer allocating
+/// fresh `_row_id`s for rows that already have them.
+pub(crate) fn cow_update_rewrite_set(
+    handle: &IcebergCommitHandle,
+    staged: &[(WriteTargetOrdinal, WrittenFile)],
+) -> Result<Option<CowUpdateRewriteSet>, ConnectorError> {
+    use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
+
+    if handle.commit_op_kind() != CommitOpKind::CowUpdate {
+        return Ok(None);
+    }
+    let base_snapshot_id = handle
+        .table()
+        .base_snapshot_id()
+        .ok_or_else(|| invalid("Iceberg copy-on-write commit requires a frozen base snapshot"))?;
+    let staged_for = |ordinal: WriteTargetOrdinal| {
+        staged
+            .iter()
+            .filter(move |(staged_ordinal, _)| *staged_ordinal == ordinal)
+            .map(|(_, file)| file)
+    };
+    let mut touched_data_files = Vec::new();
+    let mut appended_files = Vec::new();
+    let mut updated_row_ids = BTreeSet::new();
+    for (index, branch) in handle.copy_on_write().iter().enumerate() {
+        let ordinal = WriteTargetOrdinal::try_new(
+            u32::try_from(index)
+                .map_err(|_| internal("Iceberg copy-on-write branch ordinal overflowed"))?,
+        )?;
+        match branch {
+            IcebergCowBranchInput::Rewrite {
+                old_file,
+                matched_row_ids,
+            } => {
+                updated_row_ids.extend(matched_row_ids.iter().copied());
+                touched_data_files.push(CowUpdateTouchedFile {
+                    old_file: old_file.clone(),
+                    new_files: staged_for(ordinal).map(|file| file.path.clone()).collect(),
+                    row_ids: matched_row_ids.clone(),
+                });
+            }
+            IcebergCowBranchInput::Append => {
+                appended_files.extend(staged_for(ordinal).cloned());
+            }
+        }
+    }
+    Ok(Some(CowUpdateRewriteSet {
+        base_snapshot_id,
+        target_table_uuid: handle.table().table_uuid().to_string(),
+        updated_row_ids: updated_row_ids.into_iter().collect(),
+        touched_data_files,
+        appended_files,
+    }))
+}
+
 pub(crate) fn selected_rewrite_files(
     handle: &IcebergCommitHandle,
 ) -> Option<crate::commit::selected_rewrite::SelectedRewriteFiles> {
@@ -716,6 +784,17 @@ impl IcebergWriteSessionControl {
             .iter()
             .filter(|file| file.content == DataContentType::Data)
             .fold(0u64, |total, file| total.saturating_add(file.record_count));
+        // Branch `i`'s replacement artifacts are the ones its own writers
+        // staged, so the record is keyed by the write target ordinal the
+        // fragment carried and by nothing else.
+        let cow_update_rewrite = cow_update_rewrite_set(
+            handle,
+            &validated
+                .iter()
+                .map(|entry| entry.ordinal)
+                .zip(files.iter().cloned())
+                .collect::<Vec<_>>(),
+        )?;
         collector.inject_written_files(files);
 
         let snapshot_properties = session_snapshot_properties(handle, staged_data_rows)?;
@@ -742,7 +821,7 @@ impl IcebergWriteSessionControl {
             fs,
             file_io: table.file_io().clone(),
             cleanup_path_mapper,
-            cow_update_rewrite: None,
+            cow_update_rewrite,
             selected_rewrite: selected_rewrite_files(handle),
             // A partition replacement is a change to the table itself, and the
             // one commit that carries it has to be the one that publishes the
@@ -1253,11 +1332,15 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (ordinal, writer, input, route) = target.into_parts();
+            let (ordinal, writer, input, route, rewrite_source) = target.into_parts();
             let plan =
                 ConnectorWriteTargetPlan::new(ordinal, adapter.wrap_writer_handle(writer), input);
-            match route {
+            let plan = match route {
                 Some(route) => plan.with_route(route),
+                None => plan,
+            };
+            match rewrite_source {
+                Some(source) => plan.with_rewrite_source(source),
                 None => plan,
             }
         })
@@ -1466,11 +1549,46 @@ impl IcebergWriteSessionControl {
                 let groups = self.freeze_rewrite_groups(table, base_snapshot_id)?;
                 plan_distributed_rewrite_branches(&material, &groups)?
             }
+            ConnectorWriteSessionFlavor::CopyOnWrite(selection) => {
+                let table = table.as_ref().ok_or_else(|| {
+                    invalid("Iceberg copy-on-write mutation requires a loaded target table")
+                })?;
+                // Without a base snapshot there is nothing to rewrite, and a
+                // copy-on-write mutation that silently became an append would
+                // publish after-images while every before-image stayed live.
+                let snapshot_id = base_snapshot_id.ok_or_else(|| {
+                    invalid("Iceberg copy-on-write mutation requires a frozen base snapshot")
+                })?;
+                let base_version_digest = request
+                    .base
+                    .as_ref()
+                    .map(ConnectorWriteBaseVersion::digest)
+                    .ok_or_else(|| {
+                        invalid("Iceberg copy-on-write mutation requires its signed base version")
+                    })?;
+                let recipes =
+                    crate::commit::write_stack::copy_on_write::freeze_copy_on_write_branches(
+                        selection,
+                        crate::commit::write_stack::copy_on_write::IcebergCowFreezeInput {
+                            catalog: &self.key.instance_id,
+                            namespace,
+                            table_name,
+                            metadata: &metadata,
+                            snapshot_id,
+                            base_files: self.frozen_base_data_files(table, snapshot_id)?,
+                            input: &material.input,
+                            base_version_digest,
+                            max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
+                        },
+                    )?;
+                plan_copy_on_write_branches(&material, &recipes)?
+            }
         };
         let IcebergSessionFlavorPlan {
             flavor,
             publication,
             rewrite_inputs,
+            copy_on_write,
             branches,
         } = plan;
         plan_branch_session(
@@ -1483,11 +1601,33 @@ impl IcebergWriteSessionControl {
                 publication,
                 staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 rewrite_inputs,
+                copy_on_write,
                 repartition,
                 writer_table: writer_facts,
                 branches,
             },
         )
+    }
+
+    /// Every live data file of one frozen base snapshot.
+    ///
+    /// This is the same read a distributed rewrite performs to cut its groups:
+    /// a walk of the frozen snapshot's manifests, and nothing else. It opens no
+    /// delete artifact and mutates nothing.
+    fn frozen_base_data_files(
+        &self,
+        table: &crate::iceberg::table::Table,
+        snapshot_id: i64,
+    ) -> Result<Vec<crate::manifest::DataFileWithStats>, ConnectorError> {
+        let owned = table.clone();
+        self.runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                crate::manifest::extract_data_files_with_stats_at(&owned, snapshot_id).await
+            })
+            .map_err(|error| unavailable(error.to_string()))?
+            .map_err(unavailable)
     }
 
     /// Freeze the rewrite groups a distributed rewrite seals one branch each
@@ -1769,9 +1909,13 @@ pub(crate) fn session_freezes_old_deletes(
                 )
         }
         // A staged target has no base snapshot and therefore no old delete
-        // artifact to supersede: it is a table nobody has ever written to.
+        // artifact to supersede: it is a table nobody has ever written to. A
+        // distributed rewrite and a copy-on-write mutation both seal only data
+        // branches: they replace whole files rather than staging a delete
+        // beside them, so there is no artifact for one to supersede either.
         ConnectorWriteSessionFlavor::StagedCreate(_)
-        | ConnectorWriteSessionFlavor::DistributedRewrite => false,
+        | ConnectorWriteSessionFlavor::DistributedRewrite
+        | ConnectorWriteSessionFlavor::CopyOnWrite(_) => false,
     }
 }
 

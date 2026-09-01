@@ -32,12 +32,14 @@ use crate::query_execution::mv_assembly::refresh_artifact::{
 };
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_connector_write_target, dml_write_plan_input_for_admitted_target,
+    admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
+use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_sql::planning::mv::first_refresh::{
     SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
     analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,
-    compile_join_first_refresh_connector_write, compile_mv_first_refresh_connector_write,
+    compile_join_first_refresh_connector_write_dataflow,
+    compile_mv_first_refresh_connector_write_dataflow,
 };
 
 pub(crate) fn frozen_logical_context_from_rewrite(
@@ -81,33 +83,96 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let operation_id = prepared.operation_id();
-    let cohort_id = prepared.primary_cohort();
+    let connector_context =
+        crate::connector::connector_request_context_for_execution(None, execution)?;
+    // The session is opened before the plan is compiled because the plan's
+    // writer node carries the recipe it seals: a plan and the session that
+    // sealed it must not be separable.
+    let write_session = super::iceberg_activation::begin_first_refresh_connector_write_session(
+        &prepared,
+        connector_context.clone(),
+        exact_lease,
+        planning_lease,
+        query_kernel.typed_connector_control(),
+    )?;
+    match bind_first_refresh_write_dataflow(
+        query_kernel,
+        ports,
+        prepared,
+        planning_lease,
+        execution,
+        &connector_context,
+        &write_session,
+    ) {
+        Ok(assembly) => Ok(assembly),
+        Err(error) => {
+            super::iceberg_activation::release_mv_write_session_without_commit(
+                &write_session,
+                &connector_context,
+            );
+            Err(error)
+        }
+    }
+}
+
+/// The one logical target a first-refresh publication seals.
+///
+/// A publication that republishes rows wholesale has exactly one thing to do
+/// with every row it is given, so it seals a single unrouted data branch. The
+/// plan is compiled against that branch's ordinal, so a session that sealed a
+/// different number of them is refused here rather than having its extra
+/// branches written by nobody.
+fn sole_publication_write_target(
+    write_session: &ConnectorWriteSession,
+) -> Result<&novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan, String> {
+    match write_session.targets() {
+        [write_target] => Ok(write_target),
+        targets => Err(format!(
+            "MV first-refresh publication requires a write session with exactly one target, but the session sealed {}",
+            targets.len()
+        )),
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Binding a first-refresh dataflow needs each independently frozen catalog, target, and session fact."
+)]
+fn bind_first_refresh_write_dataflow(
+    query_kernel: &QueryPreparationKernel,
+    ports: &IcebergMvCorePorts,
+    prepared: PreparedMvFirstRefreshWrite,
+    planning_lease: &ConnectorControlPlanningLease,
+    execution: &QueryExecutionContext,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: &Arc<ConnectorWriteSession>,
+) -> Result<PreparedMvNativeWriteAssembly, String> {
     let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
     let target_catalog = prepared.target_catalog().to_string();
     let target_namespace = prepared.target_namespace().to_string();
     let target_name = prepared.target_name().to_string();
     let current_catalog = prepared.current_catalog().map(str::to_string);
     let current_database = prepared.current_database().to_string();
-    let connector_context =
-        crate::connector::connector_request_context_for_execution(None, execution)?;
     let root_hash_column = prepared.root_hash_column().to_string();
-    let template = super::iceberg_activation::activate_first_refresh_connector_write(
-        &prepared,
-        connector_context.clone(),
-        exact_lease,
-    )?;
-    let distributed = match prepared.into_execution_artifact() {
+    let write_target = sole_publication_write_target(write_session)?;
+    let write_target_ordinal = write_target.ordinal();
+    // The recipes are sealed once, here, and travel with the plan they were
+    // sealed for, so an encode can never pair one round's plan with another's
+    // session.
+    let sealed_write_targets = write_session
+        .seal_write_targets()
+        .map_err(|error| format!("seal MV first-refresh write target: {error}"))?;
+    match prepared.into_execution_artifact() {
         MvFirstRefreshExecutionArtifact::Sql(physical_sql) => {
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-            let target_binding = admit_prepared_connector_write_target(
+            let target_binding = admit_session_connector_write_target(
                 bindings.as_ref(),
                 novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
                     target_catalog.clone(),
                     target_namespace.clone(),
                     target_name.clone(),
                 )?,
-                template.preparation().clone(),
+                write_target,
                 planning_lease.clone(),
             )?;
             let sink = dml_write_plan_input_for_admitted_target(
@@ -156,18 +221,23 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
                 query_kernel,
                 Arc::clone(&bindings),
-                &connector_context,
+                connector_context,
             )?;
-            let distributed_plan = compile_mv_first_refresh_connector_write(analyzed, &statistics)?;
+            let distributed_plan = compile_mv_first_refresh_connector_write_dataflow(
+                analyzed,
+                &statistics,
+                write_target_ordinal,
+            )?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
                 query_kernel.typed_connector_control(),
                 execution,
                 distributed_plan,
                 bindings.as_ref(),
-                &connector_context,
-                template,
-            )?
+                connector_context,
+                Arc::clone(write_session),
+                sealed_write_targets,
+            )
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
             let facts = logical.into_context();
@@ -185,7 +255,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                 &target_name,
                 &facts,
                 planning_lease,
-                &connector_context,
+                connector_context,
             )?;
             let bindings = Arc::new(QueryTableBindingStore::try_new()?);
             let target_binding =
@@ -193,16 +263,16 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
                     &refresh_rewrite,
                     &bindings,
                     planning_lease,
-                    &connector_context,
+                    connector_context,
                 )?;
-            let write_target_binding = admit_prepared_connector_write_target(
+            let write_target_binding = admit_session_connector_write_target(
                 bindings.as_ref(),
                 novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::try_new(
                     target_catalog.clone(),
                     target_namespace.clone(),
                     target_name.clone(),
                 )?,
-                template.preparation().clone(),
+                write_target,
                 planning_lease.clone(),
             )?;
             let sink = dml_write_plan_input_for_admitted_target(
@@ -252,27 +322,25 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
                 query_kernel,
                 materializer.query_table_bindings(),
-                &connector_context,
+                connector_context,
             )?;
-            let distributed_plan =
-                compile_join_first_refresh_connector_write(analyzed, &statistics)?;
+            let distributed_plan = compile_join_first_refresh_connector_write_dataflow(
+                analyzed,
+                &statistics,
+                write_target_ordinal,
+            )?;
             prepare_sealed_iceberg_write_native_assembly(
                 query_kernel.connector_control().as_ref(),
                 query_kernel.typed_connector_control(),
                 execution,
                 distributed_plan,
                 bindings.as_ref(),
-                &connector_context,
-                template,
-            )?
+                connector_context,
+                Arc::clone(write_session),
+                sealed_write_targets,
+            )
         }
-    };
-    if distributed.write_operation_id() != operation_id
-        || distributed.write_cohort_id() != cohort_id
-    {
-        return Err("MV first-refresh distributed artifact identity mismatch".to_string());
     }
-    Ok(distributed)
 }
 
 #[expect(

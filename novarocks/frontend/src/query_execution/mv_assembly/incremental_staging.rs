@@ -354,9 +354,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         ),
                     ),
                 )?;
-            if distributed.write_operation_id() != request.operation_id
-                || distributed.write_cohort_id() != selected_cohort
-            {
+            if distributed.operation_identity() != Some((request.operation_id, selected_cohort)) {
                 return Err("MV incremental distributed artifact identity mismatch".to_string());
             }
             Ok(distributed)
@@ -460,9 +458,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
                         ),
                     ),
                 )?;
-            if distributed.write_operation_id() != request.operation_id
-                || distributed.write_cohort_id() != selected_cohort
-            {
+            if distributed.operation_identity() != Some((request.operation_id, selected_cohort)) {
                 return Err("MV incremental distributed artifact identity mismatch".to_string());
             }
             Ok(distributed)

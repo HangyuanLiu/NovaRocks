@@ -1588,6 +1588,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
         connector_context,
         connector_write.map(DistributedConnectorWrite::Begin),
         None,
+        None,
         &[],
     )
 }
@@ -1625,7 +1626,55 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
         connector_context,
         Some(DistributedConnectorWrite::Session(write_session)),
         None,
+        None,
         &[],
+    )
+}
+
+/// Compile one query of a *multi-target* write session, at the sealed ordinal
+/// that query writes to.
+///
+/// A session spanning several queries -- a copy-on-write mutation compiles one
+/// per rewritten file -- cannot read its ordinal off the sealed set: the set
+/// holds every target, and `sole_target_ordinal` refuses exactly that by
+/// design. Each query names its own, so one file's replacement rows can never
+/// be attributed to another file's writer.
+///
+/// The query-local overlays are how a copy-on-write rewrite reads the file it
+/// replaces: the frozen single-file source is not a durable catalog table, and
+/// the overlay is consumed by the application materializer without ever being
+/// registered in the shared local catalog.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
+    state: &impl DmlQueryExecutionKernel,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &Query,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
+    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
+    overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    prepare_query_as_iceberg_write_with_connector_binding(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        sink,
+        table_bindings,
+        None,
+        root_distribution,
+        execution,
+        connector_context,
+        Some(DistributedConnectorWrite::Session(write_session)),
+        scan_resolver,
+        Some(write_target_ordinal),
+        overlays,
     )
 }
 
@@ -1655,6 +1704,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context
         execution,
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
+        None,
         None,
         &[],
     )
@@ -1693,6 +1743,7 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
         connector_context,
         Some(DistributedConnectorWrite::Sealed(connector_write)),
         Some(scan_resolver),
+        None,
         overlays,
     )
 }
@@ -1798,6 +1849,11 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     connector_write: Option<DistributedConnectorWrite>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
+    // `write_target_ordinal` is the sealed target this one query writes to. A
+    // caller that drives several queries against one session names it; a
+    // single-query write leaves it out and the session's sole sealed target is
+    // used.
+    write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
     query_local_overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let maintenance_execution;
@@ -1891,12 +1947,16 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             let targets = session
                 .seal_write_targets()
                 .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
+            let ordinal = match write_target_ordinal {
+                Some(ordinal) => ordinal,
+                None => targets
+                    .sole_target_ordinal()
+                    .map_err(crate::dml::error::DmlExecutionError::from)?,
+            };
             let plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
                 optimize_request,
                 sink,
-                targets
-                    .sole_target_ordinal()
-                    .map_err(crate::dml::error::DmlExecutionError::from)?,
+                ordinal,
                 &optimizer_settings,
             )?;
             (plan, Some(targets))
@@ -2100,7 +2160,12 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 
 /// Prepare an already sealed SQL connector-write plan for the frontend-owned
 /// MV lifecycle.  SQL owns all compile/physical decisions; Core only pairs the
-/// sealed plan with the exact admitted bindings and connector write template.
+/// sealed plan with the exact admitted bindings and the write session that
+/// admitted it.
+///
+/// The sealed targets are taken rather than re-sealed here: the plan was already
+/// compiled against the ordinal they name, so sealing a second set would let the
+/// recipes the plan carries drift from the ones the writer nodes were built for.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
@@ -2108,7 +2173,8 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    sealed_write_targets: crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     crate::connector::validate_request_context(connector_context)?;
     let scan_resolver =
@@ -2124,16 +2190,11 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
         Some(&scan_resolver),
         scan_preparation_options(typed_connector_control, &settings, execution)?,
     )?;
-    let cohort_id = connector_write.cohort_id();
-    let exact_lease = connector_write.lease();
-    Ok(PreparedMvNativeWriteAssembly::new(
-        NativeFragmentEncodingInput::new(distributed_plan, prepared),
+    Ok(PreparedMvNativeWriteAssembly::session(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared)
+            .with_sealed_write_targets(sealed_write_targets),
         None,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
-            connector_write,
-        ),
-        cohort_id,
-        exact_lease,
+        write_session,
     ))
 }
 
@@ -2150,7 +2211,7 @@ pub(crate) fn prepare_planned_iceberg_change_stream_write(
     };
     let cohort_id = template.cohort_id();
     let exact_lease = template.lease();
-    Ok(PreparedMvNativeWriteAssembly::new(
+    Ok(PreparedMvNativeWriteAssembly::operation(
         encoding,
         query_opts,
         crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),

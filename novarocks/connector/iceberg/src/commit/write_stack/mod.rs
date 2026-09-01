@@ -42,6 +42,7 @@
 
 pub(crate) mod codec;
 pub mod control;
+pub(crate) mod copy_on_write;
 pub mod domain;
 pub mod execution;
 pub(crate) mod flavor;

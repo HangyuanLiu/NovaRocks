@@ -44,6 +44,7 @@ use parquet::basic::Compression;
 
 use crate::commit::CommitOpKind;
 use crate::commit::report::IcebergColumnStats;
+use crate::commit::write_stack::copy_on_write::IcebergCowBranchInput;
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::delete_file::IcebergFileFormat;
 use crate::scan_model::IcebergSchemaDef;
@@ -203,13 +204,16 @@ impl IcebergWriteFlavor {
     /// Whether one sealed session may seal the same physical branch more than
     /// once.
     ///
-    /// Only a distributed rewrite may. Its logical targets are all data
-    /// branches — one per frozen rewrite group — and the ordinal, not the
-    /// branch, is what tells the group apart. Every other flavor keeps the
-    /// stricter rule, because a repeated delete branch would make the old-delete
-    /// merge owner ambiguous.
+    /// Only a distributed rewrite and a copy-on-write mutation may. Their
+    /// logical targets are all data branches — one per frozen rewrite group,
+    /// one per rewritten data file — and the ordinal, not the branch, is what
+    /// tells them apart. Every other flavor keeps the stricter rule, because a
+    /// repeated delete branch would make the old-delete merge owner ambiguous.
     pub const fn seals_one_target_per_branch(self) -> bool {
-        !matches!(self, Self::DistributedRewrite)
+        !matches!(
+            self,
+            Self::DistributedRewrite | Self::RowMutationCopyOnWrite
+        )
     }
 
     /// Whether this flavor's write must be serialized behind the distributed
@@ -1433,6 +1437,15 @@ pub struct IcebergCommitHandle {
     /// order. Present exactly on a distributed rewrite, which is the one flavor
     /// whose commit replaces files it named before any writer ran.
     rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// What every sealed copy-on-write branch replaces, in ordinal order.
+    /// Present exactly on a copy-on-write mutation.
+    ///
+    /// It stays on the session because the single external commit needs it and
+    /// nothing on the data plane carries it: a writer produces replacement
+    /// rows, and which old file those rows supersede — together with the row
+    /// ids inside it that were matched — is a planning fact the session froze
+    /// before any writer ran.
+    copy_on_write: Vec<IcebergCowBranchInput>,
     /// The partition replacement this session's single external commit applies
     /// ahead of its snapshot. Present only on a managed publication that was
     /// admitted with one.
@@ -1459,6 +1472,9 @@ pub struct IcebergSessionFacts {
     /// Present exactly on the distributed-rewrite flavor, one entry per sealed
     /// branch and in the same order.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// Present exactly on the copy-on-write flavor, one entry per sealed branch
+    /// and in the same order.
+    pub copy_on_write: Vec<IcebergCowBranchInput>,
     /// Present only on a managed publication that replaces the target's default
     /// partitioning in the same external commit that publishes its rows.
     pub(crate) repartition:
@@ -1478,6 +1494,7 @@ impl IcebergSessionFacts {
             publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
+            copy_on_write: Vec::new(),
             repartition: None,
         }
     }
@@ -1554,6 +1571,7 @@ impl IcebergCommitHandle {
             publication,
             staged_metadata,
             rewrite_inputs,
+            copy_on_write,
             repartition,
         } = facts;
         if publication.is_some() && flavor != IcebergWriteFlavor::ManagedPublication {
@@ -1590,6 +1608,25 @@ impl IcebergCommitHandle {
             return Err(invalid(format!(
                 "Iceberg {} write session cannot carry an atomic partition replacement",
                 flavor.as_str()
+            )));
+        }
+        // A copy-on-write session's branch count follows the files its match
+        // selection touched, so both directions are errors: a copy-on-write
+        // session with no frozen branch would have nothing to replace, and any
+        // other flavor carrying one would retire a live file no writer
+        // superseded.
+        if copy_on_write.is_empty() == (flavor == IcebergWriteFlavor::RowMutationCopyOnWrite) {
+            return Err(invalid(format!(
+                "Iceberg {} write session must carry a frozen copy-on-write branch per target exactly when it rewrites matched files",
+                flavor.as_str()
+            )));
+        }
+        if !copy_on_write.is_empty() && copy_on_write.len() != targets.len() {
+            return Err(invalid(format!(
+                "Iceberg {} write session froze {} copy-on-write branches for {} sealed targets",
+                flavor.as_str(),
+                copy_on_write.len(),
+                targets.len()
             )));
         }
         if !rewrite_inputs.is_empty() && rewrite_inputs.len() != targets.len() {
@@ -1635,6 +1672,7 @@ impl IcebergCommitHandle {
             delete_owner,
             staged_metadata,
             rewrite_inputs,
+            copy_on_write,
             repartition,
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
@@ -1700,6 +1738,15 @@ impl IcebergCommitHandle {
 
     pub fn targets(&self) -> &[IcebergSealedWriteTarget] {
         &self.targets
+    }
+
+    /// What every sealed copy-on-write branch replaces, in ordinal order.
+    ///
+    /// Empty on every other flavor. The commit joins entry `i` with the
+    /// fragments the backends staged for write target `i`, which is the only
+    /// key involved: no cohort, operation, or attempt identity takes part.
+    pub(crate) fn copy_on_write(&self) -> &[IcebergCowBranchInput] {
+        &self.copy_on_write
     }
 
     /// The single external commit op this session performs.

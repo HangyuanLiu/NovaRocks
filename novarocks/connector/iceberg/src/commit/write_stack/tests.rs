@@ -56,14 +56,15 @@ use crate::commit::write_stack::control::{
     release_session_state, session_freezes_old_deletes, session_plan_from_targets,
     settle_empty_write_without_commit, validate_prepared_set,
 };
+use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
     IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
     IcebergPositionDeleteFileArtifact, IcebergWriteBranch, IcebergWriteFlavor,
     IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
-    IcebergSessionFlavorPlan, plan_distributed_rewrite_branches, plan_managed_publication_branches,
-    plan_ordinary_branches, plan_row_mutation_branches,
+    IcebergSessionFlavorPlan, plan_copy_on_write_branches, plan_distributed_rewrite_branches,
+    plan_managed_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteMergeTarget, read_and_merge_old_deletes,
@@ -815,7 +816,6 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         IcebergWriteFlavor::Append,
         IcebergWriteFlavor::Overwrite,
         IcebergWriteFlavor::PartitionOverwrite,
-        IcebergWriteFlavor::RowMutationCopyOnWrite,
         IcebergWriteFlavor::StagedCreate,
         IcebergWriteFlavor::ManagedPublication,
         IcebergWriteFlavor::DistributedRewrite,
@@ -875,6 +875,19 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         assert_eq!(handle.branch_of(ordinal(1)), Some(branch));
         seen.insert(flavor, plans.len());
     }
+    // Copy-on-write seals one branch per rewritten file rather than the
+    // canonical shape, so it is covered by its own branch-planning tests and
+    // deliberately cannot be sealed here.
+    let (handle, plans) = flavor_session(
+        plan_copy_on_write_branches(
+            &session_material(copy_on_write_input_shape()),
+            &cow_recipes(&["s3://b/wh/db/t/data/a.parquet"]),
+        )
+        .expect("row-mutation-copy-on-write must plan"),
+    );
+    assert_eq!(plans.len(), 2);
+    assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
+    seen.insert(IcebergWriteFlavor::RowMutationCopyOnWrite, plans.len());
     assert_eq!(seen.len(), 10, "every flavor must be covered");
 }
 
@@ -895,12 +908,122 @@ fn flavor_session(
             publication: plan.publication,
             staged_metadata: None,
             rewrite_inputs: plan.rewrite_inputs,
+            copy_on_write: plan.copy_on_write,
             repartition: None,
             writer_table: None,
             branches: plan.branches,
         },
     )
     .expect("seal the flavor's branches")
+}
+
+/// The frozen copy-on-write recipes of a mutation that touched `old_files`,
+/// plus the trailing append branch a folded `MERGE` insert reaches.
+///
+/// The read contract is assembled directly rather than frozen from a catalog:
+/// these tests assert the branch structure a recipe set produces, and the
+/// freeze that produces the recipes has its own unit tests beside it.
+fn cow_recipes(old_files: &[&str]) -> Vec<IcebergCowBranchRecipe> {
+    let mut recipes = old_files
+        .iter()
+        .map(|old_file| {
+            IcebergCowBranchRecipe::for_test(
+                IcebergCowBranchInput::Rewrite {
+                    old_file: (*old_file).to_string(),
+                    matched_row_ids: vec![100],
+                },
+                Some(cow_rewrite_source(old_file)),
+            )
+        })
+        .collect::<Vec<_>>();
+    recipes.push(IcebergCowBranchRecipe::for_test(
+        IcebergCowBranchInput::Append,
+        None,
+    ));
+    recipes
+}
+
+/// One rewrite branch's read contract, pinned to the single file it replaces.
+fn cow_rewrite_source(
+    old_file: &str,
+) -> novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource {
+    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+        arrow::datatypes::Field::new("k1", DataType::Int64, true),
+        arrow::datatypes::Field::new("_row_id", DataType::Int64, true),
+        arrow::datatypes::Field::new("_last_updated_sequence_number", DataType::Int64, true),
+    ]));
+    novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource::new(
+        novarocks_spi::connector::ConnectorTableHandle::try_new(
+            ConnectorInstanceId::parse("copy_on_write").expect("instance id"),
+            bytes::Bytes::from_static(b"frozen-source"),
+        )
+        .expect("frozen source handle"),
+        novarocks_spi::connector::ConnectorPinnedFileSet::try_new("db", "t", 77, [old_file])
+            .expect("pinned source"),
+        [5; 32],
+        schema,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+}
+
+/// A sealed copy-on-write session holding exactly these frozen branches.
+fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergCommitHandle {
+    IcebergCommitHandle::try_new_sealed(
+        IcebergWriteSessionId::new(),
+        table_facts(),
+        IcebergWriteFlavor::RowMutationCopyOnWrite,
+        crate::commit::write_stack::domain::IcebergSessionFacts {
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            base_version_digest: None,
+            publication: None,
+            staged_metadata: None,
+            rewrite_inputs: Vec::new(),
+            copy_on_write: branches.to_vec(),
+            repartition: None,
+        },
+        branches
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                crate::commit::write_stack::domain::IcebergSealedWriteTarget::new(
+                    ordinal(u32::try_from(index).expect("ordinal")),
+                    IcebergWriteBranch::Data,
+                    std::collections::BTreeMap::new(),
+                )
+            })
+            .collect(),
+    )
+    .expect("seal a copy-on-write session")
+}
+
+/// One replacement data file, as the commit half sees it after a fragment is
+/// interpreted against the target's metadata.
+fn written_data_file(path: &str) -> crate::commit::WrittenFile {
+    crate::commit::WrittenFile {
+        path: path.to_string(),
+        format: crate::iceberg::spec::DataFileFormat::Parquet,
+        content: crate::iceberg::spec::DataContentType::Data,
+        partition_values: crate::iceberg::spec::Struct::empty(),
+        partition_spec_id: 0,
+        record_count: 3,
+        file_size_in_bytes: 128,
+        split_offsets: Vec::new(),
+        column_sizes: std::collections::HashMap::new(),
+        value_counts: std::collections::HashMap::new(),
+        null_value_counts: std::collections::HashMap::new(),
+        nan_value_counts: std::collections::HashMap::new(),
+        lower_bounds: std::collections::HashMap::new(),
+        upper_bounds: std::collections::HashMap::new(),
+        key_metadata: None,
+        referenced_data_file: None,
+        equality_ids: None,
+        first_row_id: None,
+        content_offset: None,
+        content_size_in_bytes: None,
+        cardinality: None,
+    }
 }
 
 /// Take the neutral session plan the frontend actually receives, so a route the
@@ -1059,23 +1182,200 @@ fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
     );
 }
 
+/// A copy-on-write mutation that touched three data files must seal three
+/// branches, not one.
+///
+/// One branch would have given every file's replacement rows the same writer,
+/// and the prepared write set cannot notice: every fragment would name a target
+/// the session really did seal. The branch order is the recipe order, so each
+/// file's ordinal is the only name it needs.
 #[test]
-fn a_copy_on_write_row_mutation_seals_one_rewriting_data_branch() {
-    // A copy-on-write mutation rewrites whole files, so its one branch sees
-    // every change event that touches a file it rewrites.
+fn a_copy_on_write_row_mutation_seals_one_branch_per_rewritten_file() {
     let adapter = adapter("copy_on_write", 4);
-    let plan = plan_row_mutation_branches(&session_material(copy_on_write_input_shape()))
-        .expect("plan a copy-on-write mutation");
+    let recipes = cow_recipes(&[
+        "s3://b/wh/db/t/data/a.parquet",
+        "s3://b/wh/db/t/data/b.parquet",
+    ]);
+    let plan =
+        plan_copy_on_write_branches(&session_material(copy_on_write_input_shape()), &recipes)
+            .expect("plan a copy-on-write mutation");
     assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationCopyOnWrite);
+
     let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
-    assert_eq!(sealed.expected_targets(), vec![ordinal(0)]);
+    assert_eq!(
+        sealed.expected_targets(),
+        vec![ordinal(0), ordinal(1), ordinal(2)]
+    );
+    // Each rewrite branch replaces rows that already exist; only the trailing
+    // append branch may receive a net-new row.
     assert_eq!(
         effects(&sealed.targets()[0]),
         vec![
             ConnectorRowMutationEffect::Delete,
-            ConnectorRowMutationEffect::Replace,
-            ConnectorRowMutationEffect::Insert
+            ConnectorRowMutationEffect::Replace
         ]
+    );
+    assert_eq!(
+        effects(&sealed.targets()[1]),
+        vec![
+            ConnectorRowMutationEffect::Delete,
+            ConnectorRowMutationEffect::Replace
+        ]
+    );
+    assert_eq!(
+        effects(&sealed.targets()[2]),
+        vec![ConnectorRowMutationEffect::Insert]
+    );
+    // Two branches sharing a route key would make SQL's choice ambiguous and
+    // one file's rows would vanish.
+    let routes = sealed
+        .targets()
+        .iter()
+        .map(|target| target.route().expect("routed").route_id())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(routes.len(), 3);
+}
+
+/// Each branch re-reads exactly the file it replaces.
+///
+/// A branch that replaced one file while reading another would silently drop or
+/// duplicate rows, so the read contract travels with the target rather than
+/// being re-derived beside it.
+#[test]
+fn each_copy_on_write_branch_carries_the_read_contract_of_its_own_file() {
+    let adapter = adapter("copy_on_write_source", 4);
+    let recipes = cow_recipes(&[
+        "s3://b/wh/db/t/data/a.parquet",
+        "s3://b/wh/db/t/data/b.parquet",
+    ]);
+    let plan =
+        plan_copy_on_write_branches(&session_material(copy_on_write_input_shape()), &recipes)
+            .expect("plan a copy-on-write mutation");
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+
+    let pinned = |index: usize| {
+        sealed.targets()[index]
+            .rewrite_source()
+            .expect("a rewrite branch carries its read contract")
+            .pinned_source()
+            .files()
+            .iter()
+            .map(|file| file.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(pinned(0), vec!["s3://b/wh/db/t/data/a.parquet".to_string()]);
+    assert_eq!(pinned(1), vec!["s3://b/wh/db/t/data/b.parquet".to_string()]);
+    // The append branch replaces nothing, so it reads nothing.
+    assert!(sealed.targets()[2].rewrite_source().is_none());
+}
+
+/// The commit keys every replacement record by the write target ordinal.
+///
+/// Two rewritten files must reach two `CowUpdateTouchedFile` records, each
+/// holding only its own artifacts. Merging them would attribute one file's
+/// replacement to the other and retire a file nothing superseded.
+#[test]
+fn each_copy_on_write_branch_reaches_its_own_replacement_record() {
+    let handle = cow_handle(&[
+        IcebergCowBranchInput::Rewrite {
+            old_file: "s3://b/wh/db/t/data/a.parquet".to_string(),
+            matched_row_ids: vec![101, 100],
+        },
+        IcebergCowBranchInput::Rewrite {
+            old_file: "s3://b/wh/db/t/data/b.parquet".to_string(),
+            matched_row_ids: vec![300],
+        },
+        IcebergCowBranchInput::Append,
+    ]);
+    let rewrite = crate::commit::write_stack::control::cow_update_rewrite_set(
+        &handle,
+        &[
+            (ordinal(0), written_data_file("s3://b/new/a-0.parquet")),
+            (ordinal(1), written_data_file("s3://b/new/b-0.parquet")),
+            (ordinal(0), written_data_file("s3://b/new/a-1.parquet")),
+            (ordinal(2), written_data_file("s3://b/new/inserted.parquet")),
+        ],
+    )
+    .expect("copy-on-write rewrite set")
+    .expect("a copy-on-write session commits a rewrite set");
+
+    assert_eq!(rewrite.touched_data_files.len(), 2);
+    assert_eq!(
+        rewrite.touched_data_files[0].old_file,
+        "s3://b/wh/db/t/data/a.parquet"
+    );
+    assert_eq!(
+        rewrite.touched_data_files[0].new_files,
+        vec![
+            "s3://b/new/a-0.parquet".to_string(),
+            "s3://b/new/a-1.parquet".to_string()
+        ]
+    );
+    assert_eq!(
+        rewrite.touched_data_files[1].new_files,
+        vec!["s3://b/new/b-0.parquet".to_string()]
+    );
+    // The row ids reach the commit exactly as the selection reported them: the
+    // minimum becomes the replacement manifest's `first_row_id`, so a reordered
+    // or synthesized value would corrupt row lineage rather than fail a check.
+    assert_eq!(rewrite.touched_data_files[0].row_ids, vec![101, 100]);
+    assert_eq!(rewrite.touched_data_files[1].row_ids, vec![300]);
+    assert_eq!(rewrite.updated_row_ids, vec![100, 101, 300]);
+    // A net-new row belongs to no rewritten file and is added beside them.
+    assert_eq!(
+        rewrite
+            .appended_files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>(),
+        vec!["s3://b/new/inserted.parquet".to_string()]
+    );
+    assert_eq!(rewrite.base_snapshot_id, 77);
+}
+
+/// A copy-on-write session cannot be sealed from the canonical data shape.
+///
+/// Its branch count follows the files its match selection touched, so a session
+/// sealed without those recipes would have nothing to replace and would commit
+/// a rewrite that retires no file at all.
+#[test]
+fn a_copy_on_write_session_without_frozen_branches_is_refused() {
+    let error = plan_write_session(
+        IcebergWriteSessionId::new(),
+        IcebergWriteSessionPlanInput {
+            flavor: IcebergWriteFlavor::RowMutationCopyOnWrite,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            table: table_facts(),
+            base_version_digest: None,
+            staged_metadata: None,
+            data: data_branch_plan(),
+            deletes: Vec::new(),
+        },
+    )
+    .expect_err("a copy-on-write session must carry its frozen branches");
+    assert!(
+        error
+            .message()
+            .contains("frozen copy-on-write branch per target"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+/// A copy-on-write mutation reaching the row-mutation flavor is refused.
+///
+/// The row-mutation flavor carries no match selection, so it cannot know how
+/// many files the statement touched. Admitting it would seal one branch for a
+/// statement that rewrites several.
+#[test]
+fn a_copy_on_write_identity_is_refused_by_the_row_mutation_flavor() {
+    let error = plan_row_mutation_branches(&session_material(copy_on_write_input_shape()))
+        .expect_err("a copy-on-write mutation needs its own session flavor");
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(
+        error.message().contains("copy-on-write session flavor"),
+        "unexpected message: {}",
+        error.message()
     );
 }
 
@@ -1103,6 +1403,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
+            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: None,
             branches: vec![
@@ -1278,6 +1579,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
                 )
                 .expect("frozen rewrite input"),
             ],
+            copy_on_write: Vec::new(),
             repartition: None,
         },
         vec![
@@ -1409,6 +1711,7 @@ fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_curr
             )),
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
+            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: Some(prospective.clone()),
             branches: vec![IcebergWriteBranchPlan::Data {

@@ -36,7 +36,6 @@ use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
 use crate::maintenance::MaintenanceTarget;
-use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::runtime::query_result::QueryResult;

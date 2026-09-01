@@ -1254,6 +1254,60 @@ pub(crate) fn staged_target_metadata(
     })
 }
 
+/// The provider-private table one copy-on-write branch re-reads.
+///
+/// A copy-on-write branch replaces one whole data file, so the read that
+/// produces its replacement rows names exactly that file and pins the base
+/// snapshot the session froze. It is built from the session's own loaded
+/// metadata rather than from an admitted handle, because a session's target is
+/// resolved by name and never arrives as one.
+pub(crate) fn frozen_copy_on_write_source_payload(
+    catalog: &ConnectorInstanceId,
+    namespace: &str,
+    table_name: &str,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    file: IcebergDataFileInfo,
+) -> Result<IcebergTablePayload, ConnectorError> {
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
+    })?;
+    let snapshot_schema = snapshot.schema(metadata).map_err(|error| {
+        corrupt(format!(
+            "resolve Iceberg copy-on-write snapshot schema: {error}"
+        ))
+    })?;
+    Ok(IcebergTablePayload {
+        namespace: namespace.to_string(),
+        table: table_name.to_string(),
+        table_info: Some(IcebergTableInfo {
+            catalog: catalog.as_str().to_string(),
+            namespace: namespace.to_string(),
+            table: table_name.to_string(),
+            table_uuid: Some(metadata.uuid().to_string()),
+            current_snapshot_id: Some(snapshot_id),
+            schema_id: snapshot_schema.schema_id(),
+            location: metadata.location().to_string(),
+            schema: iceberg_schema_def(&snapshot_schema),
+            serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+                corrupt(format!(
+                    "serialize Iceberg copy-on-write source metadata: {error}"
+                ))
+            })?),
+            serialized_metadata_rows: None,
+        }),
+        metadata_columns: metadata_column_names(metadata),
+        metadata_table_type: None,
+        prepared_files: Vec::new(),
+        explicit_files: Some(vec![file]),
+        // A frozen source carries a complete explicit file set and must never
+        // fall back to a catalog lookup.
+        row_mutation_frozen_source: true,
+        logical_type_columns: logical_type_columns(metadata.properties()),
+        hidden_columns: hidden_internal_columns(metadata.properties()),
+    })
+}
+
 /// The frozen target one staged write session opens on.
 ///
 /// A registered table is loaded from the catalog on every session; a staged one

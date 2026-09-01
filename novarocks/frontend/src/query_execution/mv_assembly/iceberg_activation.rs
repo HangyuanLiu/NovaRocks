@@ -26,8 +26,7 @@ use novarocks_spi::connector::{
     ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
     ConnectorManagedPublicationTechnique, ConnectorRequestContext,
     ConnectorStagedPublicationBaseFact, ConnectorTableIdentity, ConnectorTableResolution,
-    ConnectorWriteActivationIntent, ConnectorWriteInputRequest, ConnectorWriteLease,
-    ConnectorWriteOperationId,
+    ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
@@ -174,14 +173,25 @@ fn require_exact_published_projection(
     }
 }
 
-/// Activate a managed MV write from the exact provider-signed preparation.
-/// No application caller reloads a catalog, constructs a physical collector,
-/// encodes provenance, or registers a provider write service.
-pub(crate) fn activate_first_refresh_connector_write(
+/// Open the write session one MV first refresh publishes through.
+///
+/// A first refresh republishes the materialization wholesale, so it sends plain
+/// data rows and the publication seals exactly one unrouted data branch --
+/// `ConnectorManagedPublicationShape::Data`. The shape is declared here rather
+/// than inferred because the provider cannot tell a publication's data rows from
+/// ordinary DML by input alone, and the difference decides whether the commit is
+/// a publication.
+///
+/// The publication id travels inside the managed intent and nowhere else. It
+/// reaches the snapshot the commit writes -- that is what the publication fence
+/// reads back -- but no writer recipe, commit fragment, or backend sees it.
+pub(crate) fn begin_first_refresh_connector_write_session(
     prepared: &PreparedMvFirstRefreshWrite,
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
-) -> Result<crate::query_execution::contract::ConnectorWritePlanningTemplate, String> {
+    planning_lease: &ConnectorControlPlanningLease,
+    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
     if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
     }
@@ -190,7 +200,6 @@ pub(crate) fn activate_first_refresh_connector_write(
             "MV first-refresh staging table belongs to a different connector instance".to_string(),
         );
     }
-    let operation_id: ConnectorWriteOperationId = prepared.operation_id();
     let target = crate::catalog_application::resolver::TargetBackend {
         backend_name: "iceberg",
         catalog: prepared.target_catalog().to_string(),
@@ -203,6 +212,11 @@ pub(crate) fn activate_first_refresh_connector_write(
             novarocks_spi::connector::ConnectorWriteIntent::Overwrite
         }
     };
+    // What an empty result means is the publication's business, not the
+    // terminal's: an append that produced nothing has nothing to publish, while
+    // a full overwrite that produced nothing is a truncate and must still
+    // commit. The provider applies this at finish, so the frontend commits
+    // either way and reads the effect back.
     let empty_input = match prepared.write_mode() {
         MvStagedRefreshWriteMode::Append => {
             ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
@@ -211,11 +225,14 @@ pub(crate) fn activate_first_refresh_connector_write(
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
         }
     };
-    let replacement = prepared
+    // A partition replacement establishes the new default spec in the same
+    // commit that publishes the rows, so it writes to main rather than to a
+    // staging branch that would then be fast-forwarded.
+    let target_ref = if prepared
         .publication_intent()
         .partition_spec_replacement()
-        .is_some();
-    let target_ref = if replacement {
+        .is_some()
+    {
         "main"
     } else {
         prepared.staging_branch()
@@ -227,38 +244,48 @@ pub(crate) fn activate_first_refresh_connector_write(
             .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
             .collect(),
     };
-    let purpose = novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh;
-    let preparation = if replacement {
-        crate::query_execution::dml::iceberg_writer::prepare_iceberg_connector_write_with_table(
-            exact_lease,
-            prepared.target_table().clone(),
-            target_ref,
-            intent,
-            input,
-            purpose,
-            connector_context.clone(),
-        )?
-    } else {
-        crate::query_execution::dml::iceberg_writer::prepare_iceberg_connector_write(
-            exact_lease,
+    let managed_publication =
+        managed_publication_activation_intent(prepared.publication_intent(), empty_input)?;
+    crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            typed_connector_control,
+            planning_lease,
+        )?,
+        exact_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
             &target,
             target_ref,
             intent,
             input,
-            purpose,
-            connector_context.clone(),
-        )?
-    };
-    let managed_publication =
-        managed_publication_activation_intent(prepared.publication_intent(), empty_input)?;
-    crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared_with_intent(
-        operation_id,
-        preparation,
-        ConnectorWriteActivationIntent::ManagedPublication(managed_publication),
-        connector_context,
-        exact_lease.clone(),
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
+                intent: managed_publication,
+                shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+            },
+            connector_context,
+        )?,
     )
-    .map_err(|error| format!("activate exact Iceberg MV write generation: {error}"))
+}
+
+/// Release a session that will never reach its commit.
+///
+/// Nothing external has happened -- a begin performs reads only, and a session
+/// commits only through a completion this attempt never produced -- but the
+/// provider is holding a session for a write that will not run, and this
+/// refresh's one terminal decision is the only thing that releases it. So a
+/// failed refresh leaves nothing behind. The original failure is what the
+/// caller reports, so a failure to release is logged rather than substituted
+/// for it.
+pub(crate) fn release_mv_write_session_without_commit(
+    write_session: &crate::query_execution::write_session::ConnectorWriteSession,
+    connector_context: &ConnectorRequestContext,
+) {
+    if let Err(error) = write_session.abort(connector_context.clone()) {
+        tracing::warn!(
+            %error,
+            "releasing an uncommitted MV first-refresh write session failed",
+        );
+    }
 }
 
 pub(crate) fn managed_publication_activation_intent(

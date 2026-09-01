@@ -33,11 +33,14 @@
 use std::collections::BTreeMap;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
-use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
+use novarocks_spi::connector::write_stack::session::{
+    ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
 };
 
+use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
     IcebergCommitHandle, IcebergDataBranchRecipe, IcebergFrozenRewriteBranchInput,
     IcebergManagedPublicationFacts, IcebergSealedWriteTarget, IcebergSessionFacts,
@@ -85,6 +88,7 @@ pub struct IcebergWriteTargetPlan {
     handle: IcebergWriterHandle,
     input: ConnectorWriteInputShape,
     route: Option<ConnectorWriteRouteFacts>,
+    rewrite_source: Option<ConnectorWriteRewriteSource>,
 }
 
 impl IcebergWriteTargetPlan {
@@ -105,6 +109,11 @@ impl IcebergWriteTargetPlan {
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
     }
+    /// The read contract of one copy-on-write branch, present exactly when the
+    /// branch produces its rows by re-reading the files it replaces.
+    pub const fn rewrite_source(&self) -> Option<&ConnectorWriteRewriteSource> {
+        self.rewrite_source.as_ref()
+    }
     pub fn into_parts(
         self,
     ) -> (
@@ -112,8 +121,15 @@ impl IcebergWriteTargetPlan {
         IcebergWriterHandle,
         ConnectorWriteInputShape,
         Option<ConnectorWriteRouteFacts>,
+        Option<ConnectorWriteRewriteSource>,
     ) {
-        (self.ordinal, self.handle, self.input, self.route)
+        (
+            self.ordinal,
+            self.handle,
+            self.input,
+            self.route,
+            self.rewrite_source,
+        )
     }
 }
 
@@ -246,6 +262,9 @@ pub struct IcebergBranchSessionPlanInput {
     /// Present exactly on the distributed-rewrite flavor: the exact input files
     /// each sealed branch replaces, in the same order as `branches`.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
+    /// Present exactly on the copy-on-write flavor: what each sealed branch
+    /// replaces and what it re-reads, in the same order as `branches`.
+    pub copy_on_write: Vec<IcebergCowBranchRecipe>,
     /// Present only on a managed publication that replaces the target's default
     /// partitioning in the same external commit.
     pub(crate) repartition:
@@ -327,6 +346,18 @@ pub fn plan_branch_session(
     }
     prove_unique_delete_owner(&sealed)?;
 
+    // A copy-on-write branch's read contract is per branch, so a session
+    // holding a different number of recipes than it sealed branches could not
+    // say which file any one branch replaces or re-reads.
+    if !input.copy_on_write.is_empty() && input.copy_on_write.len() != input.branches.len() {
+        return Err(invalid(format!(
+            "Iceberg {} write session froze {} copy-on-write recipes for {} sealed branches",
+            input.flavor.as_str(),
+            input.copy_on_write.len(),
+            input.branches.len()
+        )));
+    }
+
     let writer_table = input.writer_table.as_ref().unwrap_or(&input.table);
     let mut plans = Vec::with_capacity(sealed.len());
     for (index, plan) in input.branches.iter().enumerate() {
@@ -336,6 +367,11 @@ pub fn plan_branch_session(
             handle: plan.writer_handle(writer_table)?,
             input: plan.input().clone(),
             route: plan.route().cloned(),
+            rewrite_source: input
+                .copy_on_write
+                .get(index)
+                .and_then(IcebergCowBranchRecipe::rewrite_source)
+                .cloned(),
         });
     }
 
@@ -349,6 +385,11 @@ pub fn plan_branch_session(
             publication: input.publication,
             staged_metadata: input.staged_metadata,
             rewrite_inputs: input.rewrite_inputs,
+            copy_on_write: input
+                .copy_on_write
+                .into_iter()
+                .map(IcebergCowBranchRecipe::into_input)
+                .collect(),
             repartition: input.repartition,
         },
         sealed,
@@ -399,6 +440,7 @@ pub fn plan_write_session(
             publication: None,
             staged_metadata: input.staged_metadata,
             rewrite_inputs,
+            copy_on_write: Vec::new(),
             repartition: None,
             writer_table: None,
             branches,
