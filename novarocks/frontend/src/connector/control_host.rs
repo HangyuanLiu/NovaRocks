@@ -877,7 +877,7 @@ impl ConnectorControlHost {
     /// replaced, and committing through the replacement would attach staged
     /// work to a runtime that never admitted it. Callers pass the runtime id of
     /// the planning lease they are already holding.
-    fn acquire_exact_write_stack(
+    pub(crate) fn acquire_exact_write_stack(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorWriteStackLease, ConnectorError> {
@@ -889,7 +889,7 @@ impl ConnectorControlHost {
     ///
     /// Only for a caller that has not already pinned one; anything that planned
     /// against a retained generation must use [`Self::acquire_exact_write_stack`].
-    fn acquire_current_write_stack(
+    pub(crate) fn acquire_current_write_stack(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteStackLease, ConnectorError> {

@@ -141,6 +141,21 @@ impl ConnectorWriteTargetBinding {
             .map_err(|error| error.to_string())
     }
 
+    /// Derive the NCP-6 write-stack lease from the same generation that
+    /// resolved this target.
+    ///
+    /// It names the generation explicitly rather than resolving whatever is
+    /// active now, because between planning and commit the active generation
+    /// can be replaced, and committing through the replacement would attach
+    /// staged work to a runtime that never admitted it.
+    pub(crate) fn derive_write_stack_lease(
+        &self,
+        host: &crate::connector::control_host::ConnectorControlHost,
+    ) -> Result<crate::connector::control_host::ConnectorWriteStackLease, String> {
+        host.acquire_exact_write_stack(self.lease.control_runtime_id())
+            .map_err(|error| format!("derive connector write-stack lease: {error}"))
+    }
+
     /// Ask the exact generation that resolved this target to sign one row
     /// mutation. The opaque table handle is passed through unchanged.
     pub fn prepare_row_mutation(
