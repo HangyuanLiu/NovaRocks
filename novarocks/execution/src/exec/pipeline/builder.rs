@@ -1995,17 +1995,48 @@ fn build_pipeline_for_node(
         }
         ExecNodeKind::TableFinish(node) => {
             // A prepared write set is complete or it does not exist, so exactly
-            // one driver must see every writer row. Gather the local drivers
-            // into one before the finish operator is installed; the remote
-            // senders are already gathered by the Exchange above this node.
-            let build = build_pipeline_for_node(&node.input, ctx)?;
-            let mut build = gather_to_one(build, ctx, node.node_id);
-            build
-                .pipeline
+            // one driver must see every writer row.
+            //
+            // The node is n-ary: an exchange receiver names one source
+            // fragment, so a query with several writer fragments arrives here
+            // as several inputs. Converge them the way `UnionAll` does -- a
+            // shared state fed by a sink on every input pipeline -- but create
+            // the downstream pipeline at DOP 1 directly instead of gathering
+            // afterwards, so the single finish driver is the only consumer by
+            // construction.
+            let mut input_builds = Vec::with_capacity(node.inputs.len());
+            let mut producer_count = 0usize;
+            for input in &node.inputs {
+                let child_build = build_pipeline_for_node(input, ctx)?;
+                producer_count = producer_count.saturating_add(child_build.pipeline.dop as usize);
+                input_builds.push(child_build);
+            }
+            let state = UnionAllSharedState::new(producer_count.max(1), node.node_id);
+
+            let mut extra_pipelines = Vec::new();
+            for mut child_build in input_builds {
+                child_build
+                    .pipeline
+                    .factories
+                    .push(Box::new(UnionAllSinkFactory::new(
+                        state.clone(),
+                        node.node_id,
+                    )));
+                child_build.pipeline.needs_sink = false;
+                extra_pipelines.push(child_build.pipeline);
+                extra_pipelines.append(&mut child_build.extra_pipelines);
+            }
+
+            let source = Box::new(UnionAllSourceFactory::new(state, node.node_id));
+            let mut pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            pipeline
                 .factories
                 .push(Box::new(TableFinishOperatorFactory::new(node)));
-            build.stream = StreamDesc::single();
-            Ok(build)
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines,
+                stream: StreamDesc::single(),
+            })
         }
         ExecNodeKind::Fetch(fetch) => {
             let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;
@@ -2557,5 +2588,96 @@ mod tests {
             .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
             .count();
         assert_eq!(local_exchange_sources, 1);
+    }
+
+    /// A finish node is n-ary because an exchange receiver names exactly one
+    /// source fragment. Several writer fragments must therefore converge onto
+    /// the one finish driver, and the convergence must happen before the finish
+    /// operator rather than after it: a second finish driver would each see a
+    /// partial set and each believe it was complete.
+    #[test]
+    fn a_multi_input_table_finish_converges_every_writer_onto_one_driver() {
+        use crate::exec::chunk::Chunk;
+        use crate::exec::node::table_finish::TableFinishNode;
+        use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValidator;
+        use crate::exec::node::values::ValuesNode;
+        use novarocks_spi::connector::ConnectorError;
+        use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+
+        struct AcceptAll;
+        impl ConnectorCommitFragmentCarrierValidator for AcceptAll {
+            fn validate(
+                &self,
+                _target: WriteTargetOrdinal,
+                _encoded: &[u8],
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let writer_input = |node_id| ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: Chunk::default(),
+                node_id,
+            }),
+        };
+        let targets = (0..3)
+            .map(|ordinal| WriteTargetOrdinal::try_new(ordinal).expect("bounded ordinal"))
+            .collect::<Vec<_>>();
+        let finish = TableFinishNode::try_new(
+            vec![writer_input(1), writer_input(2), writer_input(3)],
+            41,
+            targets,
+            Arc::new(AcceptAll),
+        )
+        .expect("table finish node");
+
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::TableFinish(finish),
+            },
+        };
+
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            4,
+        )
+        .expect("build pipeline graph");
+
+        let finish_pipelines = graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_FINISH"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finish_pipelines.len(),
+            1,
+            "exactly one pipeline may run the finish operator"
+        );
+        assert_eq!(
+            finish_pipelines[0].dop, 1,
+            "the finish pipeline must run at DOP 1 so one driver sees every writer row"
+        );
+
+        // Every writer input keeps its own pipeline and hands off through the
+        // shared convergence sink rather than terminating on its own.
+        let convergence_sinks = graph
+            .pipelines
+            .iter()
+            .flat_map(|pipeline| pipeline.factories.iter())
+            .filter(|factory| factory.name().starts_with("UnionAllSink"))
+            .count();
+        assert_eq!(convergence_sinks, 3);
     }
 }

@@ -90,7 +90,7 @@ fn visit(
         ExecNodeKind::SetOp(node) => visit_inputs(&node.inputs, instance, bindings),
         ExecNodeKind::RuntimeFilterConsumer(node) => visit(&node.input, instance, bindings),
         ExecNodeKind::TableWriter(node) => visit(&node.input, instance, bindings),
-        ExecNodeKind::TableFinish(node) => visit(&node.input, instance, bindings),
+        ExecNodeKind::TableFinish(node) => visit_inputs(&node.inputs, instance, bindings),
     }
 }
 

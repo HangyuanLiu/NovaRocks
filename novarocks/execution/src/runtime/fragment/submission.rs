@@ -154,7 +154,9 @@ fn collect_incremental_scan_contracts(node: &ExecNode, output: &mut HashMap<i32,
             collect_incremental_scan_contracts(&value.input, output)
         }
         ExecNodeKind::TableFinish(value) => {
-            collect_incremental_scan_contracts(&value.input, output)
+            for input in &value.inputs {
+                collect_incremental_scan_contracts(input, output);
+            }
         }
         ExecNodeKind::Values(_) | ExecNodeKind::ExchangeSource(_) | ExecNodeKind::LookUp(_) => {}
     }
@@ -232,7 +234,7 @@ impl ProgramInventory {
             ExecNodeKind::SetOp(node) => self.visit_inputs(&node.inputs),
             ExecNodeKind::RuntimeFilterConsumer(node) => self.visit(&node.input),
             ExecNodeKind::TableWriter(node) => self.visit(&node.input),
-            ExecNodeKind::TableFinish(node) => self.visit(&node.input),
+            ExecNodeKind::TableFinish(node) => self.visit_inputs(&node.inputs),
         }
     }
 

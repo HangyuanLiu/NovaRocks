@@ -79,10 +79,12 @@ impl OperatorFactory for TableFinishOperatorFactory {
     }
 
     fn create(&self, dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        // The builder gathers to one before this factory is pushed, so any
-        // other degree of parallelism means the plan and the pipeline disagree
-        // about who owns the complete prepared write set. Fail closed at
-        // `prepare` rather than silently aggregating a partial set per driver.
+        // The builder creates this factory's pipeline at DOP 1, converging every
+        // writer input into it first, so any other degree of parallelism means
+        // the plan and the pipeline disagree about who owns the complete
+        // prepared write set. A second driver would each see a partial set and
+        // each believe it was complete, so fail closed at `prepare` rather than
+        // silently aggregating a partial set per driver.
         let parallelism_error = (dop.max(1) != 1 || driver_id != 0).then(|| {
             format!(
                 "table finish must run at DOP 1 on a single driver, but was created with dop={dop} driver_id={driver_id}"
@@ -382,13 +384,16 @@ mod tests {
         }
     }
 
-    fn values_input() -> Box<ExecNode> {
-        Box::new(ExecNode {
+    /// One writer input. The finish node is n-ary, so tests build a `Vec`; the
+    /// operator's behaviour does not depend on how many inputs converge, only
+    /// on the rows that arrive.
+    fn values_input() -> Vec<ExecNode> {
+        vec![ExecNode {
             kind: crate::exec::node::ExecNodeKind::Values(ValuesNode {
                 chunk: Chunk::default(),
                 node_id: 1,
             }),
-        })
+        }]
     }
 
     fn finish_node(

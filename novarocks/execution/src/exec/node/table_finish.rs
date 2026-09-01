@@ -18,12 +18,17 @@
 //! The `TableFinish` plan node.
 //!
 //! `TableFinish` is a single-driver processor on one Root BE. It consumes every
-//! writer row from a gather Exchange, validates row shape and budgets, checked-
-//! sums the row count, collects canonical commit fragments by target ordinal,
-//! and emits its complete relation into the ordinary RESULT sink only after all
-//! of its input reached EOS. It performs bounded aggregation and nothing else:
-//! it holds no commit handle, decodes no fragment, and never touches external
-//! catalog metadata.
+//! writer row, validates row shape and budgets, checked-sums the row count,
+//! collects canonical commit fragments by target ordinal, and emits its
+//! complete relation into the ordinary RESULT sink only after all of its inputs
+//! reached EOS. It performs bounded aggregation and nothing else: it holds no
+//! commit handle, decodes no fragment, and never touches external catalog
+//! metadata.
+//!
+//! The node is n-ary. An exchange receiver names exactly one source fragment,
+//! so a query with several writer fragments gives the finish node one receiver
+//! per writer rather than one shared receiver. The pipeline converges them the
+//! way `UnionAll` does, straight onto a single-driver pipeline.
 
 use std::sync::Arc;
 
@@ -36,7 +41,7 @@ use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValid
 /// The bounded aggregation stage of one distributed write.
 #[derive(Clone)]
 pub struct TableFinishNode {
-    pub input: Box<ExecNode>,
+    pub inputs: Vec<ExecNode>,
     pub node_id: i32,
     expected_targets: Arc<Vec<WriteTargetOrdinal>>,
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
@@ -44,11 +49,17 @@ pub struct TableFinishNode {
 
 impl TableFinishNode {
     pub fn try_new(
-        input: Box<ExecNode>,
+        inputs: Vec<ExecNode>,
         node_id: i32,
         expected_targets: Vec<WriteTargetOrdinal>,
         fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     ) -> Result<Self, ExecPlanBuildError> {
+        if inputs.is_empty() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Node,
+                "table finish requires at least one writer input".to_string(),
+            ));
+        }
         validate_dense_target_ordinals(&expected_targets).map_err(|error| {
             ExecPlanBuildError::new(
                 ExecPlanInvariant::Node,
@@ -56,7 +67,7 @@ impl TableFinishNode {
             )
         })?;
         Ok(Self {
-            input,
+            inputs,
             node_id,
             expected_targets: Arc::new(expected_targets),
             fragment_validator,
@@ -87,6 +98,7 @@ impl std::fmt::Debug for TableFinishNode {
         formatter
             .debug_struct("TableFinishNode")
             .field("node_id", &self.node_id)
+            .field("inputs", &self.inputs.len())
             .field("expected_targets", &self.expected_targets)
             .finish_non_exhaustive()
     }
