@@ -30,6 +30,7 @@ use crate::catalog_application::query_bindings::{
     QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
     QueryWriteTargetAdmission,
 };
+use novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorWriteInputShape, ConnectorWritePreparation,
 };
@@ -57,11 +58,14 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
     captured.admission.exact_planning_lease().map_err(|_| {
         "SQL write target binding is missing its admission planning lease".to_string()
     })?;
-    let preparation = &admitted_write_target(&captured)?.preparation;
-    preparation
-        .validate()
-        .map_err(|error| format!("validate SQL write preparation: {error}"))?;
-    validate_mode(mode, preparation.input())?;
+    let admission = admitted_write_target(&captured)?;
+    if let Some(preparation) = admission.preparation.as_ref() {
+        preparation
+            .validate()
+            .map_err(|error| format!("validate SQL write preparation: {error}"))?;
+    }
+    let write_input = &admission.input;
+    validate_mode(mode, write_input)?;
     let identity =
         novarocks_sql::planning::catalog::materialization_identity_facts(&captured.resolved);
     DmlWritePlanInput::try_new(
@@ -71,8 +75,7 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
             catalog: identity.catalog().to_string(),
             namespace: identity.namespace().to_string(),
             table: identity.table().to_string(),
-            fields: preparation
-                .input()
+            fields: write_input
                 .fields()
                 .into_iter()
                 .map(|field| DmlWriteTargetField {
@@ -88,9 +91,55 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
                 })
                 .collect(),
         },
-        admitted_write_input_columns(preparation)?,
+        admitted_write_input_columns(write_input)?,
         input,
     )
+}
+
+/// Reserve a SQL write token for one logical target of the query's write
+/// session.
+///
+/// The session already admitted this target when it began: the provider signed
+/// the whole target set at once and handed back an opaque writer recipe plus the
+/// input shape SQL is allowed to project. So there is no per-target preparation
+/// to sign here, and none is invented -- the binding carries the sealed input
+/// shape and nothing else the provider owns. The exact planning lease is the
+/// same one the session was begun on, which is what keeps the generation that
+/// signed the recipe alive through planning.
+pub(crate) fn admit_session_connector_write_target(
+    bindings: &QueryTableBindingStore,
+    identity: FrozenConnectorScanIdentity,
+    target: &ConnectorWriteTargetPlan,
+    planning_lease: ConnectorControlPlanningLease,
+) -> Result<SqlTableBindingId, String> {
+    let key = QueryTableBindingKey::session_write_target(
+        identity.catalog(),
+        identity.namespace(),
+        identity.table(),
+        target.ordinal(),
+    );
+    let input = target.input().clone();
+    bindings.resolve_or_insert_with_id(key, |binding| {
+        Ok(QueryTableBinding {
+            resolved: frozen_connector_write_target_resolved_analyzer_table(
+                &identity,
+                write_input_schema(&input),
+                binding,
+            ),
+            statistics_pin: None,
+            admission: QueryTableBindingAdmission::Exact(planning_lease),
+            // A terminal write target, not a read source: see the note on the
+            // prepared path below.
+            scan_materialization: None,
+            mv_target_read: None,
+            write_target_admission: Some(QueryWriteTargetAdmission {
+                input: input.clone(),
+                preparation: None,
+            }),
+            frozen_snapshot_materializations: std::collections::BTreeMap::new(),
+            admitted_change_scans: std::collections::BTreeMap::new(),
+        })
+    })
 }
 
 /// Reserve a SQL write token for a sealed Provider preparation.  The exact
@@ -137,7 +186,8 @@ pub(crate) fn admit_prepared_connector_write_target(
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: Some(QueryWriteTargetAdmission {
-                preparation: preparation.clone(),
+                input: preparation.input().clone(),
+                preparation: Some(preparation.clone()),
             }),
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             admitted_change_scans: std::collections::BTreeMap::new(),
@@ -167,10 +217,9 @@ fn admitted_write_target(
 }
 
 fn admitted_write_input_columns(
-    preparation: &ConnectorWritePreparation,
+    input: &ConnectorWriteInputShape,
 ) -> Result<Vec<ColumnDef>, String> {
-    Ok(preparation
-        .input()
+    Ok(input
         .fields()
         .into_iter()
         .map(|field| ColumnDef {
@@ -184,9 +233,12 @@ fn admitted_write_input_columns(
 }
 
 fn admitted_write_input_schema(preparation: &ConnectorWritePreparation) -> SchemaRef {
+    write_input_schema(preparation.input())
+}
+
+fn write_input_schema(input: &ConnectorWriteInputShape) -> SchemaRef {
     Arc::new(Schema::new(
-        preparation
-            .input()
+        input
             .fields()
             .into_iter()
             .map(|field| field.field().clone())
