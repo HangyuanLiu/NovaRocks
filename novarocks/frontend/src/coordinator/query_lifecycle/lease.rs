@@ -2430,6 +2430,7 @@ impl AttemptControl {
                 let outcome = ParticipantTerminalOutcome::parse(outcome.clone())
                     .map_err(|error| error.to_string())?;
                 self.validate_terminal_outcome_session(session, &outcome)?;
+                #[cfg(debug_assertions)]
                 if let Some(scope) = claim_terminal_snapshot_conflict(session, &outcome)? {
                     let conflict = conflicting_terminal_outcome(&outcome)?;
                     eprintln!(
@@ -2632,14 +2633,6 @@ fn protocol_execution_id(execution_id: QueryExecutionId) -> Result<QueryExecutio
     Ok(execution_id)
 }
 
-#[cfg(not(debug_assertions))]
-fn claim_terminal_snapshot_conflict(
-    _session: &ActiveSession,
-    _outcome: &ParticipantTerminalOutcome,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
-    Ok(None)
-}
-
 #[cfg(debug_assertions)]
 fn conflicting_terminal_outcome(
     outcome: &ParticipantTerminalOutcome,
@@ -2664,13 +2657,6 @@ fn conflicting_terminal_outcome(
         snapshot: None,
     })
     .map_err(|error| error.to_string())
-}
-
-#[cfg(not(debug_assertions))]
-fn conflicting_terminal_outcome(
-    _outcome: &ParticipantTerminalOutcome,
-) -> Result<ParticipantTerminalOutcome, String> {
-    Err("terminal outcome conflict injection is disabled in release builds".to_string())
 }
 
 #[cfg(not(debug_assertions))]
