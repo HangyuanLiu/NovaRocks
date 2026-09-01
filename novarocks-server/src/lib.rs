@@ -19,7 +19,6 @@ pub mod app_config;
 pub mod catalog_credential_registry;
 pub mod catalog_source_config;
 pub mod composition;
-mod connector_role_binding;
 mod env_reference;
 pub mod launch;
 pub mod logging;

@@ -50,6 +50,7 @@
 
 mod codec;
 mod domain;
+mod role_binding;
 
 pub mod control;
 pub mod execution;
@@ -65,6 +66,10 @@ pub use execution::StarRocksCatalogRuntimeMaterializer;
 pub use remote_control::{
     StarRocksHttpRequest, StarRocksHttpTransport, StarRocksRemoteControlClient,
     StarRocksRemoteControlConfig, StarRocksRemoteMetadataSource,
+};
+pub use role_binding::{
+    StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory,
+    StarRocksRoleBindingResourceLookupError, StarRocksRoleBindingResources,
 };
 pub const STARROCKS_PROVIDER_ID: &str = "starrocks";
 pub const STARROCKS_CONTRACT_VERSION: u16 = 1;

@@ -3261,6 +3261,8 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "futures",
+ "novarocks-connector-binding",
  "novarocks-spi",
  "reqwest",
  "serde",

@@ -130,25 +130,58 @@ for forbidden in \
 done
 
 # Lower-layer owners must never acquire either wire crate, including through a
-# transitive normal edge.  ADR-0114 deliberately excludes Iceberg and
+# transitive normal edge. ADR-0114 deliberately excludes Iceberg and
 # Execution: Iceberg owns typed provider conversion and Execution owns the
-# typed per-attempt split queue.  The Server is also excluded because it
-# composes FE/BE and therefore has a wire-containing transitive closure by
-# design.
+# typed per-attempt split queue. StarRocks is also excluded because its
+# provider-owned role-binding factory deliberately depends on the generic
+# binding contract. Server is excluded because it composes FE/BE and therefore
+# has a wire-containing transitive closure by design.
 for lower_layer in \
   novarocks-spi \
   novarocks-types \
   novarocks-sql \
   novarocks-state-store-foundationdb \
   novarocks-state-store-mysql \
-  novarocks-state-store-sqlite \
-  novarocks-connector-starrocks; do
+  novarocks-state-store-sqlite; do
   lower_layer_wire="$tmpdir/${lower_layer}-wire.json"
   add_normal_resolve_edge "$lower_layer" novarocks-proto-models "$lower_layer_wire"
   assert_rejected "$lower_layer_wire" \
     "$lower_layer normal dependency closure contains forbidden wire packages:"
   grep -Fq "novarocks-proto-models" "$lower_layer_wire.stderr"
 done
+
+starrocks_missing_binding="$tmpdir/starrocks-missing-binding.json"
+jq '
+  (.packages[] | select(.name == "novarocks-connector-starrocks") | .dependencies) |= map(
+    select(.name != "novarocks-connector-binding")
+  )
+' "$base_metadata" >"$starrocks_missing_binding"
+assert_rejected "$starrocks_missing_binding" \
+  "novarocks-connector-starrocks must directly declare normal dependency on novarocks-connector-binding"
+
+starrocks_direct_wire="$tmpdir/starrocks-direct-wire.json"
+jq '
+  (.packages[] | select(.name == "novarocks-connector-starrocks") | .dependencies) += [{
+    name: "novarocks-proto-models", kind: null, optional: false
+  }]
+' "$base_metadata" >"$starrocks_direct_wire"
+assert_rejected "$starrocks_direct_wire" \
+  "novarocks-connector-starrocks must obtain wire packages only through novarocks-connector-binding"
+
+starrocks_optional_direct_wire="$tmpdir/starrocks-optional-direct-wire.json"
+jq '
+  (.packages[] | select(.name == "novarocks-connector-starrocks") | .dependencies) += [{
+    name: "novarocks-proto-codec", kind: null, optional: true
+  }]
+' "$base_metadata" >"$starrocks_optional_direct_wire"
+assert_rejected "$starrocks_optional_direct_wire" \
+  "novarocks-connector-starrocks must obtain wire packages only through novarocks-connector-binding"
+
+starrocks_server="$tmpdir/starrocks-server.json"
+add_normal_resolve_edge novarocks-connector-starrocks novarocks-server "$starrocks_server"
+assert_rejected "$starrocks_server" \
+  "novarocks-connector-starrocks normal dependency closure contains application owners:"
+grep -Fq "novarocks-server" "$starrocks_server.stderr"
 
 server_direct_wire="$tmpdir/server-direct-wire.json"
 jq '

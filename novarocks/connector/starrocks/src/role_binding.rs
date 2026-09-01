@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Server-owned StarRocks role-binding composition.
+//! StarRocks' complete FE and BE role-binding factories.
 //!
-//! Role-binding factories combine a provider implementation with the generic
-//! binding contract and are therefore composition-root glue. Keeping this
-//! module in Server lets the StarRocks provider remain below the native wire
-//! layer; its current execution binding deliberately publishes no capability.
+//! Server startup constructs role-local metadata sources and projects them
+//! into [`StarRocksRoleBindingResources`]. This provider-owned factory then
+//! resolves an exact durable `local_binding` reference without exposing those
+//! resources to catalog state or native wire payloads.
 
+use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
-
-use crate::app_config::StarRocksLocalBindingRegistry;
 
 use futures::future::BoxFuture;
 use novarocks_connector_binding::{
@@ -33,22 +33,86 @@ use novarocks_connector_binding::{
     ConnectorMaterializationErrorClass, ConnectorMaterializationRetryDisposition,
     MaterializationContext, NormalizedCatalogProperties,
 };
-use novarocks_connector_starrocks::{
-    STARROCKS_PROVIDER_ID, StarRocksConnectorConfig, StarRocksControlGeneration,
-    StarRocksLocalBindingRef,
-};
 use novarocks_spi::connector::{CatalogProperties, CatalogProviderKind};
 
-/// FE-only StarRocks control factory. Metadata I/O stays behind the returned
-/// control generation and uses each metadata request's existing context.
+use crate::{
+    STARROCKS_PROVIDER_ID, StarRocksConnectorConfig, StarRocksControlGeneration,
+    StarRocksLocalBindingRef, StarRocksMetadataSource,
+};
+
+/// Immutable FE-local resources indexed by the exact local-binding identity.
+///
+/// The resource object intentionally contains only provider-defined metadata
+/// sources. Server configuration, endpoints, and credentials are consumed
+/// before this object is constructed and cannot cross this API boundary.
+#[derive(Clone)]
+pub struct StarRocksRoleBindingResources {
+    metadata_sources: BTreeMap<StarRocksLocalBindingRef, Arc<dyn StarRocksMetadataSource>>,
+}
+
+impl StarRocksRoleBindingResources {
+    pub fn new(
+        metadata_sources: BTreeMap<StarRocksLocalBindingRef, Arc<dyn StarRocksMetadataSource>>,
+    ) -> Self {
+        Self { metadata_sources }
+    }
+
+    /// Resolves one exact FE-local metadata source without remote I/O or fallback.
+    pub fn resolve(
+        &self,
+        local_binding: &StarRocksLocalBindingRef,
+    ) -> Result<Arc<dyn StarRocksMetadataSource>, StarRocksRoleBindingResourceLookupError> {
+        self.metadata_sources
+            .get(local_binding)
+            .cloned()
+            .ok_or_else(|| StarRocksRoleBindingResourceLookupError::NotFound(local_binding.clone()))
+    }
+}
+
+impl fmt::Debug for StarRocksRoleBindingResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StarRocksRoleBindingResources")
+            .field(
+                "local_bindings",
+                &self.metadata_sources.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// A stable local-resource lookup failure that contains no endpoint or credential.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StarRocksRoleBindingResourceLookupError {
+    NotFound(StarRocksLocalBindingRef),
+}
+
+impl fmt::Display for StarRocksRoleBindingResourceLookupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound(local_binding) => write!(
+                formatter,
+                "StarRocks local binding `{}` is not configured on this frontend",
+                local_binding.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StarRocksRoleBindingResourceLookupError {}
+
+/// FE-only StarRocks control factory.
+///
+/// Metadata I/O stays behind the returned control generation and uses each
+/// metadata request's existing context.
 #[derive(Clone)]
 pub struct StarRocksControlRoleBindingFactory {
-    local_bindings: StarRocksLocalBindingRegistry,
+    resources: StarRocksRoleBindingResources,
 }
 
 impl StarRocksControlRoleBindingFactory {
-    pub(crate) fn new(local_bindings: StarRocksLocalBindingRegistry) -> Self {
-        Self { local_bindings }
+    pub fn new(resources: StarRocksRoleBindingResources) -> Self {
+        Self { resources }
     }
 }
 
@@ -72,13 +136,13 @@ impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {
         context: MaterializationContext,
     ) -> BoxFuture<'static, Result<ConnectorControlRoleBinding, ConnectorMaterializationError>>
     {
-        let local_bindings = self.local_bindings.clone();
+        let resources = self.resources.clone();
         Box::pin(async move {
             context.check_active()?;
             let catalog_properties = properties.as_catalog_properties().clone();
             ensure_starrocks(&catalog_properties)?;
             let local_binding = starrocks_local_binding(&catalog_properties)?;
-            let metadata = local_bindings.resolve(&local_binding).map_err(|error| {
+            let metadata = resources.resolve(&local_binding).map_err(|error| {
                 ConnectorMaterializationError::new(
                     ConnectorMaterializationErrorClass::InvalidDefinition,
                     ConnectorMaterializationRetryDisposition::UntilDefinitionChanges,
@@ -178,8 +242,8 @@ mod tests {
 
     use super::*;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorRequestContext,
+        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorCancellation, ConnectorError,
+        ConnectorInstanceId, ConnectorRequestContext,
     };
 
     struct NeverCancelled;
@@ -187,6 +251,44 @@ mod tests {
     impl ConnectorCancellation for NeverCancelled {
         fn is_cancelled(&self) -> bool {
             false
+        }
+    }
+
+    struct MetadataMustNotRun;
+
+    impl StarRocksMetadataSource for MetadataMustNotRun {
+        fn namespace_exists(
+            &self,
+            _namespace: &str,
+            _context: &ConnectorRequestContext,
+        ) -> Result<bool, ConnectorError> {
+            panic!("control materialization must not execute metadata I/O")
+        }
+
+        fn table_exists(
+            &self,
+            _namespace: &str,
+            _table: &str,
+            _context: &ConnectorRequestContext,
+        ) -> Result<bool, ConnectorError> {
+            panic!("control materialization must not execute metadata I/O")
+        }
+
+        fn list_tables(
+            &self,
+            _namespace: &str,
+            _context: &ConnectorRequestContext,
+        ) -> Result<Vec<String>, ConnectorError> {
+            panic!("control materialization must not execute metadata I/O")
+        }
+
+        fn load_table(
+            &self,
+            _namespace: &str,
+            _table: &str,
+            _context: &ConnectorRequestContext,
+        ) -> Result<crate::StarRocksResolvedTable, ConnectorError> {
+            panic!("control materialization must not execute metadata I/O")
         }
     }
 
@@ -205,6 +307,14 @@ mod tests {
         kind: CatalogProviderKind,
         local_binding: Option<&str>,
     ) -> CatalogProperties {
+        properties_with_local_bindings(instance_id, kind, local_binding.into_iter().collect())
+    }
+
+    fn properties_with_local_bindings(
+        instance_id: &str,
+        kind: CatalogProviderKind,
+        local_bindings: Vec<&str>,
+    ) -> CatalogProperties {
         CatalogProperties::new(
             CatalogHandle::new(
                 ConnectorInstanceId::parse(instance_id).expect("catalog"),
@@ -212,40 +322,26 @@ mod tests {
             ),
             kind,
             1,
-            local_binding
-                .map(|value| vec![CatalogProperty::new("local_binding", value).expect("property")])
-                .unwrap_or_default(),
+            local_bindings
+                .into_iter()
+                .map(|value| CatalogProperty::new("local_binding", value).expect("property"))
+                .collect(),
             Vec::new(),
         )
         .expect("catalog properties")
     }
 
     fn control_factory() -> StarRocksControlRoleBindingFactory {
-        let config: crate::app_config::NovaRocksConfig = toml::from_str(
-            r#"
-[[connector.starrocks.local_bindings]]
-local_binding = "metadata-blue"
-endpoints = ["http://127.0.0.1:9"]
-username = "admin"
-password = "test-password"
-request_timeout_ms = 1000
-retry_count = 0
-
-[[connector.starrocks.local_bindings]]
-local_binding = "metadata-green"
-endpoints = ["http://127.0.0.1:10"]
-username = "admin"
-password = "test-password"
-request_timeout_ms = 1000
-retry_count = 0
-"#,
-        )
-        .expect("parse local binding config");
-        let registry = config
-            .connector
-            .starrocks_local_binding_registry(novarocks_types::ClusterRole::Fe)
-            .expect("construct local registry without metadata I/O");
-        StarRocksControlRoleBindingFactory::new(registry)
+        let sources = ["metadata-blue", "metadata-green"]
+            .into_iter()
+            .map(|name| {
+                (
+                    StarRocksLocalBindingRef::parse(name).expect("local binding"),
+                    Arc::new(MetadataMustNotRun) as Arc<dyn StarRocksMetadataSource>,
+                )
+            })
+            .collect();
+        StarRocksControlRoleBindingFactory::new(StarRocksRoleBindingResources::new(sources))
     }
 
     #[test]
@@ -358,6 +454,43 @@ retry_count = 0
             error
                 .to_string()
                 .contains("StarRocks local binding `missing` is not configured")
+        );
+    }
+
+    #[test]
+    fn control_normalization_rejects_invalid_local_bindings_and_catalog_properties_reject_duplicates()
+     {
+        let factory = control_factory();
+        let invalid = factory
+            .normalize_and_validate(properties_with_local_bindings(
+                "catalog.starrocks",
+                CatalogProviderKind::StarRocks,
+                vec!["not-ascii-\u{4e2d}"],
+            ))
+            .expect_err("invalid local binding definition must fail closed");
+        assert_eq!(
+            invalid.disposition(),
+            ConnectorMaterializationRetryDisposition::UntilDefinitionChanges
+        );
+
+        let duplicate = CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("catalog.starrocks").expect("catalog"),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            CatalogProviderKind::StarRocks,
+            1,
+            vec![
+                CatalogProperty::new("local_binding", "metadata-blue").expect("property"),
+                CatalogProperty::new("local_binding", "metadata-green").expect("property"),
+            ],
+            Vec::new(),
+        )
+        .expect_err("duplicate local_binding must not enter a catalog definition");
+        assert!(
+            duplicate
+                .to_string()
+                .contains("duplicate catalog property key")
         );
     }
 

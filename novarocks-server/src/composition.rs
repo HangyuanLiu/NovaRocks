@@ -19,9 +19,6 @@ use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
-use crate::connector_role_binding::{
-    StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory,
-};
 use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
@@ -38,6 +35,9 @@ use novarocks_connector_iceberg::storage_inspector::{
 };
 use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
+};
+use novarocks_connector_starrocks::{
+    StarRocksControlRoleBindingFactory, StarRocksExecutionRoleBindingFactory,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -721,12 +721,13 @@ pub fn compose_frontend_control_role_factories(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Vec<std::sync::Arc<dyn ConnectorControlRoleBindingFactory>>> {
-    // Design: ADR-0131 (docs/adr/ADR-0131-server-composes-provider-role-bindings.md)
-    // Server owns FE-local resource construction; catalog definitions retain only
-    // an exact local-binding reference and never contain endpoints or credentials.
-    let starrocks_local_bindings = config
+    // Design: ADR-0132 (docs/adr/ADR-0132-provider-owned-role-binding-factories.md)
+    // Server owns FE-local resource construction; the StarRocks provider owns
+    // the role-binding factory and catalog definitions retain only an exact
+    // local-binding reference, never endpoints or credentials.
+    let starrocks_resources = config
         .connector
-        .starrocks_local_binding_registry(ClusterRole::Fe)
+        .starrocks_role_binding_resources(ClusterRole::Fe)
         .map_err(|error| anyhow::anyhow!("construct StarRocks FE-local bindings: {error}"))?;
     let iceberg_binding =
         compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Fe)?;
@@ -737,9 +738,7 @@ pub fn compose_frontend_control_role_factories(
                 || anyhow::anyhow!("catalog materialization max inflight must be nonzero"),
             )?,
         )),
-        std::sync::Arc::new(StarRocksControlRoleBindingFactory::new(
-            starrocks_local_bindings,
-        )),
+        std::sync::Arc::new(StarRocksControlRoleBindingFactory::new(starrocks_resources)),
     ])
 }
 

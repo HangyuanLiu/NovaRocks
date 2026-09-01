@@ -26,7 +26,13 @@ trap 'rm -rf "$tmpdir"' EXIT
 metadata="$tmpdir/metadata.json"
 source_root="$tmpdir/source"
 mkdir -p "$source_root/novarocks/frontend/src/connector" \
-  "$source_root/novarocks/backend/src/connector"
+  "$source_root/novarocks/backend/src/connector" \
+  "$source_root/novarocks/connector/starrocks/src" \
+  "$source_root/novarocks-server/src"
+cat >"$source_root/novarocks/connector/starrocks/src/role_binding.rs" <<'EOF'
+impl ConnectorControlRoleBindingFactory for StarRocksControlRoleBindingFactory {}
+impl ConnectorExecutionRoleBindingFactory for StarRocksExecutionRoleBindingFactory {}
+EOF
 cargo metadata --manifest-path "$REPO_ROOT/Cargo.toml" --format-version 1 >"$metadata"
 
 "$CHECKER" --metadata-path "$metadata" --source-root "$source_root"
@@ -67,5 +73,14 @@ if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
   exit 1
 fi
 grep -Fq "legacy parallel registry must be removed" "$tmpdir/source.stderr"
+
+touch "$source_root/novarocks-server/src/connector_role_binding.rs"
+if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
+  >"$tmpdir/server.stdout" 2>"$tmpdir/server.stderr"; then
+  echo "Server StarRocks factory adapter mutation was accepted" >&2
+  exit 1
+fi
+grep -Fq "Server must not define a parallel StarRocks role-binding factory adapter" \
+  "$tmpdir/server.stderr"
 
 echo "connector-role-binding-boundary-test: PASS"

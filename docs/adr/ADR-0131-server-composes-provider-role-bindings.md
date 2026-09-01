@@ -2,9 +2,9 @@
 id: ADR-0131
 title: "Server composes provider role bindings from role-local resources"
 domain: [provider-spi, runtime-role]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0132
 date: 2026-09-01
 provenance:
   - "discussion: 2026-09-01 StarRocks connector role-binding convergence"

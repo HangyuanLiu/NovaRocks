@@ -29,13 +29,12 @@ use crate::env_reference::resolve_env_references;
 pub(crate) mod starrocks_binding_registry;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
-use novarocks_connector_starrocks::StarRocksLocalBindingRef;
+use novarocks_connector_starrocks::{StarRocksLocalBindingRef, StarRocksRoleBindingResources};
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
 use novarocks_state_store_sqlite::SqliteHistoryRetentionConfig;
 use novarocks_types::{ClusterRole, NativeEndpoint};
-pub(crate) use starrocks_binding_registry::StarRocksLocalBindingRegistry;
 
 pub use crate::memory_limit::DEFAULT_MEM_LIMIT_SPEC;
 
@@ -1002,21 +1001,24 @@ impl ConnectorConfig {
         CatalogCredentialRegistry::try_new(role, self.credentials.clone())
     }
 
-    /// Builds the FE-only immutable StarRocks local-resource registry. This
-    /// creates HTTP clients but deliberately performs no remote metadata I/O.
-    pub(crate) fn starrocks_local_binding_registry(
+    /// Projects FE-local Server configuration into provider-owned immutable
+    /// StarRocks role-binding resources. This creates HTTP clients but
+    /// deliberately performs no remote metadata I/O.
+    pub(crate) fn starrocks_role_binding_resources(
         &self,
         role: ClusterRole,
-    ) -> std::result::Result<StarRocksLocalBindingRegistry, String> {
+    ) -> std::result::Result<StarRocksRoleBindingResources, String> {
         if role != ClusterRole::Fe && !self.starrocks_local_bindings.is_empty() {
             return Err("role Be must not configure StarRocks FE-local bindings".to_string());
         }
-        StarRocksLocalBindingRegistry::try_new(self.starrocks_local_bindings.clone())
+        starrocks_binding_registry::project_starrocks_role_binding_resources(
+            self.starrocks_local_bindings.clone(),
+        )
     }
 
     fn validate_for_role(&self, role: ClusterRole) -> std::result::Result<(), String> {
         self.credential_registry(role)?;
-        self.starrocks_local_binding_registry(role).map(|_| ())
+        self.starrocks_role_binding_resources(role).map(|_| ())
     }
 }
 
@@ -2418,7 +2420,7 @@ retry_count = 2
     }
 
     #[test]
-    fn starrocks_local_binding_registry_is_exact_shared_and_does_not_probe_remote() {
+    fn starrocks_role_binding_resources_are_exact_shared_and_do_not_probe_remote() {
         let document = starrocks_binding_document(&format!(
             "{}{}",
             one_starrocks_binding("prod-blue"),
@@ -2427,7 +2429,7 @@ retry_count = 2
         let config: NovaRocksConfig = toml::from_str(&document).expect("parse StarRocks config");
         let registry = config
             .connector
-            .starrocks_local_binding_registry(ClusterRole::Fe)
+            .starrocks_role_binding_resources(ClusterRole::Fe)
             .expect("construct registry without remote I/O");
 
         let blue = StarRocksLocalBindingRef::parse("prod-blue").expect("blue ref");
@@ -2436,7 +2438,6 @@ retry_count = 2
         let blue_second = registry.resolve(&blue).expect("resolve shared blue");
         let green_source = registry.resolve(&green).expect("resolve green");
 
-        assert_eq!(registry.len(), 2);
         assert!(Arc::ptr_eq(&blue_first, &blue_second));
         assert!(!Arc::ptr_eq(&blue_first, &green_source));
         let unknown = StarRocksLocalBindingRef::parse("unknown").expect("unknown ref");
@@ -2461,7 +2462,7 @@ retry_count = 2
         assert!(
             duplicate
                 .connector
-                .starrocks_local_binding_registry(ClusterRole::Fe)
+                .starrocks_role_binding_resources(ClusterRole::Fe)
                 .expect_err("duplicate local binding must fail")
                 .contains("duplicate StarRocks local binding")
         );
@@ -2484,7 +2485,7 @@ retry_count = 2
                 .expect("parse invalid binding shape");
             let error = config
                 .connector
-                .starrocks_local_binding_registry(ClusterRole::Fe)
+                .starrocks_role_binding_resources(ClusterRole::Fe)
                 .expect_err("invalid local resource must fail startup validation");
             assert!(error.contains(expected), "{name}: {error}");
         }
@@ -2556,7 +2557,7 @@ frontend_endpoint = "127.0.0.1:9070"
         let be: NovaRocksConfig = toml::from_str(&be_document).expect("parse BE config");
         assert_eq!(
             be.connector
-                .starrocks_local_binding_registry(ClusterRole::Be)
+                .starrocks_role_binding_resources(ClusterRole::Be)
                 .expect_err("BE must not consume FE resource"),
             "role Be must not configure StarRocks FE-local bindings"
         );
@@ -2596,7 +2597,7 @@ retry_count = 2
         let config: NovaRocksConfig = document.try_into().expect("deserialize config");
         let registry = config
             .connector
-            .starrocks_local_binding_registry(ClusterRole::Fe)
+            .starrocks_role_binding_resources(ClusterRole::Fe)
             .expect("construct redacted registry");
 
         let canary = "ncp-2r4f-secret-canary";
@@ -2624,7 +2625,7 @@ retry_count = 2
             toml::from_str(&invalid_endpoint).expect("parse invalid endpoint config");
         let error = invalid_endpoint
             .connector
-            .starrocks_local_binding_registry(ClusterRole::Fe)
+            .starrocks_role_binding_resources(ClusterRole::Fe)
             .expect_err("credential-bearing endpoint is invalid");
         assert!(!error.contains(canary));
     }

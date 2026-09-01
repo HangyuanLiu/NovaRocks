@@ -111,7 +111,7 @@ code-anchors:
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（active）
 - ADR-0129 — vended credential 为何必须在 metadata materialization 前按 attempt 收集（active）
 - ADR-0130 — Connector role binding 为何每个进程角色只发布一个 complete generation（active）
-- ADR-0131 — Server 为何从 role-local resource 组装 provider binding（active）
+- ADR-0132 — provider 为何拥有 role-binding factory、而 Server 只组装 role-local resource（active）
 - ADR-0125 — Backend catalog runtime、Frontend effect owner 与 provider-private proof 为何使用三种不互换 identity（active）
 - ADR-0049 — row mutation 的 strategy、identity、route 与 cohort 为何由 Provider 签发并拥有（active）
 - ADR-0051 — distributed write 为何在 preparation 与 planning 之间强制 exact-generation Provider activation（active）
@@ -151,6 +151,7 @@ code-anchors:
 - ADR-0113 — Native wire 为何删除消息自证 digest、只保留跨消息引用与格式边界 fence（superseded → ADR-0126）
 - ADR-0126 — Terminal delivery 为何以 participant attempt identity 而非 payload content identity 定位（superseded → ADR-0127）
 - ADR-0127 — participant attempt identity 如何围栏 immutable Stage admission（superseded → ADR-0128）
+- ADR-0131 — Server 为何从 role-local resource 组装 provider binding（superseded → ADR-0132）
 ### distributed-query-lifecycle
 
 领域哲学：FE coordinator 拥有全局编排，BE query lifecycle 拥有本地执行与资源；两者是独立进程、故障域与状态机，
