@@ -88,6 +88,7 @@ pub mod statistics;
 pub(crate) mod terminal_codec;
 pub mod terminal_set;
 pub mod write;
+pub(crate) mod write_barrier;
 pub mod write_operation;
 pub mod write_plan;
 pub(crate) mod write_result;
