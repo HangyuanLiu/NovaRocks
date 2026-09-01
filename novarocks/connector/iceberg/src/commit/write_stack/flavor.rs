@@ -37,11 +37,12 @@
 //!   so neither comes back.
 //! * `DistributedRewrite` seals one data branch per frozen rewrite group.
 
+use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
 use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationRouteInput, ConnectorRowMutationEffect,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteRouteId,
+    ConnectorError, ConnectorErrorKind, ConnectorManagedPublicationTechnique,
+    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteRouteId,
 };
 use sha2::{Digest, Sha256};
 
@@ -177,27 +178,64 @@ pub(crate) const fn ordinary_delete_branch(
 
 /// Plan a managed publication's branches.
 ///
-/// A publication republishes rows, so it seals exactly one data branch. The
-/// technique and the empty-input disposition travel with the session rather
-/// than with a branch: they decide the single external commit op and what an
-/// empty write means, and no writer needs either.
+/// The declared shape decides the structure, and only the structure. Both
+/// shapes seal the *same* session: the technique, the empty-input disposition
+/// and the durable provenance travel with it either way, because they decide
+/// the single external commit and what an empty write means, and no writer
+/// needs any of them.
+///
+/// * `Data` republishes rows wholesale, so it seals exactly one unrouted data
+///   branch.
+/// * `RowMutation` applies a change stream, so it seals the branches a row
+///   mutation needs and SQL routes change events to them. Its branch structure
+///   is planned by the same code an ordinary DML row mutation goes through --
+///   a publication's change stream is not a second kind of row mutation, it is
+///   the same one committed under a publication.
 pub(crate) fn plan_managed_publication_branches(
     material: &IcebergSessionMaterial,
     publication: IcebergManagedPublicationFacts,
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
-    if ordinary_delete_branch(&material.input).is_some() {
-        return Err(unsupported(
-            "Iceberg managed publication publishes data files, not a row-level delete input",
-        ));
-    }
+    let branches = match publication.shape() {
+        ConnectorManagedPublicationShape::Data => {
+            if ordinary_delete_branch(&material.input).is_some() {
+                return Err(unsupported(
+                    "Iceberg managed publication publishes data files, not a row-level delete input",
+                ));
+            }
+            vec![IcebergWriteBranchPlan::Data {
+                plan: material.data_plan(material.input.clone()),
+                route: None,
+            }]
+        }
+        ConnectorManagedPublicationShape::RowMutation => {
+            // A full refresh replaces every live row, so nothing it publishes
+            // has a prior version for a change event to supersede. Applying a
+            // change stream to it would stage deletes against an image the same
+            // commit is about to discard.
+            if publication.technique() != ConnectorManagedPublicationTechnique::Incremental {
+                return Err(unsupported(
+                    "Iceberg full-refresh publication republishes rows and does not apply a change stream",
+                ));
+            }
+            let mutation = plan_row_mutation_branches(material)?;
+            // Copy-on-write rewrites whole data files, and a publication has no
+            // rewrite set to commit one with. Left admitted it would not fail
+            // closed: a copy-on-write session seals only a data branch, so the
+            // publication's commit op would resolve to a plain append and
+            // publish every after-image while the before-images stayed live.
+            if mutation.flavor == IcebergWriteFlavor::RowMutationCopyOnWrite {
+                return Err(unsupported(
+                    "Iceberg publication change stream requires a `_file`/`_pos` row identity; a copy-on-write refresh is not supported",
+                ));
+            }
+            mutation.branches
+        }
+    };
     Ok(IcebergSessionFlavorPlan {
         flavor: IcebergWriteFlavor::ManagedPublication,
         publication: Some(publication),
         rewrite_inputs: Vec::new(),
-        branches: vec![IcebergWriteBranchPlan::Data {
-            plan: material.data_plan(material.input.clone()),
-            route: None,
-        }],
+        branches,
     })
 }
 
@@ -375,6 +413,30 @@ fn plan_merge_on_read_branches(
         data_fields.iter(),
         &[],
     )?;
+    // Every change event that touches one old data file has to reach one
+    // physical delete writer: Iceberg permits a single deletion vector per data
+    // file, and two writers each staging one for the same file is refused as a
+    // corrupt prepared set. Declaring no partition field made that true the
+    // blunt way -- one writer for the whole branch -- so a merge-on-read
+    // mutation over a partitioned table gathered every delete onto one driver.
+    //
+    // `_file` is the exclusivity key itself: it names the very file the deletion
+    // vector supersedes, so hashing by it puts every row of a file on one writer
+    // and spreads distinct files across all of them. Legacy hashed by the
+    // *before-image* partition columns and relied on "a data file lives in
+    // exactly one partition" to get the same guarantee -- this is that guarantee
+    // without the indirection, and finer grained. It is also the only key
+    // available: the signed row-lineage input carries after-image data columns
+    // and the row identity, and no before-image partition column at all, so
+    // hashing by partition here would route two rows of one file to two writers
+    // whenever an update moves a row across partitions.
+    let file_identity = row_identity_fields
+        .iter()
+        .find(|field| field.field().name().eq_ignore_ascii_case(ICEBERG_FILE_COL))
+        .cloned()
+        .ok_or_else(|| {
+            invalid("Iceberg merge-on-read row identity is missing its `_file` column")
+        })?;
     let delete_route = route_facts(
         &material.table,
         RouteKey::new(flavor, IcebergWriteBranch::DeletionVector, 1),
@@ -384,7 +446,7 @@ fn plan_merge_on_read_branches(
         ],
         ordinals,
         row_identity_fields.iter(),
-        &[],
+        std::slice::from_ref(&file_identity),
     )?;
     Ok(IcebergSessionFlavorPlan {
         flavor,

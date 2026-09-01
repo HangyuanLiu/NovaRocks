@@ -86,9 +86,19 @@ pub enum ConnectorWriteSessionFlavor {
     /// vends, and it names no publication, operation, or attempt.
     StagedCreate(ConnectorTableHandle),
     /// A durable publication whose identity belongs to the upper layer that
-    /// owns it. The provider needs only the technique and what an empty input
-    /// means; the publication id never reaches a writer recipe or a fragment.
-    ManagedPublication(ConnectorManagedPublicationIntent),
+    /// owns it. The publication id never reaches a writer recipe, a commit
+    /// fragment, or a backend -- but it does reach the snapshot the commit
+    /// writes, because the publication fence reads it back off that summary.
+    ///
+    /// `shape` is declared by the caller and cannot be inferred: an incremental
+    /// merge-on-read refresh arrives as a `RowLineage` input with `_file` /
+    /// `_pos` identity, which is indistinguishable from an ordinary DML row
+    /// mutation by input alone -- and the difference decides whether the commit
+    /// is a publication or DML.
+    ManagedPublication {
+        intent: ConnectorManagedPublicationIntent,
+        shape: ConnectorManagedPublicationShape,
+    },
     /// A row mutation. The provider decides how many branches the mutation
     /// needs and what each accepts; SQL routes rows to them.
     RowMutation,
@@ -100,6 +110,21 @@ pub enum ConnectorWriteSessionFlavor {
     /// against ordinary DML it does not conflict with, and a DML write that
     /// skipped it would lose the fence's protection.
     DistributedRewrite,
+}
+
+/// How a publication's rows reach it.
+///
+/// This is the branch structure the publication commits, not a tuning knob: a
+/// `Data` publication seals one unrouted data branch, while a `RowMutation`
+/// publication seals the branches a row mutation needs and must freeze the old
+/// delete artifacts those branches supersede.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorManagedPublicationShape {
+    /// The publication replaces rows wholesale; SQL sends data rows.
+    Data,
+    /// The publication applies a change stream; SQL routes change events to the
+    /// branches the provider seals.
+    RowMutation,
 }
 
 /// One logical write target and its immutable recipe.

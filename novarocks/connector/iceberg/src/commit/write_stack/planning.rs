@@ -276,7 +276,10 @@ pub fn plan_branch_session(
             input.flavor.as_str()
         )));
     }
-    let allowed = input.flavor.branches();
+    let allowed = crate::commit::write_stack::domain::allowed_session_branches(
+        input.flavor,
+        input.publication.as_ref(),
+    );
     for plan in &input.branches {
         if !allowed.contains(&plan.branch()) {
             return Err(invalid(format!(

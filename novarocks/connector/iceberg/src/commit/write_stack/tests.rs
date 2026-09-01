@@ -36,7 +36,8 @@ use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteRouteFacts, ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
-    ConnectorPreparedWriteSet, WriteRuntimeAdapter, WriteTargetOrdinal,
+    ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteRuntimeAdapter,
+    WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
@@ -52,8 +53,8 @@ use parquet::arrow::ArrowWriter;
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    release_session_state, session_plan_from_targets, settle_empty_write_without_commit,
-    validate_prepared_set,
+    release_session_state, session_freezes_old_deletes, session_plan_from_targets,
+    settle_empty_write_without_commit, validate_prepared_set,
 };
 use crate::commit::write_stack::domain::{
     IcebergCommitFragment, IcebergCommitHandle, IcebergDataFileArtifact, IcebergEmptyWriteDecision,
@@ -75,8 +76,8 @@ use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRunti
 use crate::commit::write_stack::test_support::{
     binding, copy_on_write_input_shape, data_branch_plan, data_input_shape, delete_branch_plan,
     delete_input_shape, dv_artifact, merge_on_read_input_shape, merge_target, parquet_ref,
-    publication_facts, publication_id, sample_metrics, sample_partition, session_material,
-    table_facts,
+    publication_facts, publication_facts_with_shape, publication_flavor, publication_id,
+    sample_metrics, sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
@@ -1427,6 +1428,213 @@ fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_curr
         handle.table().default_partition_spec_id(),
         session_table.default_partition_spec_id(),
         "the session compares and swaps against the generation the table holds"
+    );
+}
+
+#[test]
+fn a_change_stream_publication_seals_the_branches_a_row_mutation_needs() {
+    // An incremental refresh applies a change stream, so SQL needs branches to
+    // route Delete/Replace/Insert to. Sealing the one unrouted data branch a
+    // wholesale republication seals left it nowhere to send a delete, and the
+    // refresh could only ever append.
+    let adapter = adapter("publication_mutation", 7);
+    let plan = plan_managed_publication_branches(
+        &session_material(merge_on_read_input_shape()),
+        publication_facts_with_shape(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ConnectorManagedPublicationShape::RowMutation,
+        ),
+    )
+    .expect("plan a change-stream publication");
+    // It stays one publication: the commit is still decided by the publication
+    // facts, not by a second row-mutation flavor.
+    assert_eq!(plan.flavor, IcebergWriteFlavor::ManagedPublication);
+    assert!(plan.publication.is_some());
+
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
+    assert_eq!(handle.branch_of(ordinal(0)), Some(IcebergWriteBranch::Data));
+    assert_eq!(
+        handle.branch_of(ordinal(1)),
+        Some(IcebergWriteBranch::DeletionVector)
+    );
+
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(
+        effects(&sealed.targets()[0]),
+        vec![
+            ConnectorRowMutationEffect::Replace,
+            ConnectorRowMutationEffect::Insert
+        ]
+    );
+    assert_eq!(
+        effects(&sealed.targets()[1]),
+        vec![
+            ConnectorRowMutationEffect::Delete,
+            ConnectorRowMutationEffect::Replace
+        ]
+    );
+}
+
+#[test]
+fn a_change_stream_publication_commits_as_a_delta_not_an_append() {
+    // The technique alone stopped being enough once a publication could apply a
+    // change stream. An incremental refresh that seals a delete branch publishes
+    // a delta; committing it as a plain append would add every after-image while
+    // dropping the deletion vector that retires the before-image, leaving both
+    // versions of the row live.
+    let (delta, _) = flavor_session(
+        plan_managed_publication_branches(
+            &session_material(merge_on_read_input_shape()),
+            publication_facts_with_shape(
+                ConnectorManagedPublicationTechnique::Incremental,
+                ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                ConnectorManagedPublicationShape::RowMutation,
+            ),
+        )
+        .expect("plan a change-stream publication"),
+    );
+    assert_eq!(delta.commit_op_kind(), CommitOpKind::RowDeltaDvFromFiles);
+    // It is the same op an ordinary DML merge-on-read mutation commits under --
+    // the delta form follows the artifact the delete branch writes, and the
+    // mapping is stated once.
+    assert_eq!(
+        delta.commit_op_kind(),
+        IcebergWriteFlavor::RowMutationDeletionVector.commit_op_kind()
+    );
+
+    // A publication that only republishes rows keeps the technique's own op.
+    for (technique, shape, op_kind) in [
+        (
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::Data,
+            CommitOpKind::FastAppend,
+        ),
+        (
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationShape::Data,
+            CommitOpKind::Overwrite,
+        ),
+    ] {
+        let (handle, _) = flavor_session(
+            plan_managed_publication_branches(
+                &session_material(data_input_shape()),
+                publication_facts_with_shape(
+                    technique,
+                    ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+                    shape,
+                ),
+            )
+            .expect("plan a data publication"),
+        );
+        assert_eq!(handle.commit_op_kind(), op_kind);
+    }
+}
+
+#[test]
+fn a_full_refresh_cannot_apply_a_change_stream() {
+    // A full refresh replaces every live row, so nothing it publishes has a
+    // prior version for a change event to supersede.
+    let error = plan_managed_publication_branches(
+        &session_material(merge_on_read_input_shape()),
+        publication_facts_with_shape(
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ConnectorManagedPublicationShape::RowMutation,
+        ),
+    )
+    .expect_err("a full refresh does not apply a change stream");
+    assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+    assert!(
+        error.message().contains("does not apply a change stream"),
+        "unexpected message: {}",
+        error.message()
+    );
+
+    // A copy-on-write change stream is refused for a sharper reason: it seals
+    // only a data branch, so its publication would resolve to a plain append and
+    // publish every after-image while the before-images stayed live.
+    let error = plan_managed_publication_branches(
+        &session_material(copy_on_write_input_shape()),
+        publication_facts_with_shape(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+            ConnectorManagedPublicationShape::RowMutation,
+        ),
+    )
+    .expect_err("a copy-on-write refresh is not supported");
+    assert!(
+        error
+            .message()
+            .contains("copy-on-write refresh is not supported"),
+        "unexpected message: {}",
+        error.message()
+    );
+}
+
+#[test]
+fn a_change_stream_publication_freezes_the_old_deletes_it_supersedes() {
+    // A merge-on-read refresh stages a deletion vector that must account for
+    // every delete artifact already attached to the data file it touches. The
+    // session freezes those references at admission, and a publication that
+    // skipped the freeze would stage an artifact that silently dropped them.
+    let signed = merge_on_read_input_shape();
+    assert!(session_freezes_old_deletes(
+        &publication_flavor(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+        ),
+        &signed,
+    ));
+    // A wholesale republication seals no delete branch, so it has nothing to
+    // supersede and must not pay for the read.
+    assert!(!session_freezes_old_deletes(
+        &publication_flavor(
+            ConnectorManagedPublicationTechnique::Full,
+            ConnectorManagedPublicationShape::Data,
+        ),
+        &data_input_shape(),
+    ));
+    assert!(!session_freezes_old_deletes(
+        &publication_flavor(
+            ConnectorManagedPublicationTechnique::Incremental,
+            ConnectorManagedPublicationShape::RowMutation,
+        ),
+        &data_input_shape(),
+    ));
+}
+
+#[test]
+fn a_merge_on_read_delete_branch_partitions_by_the_data_file_it_supersedes() {
+    // Iceberg permits one deletion vector per data file, and the prepared set
+    // refuses a second, so every change event touching one old file has to reach
+    // one physical delete writer. Declaring no partition field made that true by
+    // gathering the whole branch onto a single writer -- correct, and serial.
+    //
+    // `_file` is the exclusivity key itself, so hashing by it keeps the
+    // guarantee and spreads distinct files across writers.
+    let adapter = adapter("mor_partitioning", 8);
+    let input = merge_on_read_input_shape();
+    let plan =
+        plan_row_mutation_branches(&session_material(input.clone())).expect("plan a mutation");
+    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+
+    let file_token = input
+        .fields()
+        .into_iter()
+        .find(|field| field.field().name() == "_file")
+        .expect("the row identity carries `_file`")
+        .token();
+    let delete_route = sealed.targets()[1].route().expect("routed");
+    assert_eq!(delete_route.partition_fields(), &[file_token]);
+    // SQL resolves a partition token through the route's own input ordinals, so
+    // a token the branch does not consume would fail to bind.
+    assert!(
+        delete_route
+            .input_ordinals()
+            .iter()
+            .any(|binding| binding.token() == file_token)
     );
 }
 

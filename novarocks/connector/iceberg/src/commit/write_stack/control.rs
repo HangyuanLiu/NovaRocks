@@ -45,7 +45,9 @@ use novarocks_spi::connector::write_stack::session::{
     ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
     ConnectorWriteTargetPlan,
 };
-use novarocks_spi::connector::write_stack::{ConnectorPreparedWriteSet, WriteTargetOrdinal};
+use novarocks_spi::connector::write_stack::{
+    ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteTargetOrdinal,
+};
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedPublicationIntent, ConnectorMutationFailure, ConnectorMutationFailureKind,
@@ -1358,7 +1360,7 @@ impl IcebergWriteSessionControl {
         // the spec the table still has would stage files partitioned against a
         // spec the same commit retires.
         let repartition = match &request.flavor {
-            ConnectorWriteSessionFlavor::ManagedPublication(intent) => intent
+            ConnectorWriteSessionFlavor::ManagedPublication { intent, .. } => intent
                 .partition_spec_replacement()
                 .map(|replacement| {
                     let prepared = crate::commit::write_stack::repartition::
@@ -1453,8 +1455,8 @@ impl IcebergWriteSessionControl {
             | ConnectorWriteSessionFlavor::StagedCreate(_) => {
                 plan_ordinary_branches(flavor_for(request)?, &material)?
             }
-            ConnectorWriteSessionFlavor::ManagedPublication(intent) => {
-                plan_managed_publication_branches(&material, publication_facts(intent)?)?
+            ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
+                plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite => {
@@ -1691,8 +1693,9 @@ fn format_version_number(metadata: &TableMetadata) -> u8 {
 /// looks for the property. Converting the intent's durable facts once, here, is
 /// what keeps the id off the execution path while still putting it where the
 /// fence looks.
-fn publication_facts(
+pub(crate) fn publication_facts(
     intent: &ConnectorManagedPublicationIntent,
+    shape: ConnectorManagedPublicationShape,
 ) -> Result<IcebergManagedPublicationFacts, ConnectorError> {
     let bases = intent
         .bases()
@@ -1703,6 +1706,7 @@ fn publication_facts(
     Ok(IcebergManagedPublicationFacts::new(
         intent.technique(),
         intent.empty_input(),
+        shape,
         IcebergManagedPublicationProvenance::try_new(
             intent.publication_id(),
             bases,
@@ -1738,7 +1742,7 @@ fn provenance_base_from_staged_fact(
 
 /// Whether this session will seal a delete branch, and therefore has to freeze
 /// the old delete artifacts that branch must supersede.
-fn session_freezes_old_deletes(
+pub(crate) fn session_freezes_old_deletes(
     flavor: &ConnectorWriteSessionFlavor,
     signed: &ConnectorWriteInputShape,
 ) -> bool {
@@ -1752,10 +1756,21 @@ fn session_freezes_old_deletes(
             signed,
             ConnectorWriteInputShape::Data { .. } | ConnectorWriteInputShape::EqualityDelete { .. }
         ),
+        // A publication that applies a change stream seals the same delete
+        // branch a DML row mutation does, so it must supersede the same old
+        // artifacts. One that republishes rows wholesale seals no delete branch
+        // at all and has nothing to freeze.
+        ConnectorWriteSessionFlavor::ManagedPublication { shape, .. } => {
+            *shape == ConnectorManagedPublicationShape::RowMutation
+                && !matches!(
+                    signed,
+                    ConnectorWriteInputShape::Data { .. }
+                        | ConnectorWriteInputShape::EqualityDelete { .. }
+                )
+        }
         // A staged target has no base snapshot and therefore no old delete
         // artifact to supersede: it is a table nobody has ever written to.
         ConnectorWriteSessionFlavor::StagedCreate(_)
-        | ConnectorWriteSessionFlavor::ManagedPublication(_)
         | ConnectorWriteSessionFlavor::DistributedRewrite => false,
     }
 }

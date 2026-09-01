@@ -80,9 +80,10 @@ pub use runtime::{
     ConnectorWriterHandle,
 };
 pub use session::{
-    ConnectorWriteBeginRequest, ConnectorWriteControl, ConnectorWriteFinishRequest,
-    ConnectorWriteRouteFacts, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor,
-    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteControl,
+    ConnectorWriteFinishRequest, ConnectorWriteRouteFacts, ConnectorWriteSessionAbortRequest,
+    ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest,
+    ConnectorWriteTargetPlan,
 };
 pub use target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 pub use writer::{

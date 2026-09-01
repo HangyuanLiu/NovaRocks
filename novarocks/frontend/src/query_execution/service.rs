@@ -105,13 +105,16 @@ impl QueryExecutionService {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
+        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorDistributedRewriteSession, DistributedQueryError> {
-        ConnectorDistributedRewriteSession::try_begin(plan, lease, context).map_err(|error| {
-            DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                format!("seal distributed rewrite operation cohorts: {error}"),
-            )
-        })
+        ConnectorDistributedRewriteSession::try_begin(plan, lease, write_stack, table, context)
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                    format!("seal distributed rewrite operation cohorts: {error}"),
+                )
+            })
     }
 }

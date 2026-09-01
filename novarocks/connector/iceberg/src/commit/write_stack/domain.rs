@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::write_stack::{ConnectorManagedPublicationShape, WriteTargetOrdinal};
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorManagedPublicationEmptyInputDisposition,
     ConnectorManagedPublicationTechnique, ConnectorWriteAdmissionPurpose, ConnectorWriteIntent,
@@ -244,6 +244,7 @@ impl IcebergWriteFlavor {
 pub struct IcebergManagedPublicationFacts {
     technique: ConnectorManagedPublicationTechnique,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+    shape: ConnectorManagedPublicationShape,
     provenance: IcebergManagedPublicationProvenance,
 }
 
@@ -326,13 +327,26 @@ impl IcebergManagedPublicationFacts {
     pub const fn new(
         technique: ConnectorManagedPublicationTechnique,
         empty_input: ConnectorManagedPublicationEmptyInputDisposition,
+        shape: ConnectorManagedPublicationShape,
         provenance: IcebergManagedPublicationProvenance,
     ) -> Self {
         Self {
             technique,
             empty_input,
+            shape,
             provenance,
         }
+    }
+
+    /// How this publication's rows reach it, as its caller declared.
+    ///
+    /// It decides the branch structure the session seals, and therefore the
+    /// delta form its commit takes. It is a sealed session fact rather than
+    /// something re-derived at each use, because the input shape it would have
+    /// to be derived from cannot tell a publication's change stream from
+    /// ordinary DML.
+    pub const fn shape(&self) -> ConnectorManagedPublicationShape {
+        self.shape
     }
 
     pub const fn technique(&self) -> ConnectorManagedPublicationTechnique {
@@ -347,15 +361,40 @@ impl IcebergManagedPublicationFacts {
         &self.provenance
     }
 
-    /// The single external commit op a publication of this technique performs.
+    /// The single external commit op this publication performs, given the
+    /// delete branch its session sealed.
     ///
-    /// A full refresh republishes the whole target, so it replaces what the ref
-    /// already holds; an incremental refresh adds to it. Committing a full
-    /// refresh as an append would leave the superseded rows live.
-    pub const fn commit_op_kind(&self) -> CommitOpKind {
-        match self.technique {
-            ConnectorManagedPublicationTechnique::Full => CommitOpKind::Overwrite,
-            ConnectorManagedPublicationTechnique::Incremental => CommitOpKind::FastAppend,
+    /// The technique alone stopped being enough once a publication could apply
+    /// a change stream. A full refresh republishes the whole target, so it
+    /// replaces what the ref already holds, and committing it as an append
+    /// would leave the superseded rows live. An incremental refresh adds to
+    /// what is live — but one that also seals a delete branch publishes a
+    /// *delta*, and committing that as a plain append would add every
+    /// after-image while silently dropping the delete artifact that retires the
+    /// before-image, leaving both versions of the row live.
+    ///
+    /// So the sealed delete branch decides the delta form, and it decides it
+    /// through the exact mapping ordinary DML already commits a row mutation
+    /// under rather than a second one written out here.
+    pub const fn commit_op_kind(&self, delete_branch: Option<IcebergWriteBranch>) -> CommitOpKind {
+        match (self.technique, delete_branch) {
+            // A full refresh never seals a delete branch:
+            // `plan_managed_publication_branches` refuses a full refresh with a
+            // change-stream shape, because a commit that replaces every live
+            // row has no prior row for a change event to supersede.
+            (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::Overwrite,
+            (ConnectorManagedPublicationTechnique::Incremental, None)
+            | (ConnectorManagedPublicationTechnique::Incremental, Some(IcebergWriteBranch::Data)) => {
+                CommitOpKind::FastAppend
+            }
+            (
+                ConnectorManagedPublicationTechnique::Incremental,
+                Some(IcebergWriteBranch::DeletionVector),
+            ) => IcebergWriteFlavor::RowMutationDeletionVector.commit_op_kind(),
+            (
+                ConnectorManagedPublicationTechnique::Incremental,
+                Some(IcebergWriteBranch::PositionDelete),
+            ) => IcebergWriteFlavor::RowMutationPositionDelete.commit_op_kind(),
         }
     }
 
@@ -366,6 +405,38 @@ impl IcebergManagedPublicationFacts {
             ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
             ConnectorManagedPublicationTechnique::Incremental => ConnectorWriteIntent::Append,
         }
+    }
+}
+
+/// The physical branches one sealed session may own.
+///
+/// Every flavor but one answers this from itself. A managed publication cannot:
+/// its branch structure follows the shape its caller declared, so a `Data`
+/// publication owns only its data branch while a `RowMutation` one owns the
+/// branches a row mutation needs. Deriving it from the sealed publication facts
+/// keeps the planner's check and the handle's reading the same source, instead
+/// of a second provider flavor that would say the same thing twice.
+///
+/// A row-mutation publication is admitted for the union of the delete branches,
+/// not for one of them: which delete branch it seals is the branch planner's
+/// decision from the signed input, and the sealed session still refuses to
+/// repeat a branch, so the union cannot admit two delete owners.
+pub fn allowed_session_branches(
+    flavor: IcebergWriteFlavor,
+    publication: Option<&IcebergManagedPublicationFacts>,
+) -> &'static [IcebergWriteBranch] {
+    const ROW_MUTATION_BRANCHES: &[IcebergWriteBranch] = &[
+        IcebergWriteBranch::Data,
+        IcebergWriteBranch::PositionDelete,
+        IcebergWriteBranch::DeletionVector,
+    ];
+    match publication {
+        Some(publication)
+            if publication.shape() == ConnectorManagedPublicationShape::RowMutation =>
+        {
+            ROW_MUTATION_BRANCHES
+        }
+        _ => flavor.branches(),
     }
 }
 
@@ -617,13 +688,24 @@ impl IcebergWriterOutput {
     }
 }
 
-/// The data-branch recipe: schema, partitioning, and row-lineage facts.
+/// The data-branch recipe: the frozen input schema and the partitioning every
+/// data writer writes through.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
     input_schema: Option<IcebergSchemaDef>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
+    /// Whether the branch this recipe drives was cut from a row-lineage input.
+    ///
+    /// It is descriptive only, and deliberately recorded as such: **no writer
+    /// consults it**. Row lineage is preserved by the columns themselves --
+    /// `annotate_schema_from_scan_model` (`crate::schema_mapping`) recognises an
+    /// incoming `_row_id` / `_last_updated_sequence_number` column by name and
+    /// stamps Iceberg's reserved field id straight onto it, without consulting
+    /// the frozen table schema at all. So an updated row keeps its identity
+    /// because SQL sends those columns, not because this flag is set, and
+    /// clearing it would not stop lineage being written.
     row_lineage: bool,
 }
 
@@ -672,6 +754,11 @@ impl IcebergDataBranchRecipe {
     pub fn transform_exprs(&self) -> &[String] {
         &self.transform_exprs
     }
+    /// Whether this branch was cut from a row-lineage input.
+    ///
+    /// Descriptive metadata: it round-trips through the writer-handle codec and
+    /// is read by nothing that writes. See the field's own note for what
+    /// actually carries row lineage.
     pub const fn row_lineage(&self) -> bool {
         self.row_lineage
     }
@@ -1526,7 +1613,10 @@ impl IcebergCommitHandle {
                 ));
             }
         }
-        let allowed = flavor.branches().iter().copied().collect::<BTreeSet<_>>();
+        let allowed = allowed_session_branches(flavor, publication.as_ref())
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
         if !branches.is_subset(&allowed) {
             return Err(invalid(format!(
                 "Iceberg {} write session seals a branch the flavor does not own",
@@ -1619,9 +1709,21 @@ impl IcebergCommitHandle {
     /// it from its flavor alone.
     pub fn commit_op_kind(&self) -> CommitOpKind {
         match &self.publication {
-            Some(publication) => publication.commit_op_kind(),
+            Some(publication) => publication.commit_op_kind(self.sealed_delete_branch()),
             None => self.flavor.commit_op_kind(),
         }
+    }
+
+    /// The delete branch this session sealed, if it sealed one.
+    ///
+    /// At most one exists: `seals_one_target_per_branch` forbids repeating a
+    /// branch for every flavor that can own a delete branch at all, so the
+    /// first match is the only one.
+    fn sealed_delete_branch(&self) -> Option<IcebergWriteBranch> {
+        self.targets
+            .iter()
+            .map(IcebergSealedWriteTarget::branch)
+            .find(|branch| branch.writes_deletes())
     }
 
     /// Whether this session must be serialized behind the distributed external

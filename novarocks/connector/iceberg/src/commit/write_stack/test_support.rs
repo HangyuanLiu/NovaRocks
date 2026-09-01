@@ -112,11 +112,74 @@ pub(crate) fn publication_provenance() -> IcebergManagedPublicationProvenance {
     .expect("publication provenance")
 }
 
+/// A publication that republishes rows wholesale: the shape every existing
+/// publication test means unless it says otherwise.
 pub(crate) fn publication_facts(
     technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
     empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
 ) -> IcebergManagedPublicationFacts {
-    IcebergManagedPublicationFacts::new(technique, empty_input, publication_provenance())
+    publication_facts_with_shape(
+        technique,
+        empty_input,
+        novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+    )
+}
+
+pub(crate) fn publication_facts_with_shape(
+    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+    empty_input: novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition,
+    shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
+) -> IcebergManagedPublicationFacts {
+    IcebergManagedPublicationFacts::new(technique, empty_input, shape, publication_provenance())
+}
+
+/// The neutral publication intent a frontend hands to `begin_write`.
+///
+/// Built here so a test can exercise the admission path that reads it, rather
+/// than the provider-side facts it is converted into.
+pub(crate) fn publication_intent(
+    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+) -> novarocks_spi::connector::ConnectorManagedPublicationIntent {
+    novarocks_spi::connector::ConnectorManagedPublicationIntent::try_new(
+        publication_id(),
+        novarocks_spi::connector::ConnectorManagedPublicationTarget::try_new(
+            novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                bytes::Bytes::from_static(b"6f7c3a0e-0000-4000-8000-000000000001"),
+            )
+            .expect("target object id"),
+            Some(77),
+        )
+        .expect("publication target"),
+        technique,
+        vec![novarocks_spi::connector::ConnectorStagedPublicationBaseFact {
+            table: std::sync::Arc::from("db.base"),
+            object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                bytes::Bytes::from_static(b"6f7c3a0e-0000-4000-8000-000000000002"),
+            )
+            .expect("base object id"),
+            from_version: Some(11),
+            to_version: 12,
+        }],
+        "fingerprint",
+        novarocks_spi::connector::ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+        novarocks_spi::connector::ConnectorManagedDescriptorProperties::try_new(vec![(
+            std::sync::Arc::from("novarocks.mv.definition"),
+            std::sync::Arc::from("select 1"),
+        )])
+        .expect("descriptor properties"),
+    )
+    .expect("publication intent")
+}
+
+/// The neutral session flavor a managed publication is admitted under.
+pub(crate) fn publication_flavor(
+    technique: novarocks_spi::connector::ConnectorManagedPublicationTechnique,
+    shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape,
+) -> novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor {
+    novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
+        intent: publication_intent(technique),
+        shape,
+    }
 }
 
 pub(crate) fn sample_partition() -> IcebergArtifactPartition {

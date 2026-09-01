@@ -150,6 +150,28 @@ impl ConnectorWriteSessionCompletion {
 impl WriteExecutionOutcome {
     /// The NCP-6 session completion, present exactly when this query used the
     /// write-session data plane.
+    /// Split a write outcome into every part, including the session
+    /// completion. The legacy connector completion stays in the tuple until the
+    /// old path is deleted, so a caller cannot silently read one when it meant
+    /// the other.
+    pub(crate) fn into_parts_with_session(
+        self,
+    ) -> (
+        QueryResult,
+        Option<WriteCommitInput>,
+        Option<WriteAbortInput>,
+        Option<ConnectorWriteCompletion>,
+        Option<ConnectorWriteSessionCompletion>,
+    ) {
+        (
+            self.result,
+            self.commit,
+            self.abort,
+            self.connector_completion,
+            self.write_session,
+        )
+    }
+
     pub(crate) fn into_write_session(self) -> Option<ConnectorWriteSessionCompletion> {
         self.write_session
     }
