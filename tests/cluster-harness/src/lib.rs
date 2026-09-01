@@ -4423,12 +4423,14 @@ pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) ->
         .arg(config_path)
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD", "1")
-        // Cross-process SQL fixtures own both process logs, so they enable the
-        // bounded connector scan lifecycle markers used for structural
-        // evidence. This is runner-owned and compiled out of release builds.
-        .env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Cross-process SQL fixtures own both process logs, so debug harnesses
+    // enable the bounded connector scan lifecycle markers used for structural
+    // evidence. Release servers reject this debug-only environment variable.
+    if cfg!(debug_assertions) {
+        command.env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1");
+    }
     command
 }
 
@@ -4833,7 +4835,23 @@ fn table_mut<'a>(
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::ffi::OsStr;
     use std::fs;
+
+    #[test]
+    fn novarocks_command_only_enables_connector_reader_marker_in_debug_harnesses() {
+        let command = build_novarocks_command(
+            Path::new("/tmp/novarocks"),
+            "fe",
+            Path::new("/tmp/novarocks-fe.toml"),
+        );
+        let marker_is_set = command.get_envs().any(|(name, value)| {
+            name == OsStr::new("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
+                && value == Some(OsStr::new("1"))
+        });
+
+        assert_eq!(marker_is_set, cfg!(debug_assertions));
+    }
 
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {
         let mut value = serde_json::json!({
