@@ -62,7 +62,7 @@ fn encode_writer_unique_id(value: [u8; 16]) -> common::UniqueId {
     }
 }
 
-fn encode_connector_write_input_binding(
+pub(super) fn encode_connector_write_input_binding(
     src: &ConnectorWriteInputBinding,
 ) -> plan::ConnectorWriteInputBinding {
     use plan::connector_write_input_binding::Kind;
