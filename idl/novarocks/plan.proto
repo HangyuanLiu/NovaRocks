@@ -27,6 +27,7 @@ package novarocks.plan;
 import "common.proto";
 import "catalog.proto";
 import "connector_read.proto";
+import "connector_write.proto";
 import "expr.proto";
 
 // Whole-query distributed plan.
@@ -79,7 +80,44 @@ message DistributedNode {
   oneof payload {
     PlanNode physical = 10;       // physical operator payload.
     ExchangeReceiver exchange = 11; // exchange receiver payload.
+    TableWriterNode table_writer = 12;  // dataflow connector writer payload.
+    TableFinishNode table_finish = 13;  // single per-query write finish payload.
   }
+}
+
+// A dataflow connector writer.
+//
+// It is an ordinary unary processor with output, not a terminal sink: it hands
+// its child's rows to one driver-local connector writer and emits the frozen
+// write relation. The assignment names the exact query-leased catalog runtime,
+// one query-local logical write target, and the immutable recipe copied to
+// every placement that serves that target -- so the same canonical handle
+// legitimately appears in several submissions.
+//
+// Owner: produced by the FE native plan encoder from the frozen begin session
+// and consumed by the BE plan decode layer through its exact execution role
+// binding.
+message TableWriterNode {
+  novarocks.catalog.CatalogHandle catalog_handle = 1;   // exact query-leased BE runtime.
+  uint32 write_target_ordinal = 2;                      // dense query-local logical target.
+  novarocks.connector_write.ConnectorWriterHandle handle = 3;  // immutable write recipe.
+  ConnectorWriteInputBinding input = 4;                 // Arrow input projection.
+  uint32 writer_ordinal = 5;                            // physical-context component.
+  repeated novarocks.expr.Expr output_exprs = 6;        // sealed write output expressions.
+  repeated novarocks.common.OutputColumn target_schema = 7;  // sealed write target schema.
+}
+
+// The single per-query write finish node.
+//
+// It runs on one Root backend at DOP 1, gathers every writer's relation, and
+// emits the complete root relation into the ordinary result sink only after all
+// senders reach EOS. It knows which logical targets are legal and nothing else:
+// it never interprets a provider fragment and holds no commit authority.
+//
+// Owner: produced by the FE native plan encoder and consumed by the BE plan
+// decode layer.
+message TableFinishNode {
+  repeated uint32 expected_target_ordinals = 1;  // dense 0..n legal target set.
 }
 
 // Exchange receiver node payload.

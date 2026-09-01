@@ -865,3 +865,97 @@ fn retired_participant_role_projection_remains_reserved() {
         "retired QueryParticipantRole enum must not return to the wire contract"
     );
 }
+
+#[test]
+fn write_dataflow_nodes_are_appended_after_the_existing_distributed_payloads() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let node = pool
+        .get_message_by_name("novarocks.plan.DistributedNode")
+        .expect("DistributedNode descriptor");
+    // The two overlay-only write nodes are appended; the pre-existing payload
+    // arms keep their numbers so an older plan still parses the same way.
+    for (field_name, field_number) in [
+        ("physical", 10),
+        ("exchange", 11),
+        ("table_writer", 12),
+        ("table_finish", 13),
+    ] {
+        let field = node
+            .get_field_by_name(field_name)
+            .unwrap_or_else(|| panic!("DistributedNode.{field_name} descriptor"));
+        assert_eq!(field.number(), field_number);
+    }
+}
+
+#[test]
+fn the_connector_write_carriers_are_closed_single_provider_oneofs() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    // Iceberg is the only provider that can write today. StarRocks deliberately
+    // has no arm here: an unused placeholder would advertise a capability the
+    // provider does not have, and `write: None` must stay a real refusal.
+    for (message_name, oneof_name, arm_name) in [
+        (
+            "novarocks.connector_write.ConnectorWriterHandle",
+            "handle",
+            "iceberg",
+        ),
+        (
+            "novarocks.connector_write.ConnectorCommitFragment",
+            "fragment",
+            "iceberg",
+        ),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        let oneof = message
+            .oneofs()
+            .find(|oneof| oneof.name() == oneof_name)
+            .unwrap_or_else(|| panic!("{message_name}.{oneof_name} oneof"));
+        let arms = oneof.fields().map(|field| field.name().to_string()).collect::<Vec<_>>();
+        assert_eq!(arms, vec![arm_name.to_string()]);
+        let arm = message
+            .get_field_by_name(arm_name)
+            .unwrap_or_else(|| panic!("{message_name}.{arm_name} descriptor"));
+        // Provider arms start at 10 by repository convention, leaving 1..9 for
+        // neutral envelope fields if one is ever needed.
+        assert_eq!(arm.number(), 10);
+    }
+}
+
+#[test]
+fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let fragment = pool
+        .get_message_by_name("novarocks.connector_write.IcebergCommitFragment")
+        .expect("IcebergCommitFragment descriptor");
+    let artifact = fragment
+        .oneofs()
+        .find(|oneof| oneof.name() == "artifact")
+        .expect("IcebergCommitFragment.artifact oneof");
+    let arms = artifact.fields().map(|field| field.name().to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        arms,
+        vec![
+            "data_file".to_string(),
+            "position_delete_file".to_string(),
+            "deletion_vector".to_string(),
+        ]
+    );
+    // A fragment carries no writer identity, attempt id, or aggregate summary:
+    // those belong to an execution, not to an artifact.
+    let field_names = fragment
+        .fields()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(field_names.len(), 3);
+    for forbidden in ["writer", "operation_id", "cohort_id", "summary", "row_count"] {
+        assert!(
+            !field_names.iter().any(|name| name.contains(forbidden)),
+            "commit fragment must not carry {forbidden}"
+        );
+    }
+}

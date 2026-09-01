@@ -247,6 +247,25 @@ fn decode_node_inner(
             arena,
             ctx,
         ),
+        // The write dataflow nodes are decoded by the connector write path,
+        // which is introduced with the backend's write cutover. Until it lands,
+        // refusing them is correct: a plan carrying one cannot be executed by
+        // this decoder, and silently ignoring it would run a write that stages
+        // nothing.
+        plan::distributed_node::Payload::TableWriter(_) => Err(NativeFragmentDecodeError::missing(
+            path.clone().field("payload").field("table_writer"),
+            format!(
+                "native node_id={} carries a table writer the backend cannot decode yet",
+                node.node_id
+            ),
+        )),
+        plan::distributed_node::Payload::TableFinish(_) => Err(NativeFragmentDecodeError::missing(
+            path.clone().field("payload").field("table_finish"),
+            format!(
+                "native node_id={} carries a table finish the backend cannot decode yet",
+                node.node_id
+            ),
+        )),
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
         attach_leaf_consumers(
@@ -288,6 +307,16 @@ fn validate_distributed_node_children(
     match payload {
         plan::distributed_node::Payload::Exchange(_) => {
             require_exact_children(node_path, "ExchangeReceiver", 0, actual)
+        }
+        // A writer is an ordinary unary processor.
+        plan::distributed_node::Payload::TableWriter(_) => {
+            require_exact_children(node_path, "TableWriterNode", 1, actual)
+        }
+        // The finish node is n-ary: the planner gives it one exchange receiver
+        // per writer fragment, because a receiver names exactly one source
+        // fragment and therefore cannot be shared between senders.
+        plan::distributed_node::Payload::TableFinish(_) => {
+            require_min_children(node_path, "TableFinishNode", 1, actual)
         }
         plan::distributed_node::Payload::Physical(physical) => {
             let Some(kind) = physical.kind.as_ref() else {
@@ -497,6 +526,18 @@ fn attach_leaf_consumers(
         )
     })?;
     match payload {
+        // A write dataflow node is never a runtime-filter consumer: it has no
+        // scan and no probe side to filter.
+        plan::distributed_node::Payload::TableWriter(_)
+        | plan::distributed_node::Payload::TableFinish(_) => {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().field("payload"),
+                format!(
+                    "native node_id={} is a write dataflow node and cannot consume a runtime filter",
+                    wire_node.node_id
+                ),
+            ));
+        }
         plan::distributed_node::Payload::Exchange(_) => {
             let exchange = find_exchange_source_mut(&mut lowered.node).ok_or_else(|| {
                 NativeFragmentDecodeError::inconsistent(
