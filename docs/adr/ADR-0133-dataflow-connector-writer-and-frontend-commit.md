@@ -112,9 +112,12 @@ N 个 writer fragment 更贴合上面描述的拓扑，但需要一个接受 N �
 DML/MV/maintenance caller。因为没有历史用户与兼容承诺，选择一次原子切换而不是长期双栈——如果存在
 历史用户，这个选择会完全不同。
 
-**一条相邻裁决被收窄而非推翻。** row mutation 的 strategy、identity 与 route 仍由 provider 签发并
-拥有（ADR-0049）；变的只是它的 cohort 词汇被 query-local 的目标序号取代。那条 ADR 的核心立场未变，
-因此保持 active。
+**一条相邻裁决被收窄而非推翻，但收窄得比第一眼更多。** ADR-0049 的裁决句把 cohort 与 row identity、
+match contract、strategy、route id 并列为「provider 拥有的事实」。本决策**删除了 distributed writer
+数据面上的 cohort**：分支身份改为 query-local 的目标序号。它的所有权立场没有变——这些事实仍归 provider
+签发、不归 SQL 或 Core——所以那条 ADR 保持 active 而不是被 supersede；但今天照字面读它的人会以为 cohort
+仍存在于 writer 数据面，而它不再存在。把这句写在这里，是因为让下一个人自己去撞这个不一致，正是 ADR 库
+存在要避免的事。
 
 ## 何时重新评估
 
