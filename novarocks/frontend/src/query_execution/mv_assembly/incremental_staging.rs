@@ -319,6 +319,9 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                // This MV flow still uses the terminal-sink shape; it moves to
+                // the dataflow shape with the rest of its migration.
+                novarocks_sql::planning::dml::DmlWritePlanShape::TerminalSink,
             )?;
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(
@@ -422,6 +425,9 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                // This MV flow still uses the terminal-sink shape; it moves to
+                // the dataflow shape with the rest of its migration.
+                novarocks_sql::planning::dml::DmlWritePlanShape::TerminalSink,
             )?;
             let planned =
                 crate::query_execution::compiler::prepare_dml_change_stream_write_with_execution(

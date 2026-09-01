@@ -337,6 +337,18 @@ pub fn compile_mv_first_refresh_connector_write(
     )
 }
 
+/// The NCP-6 dataflow form of [`compile_mv_first_refresh_connector_write`].
+pub fn compile_mv_first_refresh_connector_write_dataflow(
+    analyzed: SqlMvFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::planning::dml::compile_connector_write_dataflow_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        analyzed.sink,
+        &analyzed.settings,
+    )
+}
+
 /// Immutable inputs for the join-MV first-refresh terminal.  The snapshot is
 /// already sealed by the compiler facade; the query is syntax only, not a
 /// logical or physical planner graph.
@@ -442,6 +454,18 @@ pub fn compile_join_first_refresh_connector_write(
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_distributed_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        analyzed.sink,
+        &analyzed.settings,
+    )
+}
+
+/// The NCP-6 dataflow form of [`compile_join_first_refresh_connector_write`].
+pub fn compile_join_first_refresh_connector_write_dataflow(
+    analyzed: SqlMvJoinFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+) -> Result<crate::plan_read::DistributedPlan, String> {
+    crate::planning::dml::compile_connector_write_dataflow_plan(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
         analyzed.sink,
         &analyzed.settings,
@@ -562,6 +586,7 @@ pub fn analyze_join_incremental_refresh_change_stream(
 pub fn compile_join_incremental_refresh_change_stream(
     analyzed: SqlMvJoinIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
@@ -584,7 +609,7 @@ pub fn compile_join_incremental_refresh_change_stream(
         analyzed.routes,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
-        crate::planning::dml::DmlWritePlanShape::TerminalSink,
+        shape,
     )
 }
 
@@ -658,6 +683,7 @@ pub fn analyze_mv_incremental_refresh_change_stream(
 pub fn compile_mv_incremental_refresh_change_stream(
     analyzed: SqlMvIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
         crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
@@ -677,7 +703,7 @@ pub fn compile_mv_incremental_refresh_change_stream(
         analyzed.routes,
         JOIN_INCREMENTAL_EFFECT_COLUMN,
         None,
-        crate::planning::dml::DmlWritePlanShape::TerminalSink,
+        shape,
     )
 }
 
@@ -2688,6 +2714,7 @@ mod tests {
         let _: fn(
             SqlMvJoinIncrementalRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            crate::planning::dml::DmlWritePlanShape,
         ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
             compile_join_incremental_refresh_change_stream;
     }
@@ -2729,6 +2756,7 @@ mod tests {
         let _: fn(
             SqlMvIncrementalRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            crate::planning::dml::DmlWritePlanShape,
         ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
             compile_mv_incremental_refresh_change_stream;
     }
