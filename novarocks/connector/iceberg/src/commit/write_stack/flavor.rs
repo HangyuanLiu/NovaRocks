@@ -35,7 +35,9 @@
 //!   [`WriteTargetOrdinal`](novarocks_spi::connector::write_stack::WriteTargetOrdinal)
 //!   and its `preparation` is subsumed by the provider-private writer recipe,
 //!   so neither comes back.
-//! * `DistributedRewrite` seals one data branch per frozen rewrite group.
+//! * `DistributedRewrite` seals one branch per frozen rewrite group: a data
+//!   branch when the frozen operation republishes data files, a deletion-vector
+//!   branch when it repacks position deletes.
 //! * `CopyOnWrite` seals one data branch per frozen copy-on-write recipe: one
 //!   per rewritten data file, plus a trailing append branch when the statement
 //!   also has net-new rows.
@@ -43,9 +45,10 @@
 use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
 use novarocks_spi::connector::write_stack::session::ConnectorWriteRouteFacts;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorManagedPublicationTechnique,
-    ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldBinding,
-    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteRouteId,
+    ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
+    ConnectorManagedPublicationTechnique, ConnectorMutationRouteInput, ConnectorRowMutationEffect,
+    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+    ConnectorWriteRouteId,
 };
 use sha2::{Digest, Sha256};
 
@@ -111,6 +114,22 @@ impl IcebergSessionMaterial {
         branch: IcebergWriteBranch,
         input: ConnectorWriteInputShape,
     ) -> Result<IcebergDeleteBranchPlan, ConnectorError> {
+        self.rewrite_delete_plan(branch, input, self.merge_targets.clone())
+    }
+
+    /// A delete branch whose owned data files are stated rather than taken from
+    /// the session-wide freeze.
+    ///
+    /// A distributed rewrite seals several delete branches, and each owns only
+    /// its own group's data files; giving every branch the session-wide set
+    /// would make each one claim every file, which the unique-owner proof
+    /// refuses.
+    fn rewrite_delete_plan(
+        &self,
+        branch: IcebergWriteBranch,
+        input: ConnectorWriteInputShape,
+        merge_targets: Vec<IcebergOldDeleteMergeTarget>,
+    ) -> Result<IcebergDeleteBranchPlan, ConnectorError> {
         Ok(IcebergDeleteBranchPlan {
             branch,
             output: IcebergWriterOutput::try_new(
@@ -118,7 +137,7 @@ impl IcebergSessionMaterial {
                 parquet::basic::Compression::SNAPPY,
                 None,
             )?,
-            merge_targets: self.merge_targets.clone(),
+            merge_targets,
             input,
         })
     }
@@ -346,42 +365,117 @@ pub(crate) fn plan_managed_publication_branches(
     })
 }
 
-/// Plan a distributed rewrite's branches: one data branch per frozen group.
+/// One frozen rewrite group, together with what its branch's writer owns.
 ///
-/// The ordinal is the group's query-local name. Nothing about the group is
-/// copied into a writer recipe — a rewrite writer's job is to write new data
-/// files for the rows it is handed, and which old files those rows came from is
-/// a planning fact the frontend already holds.
+/// The group alone decides a data rewrite's branch. A position-delete rewrite
+/// needs one thing more: its branch writes a deletion vector, and the writer
+/// resolves a data file's partition and row count through the merge target the
+/// session froze for it. Those come from the table metadata, so `begin_write`
+/// freezes them and the pure branch planner only attaches them.
+#[derive(Clone, Debug)]
+pub(crate) struct IcebergFrozenRewriteBranch {
+    /// The group this branch rewrites, and therefore exactly what its commit
+    /// replaces.
+    pub group: IcebergFrozenRewriteGroupV1,
+    /// The data files this branch's delete writer owns, each frozen with *no*
+    /// old reference to merge. Empty on a data rewrite, which seals no delete
+    /// branch at all.
+    ///
+    /// A rewrite reads the old artifacts through its own scan and republishes
+    /// their positions, so there is nothing left for the writer to merge —
+    /// handing it the references would make it read the same Puffin blobs a
+    /// second time, and its commit retires them either way.
+    pub delete_targets: Vec<IcebergOldDeleteMergeTarget>,
+}
+
+/// Plan a distributed rewrite's branches: one branch per frozen group.
+///
+/// The ordinal is the group's query-local name. Which *kind* of branch it seals
+/// is the frozen operation's decision, not the input's: a data rewrite seals a
+/// data branch and refuses a row-level delete input, a position-delete rewrite
+/// seals a deletion-vector branch and refuses anything else. Reading it off the
+/// input alone would let a caller turn one rewrite into the other by signing a
+/// different shape, and its commit would then retire the wrong half of the
+/// frozen set.
+///
+/// Nothing about the group is copied into a data branch's writer recipe — a
+/// rewrite writer's job is to write new data files for the rows it is handed,
+/// and which old files those rows came from is a planning fact the frontend
+/// already holds.
 pub(crate) fn plan_distributed_rewrite_branches(
     material: &IcebergSessionMaterial,
-    groups: &[IcebergFrozenRewriteGroupV1],
+    shape: ConnectorDistributedRewriteShape,
+    groups: &[IcebergFrozenRewriteBranch],
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
-    if ordinary_delete_branch(&material.input).is_some() {
-        return Err(unsupported(
-            "Iceberg distributed rewrite republishes data files, not a row-level delete input",
-        ));
-    }
+    let flavor = match shape {
+        ConnectorDistributedRewriteShape::DataFiles { .. } => {
+            if ordinary_delete_branch(&material.input).is_some() {
+                return Err(unsupported(
+                    "Iceberg distributed rewrite republishes data files, not a row-level delete input",
+                ));
+            }
+            IcebergWriteFlavor::DistributedRewrite
+        }
+        ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+            // A repacked deletion vector is a v3 Puffin artifact; on an earlier
+            // format version the rewrite would have to write a Parquet position
+            // delete instead, which replaces nothing the plan selected.
+            if material.table.format_version() < 3 {
+                return Err(unsupported(
+                    "Iceberg position-delete rewrite requires a format-version 3 table",
+                ));
+            }
+            if !matches!(
+                material.input,
+                ConnectorWriteInputShape::DeletionVector { .. }
+            ) {
+                return Err(unsupported(
+                    "Iceberg position-delete rewrite republishes deletion vectors, not a data input",
+                ));
+            }
+            IcebergWriteFlavor::DistributedRewritePositionDeletes
+        }
+    };
     // A rewrite that found nothing to rewrite still seals one branch: the
     // session has to exist so it can terminate, and its empty prepared set is
     // what makes it a no-op rather than a failure. Its frozen input is empty
     // for the same reason, and the branch count stays one per input.
-    let rewrite_inputs = if groups.is_empty() {
-        vec![IcebergFrozenRewriteBranchInput::default()]
+    let empty = [IcebergFrozenRewriteBranch {
+        group: IcebergFrozenRewriteGroupV1::default(),
+        delete_targets: Vec::new(),
+    }];
+    let groups = if groups.is_empty() {
+        &empty[..]
     } else {
         groups
-            .iter()
-            .map(frozen_rewrite_branch_input)
-            .collect::<Result<Vec<_>, _>>()?
     };
-    let branches = rewrite_inputs
+    let rewrite_inputs = groups
         .iter()
-        .map(|_| IcebergWriteBranchPlan::Data {
-            plan: material.data_plan(material.input.clone()),
-            route: None,
+        .map(|branch| frozen_rewrite_branch_input(shape, &branch.group))
+        .collect::<Result<Vec<_>, _>>()?;
+    let branches = groups
+        .iter()
+        .map(|branch| match shape {
+            ConnectorDistributedRewriteShape::DataFiles { .. } => {
+                Ok(IcebergWriteBranchPlan::Data {
+                    plan: material.data_plan(material.input.clone()),
+                    route: None,
+                })
+            }
+            ConnectorDistributedRewriteShape::PositionDeletes { .. } => {
+                Ok(IcebergWriteBranchPlan::Delete {
+                    plan: material.rewrite_delete_plan(
+                        IcebergWriteBranch::DeletionVector,
+                        material.input.clone(),
+                        branch.delete_targets.clone(),
+                    )?,
+                    route: None,
+                })
+            }
         })
-        .collect();
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
     Ok(IcebergSessionFlavorPlan {
-        flavor: IcebergWriteFlavor::DistributedRewrite,
+        flavor,
         publication: None,
         rewrite_inputs,
         copy_on_write: Vec::new(),
@@ -395,16 +489,32 @@ pub(crate) fn plan_distributed_rewrite_branches(
 /// artifacts the group was proven to own, because the rows those deletions
 /// removed are already absent from the files the branch writes. Leaving an
 /// owned delete artifact live would re-apply it to rows that no longer exist.
+///
+/// A position-delete rewrite retires only the delete artifacts its group
+/// selected. Its data files stay live and are named anyway, because they are
+/// what the replacement deletion vectors must cover: the commit proves the
+/// staged artifacts reference exactly this set.
 fn frozen_rewrite_branch_input(
+    shape: ConnectorDistributedRewriteShape,
     group: &IcebergFrozenRewriteGroupV1,
 ) -> Result<IcebergFrozenRewriteBranchInput, ConnectorError> {
+    let delete_paths = match shape {
+        ConnectorDistributedRewriteShape::DataFiles { .. } => {
+            group.owned_data_delete_files.iter().cloned().collect()
+        }
+        ConnectorDistributedRewriteShape::PositionDeletes { .. } => group
+            .selected_position_delete_files
+            .iter()
+            .cloned()
+            .collect(),
+    };
     IcebergFrozenRewriteBranchInput::try_new(
         group
             .data_files
             .iter()
             .map(|file| file.path.clone())
             .collect(),
-        group.owned_data_delete_files.iter().cloned().collect(),
+        delete_paths,
     )
 }
 

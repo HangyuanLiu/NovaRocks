@@ -210,6 +210,25 @@ fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
     )
 }
 
+/// Acceptance evidence that a driver-local connector writer really opened on
+/// this backend for this exact write target.
+///
+/// A result-only assertion cannot show it: a write whose rows never reached a
+/// backend, and one that opened no writer because its branch was never sealed,
+/// both leave the same committed table behind. The structured
+/// `connector_write_writer_open` event above says the same thing to an
+/// operator; this says it on a stream a cross-process test can read.
+fn emit_writer_marker(marker: &str, plan_node_id: i32, target: WriteTargetOrdinal) {
+    if !crate::config::debug_emit_connector_writer_marker() {
+        return;
+    }
+    println!(
+        "{marker} plan_node={plan_node_id} write_target={}",
+        target.get()
+    );
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 /// The write execution decorator that owns write data-plane observation.
 ///
 /// It adds no authority: every call is forwarded to the query-leased binding's
@@ -267,6 +286,7 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
                     driver_id = physical.driver_id(),
                     "opened a driver-local connector writer"
                 );
+                emit_writer_marker("NOVAROCKS_CONNECTOR_WRITER_OPENED", self.node_id, target);
                 Ok(Box::new(ObservedConnectorBatchWriter {
                     inner: writer,
                     execution_id: self.execution_id,

@@ -42,7 +42,8 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationRouteInput, ConnectorProviderId, ConnectorRequestContext,
     ConnectorRowMutationEffect, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
@@ -64,8 +65,9 @@ use crate::commit::write_stack::domain::{
     IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
 };
 use crate::commit::write_stack::flavor::{
-    IcebergSessionFlavorPlan, plan_copy_on_write_branches, plan_distributed_rewrite_branches,
-    plan_managed_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
+    IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, plan_copy_on_write_branches,
+    plan_distributed_rewrite_branches, plan_managed_publication_branches, plan_ordinary_branches,
+    plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteMergeTarget, read_and_merge_old_deletes,
@@ -1446,30 +1448,130 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
     );
 }
 
+/// The frozen data-file rewrite shape, whose selection the provider re-cuts
+/// from the target alone.
+const DATA_FILE_REWRITE: ConnectorDistributedRewriteShape =
+    ConnectorDistributedRewriteShape::DataFiles { rewrite_all: true };
+
+/// The frozen position-delete rewrite shape. Its selection facts travel with
+/// it because the group set depends on them.
+const POSITION_DELETE_REWRITE: ConnectorDistributedRewriteShape =
+    ConnectorDistributedRewriteShape::PositionDeletes {
+        rewrite_all: true,
+        min_input_files: None,
+    };
+
+/// One live data file, with whatever delete artifacts are attached to it.
+fn rewrite_data_file(
+    partition: &str,
+    delete_files: Vec<crate::scan_model::IcebergDeleteFileInfo>,
+) -> DataFileWithStats {
+    DataFileWithStats {
+        path: format!("s3://b/wh/db/t/data/{partition}/f.parquet"),
+        size: 1,
+        record_count: Some(1),
+        column_stats: None,
+        partition_spec_id: Some(0),
+        partition_key: Some(partition.to_string()),
+        partition_values: None,
+        manifest_path: None,
+        partition_field_values: Vec::new(),
+        first_row_id: None,
+        data_sequence_number: Some(4),
+        delete_files,
+    }
+}
+
+/// One live Puffin deletion vector attached to `data_file`.
+fn rewrite_deletion_vector(
+    path: &str,
+    data_file: &str,
+) -> crate::scan_model::IcebergDeleteFileInfo {
+    crate::scan_model::IcebergDeleteFileInfo {
+        path: path.to_string(),
+        file_format: crate::scan_model::IcebergDeleteFileFormat::Puffin,
+        file_content: crate::scan_model::IcebergDeleteFileContent::Position,
+        length: Some(1024),
+        content_offset: Some(4),
+        content_size_in_bytes: Some(32),
+        sequence_number: Some(7),
+        partition_spec_id: Some(0),
+        partition_key: None,
+        referenced_data_file: Some(data_file.to_string()),
+        equality_column_names: Vec::new(),
+        equality_field_ids: Vec::new(),
+    }
+}
+
+/// Attach the frozen branch facts a data rewrite carries: none, because a data
+/// branch owns no delete artifact.
+fn data_rewrite_branches(
+    groups: Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1>,
+) -> Vec<IcebergFrozenRewriteBranch> {
+    groups
+        .into_iter()
+        .map(|group| IcebergFrozenRewriteBranch {
+            group,
+            delete_targets: Vec::new(),
+        })
+        .collect()
+}
+
 /// Cut real rewrite groups, one per partition key, through the rewrite
 /// planner the rewrite path already uses.
-fn rewrite_groups(
-    partitions: &[&str],
-) -> Vec<crate::distributed_rewrite::IcebergFrozenRewriteGroupV1> {
+fn rewrite_groups(partitions: &[&str]) -> Vec<IcebergFrozenRewriteBranch> {
     let files = partitions
         .iter()
-        .map(|partition| DataFileWithStats {
-            path: format!("s3://b/wh/db/t/data/{partition}/f.parquet"),
-            size: 1,
-            record_count: Some(1),
-            column_stats: None,
-            partition_spec_id: Some(0),
-            partition_key: Some((*partition).to_string()),
-            partition_values: None,
-            manifest_path: None,
-            partition_field_values: Vec::new(),
-            first_row_id: None,
-            data_sequence_number: Some(4),
-            delete_files: Vec::new(),
+        .map(|partition| rewrite_data_file(partition, Vec::new()))
+        .collect::<Vec<_>>();
+    data_rewrite_branches(
+        crate::distributed_rewrite::plan_data_file_groups(
+            files,
+            &std::collections::BTreeSet::new(),
+        )
+        .expect("plan rewrite groups"),
+    )
+}
+
+/// Cut real position-delete rewrite groups, one per data file that carries
+/// deletion vectors, and freeze each branch's own merge target the way
+/// `begin_write` does: owning its group's data file with no old reference to
+/// merge.
+fn position_delete_rewrite_groups(partitions: &[&str]) -> Vec<IcebergFrozenRewriteBranch> {
+    let files = partitions
+        .iter()
+        .map(|partition| {
+            let path = format!("s3://b/wh/db/t/data/{partition}/f.parquet");
+            rewrite_data_file(
+                partition,
+                vec![
+                    rewrite_deletion_vector(
+                        &format!("s3://b/wh/db/t/data/{partition}/d0.puffin"),
+                        &path,
+                    ),
+                    rewrite_deletion_vector(
+                        &format!("s3://b/wh/db/t/data/{partition}/d1.puffin"),
+                        &path,
+                    ),
+                ],
+            )
         })
         .collect::<Vec<_>>();
-    crate::distributed_rewrite::plan_data_file_groups(files, &std::collections::BTreeSet::new())
-        .expect("plan rewrite groups")
+    crate::distributed_rewrite::plan_position_delete_groups(files, true, None)
+        .expect("plan position-delete rewrite groups")
+        .into_iter()
+        .map(|group| {
+            let delete_targets = group
+                .data_files
+                .iter()
+                .map(|file| merge_target(&file.path, 1, Vec::new()))
+                .collect();
+            IcebergFrozenRewriteBranch {
+                group,
+                delete_targets,
+            }
+        })
+        .collect()
 }
 
 #[test]
@@ -1477,8 +1579,12 @@ fn a_distributed_rewrite_yields_one_target_per_rewrite_group() {
     let adapter = adapter("rewrite", 6);
     let groups = rewrite_groups(&["a", "b", "c"]);
     assert_eq!(groups.len(), 3);
-    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
-        .expect("plan a distributed rewrite");
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(data_input_shape()),
+        DATA_FILE_REWRITE,
+        &groups,
+    )
+    .expect("plan a distributed rewrite");
     assert_eq!(plan.flavor, IcebergWriteFlavor::DistributedRewrite);
     let (handle, targets) = flavor_session(plan);
     assert_eq!(
@@ -1517,29 +1623,22 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
         "s3://b/wh/db/t/data/d0.puffin".to_string(),
         "s3://b/wh/db/t/data/d1.puffin".to_string(),
     ]);
-    let groups = crate::distributed_rewrite::plan_data_file_groups(
-        ["a", "b"]
-            .iter()
-            .map(|partition| DataFileWithStats {
-                path: format!("s3://b/wh/db/t/data/{partition}/f.parquet"),
-                size: 1,
-                record_count: Some(1),
-                column_stats: None,
-                partition_spec_id: Some(0),
-                partition_key: Some((*partition).to_string()),
-                partition_values: None,
-                manifest_path: None,
-                partition_field_values: Vec::new(),
-                first_row_id: None,
-                data_sequence_number: Some(4),
-                delete_files: Vec::new(),
-            })
-            .collect(),
-        &live_deletes,
+    let groups = data_rewrite_branches(
+        crate::distributed_rewrite::plan_data_file_groups(
+            ["a", "b"]
+                .iter()
+                .map(|partition| rewrite_data_file(partition, Vec::new()))
+                .collect(),
+            &live_deletes,
+        )
+        .expect("plan rewrite groups"),
+    );
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(data_input_shape()),
+        DATA_FILE_REWRITE,
+        &groups,
     )
-    .expect("plan rewrite groups");
-    let plan = plan_distributed_rewrite_branches(&session_material(data_input_shape()), &groups)
-        .expect("plan a distributed rewrite");
+    .expect("plan a distributed rewrite");
     let (handle, _) = flavor_session(plan);
 
     let files = crate::commit::write_stack::control::selected_rewrite_files(&handle)
@@ -1547,6 +1646,10 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     files
         .validate()
         .expect("the frozen file set satisfies the rewrite action");
+    assert_eq!(
+        files.kind,
+        crate::commit::selected_rewrite::SelectedRewriteKind::Data
+    );
     assert_eq!(
         files.data_paths,
         std::collections::BTreeSet::from([
@@ -1557,6 +1660,152 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     // Every live delete artifact is retired with the data it applied to: the
     // rewritten files no longer contain the rows it removed.
     assert_eq!(files.delete_paths, live_deletes);
+}
+
+/// A position-delete rewrite repacks delete artifacts, so it seals a deletion
+/// vector branch per frozen group -- never the data branch a data rewrite
+/// seals. Sealing a data branch here would give SQL somewhere to send table
+/// rows the operation never reads, and its commit would then republish data
+/// files nothing rewrote.
+#[test]
+fn a_position_delete_rewrite_seals_one_delete_branch_per_frozen_group() {
+    let adapter = adapter("rewrite-position-deletes", 6);
+    let groups = position_delete_rewrite_groups(&["a", "b"]);
+    assert_eq!(groups.len(), 2);
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
+        POSITION_DELETE_REWRITE,
+        &groups,
+    )
+    .expect("plan a position-delete rewrite");
+    assert_eq!(
+        plan.flavor,
+        IcebergWriteFlavor::DistributedRewritePositionDeletes
+    );
+    let (handle, targets) = flavor_session(plan);
+    assert_eq!(handle.expected_targets(), vec![ordinal(0), ordinal(1)]);
+    assert!(
+        handle
+            .targets()
+            .iter()
+            .all(|target| target.branch() == IcebergWriteBranch::DeletionVector)
+    );
+    // Each branch owns exactly its own group's data file, which is what makes
+    // the unique-owner proof pass with two delete branches in one session.
+    // Ordinals follow the frozen group order, which is the planner's digest
+    // order rather than the partition order it was cut from.
+    assert_eq!(handle.delete_owner().len(), 2);
+    for (index, branch) in groups.iter().enumerate() {
+        for file in &branch.group.data_files {
+            assert_eq!(
+                handle
+                    .delete_owner()
+                    .get(&file.path)
+                    .map(|target| target.get()),
+                Some(index as u32),
+                "{} must be owned by its own group's branch",
+                file.path
+            );
+        }
+    }
+    // A rewrite reads the old vectors through its own scan, so its writer has
+    // no old reference to merge -- and the commit still retires them.
+    assert!(
+        handle
+            .frozen_old_references()
+            .values()
+            .flat_map(|files| files.values())
+            .all(|references| references.is_empty())
+    );
+    let sealed = neutral_plan(&adapter, (handle, targets)).expect("neutral plan");
+    assert_eq!(sealed.targets().len(), 2);
+    assert!(
+        sealed
+            .targets()
+            .iter()
+            .all(|target| target.route().is_none())
+    );
+}
+
+/// The commit replaces the half of the frozen set its operation names. A data
+/// rewrite retires the group's data files plus the deletes they owned; a
+/// position-delete rewrite retires only the vectors its groups selected, and
+/// names their data files so the replacements can be proven to cover them.
+#[test]
+fn a_position_delete_rewrite_commits_the_delete_artifacts_it_froze() {
+    let plan = plan_distributed_rewrite_branches(
+        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
+        POSITION_DELETE_REWRITE,
+        &position_delete_rewrite_groups(&["a"]),
+    )
+    .expect("plan a position-delete rewrite");
+    let (handle, _) = flavor_session(plan);
+    assert_eq!(handle.commit_op_kind(), CommitOpKind::SelectedRewrite);
+
+    let files = crate::commit::write_stack::control::selected_rewrite_files(&handle)
+        .expect("a rewrite session commits the file set it froze");
+    files
+        .validate()
+        .expect("the frozen file set satisfies the rewrite action");
+    assert_eq!(
+        files.kind,
+        crate::commit::selected_rewrite::SelectedRewriteKind::PositionDeletes
+    );
+    assert_eq!(
+        files.delete_paths,
+        std::collections::BTreeSet::from([
+            "s3://b/wh/db/t/data/a/d0.puffin".to_string(),
+            "s3://b/wh/db/t/data/a/d1.puffin".to_string(),
+        ])
+    );
+    assert_eq!(
+        files.data_paths,
+        std::collections::BTreeSet::from(["s3://b/wh/db/t/data/a/f.parquet".to_string()])
+    );
+}
+
+/// Which branch a rewrite seals follows the frozen operation, not the writer
+/// input. Reading it off the input would let a caller signing a delete shape
+/// turn a data rewrite into a delete rewrite -- and its commit would then
+/// retire the wrong half of the frozen set -- so each shape refuses the
+/// other's input outright.
+#[test]
+fn a_rewrite_refuses_the_input_its_frozen_operation_does_not_write() {
+    let delete_input_to_data_rewrite = plan_distributed_rewrite_branches(
+        &session_material(delete_input_shape(IcebergWriteBranch::DeletionVector)),
+        DATA_FILE_REWRITE,
+        &rewrite_groups(&["a"]),
+    )
+    .expect_err("a data rewrite writes data files");
+    assert_eq!(
+        delete_input_to_data_rewrite.kind(),
+        ConnectorErrorKind::Unsupported
+    );
+    assert!(
+        delete_input_to_data_rewrite
+            .message()
+            .contains("not a row-level delete input"),
+        "unexpected message: {}",
+        delete_input_to_data_rewrite.message()
+    );
+
+    let data_input_to_delete_rewrite = plan_distributed_rewrite_branches(
+        &session_material(data_input_shape()),
+        POSITION_DELETE_REWRITE,
+        &position_delete_rewrite_groups(&["a"]),
+    )
+    .expect_err("a position-delete rewrite writes deletion vectors");
+    assert_eq!(
+        data_input_to_delete_rewrite.kind(),
+        ConnectorErrorKind::Unsupported
+    );
+    assert!(
+        data_input_to_delete_rewrite
+            .message()
+            .contains("not a data input"),
+        "unexpected message: {}",
+        data_input_to_delete_rewrite.message()
+    );
 }
 
 #[test]
@@ -1635,9 +1884,11 @@ fn a_rewrite_is_not_gated_by_the_external_write_fence() {
         );
     }
     assert!(!IcebergWriteFlavor::DistributedRewrite.requires_external_write_fence());
+    assert!(!IcebergWriteFlavor::DistributedRewritePositionDeletes.requires_external_write_fence());
 
     let plan = plan_distributed_rewrite_branches(
         &session_material(data_input_shape()),
+        DATA_FILE_REWRITE,
         &rewrite_groups(&["a"]),
     )
     .expect("plan a distributed rewrite");
@@ -2215,8 +2466,12 @@ fn an_empty_prepared_set_commits_or_aborts_by_the_publication_disposition() {
     // A rewrite with nothing to rewrite is the same no-op, and it is decided by
     // the flavor rather than by a publication disposition.
     let (rewrite, _) = flavor_session(
-        plan_distributed_rewrite_branches(&session_material(data_input_shape()), &[])
-            .expect("plan an empty distributed rewrite"),
+        plan_distributed_rewrite_branches(
+            &session_material(data_input_shape()),
+            DATA_FILE_REWRITE,
+            &[],
+        )
+        .expect("plan an empty distributed rewrite"),
     );
     assert_eq!(
         rewrite.empty_write_decision(),

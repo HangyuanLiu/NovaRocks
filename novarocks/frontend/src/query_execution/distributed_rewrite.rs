@@ -370,8 +370,10 @@ impl ConnectorDistributedRewriteSession {
 /// disagree about what their writers accept.
 ///
 /// The provider derives one branch per frozen group from the loaded table rather
-/// than from anything named here, and `flavor.rs` refuses a row-level delete
-/// input for a rewrite.
+/// than from anything named here. What it cannot derive is which artifacts this
+/// rewrite selected, so the plan's frozen shape travels in the flavor: it is
+/// what decides whether the session seals data branches or delete branches, and
+/// the provider refuses an input that disagrees with it.
 fn rewrite_begin_request(
     plan: &ConnectorDistributedRewritePlan,
     table: &novarocks_spi::connector::ConnectorTableMetadata,
@@ -404,7 +406,10 @@ fn rewrite_begin_request(
                 preparation.input(),
             ),
             base: None,
-            flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite,
+            flavor:
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite(
+                    plan.shape(),
+                ),
             context,
         },
     )

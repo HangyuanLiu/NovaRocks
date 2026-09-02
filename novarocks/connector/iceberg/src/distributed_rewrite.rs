@@ -156,11 +156,7 @@ impl IcebergDistributedRewriteControl {
                 min_input_files,
                 ..
             } => {
-                let groups = plan_position_delete_groups(
-                    files,
-                    *rewrite_all,
-                    min_input_files.unwrap_or(2) as usize,
-                )?;
+                let groups = plan_position_delete_groups(files, *rewrite_all, *min_input_files)?;
                 if !groups.is_empty()
                     && metadata.format_version() != crate::iceberg::spec::FormatVersion::V3
                 {
@@ -378,7 +374,7 @@ pub(crate) struct IcebergFrozenRewriteArtifactV1 {
     pub groups: Vec<IcebergFrozenRewriteGroupV1>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IcebergFrozenRewriteGroupV1 {
     pub group_digest_hex: String,
@@ -630,7 +626,7 @@ pub(crate) fn plan_data_file_groups(
 pub(crate) fn plan_position_delete_groups(
     files: Vec<DataFileWithStats>,
     rewrite_all: bool,
-    min_input_files: usize,
+    min_input_files: Option<u32>,
 ) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
     group_data_files(
         files
@@ -638,9 +634,22 @@ pub(crate) fn plan_position_delete_groups(
             .map(data_file_with_stats_to_iceberg_data_file_info)
             .collect(),
         rewrite_all,
-        Some(min_input_files),
+        Some(position_delete_min_input_files(min_input_files)),
     )
 }
+
+/// How many attached Puffin deletion vectors make a data file worth repacking.
+///
+/// The default lives here and nowhere else: planning and the write session both
+/// cut the same groups, and a default resolved twice could drift and leave the
+/// two disagreeing about how many branches the rewrite has.
+fn position_delete_min_input_files(min_input_files: Option<u32>) -> usize {
+    min_input_files.unwrap_or(DEFAULT_POSITION_DELETE_MIN_INPUT_FILES) as usize
+}
+
+/// A data file with a single deletion vector is already packed; two is the
+/// smallest input a repack can actually shrink.
+const DEFAULT_POSITION_DELETE_MIN_INPUT_FILES: u32 = 2;
 
 fn group_data_files(
     mut files: Vec<IcebergDataFileInfo>,

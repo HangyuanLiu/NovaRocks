@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 
+use crate::connector::distributed_rewrite::ConnectorDistributedRewriteShape;
 use crate::connector::handle::ConnectorPinnedFileSet;
 use crate::connector::row_mutation::{
     ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
@@ -128,7 +129,14 @@ pub enum ConnectorWriteSessionFlavor {
     /// a tuning knob: a rewrite that took the external fence would serialize
     /// against ordinary DML it does not conflict with, and a DML write that
     /// skipped it would lose the fence's protection.
-    DistributedRewrite,
+    ///
+    /// It carries the frozen rewrite's shape for the same reason
+    /// [`Self::CopyOnWrite`] carries its selection: the provider cuts the same
+    /// groups a second time when it seals the session, and which artifacts a
+    /// rewrite selected is not a function of the target alone. Reading it off
+    /// the writer input instead would make the branch kind a property of what
+    /// the caller signed rather than of the operation the frontend froze.
+    DistributedRewrite(ConnectorDistributedRewriteShape),
 }
 
 /// How a publication's rows reach it.

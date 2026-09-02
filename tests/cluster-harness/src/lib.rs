@@ -4532,10 +4532,12 @@ pub fn build_novarocks_command(binary: &Path, role: &str, config_path: &Path) ->
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Cross-process SQL fixtures own both process logs, so debug harnesses
-    // enable the bounded connector scan lifecycle markers used for structural
-    // evidence. Release servers reject this debug-only environment variable.
+    // enable the bounded connector scan and write lifecycle markers used for
+    // structural evidence. Release servers reject these debug-only environment
+    // variables.
     if cfg!(debug_assertions) {
         command.env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER", "1");
+        command.env("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER", "1");
     }
     command
 }
@@ -4945,18 +4947,22 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn novarocks_command_only_enables_connector_reader_marker_in_debug_harnesses() {
+    fn novarocks_command_only_enables_connector_markers_in_debug_harnesses() {
         let command = build_novarocks_command(
             Path::new("/tmp/novarocks"),
             "fe",
             Path::new("/tmp/novarocks-fe.toml"),
         );
-        let marker_is_set = command.get_envs().any(|(name, value)| {
-            name == OsStr::new("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
-                && value == Some(OsStr::new("1"))
-        });
+        for marker in [
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
+            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",
+        ] {
+            let marker_is_set = command
+                .get_envs()
+                .any(|(name, value)| name == OsStr::new(marker) && value == Some(OsStr::new("1")));
 
-        assert_eq!(marker_is_set, cfg!(debug_assertions));
+            assert_eq!(marker_is_set, cfg!(debug_assertions), "{marker}");
+        }
     }
 
     fn lifecycle_debug_json(execution_id: &str) -> serde_json::Value {

@@ -65,6 +65,16 @@ pub fn debug_emit_connector_reader_marker() -> bool {
     debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
 }
 
+/// Returns whether execution should emit connector-writer evidence markers.
+///
+/// It is a separate switch from the reader marker rather than the same one:
+/// the two prove different halves of a distributed write, and a case asserting
+/// that a writer opened on a backend must not be satisfied by a page source
+/// having opened there.
+pub fn debug_emit_connector_writer_marker() -> bool {
+    debug_env_flag("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER")
+}
+
 /// Returns whether catalog runtime materialization emits a test-only marker.
 ///
 /// The marker carries only the immutable catalog handle and is compiled out of

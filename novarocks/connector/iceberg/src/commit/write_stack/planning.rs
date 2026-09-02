@@ -449,7 +449,7 @@ pub fn plan_write_session(
     // way therefore replaces nothing: its empty prepared set terminates it as a
     // no-op, and a non-empty one is refused by the commit action rather than
     // retiring files no group named.
-    let rewrite_inputs = if input.flavor == IcebergWriteFlavor::DistributedRewrite {
+    let rewrite_inputs = if input.flavor.is_distributed_rewrite() {
         branches
             .iter()
             .map(|_| IcebergFrozenRewriteBranchInput::default())

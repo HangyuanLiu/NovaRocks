@@ -57,11 +57,63 @@ pub enum ConnectorDistributedRewriteOperation {
     },
 }
 
+/// Which artifacts a distributed rewrite republishes, and the selection facts
+/// that decide which of them it selected.
+///
+/// This is the frozen operation stripped of its target, so it can travel with a
+/// write session that already names one. It exists because the two rewrites are
+/// not distinguishable downstream by anything else: both reach `begin_write`
+/// through the same neutral request, and a provider that read the writer input
+/// shape instead would let a caller turn a data rewrite into a delete rewrite by
+/// signing a different input.
+///
+/// The selection facts travel with the kind rather than being re-derived. A
+/// provider cuts the same groups twice — once when it freezes the plan, once
+/// when it seals the session — and which delete artifacts a rewrite selected is
+/// not a function of the target alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorDistributedRewriteShape {
+    /// Republish the target's data files.
+    ///
+    /// `rewrite_all` is carried so the shape stays a faithful projection of the
+    /// frozen operation. Whether a provider narrows its selection by it is that
+    /// provider's decision; both sides read the same value, so they cannot
+    /// disagree about the group set either way.
+    DataFiles { rewrite_all: bool },
+    /// Repack the position-delete artifacts attached to the target's data
+    /// files. Both facts narrow the selection: `rewrite_all` waives the
+    /// threshold, and `min_input_files` sets how many attached artifacts make a
+    /// data file worth repacking.
+    PositionDeletes {
+        rewrite_all: bool,
+        min_input_files: Option<u32>,
+    },
+}
+
 impl ConnectorDistributedRewriteOperation {
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::RewriteDataFiles { .. } => REWRITE_DATA_FILES_KIND,
             Self::RewritePositionDeletes { .. } => REWRITE_POSITION_DELETES_KIND,
+        }
+    }
+
+    /// What this operation rewrites, without its target.
+    pub const fn shape(&self) -> ConnectorDistributedRewriteShape {
+        match self {
+            Self::RewriteDataFiles { rewrite_all, .. } => {
+                ConnectorDistributedRewriteShape::DataFiles {
+                    rewrite_all: *rewrite_all,
+                }
+            }
+            Self::RewritePositionDeletes {
+                rewrite_all,
+                min_input_files,
+                ..
+            } => ConnectorDistributedRewriteShape::PositionDeletes {
+                rewrite_all: *rewrite_all,
+                min_input_files: *min_input_files,
+            },
         }
     }
 
@@ -390,8 +442,10 @@ impl fmt::Debug for ConnectorDistributedRewriteCohortPlan {
 pub struct ConnectorDistributedRewritePlan {
     owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
-    operation_kind: Arc<str>,
-    target: ConnectorTableHandle,
+    /// The exact operation this plan froze. It is kept whole rather than
+    /// reduced to a kind and a target, because everything downstream that must
+    /// re-cut the same groups needs its selection facts too.
+    operation: ConnectorDistributedRewriteOperation,
     request_digest: [u8; 32],
     state_digest: [u8; 32],
     manifest_digest: [u8; 32],
@@ -443,8 +497,7 @@ impl ConnectorDistributedRewritePlan {
         Ok(Self {
             owner: request.owner.clone(),
             operation_id: request.operation_id,
-            operation_kind: request.operation.kind().into(),
-            target: request.operation.table().clone(),
+            operation: request.operation.clone(),
             request_digest: request.request_digest,
             state_digest,
             manifest_digest,
@@ -460,14 +513,24 @@ impl ConnectorDistributedRewritePlan {
     pub const fn operation_id(&self) -> ConnectorWriteOperationId {
         self.operation_id
     }
-    pub fn operation_kind(&self) -> &str {
-        &self.operation_kind
+    pub const fn operation_kind(&self) -> &str {
+        self.operation.kind()
+    }
+    /// The exact operation this plan froze.
+    pub const fn operation(&self) -> &ConnectorDistributedRewriteOperation {
+        &self.operation
+    }
+    /// What this plan rewrites, and how it selected it. A session sealed from
+    /// this plan must cut the same groups, so it is told the same facts rather
+    /// than left to infer them from the writer input.
+    pub const fn shape(&self) -> ConnectorDistributedRewriteShape {
+        self.operation.shape()
     }
     /// Table that receives the C1 staged output.  Cohort sources may differ
     /// from this table in future providers, so callers must not substitute a
     /// source handle here.
-    pub fn target(&self) -> &ConnectorTableHandle {
-        &self.target
+    pub const fn target(&self) -> &ConnectorTableHandle {
+        self.operation.table()
     }
     pub const fn request_digest(&self) -> [u8; 32] {
         self.request_digest
@@ -492,10 +555,8 @@ impl ConnectorDistributedRewritePlan {
     }
     pub fn validate(&self) -> Result<(), ConnectorError> {
         validate_payload(&self.provider_payload, "plan")?;
-        if !matches!(
-            self.operation_kind.as_ref(),
-            REWRITE_DATA_FILES_KIND | REWRITE_POSITION_DELETES_KIND
-        ) || self.cohorts.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
+        self.operation.validate()?;
+        if self.cohorts.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS
             || self
                 .cohorts
                 .windows(2)
@@ -503,11 +564,11 @@ impl ConnectorDistributedRewritePlan {
         {
             return Err(invalid("distributed rewrite plan is invalid"));
         }
-        if self.target.owner() != &self.owner.instance_id
+        if self.target().owner() != &self.owner.instance_id
             || self.cohorts.iter().any(|cohort| {
                 cohort.preparation.validate().is_err()
                     || cohort.preparation.owner() != &self.owner
-                    || cohort.preparation.table() != &self.target
+                    || cohort.preparation.table() != self.target()
                     || cohort.preparation.intent()
                         != rewrite_operation_intent(self.operation_kind())
             })
@@ -517,7 +578,7 @@ impl ConnectorDistributedRewritePlan {
         if self.plan_digest
             != plan_digest(
                 self.request_digest,
-                &self.target,
+                self.target(),
                 self.state_digest,
                 self.manifest_digest,
                 self.summary,
@@ -536,8 +597,8 @@ impl fmt::Debug for ConnectorDistributedRewritePlan {
         f.debug_struct("ConnectorDistributedRewritePlan")
             .field("owner", &self.owner)
             .field("operation_id", &self.operation_id)
-            .field("operation_kind", &self.operation_kind)
-            .field("target_owner", self.target.owner())
+            .field("operation_kind", &self.operation_kind())
+            .field("target_owner", self.target().owner())
             .field("manifest_digest", &self.manifest_digest)
             .field("cohort_count", &self.cohorts.len())
             .field("provider_payload_len", &self.provider_payload.len())

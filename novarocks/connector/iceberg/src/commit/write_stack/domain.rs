@@ -156,8 +156,17 @@ pub enum IcebergWriteFlavor {
     StagedCreate,
     /// Materialized-view refresh publication.
     ManagedPublication,
-    /// Distributed compaction / rewrite of a frozen file set.
+    /// Distributed compaction / rewrite of a frozen data file set.
     DistributedRewrite,
+    /// Distributed repack of a frozen position-delete artifact set.
+    ///
+    /// It is a separate flavor from [`Self::DistributedRewrite`] rather than a
+    /// flag on it because the two seal different physical branches: this one
+    /// republishes deletion vectors and never writes a data file, and the other
+    /// republishes data files and never writes a delete artifact. Keeping them
+    /// apart is what lets `allowed_session_branches` refuse each one's branch on
+    /// the other.
+    DistributedRewritePositionDeletes,
     /// Provider-owned maintenance such as `TRUNCATE`.
     TableMaintenance,
 }
@@ -183,8 +192,41 @@ impl IcebergWriteFlavor {
             // equality delete's are not.
             Self::EqualityDelete => CommitOpKind::RowDelta,
             Self::RowMutationCopyOnWrite => CommitOpKind::CowUpdate,
-            Self::DistributedRewrite => CommitOpKind::SelectedRewrite,
+            // Both rewrites commit as one selected replacement of a frozen
+            // input set; what differs is which half of that set they replace,
+            // and the commit reads that off the session's flavor.
+            Self::DistributedRewrite | Self::DistributedRewritePositionDeletes => {
+                CommitOpKind::SelectedRewrite
+            }
             Self::TableMaintenance => CommitOpKind::Truncate,
+        }
+    }
+
+    /// Whether this flavor is one of the two distributed rewrites.
+    ///
+    /// The two share every session-level rule but their branch set: both freeze
+    /// one input per branch, both may repeat a branch, both skip the external
+    /// write fence, and both terminate an empty prepared set without a commit.
+    pub const fn is_distributed_rewrite(self) -> bool {
+        matches!(
+            self,
+            Self::DistributedRewrite | Self::DistributedRewritePositionDeletes
+        )
+    }
+
+    /// The frozen input half a rewrite of this flavor replaces.
+    ///
+    /// `None` on every flavor that is not a rewrite. It is read off the flavor
+    /// rather than off the staged artifacts, because a branch whose writer
+    /// produced nothing must still retire its frozen inputs.
+    pub(crate) const fn selected_rewrite_kind(
+        self,
+    ) -> Option<crate::commit::selected_rewrite::SelectedRewriteKind> {
+        use crate::commit::selected_rewrite::SelectedRewriteKind;
+        match self {
+            Self::DistributedRewrite => Some(SelectedRewriteKind::Data),
+            Self::DistributedRewritePositionDeletes => Some(SelectedRewriteKind::PositionDeletes),
+            _ => None,
         }
     }
 
@@ -210,6 +252,11 @@ impl IcebergWriteFlavor {
             // a data branch beside it would give SQL somewhere to send rows the
             // statement never produces.
             Self::EqualityDelete => &[IcebergWriteBranch::EqualityDelete],
+            // A position-delete rewrite reads old deletion vectors and writes
+            // replacements for them; it never produces a table row, so sealing
+            // a data branch beside it would give SQL somewhere to send rows the
+            // operation never produces.
+            Self::DistributedRewritePositionDeletes => &[IcebergWriteBranch::DeletionVector],
         }
     }
 
@@ -225,15 +272,20 @@ impl IcebergWriteFlavor {
     /// Whether one sealed session may seal the same physical branch more than
     /// once.
     ///
-    /// Only a distributed rewrite and a copy-on-write mutation may. Their
-    /// logical targets are all data branches — one per frozen rewrite group,
-    /// one per rewritten data file — and the ordinal, not the branch, is what
-    /// tells them apart. Every other flavor keeps the stricter rule, because a
-    /// repeated delete branch would make the old-delete merge owner ambiguous.
+    /// Only the two distributed rewrites and a copy-on-write mutation may.
+    /// Their logical targets are all one branch kind — one per frozen rewrite
+    /// group, one per rewritten data file — and the ordinal, not the branch, is
+    /// what tells them apart. Every other flavor keeps the stricter rule,
+    /// because a repeated delete branch would make the old-delete merge owner
+    /// ambiguous. A position-delete rewrite repeats one and stays unambiguous
+    /// for a different reason: `prove_unique_delete_owner` still runs, and its
+    /// groups own disjoint data files, so no two branches claim one file.
     pub const fn seals_one_target_per_branch(self) -> bool {
         !matches!(
             self,
-            Self::DistributedRewrite | Self::RowMutationCopyOnWrite
+            Self::DistributedRewrite
+                | Self::DistributedRewritePositionDeletes
+                | Self::RowMutationCopyOnWrite
         )
     }
 
@@ -246,7 +298,7 @@ impl IcebergWriteFlavor {
     /// it does not conflict with. Every other flavor keeps the fence, because a
     /// DML write that skipped it would lose that protection.
     pub const fn requires_external_write_fence(self) -> bool {
-        !matches!(self, Self::DistributedRewrite)
+        !self.is_distributed_rewrite()
     }
 }
 
@@ -550,6 +602,7 @@ impl IcebergWriteFlavor {
             Self::StagedCreate => "staged-create",
             Self::ManagedPublication => "managed-publication",
             Self::DistributedRewrite => "distributed-rewrite",
+            Self::DistributedRewritePositionDeletes => "distributed-rewrite-position-deletes",
             Self::TableMaintenance => "table-maintenance",
             Self::EqualityDelete => "equality-delete",
         }
@@ -565,9 +618,12 @@ impl IcebergWriteFlavor {
                 ConnectorWriteIntent::Overwrite
             }
             Self::PartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
+            // A position-delete rewrite stages delete artifacts, so it presents
+            // the same neutral intent every other delete-staging write does.
             Self::RowMutationPositionDelete
             | Self::RowMutationDeletionVector
             | Self::RowMutationCopyOnWrite
+            | Self::DistributedRewritePositionDeletes
             | Self::EqualityDelete => ConnectorWriteIntent::RowDelta,
         }
     }
@@ -1847,7 +1903,7 @@ impl IcebergCommitHandle {
         // number of entries than it sealed branches could not say which files
         // any one branch replaces. The two directions are both errors for the
         // same reason as the staged metadata above.
-        if rewrite_inputs.is_empty() == (flavor == IcebergWriteFlavor::DistributedRewrite) {
+        if rewrite_inputs.is_empty() == flavor.is_distributed_rewrite() {
             return Err(invalid(format!(
                 "Iceberg {} write session must carry a frozen rewrite input per branch exactly when it rewrites a frozen file set",
                 flavor.as_str()
@@ -2045,7 +2101,7 @@ impl IcebergCommitHandle {
     /// first depends on a disposition only the publication carries, and the
     /// second differs from a zero-row `INSERT`, which still publishes.
     pub fn empty_write_decision(&self) -> IcebergEmptyWriteDecision {
-        if self.flavor == IcebergWriteFlavor::DistributedRewrite {
+        if self.flavor.is_distributed_rewrite() {
             return IcebergEmptyWriteDecision::SkipExternalCommit;
         }
         match self
@@ -2202,6 +2258,24 @@ mod tests {
             IcebergWriteFlavor::RowMutationDeletionVector.branches(),
             &[IcebergWriteBranch::Data, IcebergWriteBranch::DeletionVector]
         );
+        // Two flavors deliberately own no data branch: they write delete
+        // artifacts and nothing else, so sealing one would give SQL somewhere
+        // to send rows the statement never produces.
+        for (flavor, branches) in [
+            (
+                IcebergWriteFlavor::EqualityDelete,
+                &[IcebergWriteBranch::EqualityDelete][..],
+            ),
+            (
+                IcebergWriteFlavor::DistributedRewritePositionDeletes,
+                &[IcebergWriteBranch::DeletionVector][..],
+            ),
+        ] {
+            assert_eq!(flavor.branches(), branches, "{}", flavor.as_str());
+            let _ = flavor.commit_op_kind();
+            let _ = flavor.connector_intent();
+            assert!(flavor.accepts_empty_prepared_set());
+        }
     }
 
     #[test]
