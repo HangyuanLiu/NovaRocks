@@ -268,6 +268,7 @@ fn validate_iceberg_commit_fragment(
 
 #[cfg(test)]
 mod tests {
+    use super::super::MAX_COLUMN_STAT_BOUND_BYTES;
     use super::*;
     use crate::ProtocolErrorKind;
 
@@ -446,6 +447,89 @@ mod tests {
             error.path().to_string(),
             "commit_fragment.iceberg.data_file.metrics.column_stats.null_value_counts[\"1\"]"
         );
+    }
+
+    /// Grow a valid data-file fragment until it encodes to exactly `target`
+    /// bytes.
+    ///
+    /// Column bounds are the only field with room to reach a megabyte, and each
+    /// one is separately capped, so the padding is spread over full-size
+    /// entries plus a final entry whose length is solved for. Kept inside the
+    /// 16 KiB..64 KiB band that final length keeps a three-byte protobuf length
+    /// prefix, so one added byte is one added encoded byte and the solve
+    /// settles in a single correction.
+    fn fragment_encoding_exactly(target: usize) -> dto::ConnectorCommitFragment {
+        let full = target / MAX_COLUMN_STAT_BOUND_BYTES - 1;
+        let build = |last: usize| {
+            let mut raw = data_file();
+            let dto::connector_commit_fragment::Fragment::Iceberg(iceberg) =
+                raw.fragment.as_mut().expect("variant");
+            let Some(dto::iceberg_commit_fragment::Artifact::DataFile(data)) =
+                iceberg.artifact.as_mut()
+            else {
+                unreachable!("data file fixture")
+            };
+            let stats = data
+                .metrics
+                .as_mut()
+                .expect("metrics")
+                .column_stats
+                .as_mut()
+                .expect("stats");
+            for index in 0..=full {
+                let field_id = 1000 + i32::try_from(index).expect("bounded");
+                let bytes = if index == full {
+                    last
+                } else {
+                    MAX_COLUMN_STAT_BOUND_BYTES
+                };
+                stats.lower_bounds.insert(field_id, vec![7_u8; bytes]);
+            }
+            raw
+        };
+
+        let mut last = 32 * 1024;
+        for _ in 0..4 {
+            let candidate = build(last);
+            let encoded_len = candidate.encoded_len();
+            if encoded_len == target {
+                return candidate;
+            }
+            let correction = isize::try_from(target).expect("bounded")
+                - isize::try_from(encoded_len).expect("bounded");
+            last = last
+                .checked_add_signed(correction)
+                .expect("the correction stays positive");
+            assert!(
+                (16 * 1024..=MAX_COLUMN_STAT_BOUND_BYTES).contains(&last),
+                "the tuning bound left the constant-width band at {last} bytes"
+            );
+        }
+        panic!("could not pad a commit fragment to exactly {target} bytes");
+    }
+
+    /// Reaching the frozen single-fragment budget is legal; the gate rejects
+    /// only what exceeds it. Proving the inclusive side needs a fragment that
+    /// encodes to exactly the budget, not one that merely approaches it.
+    #[test]
+    fn a_fragment_at_exactly_the_frozen_budget_is_accepted_and_reports_it() {
+        let raw = fragment_encoding_exactly(MAX_COMMIT_FRAGMENT_ENCODED_BYTES);
+        assert_eq!(raw.encoded_len(), MAX_COMMIT_FRAGMENT_ENCODED_BYTES);
+        let validated = parse(raw).expect("the exact single-fragment budget is legal");
+        // The caller charges its ledger with this number, so it must be the
+        // one the gate bounded.
+        assert_eq!(validated.encoded_len(), MAX_COMMIT_FRAGMENT_ENCODED_BYTES);
+    }
+
+    /// One byte over the same budget, with every other field still valid, so
+    /// the size gate is the only thing that can reject it.
+    #[test]
+    fn a_fragment_one_byte_over_the_frozen_budget_is_rejected() {
+        let raw = fragment_encoding_exactly(MAX_COMMIT_FRAGMENT_ENCODED_BYTES + 1);
+        assert_eq!(raw.encoded_len(), MAX_COMMIT_FRAGMENT_ENCODED_BYTES + 1);
+        let error = parse(raw).expect_err("one byte over the single-fragment budget");
+        assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(error.path().to_string(), "commit_fragment");
     }
 
     #[test]

@@ -48,10 +48,10 @@ use prost::Message;
 use novarocks_execution::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, ConnectorCommitFragmentEncoder,
 };
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_write::{
     ConnectorWriteFragmentEncoder, ValidatedCommitFragment,
 };
+use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::connector_write as dto;
 use novarocks_spi::connector::write_stack::{
     ConnectorBatchWriter, ConnectorCommitFragment, ConnectorOpenWriterRequest,
@@ -147,6 +147,21 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
         })?;
         let validated = ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
             .map_err(|error| {
+                // A fragment that is merely too large is not corrupt, and the
+                // difference is what an operator acts on: one says the write
+                // outgrew a frozen budget, the other says something rewrote the
+                // bytes in flight. The size gate runs inside `parse`, before the
+                // ledger would have charged it, so the kind has to be recovered
+                // here or the budget's documented failure never appears.
+                if error.kind() == ProtocolErrorKind::OutOfRange {
+                    return ConnectorError::new(
+                        ConnectorErrorKind::ResourceExhausted,
+                        format!(
+                            "connector commit fragment carrier for write target {}: {error}",
+                            target.get()
+                        ),
+                    );
+                }
                 carrier_error(target, format!("carrier failed validation: {error}"))
             })?;
         // Canonicality is a byte-exact property, not a length coincidence: the
@@ -625,14 +640,32 @@ mod tests {
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 
+    /// An oversized carrier exhausts a frozen budget; it is not corrupt data.
+    ///
+    /// The distinction is what an operator acts on: one says the write outgrew
+    /// a budget, the other says something rewrote the bytes in flight. The size
+    /// gate lives inside the carrier parse, which runs before the ledger would
+    /// have charged it, so this is the only place the budget's documented
+    /// failure can surface.
     #[test]
-    fn the_validator_rejects_a_carrier_over_the_frozen_fragment_budget() {
+    fn the_validator_reports_a_carrier_over_the_frozen_fragment_budget_as_exhausted() {
         let validator = RootCommitFragmentCarrierValidator::new(execution_id(), 12);
         let oversized = data_file_fragment(&"s".repeat(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1))
             .encode_to_vec();
         let error = validator
             .validate(target(0), &oversized)
             .expect_err("an oversized carrier is refused");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    /// A carrier that is within the budget but structurally wrong stays
+    /// CorruptData, so the two failures cannot collapse into one.
+    #[test]
+    fn the_validator_still_reports_a_malformed_carrier_as_corrupt() {
+        let validator = RootCommitFragmentCarrierValidator::new(execution_id(), 12);
+        let error = validator
+            .validate(target(0), b"not a protobuf message at all")
+            .expect_err("a malformed carrier is refused");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 

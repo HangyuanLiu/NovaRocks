@@ -200,6 +200,42 @@ impl ConnectorPreparedWriteSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connector::write_stack::runtime::{ConnectorWriteBinding, OpaqueWritePayload};
+    use crate::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
+
+    fn binding() -> ConnectorWriteBinding {
+        let instance_id = ConnectorInstanceId::parse("prepared_unit").expect("instance id");
+        ConnectorWriteBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("fake").expect("provider id"),
+                instance_id: instance_id.clone(),
+            },
+            CatalogHandle::new(instance_id, CatalogVersion::from_bytes([3; 32])),
+        )
+    }
+
+    /// `count` decoded fragments all naming `target`, as a completed
+    /// aggregation would hand them to the frontend.
+    fn fragments(
+        target: WriteTargetOrdinal,
+        count: usize,
+    ) -> Vec<(WriteTargetOrdinal, ConnectorCommitFragment)> {
+        let binding = binding();
+        (0..count)
+            .map(|_| {
+                (
+                    target,
+                    ConnectorCommitFragment::from_parts(
+                        binding.clone(),
+                        OpaqueWritePayload::new(()),
+                    ),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn ledger_accepts_the_exact_bounds_and_rejects_one_more() {
@@ -280,5 +316,142 @@ mod tests {
     fn prepared_set_accepts_a_single_target_query_set_at_a_non_zero_ordinal() {
         let targets = [WriteTargetOrdinal::try_new(2).expect("bounded")];
         assert!(ConnectorPreparedWriteSet::try_new(0, Vec::new(), &targets).is_ok());
+    }
+
+    /// The ledger bounds entries while the root aggregates; the constructor
+    /// bounds them again on the set the frontend is about to commit. The
+    /// constructor's own boundary is therefore a separate fact from the
+    /// ledger's, and the exact bound has to be a set that exists.
+    #[test]
+    fn prepared_set_accepts_the_exact_entry_budget_and_refuses_one_more() {
+        let target = WriteTargetOrdinal::try_new(0).expect("bounded");
+        let targets = [target];
+
+        let exact = ConnectorPreparedWriteSet::try_new(
+            0,
+            fragments(target, MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES),
+            &targets,
+        )
+        .expect("the exact entry budget is legal");
+        assert_eq!(
+            exact.fragments().len(),
+            MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES
+        );
+
+        let error = ConnectorPreparedWriteSet::try_new(
+            0,
+            fragments(target, MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES + 1),
+            &targets,
+        )
+        .expect_err("one entry over the budget");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    /// A copy-on-write statement drives several queries against one session and
+    /// commits once. Each query's set is complete for its own execution graph,
+    /// so a per-query charge would accept every one of them while the frontend
+    /// held their sum. The budgets bound that sum.
+    #[test]
+    fn the_set_byte_budget_bounds_the_union_of_a_statements_queries() {
+        let per_query = MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES / 2;
+        let fragments_per_query = per_query / MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES;
+
+        // Either query alone is inside the byte budget with room to spare.
+        for _ in 0..2 {
+            let mut alone = PreparedWriteSetLedger::new();
+            for _ in 0..fragments_per_query {
+                alone
+                    .reserve_fragment(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES)
+                    .expect("one query is well inside the byte budget");
+            }
+            assert_eq!(alone.bytes(), per_query);
+        }
+
+        // Charged on the union, the second query fills the budget exactly and
+        // the next fragment is refused.
+        let mut union = PreparedWriteSetLedger::new();
+        for _ in 0..(2 * fragments_per_query) {
+            union
+                .reserve_fragment(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES)
+                .expect("the union is still inside the byte budget");
+        }
+        assert_eq!(union.bytes(), MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES);
+        let settled = union;
+        let mut over = settled;
+        assert_eq!(
+            over.reserve_fragment(1)
+                .expect_err("over the union byte budget")
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        // A refused fragment charges nothing: the ledger still describes the
+        // set that was actually accepted.
+        assert_eq!(over, settled);
+    }
+
+    /// The entry budget is a union fact too, and it is reached by fragments
+    /// that cost no bytes at all -- which is exactly why it exists beside the
+    /// byte budget.
+    #[test]
+    fn the_set_entry_budget_bounds_the_union_of_a_statements_queries() {
+        let per_query = MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES / 2;
+
+        let mut alone = PreparedWriteSetLedger::new();
+        for _ in 0..per_query {
+            alone
+                .reserve_fragment(0)
+                .expect("one query is well inside the entry budget");
+        }
+        assert_eq!(alone.entries(), per_query);
+
+        let mut union = PreparedWriteSetLedger::new();
+        for _ in 0..(2 * per_query) {
+            union
+                .reserve_fragment(0)
+                .expect("the union is still inside the entry budget");
+        }
+        assert_eq!(union.entries(), MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES);
+        let settled = union;
+        let mut over = settled;
+        assert_eq!(
+            over.reserve_fragment(0)
+                .expect_err("over the union entry budget")
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(over, settled);
+    }
+
+    /// Refusing the set byte budget must not leave the ledger describing a
+    /// partially charged set: the frontend commits what the ledger accepted, so
+    /// a half-charged fragment would be a half-committed write.
+    #[test]
+    fn a_refused_fragment_leaves_the_set_ledger_exactly_where_it_was() {
+        let mut ledger = PreparedWriteSetLedger::new();
+        let full = MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES / MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES;
+        for _ in 0..full {
+            ledger
+                .reserve_fragment(MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES)
+                .expect("within the set byte budget");
+        }
+        let settled = ledger;
+
+        // Over the single-fragment budget, over the set byte budget, and over
+        // both at once: none of them may move the ledger.
+        for over in [
+            MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES + 1,
+            1,
+            MAX_CONNECTOR_PREPARED_WRITE_SET_BYTES + 1,
+        ] {
+            let mut attempt = settled;
+            assert_eq!(
+                attempt
+                    .reserve_fragment(over)
+                    .expect_err("over a frozen budget")
+                    .kind(),
+                ConnectorErrorKind::ResourceExhausted
+            );
+            assert_eq!(attempt, settled);
+        }
     }
 }

@@ -679,6 +679,77 @@ mod tests {
         assert_eq!(validated.as_proto(), &raw);
     }
 
+    /// Grow a valid data-branch handle until it encodes to exactly `target`
+    /// bytes.
+    ///
+    /// Transform expressions are the only field with room to reach sixteen
+    /// megabytes, and each one is separately capped, so the padding is spread
+    /// over full-size expressions plus a final one whose length is solved for.
+    /// Every added expression needs its paired partition column, or the recipe
+    /// would be rejected for a reason that has nothing to do with size. Kept
+    /// inside the 16 KiB..64 KiB band the final length keeps a three-byte
+    /// protobuf length prefix, so one added byte is one added encoded byte and
+    /// the solve settles in a single correction.
+    fn handle_encoding_exactly(target: usize) -> dto::ConnectorWriterHandle {
+        let full = target / MAX_TRANSFORM_EXPR_BYTES - 1;
+        let build = |last: usize| {
+            let mut raw = data_handle();
+            let dto::connector_writer_handle::Handle::Iceberg(iceberg) =
+                raw.handle.as_mut().expect("variant");
+            let data = iceberg.data.as_mut().expect("data recipe");
+            for index in 0..=full {
+                let bytes = if index == full {
+                    last
+                } else {
+                    MAX_TRANSFORM_EXPR_BYTES
+                };
+                data.partition_column_names.push(format!("pad_{index}"));
+                data.transform_exprs.push("e".repeat(bytes));
+            }
+            raw
+        };
+
+        let mut last = 32 * 1024;
+        for _ in 0..4 {
+            let candidate = build(last);
+            let encoded_len = candidate.encoded_len();
+            if encoded_len == target {
+                return candidate;
+            }
+            let correction = isize::try_from(target).expect("bounded")
+                - isize::try_from(encoded_len).expect("bounded");
+            last = last
+                .checked_add_signed(correction)
+                .expect("the correction stays positive");
+            assert!(
+                (16 * 1024..=MAX_TRANSFORM_EXPR_BYTES).contains(&last),
+                "the tuning expression left the constant-width band at {last} bytes"
+            );
+        }
+        panic!("could not pad a writer handle to exactly {target} bytes");
+    }
+
+    /// Reaching the frozen single-handle budget is legal; the gate rejects only
+    /// what exceeds it.
+    #[test]
+    fn a_handle_at_exactly_the_frozen_budget_is_accepted() {
+        let raw = handle_encoding_exactly(MAX_WRITER_HANDLE_ENCODED_BYTES);
+        assert_eq!(raw.encoded_len(), MAX_WRITER_HANDLE_ENCODED_BYTES);
+        parse(raw).expect("the exact single-handle budget is legal");
+    }
+
+    /// One byte over the same budget, with every other field still valid, so
+    /// the size gate is the only thing that can reject it -- and it names the
+    /// carrier rather than a field, because it fires before the walk.
+    #[test]
+    fn a_handle_one_byte_over_the_frozen_budget_is_rejected() {
+        let raw = handle_encoding_exactly(MAX_WRITER_HANDLE_ENCODED_BYTES + 1);
+        assert_eq!(raw.encoded_len(), MAX_WRITER_HANDLE_ENCODED_BYTES + 1);
+        let error = parse(raw).expect_err("one byte over the single-handle budget");
+        assert_eq!(error.kind(), ProtocolErrorKind::OutOfRange);
+        assert_eq!(error.path().to_string(), "writer_handle");
+    }
+
     #[test]
     fn a_handle_without_a_provider_variant_is_a_missing_field() {
         let error = parse(dto::ConnectorWriterHandle { handle: None }).expect_err("no variant");

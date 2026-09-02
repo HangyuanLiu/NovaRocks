@@ -117,6 +117,62 @@ mod tests {
         );
     }
 
+    /// The free function is what both sides call, but the frontend reaches the
+    /// cap through the ledger, so the ledger's own boundary is asserted too --
+    /// and a refused handle must leave nothing charged behind it.
+    #[test]
+    fn the_ledger_enforces_the_single_handle_cap_at_its_exact_boundary() {
+        let mut exact = UniqueWriterHandleLedger::new();
+        exact
+            .charge(target(0), MAX_CONNECTOR_WRITER_HANDLE_BYTES)
+            .expect("the exact single-handle budget is legal");
+        assert_eq!(exact.bytes(), MAX_CONNECTOR_WRITER_HANDLE_BYTES);
+        assert_eq!(exact.unique_handles(), 1);
+
+        let mut over = UniqueWriterHandleLedger::new();
+        assert_eq!(
+            over.charge(target(0), MAX_CONNECTOR_WRITER_HANDLE_BYTES + 1)
+                .expect_err("one byte over the single-handle budget")
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(over.bytes(), 0);
+        assert_eq!(over.unique_handles(), 0);
+    }
+
+    /// A refused handle must not half-charge the unique total: the ledger has
+    /// to keep describing the set of targets that was actually sealed.
+    #[test]
+    fn a_refused_handle_leaves_the_unique_ledger_exactly_where_it_was() {
+        let mut ledger = UniqueWriterHandleLedger::new();
+        let per_target = MAX_CONNECTOR_WRITER_HANDLE_BYTES;
+        let fits = MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES / per_target;
+        for index in 0..fits {
+            let ordinal = u32::try_from(index).expect("bounded");
+            ledger
+                .charge(target(ordinal), per_target)
+                .expect("within the unique budget");
+        }
+        let settled_bytes = ledger.bytes();
+        let settled_handles = ledger.unique_handles();
+        assert_eq!(settled_bytes, MAX_CONNECTOR_UNIQUE_WRITER_HANDLE_BYTES);
+
+        let next = u32::try_from(fits).expect("bounded");
+        // Over the unique total, and over the single-handle cap: neither may
+        // move the ledger.
+        for (ordinal, bytes) in [(next, 1), (next + 1, MAX_CONNECTOR_WRITER_HANDLE_BYTES + 1)] {
+            assert_eq!(
+                ledger
+                    .charge(target(ordinal), bytes)
+                    .expect_err("over a frozen budget")
+                    .kind(),
+                ConnectorErrorKind::ResourceExhausted
+            );
+            assert_eq!(ledger.bytes(), settled_bytes);
+            assert_eq!(ledger.unique_handles(), settled_handles);
+        }
+    }
+
     #[test]
     fn physical_copies_of_one_target_are_not_charged_twice() {
         let mut ledger = UniqueWriterHandleLedger::new();

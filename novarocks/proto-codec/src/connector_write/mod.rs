@@ -146,3 +146,29 @@ pub(crate) fn bounded_count(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use novarocks_spi::connector::write_stack::{
+        MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES, MAX_CONNECTOR_WRITER_HANDLE_BYTES,
+    };
+
+    use super::{MAX_COMMIT_FRAGMENT_ENCODED_BYTES, MAX_WRITER_HANDLE_ENCODED_BYTES};
+
+    /// The two encoded-size caps are restated here so the codec can reject a
+    /// carrier before parsing it, but they are the SPI's budgets and nothing
+    /// else. Restating a number is only safe while something proves the two
+    /// copies still agree: widening one alone would silently open the trust
+    /// boundary that the other still believes it closes.
+    #[test]
+    fn the_codec_size_caps_are_the_spi_budgets_they_restate() {
+        assert_eq!(
+            MAX_WRITER_HANDLE_ENCODED_BYTES,
+            MAX_CONNECTOR_WRITER_HANDLE_BYTES
+        );
+        assert_eq!(
+            MAX_COMMIT_FRAGMENT_ENCODED_BYTES,
+            MAX_CONNECTOR_COMMIT_FRAGMENT_BYTES
+        );
+    }
+}
