@@ -1420,6 +1420,9 @@ const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution
 const QUERY_LIFECYCLE_TERMINAL_METRIC: &str = "novarocks_backend_query_lifecycle_terminal_total";
 const FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC: &str =
     "novarocks_frontend_query_lifecycle_control_total";
+const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_terminal_total";
+const FRONTEND_QUERY_LIFECYCLE_ATTEMPTS_METRIC: &str =
+    "novarocks_frontend_query_lifecycle_active_attempts";
 
 const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 10] = [
     "stage_active_builders",
@@ -1873,6 +1876,30 @@ fn assert_role_scoped_metrics(runtime: &CrossProcessRuntime) -> Result<()> {
         runtime.be.len()
     );
     Ok(())
+}
+
+/// Read the single sample of `metric` whose label set contains every requested
+/// pair. Unlike [`prometheus_labeled_gauge`] this matches on more than one
+/// label, which a four-label counter such as the DML publication terminal
+/// family needs in order to name exactly one sample.
+fn prometheus_labeled_sample(body: &str, metric: &str, labels: &[(&str, &str)]) -> Result<f64> {
+    let rendered = labels
+        .iter()
+        .map(|(name, value)| format!("{name}=\"{value}\""))
+        .collect::<Vec<_>>();
+    let mut values = body
+        .lines()
+        .filter(|line| line.starts_with(metric))
+        .filter(|line| rendered.iter().all(|label| line.contains(label.as_str())))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|value| value.parse::<f64>())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parse {metric} labels {rendered:?}"))?;
+    match values.len() {
+        1 => Ok(values.remove(0)),
+        0 => bail!("missing required {metric} sample with labels {rendered:?}"),
+        count => bail!("ambiguous {metric} sample with labels {rendered:?}: {count} samples"),
+    }
 }
 
 fn prometheus_labeled_gauge(
@@ -3203,6 +3230,58 @@ impl CrossProcessServerHandle {
                 format!("read BE[{index}] {metric}{{{label_name}=\"{label_value}\"}}")
             }),
         }
+    }
+
+    /// Read one frontend DML publication terminal counter.
+    ///
+    /// This is the frontend's published record of how a statement's external
+    /// publication ended. `phase` is the part a write scenario cannot infer any
+    /// other way: `pre_dispatch` means the terminal was assigned before the
+    /// statement could possibly have asked a provider to commit, so a
+    /// `pre_dispatch` / `known_uncommitted` terminal is the process-boundary
+    /// form of "the connector's commit was invoked zero times".
+    ///
+    /// The frontend pre-creates every label combination on each scrape, so a
+    /// combination that has never happened reads as zero rather than being
+    /// absent; a missing sample therefore means the frontend changed its
+    /// vocabulary and is reported as an error rather than silently as zero.
+    pub fn frontend_dml_publication_terminal(
+        &self,
+        family: &str,
+        phase: &str,
+        disposition: &str,
+        finalization: &str,
+    ) -> Result<f64> {
+        let metrics = scrape_prometheus_metrics(self.runtime.fe_http_port)
+            .context("scrape cross-process FE /metrics")?;
+        prometheus_labeled_sample(
+            &metrics,
+            DML_PUBLICATION_TERMINAL_METRIC,
+            &[
+                ("family", family),
+                ("phase", phase),
+                ("disposition", disposition),
+                ("finalization", finalization),
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "read FE {DML_PUBLICATION_TERMINAL_METRIC}{{family=\"{family}\",phase=\"{phase}\",disposition=\"{disposition}\",finalization=\"{finalization}\"}}"
+            )
+        })
+    }
+
+    /// Read the frontend's count of live query lifecycle attempts.
+    ///
+    /// The backend resource oracle cannot see this: an attempt's frontend-side
+    /// state -- its control leases, its coordinator, and for a write its commit
+    /// session -- is released by the frontend, and a scenario that only watched
+    /// the backends would call a leaked frontend attempt convergence.
+    pub fn frontend_query_lifecycle_active_attempts(&self) -> Result<f64> {
+        let metrics = scrape_prometheus_metrics(self.runtime.fe_http_port)
+            .context("scrape cross-process FE /metrics")?;
+        prometheus_labeled_sample(&metrics, FRONTEND_QUERY_LIFECYCLE_ATTEMPTS_METRIC, &[])
+            .context("read FE active query lifecycle attempts")
     }
 
     /// Directory containing generated process config and captured logs.
@@ -6332,6 +6411,59 @@ static_file_path = "catalogs.toml"
                 QUERY_EXECUTION_RESOURCE_METRIC,
                 "resource",
                 "native_query_contexts_active"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prometheus_labeled_sample_names_one_publication_terminal() {
+        // Four labels, and three of the samples differ from the wanted one in
+        // exactly one label each: a matcher that checked fewer labels, or that
+        // matched substrings loosely, would pick up a neighbour.
+        let metrics = concat!(
+            "novarocks_dml_publication_terminal_total{family=\"write\",phase=\"pre_dispatch\",disposition=\"known_uncommitted\",finalization=\"not_applicable\"} 4\n",
+            "novarocks_dml_publication_terminal_total{family=\"write\",phase=\"dispatch_possible\",disposition=\"known_uncommitted\",finalization=\"not_applicable\"} 5\n",
+            "novarocks_dml_publication_terminal_total{family=\"data_mutation\",phase=\"pre_dispatch\",disposition=\"known_uncommitted\",finalization=\"not_applicable\"} 6\n",
+            "novarocks_dml_publication_terminal_total{family=\"write\",phase=\"pre_dispatch\",disposition=\"commit_unknown\",finalization=\"not_applicable\"} 7\n",
+        );
+        assert_eq!(
+            prometheus_labeled_sample(
+                metrics,
+                DML_PUBLICATION_TERMINAL_METRIC,
+                &[
+                    ("family", "write"),
+                    ("phase", "pre_dispatch"),
+                    ("disposition", "known_uncommitted"),
+                    ("finalization", "not_applicable"),
+                ],
+            )
+            .expect("read the exact publication terminal sample"),
+            4.0
+        );
+        // A combination the frontend has not published is an error rather than
+        // a zero: reading it as zero would turn a renamed label into a
+        // permanently satisfied assertion.
+        assert!(
+            prometheus_labeled_sample(
+                metrics,
+                DML_PUBLICATION_TERMINAL_METRIC,
+                &[
+                    ("family", "write"),
+                    ("phase", "dispatch_possible"),
+                    ("disposition", "known_committed"),
+                    ("finalization", "succeeded"),
+                ],
+            )
+            .is_err()
+        );
+        // A partially specified label set matches more than one sample, which
+        // must be refused rather than silently resolved to the first.
+        assert!(
+            prometheus_labeled_sample(
+                metrics,
+                DML_PUBLICATION_TERMINAL_METRIC,
+                &[("family", "write"), ("phase", "pre_dispatch")],
             )
             .is_err()
         );
