@@ -651,8 +651,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn writer_node(execution: Arc<dyn ConnectorWriteExecution>) -> TableWriterNode {
+        writer_node_over(values_input(), execution)
+    }
+
+    /// A writer node over a caller-supplied input, for tests that care about the
+    /// pipeline shape the input implies rather than the writer's own behavior.
+    pub(crate) fn writer_node_over(
+        input: Box<ExecNode>,
+        execution: Arc<dyn ConnectorWriteExecution>,
+    ) -> TableWriterNode {
         TableWriterNode::try_new(
-            values_input(),
+            input,
             2,
             writer_handle(),
             target(0),

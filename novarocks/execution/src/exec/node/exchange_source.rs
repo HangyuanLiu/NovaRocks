@@ -17,6 +17,7 @@
 use std::time::Duration;
 
 use crate::exec::chunk::ChunkSchemaRef;
+use crate::exec::expr::ExprId;
 use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 
 #[derive(Clone, Debug)]
@@ -25,6 +26,16 @@ pub struct ExchangeSourceNode {
     pub timeout: Duration,
     pub expected_chunk_schema: ChunkSchemaRef,
     pub native_runtime_filter_specs: Vec<RuntimeFilterConsumerBinding>,
+    /// The key the sender hashed rows by, resolved against this receiver's own
+    /// tuple, or empty when the edge carries no hash key.
+    ///
+    /// A hash edge only promises that rows sharing this key reach the same
+    /// *fragment instance*. Every driver of the receiving pipeline pulls from
+    /// the one instance-wide receiver, so a chunk goes to whichever driver is
+    /// free and the key does not survive to the driver. An operator that needs
+    /// per-driver exclusivity must re-partition locally on this key; it is
+    /// recorded here so it does not have to be guessed from column names.
+    pub hash_partition_exprs: Vec<ExprId>,
 }
 
 impl ExchangeSourceNode {
@@ -34,7 +45,19 @@ impl ExchangeSourceNode {
             timeout,
             expected_chunk_schema,
             native_runtime_filter_specs: Vec::new(),
+            hash_partition_exprs: Vec::new(),
         }
+    }
+
+    /// Record the sender's hash key, already resolved against this receiver's
+    /// tuple. An empty list means the edge is not hash-partitioned.
+    pub fn with_hash_partition_exprs(mut self, exprs: Vec<ExprId>) -> Self {
+        self.hash_partition_exprs = exprs;
+        self
+    }
+
+    pub fn hash_partition_exprs(&self) -> &[ExprId] {
+        &self.hash_partition_exprs
     }
 
     pub fn profile_name(&self) -> String {

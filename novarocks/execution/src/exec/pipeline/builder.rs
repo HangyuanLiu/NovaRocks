@@ -1985,7 +1985,30 @@ fn build_pipeline_for_node(
             // A table writer is an ordinary unary processor: every driver of the
             // upstream pipeline keeps writing at its own degree of parallelism
             // and reports what it wrote downstream. No gather, no shared state.
+            //
+            // What drivers may not do is split one hash key between them. A
+            // hash-partitioned exchange routes a key to one fragment *instance*;
+            // inside that instance every driver pulls from the same receiver, so
+            // two chunks carrying one key are taken by whichever drivers are
+            // free. A connector writer that owns one artifact per key then
+            // stages two of them -- Iceberg permits a single deletion vector per
+            // data file, so a `_file`-keyed delete branch produces two vectors
+            // for one file and the commit is refused as corrupt. Re-partitioning
+            // on the edge's own key restores the guarantee at driver
+            // granularity, and unlike a gather it leaves every driver writing.
+            //
+            // An unpartitioned or random edge carries no key and is left alone.
             let mut build = build_pipeline_for_node(&node.input, ctx)?;
+            let hash_key = match &node.input.kind {
+                ExecNodeKind::ExchangeSource(source) => source.hash_partition_exprs().to_vec(),
+                _ => Vec::new(),
+            };
+            if !hash_key.is_empty() {
+                // `shuffle_by_hash` is a no-op at one partition, which is the
+                // right answer for DOP 1: one driver already owns every key.
+                let partitions = build.pipeline.dop.max(1) as usize;
+                build = shuffle_by_hash(build, ctx, node.node_id, hash_key, partitions);
+            }
             build
                 .pipeline
                 .factories
@@ -2679,5 +2702,164 @@ mod tests {
             .filter(|factory| factory.name().starts_with("UnionAllSink"))
             .count();
         assert_eq!(convergence_sinks, 3);
+    }
+
+    /// Build one table-writer plan over an exchange receiver and report the
+    /// pipeline the writer ended up on, plus the graph it belongs to.
+    fn table_writer_graph_over_exchange(
+        hash_partition_exprs: Vec<crate::exec::expr::ExprId>,
+        arena: ExprArena,
+        dop: i32,
+    ) -> super::PipelineGraph {
+        use crate::exec::node::exchange_source::ExchangeSourceNode;
+        use crate::exec::operators::table_writer::tests::{
+            TestWriteExecution, WriteExecutionStats, writer_input_schema, writer_node_over,
+        };
+        use crate::exec::pipeline::binding::ExchangeBinding;
+        use crate::runtime::exchange::ExchangeKey;
+        use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+        use std::time::Duration;
+
+        const EXCHANGE_NODE_ID: i32 = 7;
+
+        let chunk_schema = chunk_schema_of(&writer_input_schema(), &[SlotId::new(1)]);
+        let input = ExecNode {
+            kind: ExecNodeKind::ExchangeSource(
+                ExchangeSourceNode::new(EXCHANGE_NODE_ID, Duration::from_secs(2), chunk_schema)
+                    .with_hash_partition_exprs(hash_partition_exprs),
+            ),
+        };
+        let execution = Arc::new(TestWriteExecution::new(Arc::new(
+            WriteExecutionStats::default(),
+        )));
+        let plan = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::TableWriter(writer_node_over(Box::new(input), execution)),
+            },
+        };
+
+        let mut bindings = ExchangeBindings::default();
+        bindings.insert(
+            EXCHANGE_NODE_ID,
+            ExchangeBinding {
+                key: ExchangeKey {
+                    finst_id_hi: 1,
+                    finst_id_lo: 2,
+                    node_id: EXCHANGE_NODE_ID,
+                },
+                expected_senders: 1,
+                receiver_port: in_process_test_exchange_receiver_port(),
+            },
+        );
+
+        build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            bindings,
+            ScanBindings::default(),
+            dop,
+        )
+        .expect("build pipeline graph")
+    }
+
+    fn local_exchange_source_count(graph: &super::PipelineGraph) -> usize {
+        graph
+            .pipelines
+            .iter()
+            .flat_map(|pipeline| pipeline.factories.iter())
+            .filter(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            .count()
+    }
+
+    /// A hash-partitioned exchange routes a key to one fragment *instance*, not
+    /// to one driver: every driver of the receiving pipeline pulls from the same
+    /// instance-wide receiver, so two chunks carrying one key are taken by
+    /// whichever drivers happen to be free. A connector writer that owns one
+    /// artifact per key -- Iceberg allows a single deletion vector per data file
+    /// -- then stages two artifacts for that key and the commit is refused as
+    /// corrupt. The writer must therefore sit behind a local shuffle on the very
+    /// key the exchange used.
+    #[test]
+    fn a_table_writer_behind_a_hash_exchange_repartitions_to_its_drivers() {
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let graph = table_writer_graph_over_exchange(vec![key], arena, 4);
+
+        assert_eq!(
+            local_exchange_source_count(&graph),
+            1,
+            "the writer must consume a driver-level shuffle of the exchange key"
+        );
+        let writer_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_WRITER"))
+            })
+            .expect("a pipeline runs the writer");
+        assert_eq!(
+            writer_pipeline.dop, 4,
+            "re-partitioning keeps every driver writing; it is not a gather"
+        );
+        assert!(
+            writer_pipeline
+                .factories
+                .first()
+                .expect("the writer pipeline has a source")
+                .name()
+                .starts_with("LOCAL_EXCHANGE_SOURCE"),
+            "the shuffle must sit between the exchange and the writer"
+        );
+    }
+
+    /// An unpartitioned or random edge carries no key, so there is nothing for a
+    /// local shuffle to preserve and adding one would only cost a pipeline
+    /// boundary. Writers on such an edge keep consuming the exchange directly.
+    #[test]
+    fn a_table_writer_behind_an_unpartitioned_exchange_keeps_its_input() {
+        let graph = table_writer_graph_over_exchange(Vec::new(), ExprArena::default(), 4);
+
+        assert_eq!(
+            local_exchange_source_count(&graph),
+            0,
+            "an edge with no hash key must not gain a shuffle"
+        );
+        let writer_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_WRITER"))
+            })
+            .expect("a pipeline runs the writer");
+        assert_eq!(writer_pipeline.dop, 4);
+        assert!(
+            writer_pipeline
+                .factories
+                .first()
+                .expect("the writer pipeline has a source")
+                .name()
+                .starts_with("EXCHANGE_SOURCE"),
+            "the writer still reads the exchange directly"
+        );
+    }
+
+    /// One driver already owns every key, so a shuffle at DOP 1 would add a
+    /// pipeline boundary and buy nothing.
+    #[test]
+    fn a_single_driver_table_writer_needs_no_shuffle() {
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let graph = table_writer_graph_over_exchange(vec![key], arena, 1);
+
+        assert_eq!(local_exchange_source_count(&graph), 0);
     }
 }
