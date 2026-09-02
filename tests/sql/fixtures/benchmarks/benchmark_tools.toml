@@ -106,51 +106,51 @@ aws_sdk_version = "1.12.262"
 [[fixture.table_layouts]]
 suite = "ssb"
 table = "lineorder"
-range_partitions = 64
+range_partitions = 4
 sort_columns = ["lo_discount", "lo_quantity", "lo_orderdate"]
-target_file_size_bytes = 4194304
+target_file_size_bytes = 67108864
 
 [[fixture.table_layouts]]
 suite = "tpc-h"
 table = "lineitem"
-range_partitions = 64
+range_partitions = 4
 sort_columns = ["l_shipdate", "l_discount", "l_quantity"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [[fixture.table_layouts]]
 suite = "tpc-h"
 table = "orders"
-range_partitions = 16
+range_partitions = 1
 sort_columns = ["o_orderdate", "o_orderkey"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [[fixture.table_layouts]]
 suite = "tpc-ds"
 table = "store_sales"
-range_partitions = 64
+range_partitions = 4
 sort_columns = ["ss_sold_date_sk", "ss_item_sk"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [[fixture.table_layouts]]
 suite = "tpc-ds"
 table = "catalog_sales"
-range_partitions = 64
+range_partitions = 4
 sort_columns = ["cs_sold_date_sk", "cs_item_sk"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [[fixture.table_layouts]]
 suite = "tpc-ds"
 table = "web_sales"
-range_partitions = 64
+range_partitions = 4
 sort_columns = ["ws_sold_date_sk", "ws_item_sk"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [[fixture.table_layouts]]
 suite = "tpc-ds"
 table = "inventory"
-range_partitions = 16
+range_partitions = 1
 sort_columns = ["inv_date_sk", "inv_item_sk"]
-target_file_size_bytes = 16777216
+target_file_size_bytes = 268435456
 
 [fixture.producer_inputs]
 resolver = "tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py"

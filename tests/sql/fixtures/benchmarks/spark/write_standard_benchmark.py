@@ -171,39 +171,39 @@ SUITE_RAW_NAMES = {
 
 TABLE_LAYOUTS = {
     ("ssb", "lineorder"): {
-        "range_partitions": 64,
+        "range_partitions": 4,
         "sort_columns": ["lo_discount", "lo_quantity", "lo_orderdate"],
-        "target_file_size_bytes": 4 * 1024 * 1024,
+        "target_file_size_bytes": 64 * 1024 * 1024,
     },
     ("tpc-h", "lineitem"): {
-        "range_partitions": 64,
+        "range_partitions": 4,
         "sort_columns": ["l_shipdate", "l_discount", "l_quantity"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
     ("tpc-h", "orders"): {
-        "range_partitions": 16,
+        "range_partitions": 1,
         "sort_columns": ["o_orderdate", "o_orderkey"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
     ("tpc-ds", "store_sales"): {
-        "range_partitions": 64,
+        "range_partitions": 4,
         "sort_columns": ["ss_sold_date_sk", "ss_item_sk"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
     ("tpc-ds", "catalog_sales"): {
-        "range_partitions": 64,
+        "range_partitions": 4,
         "sort_columns": ["cs_sold_date_sk", "cs_item_sk"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
     ("tpc-ds", "web_sales"): {
-        "range_partitions": 64,
+        "range_partitions": 4,
         "sort_columns": ["ws_sold_date_sk", "ws_item_sk"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
     ("tpc-ds", "inventory"): {
-        "range_partitions": 16,
+        "range_partitions": 1,
         "sort_columns": ["inv_date_sk", "inv_item_sk"],
-        "target_file_size_bytes": 16 * 1024 * 1024,
+        "target_file_size_bytes": 256 * 1024 * 1024,
     },
 }
 
