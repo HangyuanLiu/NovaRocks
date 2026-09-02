@@ -56,7 +56,14 @@ fn fragment_local_input_closed(kind: &DistributedNodeKind) -> bool {
         | DistributedNodeKind::NestLoopJoin(_)
         | DistributedNodeKind::SetOp(_)
         | DistributedNodeKind::ChangeEventExpand(_)
-        | DistributedNodeKind::Exchange(_) => true,
+        | DistributedNodeKind::Exchange(_)
+        // A `TableWriter` reads only its child subtree and hands each batch to
+        // its own bound writer; a `TableFinish` reads only its Exchange
+        // children (fragment-boundary leaves the walk stops at). Neither shares
+        // cross-subtree state nor waits on an event outside its subtree, so both
+        // are audited input-closed against (a)-(c).
+        | DistributedNodeKind::TableWriter(_)
+        | DistributedNodeKind::TableFinish(_) => true,
     }
 }
 

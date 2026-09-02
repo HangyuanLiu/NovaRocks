@@ -34,16 +34,24 @@ use novarocks_connector_binding::{
     ConnectorMaterializationRetryDisposition, MaterializationContext, NormalizedCatalogProperties,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
+use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
 use novarocks_spi::connector::{
     CatalogProperties, CatalogProviderKind, CatalogWriteExecutionBundleFactory,
-    ConnectorControlFactory, ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
+    ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
 };
 
 use crate::IcebergCatalogWriteExecutionFactory;
+use crate::commit::write_stack::codec::{
+    IcebergWriteFragmentDecoder, IcebergWriteFragmentEncoder, IcebergWriteHandleDecoder,
+    IcebergWriteHandleEncoder,
+};
+use crate::commit::write_stack::control::IcebergWriteSessionControl;
+use crate::commit::write_stack::execution::IcebergWriteStackExecutionFactory;
+use crate::commit::write_stack::runtime::build_write_adapter;
 use crate::connector_factory::IcebergConnectorFactory;
 use crate::file_reader::execution_installer::IcebergExecutionBindingFactory;
 use crate::resources::{IcebergExecutionResources, IcebergMetadataResources};
-use crate::typed_provider_factory::IcebergTypedProviderFactory;
+use crate::typed_provider_factory::{IcebergTypedProviderFactory, iceberg_descriptor};
 use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
 
 /// FE-only factory for one exact Iceberg control generation.
@@ -165,8 +173,11 @@ fn materialize_control_blocking(
     )
     .and_then(|request| request.with_catalog_properties(catalog_properties.clone()))
     .map_err(ConnectorMaterializationError::from)?;
-    let creation = factory
-        .create_control(request)
+    // One catalog generation is created here and nowhere else. Its runtime is
+    // returned alongside the creation so the frontend write session below is
+    // built from *this* generation rather than a second catalog client.
+    let (creation, runtime) = factory
+        .create_control_with_runtime(request)
         .map_err(ConnectorMaterializationError::from)?;
     context.check_active()?;
     let (control, _durable_properties) = creation.into_parts();
@@ -190,10 +201,37 @@ fn materialize_control_blocking(
                 "Iceberg control generation did not install its typed read group",
             )
         })?;
-    let write = control
-        .write()
-        .cloned()
-        .map(ConnectorControlWriteBinding::new);
+    // The typed write group is built exactly when the generic control
+    // generation advertises write, which is the parity the role binding
+    // enforces. Every member comes from the one generation the read group came
+    // from: the same descriptor, the same incarnation, and the same exact
+    // catalog handle the desired-state owner stamped.
+    let write = match control.write().cloned() {
+        Some(write) => {
+            let descriptor = control.descriptor().clone();
+            let catalog_handle = control
+                .catalog_handle()
+                .map_err(ConnectorMaterializationError::from)?
+                .clone();
+            let session = Arc::new(IcebergWriteSessionControl::new(
+                descriptor.clone(),
+                control.incarnation(),
+                catalog_handle.clone(),
+                runtime,
+            ));
+            let adapter = build_write_adapter(descriptor, catalog_handle);
+            Some(ConnectorControlWriteBinding::new(
+                write,
+                session,
+                // The frontend's half of each pair: it encodes the handles it
+                // sends and decodes the fragments that come back. It is given
+                // no way to forge a fragment or to read a handle it received.
+                Arc::new(IcebergWriteHandleEncoder::new(adapter.clone())),
+                Arc::new(IcebergWriteFragmentDecoder::new(adapter)),
+            ))
+        }
+        None => None,
+    };
     context.check_active()?;
     ConnectorControlRoleBinding::try_new(properties, Arc::new(control), Some(read), write)
         .map_err(ConnectorMaterializationError::from)
@@ -251,9 +289,32 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         )
         .build(catalog_properties)
         .map_err(ConnectorMaterializationError::from)?;
+        // The write-stack execution and both codec facets are minted from the
+        // same immutable catalog generation the read facets above were bound
+        // to: one descriptor derived from this exact catalog handle, and one
+        // adapter over it. A handle another generation encoded therefore cannot
+        // open a writer here.
+        let catalog_handle = catalog_properties.handle().clone();
+        let descriptor = iceberg_descriptor(&catalog_handle);
+        let write_execution = IcebergWriteStackExecutionFactory::new(
+            descriptor.clone(),
+            self.resources.binding().clone(),
+            self.resources.runtime().clone(),
+        )
+        .build(catalog_properties)
+        .map_err(ConnectorMaterializationError::from)?;
+        let adapter = build_write_adapter(descriptor, catalog_handle);
         let read =
             ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
-        let write = ConnectorExecutionWriteBinding::new(typed_write.execution());
+        let write = ConnectorExecutionWriteBinding::new(
+            typed_write.execution(),
+            write_execution,
+            // The backend's half of each pair, the mirror image of the
+            // frontend's: it decodes the handles it is given and encodes the
+            // fragments it produces, and holds no commit authority at all.
+            Arc::new(IcebergWriteHandleDecoder::new(adapter.clone())),
+            Arc::new(IcebergWriteFragmentEncoder::new(adapter)),
+        );
         ConnectorExecutionRoleBinding::try_new(
             properties.clone(),
             Some(execution),
@@ -293,9 +354,49 @@ fn invalid_definition(detail: String) -> ConnectorMaterializationError {
 mod tests {
     use super::*;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_proto_codec::FieldPath;
+    use novarocks_proto_codec::connector_write::{
+        ConnectorWriteFragmentEncoder, ConnectorWriteHandleEncoder, ValidatedCommitFragment,
+        ValidatedWriterHandle,
+    };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperty, CatalogVersion, ConnectorInstanceId,
     };
+
+    use crate::commit::write_stack::domain::{
+        IcebergArtifactMetrics, IcebergCommitFragment, IcebergDataBranchRecipe,
+        IcebergDataFileArtifact, IcebergWriterHandle, IcebergWriterOutput,
+    };
+    use crate::commit::write_stack::test_support::{sample_partition, table_facts};
+    use crate::delete_file::IcebergFileFormat;
+
+    fn writer_handle() -> IcebergWriterHandle {
+        IcebergWriterHandle::try_new_data(
+            table_facts(),
+            IcebergWriterOutput::try_new(
+                IcebergFileFormat::Parquet,
+                parquet::basic::Compression::SNAPPY,
+                None,
+            )
+            .expect("output"),
+            IcebergDataBranchRecipe::try_new(None, Vec::new(), Vec::new(), Vec::new(), false)
+                .expect("recipe"),
+        )
+        .expect("writer handle")
+    }
+
+    fn commit_fragment() -> IcebergCommitFragment {
+        IcebergCommitFragment::data_file(
+            IcebergDataFileArtifact::try_new(
+                "s3://b/wh/db/t/data/new.parquet".to_string(),
+                IcebergFileFormat::Parquet,
+                sample_partition(),
+                IcebergArtifactMetrics::try_new(4, 4096, Vec::new(), None).expect("metrics"),
+                None,
+            )
+            .expect("data file"),
+        )
+    }
 
     fn properties() -> CatalogProperties {
         CatalogProperties::new(
@@ -363,7 +464,43 @@ mod tests {
                 .is_some()
         );
         assert!(binding.read().is_some());
-        assert!(binding.write().is_some());
+
+        // The four-member write group is complete and every member names the
+        // one catalog generation these properties froze.
+        let write = binding.write().expect("one complete typed write group");
+        let catalog_name = normalized.handle().catalog_name().as_str();
+        assert_eq!(write.handle_decoder().owner(), catalog_name);
+        assert_eq!(write.fragment_encoder().owner(), catalog_name);
+        assert_eq!(write.write().catalog_handle(), normalized.handle());
+        assert_eq!(write.execution().catalog_handle(), normalized.handle());
+
+        // The backend's decoder rebuilds a handle bound to that same
+        // generation, so the writer factory beside it can open a writer for it.
+        let encoder = IcebergWriteHandleEncoder::new(build_write_adapter(
+            iceberg_descriptor(normalized.handle()),
+            normalized.handle().clone(),
+        ));
+        let adapter = build_write_adapter(
+            iceberg_descriptor(normalized.handle()),
+            normalized.handle().clone(),
+        );
+        let raw = encoder
+            .encode_writer_handle(&adapter.wrap_writer_handle(writer_handle()))
+            .expect("encode a writer handle for this generation");
+        let decoded = write
+            .handle_decoder()
+            .decode_writer_handle(
+                &ValidatedWriterHandle::parse(raw, FieldPath::root("writer_handle"))
+                    .expect("canonical carrier"),
+            )
+            .expect("decode a writer handle for this generation");
+        assert_eq!(
+            adapter
+                .writer_handle(&decoded)
+                .expect("the decoded handle belongs to this generation")
+                .table(),
+            &table_facts()
+        );
     }
 
     #[tokio::test]
@@ -420,6 +557,51 @@ mod tests {
         assert_eq!(
             read.encoder().owner(),
             normalized.handle().catalog_name().as_str()
+        );
+
+        // The write group is present exactly because generic control advertises
+        // write, and it is built from the same generation as the read group:
+        // the session's binding key is this control binding's own instance and
+        // incarnation, not a second one materialized on the side.
+        let write = binding.write().expect("one complete typed write group");
+        let catalog_name = normalized.handle().catalog_name();
+        assert_eq!(write.handle_encoder().owner(), catalog_name.as_str());
+        assert_eq!(write.fragment_decoder().owner(), catalog_name.as_str());
+        assert_eq!(&write.session().binding_key().instance_id, catalog_name);
+        assert_eq!(
+            write.session().binding_key().incarnation,
+            binding.control().incarnation()
+        );
+
+        // The frontend encodes handles and decodes fragments; the fragment it
+        // decodes comes back bound to this same generation.
+        let adapter = build_write_adapter(
+            iceberg_descriptor(normalized.handle()),
+            normalized.handle().clone(),
+        );
+        let raw = write
+            .handle_encoder()
+            .encode_writer_handle(&adapter.wrap_writer_handle(writer_handle()))
+            .expect("the frontend encodes its own generation's handle");
+        assert!(ValidatedWriterHandle::parse(raw, FieldPath::root("writer_handle")).is_ok());
+
+        let encoder = IcebergWriteFragmentEncoder::new(adapter.clone());
+        let raw = encoder
+            .encode_commit_fragment(&adapter.wrap_commit_fragment(commit_fragment()))
+            .expect("encode a commit fragment for this generation");
+        let decoded = write
+            .fragment_decoder()
+            .decode_commit_fragment(
+                &ValidatedCommitFragment::parse(raw, FieldPath::root("commit_fragment"))
+                    .expect("canonical carrier"),
+            )
+            .expect("the frontend decodes the fragments it receives");
+        assert_eq!(
+            adapter
+                .commit_fragment(&decoded)
+                .expect("the decoded fragment belongs to this generation")
+                .path(),
+            "s3://b/wh/db/t/data/new.parquet"
         );
     }
 }

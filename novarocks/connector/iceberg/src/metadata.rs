@@ -1210,6 +1210,114 @@ impl IcebergMetadata {
     }
 }
 
+/// Read back the frozen facts a staged write target carries.
+///
+/// This is the exact inverse of [`IcebergMetadata::staged_write_table_handle`]:
+/// a staged CTAS target has no catalog entry, so the metadata a write session
+/// would otherwise have loaded travels inside the handle the staged-create
+/// capability minted. Decoding it here is the only way that metadata is ever
+/// read back, and the handle's owner is checked first so one catalog's staged
+/// target cannot be opened against another's generation.
+pub(crate) fn staged_target_metadata(
+    owner: &ConnectorInstanceId,
+    table: &ConnectorTableHandle,
+) -> Result<IcebergStagedTargetMetadata, ConnectorError> {
+    if table.owner() != owner {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "staged Iceberg write target belongs to another connector instance",
+        ));
+    }
+    let payload: IcebergTablePayload = decode_payload(table.payload(), "staged table handle")?;
+    if payload.metadata_table_type.is_some() {
+        return Err(corrupt(
+            "Iceberg metadata tables cannot be staged write targets",
+        ));
+    }
+    let table_info = payload.table_info.ok_or_else(|| {
+        corrupt("staged Iceberg write target is missing its frozen table descriptor")
+    })?;
+    let serialized = table_info
+        .serialized_metadata
+        .as_deref()
+        .ok_or_else(|| corrupt("staged Iceberg write target is missing frozen metadata"))?;
+    let metadata: crate::iceberg::spec::TableMetadata =
+        serde_json::from_str(serialized).map_err(|error| {
+            corrupt(format!(
+                "decode staged Iceberg write target metadata: {error}"
+            ))
+        })?;
+    Ok(IcebergStagedTargetMetadata {
+        namespace: payload.namespace,
+        table: payload.table,
+        metadata,
+    })
+}
+
+/// The provider-private table one copy-on-write branch re-reads.
+///
+/// A copy-on-write branch replaces one whole data file, so the read that
+/// produces its replacement rows names exactly that file and pins the base
+/// snapshot the session froze. It is built from the session's own loaded
+/// metadata rather than from an admitted handle, because a session's target is
+/// resolved by name and never arrives as one.
+pub(crate) fn frozen_copy_on_write_source_payload(
+    catalog: &ConnectorInstanceId,
+    namespace: &str,
+    table_name: &str,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    snapshot_id: i64,
+    file: IcebergDataFileInfo,
+) -> Result<IcebergTablePayload, ConnectorError> {
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        corrupt("Iceberg copy-on-write base snapshot is absent from its metadata")
+    })?;
+    let snapshot_schema = snapshot.schema(metadata).map_err(|error| {
+        corrupt(format!(
+            "resolve Iceberg copy-on-write snapshot schema: {error}"
+        ))
+    })?;
+    Ok(IcebergTablePayload {
+        namespace: namespace.to_string(),
+        table: table_name.to_string(),
+        table_info: Some(IcebergTableInfo {
+            catalog: catalog.as_str().to_string(),
+            namespace: namespace.to_string(),
+            table: table_name.to_string(),
+            table_uuid: Some(metadata.uuid().to_string()),
+            current_snapshot_id: Some(snapshot_id),
+            schema_id: snapshot_schema.schema_id(),
+            location: metadata.location().to_string(),
+            schema: iceberg_schema_def(&snapshot_schema),
+            serialized_metadata: Some(serde_json::to_string(metadata).map_err(|error| {
+                corrupt(format!(
+                    "serialize Iceberg copy-on-write source metadata: {error}"
+                ))
+            })?),
+            serialized_metadata_rows: None,
+        }),
+        metadata_columns: metadata_column_names(metadata),
+        metadata_table_type: None,
+        prepared_files: Vec::new(),
+        explicit_files: Some(vec![file]),
+        // A frozen source carries a complete explicit file set and must never
+        // fall back to a catalog lookup.
+        row_mutation_frozen_source: true,
+        logical_type_columns: logical_type_columns(metadata.properties()),
+        hidden_columns: hidden_internal_columns(metadata.properties()),
+    })
+}
+
+/// The frozen target one staged write session opens on.
+///
+/// A registered table is loaded from the catalog on every session; a staged one
+/// cannot be, so this is what a staged handle stands in for.
+pub(crate) struct IcebergStagedTargetMetadata {
+    pub namespace: String,
+    pub table: String,
+    pub metadata: crate::iceberg::spec::TableMetadata,
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 pub(crate) struct IcebergTablePayload {
     pub namespace: String,

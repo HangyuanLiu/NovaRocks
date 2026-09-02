@@ -26,47 +26,43 @@
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteCohortId, ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWriteReceipt,
-    MvLakePackageObservation,
+    ConnectorWriteLease, ConnectorWriteReceipt, MvLakePackageObservation,
 };
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::query_execution::contract::ConnectorWriteOperationRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvRefreshCommittedFacts, MvRefreshPublicationIntent,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 
 /// Exact Core-retained inputs for one Frontend-owned MV native assembly.
 ///
 /// The frontend may read the immutable input only to encode the native
 /// fragment bundle.  Finishing consumes the same retained pair, so neither a
 /// newer binding nor a replacement prepared fragment set can reach dispatch.
+///
+/// Every MV data write -- first refresh and incremental alike -- commits through
+/// the write session that admitted it. The session sealed the recipes this
+/// plan's writer nodes carry, so the two travel together and no operation,
+/// cohort, or attempt identity reaches the writer data plane.
 pub struct PreparedMvNativeWriteAssembly {
     encoding: NativeFragmentEncodingInput,
     query_options: Option<QueryOptions>,
-    registration: ConnectorWriteOperationRegistration,
-    cohort_id: ConnectorWriteCohortId,
-    lease: ConnectorWriteLease,
+    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedMvNativeWriteAssembly {
-    pub(crate) fn new(
+    pub(crate) fn session(
         encoding: NativeFragmentEncodingInput,
         query_options: Option<QueryOptions>,
-        registration: ConnectorWriteOperationRegistration,
-        cohort_id: ConnectorWriteCohortId,
-        lease: ConnectorWriteLease,
+        write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Self {
         Self {
             encoding,
             query_options,
-            registration,
-            cohort_id,
-            lease,
+            session: write_session,
         }
     }
 
@@ -74,33 +70,61 @@ impl PreparedMvNativeWriteAssembly {
         &self.encoding
     }
 
-    pub fn write_operation_id(&self) -> ConnectorWriteOperationId {
-        self.registration.operation_id()
-    }
-
-    pub fn write_cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
+    /// The commit authority of this write, so a caller that fails between
+    /// assembly and dispatch can release it rather than leaving the provider
+    /// holding a session for a plan that will never run.
+    pub(crate) fn write_session(
+        &self,
+    ) -> &std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession> {
+        &self.session
     }
 
     pub fn finish(
         self,
         native_bundle: NativeFragmentAttachment,
-    ) -> Result<PreparedDistributedWriteRequest, String> {
+    ) -> Result<PreparedMvSessionWrite, String> {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed MV encoding input".into(),
             );
         }
         let (_, prepared) = self.encoding.into_parts();
-        PreparedDistributedWriteRequest::new(
+        Ok(PreparedMvSessionWrite {
             prepared,
             native_bundle,
-            self.query_options,
-            self.registration,
-            self.cohort_id,
-            self.lease,
-        )
-        .map_err(|error| error.to_string())
+            query_options: self.query_options,
+            session: self.session,
+        })
+    }
+}
+
+/// A session-driven MV write, one step away from dispatch.
+///
+/// The session rides along as the request's single commit authority, so no
+/// operation, cohort, or attempt identity reaches the writer data plane.
+pub struct PreparedMvSessionWrite {
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: NativeFragmentAttachment,
+    query_options: Option<QueryOptions>,
+    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+}
+
+impl PreparedMvSessionWrite {
+    pub(crate) fn into_request(
+        self,
+        execution: &QueryExecutionContext,
+    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
+        let request =
+            crate::query_execution::contract::build_distributed_query_request_with_execution(
+                self.prepared,
+                self.native_bundle,
+                self.query_options,
+                crate::query_execution::contract::DistributedQueryIntent::Write,
+                execution,
+            )
+            .map_err(|error| error.to_string())?;
+        crate::query_execution::contract::with_connector_write_session(request, self.session)
+            .map_err(|error| error.to_string())
     }
 }
 

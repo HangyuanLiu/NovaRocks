@@ -241,6 +241,16 @@ fn validate_structure(
         }
     }
 
+    // The NCP-6 dataflow write overlay puts a `TableFinish` fragment on the
+    // plan root. When (and only when) that root is present, a change-stream
+    // router fragment is legally a non-root producer: its writers now stream on
+    // into the finish fragment instead of terminating in a connector sink.
+    let dataflow_write_root = fragments_by_id
+        .get(&root_fragment_id)
+        .is_some_and(|fragment| {
+            matches!(fragment.root.payload, DistributedNodeKind::TableFinish(_))
+        });
+
     for fragment in fragments {
         ensure_unpartitioned("data_partition", &fragment.data_partition)?;
         if fragment.output_exprs.is_some() {
@@ -254,31 +264,30 @@ fn validate_structure(
         if fragment.fragment_id == root_fragment_id {
             let root_sink_supported = matches!(
                 fragment.sink,
-                DataSink::Result
-                    | DataSink::Statistics(_)
-                    | DataSink::ConnectorWrite(_)
-                    | DataSink::ChangeStreamRouter(_)
+                DataSink::Result | DataSink::Statistics(_) | DataSink::ChangeStreamRouter(_)
             );
             if !root_sink_supported {
                 return Err(format!(
-                    "lower_distributed_plan root fragment id={} must use result, statistics, connector write, or change-stream router sink",
+                    "lower_distributed_plan root fragment id={} must use result, statistics, or change-stream router sink",
                     fragment.fragment_id
                 ));
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else {
-            let non_root_sink_supported =
-                matches!(fragment.sink, DataSink::Noop | DataSink::ConnectorWrite(_));
+            let non_root_sink_supported = matches!(fragment.sink, DataSink::Noop)
+                || (dataflow_write_root
+                    && matches!(fragment.sink, DataSink::ChangeStreamRouter(_)));
             if non_root_sink_supported {
                 continue;
             }
             return Err(format!(
-                "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
+                "lower_distributed_plan non-root fragment id={} must use noop sink",
                 fragment.fragment_id
             ));
         }
     }
 
+    validate_dataflow_write_shape(&fragments_by_id, root_fragment_id, edges)?;
     validate_source_edge_shape(edges)?;
 
     let mut router_target_partitions = BTreeMap::new();
@@ -328,6 +337,187 @@ fn validate_global_node_ids(fragments: &[PlanFragment]) -> Result<(), String> {
     let mut owners = HashMap::new();
     for fragment in fragments {
         visit(&fragment.root, fragment.fragment_id, &mut owners)?;
+    }
+    Ok(())
+}
+
+/// Validate the NCP-6 dataflow write overlay shape.
+///
+/// The overlay is all-or-nothing: either the plan has no `TableWriter` and no
+/// `TableFinish`, or it has at least one writer AND exactly one finish fragment
+/// that is the plan root. Every accepted fact below is stated positively, so a
+/// mis-wired write plan is rejected rather than tolerated by a permissive
+/// wildcard:
+///
+/// * `TableWriter` / `TableFinish` are fragment-root-only nodes.
+/// * The single `TableFinish` fragment is the plan root and carries the result
+///   sink; nothing streams out of it.
+/// * A `TableWriter` fragment carries a `Noop` sink and exactly one outgoing
+///   edge: a `Gather` `Stream` edge into the finish fragment.
+/// * Only writer fragments stream into the finish fragment.
+/// * The writer ordinals form the dense `0..n` set the finish node expects.
+fn validate_dataflow_write_shape(
+    fragments_by_id: &BTreeMap<FragmentId, &PlanFragment>,
+    root_fragment_id: FragmentId,
+    edges: &[FragmentEdge],
+) -> Result<(), String> {
+    let mut writer_ordinals_by_fragment: BTreeMap<FragmentId, u32> = BTreeMap::new();
+    let mut finish_fragments: Vec<FragmentId> = Vec::new();
+    for (fragment_id, fragment) in fragments_by_id {
+        validate_dataflow_write_node_placement(*fragment_id, &fragment.root, true)?;
+        match &fragment.root.payload {
+            DistributedNodeKind::TableWriter(writer) => {
+                writer_ordinals_by_fragment.insert(*fragment_id, writer.write_target_ordinal.get());
+            }
+            DistributedNodeKind::TableFinish(_) => finish_fragments.push(*fragment_id),
+            _ => {}
+        }
+    }
+
+    if writer_ordinals_by_fragment.is_empty() && finish_fragments.is_empty() {
+        return Ok(());
+    }
+    let [finish_fragment_id] = finish_fragments.as_slice() else {
+        return Err(format!(
+            "lower_distributed_plan dataflow write plan must contain exactly one TableFinish fragment, found {:?}",
+            finish_fragments
+        ));
+    };
+    let finish_fragment_id = *finish_fragment_id;
+    if finish_fragment_id != root_fragment_id {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} must be the plan root fragment id={root_fragment_id}"
+        ));
+    }
+    let finish_fragment = fragments_by_id.get(&finish_fragment_id).ok_or_else(|| {
+        format!("lower_distributed_plan missing TableFinish fragment id={finish_fragment_id}")
+    })?;
+    if !matches!(finish_fragment.sink, DataSink::Result) {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} must use the result sink"
+        ));
+    }
+    if writer_ordinals_by_fragment.is_empty() {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} has no TableWriter fragment"
+        ));
+    }
+
+    let mut outgoing_by_source: BTreeMap<FragmentId, Vec<&FragmentEdge>> = BTreeMap::new();
+    for edge in edges {
+        outgoing_by_source
+            .entry(edge.source_fragment_id)
+            .or_default()
+            .push(edge);
+    }
+    if let Some(outgoing) = outgoing_by_source.get(&finish_fragment_id) {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} must be terminal but drives {} outgoing edge(s)",
+            outgoing.len()
+        ));
+    }
+
+    for writer_fragment_id in writer_ordinals_by_fragment.keys() {
+        let writer_fragment = fragments_by_id.get(writer_fragment_id).ok_or_else(|| {
+            format!("lower_distributed_plan missing TableWriter fragment id={writer_fragment_id}")
+        })?;
+        if !matches!(writer_fragment.sink, DataSink::Noop) {
+            return Err(format!(
+                "lower_distributed_plan TableWriter fragment id={writer_fragment_id} must use the noop sink"
+            ));
+        }
+        let outgoing = outgoing_by_source
+            .get(writer_fragment_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [edge] = outgoing else {
+            return Err(format!(
+                "lower_distributed_plan TableWriter fragment id={writer_fragment_id} must drive exactly one outgoing stream edge, found {}",
+                outgoing.len()
+            ));
+        };
+        if !matches!(edge.edge_kind, FragmentEdgeKind::Stream)
+            || edge.stream_kind != FragmentStreamKind::Gather
+        {
+            return Err(format!(
+                "lower_distributed_plan TableWriter fragment id={writer_fragment_id} must gather into the TableFinish fragment through a plain stream edge"
+            ));
+        }
+        if edge.target_fragment_id != finish_fragment_id {
+            return Err(format!(
+                "lower_distributed_plan TableWriter fragment id={writer_fragment_id} streams into fragment id={} instead of the TableFinish fragment id={finish_fragment_id}",
+                edge.target_fragment_id
+            ));
+        }
+    }
+
+    for edge in edges {
+        if edge.target_fragment_id == finish_fragment_id
+            && !writer_ordinals_by_fragment.contains_key(&edge.source_fragment_id)
+        {
+            return Err(format!(
+                "lower_distributed_plan TableFinish fragment id={finish_fragment_id} receives from non-writer fragment id={}",
+                edge.source_fragment_id
+            ));
+        }
+    }
+
+    let DistributedNodeKind::TableFinish(finish) = &finish_fragment.root.payload else {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} lost its TableFinish root"
+        ));
+    };
+    let observed: BTreeSet<u32> = writer_ordinals_by_fragment.values().copied().collect();
+    if observed.len() != writer_ordinals_by_fragment.len() {
+        return Err(format!(
+            "lower_distributed_plan dataflow write plan repeats a write target ordinal across writer fragments: {:?}",
+            writer_ordinals_by_fragment
+        ));
+    }
+    let expected: BTreeSet<u32> = finish
+        .expected_target_ordinals
+        .iter()
+        .map(|ordinal| ordinal.get())
+        .collect();
+    if observed != expected {
+        return Err(format!(
+            "lower_distributed_plan TableFinish fragment id={finish_fragment_id} expects write target ordinals {expected:?} but its writers carry {observed:?}"
+        ));
+    }
+    // Deliberately no denseness assertion. The ordinals a query's writers carry
+    // are the subset of the session's sealed targets *this query* feeds, and a
+    // copy-on-write statement compiles one writer per query at that group's own
+    // ordinal, so query `k` carries `{k}`. The set equality above is the real
+    // invariant: the finish node expects exactly the targets its writers feed.
+    // Denseness from zero belongs to the session's sealed set and is enforced by
+    // `ConnectorWriteSessionPlan::try_new`.
+    Ok(())
+}
+
+/// `TableWriter` and `TableFinish` are fragment-root-only nodes: a writer is the
+/// last operator before its fragment's sink, and the finish node is the plan's
+/// single result producer. Anywhere else they would silently lose the write
+/// relation, so reject them.
+fn validate_dataflow_write_node_placement(
+    fragment_id: FragmentId,
+    node: &DistributedNode,
+    is_fragment_root: bool,
+) -> Result<(), String> {
+    if !is_fragment_root {
+        let label = match &node.payload {
+            DistributedNodeKind::TableWriter(_) => Some("TableWriter"),
+            DistributedNodeKind::TableFinish(_) => Some("TableFinish"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            return Err(format!(
+                "lower_distributed_plan {label} node_id={} in fragment id={fragment_id} must be the fragment root",
+                node.node_id
+            ));
+        }
+    }
+    for child in &node.children {
+        validate_dataflow_write_node_placement(fragment_id, child, false)?;
     }
     Ok(())
 }
@@ -926,8 +1116,8 @@ mod tests {
     use crate::planner::payload::PlanValuesNode;
     use crate::planner::physical::{PhysicalPlanStats, PlannerConfidence};
     use novarocks_spi::connector::{
-        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteCohortId,
-        ConnectorWriteFieldToken, ConnectorWriteRouteId,
+        ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+        ConnectorWriteRouteId,
     };
 
     fn stats() -> PhysicalPlanStats {
@@ -1060,7 +1250,8 @@ mod tests {
         };
         let route = crate::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec {
             route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-            cohort_id: ConnectorWriteCohortId::from_bytes([6; 32]),
+            write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+                .expect("bounded ordinal"),
             accepted_effects: vec![ConnectorRowMutationEffect::Delete],
             input_ordinals: vec![ConnectorMutationRouteInput::new(
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
@@ -1076,7 +1267,7 @@ mod tests {
                 0,
                 vec![route],
             );
-        crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
+        crate::planner::distributed::write::plan::finalize_sql_change_stream_table_writer_finish_test_plan(dp, dag)
             .expect("plan change-stream write")
     }
 
@@ -1293,8 +1484,13 @@ mod tests {
     #[test]
     fn finalized_router_validation_rejects_stale_contracts() {
         let planned = finalized_router_plan();
-        let source_fragment_id = planned.edges()[0].source_fragment_id;
-        let target_fragment_id = planned.edges()[0].target_fragment_id;
+        let router_edge = planned
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.edge_kind, FragmentEdgeKind::ChangeStreamRouter { .. }))
+            .expect("router edge");
+        let source_fragment_id = router_edge.source_fragment_id;
+        let target_fragment_id = router_edge.target_fragment_id;
 
         let mut wrong_sink = draft_builder_from_plan(&planned, Default::default());
         wrong_sink
@@ -1302,7 +1498,7 @@ mod tests {
             .iter_mut()
             .find(|fragment| fragment.fragment_id == source_fragment_id)
             .expect("router source fragment")
-            .sink = DataSink::Result;
+            .sink = DataSink::Noop;
         let err = wrong_sink
             .seal()
             .expect_err("router edge without router sink must fail");
@@ -1355,7 +1551,10 @@ mod tests {
                 .iter_mut()
                 .find(|fragment| fragment.fragment_id == target_fragment_id)
                 .expect("router target fragment");
-            let DistributedNodeKind::Exchange(exchange) = &mut target.root.payload else {
+            // The route's writer fragment is `Exchange -> TableWriter`, so the
+            // receiver the router edge points at is the writer node's child.
+            let DistributedNodeKind::Exchange(exchange) = &mut target.root.children[0].payload
+            else {
                 panic!("expected router Exchange receiver");
             };
             exchange.partition = DataPartition::unpartitioned();

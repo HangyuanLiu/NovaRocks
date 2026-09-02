@@ -25,9 +25,6 @@ use crate::mv::domain::application::{
     MvApplicationError, MvApplicationErrorKind, MvStatementResult,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::native::fragment_encoder::encode_native_fragment_bundle;
-use crate::query_execution::ConnectorWriteCompletion;
-use crate::query_execution::contract::ConnectorWriteExecutionRegistration;
 use crate::query_execution::mv_assembly::refresh_artifact::MvRefreshCommittedFacts;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
@@ -218,6 +215,17 @@ fn execute_data(
         ));
     }
     let intent = prepared.publication_intent().clone();
+    // The publication identity must not drift mid-attempt. A session-driven
+    // write carries no operation id to re-check after the fact, so the
+    // invariant is enforced here, before the flavor that will carry this intent
+    // into the commit is built -- mirroring the metadata-only check below. The
+    // other half is the provider's own fence: it stamps this publication id
+    // into the snapshot summary and reads it back.
+    if intent.publication_id() != attempt.publication_id {
+        return Err(invalid(
+            "SQL-prepared MV publication intent does not use its Lake publication identity",
+        ));
+    }
     if intent.partition_spec_replacement().is_none() {
         create_data_staging_branch(planning, &attempt, &finalize, &intent, context.clone())?;
     }
@@ -230,71 +238,33 @@ fn execute_data(
         &write_lease,
         execution,
     )?;
-    let bundle = encode_native_fragment_bundle(assembly.native_encoding().encoding_view())
-        .map_err(invalid)?;
-    let write = assembly.finish(bundle).map_err(invalid)?;
-    if write.write_operation_id() != attempt.write_operation_id() {
-        return Err(invalid(
-            "MV native write changed its Lake publication identity",
-        ));
-    }
-    let session = dependencies
-        .query_execution
-        .begin_write_operation(write.registration(), write_lease)
-        .map_err(|error| invalid(error.to_string()))?;
-    let registration =
-        ConnectorWriteExecutionRegistration::try_new(session, write.write_cohort_id())
-            .map_err(|error| invalid(error.to_string()))?;
-    let outcome = dependencies
-        .query_execution
-        .execute(
-            write
-                .into_request(execution, registration)
-                .map_err(|error| invalid(error.to_string()))?,
-        )
-        .map_err(|error| {
-            MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
-        })?
-        .into_write()
-        .map_err(|error| {
-            MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
-        })?;
-    let (result, direct, abort, completion) = outcome.into_parts_with_connector();
-    if !result.columns.is_empty() || !result.chunks.is_empty() || direct.is_some() {
-        return Err(invalid(
-            "MV refresh write returned an invalid terminal payload",
-        ));
-    }
-    if let Some(abort) = abort {
-        return Err(MvApplicationError::new(
-            MvApplicationErrorKind::Engine,
-            format!("MV refresh distributed write aborted: {}", abort.reason()),
-        ));
-    }
-    let (effect, receipt) = commit_known(
-        &completion
-            .ok_or_else(|| invalid("MV refresh write completed without connector reports"))?,
-        context.clone(),
-    )?;
-    let committed = dependencies
-        .provider_activation
-        .validate_write_commit(intent, &receipt)?;
+    let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
+    let authority = write_commit_authority(outcome.into_write_session())?;
+    let (effect, receipt) = commit_known(authority, context.clone())?;
     if effect == novarocks_spi::connector::ExternalMutationEffect::NoOp {
         // The writer has proved that the incremental window produced no
         // materialized rows. Its staging branch still points at the old,
         // unmarked target snapshot, so publishing that version would violate
         // the publication guard. Materialize the refresh waterline on the
         // existing branch through the metadata-only catalog operation instead.
+        //
+        // This is decided before the receipt is interpreted: a session that
+        // skipped its external commit reports the unchanged snapshot with no
+        // committed row count, and a publication that never happened has no
+        // committed facts to interpret.
         return execute_metadata_only(
             dependencies,
             planning,
             attempt,
             finalize,
-            committed.intent().clone(),
+            intent,
             context,
             true,
         );
     }
+    let committed = dependencies
+        .provider_activation
+        .validate_write_commit(intent, &receipt)?;
     wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
     let publication_version = if committed.intent().partition_spec_replacement().is_some() {
         committed.committed_version().clone()
@@ -322,6 +292,69 @@ fn execute_data(
         .project_observed(*attempt.publication_id.as_uuid(), &package)
         .map_err(repository_error)?;
     Ok(MvStatementResult::Ok)
+}
+
+/// The one commit authority of one MV data write.
+///
+/// Every MV data write -- first refresh and incremental alike -- commits through
+/// the write session that admitted it. It is still established explicitly
+/// rather than assumed: a write whose data plane never closed carries no
+/// session completion, and it is refused here instead of reaching the provider.
+fn write_commit_authority(
+    session: Option<crate::query_execution::outcome::ConnectorWriteSessionCompletion>,
+) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, MvApplicationError> {
+    session.ok_or_else(|| invalid("MV refresh write completed without a write session"))
+}
+
+/// Encode one prepared MV write and run it through the data plane its commit
+/// authority requires.
+///
+/// The write carries its session into the request, so the plan's writer nodes
+/// and the commit authority are the same admission, and no operation, cohort, or
+/// attempt identity reaches the writer data plane. There is nothing to re-check
+/// after the fact either: the publication identity is proved once in
+/// `execute_data`, before the flavor that carries it into the commit is built.
+fn dispatch_data_write(
+    dependencies: &FrontendMvRefreshDependencies,
+    assembly: PreparedMvNativeWriteAssembly,
+    execution: &QueryExecutionContext,
+    context: &ConnectorRequestContext,
+) -> Result<crate::query_execution::outcome::WriteExecutionOutcome, MvApplicationError> {
+    let write_session = Arc::clone(assembly.write_session());
+    let dispatched = bind_and_execute_data_write(dependencies, assembly, execution);
+    if dispatched.is_err() {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            &write_session, context,
+        );
+    }
+    dispatched
+}
+
+fn bind_and_execute_data_write(
+    dependencies: &FrontendMvRefreshDependencies,
+    assembly: PreparedMvNativeWriteAssembly,
+    execution: &QueryExecutionContext,
+) -> Result<crate::query_execution::outcome::WriteExecutionOutcome, MvApplicationError> {
+    // An MV data write is a dataflow plan, so its writer nodes need the recipes
+    // the sealed input carries. The view-based entrypoint drops them, which the
+    // encoder then reports as a plan with no sealed write session.
+    let bundle = crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
+        assembly.native_encoding(),
+    )
+    .map_err(invalid)?;
+    let request = assembly
+        .finish(bundle)
+        .map_err(invalid)?
+        .into_request(execution)
+        .map_err(|error| invalid(error.to_string()))?;
+    dependencies
+        .query_execution
+        .execute(request)
+        .map_err(|error| {
+            MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
+        })?
+        .into_write()
+        .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string()))
 }
 
 fn create_data_staging_branch(
@@ -681,7 +714,7 @@ fn require_catalog_commit(
 }
 
 fn commit_known(
-    completion: &ConnectorWriteCompletion,
+    authority: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
     context: ConnectorRequestContext,
 ) -> Result<
     (
@@ -690,7 +723,15 @@ fn commit_known(
     ),
     MvApplicationError,
 > {
-    match completion.session().commit(context).map_err(|error| {
+    // The commit is always performed, never gated on the write having produced
+    // fragments. What an empty publication means -- terminate without an
+    // external effect, or commit the empty write -- is a disposition the
+    // publication carries and the provider applies at finish. Skipping the call
+    // here would silently drop the commit of a full-overwrite refresh that
+    // legitimately truncates its target.
+    let outcome = crate::query_execution::write_session::finish_write_session(authority, context)
+        .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome);
+    match outcome.map_err(|error| {
         MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
     })? {
         ExternalMutationOutcome::KnownCommitted {
@@ -743,4 +784,262 @@ fn repository_error(error: crate::mv::domain::repository::MvRepositoryError) -> 
         }
     };
     MvApplicationError::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_spi::connector::{
+        ConnectorCommittedVersion, ConnectorManagedDescriptorProperties, ConnectorTableObjectId,
+        ExternalMutationEffect, ExternalMutationOutcome, LakePublicationId,
+    };
+
+    use super::*;
+    use crate::query_execution::mv_assembly::refresh_artifact::{
+        MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
+    };
+    use crate::query_execution::outcome::ConnectorWriteSessionCompletion;
+    use crate::query_execution::write_barrier::WriteCommitBarrier;
+    use crate::query_execution::write_result::DecodedPreparedWriteSet;
+    use crate::query_execution::write_session::tests as write_session_tests;
+
+    fn committed_version(snapshot_id: i64) -> ConnectorCommittedVersion {
+        ConnectorCommittedVersion::try_new(
+            bytes::Bytes::from_static(b"mv-publication-receipt"),
+            Some(snapshot_id),
+        )
+        .expect("committed version")
+    }
+
+    /// What a publication that actually committed reports back.
+    fn published_outcome(row_count: u64) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::Applied,
+            receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
+                bytes::Bytes::from_static(b"mv-publication-receipt"),
+                committed_version(42),
+                Some(row_count),
+            )
+            .expect("receipt"),
+            finalization: ExternalMutationFinalization::Complete,
+        }
+    }
+
+    /// What a publication that declared `AbortWithoutExternalCommit` reports
+    /// when its write produced nothing: the unchanged snapshot, and no
+    /// committed facts at all. This mirrors the provider's
+    /// `settle_empty_write_without_commit`.
+    fn skipped_publication_outcome() -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+        ExternalMutationOutcome::KnownCommitted {
+            effect: ExternalMutationEffect::NoOp,
+            receipt: ConnectorWriteReceipt::try_new_with_committed_facts(
+                bytes::Bytes::from_static(b"mv-publication-receipt"),
+                committed_version(7),
+                None,
+            )
+            .expect("receipt"),
+            finalization: ExternalMutationFinalization::Complete,
+        }
+    }
+
+    fn publication_intent() -> MvRefreshPublicationIntent {
+        MvRefreshPublicationIntent::try_new(
+            LakePublicationId::new_v7(),
+            ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"mv-target-object"))
+                .expect("target object id"),
+            Some(7),
+            ConnectorManagedDescriptorProperties::try_new(vec![(
+                Arc::from("novarocks.mv.descriptor.hash"),
+                Arc::from("descriptor-hash"),
+            )])
+            .expect("descriptor properties"),
+            MvRefreshPublicationTechnique::Full,
+            vec![
+                MvRefreshPublicationBase::try_new(
+                    "ice.db.base".to_string(),
+                    ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object"))
+                        .expect("base object id"),
+                    None,
+                    7,
+                )
+                .expect("base"),
+            ],
+            "fingerprint".to_string(),
+            "ice".to_string(),
+            "db".to_string(),
+            "mv".to_string(),
+        )
+        .expect("publication intent")
+    }
+
+    fn session_completion(
+        session: &Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        row_count: u64,
+        fragments: Vec<(
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            Vec<u8>,
+        )>,
+    ) -> ConnectorWriteSessionCompletion {
+        ConnectorWriteSessionCompletion::for_test(
+            Arc::clone(session),
+            DecodedPreparedWriteSet::for_test(row_count, fragments),
+        )
+    }
+
+    fn ordinal(value: u32) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(value).expect("ordinal")
+    }
+
+    fn sole_target() -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        ordinal(0)
+    }
+
+    /// The headline invariant: one write, one external commit, performed by the
+    /// session that admitted it rather than by an operation session beside it.
+    #[test]
+    fn a_first_refresh_commits_exactly_once_through_its_write_session() {
+        let fixture = write_session_tests::fixture_with_outcome(1, 16, published_outcome(7));
+        let completion = session_completion(
+            &fixture.session,
+            7,
+            vec![(sole_target(), write_session_tests::commit_fragment_bytes())],
+        );
+
+        let (effect, receipt) = commit_known(completion, write_session_tests::request_context())
+            .expect("the write session performs the publication commit");
+
+        assert_eq!(effect, ExternalMutationEffect::Applied);
+        assert_eq!(receipt.resulting_row_count(), Some(7));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    /// A full-overwrite refresh that produced no rows is a truncate, and it must
+    /// still commit. Whether an empty publication commits or terminates without
+    /// an external effect is a disposition the publication carries and the
+    /// provider applies at finish, so the terminal always asks.
+    #[test]
+    fn an_empty_first_refresh_still_reaches_its_publication_commit() {
+        let fixture = write_session_tests::fixture_with_outcome(1, 16, published_outcome(0));
+        let completion = session_completion(&fixture.session, 0, Vec::new());
+
+        let (effect, _) = commit_known(completion, write_session_tests::request_context())
+            .expect("an empty overwrite still commits");
+
+        assert_eq!(effect, ExternalMutationEffect::Applied);
+        assert_eq!(fixture.session.finish_invocations(), 1);
+    }
+
+    /// The same invariant for the last flow to move onto the session: an
+    /// incremental refresh applies a change stream over several sealed branches
+    /// -- a data branch and the delete branch retiring what it supersedes -- and
+    /// commits all of them exactly once, through the session that sealed them.
+    ///
+    /// Before the migration this flow ran its writers under the session's
+    /// recipes but committed through a staged-report operation beside it, so the
+    /// write had a second commit authority the session never saw.
+    #[test]
+    fn an_incremental_refresh_commits_every_branch_once_through_its_write_session() {
+        let fixture = write_session_tests::fixture_with_outcome(2, 16, published_outcome(7));
+        let completion = session_completion(
+            &fixture.session,
+            7,
+            vec![
+                (ordinal(0), write_session_tests::commit_fragment_bytes()),
+                (ordinal(1), write_session_tests::commit_fragment_bytes()),
+            ],
+        );
+
+        let (effect, receipt) = commit_known(completion, write_session_tests::request_context())
+            .expect("the write session performs the publication commit");
+
+        assert_eq!(effect, ExternalMutationEffect::Applied);
+        assert_eq!(receipt.resulting_row_count(), Some(7));
+        // One commit for the whole refresh, not one per branch.
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+    }
+
+    /// An append-mode refresh whose window produced nothing is the common
+    /// "nothing changed" case. Its session terminates without an external
+    /// commit and reports the unchanged snapshot, so its receipt carries no
+    /// committed facts -- and the terminal must decide on the effect before it
+    /// tries to interpret them.
+    #[test]
+    fn an_empty_append_refresh_takes_the_waterline_path_without_interpreting_its_receipt() {
+        let fixture =
+            write_session_tests::fixture_with_outcome(1, 16, skipped_publication_outcome());
+        let completion = session_completion(&fixture.session, 0, Vec::new());
+
+        let (effect, receipt) = commit_known(completion, write_session_tests::request_context())
+            .expect("a skipped publication is a successful no-op");
+
+        assert_eq!(effect, ExternalMutationEffect::NoOp);
+        assert!(receipt.resulting_row_count().is_none());
+        // Interpreting this receipt -- which is what the terminal did before the
+        // effect check was hoisted above it -- fails on exactly the fact a
+        // skipped publication cannot have. The waterline path has to be taken
+        // first.
+        let error = MvRefreshCommittedFacts::from_write_receipt(publication_intent(), &receipt)
+            .expect_err("a skipped publication has no committed facts to interpret");
+        assert!(
+            error.contains("without resulting row-count fact"),
+            "unexpected interpretation failure: {error}"
+        );
+    }
+
+    /// The dual barrier is what keeps a half-closed write away from the
+    /// provider: no prepared write set means no completion, and no completion
+    /// means the terminal cannot even name a commit authority.
+    #[test]
+    fn an_mv_write_whose_data_plane_never_closed_reaches_the_provider_zero_times() {
+        let fixture = write_session_tests::fixture_with_outcome(1, 16, published_outcome(7));
+
+        // Every participant succeeded, but no writer's prepared set ever
+        // arrived, so the coordinator produces no completion for this write.
+        let mut barrier = WriteCommitBarrier::new();
+        barrier.observe_execution_terminals(true);
+        assert!(barrier.into_committable().is_err());
+
+        let Err(error) = write_commit_authority(None) else {
+            panic!("a write with no completion has no commit authority");
+        };
+
+        assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+    }
+
+    /// The same barrier for an incremental refresh, whose change stream fans out
+    /// across several sealed branches: a write whose data plane never closed has
+    /// no completion, so it can name no commit authority and the provider is
+    /// never asked.
+    #[test]
+    fn an_incremental_write_whose_data_plane_never_closed_reaches_the_provider_zero_times() {
+        let fixture = write_session_tests::fixture_with_outcome(2, 16, published_outcome(7));
+
+        let mut barrier = WriteCommitBarrier::new();
+        barrier.observe_execution_terminals(true);
+        assert!(barrier.into_committable().is_err());
+
+        let Err(error) = write_commit_authority(None) else {
+            panic!("a write with no completion has no commit authority");
+        };
+
+        assert_eq!(error.kind(), MvApplicationErrorKind::InvalidRequest);
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+    }
+
+    /// The commit authority is the session completion itself, so the terminal
+    /// never has to guess which data plane a write came from.
+    #[test]
+    fn a_session_completion_is_the_commit_authority() {
+        let fixture = write_session_tests::fixture_with_outcome(1, 16, published_outcome(0));
+        let completion = session_completion(&fixture.session, 0, Vec::new());
+
+        assert!(write_commit_authority(Some(completion)).is_ok());
+        assert_eq!(fixture.session.finish_invocations(), 0);
+    }
 }

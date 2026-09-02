@@ -22,7 +22,6 @@ use crate::common::query_cancellation::{
 };
 use crate::query_execution::artifact::{
     BackendPlacement, FragmentScheduleDraft, ValidatedFragmentSchedule, ValidatedNativeSubmission,
-    WriterRegistrationSet,
 };
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
@@ -40,7 +39,6 @@ use crate::query_execution::statistics::{
     StatisticsExecutionMode, StatisticsExecutionPolicy, ThetaSketchPartial,
 };
 use crate::query_execution::terminal_set::QueryTerminalSet;
-use crate::query_execution::write::{WriteAbortInput, WriteCommitInput};
 use bytes::Bytes;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
@@ -335,16 +333,13 @@ fn query_control_typestate_initializes_before_native_assembly() {
         ..Default::default()
     };
     let attachment = submission_view
-        .seal(
-            vec![ValidatedNativeSubmission::new(
-                key.backend_idx(),
-                key.fragment_instance_id(),
-                submission_view.execution_id(),
-                template,
-                instance_params,
-            )],
-            WriterRegistrationSet::new(std::iter::empty()),
-        )
+        .seal(vec![ValidatedNativeSubmission::new(
+            key.backend_idx(),
+            key.fragment_instance_id(),
+            submission_view.execution_id(),
+            template,
+            instance_params,
+        )])
         .expect("seal explicit test submission attachment");
     let execution = ready
         .finish_stage(attachment)
@@ -378,19 +373,23 @@ fn cancellation_view_observes_injected_flag() {
 
 #[test]
 fn outcome_factory_rejects_intent_mismatch() {
-    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).write(
-        crate::runtime::query_result::QueryResult::empty(),
-        None,
-        None,
+    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).from_execution_result(
+        crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_session: None,
+            fragment_profiles: vec![
+                novarocks_execution::runtime::profile::Profiler::new("fragment-1").to_native_tree(),
+            ],
+        },
     );
 
     let Err(error) = result else {
-        panic!("Result intent must reject a Write outcome");
+        panic!("Result intent must reject a profile payload");
     };
     assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
     assert_eq!(
         error.message(),
-        "distributed query outcome intent mismatch: expected Result, received Write"
+        "Result outcome cannot contain write or profile payloads"
     );
 }
 
@@ -619,84 +618,6 @@ fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
 }
 
 #[test]
-fn write_outcome_preserves_commit_or_abort() {
-    let write_id = novarocks_types::UniqueId::new(41, 73);
-    let commit = WriteCommitInput {
-        write_id,
-        writers: Vec::new(),
-    };
-    let commit_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
-        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
-                "status",
-                vec!["committed".to_string()],
-            )
-            .expect("commit result"),
-            write_commit: Some(commit.clone()),
-            write_abort: None,
-            connector_completion: None,
-            fragment_profiles: Vec::new(),
-        })
-        .expect("Write intent accepts a commit payload");
-    let (result, actual_commit, actual_abort) = commit_outcome
-        .into_write()
-        .expect("write outcome variant")
-        .into_parts();
-    assert_eq!(result.row_count(), 1);
-    assert_eq!(actual_commit, Some(commit));
-    assert_eq!(actual_abort, None);
-
-    let abort = WriteAbortInput {
-        write_id,
-        reason: "writer failed".to_string(),
-        completed_writer_outputs: Vec::new(),
-        incomplete_writers: Vec::new(),
-    };
-    let abort_outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
-        .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(abort.clone()),
-            connector_completion: None,
-            fragment_profiles: Vec::new(),
-        })
-        .expect("Write intent accepts an abort payload");
-    let (_, actual_commit, actual_abort) = abort_outcome
-        .into_write()
-        .expect("write outcome variant")
-        .into_parts();
-    assert_eq!(actual_commit, None);
-    assert_eq!(actual_abort, Some(abort));
-}
-
-#[test]
-fn connector_staging_rejects_a_legacy_direct_commit_payload() {
-    let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Write)
-        .write(
-            crate::runtime::query_result::QueryResult::empty(),
-            Some(WriteCommitInput {
-                write_id: novarocks_types::UniqueId::new(43, 79),
-                writers: Vec::new(),
-            }),
-            None,
-        )
-        .expect("legacy write terminal remains valid outside connector staging");
-
-    let result = outcome
-        .into_write()
-        .expect("write outcome variant")
-        .into_connector_staging();
-    let Err(error) = result else {
-        panic!("connector staging must not consume a legacy direct commit");
-    };
-    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-    assert_eq!(
-        error.message(),
-        "connector staging terminal returned a legacy direct commit payload"
-    );
-}
-
-#[test]
 fn profile_outcome_preserves_fragment_profiles() {
     let profile =
         novarocks_execution::runtime::profile::Profiler::new("fragment-7").to_native_tree();
@@ -707,9 +628,7 @@ fn profile_outcome_preserves_fragment_profiles() {
                 vec!["profiled".to_string()],
             )
             .expect("profile result"),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
+            write_session: None,
             fragment_profiles: vec![profile.clone()],
         })
         .expect("Profile intent accepts fragment profiles");
@@ -731,9 +650,7 @@ fn result_outcome_preserves_query_result() {
                 vec!["kept".to_string()],
             )
             .expect("result payload"),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
+            write_session: None,
             fragment_profiles: Vec::new(),
         })
         .expect("Result intent accepts a plain query result");
@@ -745,33 +662,6 @@ fn result_outcome_preserves_query_result() {
             .into_query_result()
             .row_count(),
         1
-    );
-}
-
-#[test]
-fn write_outcome_rejects_commit_and_abort_together() {
-    let write_id = novarocks_types::UniqueId::new(8, 13);
-    let result = QueryOutcomeFactory::new(DistributedQueryIntent::Write).write(
-        crate::runtime::query_result::QueryResult::empty(),
-        Some(WriteCommitInput {
-            write_id,
-            writers: Vec::new(),
-        }),
-        Some(WriteAbortInput {
-            write_id,
-            reason: "ambiguous".to_string(),
-            completed_writer_outputs: Vec::new(),
-            incomplete_writers: Vec::new(),
-        }),
-    );
-
-    let Err(error) = result else {
-        panic!("Write outcome must reject simultaneous commit and abort payloads");
-    };
-    assert_eq!(error.kind(), DistributedQueryErrorKind::ContractViolation);
-    assert_eq!(
-        error.message(),
-        "Write outcome cannot contain both commit and abort payloads"
     );
 }
 

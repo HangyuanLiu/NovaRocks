@@ -55,7 +55,7 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
             .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?;
         let input = encoding.input().map_err(DmlError::executor)?;
         let native_bundle =
-            crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
+            crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input)
                 .map_err(DmlError::executor)?;
         drop(encoding);
         Ok(
@@ -64,9 +64,6 @@ impl WriteExecutor for DeleteWriteExecutor<'_> {
                 .run_delete_with_native_bundle(self.prepared.handle.as_ref(), native_bundle)
                 .map_err(DmlError::executor)?
             {
-                DeleteWriteReport::Aborted { reason, .. } => {
-                    CoordinatedWriteReport::Aborted { reason }
-                }
                 DeleteWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 DeleteWriteReport::CommitRequired(handle) => {
                     CoordinatedWriteReport::CommitRequired(handle)

@@ -23,15 +23,13 @@ use crate::query_execution::completion::{
     PreparedDistributedQuery, PreparedRetriableDistributedRequest, QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
-    ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
-    DistributedQueryOutcome, DistributedQueryRequest,
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
+    DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
-    ConnectorWriteLease,
 };
 
 #[derive(Clone)]
@@ -89,29 +87,22 @@ impl QueryExecutionService {
         self.coordinator.execute_prepared_raw(operation)
     }
 
-    /// Seal every cohort against the application-retained exact control lease
-    /// before any distributed writer attempt is staged.
-    pub fn begin_write_operation(
-        &self,
-        registration: ConnectorWriteOperationRegistration,
-        lease: ConnectorWriteLease,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        self.coordinator.begin_write_operation(registration, lease)
-    }
-
     /// Seal a provider-frozen distributed rewrite against the composite lease
     /// that selected its metadata, rewrite and C1 write capabilities together.
     pub fn begin_distributed_rewrite_operation_with_lease(
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
+        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorDistributedRewriteSession, DistributedQueryError> {
-        ConnectorDistributedRewriteSession::try_begin(plan, lease, context).map_err(|error| {
-            DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                format!("seal distributed rewrite operation cohorts: {error}"),
-            )
-        })
+        ConnectorDistributedRewriteSession::try_begin(plan, lease, write_stack, table, context)
+            .map_err(|error| {
+                DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                    format!("seal distributed rewrite operation cohorts: {error}"),
+                )
+            })
     }
 }

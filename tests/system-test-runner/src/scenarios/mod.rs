@@ -3,6 +3,7 @@ use crate::scenario::Scenario;
 mod backend_membership;
 mod catalog_state;
 mod connector;
+mod distributed_writer;
 mod frontend_lifecycle;
 mod mv_recovery;
 mod native_compatibility;
@@ -19,6 +20,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());
+    scenarios.extend(distributed_writer::scenarios());
     scenarios.extend(frontend_lifecycle::scenarios());
     scenarios.extend(catalog_state::scenarios());
     scenarios.extend(mv_recovery::scenarios());

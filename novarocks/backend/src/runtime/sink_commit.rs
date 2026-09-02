@@ -52,21 +52,9 @@ pub(crate) struct TabletFailInfo {
 /// projects them into the Protocol terminal snapshot.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct SinkCommitReportSnapshot {
-    pub(crate) connector_staged_report_frames:
-        Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
     pub(crate) tablet_commit_infos: Vec<TabletCommitInfo>,
     pub(crate) tablet_fail_infos: Vec<TabletFailInfo>,
     pub(crate) load_stats: SinkLoadStats,
-}
-
-impl SinkCommitReportSnapshot {
-    pub(crate) fn with_connector_staged_report_frames(
-        mut self,
-        frames: Vec<novarocks_spi::connector::ConnectorStagedReportFrame>,
-    ) -> Self {
-        self.connector_staged_report_frames = frames;
-        self
-    }
 }
 
 #[derive(Debug, Default)]
@@ -109,22 +97,22 @@ fn acquire_backend_sink_commit_lease(
     fragment_instance_id: UniqueId,
     evidence_limits: WriteCommitEvidenceLimits,
 ) -> Result<Box<dyn FragmentCommitLease>, String> {
-    let evidence_ledger = WriteCommitEvidenceLedger::new(evidence_limits);
-    if !try_register_with_ledger(fragment_instance_id, evidence_ledger.clone()) {
+    if !try_register_with_ledger(
+        fragment_instance_id,
+        WriteCommitEvidenceLedger::new(evidence_limits),
+    ) {
         return Err(format!(
             "sink commit already registered for fragment instance {fragment_instance_id}"
         ));
     }
     Ok(Box::new(BackendSinkCommitLease {
         fragment_instance_id,
-        evidence_ledger,
         active: true,
     }))
 }
 
 struct BackendSinkCommitLease {
     fragment_instance_id: UniqueId,
-    evidence_ledger: WriteCommitEvidenceLedger,
     active: bool,
 }
 
@@ -132,7 +120,6 @@ impl BackendSinkCommitLease {
     fn snapshot(&self) -> FragmentCommitReport {
         let snapshot = report_snapshot(self.fragment_instance_id);
         FragmentCommitReport {
-            connector_staged_report_frames: snapshot.connector_staged_report_frames,
             tablet_commit_infos: snapshot
                 .tablet_commit_infos
                 .into_iter()
@@ -159,10 +146,6 @@ impl BackendSinkCommitLease {
 }
 
 impl FragmentCommitLease for BackendSinkCommitLease {
-    fn write_commit_evidence_ledger(&self) -> WriteCommitEvidenceLedger {
-        self.evidence_ledger.clone()
-    }
-
     fn add_load_stats(&mut self, stats: FragmentSinkLoadStats) {
         add_load_stats(
             self.fragment_instance_id,
@@ -321,7 +304,6 @@ pub(crate) fn report_snapshot(finst_id: UniqueId) -> SinkCommitReportSnapshot {
         return SinkCommitReportSnapshot::default();
     };
     SinkCommitReportSnapshot {
-        connector_staged_report_frames: Vec::new(),
         tablet_commit_infos: entry.tablet_commit_infos.clone(),
         tablet_fail_infos: entry.tablet_fail_infos.clone(),
         load_stats: SinkLoadStats {

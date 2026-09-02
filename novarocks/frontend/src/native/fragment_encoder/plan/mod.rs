@@ -37,6 +37,7 @@ mod scan;
 mod topology;
 mod type_mapping;
 mod write;
+pub(crate) mod write_dataflow;
 
 type ContextRef<'a, T> = Option<&'a T>;
 
@@ -62,6 +63,11 @@ pub(super) struct NativePlanEncodeContext<'a> {
     /// `None` only in bare-node/bare-fragment encoder unit tests, which never
     /// encode a write or router fragment.
     pub(super) write_contracts: ContextRef<'a, WriteContractCatalog>,
+    /// The begin session's sealed logical write targets. The encoder stamps a
+    /// writer node's catalog handle and canonical recipe from here, so a handle
+    /// never has to be patched in after placement. `None` outside a write
+    /// query and in bare-node encoder unit tests.
+    pub(super) write_targets: ContextRef<'a, write_dataflow::SealedWriteTargets>,
 }
 
 impl<'a> NativePlanEncodeContext<'a> {
@@ -71,7 +77,19 @@ impl<'a> NativePlanEncodeContext<'a> {
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
+            write_targets: None,
         }
+    }
+
+    /// Attach the begin session's sealed write targets. A plan containing a
+    /// writer node without them fails to encode rather than submitting a
+    /// writer the backend could not bind.
+    pub(super) const fn with_write_targets(
+        mut self,
+        targets: &'a write_dataflow::SealedWriteTargets,
+    ) -> Self {
+        self.write_targets = Some(targets);
+        self
     }
 }
 
@@ -84,6 +102,19 @@ fn required_context_ref<'a, T>(
 
 fn optional_context_ref<T>(value: Option<&T>) -> Option<&T> {
     value
+}
+
+/// Encode a plan whose writer nodes are stamped from the begin session's
+/// sealed targets.
+pub(super) fn encode_distributed_plan_with_write_targets(
+    src: &DistributedPlan,
+    scan_facts: NativeScanFactsView<'_>,
+    write_targets: &write_dataflow::SealedWriteTargets,
+) -> Result<plan::DistributedPlan, String> {
+    encode_distributed_plan_with_context_inner(
+        src,
+        NativePlanEncodeContext::complete(src, scan_facts).with_write_targets(write_targets),
+    )
 }
 
 pub(super) fn encode_distributed_plan(
@@ -112,6 +143,7 @@ pub(super) fn encode_distributed_plan_with_context(
             node_outputs: Some(src.node_outputs()),
             fragment_edge_outputs: Some(src.fragment_edge_outputs()),
             write_contracts: Some(src.write_contracts()),
+            write_targets: ctx.write_targets,
         },
     )
 }
@@ -158,6 +190,7 @@ pub(crate) fn encode_node(src: &DistributedNode) -> Result<plan::DistributedNode
             node_outputs: None,
             fragment_edge_outputs: None,
             write_contracts: None,
+            write_targets: None,
         },
     )
 }
@@ -187,6 +220,12 @@ pub(super) fn encode_node_with_context(
                 output_columns,
             )?)
         }
+        DistributedNodeKind::TableWriter(writer) => plan::distributed_node::Payload::TableWriter(
+            write_dataflow::encode_table_writer_node(writer, ctx)?,
+        ),
+        DistributedNodeKind::TableFinish(finish) => plan::distributed_node::Payload::TableFinish(
+            write_dataflow::encode_table_finish_node(finish),
+        ),
         other => {
             let physical = distributed_kind_to_physical(other);
             plan::distributed_node::Payload::Physical(encode_physical_node(

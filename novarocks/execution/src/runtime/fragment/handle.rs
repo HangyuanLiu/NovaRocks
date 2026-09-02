@@ -163,10 +163,6 @@ struct TestFragmentCommitLease;
 
 #[cfg(test)]
 impl crate::runtime::fragment::io::FragmentCommitLease for TestFragmentCommitLease {
-    fn write_commit_evidence_ledger(&self) -> novarocks_spi::connector::WriteCommitEvidenceLedger {
-        novarocks_spi::connector::WriteCommitEvidenceLedger::default()
-    }
-
     fn add_load_stats(&mut self, _stats: crate::runtime::fragment::io::FragmentSinkLoadStats) {}
 
     fn add_tablet_commit_info(
@@ -580,12 +576,6 @@ impl RunningFragmentHandle {
             .resources
             .handoff_sink_commit();
     }
-
-    pub fn take_connector_staged_report_frames(
-        &self,
-    ) -> Vec<novarocks_spi::connector::ConnectorStagedReportFrame> {
-        self.inner.pipeline.take_connector_staged_report_frames()
-    }
 }
 
 impl RunningFragmentInner {
@@ -692,24 +682,6 @@ pub fn prepare_fragment(
     let prepare_result = (|| {
         resources.acquire_sink_commit(finst_id)?;
         context.fail_if_injected(PrepareFailurePoint::AfterSinkCommit)?;
-        if let Some(collector) = program.sink().program().connector_staged_report_collector() {
-            let ledger = resources.write_commit_evidence_ledger().ok_or_else(|| {
-                FragmentLaunchError::new(
-                    FragmentLaunchStage::Register,
-                    FragmentLaunchErrorKind::ResourceUnavailable,
-                    "sink commit lease did not provide a write commit evidence ledger",
-                )
-            })?;
-            collector
-                .bind_write_commit_evidence_ledger(ledger)
-                .map_err(|error| {
-                    FragmentLaunchError::new(
-                        FragmentLaunchStage::Register,
-                        FragmentLaunchErrorKind::ResourceUnavailable,
-                        format!("bind connector staged report ledger: {error}"),
-                    )
-                })?;
-        }
         let result_spec = context.result_spec.clone().unwrap_or_else(|| {
             ResultWriteSpec::new(
                 finst_id,
@@ -734,10 +706,6 @@ pub fn prepare_fragment(
                 backend_num: Some(instance.backend_num().get()),
                 mem_tracker: context.mem_tracker.clone(),
                 runtime_filter_session: context.runtime_filter.clone(),
-                connector_staged_report_collector: program
-                    .sink()
-                    .program()
-                    .connector_staged_report_collector(),
                 execution_runtime: context.execution_runtime.clone(),
                 scan_registration: context.scan_registration.clone(),
             },

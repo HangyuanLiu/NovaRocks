@@ -86,11 +86,6 @@ pub(crate) fn prepare_fragments(
         ));
     }
     let result_fragment_id = preparation_facts.result_fragment_id();
-    let terminal_write_fragment_ids = preparation_facts
-        .terminal_write_fragment_ids()
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     let producer_fragment_ids = preparation_facts
         .producer_fragment_ids()
         .iter()
@@ -99,17 +94,11 @@ pub(crate) fn prepare_fragments(
     validate_topology_roles(
         &sealed_ids,
         result_fragment_id,
-        &terminal_write_fragment_ids,
         &producer_fragment_ids,
         execution_anchor_fragment_id,
     )?;
-    // A terminal writer has an Iceberg-write boundary even when it has no
-    // query output contract. The latter is an application result-shape fact,
-    // while the former is part of the sealed execution topology.
-    let write_contract_fragment_ids = terminal_write_fragment_ids.clone();
     let boundary_contracts = validate_and_group_boundary_contracts(
         result_fragment_id,
-        &write_contract_fragment_ids,
         plan.edges(),
         preparation_facts.boundary_contracts(),
         &sealed_ids,
@@ -183,28 +172,15 @@ pub(crate) fn prepare_fragments(
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
-        } else if terminal_write_fragment_ids.contains(&fragment.fragment_id) {
-            PreparedFragmentRole::TerminalWrite
         } else {
             PreparedFragmentRole::NonTerminal
         };
-        // Query-path output is finalized by FragmentEdgeOutputCatalog. Iceberg
-        // target-schema output belongs to WriteContractCatalog and is not a
-        // fetch/result projection. The two sealed catalogs are complementary:
-        // exactly write fragments must be absent from fragment-edge outputs.
-        let sealed_output_columns = plan
+        // Query-path output is finalized by FragmentEdgeOutputCatalog.
+        let output_columns = match plan
             .fragment_edge_outputs()
-            .fragment_output_columns(fragment.fragment_id);
-        let output_columns = match (
-            write_contract_fragment_ids.contains(&fragment.fragment_id),
-            sealed_output_columns,
-        ) {
-            // A connector writer's carrier output is not a query result. The
-            // write contract owns its target schema; preparation therefore
-            // deliberately projects no query-output columns whether or not
-            // sealing retained the writer's carrier columns.
-            (true, _) => Vec::new(),
-            (false, Some(columns)) => columns
+            .fragment_output_columns(fragment.fragment_id)
+        {
+            Some(columns) => columns
                 .iter()
                 .map(|column| PreparedOutputColumn {
                     name: column.name.clone(),
@@ -212,9 +188,9 @@ pub(crate) fn prepare_fragments(
                     nullable: column.nullable,
                 })
                 .collect(),
-            (false, None) => {
+            None => {
                 return Err(format!(
-                    "prepared sealed output mismatch fragment_id={}: non-write fragment is missing FragmentEdgeOutputCatalog output",
+                    "prepared sealed output mismatch fragment_id={}: fragment is missing FragmentEdgeOutputCatalog output",
                     fragment.fragment_id
                 ));
             }
@@ -282,11 +258,6 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             Vec::new(),
         )?;
     let result_fragment_id = preparation_facts.result_fragment_id();
-    let terminal_write_fragment_ids = preparation_facts
-        .terminal_write_fragment_ids()
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
     let mut by_fragment = BTreeMap::new();
     for fragment in plan.fragments() {
         let role = if matches!(
@@ -296,8 +267,6 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             PreparedFragmentRole::Statistics
         } else if result_fragment_id == Some(fragment.fragment_id) {
             PreparedFragmentRole::Result
-        } else if terminal_write_fragment_ids.contains(&fragment.fragment_id) {
-            PreparedFragmentRole::TerminalWrite
         } else {
             PreparedFragmentRole::NonTerminal
         };
@@ -340,44 +309,9 @@ mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn write_plan() -> novarocks_sql::plan_read::DistributedPlan {
-        novarocks_sql::test_support::native_preparation_plan(
-            novarocks_sql::test_support::NativePreparationFixture::TerminalWrite,
-        )
-        .expect("sealed terminal-write preparation fixture")
-    }
 
     #[test]
-    fn production_preparation_accepts_write_without_query_output_contract() {
-        let plan = write_plan();
-        assert!(
-            plan.fragment_edge_outputs()
-                .fragment_output_columns(9)
-                .is_some_and(|columns| !columns.is_empty())
-        );
-        let registry = crate::connector::FixtureConnectorRegistry::new();
-        let controls = crate::connector::FixtureControlResolver::new(registry.clone());
-        let prepared = prepare_fragments(
-            &plan,
-            &controls,
-            &crate::connector::test_request_context(),
-            None,
-            None,
-            ScanPreparationOptions::single_backend_fixture(),
-        )
-        .expect("sealed write output absence is legal");
-        assert!(
-            prepared
-                .fragment(9)
-                .expect("prepared writer")
-                .boundary_projection()
-                .output_columns()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn production_preparation_rejects_missing_non_write_output_contract() {
+    fn production_preparation_rejects_a_missing_output_contract() {
         let plan = novarocks_sql::test_support::native_preparation_plan(
             novarocks_sql::test_support::NativePreparationFixture::MissingResultOutput,
         )
@@ -393,13 +327,13 @@ mod tests {
             ScanPreparationOptions::single_backend_fixture(),
         ) {
             Ok(_) => {
-                panic!("non-write output absence must fail through production preparation")
+                panic!("output absence must fail through production preparation")
             }
             Err(error) => error,
         };
         assert_eq!(
             error,
-            "prepared sealed output mismatch fragment_id=7: non-write fragment is missing FragmentEdgeOutputCatalog output"
+            "prepared sealed output mismatch fragment_id=7: fragment is missing FragmentEdgeOutputCatalog output"
         );
     }
 }

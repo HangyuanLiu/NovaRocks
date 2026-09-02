@@ -28,18 +28,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorMutationFailure, ConnectorPartitionTransform,
     ConnectorStagedCreateLease, ConnectorStagedCreatePrepareOutcome,
     ConnectorStagedCreatePrepareRequest, ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
     ConnectorStagedCreatePublishRequest, ConnectorStagedTableHandle,
-    ConnectorStagedWritePlanningRequest, ConnectorUnanchoredCtasCleanupLease,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationCompletion,
-    ConnectorWriteOperationId, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
-    CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
+    ConnectorStagedWritePlanningRequest, ConnectorStagedWriteProof,
+    ConnectorUnanchoredCtasCleanupLease, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteIntent,
+    ConnectorWriteLease, CreatePolicy, ExternalMutationEvidence, ExternalMutationFinalization,
+    ExternalMutationOutcome, LakePublicationId,
 };
 use novarocks_user_error::UserError;
 
@@ -419,8 +418,6 @@ pub enum StandardCtasStageOutcome {
 
 pub struct PreparedStandardCtasWrite {
     pub target_facts: StandardCtasTargetFacts,
-    pub write_operation_id: ConnectorWriteOperationId,
-    pub cohort_set_digest: [u8; 32],
     pub execution_identity: [u8; 32],
     pub handle: Arc<dyn CtasPreparedWrite>,
 }
@@ -459,10 +456,15 @@ pub enum StandardCtasPublicationAdjudicationOutcome {
 /// The standard staged-create path never carries a takeover fence. Keeping a
 /// separate outcome type prevents the retired authority carrier from leaking
 /// back into the crash-only CTAS frontier while legacy code is being removed.
+///
+/// `CommitUnknown` is retained but is no longer reachable from the staged
+/// write: a staged write session seals its artifacts without touching the
+/// catalog, so until the publication runs there is nothing whose external
+/// outcome could be in doubt. A write that fails now says so.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StandardCtasWriteOutcome {
     Completed {
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
         execution_identity: [u8; 32],
     },
     KnownUncommitted {
@@ -519,7 +521,6 @@ pub trait CtasEngine: Send + Sync {
         &self,
         _source: &dyn CtasPreparedSource,
         _target: &dyn CtasPreparedTarget,
-        _write_operation_id: ConnectorWriteOperationId,
     ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
         Err(standard_ctas_unsupported())
     }
@@ -545,7 +546,7 @@ pub trait CtasEngine: Send + Sync {
         &self,
         _target: &dyn CtasPreparedTarget,
         _publication_id: LakePublicationId,
-        _completion: ConnectorWriteOperationCompletion,
+        _write: ConnectorStagedWriteProof,
     ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
         Err(standard_ctas_unsupported())
     }
@@ -685,7 +686,7 @@ fn prepare_planned_ctas_connector_write(
     input_schema: arrow::datatypes::SchemaRef,
     query_options: Option<QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    template: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<
     (
         crate::query_execution::compiler::NativeFragmentEncodingInput,
@@ -693,13 +694,21 @@ fn prepare_planned_ctas_connector_write(
     ),
     String,
 > {
-    let distributed = novarocks_sql::planning::dml::build_ctas_connector_write_distributed_plan(
+    // The session both selects this plan shape and owns the writer recipes it
+    // carries, so the two are sealed together rather than by two independent
+    // choices that could disagree. Sealing first also means the plan's write
+    // target ordinal is read off the session instead of assumed.
+    let sealed = session
+        .seal_write_targets()
+        .map_err(|error| error.to_string())?;
+    let dataflow = novarocks_sql::planning::dml::build_ctas_connector_write_dataflow_plan(
         &planned.source,
         input_schema,
+        sealed.sole_target_ordinal()?,
         &planned.optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed,
+        &dataflow,
         state.connector_control().as_ref(),
         connector_context,
         Some(planned.table_bindings.as_ref()),
@@ -716,18 +725,12 @@ fn prepare_planned_ctas_connector_write(
             crate::query_execution::compiler::typed_connector_session()?,
         ),
     )?;
-    let cohort_id = template.cohort_id();
-    let exact_lease = template.lease();
     Ok((
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(distributed, prepared),
+        crate::query_execution::compiler::NativeFragmentEncodingInput::new(dataflow, prepared)
+            .with_sealed_write_targets(sealed),
         PendingCtasDistributedWrite {
             query_options,
-            registration:
-                crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
-                    template,
-                ),
-            cohort_id,
-            lease: exact_lease,
+            session,
         },
     ))
 }
@@ -772,6 +775,10 @@ impl CoreCtasCatalogAction {
 struct CoreStandardCtasTargetPreflight {
     target: crate::catalog_application::resolver::TargetBackend,
     lease: ConnectorStagedCreateLease,
+    /// Retained so the write session opens on the *same* control generation
+    /// that staged the target. Re-acquiring the current one at write time could
+    /// hand the session a runtime that never saw the staged create.
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     unanchored_ctas_cleanup_lease: novarocks_spi::connector::ConnectorUnanchoredCtasCleanupLease,
     write_lease: ConnectorWriteLease,
     target_catalog_properties: novarocks_spi::connector::CatalogProperties,
@@ -812,6 +819,8 @@ impl CtasPreparedSource for CorePreparedStandardCtasSource {
 struct CoreStandardCtasTargetSession {
     lease: ConnectorStagedCreateLease,
     write_lease: ConnectorWriteLease,
+    planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
+    target: crate::catalog_application::resolver::TargetBackend,
     handle: ConnectorStagedTableHandle,
     publication_id: LakePublicationId,
     context: Mutex<novarocks_spi::connector::ConnectorRequestContext>,
@@ -834,7 +843,7 @@ impl CoreStandardCtasTargetSession {
     fn prepare_publish(
         &self,
         publication_id: LakePublicationId,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<ConnectorStagedCreatePublishRequest, CtasFailure> {
         if publication_id != self.publication_id {
             return Err(internal_failure(
@@ -863,7 +872,7 @@ impl CoreStandardCtasTargetSession {
                 publication_id.to_bytes(),
             ),
             handle: self.handle.clone(),
-            completion,
+            write,
             context: self
                 .context
                 .lock()
@@ -879,120 +888,101 @@ impl CtasPreparedTarget for CoreStandardCtasTargetSession {
     }
 }
 
+/// What a staged CTAS target lets its write do.
+///
+/// Opening the session and binding its result are the whole surface: the target
+/// hands the session the frozen facts a catalog load would otherwise have
+/// returned, and takes back the one receipt that session produced.
 trait CtasWriteTarget: Send + Sync {
-    fn plan_write(
+    fn begin_write_session(
         &self,
-        operation_id: ConnectorWriteOperationId,
-        input_schema: arrow::datatypes::SchemaRef,
+        host: &crate::connector::control_host::ConnectorControlHost,
+        output_schema: &arrow::datatypes::SchemaRef,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<
-        crate::query_execution::contract::ConnectorWritePlanningTemplate,
-        novarocks_spi::connector::ConnectorError,
-    >;
+    ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>;
 
     fn bind_write(
         &self,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), novarocks_spi::connector::ConnectorError>;
-
-    fn install_terminal_context(&self, context: novarocks_spi::connector::ConnectorRequestContext);
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError>;
-
-    fn reconcile_write_completion(
-        &self,
-        completion: ConnectorWriteOperationCompletion,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError>;
 }
 
 impl CtasWriteTarget for CoreStandardCtasTargetSession {
-    fn plan_write(
+    fn begin_write_session(
         &self,
-        operation_id: ConnectorWriteOperationId,
-        input_schema: arrow::datatypes::SchemaRef,
+        host: &crate::connector::control_host::ConnectorControlHost,
+        output_schema: &arrow::datatypes::SchemaRef,
         context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<
-        crate::query_execution::contract::ConnectorWritePlanningTemplate,
-        novarocks_spi::connector::ConnectorError,
-    > {
+    ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
+    {
         if self.write_unknown_latched.load(Ordering::Acquire) {
-            return Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-                "standard CTAS writer outcome is unresolved",
-            ));
+            return Err(CtasFailure {
+                kind: CtasFailureKind::Unavailable,
+                message: "standard CTAS writer outcome is unresolved".to_string(),
+                user_error: None,
+            });
         }
         if self
             .write_plan_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err(novarocks_spi::connector::ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+            return Err(internal_failure(
                 "standard CTAS staged target write has already been prepared",
             ));
         }
-        let binding = self.lease.plan_write(ConnectorStagedWritePlanningRequest {
-            handle: self.handle.clone(),
-            operation_id,
+        // The staged target vends the opaque table facts the session opens on.
+        // This is the only way to reach them: the catalog will not know this
+        // table until the publication commits.
+        let binding = self
+            .lease
+            .plan_write(ConnectorStagedWritePlanningRequest {
+                handle: self.handle.clone(),
+                context,
+            })
+            .map_err(connector_failure)?;
+        let stack =
+            crate::connector::write_target::derive_write_stack_lease(host, &self.planning_lease)
+                .map_err(internal_failure)?;
+        let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            table: Arc::from(format!("{}.{}", self.target.namespace, self.target.table).as_str()),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             intent: ConnectorWriteIntent::Append,
-            input_schema: Arc::clone(&input_schema),
-            context,
-        })?;
-        let outcome = self
-            .write_lease
-            .prepare_write(ConnectorWritePreparationRequest {
-                table: binding.table().clone(),
-                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-                intent: binding.intent(),
-                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                input: ConnectorWriteInputRequest::Data {
-                    fields: input_schema
-                        .fields()
-                        .iter()
-                        .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
-                        .collect(),
-                },
-                context: binding.context().clone(),
-            })?;
-        let preparation = match outcome {
-            ConnectorWritePreparationOutcome::Prepared(preparation) => preparation,
-            ConnectorWritePreparationOutcome::Denied(error) => return Err(error),
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::Data {
+                fields: output_schema
+                    .fields()
+                    .iter()
+                    .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
+                    .collect(),
+            },
+            base: None,
+            flavor:
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
+                    binding.table().clone(),
+                ),
+            context: binding.context().clone(),
         };
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-            binding.operation_id(),
-            preparation,
-            binding.context().clone(),
-            self.write_lease.clone(),
+        crate::query_execution::write_session::begin_connector_write_session(
+            stack,
+            &self.write_lease,
+            request,
         )
+        .map_err(internal_failure)
     }
 
     fn bind_write(
         &self,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.lease.bind_write(self.handle.clone(), completion)
-    }
-
-    fn install_terminal_context(&self, context: novarocks_spi::connector::ConnectorRequestContext) {
-        *self
-            .context
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = context;
+        self.lease.bind_write(self.handle.clone(), write)
     }
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError> {
         self.write_unknown_latched.store(true, Ordering::Release);
         self.lease.mark_write_unknown(&self.handle)
-    }
-
-    fn reconcile_write_completion(
-        &self,
-        _completion: ConnectorWriteOperationCompletion,
-    ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        Err(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
-            "crash-only standard CTAS does not reconcile writer uncertainty in process",
-        ))
     }
 }
 
@@ -1117,12 +1107,8 @@ struct CorePreparedCtasWrite {
     target: Arc<dyn CtasWriteTarget>,
     native_encoding: Mutex<Option<crate::query_execution::compiler::NativeFragmentEncodingInput>>,
     pending: Mutex<Option<PendingCtasDistributedWrite>>,
-    prepared:
-        Mutex<Option<crate::query_execution::prepared_write::PreparedDistributedWriteRequest>>,
-    completion: Mutex<Option<crate::query_execution::ConnectorWriteCompletion>>,
-    write_session:
-        Mutex<Option<crate::query_execution::write_operation::ConnectorWriteOperationSession>>,
-    write_unknown: Mutex<Option<ExternalMutationEvidence>>,
+    prepared: Mutex<Option<BoundCtasDistributedWrite>>,
+    terminal_context: novarocks_spi::connector::ConnectorRequestContext,
     attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
     execution_identity: [u8; 32],
 }
@@ -1132,9 +1118,16 @@ struct CorePreparedCtasWrite {
 /// native bundle for the sealed plan/preparation pair.
 struct PendingCtasDistributedWrite {
     query_options: Option<QueryOptions>,
-    registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
-    cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
-    lease: ConnectorWriteLease,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+}
+
+/// The same facts once the native bundle has been bound to them. It is the
+/// exact input of the one distributed round this CTAS runs.
+struct BoundCtasDistributedWrite {
+    prepared: crate::query_execution::preparation::PreparedFragmentSet,
+    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
+    query_options: Option<QueryOptions>,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl CtasPreparedWrite for CorePreparedCtasWrite {
@@ -1314,8 +1307,103 @@ fn standard_publish_input_digest(request: &ConnectorStagedCreatePublishRequest) 
         b"novarocks.standard-ctas-publish.v1",
         &request.operation_id.to_bytes(),
         &request.handle.digest(),
-        &request.completion.aggregate_digest(),
+        &request.write.digest(),
+        &request.write.row_count().to_be_bytes(),
     ])
+}
+
+/// Turn one completed write session into the proof its publication needs.
+///
+/// This is the whole terminal of a staged CTAS write: seal exactly once, take
+/// the rows only if the seal is known to have succeeded, and bind the resulting
+/// receipt to the staged target. Every failure below is proven-uncommitted --
+/// a staged seal touches no catalog, so the target still does not exist.
+fn seal_ctas_write(
+    target: &dyn CtasWriteTarget,
+    execution_identity: [u8; 32],
+    completion: Option<crate::query_execution::outcome::ConnectorWriteSessionCompletion>,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> StandardCtasWriteOutcome {
+    // An empty prepared write set arrives here exactly like a full one. Whether
+    // an empty CTAS publishes an empty table is the provider's decision, and it
+    // cannot make it if the frontend short-circuits on "there were no
+    // fragments".
+    let Some(completion) = completion else {
+        return staged_write_failed(target, "CTAS write produced no sealed write set");
+    };
+    let committed =
+        match crate::query_execution::write_session::finish_write_session(completion, context) {
+            Ok(committed) => committed,
+            Err(error) => {
+                return staged_write_failed(
+                    target,
+                    format!("CTAS write set could not be sealed: {error}"),
+                );
+            }
+        };
+    // Rows become reportable exactly here, and only on an outcome known to
+    // have succeeded.
+    let Some(row_count) = committed.affected_rows() else {
+        let message = match committed.into_outcome() {
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                format!("CTAS write was not sealed: {}", failure.message())
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => format!(
+                "CTAS write sealing outcome is unresolved: {}",
+                failure.message()
+            ),
+            ExternalMutationOutcome::KnownCommitted { .. } => {
+                "CTAS write sealed without reporting its rows".to_string()
+            }
+        };
+        return staged_write_failed(target, message);
+    };
+    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = committed.into_outcome() else {
+        return staged_write_failed(target, "CTAS write reported rows without a receipt");
+    };
+    let proof = match ConnectorStagedWriteProof::try_new(receipt, row_count) {
+        Ok(proof) => proof,
+        Err(error) => {
+            return staged_write_failed(
+                target,
+                format!("CTAS write receipt is not publishable: {error}"),
+            );
+        }
+    };
+    if let Err(error) = target.bind_write(proof.clone()) {
+        return staged_write_failed(
+            target,
+            format!("CTAS target refused its sealed write: {error}"),
+        );
+    }
+    StandardCtasWriteOutcome::Completed {
+        write: proof,
+        execution_identity,
+    }
+}
+
+/// Close a staged target whose write never produced a publishable receipt.
+///
+/// The latch matters even though the publication would refuse anyway: a target
+/// whose write is unresolved must not be aborted either, because aborting
+/// deletes objects and this process no longer knows what the write left behind.
+fn staged_write_failed(
+    target: &dyn CtasWriteTarget,
+    message: impl Into<String>,
+) -> StandardCtasWriteOutcome {
+    let mut message = message.into();
+    if let Err(error) = target.mark_write_unknown() {
+        message.push_str(&format!(
+            "; standard CTAS target rejected write-unknown transition: {error}"
+        ));
+    }
+    StandardCtasWriteOutcome::KnownUncommitted {
+        failure: CtasFailure {
+            kind: CtasFailureKind::Unavailable,
+            message,
+            user_error: None,
+        },
+    }
 }
 
 fn standard_ctas_unsupported() -> CtasFailure {
@@ -1323,66 +1411,6 @@ fn standard_ctas_unsupported() -> CtasFailure {
         kind: CtasFailureKind::Unsupported,
         message: "connector does not support crash-only standard CTAS staged-create".to_string(),
         user_error: None,
-    }
-}
-
-fn write_staging_evidence(
-    session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
-) -> ExternalMutationEvidence {
-    let mut payload = Vec::with_capacity(8 + 16 + 16 + 32);
-    payload.extend_from_slice(b"CTASWS1\0");
-    payload.extend_from_slice(&session.operation_id().to_bytes());
-    payload.extend_from_slice(&session.owner().incarnation.to_bytes());
-    payload.extend_from_slice(&session.sealed().digest());
-    ExternalMutationEvidence::try_new(
-        1,
-        novarocks_spi::connector::ConnectorInstanceDescriptor {
-            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                .expect("static Iceberg provider ID is valid"),
-            instance_id: session.owner().instance_id.clone(),
-        },
-        session.owner().incarnation,
-        novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
-            session.operation_id().to_bytes(),
-        ),
-        "ctas-write-staging",
-        Bytes::from(payload),
-    )
-    .expect("bounded CTAS writer evidence is valid")
-}
-
-fn standard_write_commit_unknown(
-    prepared: &CorePreparedCtasWrite,
-    session: &crate::query_execution::write_operation::ConnectorWriteOperationSession,
-    message: impl Into<String>,
-) -> StandardCtasWriteOutcome {
-    let mut failure_message = message.into();
-    let evidence = {
-        let mut stored = prepared
-            .write_unknown
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if stored.is_none() {
-            let evidence = write_staging_evidence(session);
-            if let Err(error) = prepared.target.mark_write_unknown() {
-                failure_message.push_str(&format!(
-                    "; standard CTAS target rejected write-unknown transition: {error}"
-                ));
-            }
-            *stored = Some(evidence);
-        }
-        stored
-            .as_ref()
-            .expect("CTAS evidence was installed")
-            .clone()
-    };
-    StandardCtasWriteOutcome::CommitUnknown {
-        failure: CtasFailure {
-            kind: CtasFailureKind::Unavailable,
-            message: failure_message,
-            user_error: None,
-        },
-        evidence,
     }
 }
 
@@ -1458,6 +1486,7 @@ impl CtasEngine for DmlExecutionKernel {
                 handle: Arc::new(CoreStandardCtasTargetPreflight {
                     target,
                     lease,
+                    planning_lease: planning.clone(),
                     unanchored_ctas_cleanup_lease,
                     write_lease,
                     target_catalog_properties,
@@ -1680,6 +1709,8 @@ impl CtasEngine for DmlExecutionKernel {
                 let target = Arc::new(CoreStandardCtasTargetSession {
                     lease: preflight.lease.clone(),
                     write_lease: preflight.write_lease.clone(),
+                    planning_lease: preflight.planning_lease.clone(),
+                    target: preflight.target.clone(),
                     handle,
                     publication_id: request.publication_id,
                     context: Mutex::new(request.context.clone()),
@@ -1728,7 +1759,6 @@ impl CtasEngine for DmlExecutionKernel {
         &self,
         source: &dyn CtasPreparedSource,
         target: &dyn CtasPreparedTarget,
-        write_operation_id: ConnectorWriteOperationId,
     ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
         let source = downcast_standard_source(source)?;
         let target = downcast_standard_target(target)?;
@@ -1752,13 +1782,13 @@ impl CtasEngine for DmlExecutionKernel {
                 "standard CTAS target does not match the source-retained exact session",
             ));
         }
-        let template = target
-            .plan_write(
-                write_operation_id,
-                Arc::clone(&source.output_schema),
-                source.connector_context.clone(),
-            )
-            .map_err(connector_failure)?;
+        // The session is opened before the plan is compiled, because it owns
+        // the writer recipes that plan's writer node carries.
+        let session = target.begin_write_session(
+            self.typed_connector_control(),
+            &source.output_schema,
+            source.connector_context.clone(),
+        )?;
         let planned = source
             .gate
             .source_artifact()
@@ -1772,15 +1802,9 @@ impl CtasEngine for DmlExecutionKernel {
             Arc::clone(&source.output_schema),
             source.query_options.clone(),
             &source.connector_context,
-            template,
+            session,
         )
         .map_err(internal_failure)?;
-        let cohort_set_digest = pending
-            .registration
-            .clone()
-            .sealed_cohorts()
-            .map_err(connector_failure)?
-            .digest();
         let attempt_reservation = source
             .attempt_reservation
             .lock()
@@ -1794,8 +1818,6 @@ impl CtasEngine for DmlExecutionKernel {
         let target_for_write: Arc<dyn CtasWriteTarget> = target_arc;
         Ok(PreparedStandardCtasWrite {
             target_facts,
-            write_operation_id,
-            cohort_set_digest,
             execution_identity: identity,
             handle: Arc::new(CorePreparedCtasWrite {
                 state: self.clone(),
@@ -1804,9 +1826,7 @@ impl CtasEngine for DmlExecutionKernel {
                 native_encoding: Mutex::new(Some(native_encoding)),
                 pending: Mutex::new(Some(pending)),
                 prepared: Mutex::new(None),
-                completion: Mutex::new(None),
-                write_session: Mutex::new(None),
-                write_unknown: Mutex::new(None),
+                terminal_context: source.connector_context.clone(),
                 attempt_reservation: Mutex::new(Some(attempt_reservation)),
                 execution_identity: identity,
             }),
@@ -1837,20 +1857,16 @@ impl CtasEngine for DmlExecutionKernel {
             ));
         }
         let (_, prepared_fragments) = encoding.into_parts();
-        let request = crate::query_execution::prepared_write::PreparedDistributedWriteRequest::new(
-            prepared_fragments,
-            native_bundle,
-            pending.query_options,
-            pending.registration,
-            pending.cohort_id,
-            pending.lease,
-        )
-        .map_err(|error| internal_failure(error.to_string()))?;
         *prepared
             .prepared
             .lock()
             .map_err(|error| internal_failure(format!("CTAS prepared write lock: {error}")))? =
-            Some(request);
+            Some(BoundCtasDistributedWrite {
+                prepared: prepared_fragments,
+                native_bundle,
+                query_options: pending.query_options,
+                session: pending.session,
+            });
         Ok(())
     }
 
@@ -1865,38 +1881,43 @@ impl CtasEngine for DmlExecutionKernel {
         let result = prepared
             .gate
             .execute_once(prepared.execution_identity, |_, execution| {
-                let request = prepared
+                let bound = prepared
                     .prepared
                     .lock()
                     .map_err(|error| format!("CTAS prepared write lock: {error}"))?
                     .take()
                     .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
-                let cohort_id = request.write_cohort_id();
-                let session = prepared
-                    .state
-                    .query_execution()
-                    .begin_write_operation(request.registration(), request.lease())
-                    .map_err(|error| error.to_string())?;
-                *prepared
-                    .write_session
-                    .lock()
-                    .map_err(|error| format!("CTAS write session lock: {error}"))? =
-                    Some(session.clone());
-                let registration =
-                    crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-                        session.clone(),
-                        cohort_id,
+                let BoundCtasDistributedWrite {
+                    prepared: fragments,
+                    native_bundle,
+                    query_options,
+                    session,
+                } = bound;
+                let request =
+                    crate::query_execution::contract::build_distributed_query_request_with_execution(
+                        fragments,
+                        native_bundle,
+                        query_options,
+                        crate::query_execution::contract::DistributedQueryIntent::Write,
+                        &execution,
                     )
                     .map_err(|error| error.to_string())?;
-                let request = request
-                    .into_request(&execution, registration)
-                    .map_err(|error| error.to_string())?;
+                let request = crate::query_execution::contract::with_connector_write_session(
+                    request,
+                    Arc::clone(&session),
+                )
+                .map_err(|error| error.to_string())?;
                 let attempt_reservation = prepared
                     .attempt_reservation
                     .lock()
                     .map_err(|error| format!("CTAS attempt reservation lock: {error}"))?
                     .take()
                     .ok_or_else(|| "CTAS attempt reservation was already consumed".to_string())?;
+                // Nothing below can leave the publication in doubt. A staged
+                // write session seals its artifacts without touching the
+                // catalog, so every failure here is proven-uncommitted: the
+                // target still does not exist, and the objects the backends
+                // staged are collected by the unanchored-CTAS sweep.
                 let outcome = match prepared
                     .state
                     .query_execution()
@@ -1904,64 +1925,29 @@ impl CtasEngine for DmlExecutionKernel {
                 {
                     Ok(outcome) => outcome,
                     Err(error) => {
-                        return Ok(standard_write_commit_unknown(
-                            prepared,
-                            &session,
-                            format!("CTAS writer dispatch outcome is unknown: {error}"),
+                        return Ok(staged_write_failed(
+                            prepared.target.as_ref(),
+                            format!("CTAS write did not complete: {error}"),
                         ));
                     }
                 };
                 let write = match outcome.into_write() {
                     Ok(write) => write,
                     Err(error) => {
-                        return Ok(standard_write_commit_unknown(
-                            prepared,
-                            &session,
-                            format!("CTAS writer terminal outcome is unknown: {error}"),
+                        return Ok(staged_write_failed(
+                            prepared.target.as_ref(),
+                            format!("CTAS write reached no terminal: {error}"),
                         ));
                     }
                 };
-                let (_, _, _, completion) = write.into_parts_with_connector();
-                let Some(completion) = completion else {
-                    return Ok(standard_write_commit_unknown(
-                        prepared,
-                        &session,
-                        "CTAS writer returned no complete generic completion",
-                    ));
-                };
-                // Native execution has finalized by the time a CTAS binds its
-                // writer aggregate. Switch the staged target to the
-                // completion-owned terminal capability before any later
-                // metadata write, publication, or reconciliation can touch
-                // vended object storage.
-                prepared
-                    .target
-                    .install_terminal_context(completion.terminal_request_context());
-                let sealed = match completion.sealed_operation_completion() {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        return Ok(standard_write_commit_unknown(
-                            prepared,
-                            &session,
-                            format!("CTAS writer aggregate is incomplete: {error}"),
-                        ));
-                    }
-                };
-                if let Err(error) = prepared.target.bind_write(sealed.clone()) {
-                    return Ok(standard_write_commit_unknown(
-                        prepared,
-                        &session,
-                        format!("CTAS target write binding outcome is unknown: {error}"),
-                    ));
-                }
-                *prepared
-                    .completion
-                    .lock()
-                    .map_err(|error| format!("CTAS completion lock: {error}"))? = Some(completion);
-                Ok(StandardCtasWriteOutcome::Completed {
-                    completion: sealed,
-                    execution_identity: prepared.execution_identity,
-                })
+                // The data plane closed and every participant succeeded, so
+                // the session is asked to seal.
+                Ok(seal_ctas_write(
+                    prepared.target.as_ref(),
+                    prepared.execution_identity,
+                    write.into_write_session(),
+                    prepared.terminal_context.clone(),
+                ))
             });
         match result {
             Ok(outcome) => outcome,
@@ -1975,10 +1961,10 @@ impl CtasEngine for DmlExecutionKernel {
         &self,
         target: &dyn CtasPreparedTarget,
         publication_id: LakePublicationId,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<PreparedStandardCtasCatalogAction, CtasFailure> {
         let target = downcast_standard_target(target)?;
-        let request = target.prepare_publish(publication_id, completion)?;
+        let request = target.prepare_publish(publication_id, write)?;
         Ok(PreparedStandardCtasCatalogAction {
             input_digest: standard_publish_input_digest(&request),
             handle: Arc::new(CoreCtasCatalogAction {
@@ -1986,6 +1972,8 @@ impl CtasEngine for DmlExecutionKernel {
                     target: Arc::new(CoreStandardCtasTargetSession {
                         lease: target.lease.clone(),
                         write_lease: target.write_lease.clone(),
+                        planning_lease: target.planning_lease.clone(),
+                        target: target.target.clone(),
                         handle: target.handle.clone(),
                         publication_id: target.publication_id,
                         context: Mutex::new(
@@ -2088,5 +2076,189 @@ impl CtasEngine for DmlExecutionKernel {
                 failure: mutation_failure(failure),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use novarocks_spi::connector::ConnectorError;
+
+    use super::*;
+    use crate::query_execution::write_session::tests as write_session_fixture;
+
+    /// A staged target that only records what the write terminal asked of it.
+    #[derive(Default)]
+    struct RecordingTarget {
+        bound: Mutex<Vec<ConnectorStagedWriteProof>>,
+        unknown: AtomicUsize,
+    }
+
+    impl CtasWriteTarget for RecordingTarget {
+        fn begin_write_session(
+            &self,
+            _host: &crate::connector::control_host::ConnectorControlHost,
+            _output_schema: &arrow::datatypes::SchemaRef,
+            _context: novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
+        {
+            unreachable!("these tests drive the write terminal, not admission")
+        }
+
+        fn bind_write(&self, write: ConnectorStagedWriteProof) -> Result<(), ConnectorError> {
+            self.bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(write);
+            Ok(())
+        }
+
+        fn mark_write_unknown(&self) -> Result<(), ConnectorError> {
+            self.unknown.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl RecordingTarget {
+        fn bound(&self) -> Vec<ConnectorStagedWriteProof> {
+            self.bound
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    fn completion(
+        session: &Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        row_count: u64,
+    ) -> crate::query_execution::outcome::ConnectorWriteSessionCompletion {
+        crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+            Arc::clone(session),
+            crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
+                row_count,
+                Vec::new(),
+            ),
+        )
+    }
+
+    /// The whole CTAS write terminal on a successful seal: the session is asked
+    /// exactly once, the rows it made durable travel with the receipt, and the
+    /// staged target binds that receipt so nothing else can publish under it.
+    #[test]
+    fn a_sealed_ctas_write_binds_one_receipt_and_carries_its_rows() {
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
+        let target = RecordingTarget::default();
+        assert_eq!(fixture.session.finish_invocations(), 0);
+
+        let outcome = seal_ctas_write(
+            &target,
+            [9; 32],
+            Some(completion(&fixture.session, 11)),
+            write_session_fixture::request_context(),
+        );
+
+        let StandardCtasWriteOutcome::Completed {
+            write,
+            execution_identity,
+        } = outcome
+        else {
+            panic!("a known-committed seal must complete");
+        };
+        assert_eq!(execution_identity, [9; 32]);
+        assert_eq!(write.row_count(), 11);
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+        assert_eq!(target.bound(), vec![write]);
+        assert_eq!(target.unknown.load(Ordering::SeqCst), 0);
+    }
+
+    /// An unresolved seal reports no rows and binds nothing, so the publication
+    /// has nothing to publish -- and the target is latched closed, because a
+    /// process that does not know what its write left behind must not abort it
+    /// either.
+    #[test]
+    fn an_unresolved_ctas_write_reports_no_rows_and_leaves_nothing_to_publish() {
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::commit_unknown(),
+        );
+        let target = RecordingTarget::default();
+
+        let outcome = seal_ctas_write(
+            &target,
+            [9; 32],
+            Some(completion(&fixture.session, 11)),
+            write_session_fixture::request_context(),
+        );
+
+        assert!(matches!(
+            outcome,
+            StandardCtasWriteOutcome::KnownUncommitted { .. }
+        ));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert!(target.bound().is_empty());
+        assert_eq!(target.unknown.load(Ordering::SeqCst), 1);
+    }
+
+    /// A write that staged no artifact still reaches the provider's seal.
+    ///
+    /// Whether an empty CTAS publishes an empty table is the provider's call;
+    /// the frontend must not make it by short-circuiting on "there were no
+    /// fragments".
+    #[test]
+    fn a_ctas_write_that_staged_nothing_still_reaches_the_provider() {
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
+        let target = RecordingTarget::default();
+
+        let outcome = seal_ctas_write(
+            &target,
+            [9; 32],
+            Some(completion(&fixture.session, 0)),
+            write_session_fixture::request_context(),
+        );
+
+        let StandardCtasWriteOutcome::Completed { write, .. } = outcome else {
+            panic!("an empty staged write is still the provider's decision");
+        };
+        assert_eq!(write.row_count(), 0);
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(target.bound().len(), 1);
+    }
+
+    /// A write whose data plane never closed has no session to seal, so the
+    /// connector is never asked at all.
+    #[test]
+    fn a_ctas_write_without_a_closed_data_plane_never_reaches_the_connector() {
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
+        let target = RecordingTarget::default();
+
+        let outcome = seal_ctas_write(
+            &target,
+            [9; 32],
+            None,
+            write_session_fixture::request_context(),
+        );
+
+        assert!(matches!(
+            outcome,
+            StandardCtasWriteOutcome::KnownUncommitted { .. }
+        ));
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+        assert!(target.bound().is_empty());
     }
 }

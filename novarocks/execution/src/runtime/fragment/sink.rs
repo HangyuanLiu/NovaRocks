@@ -21,8 +21,8 @@ use crate::exec::fragment::sink::{
     MultiCastDataStreamSinkProgram,
 };
 use crate::exec::operators::{
-    ConnectorWriteSinkFactory, DataStreamSinkFactory, MultiCastDataStreamSinkFactory,
-    NoopSinkFactory, ResultBufferSinkFactory, SplitDataStreamSinkFactory,
+    DataStreamSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
+    ResultBufferSinkFactory, SplitDataStreamSinkFactory,
 };
 use crate::exec::operators::{StatisticsSinkFactory, StatisticsSinkHandle};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -223,14 +223,6 @@ fn materialize_fragment_sink_components_with_result_and_statistics(
             factory,
             statistics_handle: None,
         }),
-        (FragmentSinkProgram::ConnectorWrite(connector), FragmentSinkAssignment::None) => {
-            ConnectorWriteSinkFactory::try_new(connector)
-                .map(|factory| MaterializedFragmentSink {
-                    factory: Box::new(factory) as Box<dyn OperatorFactory>,
-                    statistics_handle: None,
-                })
-                .map_err(materialization_error)
-        }
         (static_program, dynamic_assignment) => Err(materialization_error(format!(
             "sink {} cannot be materialized with assignment {}",
             sink_program_name(static_program),
@@ -348,7 +340,6 @@ fn sink_program_name(program: &FragmentSinkProgram) -> &'static str {
         FragmentSinkProgram::DataStream(_) => "data_stream",
         FragmentSinkProgram::MultiCastDataStream(_) => "multi_cast_data_stream",
         FragmentSinkProgram::SplitDataStream(_) => "split_data_stream",
-        FragmentSinkProgram::ConnectorWrite(_) => "connector_write",
     }
 }
 

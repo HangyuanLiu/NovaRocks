@@ -297,6 +297,16 @@ fn node_from_proto(proto: &plan::DistributedNode) -> Result<INode, String> {
         plan::distributed_node::Payload::Exchange(exchange) => IPayload::Exchange {
             source_fragment_id: exchange.source_fragment_id,
         },
+        // The write dataflow nodes are deliberately outside this fixture's
+        // model: they carry a typed connector payload whose round trip belongs
+        // to the connector write contract tests, not to this generic plan
+        // shape fixture.
+        payload @ (plan::distributed_node::Payload::TableWriter(_)
+        | plan::distributed_node::Payload::TableFinish(_)) => {
+            return Err(format!(
+                "write dataflow node is not part of the generic plan fixture: {payload:?}"
+            ));
+        }
     };
 
     Ok(INode {

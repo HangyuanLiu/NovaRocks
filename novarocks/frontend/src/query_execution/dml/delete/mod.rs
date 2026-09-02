@@ -98,10 +98,6 @@ pub struct PreparedDelete {
 }
 
 pub enum DeleteWriteReport {
-    Aborted {
-        reason: String,
-        has_staged_files: bool,
-    },
     NoOp,
     CommitRequired(Arc<dyn DeleteCommit>),
 }
@@ -169,15 +165,10 @@ pub(crate) trait PreparedDeleteExecution: Send + Sync {
         &self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
-    fn commit_terminal(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    >;
+    /// The admitted request context this statement commits and reconciles
+    /// under. It is the statement's own context, never a fresh one: a commit
+    /// issued under different credentials is a different request.
+    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext;
     fn finalize(&self) -> Result<(), String>;
 }
 
@@ -280,7 +271,7 @@ impl DeleteEngine for DmlExecutionKernel {
     ) -> Result<DeleteWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
         let result = prepared.execution.run_with_native_bundle(native_bundle)?;
-        delete_write_report_from_result(result)
+        delete_write_report_from_result(result, prepared.execution.terminal_request_context())
     }
 
     fn commit_delete_terminal(
@@ -298,7 +289,7 @@ impl DeleteEngine for DmlExecutionKernel {
             .as_any()
             .downcast_ref::<CoreDeleteCommit>()
             .ok_or_else(|| "foreign DELETE commit handle".to_string())?;
-        prepared.execution.commit_terminal(&commit.completion)
+        commit.commit(prepared.execution.terminal_request_context())
     }
 
     fn adjudicate_delete_publication(
@@ -312,15 +303,14 @@ impl DeleteEngine for DmlExecutionKernel {
         >,
         String,
     > {
-        let _prepared = downcast_prepared(prepared)?;
+        let prepared = downcast_prepared(prepared)?;
         let commit = commit
             .as_any()
             .downcast_ref::<CoreDeleteCommit>()
             .ok_or_else(|| "foreign DELETE commit handle".to_string())?;
         commit
-            .completion
-            .session()
-            .adjudicate_publication(evidence, commit.completion.terminal_request_context())
+            .session
+            .reconcile(evidence, prepared.execution.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 
@@ -331,34 +321,23 @@ impl DeleteEngine for DmlExecutionKernel {
 
 fn delete_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
+    context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<DeleteWriteReport, String> {
-    if let Some(abort) = result.write_abort {
-        let has_staged_files = abort
-            .completed_writer_outputs
-            .iter()
-            .any(|writer| !writer.connector_staged_report_frames.is_empty());
-        return Ok(DeleteWriteReport::Aborted {
-            reason: abort.reason,
-            has_staged_files,
-        });
-    }
-    let Some(completion) = result.connector_completion else {
+    let Some(completion) = result.write_session else {
         return Ok(DeleteWriteReport::NoOp);
     };
-    let has_staged_output = completion
-        .input()
-        .map_err(|error| error.to_string())?
-        .reports()
-        .iter()
-        .any(|report| report.summary().artifact_count > 0);
-    if !has_staged_output {
+    // A DELETE whose predicate matched nothing produced no commit fragment.
+    // Committing that would publish an empty snapshot, so the session is
+    // released instead and the statement reports a no-op.
+    if completion.is_empty() {
         completion
-            .finish_known_empty_noop()
+            .session()
+            .abort(context)
             .map_err(|error| error.to_string())?;
         return Ok(DeleteWriteReport::NoOp);
     }
     Ok(DeleteWriteReport::CommitRequired(Arc::new(
-        CoreDeleteCommit { completion },
+        CoreDeleteCommit::new(completion),
     )))
 }
 
@@ -377,8 +356,66 @@ impl DeletePrepared for CorePreparedDelete {
     }
 }
 
+/// One DELETE's commit authority.
+///
+/// The completion is taken by the single commit, so a second attempt finds
+/// nothing rather than asking the connector twice. The session stays beside it
+/// because a `CommitUnknown` is resolved through the session that issued the
+/// commit, never through a replacement.
 struct CoreDeleteCommit {
-    completion: crate::query_execution::ConnectorWriteCompletion,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    completion:
+        std::sync::Mutex<Option<crate::query_execution::outcome::ConnectorWriteSessionCompletion>>,
+    /// Set only after a commit that is known to have succeeded.
+    affected_rows: std::sync::Mutex<Option<u64>>,
+}
+
+impl CoreDeleteCommit {
+    fn new(completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion) -> Self {
+        Self {
+            session: Arc::clone(completion.session()),
+            completion: std::sync::Mutex::new(Some(completion)),
+            affected_rows: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn commit(
+        &self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let completion = self
+            .completion
+            .lock()
+            .map_err(|_| "DELETE commit handle is poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "DELETE write session was already committed".to_string())?;
+        let committed =
+            crate::query_execution::write_session::finish_write_session(completion, context)
+                .map_err(|error| error.to_string())?;
+        // Rows become reportable exactly here: after the external commit said
+        // it succeeded, and never on a commit whose outcome is unknown.
+        *self
+            .affected_rows
+            .lock()
+            .map_err(|_| "DELETE commit handle is poisoned".to_string())? =
+            committed.affected_rows();
+        Ok(committed.into_outcome())
+    }
+
+    /// The rows a client may be told about. `None` until a known-successful
+    /// commit has happened.
+    #[allow(
+        dead_code,
+        reason = "The gated affected-row count is surfaced to the MySQL result by a later task."
+    )]
+    fn affected_rows(&self) -> Option<u64> {
+        self.affected_rows.lock().ok().and_then(|rows| *rows)
+    }
 }
 
 impl DeleteCommit for CoreDeleteCommit {
@@ -425,5 +462,92 @@ mod tests {
             DeleteStatement::Predicate(delete).kind(),
             DeleteStatementKind::Predicate
         );
+    }
+
+    fn session_result(
+        session: &Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+        row_count: u64,
+        fragments: Vec<(
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            Vec<u8>,
+        )>,
+    ) -> crate::query_execution::outcome::QueryExecutionResult {
+        crate::query_execution::outcome::QueryExecutionResult {
+            query_result: crate::runtime::query_result::QueryResult::empty(),
+            write_session: Some(
+                crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+                    Arc::clone(session),
+                    crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
+                        row_count, fragments,
+                    ),
+                ),
+            ),
+            fragment_profiles: Vec::new(),
+        }
+    }
+
+    /// A DELETE that matched rows commits exactly once, and its rows become
+    /// reportable only after that commit succeeded.
+    #[test]
+    fn a_matching_delete_commits_its_session_once() {
+        use crate::query_execution::write_session::tests as write_session_fixture;
+
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
+        let ordinal =
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).expect("ordinal");
+        let report = delete_write_report_from_result(
+            session_result(
+                &fixture.session,
+                4,
+                vec![(ordinal, write_session_fixture::commit_fragment_bytes())],
+            ),
+            write_session_fixture::request_context(),
+        )
+        .expect("report");
+
+        let DeleteWriteReport::CommitRequired(handle) = report else {
+            panic!("a delete that staged a fragment must require a commit");
+        };
+        let commit = handle
+            .as_any()
+            .downcast_ref::<CoreDeleteCommit>()
+            .expect("core delete commit handle");
+        assert!(commit.affected_rows().is_none());
+
+        commit
+            .commit(write_session_fixture::request_context())
+            .expect("commit");
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+        assert_eq!(commit.affected_rows(), Some(4));
+    }
+
+    /// A DELETE whose predicate matched nothing produced no commit fragment.
+    /// Committing that would publish a snapshot describing nothing, so the
+    /// session is released and the connector is never asked to commit.
+    #[test]
+    fn a_delete_that_staged_nothing_releases_its_session_without_committing() {
+        use crate::query_execution::write_session::tests as write_session_fixture;
+
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
+        let report = delete_write_report_from_result(
+            session_result(&fixture.session, 0, Vec::new()),
+            write_session_fixture::request_context(),
+        )
+        .expect("report");
+
+        assert!(matches!(report, DeleteWriteReport::NoOp));
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        let recorded = fixture.recorded.lock().expect("recorded");
+        assert_eq!(recorded.finish, 0);
+        assert_eq!(recorded.abort, 1);
     }
 }

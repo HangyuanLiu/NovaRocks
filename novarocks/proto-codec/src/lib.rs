@@ -14,6 +14,10 @@ pub mod catalog;
 /// Structural validation and canonical encoding for the typed connector read wire.
 pub mod connector_read;
 
+/// Structural validation and canonical encoding for the connector write
+/// carriers.
+pub mod connector_write;
+
 /// Validated neutral values used by the native query lifecycle.
 pub mod lifecycle;
 

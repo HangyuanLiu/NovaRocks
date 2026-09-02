@@ -17,7 +17,6 @@
 
 //! Core-owned distributed-query request contract.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
@@ -39,17 +38,8 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_spi::connector::{
-    ConnectorActivatedWriteCohort, ConnectorError, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorWriteActivationIntent, ConnectorWriteActivationRequest,
-    ConnectorWriteActivationSource, ConnectorWriteCohortId, ConnectorWriteExecutionId,
-    ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePlanningRequest,
-    ConnectorWritePreparation,
-};
 use novarocks_types::BackendProcessId;
 
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use novarocks_sql::plan_read::FragmentId;
 #[cfg(test)]
 pub(crate) use novarocks_types::QueryId;
 
@@ -231,430 +221,6 @@ pub enum DistributedQueryIntent {
     Statistics,
 }
 
-/// DML-owned facts required to plan one provider-neutral writer manifest
-/// after frontend placement.  The request deliberately excludes execution ID
-/// and expected writers: both are derived from the immutable placement and
-/// cannot be supplied by a pre-scheduling caller.
-#[derive(Clone)]
-pub struct ConnectorWritePlanningTemplate {
-    operation_id: ConnectorWriteOperationId,
-    cohort_id: ConnectorWriteCohortId,
-    activation: ConnectorActivatedWriteCohort,
-    context: ConnectorRequestContext,
-    // This lease is derived from the planning generation that accepted the
-    // preparation.  Keeping it with the inert planning template prevents an
-    // execution handoff from replacing it with a current-generation lookup.
-    lease: ConnectorWriteLease,
-}
-
-impl ConnectorWritePlanningTemplate {
-    pub fn from_activated_cohort(
-        activation: ConnectorActivatedWriteCohort,
-        context: ConnectorRequestContext,
-        lease: ConnectorWriteLease,
-    ) -> Result<Self, ConnectorError> {
-        activation.validate()?;
-        if !lease.matches_provider_binding_key(activation.owner()) {
-            return Err(ConnectorError::new(
-                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
-                "activated connector write cohort does not match its exact write lease",
-            ));
-        }
-        Ok(Self::new(
-            activation.operation_id(),
-            activation,
-            context,
-            lease,
-        ))
-    }
-
-    /// Activate an ordinary Provider-signed preparation on its retained exact
-    /// lease and construct the only legal planning template for it.
-    pub fn activate_prepared(
-        operation_id: ConnectorWriteOperationId,
-        preparation: ConnectorWritePreparation,
-        context: ConnectorRequestContext,
-        lease: ConnectorWriteLease,
-    ) -> Result<Self, ConnectorError> {
-        Self::activate_prepared_with_intent(
-            operation_id,
-            preparation,
-            ConnectorWriteActivationIntent::Ordinary,
-            context,
-            lease,
-        )
-    }
-
-    /// Activate a prepared write with an application-owned, provider-neutral
-    /// intent.  Only the exact lease may turn the preparation into planning
-    /// authority; the intent is bound into the activation digest at that
-    /// transition.
-    pub fn activate_prepared_with_intent(
-        operation_id: ConnectorWriteOperationId,
-        preparation: ConnectorWritePreparation,
-        intent: ConnectorWriteActivationIntent,
-        context: ConnectorRequestContext,
-        lease: ConnectorWriteLease,
-    ) -> Result<Self, ConnectorError> {
-        let activation = lease.activate_write(ConnectorWriteActivationRequest {
-            operation_id,
-            source: ConnectorWriteActivationSource::Prepared(preparation),
-            intent,
-            context: context.clone(),
-        })?;
-        let cohort = activation
-            .cohort(ConnectorWriteCohortId::primary(operation_id))
-            .ok_or_else(|| {
-                ConnectorError::new(
-                    novarocks_spi::connector::ConnectorErrorKind::CorruptData,
-                    "ordinary connector write activation omitted its primary cohort",
-                )
-            })?;
-        Ok(Self::new(operation_id, cohort, context, lease))
-    }
-    pub fn new(
-        operation_id: ConnectorWriteOperationId,
-        activation: ConnectorActivatedWriteCohort,
-        context: ConnectorRequestContext,
-        lease: ConnectorWriteLease,
-    ) -> Self {
-        Self::new_in_cohort(
-            operation_id,
-            activation.cohort_id(),
-            activation,
-            context,
-            lease,
-        )
-    }
-
-    pub fn new_in_cohort(
-        operation_id: ConnectorWriteOperationId,
-        cohort_id: ConnectorWriteCohortId,
-        activation: ConnectorActivatedWriteCohort,
-        context: ConnectorRequestContext,
-        lease: ConnectorWriteLease,
-    ) -> Self {
-        Self {
-            operation_id,
-            cohort_id,
-            activation,
-            context,
-            lease,
-        }
-    }
-
-    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-
-    pub const fn cohort_id(&self) -> ConnectorWriteCohortId {
-        self.cohort_id
-    }
-
-    pub fn connector_instance_id(&self) -> &novarocks_spi::connector::ConnectorInstanceId {
-        self.activation.preparation().table().owner()
-    }
-
-    pub fn preparation(&self) -> &ConnectorWritePreparation {
-        self.activation.preparation()
-    }
-
-    pub fn request_context(&self) -> &ConnectorRequestContext {
-        &self.context
-    }
-
-    pub fn intent(&self) -> novarocks_spi::connector::ConnectorWriteIntent {
-        self.activation.preparation().intent()
-    }
-
-    pub fn context(&self) -> &ConnectorRequestContext {
-        &self.context
-    }
-
-    /// The exact write lease derived by the planning generation that signed
-    /// this preparation.  A caller must retain this capability through bind;
-    /// it must never reacquire a current generation.
-    pub fn lease(&self) -> ConnectorWriteLease {
-        self.lease.clone()
-    }
-
-    pub fn retains_lease_generation(&self, lease: &ConnectorWriteLease) -> bool {
-        self.lease.retains_same_generation(lease)
-    }
-
-    pub fn stable_digest(
-        &self,
-        owner: &ConnectorProviderBindingKey,
-    ) -> Result<[u8; 32], ConnectorError> {
-        self.clone()
-            .into_request(ConnectorWriteExecutionId::new([0; 16], 0))
-            .stable_digest(owner)
-    }
-
-    pub fn into_request(
-        self,
-        execution_id: ConnectorWriteExecutionId,
-    ) -> ConnectorWritePlanningRequest {
-        ConnectorWritePlanningRequest {
-            operation_id: self.operation_id,
-            cohort_id: self.cohort_id,
-            execution_id,
-            activation: self.activation,
-            expected_writers: Vec::new(),
-            context: self.context,
-        }
-    }
-}
-
-/// The complete provider-neutral cohort registration supplied before any
-/// writer attempt may be planned.  Frontend consumes this value exactly once
-/// to acquire one exact-generation lease and seal the immutable cohort set.
-#[derive(Clone)]
-pub struct ConnectorWriteOperationRegistration {
-    operation_id: ConnectorWriteOperationId,
-    owner: ConnectorProviderBindingKey,
-    cohorts: Vec<ConnectorWritePlanningTemplate>,
-}
-
-impl ConnectorWriteOperationRegistration {
-    pub fn try_new(
-        cohorts: Vec<ConnectorWritePlanningTemplate>,
-    ) -> Result<Self, DistributedQueryError> {
-        let first = cohorts.first().ok_or_else(|| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write operation registration has no cohorts",
-            )
-        })?;
-        let operation_id = first.operation_id();
-        let owner = first.preparation().owner().clone();
-        let lease = first.lease();
-        let context = first.request_context();
-        let mut cohort_ids = std::collections::BTreeSet::new();
-        for cohort in &cohorts {
-            let candidate_context = cohort.request_context();
-            if cohort.operation_id() != operation_id
-                || cohort.preparation().owner() != &owner
-                || !cohort.retains_lease_generation(&lease)
-                || !cohort_ids.insert(cohort.cohort_id())
-            {
-                return Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "connector write operation registration contains a foreign or duplicate cohort",
-                ));
-            }
-            if candidate_context.deadline() != context.deadline()
-                || candidate_context.max_handle_payload_bytes()
-                    != context.max_handle_payload_bytes()
-                || candidate_context.max_total_payload_bytes() != context.max_total_payload_bytes()
-                || !Arc::ptr_eq(candidate_context.cancellation(), context.cancellation())
-            {
-                return Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "connector write operation registration contains inconsistent request contexts",
-                ));
-            }
-        }
-        Ok(Self {
-            operation_id,
-            owner,
-            cohorts,
-        })
-    }
-
-    pub fn single(cohort: ConnectorWritePlanningTemplate) -> Self {
-        Self::try_new(vec![cohort]).expect("one connector write cohort is a valid registration")
-    }
-
-    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-
-    pub fn owner(&self) -> &ConnectorProviderBindingKey {
-        &self.owner
-    }
-
-    pub fn sealed_cohorts(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorSealedWriteCohortSet, ConnectorError> {
-        let descriptors = self
-            .cohorts
-            .iter()
-            .map(|template| {
-                Ok(
-                    novarocks_spi::connector::ConnectorWriteCohortDescriptor::new(
-                        template.cohort_id(),
-                        template.intent(),
-                        template.stable_digest(&self.owner)?,
-                    ),
-                )
-            })
-            .collect::<Result<Vec<_>, ConnectorError>>()?;
-        novarocks_spi::connector::ConnectorSealedWriteCohortSet::try_new(
-            self.operation_id,
-            descriptors,
-        )
-    }
-
-    pub fn into_cohorts(self) -> Vec<ConnectorWritePlanningTemplate> {
-        self.cohorts
-    }
-}
-
-/// Exact operation-scoped routing from terminal writer fragments to cohorts.
-#[derive(Clone)]
-pub struct ConnectorWriteExecutionRegistration {
-    session: ConnectorWriteOperationSession,
-    routing: ConnectorWriteExecutionRouting,
-}
-
-#[derive(Clone)]
-enum ConnectorWriteExecutionRouting {
-    Single(ConnectorWriteCohortId),
-    ByWriter(BTreeMap<FragmentId, ConnectorWriteCohortId>),
-}
-
-impl ConnectorWriteExecutionRegistration {
-    /// Register a genuinely single-cohort distributed execution.
-    ///
-    /// The scheduling artifact will bind every terminal writer fragment to
-    /// this cohort. Multi-cohort executions must use
-    /// [`Self::try_new_with_writer_fragment_cohorts`] instead.
-    pub fn try_new(
-        session: ConnectorWriteOperationSession,
-        cohort_id: ConnectorWriteCohortId,
-    ) -> Result<Self, DistributedQueryError> {
-        if !session.contains_cohort(cohort_id) {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write execution references a cohort outside the sealed operation",
-            ));
-        }
-        Ok(Self {
-            session,
-            routing: ConnectorWriteExecutionRouting::Single(cohort_id),
-        })
-    }
-
-    pub fn try_new_with_writer_fragment_cohorts<I>(
-        session: ConnectorWriteOperationSession,
-        writer_fragment_cohorts: I,
-    ) -> Result<Self, DistributedQueryError>
-    where
-        I: IntoIterator<Item = (FragmentId, ConnectorWriteCohortId)>,
-    {
-        let mut canonical = BTreeMap::new();
-        for (fragment_id, cohort_id) in writer_fragment_cohorts {
-            if canonical.insert(fragment_id, cohort_id).is_some() {
-                return Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "connector write execution contains a duplicate writer fragment",
-                ));
-            }
-        }
-        if canonical.is_empty() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write execution has no terminal writer fragments",
-            ));
-        }
-        if canonical
-            .values()
-            .any(|cohort_id| !session.contains_cohort(*cohort_id))
-        {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write execution mapping references a cohort outside the sealed operation",
-            ));
-        }
-        Ok(Self {
-            session,
-            routing: ConnectorWriteExecutionRouting::ByWriter(canonical),
-        })
-    }
-
-    pub fn single<I>(
-        session: ConnectorWriteOperationSession,
-        writer_fragment_ids: I,
-        cohort_id: ConnectorWriteCohortId,
-    ) -> Result<Self, DistributedQueryError>
-    where
-        I: IntoIterator<Item = FragmentId>,
-    {
-        Self::try_new_with_writer_fragment_cohorts(
-            session,
-            writer_fragment_ids
-                .into_iter()
-                .map(|fragment_id| (fragment_id, cohort_id)),
-        )
-    }
-
-    pub fn session(&self) -> &ConnectorWriteOperationSession {
-        &self.session
-    }
-
-    pub fn writer_fragment_cohorts(&self) -> Option<&BTreeMap<FragmentId, ConnectorWriteCohortId>> {
-        match &self.routing {
-            ConnectorWriteExecutionRouting::Single(_) => None,
-            ConnectorWriteExecutionRouting::ByWriter(routing) => Some(routing),
-        }
-    }
-
-    pub fn cohort_id_for_writer_fragment(
-        &self,
-        fragment_id: FragmentId,
-    ) -> Option<ConnectorWriteCohortId> {
-        match &self.routing {
-            ConnectorWriteExecutionRouting::Single(cohort_id) => Some(*cohort_id),
-            ConnectorWriteExecutionRouting::ByWriter(routing) => routing.get(&fragment_id).copied(),
-        }
-    }
-
-    pub fn single_cohort_id(&self) -> Option<ConnectorWriteCohortId> {
-        match &self.routing {
-            ConnectorWriteExecutionRouting::Single(cohort_id) => Some(*cohort_id),
-            ConnectorWriteExecutionRouting::ByWriter(routing) => {
-                let mut cohorts = routing.values().copied();
-                let cohort_id = cohorts.next()?;
-                cohorts
-                    .all(|candidate| candidate == cohort_id)
-                    .then_some(cohort_id)
-            }
-        }
-    }
-
-    pub fn resolve_writer_fragment_cohorts<I>(
-        &self,
-        writer_fragment_ids: I,
-    ) -> Result<BTreeMap<FragmentId, ConnectorWriteCohortId>, DistributedQueryError>
-    where
-        I: IntoIterator<Item = FragmentId>,
-    {
-        let writer_fragment_ids = writer_fragment_ids.into_iter().collect::<BTreeSet<_>>();
-        if writer_fragment_ids.is_empty() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write execution has no terminal writer fragments",
-            ));
-        }
-        match &self.routing {
-            ConnectorWriteExecutionRouting::Single(cohort_id) => Ok(writer_fragment_ids
-                .into_iter()
-                .map(|fragment_id| (fragment_id, *cohort_id))
-                .collect()),
-            ConnectorWriteExecutionRouting::ByWriter(routing) => {
-                if routing.keys().copied().collect::<BTreeSet<_>>() != writer_fragment_ids {
-                    return Err(DistributedQueryError::new(
-                        DistributedQueryErrorKind::ContractViolation,
-                        "connector write execution mapping does not exactly cover terminal writer fragments",
-                    ));
-                }
-                Ok(routing.clone())
-            }
-        }
-    }
-}
-
 /// An owned request passed from core to the injected execution coordinator.
 ///
 /// Every field is private so role crates cannot assemble a request from
@@ -667,7 +233,9 @@ pub struct DistributedQueryRequest {
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
-    connector_write: Option<ConnectorWriteExecutionRegistration>,
+    /// The NCP-6 write session, present exactly when this query's plan carries
+    /// the dataflow write shape.
+    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -696,8 +264,10 @@ impl DistributedQueryRequest {
         self.deadline
     }
 
-    pub fn connector_write(&self) -> Option<&ConnectorWriteExecutionRegistration> {
-        self.connector_write.as_ref()
+    pub(crate) fn write_stack_session(
+        &self,
+    ) -> Option<&Arc<crate::query_execution::write_session::ConnectorWriteSession>> {
+        self.write_stack_session.as_ref()
     }
 
     pub fn statistics_program(&self) -> Option<&StatisticsCollectionProgram> {
@@ -712,7 +282,7 @@ impl DistributedQueryRequest {
             deadline: self.deadline,
             cancellation: self.cancellation,
             completion: self.completion,
-            connector_write: self.connector_write,
+            write_stack_session: self.write_stack_session,
             statistics_program: self.statistics_program,
         }
     }
@@ -727,7 +297,8 @@ pub struct DistributedQueryRequestParts {
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
-    pub connector_write: Option<ConnectorWriteExecutionRegistration>,
+    pub write_stack_session:
+        Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     pub statistics_program: Option<StatisticsCollectionProgram>,
 }
 
@@ -754,7 +325,7 @@ pub(crate) fn build_distributed_query_request_with_execution(
         deadline: execution.deadline(),
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(intent),
-        connector_write: None,
+        write_stack_session: None,
         statistics_program: None,
     })
 }
@@ -777,31 +348,33 @@ pub(crate) fn build_statistics_query_request_with_execution(
         deadline: execution.deadline(),
         cancellation: execution.cancellation().clone(),
         completion: QueryOutcomeFactory::new(DistributedQueryIntent::Statistics),
-        connector_write: None,
+        write_stack_session: None,
         statistics_program: Some(program),
     }
 }
 
-/// Attach a placement-deferred connector writer request to an otherwise
-/// sealed distributed execution request. Only the core request builder can
-/// invoke this: callers cannot recombine prepared/native artifacts.
-pub(crate) fn with_connector_write_operation(
+/// Attach the NCP-6 write session to a sealed distributed write request.
+///
+/// A query carries this or the placement-deferred writer template, never both:
+/// they describe the same write through two different data planes, and a query
+/// that claimed both would have two answers to "did this commit".
+pub(crate) fn with_connector_write_session(
     mut request: DistributedQueryRequest,
-    registration: ConnectorWriteExecutionRegistration,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<DistributedQueryRequest, DistributedQueryError> {
     if request.intent() != DistributedQueryIntent::Write {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
-            "connector write planning is only valid for distributed write requests",
+            "a connector write session is only valid for a distributed write request",
         ));
     }
-    if request.connector_write.is_some() {
+    if request.write_stack_session.is_some() {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::ContractViolation,
-            "distributed query already has a connector write planning template",
+            "distributed query already has a connector write session",
         ));
     }
-    request.connector_write = Some(registration);
+    request.write_stack_session = Some(session);
     Ok(request)
 }
 
@@ -944,17 +517,6 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
         Err(DistributedQueryError::new(
             DistributedQueryErrorKind::Rejected,
             "distributed query coordinator does not reserve attempt identities",
-        ))
-    }
-
-    fn begin_write_operation(
-        &self,
-        _registration: ConnectorWriteOperationRegistration,
-        _lease: ConnectorWriteLease,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::Rejected,
-            "distributed query coordinator has no connector write operation service",
         ))
     }
 

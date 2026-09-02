@@ -35,8 +35,6 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) backend_num: Option<i32>,
     pub(crate) mem_tracker: Option<Arc<MemTracker>>,
     pub(crate) runtime_filter_session: Option<RuntimeFilterSessionRef>,
-    pub(crate) connector_staged_report_collector:
-        Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
     pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
     pub(crate) scan_registration: Option<Arc<dyn ScanRegistrationPort>>,
 }
@@ -97,7 +95,6 @@ pub(crate) fn build_runtime_state(
             inputs.execution_runtime,
             inputs.scan_registration,
         )
-        .with_runtime_filter_session(inputs.runtime_filter_session)
-        .with_connector_staged_report_collector(inputs.connector_staged_report_collector),
+        .with_runtime_filter_session(inputs.runtime_filter_session),
     ))
 }

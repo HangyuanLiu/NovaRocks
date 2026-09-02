@@ -77,8 +77,8 @@ use crate::exec::operators::{
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
     LocalExchangeSourceFactory, LookUpSourceFactory, PartitionedJoinProbeProcessorFactory,
     ProjectProcessorFactory, RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory,
-    TableFunctionProcessorFactory, UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory,
-    ValuesSourceFactory,
+    TableFinishOperatorFactory, TableFunctionProcessorFactory, TableWriterOperatorFactory,
+    UnionAllSharedState, UnionAllSinkFactory, UnionAllSourceFactory, ValuesSourceFactory,
 };
 use crate::exec::operators::{ExceptSharedState, IntersectSharedState, SetOpStageController};
 use crate::exec::operators::{
@@ -651,6 +651,12 @@ pub fn output_chunk_schema_for_node(node: &ExecNode) -> Option<crate::exec::chun
         }
         ExecNodeKind::Analytic(analytic) => Some(Arc::clone(&analytic.output_chunk_schema)),
         ExecNodeKind::SetOp(set_op) => Some(Arc::clone(&set_op.output_chunk_schema)),
+        ExecNodeKind::TableWriter(_) => {
+            Some(crate::exec::node::table_write_relation::writer_relation_chunk_schema())
+        }
+        ExecNodeKind::TableFinish(_) => {
+            Some(crate::exec::node::table_write_relation::root_relation_chunk_schema())
+        }
     }
 }
 
@@ -1975,6 +1981,86 @@ fn build_pipeline_for_node(
                 stream: StreamDesc::any(ctx.pipeline_dop),
             })
         }
+        ExecNodeKind::TableWriter(node) => {
+            // A table writer is an ordinary unary processor: every driver of the
+            // upstream pipeline keeps writing at its own degree of parallelism
+            // and reports what it wrote downstream. No gather, no shared state.
+            //
+            // What drivers may not do is split one hash key between them. A
+            // hash-partitioned exchange routes a key to one fragment *instance*;
+            // inside that instance every driver pulls from the same receiver, so
+            // two chunks carrying one key are taken by whichever drivers are
+            // free. A connector writer that owns one artifact per key then
+            // stages two of them -- Iceberg permits a single deletion vector per
+            // data file, so a `_file`-keyed delete branch produces two vectors
+            // for one file and the commit is refused as corrupt. Re-partitioning
+            // on the edge's own key restores the guarantee at driver
+            // granularity, and unlike a gather it leaves every driver writing.
+            //
+            // An unpartitioned or random edge carries no key and is left alone.
+            let mut build = build_pipeline_for_node(&node.input, ctx)?;
+            let hash_key = match &node.input.kind {
+                ExecNodeKind::ExchangeSource(source) => source.hash_partition_exprs().to_vec(),
+                _ => Vec::new(),
+            };
+            if !hash_key.is_empty() {
+                // `shuffle_by_hash` is a no-op at one partition, which is the
+                // right answer for DOP 1: one driver already owns every key.
+                let partitions = build.pipeline.dop.max(1) as usize;
+                build = shuffle_by_hash(build, ctx, node.node_id, hash_key, partitions);
+            }
+            build
+                .pipeline
+                .factories
+                .push(Box::new(TableWriterOperatorFactory::new(node)));
+            build.stream = StreamDesc::any(build.pipeline.dop);
+            Ok(build)
+        }
+        ExecNodeKind::TableFinish(node) => {
+            // A prepared write set is complete or it does not exist, so exactly
+            // one driver must see every writer row.
+            //
+            // The node is n-ary: an exchange receiver names one source
+            // fragment, so a query with several writer fragments arrives here
+            // as several inputs. Converge them the way `UnionAll` does -- a
+            // shared state fed by a sink on every input pipeline -- but create
+            // the downstream pipeline at DOP 1 directly instead of gathering
+            // afterwards, so the single finish driver is the only consumer by
+            // construction.
+            let mut input_builds = Vec::with_capacity(node.inputs.len());
+            let mut producer_count = 0usize;
+            for input in &node.inputs {
+                let child_build = build_pipeline_for_node(input, ctx)?;
+                producer_count = producer_count.saturating_add(child_build.pipeline.dop as usize);
+                input_builds.push(child_build);
+            }
+            let state = UnionAllSharedState::new(producer_count.max(1), node.node_id);
+
+            let mut extra_pipelines = Vec::new();
+            for mut child_build in input_builds {
+                child_build
+                    .pipeline
+                    .factories
+                    .push(Box::new(UnionAllSinkFactory::new(
+                        state.clone(),
+                        node.node_id,
+                    )));
+                child_build.pipeline.needs_sink = false;
+                extra_pipelines.push(child_build.pipeline);
+                extra_pipelines.append(&mut child_build.extra_pipelines);
+            }
+
+            let source = Box::new(UnionAllSourceFactory::new(state, node.node_id));
+            let mut pipeline = new_source_pipeline_with_dop(ctx, source, 1);
+            pipeline
+                .factories
+                .push(Box::new(TableFinishOperatorFactory::new(node)));
+            Ok(PipelineBuildResult {
+                pipeline,
+                extra_pipelines,
+                stream: StreamDesc::single(),
+            })
+        }
         ExecNodeKind::Fetch(fetch) => {
             let mut child_build = build_pipeline_for_node(&fetch.input, ctx)?;
             child_build
@@ -2525,5 +2611,255 @@ mod tests {
             .filter(|f| f.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
             .count();
         assert_eq!(local_exchange_sources, 1);
+    }
+
+    /// A finish node is n-ary because an exchange receiver names exactly one
+    /// source fragment. Several writer fragments must therefore converge onto
+    /// the one finish driver, and the convergence must happen before the finish
+    /// operator rather than after it: a second finish driver would each see a
+    /// partial set and each believe it was complete.
+    #[test]
+    fn a_multi_input_table_finish_converges_every_writer_onto_one_driver() {
+        use crate::exec::chunk::Chunk;
+        use crate::exec::node::table_finish::TableFinishNode;
+        use crate::exec::node::table_write_relation::ConnectorCommitFragmentCarrierValidator;
+        use crate::exec::node::values::ValuesNode;
+        use novarocks_spi::connector::ConnectorError;
+        use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+
+        struct AcceptAll;
+        impl ConnectorCommitFragmentCarrierValidator for AcceptAll {
+            fn validate(
+                &self,
+                _target: WriteTargetOrdinal,
+                _encoded: &[u8],
+            ) -> Result<(), ConnectorError> {
+                Ok(())
+            }
+        }
+
+        let writer_input = |node_id| ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk: Chunk::default(),
+                node_id,
+            }),
+        };
+        let targets = (0..3)
+            .map(|ordinal| WriteTargetOrdinal::try_new(ordinal).expect("bounded ordinal"))
+            .collect::<Vec<_>>();
+        let finish = TableFinishNode::try_new(
+            vec![writer_input(1), writer_input(2), writer_input(3)],
+            41,
+            targets,
+            Arc::new(AcceptAll),
+        )
+        .expect("table finish node");
+
+        let plan = ExecPlan {
+            arena: ExprArena::default(),
+            root: ExecNode {
+                kind: ExecNodeKind::TableFinish(finish),
+            },
+        };
+
+        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            ExchangeBindings::default(),
+            ScanBindings::default(),
+            4,
+        )
+        .expect("build pipeline graph");
+
+        let finish_pipelines = graph
+            .pipelines
+            .iter()
+            .filter(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_FINISH"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finish_pipelines.len(),
+            1,
+            "exactly one pipeline may run the finish operator"
+        );
+        assert_eq!(
+            finish_pipelines[0].dop, 1,
+            "the finish pipeline must run at DOP 1 so one driver sees every writer row"
+        );
+
+        // Every writer input keeps its own pipeline and hands off through the
+        // shared convergence sink rather than terminating on its own.
+        let convergence_sinks = graph
+            .pipelines
+            .iter()
+            .flat_map(|pipeline| pipeline.factories.iter())
+            .filter(|factory| factory.name().starts_with("UnionAllSink"))
+            .count();
+        assert_eq!(convergence_sinks, 3);
+    }
+
+    /// Build one table-writer plan over an exchange receiver and report the
+    /// pipeline the writer ended up on, plus the graph it belongs to.
+    fn table_writer_graph_over_exchange(
+        hash_partition_exprs: Vec<crate::exec::expr::ExprId>,
+        arena: ExprArena,
+        dop: i32,
+    ) -> super::PipelineGraph {
+        use crate::exec::node::exchange_source::ExchangeSourceNode;
+        use crate::exec::operators::table_writer::tests::{
+            TestWriteExecution, WriteExecutionStats, writer_input_schema, writer_node_over,
+        };
+        use crate::exec::pipeline::binding::ExchangeBinding;
+        use crate::runtime::exchange::ExchangeKey;
+        use crate::runtime::fragment::io::exchange::in_process_test_exchange_receiver_port;
+        use std::time::Duration;
+
+        const EXCHANGE_NODE_ID: i32 = 7;
+
+        let chunk_schema = chunk_schema_of(&writer_input_schema(), &[SlotId::new(1)]);
+        let input = ExecNode {
+            kind: ExecNodeKind::ExchangeSource(
+                ExchangeSourceNode::new(EXCHANGE_NODE_ID, Duration::from_secs(2), chunk_schema)
+                    .with_hash_partition_exprs(hash_partition_exprs),
+            ),
+        };
+        let execution = Arc::new(TestWriteExecution::new(Arc::new(
+            WriteExecutionStats::default(),
+        )));
+        let plan = ExecPlan {
+            arena,
+            root: ExecNode {
+                kind: ExecNodeKind::TableWriter(writer_node_over(Box::new(input), execution)),
+            },
+        };
+
+        let mut bindings = ExchangeBindings::default();
+        bindings.insert(
+            EXCHANGE_NODE_ID,
+            ExchangeBinding {
+                key: ExchangeKey {
+                    finst_id_hi: 1,
+                    finst_id_lo: 2,
+                    node_id: EXCHANGE_NODE_ID,
+                },
+                expected_senders: 1,
+                receiver_port: in_process_test_exchange_receiver_port(),
+            },
+        );
+
+        build_native_pipeline_graph_for_exec_plan_with_dop(
+            &plan,
+            false,
+            DependencyManager::new(),
+            None,
+            bindings,
+            ScanBindings::default(),
+            dop,
+        )
+        .expect("build pipeline graph")
+    }
+
+    fn local_exchange_source_count(graph: &super::PipelineGraph) -> usize {
+        graph
+            .pipelines
+            .iter()
+            .flat_map(|pipeline| pipeline.factories.iter())
+            .filter(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SOURCE"))
+            .count()
+    }
+
+    /// A hash-partitioned exchange routes a key to one fragment *instance*, not
+    /// to one driver: every driver of the receiving pipeline pulls from the same
+    /// instance-wide receiver, so two chunks carrying one key are taken by
+    /// whichever drivers happen to be free. A connector writer that owns one
+    /// artifact per key -- Iceberg allows a single deletion vector per data file
+    /// -- then stages two artifacts for that key and the commit is refused as
+    /// corrupt. The writer must therefore sit behind a local shuffle on the very
+    /// key the exchange used.
+    #[test]
+    fn a_table_writer_behind_a_hash_exchange_repartitions_to_its_drivers() {
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let graph = table_writer_graph_over_exchange(vec![key], arena, 4);
+
+        assert_eq!(
+            local_exchange_source_count(&graph),
+            1,
+            "the writer must consume a driver-level shuffle of the exchange key"
+        );
+        let writer_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_WRITER"))
+            })
+            .expect("a pipeline runs the writer");
+        assert_eq!(
+            writer_pipeline.dop, 4,
+            "re-partitioning keeps every driver writing; it is not a gather"
+        );
+        assert!(
+            writer_pipeline
+                .factories
+                .first()
+                .expect("the writer pipeline has a source")
+                .name()
+                .starts_with("LOCAL_EXCHANGE_SOURCE"),
+            "the shuffle must sit between the exchange and the writer"
+        );
+    }
+
+    /// An unpartitioned or random edge carries no key, so there is nothing for a
+    /// local shuffle to preserve and adding one would only cost a pipeline
+    /// boundary. Writers on such an edge keep consuming the exchange directly.
+    #[test]
+    fn a_table_writer_behind_an_unpartitioned_exchange_keeps_its_input() {
+        let graph = table_writer_graph_over_exchange(Vec::new(), ExprArena::default(), 4);
+
+        assert_eq!(
+            local_exchange_source_count(&graph),
+            0,
+            "an edge with no hash key must not gain a shuffle"
+        );
+        let writer_pipeline = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                pipeline
+                    .factories
+                    .iter()
+                    .any(|factory| factory.name().starts_with("TABLE_WRITER"))
+            })
+            .expect("a pipeline runs the writer");
+        assert_eq!(writer_pipeline.dop, 4);
+        assert!(
+            writer_pipeline
+                .factories
+                .first()
+                .expect("the writer pipeline has a source")
+                .name()
+                .starts_with("EXCHANGE_SOURCE"),
+            "the writer still reads the exchange directly"
+        );
+    }
+
+    /// One driver already owns every key, so a shuffle at DOP 1 would add a
+    /// pipeline boundary and buy nothing.
+    #[test]
+    fn a_single_driver_table_writer_needs_no_shuffle() {
+        let mut arena = ExprArena::default();
+        let key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let graph = table_writer_graph_over_exchange(vec![key], arena, 1);
+
+        assert_eq!(local_exchange_source_count(&graph), 0);
     }
 }

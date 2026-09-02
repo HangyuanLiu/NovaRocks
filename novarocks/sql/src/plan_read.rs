@@ -30,12 +30,13 @@ pub use crate::common::expr::{
 pub use crate::common::plan_hints::{ScanVariantColumn, SqlTopNType};
 pub use crate::common::schema::OutputColumn;
 pub use crate::planner::distributed::write::{
-    ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
+    ChangeStreamRouterSink, ConnectorWriteInputBinding, TableFinishNode, TableWriterNode,
 };
 pub use crate::planner::distributed::{
-    BoundaryColumn, BoundaryContract, BoundaryKind, DataPartition, DataSink, DistributedNode,
-    DistributedNodeKind, DistributedPlan, ExchangeFlavor, ExchangeReceiver, ExecutionColumnId,
-    FragmentEdge, FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentId, FragmentStreamKind,
+    BoundaryColumn, BoundaryContract, BoundaryKind, ConnectorWriteOutputContract, DataPartition,
+    DataSink, DistributedNode, DistributedNodeKind, DistributedPlan, ExchangeFlavor,
+    ExchangeReceiver, ExecutionColumnId, FinalizedWriteTargetColumn, FragmentEdge,
+    FragmentEdgeKind, FragmentEdgeOutputCatalog, FragmentId, FragmentStreamKind,
     NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, PartitionKind, PlanFragment,
     WriteContractCatalog, distributed_kind_to_physical,
 };
@@ -57,20 +58,46 @@ impl DistributedNode {
     }
 }
 
-/// Read-only access to one sealed connector writer sink. The opaque provider
-/// payload remains inside the signed SPI handle; plan readers can only encode
-/// its immutable envelope.
-impl ConnectorWriteFragmentSink {
-    pub fn handle(&self) -> Option<&novarocks_spi::connector::ConnectorWriterHandle> {
-        self.handle.as_ref()
+/// Read-only access to one sealed NCP-6 dataflow table writer.
+///
+/// The writer emits the SPI-owned writer relation
+/// (`novarocks_spi::connector::write_stack::writer_output_schema`) rather than
+/// terminating the plan; readers can only observe its query-local writer
+/// ordinal, its Arrow input binding, and the sealed SQL/Arrow output contract
+/// it feeds the connector writer.
+impl TableWriterNode {
+    /// The dense, query-local writer-handle ordinal every row this writer emits
+    /// is tagged with.
+    pub const fn write_target_ordinal(
+        &self,
+    ) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        self.write_target_ordinal
     }
 
+    /// The Arrow input selection that feeds the connector writer.
     pub fn input(&self) -> &ConnectorWriteInputBinding {
         &self.input
     }
 
-    pub fn has_output_contract(&self) -> bool {
-        self.output_contract.is_some()
+    /// The sealed write output expressions, evaluated against the writer's
+    /// execution input.
+    pub fn output_exprs(&self) -> &[TypedExpr] {
+        &self.output_contract.output_exprs
+    }
+
+    /// The sealed write target schema, carrying positional target-field ids.
+    pub fn target_schema(&self) -> &[FinalizedWriteTargetColumn] {
+        &self.output_contract.target_schema
+    }
+}
+
+/// Read-only access to the single sealed NCP-6 write finish node.
+impl TableFinishNode {
+    /// The dense `0..n` writer ordinals this finish node must observe.
+    pub fn expected_target_ordinals(
+        &self,
+    ) -> &[novarocks_spi::connector::write_stack::WriteTargetOrdinal] {
+        &self.expected_target_ordinals
     }
 }
 
@@ -85,8 +112,11 @@ impl ChangeStreamRouterRouteRead<'_> {
         self.0.route_id
     }
 
-    pub fn cohort_id(&self) -> novarocks_spi::connector::ConnectorWriteCohortId {
-        self.0.cohort_id
+    /// The dense, query-local logical write target this branch feeds.
+    pub const fn write_target_ordinal(
+        &self,
+    ) -> novarocks_spi::connector::write_stack::WriteTargetOrdinal {
+        self.0.write_target_ordinal
     }
 
     pub fn accepted_effects(&self) -> &[ConnectorRowMutationEffect] {
@@ -900,7 +930,6 @@ pub enum SqlBoundaryKindRead {
     ResultOutput,
     ExchangeSend,
     ExchangeReceive,
-    IcebergWriteInput,
     ChangeStreamRouterInput,
 }
 
@@ -930,9 +959,6 @@ pub fn boundary_contract_reads(plan: &DistributedPlan) -> Vec<SqlBoundaryContrac
                 }
                 crate::planner::distributed::BoundaryKind::ExchangeReceive => {
                     SqlBoundaryKindRead::ExchangeReceive
-                }
-                crate::planner::distributed::BoundaryKind::IcebergWriteInput => {
-                    SqlBoundaryKindRead::IcebergWriteInput
                 }
                 crate::planner::distributed::BoundaryKind::ChangeStreamRouterInput => {
                     SqlBoundaryKindRead::ChangeStreamRouterInput

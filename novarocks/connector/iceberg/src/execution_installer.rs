@@ -31,7 +31,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::write_execution::IcebergDataWriteExecution;
 use crate::file_reader::batch_reader::IcebergBatchReader;
 use crate::file_reader::delta_reader::IcebergDeltaBatchReader;
 use crate::file_reader::execution_payload::{
@@ -148,13 +147,22 @@ impl IcebergExecutionBindingFactory {
                 key: key.clone(),
                 binding: binding.clone(),
             })),
-            Some(Arc::new(IcebergDataWriteExecution::new(
-                binding,
-                self.resources.runtime().clone(),
-            ))),
+            // Writers are opened through the write stack's own execution
+            // binding, which the role binding publishes alongside this one.
+            // The slot stays occupied because the role binding requires the
+            // generic and typed write groups to agree about whether this
+            // provider writes at all.
+            Some(Arc::new(IcebergWriteCapability)),
         )
     }
 }
+
+/// The generic write capability marker. It exists so the execution role
+/// binding can see that this provider writes (ADR-0130); writers themselves are
+/// opened through the write stack's own execution binding.
+struct IcebergWriteCapability;
+
+impl novarocks_spi::connector::ConnectorWriteExecution for IcebergWriteCapability {}
 
 /// Materializes only FE-frozen membership into local read units. Catalog
 /// access and all planning remain outside this BE execution object.

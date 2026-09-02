@@ -23,7 +23,6 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_spi::connector::{ConnectorSplit, ConnectorWriterHandle};
 
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::{
@@ -187,12 +186,11 @@ pub fn group_router_edges_by_source(
 pub fn ensure_native_fragment_sink_supported(
     fragment_id: FragmentId,
     is_root: bool,
-    is_terminal_write: bool,
     has_stream_edge: bool,
     has_router_edges: bool,
     has_cte_id: bool,
 ) -> Result<(), String> {
-    if is_root || is_terminal_write || has_stream_edge || has_router_edges || has_cte_id {
+    if is_root || has_stream_edge || has_router_edges || has_cte_id {
         return Ok(());
     }
 
@@ -203,150 +201,6 @@ pub fn ensure_native_fragment_sink_supported(
     ))
 }
 
-/// Install one placement-local provider-neutral writer handle planned by the
-/// frontend control binding.
-///
-/// Native fragment templates are encoded before scheduling.  The writer
-/// identity therefore cannot be valid until the placement has been frozen.
-/// This is the only seam that installs the per-placement opaque handle; it
-/// neither decodes its provider payload nor permits a fallback to an
-/// unplanned handle.
-pub fn patch_native_connector_write_sink(
-    fragment: &mut novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    fragment_instance_id: novarocks_types::UniqueId,
-    backend_num: i32,
-    handle: &ConnectorWriterHandle,
-) -> Result<(), String> {
-    let mut patched_fragment = fragment.clone();
-    patch_native_connector_write_sink_in_place(
-        &mut patched_fragment,
-        fragment_id,
-        fragment_instance_id,
-        backend_num,
-        handle,
-    )?;
-    *fragment = patched_fragment;
-    Ok(())
-}
-
-fn patch_native_connector_write_sink_in_place(
-    fragment: &mut novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    fragment_instance_id: novarocks_types::UniqueId,
-    backend_num: i32,
-    handle: &ConnectorWriterHandle,
-) -> Result<(), String> {
-    let writer = handle.writer();
-    if writer.fragment_id()
-        != i32::try_from(fragment_id)
-            .map_err(|_| format!("connector write fragment {fragment_id} exceeds i32 width"))?
-        || writer.backend_num() != backend_num
-        || writer.fragment_instance_id() != unique_id_bytes(fragment_instance_id)
-        || writer.sink_ordinal() != 0
-    {
-        return Err(format!(
-            "connector writer handle does not match scheduled placement: fragment={fragment_id} backend_num={backend_num} finst={fragment_instance_id:?}"
-        ));
-    }
-
-    let sink = fragment
-        .sink
-        .as_mut()
-        .ok_or_else(|| format!("terminal write fragment {fragment_id} has no native sink"))?;
-    let template = match sink.kind.take() {
-        Some(novarocks_proto_models::plan::data_sink::Kind::ConnectorWrite(template)) => template,
-        Some(other) => {
-            sink.kind = Some(other);
-            return Err(format!(
-                "terminal write fragment {fragment_id} requires CONNECTOR_WRITE template before connector write patch"
-            ));
-        }
-        None => {
-            return Err(format!(
-                "terminal write fragment {fragment_id} has an empty native sink"
-            ));
-        }
-    };
-    if template.handle.is_some() {
-        return Err(format!(
-            "terminal connector write fragment {fragment_id} already has a writer handle"
-        ));
-    }
-    let input = template.input.ok_or_else(|| {
-        format!("terminal connector write fragment {fragment_id} is missing input binding")
-    })?;
-    let input = match input.kind {
-        Some(novarocks_proto_models::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
-            value,
-        )) => novarocks_proto_models::plan::ConnectorWriteInputBinding {
-            kind: Some(
-                novarocks_proto_models::plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
-                    value,
-                ),
-            ),
-        },
-        Some(novarocks_proto_models::plan::connector_write_input_binding::Kind::OutputOrdinals(
-            values,
-        )) => novarocks_proto_models::plan::ConnectorWriteInputBinding {
-            kind: Some(
-                novarocks_proto_models::plan::connector_write_input_binding::Kind::OutputOrdinals(values),
-            ),
-        },
-        None => {
-            return Err(format!(
-                "terminal connector write fragment {fragment_id} has an empty input binding"
-            ));
-        }
-    };
-    sink.kind = Some(
-        novarocks_proto_models::plan::data_sink::Kind::ConnectorWrite(
-            novarocks_proto_models::plan::ConnectorWriteFragmentSink {
-                handle: Some(
-                    novarocks_proto_models::plan::ConnectorWriterHandleEnvelope {
-                        contract_version: handle.version(),
-                        writer: Some(novarocks_proto_models::plan::ConnectorWriterIdentity {
-                            operation_id: writer.operation_id().to_bytes().to_vec(),
-                            cohort_id: writer.cohort_id().to_bytes().to_vec(),
-                            execution_query_id: writer.execution_id().query_id().to_vec(),
-                            execution_attempt_id: writer.execution_id().attempt_id(),
-                            fragment_instance_id: Some(native_unique_id(
-                                writer.fragment_instance_id(),
-                            )),
-                            fragment_id: writer.fragment_id(),
-                            backend_num: writer.backend_num(),
-                            sink_ordinal: writer.sink_ordinal(),
-                            catalog_handle: Some(
-                                novarocks_proto_codec::catalog::encode_catalog_handle(
-                                    writer.catalog_handle(),
-                                ),
-                            ),
-                        }),
-                        payload: handle.payload().to_vec(),
-                        payload_sha256: handle.payload_digest().to_vec(),
-                    },
-                ),
-                input: Some(input),
-            },
-        ),
-    );
-    Ok(())
-}
-
-fn unique_id_bytes(value: novarocks_types::UniqueId) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
-    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
-    bytes
-}
-
-fn native_unique_id(value: [u8; 16]) -> novarocks_proto_models::common::UniqueId {
-    novarocks_proto_models::common::UniqueId {
-        hi: i64::from_be_bytes(value[..8].try_into().expect("fixed writer identity prefix")),
-        lo: i64::from_be_bytes(value[8..].try_into().expect("fixed writer identity suffix")),
-    }
-}
-
 #[allow(
     dead_code,
     reason = "Retained for staged query-execution contract and lifecycle integration."
@@ -354,28 +208,16 @@ fn native_unique_id(value: [u8; 16]) -> novarocks_proto_models::common::UniqueId
 pub(crate) fn validate_fragment_output_kind(
     fragment_id: FragmentId,
     is_root: bool,
-    is_terminal_write: bool,
     is_producer: bool,
     output_kind: PreparedFragmentRole,
 ) -> Result<(), String> {
     if is_root {
         return match output_kind {
-            PreparedFragmentRole::Result
-            | PreparedFragmentRole::Statistics
-            | PreparedFragmentRole::TerminalWrite => Ok(()),
+            PreparedFragmentRole::Result | PreparedFragmentRole::Statistics => Ok(()),
             PreparedFragmentRole::NonTerminal => Err(format!(
-                "root fragment {fragment_id} must have Result or TerminalWrite output kind"
+                "root fragment {fragment_id} must have Result output kind"
             )),
         };
-    }
-    if is_terminal_write {
-        return (output_kind == PreparedFragmentRole::TerminalWrite)
-            .then_some(())
-            .ok_or_else(|| {
-                format!(
-                    "terminal write fragment {fragment_id} must have TerminalWrite output kind, got {output_kind:?}"
-                )
-            });
     }
     if is_producer {
         return (output_kind == PreparedFragmentRole::NonTerminal)
@@ -904,12 +746,7 @@ mod tests {
     use arrow::array::{Decimal128Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use bytes::Bytes;
-    use novarocks_spi::connector::{
-        ConnectorInstanceId, ConnectorProviderBindingKey, ConnectorWriteCohortId,
-        ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriteRouteId,
-        ConnectorWriterHandle, ConnectorWriterIdentity, ProviderBindingEpoch,
-    };
+    use novarocks_spi::connector::ConnectorWriteRouteId;
 
     use super::*;
     use novarocks_execution::exec::chunk::ChunkSchema;
@@ -965,9 +802,7 @@ mod tests {
                             }),
                             destinations: None,
                             route_id: vec![7; 32],
-                            cohort_id: ConnectorWriteCohortId::from_bytes([8; 32])
-                                .to_bytes()
-                                .to_vec(),
+                            write_target_ordinal: 0,
                             accepted_effects: vec![native_plan::RowMutationEffect::Delete as i32],
                             input_ordinals: vec![0],
                         }],
@@ -978,128 +813,34 @@ mod tests {
         }
     }
 
-    fn connector_writer_handle(
-        fragment_id: FragmentId,
-        finst_id: UniqueId,
-    ) -> ConnectorWriterHandle {
-        let owner = ConnectorProviderBindingKey {
-            instance_id: ConnectorInstanceId::parse("iceberg").expect("valid instance"),
-            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
-        };
-        let operation_id = ConnectorWriteOperationId::new();
-        let writer = ConnectorWriterIdentity::new(
-            operation_id,
-            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
-            ConnectorWriteExecutionId::new([3; 16], 1),
-            unique_id_bytes(finst_id),
-            i32::try_from(fragment_id).expect("test fragment fits i32"),
-            0,
-            0,
-            novarocks_spi::connector::CatalogHandle::new(
-                owner.instance_id.clone(),
-                novarocks_spi::connector::CatalogVersion::from_bytes([1; 32]),
-            ),
-        );
-        ConnectorWriterHandle::try_new(
-            writer,
-            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
-            Bytes::from_static(b"opaque"),
-        )
-        .expect("valid connector handle")
-    }
-
-    fn connector_writer_template_fragment(fragment_id: FragmentId) -> native_plan::PlanFragment {
-        native_plan::PlanFragment {
-            fragment_id,
-            sink: Some(native_plan::DataSink {
-                kind: Some(native_plan::data_sink::Kind::ConnectorWrite(
-                    native_plan::ConnectorWriteFragmentSink {
-                        handle: None,
-                        input: Some(native_plan::ConnectorWriteInputBinding {
-                            kind: Some(
-                                native_plan::connector_write_input_binding::Kind::RootOutputByOrdinal(
-                                    true,
-                                ),
-                            ),
-                        }),
-                    },
-                )),
-            }),
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn validates_native_sink_and_output_roles() {
-        ensure_native_fragment_sink_supported(7, false, false, true, false, false)
+        ensure_native_fragment_sink_supported(7, false, true, false, false)
             .expect("stream sink is supported");
-        ensure_native_fragment_sink_supported(8, false, false, false, true, false)
+        ensure_native_fragment_sink_supported(8, false, false, true, false)
             .expect("router sink is supported");
-        ensure_native_fragment_sink_supported(9, false, false, false, false, true)
+        ensure_native_fragment_sink_supported(9, false, false, false, true)
             .expect("CTE multicast sink is supported");
         assert!(
-            ensure_native_fragment_sink_supported(10, false, false, false, false, false)
+            ensure_native_fragment_sink_supported(10, false, false, false, false)
                 .expect_err("unowned dynamic sink must be rejected")
                 .contains("dynamic fragment sink")
         );
 
-        validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::Result)
+        validate_fragment_output_kind(1, true, false, PreparedFragmentRole::Result)
             .expect("result root");
-        validate_fragment_output_kind(1, true, false, false, PreparedFragmentRole::Statistics)
+        validate_fragment_output_kind(1, true, false, PreparedFragmentRole::Statistics)
             .expect("statistics root");
-        assert!(validate_fragment_output_kind(
-            1,
-            true,
-            false,
-            false,
-            PreparedFragmentRole::NonTerminal,
-        )
-        .expect_err("root cannot be nonterminal")
-        .contains("root fragment 1"));
         assert!(
-            validate_fragment_output_kind(2, false, false, true, PreparedFragmentRole::Result,)
+            validate_fragment_output_kind(1, true, false, PreparedFragmentRole::NonTerminal)
+                .expect_err("root cannot be nonterminal")
+                .contains("root fragment 1")
+        );
+        assert!(
+            validate_fragment_output_kind(2, false, true, PreparedFragmentRole::Result)
                 .expect_err("producer must be nonterminal")
                 .contains("producer fragment 2")
         );
-    }
-
-    #[test]
-    fn patches_only_the_exact_placement_to_a_generic_connector_writer() {
-        let finst_id = UniqueId::new(41, 77);
-        let handle = connector_writer_handle(9, finst_id);
-        let mut fragment = connector_writer_template_fragment(9);
-
-        patch_native_connector_write_sink(&mut fragment, 9, finst_id, 0, &handle)
-            .expect("exact writer placement patches");
-
-        let Some(native_plan::data_sink::Kind::ConnectorWrite(sink)) =
-            fragment.sink.as_ref().and_then(|sink| sink.kind.as_ref())
-        else {
-            panic!("generic connector write sink");
-        };
-        let writer = sink
-            .handle
-            .as_ref()
-            .and_then(|handle| handle.writer.as_ref())
-            .expect("writer");
-        assert_eq!(writer.fragment_id, 9);
-        assert_eq!(writer.backend_num, 0);
-        assert_eq!(sink.handle.as_ref().expect("handle").payload, b"opaque");
-        assert!(matches!(
-            sink.input.as_ref().and_then(|input| input.kind.as_ref()),
-            Some(native_plan::connector_write_input_binding::Kind::RootOutputByOrdinal(true))
-        ));
-
-        let mut wrong = connector_writer_template_fragment(9);
-        let before = wrong.clone();
-        let error =
-            patch_native_connector_write_sink(&mut wrong, 9, UniqueId::new(41, 78), 0, &handle)
-                .expect_err("wrong fragment instance must fail closed");
-        assert!(
-            error.contains("does not match scheduled placement"),
-            "{error}"
-        );
-        assert_eq!(wrong, before, "failed patch must preserve legacy template");
     }
 
     #[test]

@@ -442,8 +442,10 @@ fn execute_distributed_rewrite(
         let completion = engine
             .prepare_distributed_rewrite_cohort(&session, cohort.cohort_id())
             .and_then(|prepared| {
-                crate::native::fragment_encoder::encode_native_fragment_bundle(
-                    prepared.encoding().encoding_view(),
+                // A rewrite group's plan carries writer nodes, so the bundle
+                // has to be encoded against the session's sealed recipes.
+                crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
+                    prepared.encoding(),
                 )
                 .map_err(|error| format!("encode distributed rewrite fragments: {error}"))
                 .and_then(|bundle| prepared.finish(bundle))
@@ -452,7 +454,9 @@ fn execute_distributed_rewrite(
             Ok(completion) => completion,
             Err(error) => return abort_distributed_rewrite(engine, &session, error),
         };
-        if let Err(error) = engine.checkpoint_distributed_rewrite_attempt(&session, &completion) {
+        // Each group runs as its own query, so the session collects their
+        // prepared sets and commits the union once below.
+        if let Err(error) = engine.accumulate_distributed_rewrite_group(&session, completion) {
             return abort_distributed_rewrite(engine, &session, error);
         }
     }

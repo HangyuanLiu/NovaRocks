@@ -23,7 +23,7 @@
 //! connector, and external commit truth behind this object-safe boundary.
 
 use std::any::Any;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use novarocks_types::schema::ColumnDef;
 
@@ -177,10 +177,6 @@ pub struct PreparedIcebergInsert {
 
 /// Connector-neutral result of the coordinated writer phase.
 pub enum IcebergWriteReport {
-    Aborted {
-        reason: String,
-        has_staged_files: bool,
-    },
     NoOp,
     CommitRequired(Arc<dyn IcebergInsertCommit>),
 }
@@ -265,8 +261,65 @@ impl IcebergPreparedInsert for CorePreparedIcebergInsert {
     }
 }
 
+/// One INSERT's commit authority.
+///
+/// The completion is taken by the single commit, so a second commit attempt
+/// finds nothing rather than asking the connector twice. The session stays
+/// beside it because a `CommitUnknown` is resolved through the same session
+/// that issued the commit, never through a replacement.
 struct CoreIcebergInsertCommit {
-    completion: crate::query_execution::ConnectorWriteCompletion,
+    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    completion: Mutex<Option<crate::query_execution::outcome::ConnectorWriteSessionCompletion>>,
+    /// Set only after a commit that is known to have succeeded.
+    affected_rows: Mutex<Option<u64>>,
+}
+
+impl CoreIcebergInsertCommit {
+    fn new(completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion) -> Self {
+        Self {
+            session: Arc::clone(completion.session()),
+            completion: Mutex::new(Some(completion)),
+            affected_rows: Mutex::new(None),
+        }
+    }
+
+    fn commit(
+        &self,
+        context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<
+        novarocks_spi::connector::ExternalMutationOutcome<
+            novarocks_spi::connector::ConnectorWriteReceipt,
+        >,
+        String,
+    > {
+        let completion = self
+            .completion
+            .lock()
+            .map_err(|_| "Iceberg INSERT commit handle is poisoned".to_string())?
+            .take()
+            .ok_or_else(|| "Iceberg INSERT write session was already committed".to_string())?;
+        let committed =
+            crate::query_execution::write_session::finish_write_session(completion, context)
+                .map_err(|error| error.to_string())?;
+        // Rows become reportable exactly here: after the external commit said
+        // it succeeded, and never on a commit whose outcome is unknown.
+        *self
+            .affected_rows
+            .lock()
+            .map_err(|_| "Iceberg INSERT commit handle is poisoned".to_string())? =
+            committed.affected_rows();
+        Ok(committed.into_outcome())
+    }
+
+    /// The rows a client may be told about. `None` until a known-successful
+    /// commit has happened.
+    #[allow(
+        dead_code,
+        reason = "The gated affected-row count is surfaced to the MySQL result by a later task."
+    )]
+    fn affected_rows(&self) -> Option<u64> {
+        self.affected_rows.lock().ok().and_then(|rows| *rows)
+    }
 }
 
 impl IcebergInsertCommit for CoreIcebergInsertCommit {
@@ -454,7 +507,7 @@ impl InsertEngine for DmlExecutionKernel {
             .as_any()
             .downcast_ref::<CoreIcebergInsertCommit>()
             .ok_or_else(|| "foreign Iceberg INSERT commit handle".to_string())?;
-        prepared.prepared.commit_terminal(&commit.completion)
+        commit.commit(prepared.prepared.terminal_request_context())
     }
 
     fn adjudicate_iceberg_write_publication(
@@ -468,15 +521,14 @@ impl InsertEngine for DmlExecutionKernel {
         >,
         String,
     > {
-        let _prepared = downcast_prepared(prepared)?;
+        let prepared = downcast_prepared(prepared)?;
         let commit = commit
             .as_any()
             .downcast_ref::<CoreIcebergInsertCommit>()
             .ok_or_else(|| "foreign Iceberg INSERT commit handle".to_string())?;
         commit
-            .completion
-            .session()
-            .adjudicate_publication(evidence, commit.completion.terminal_request_context())
+            .session
+            .reconcile(evidence, prepared.prepared.terminal_request_context())
             .map_err(|error| error.to_string())
     }
 
@@ -547,20 +599,10 @@ fn downcast_prepared(
 fn iceberg_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
 ) -> IcebergWriteReport {
-    if let Some(abort) = result.write_abort {
-        let has_staged_files = abort
-            .completed_writer_outputs
-            .iter()
-            .any(|writer| !writer.connector_staged_report_frames.is_empty());
-        return IcebergWriteReport::Aborted {
-            reason: abort.reason,
-            has_staged_files,
-        };
-    }
-    let Some(completion) = result.connector_completion else {
+    let Some(completion) = result.write_session else {
         return IcebergWriteReport::NoOp;
     };
-    let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit { completion });
+    let commit: Arc<dyn IcebergInsertCommit> = Arc::new(CoreIcebergInsertCommit::new(completion));
     IcebergWriteReport::CommitRequired(commit)
 }
 
@@ -589,20 +631,14 @@ fn insert_value_to_literal(value: &InsertValue) -> Literal {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
     use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
-    use crate::query_execution::write::{
-        WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
-    };
     use crate::runtime::query_result::QueryResult;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
-    use novarocks_types::UniqueId;
 
     fn cancelled_execution() -> QueryExecutionContext {
         let cancellation = QueryCancellationSource::new();
@@ -633,32 +669,6 @@ mod tests {
         )
     }
 
-    fn write_abort_with_staged_report() -> WriteAbortInput {
-        let write_id = UniqueId::new(10, 20);
-        let writer_key = WriterKey {
-            query_id: write_id,
-            fragment_instance_id: UniqueId::new(101, 201),
-            backend_num: 0,
-        };
-        WriteAbortInput {
-            write_id,
-            reason: "query timed out waiting for write final reports".to_string(),
-            completed_writer_outputs: vec![WriterCommitInput {
-                writer_id: 0,
-                fragment_id: 0,
-                writer_key,
-                connector_staged_report_frames: vec![
-                    novarocks_proto_models::novarocks::ConnectorStagedReportFrame::default(),
-                ],
-                load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
-                loaded_rows: 11,
-                loaded_bytes: 110,
-                filtered_rows: 0,
-            }],
-            incomplete_writers: Vec::new(),
-        }
-    }
-
     #[test]
     fn insert_engine_is_object_safe() {
         fn accepts_object_safe_engine(_engine: Option<&dyn InsertEngine>) {}
@@ -683,92 +693,116 @@ mod tests {
         assert_eq!(error, "connector request was cancelled");
     }
 
+    /// The whole INSERT terminal, from the completion the coordinator hands
+    /// back to the one external commit: the session is asked to commit exactly
+    /// once, and only then does the statement have rows it may report.
     #[test]
-    fn query_execution_result_ignores_legacy_fileless_overwrite_carrier() {
+    fn a_completed_write_session_commits_once_and_then_reports_its_rows() {
+        use crate::query_execution::write_session::tests as write_session_fixture;
+
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::known_committed(),
+        );
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
-            write_commit: Some(WriteCommitInput {
-                write_id: UniqueId::new(1, 2),
-                writers: Vec::new(),
-            }),
-            write_abort: None,
-            connector_completion: None,
+            write_session: Some(
+                crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+                    Arc::clone(&fixture.session),
+                    crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
+                        11,
+                        Vec::new(),
+                    ),
+                ),
+            ),
             fragment_profiles: Vec::new(),
         });
 
-        assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_absent_commit_to_noop() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_fileless_fast_append_to_noop() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(WriteCommitInput {
-                write_id: UniqueId::new(1, 2),
-                writers: Vec::new(),
-            }),
-            write_abort: None,
-            connector_completion: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_writer_abort_with_staged_files() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(write_abort_with_staged_report()),
-            connector_completion: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        let IcebergWriteReport::Aborted {
-            reason,
-            has_staged_files,
-        } = report
-        else {
-            panic!("writer abort must stay an aborted report");
+        let IcebergWriteReport::CommitRequired(handle) = report else {
+            panic!("a completed write session must require a commit");
         };
-        assert!(reason.contains("timed out"));
-        assert!(has_staged_files);
+        let commit = handle
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .expect("core commit handle");
+        assert_eq!(fixture.session.finish_invocations(), 0);
+        assert!(
+            commit.affected_rows().is_none(),
+            "no rows may be reported before the commit"
+        );
+
+        let outcome = commit
+            .commit(write_session_fixture::request_context())
+            .expect("commit");
+        assert!(matches!(
+            outcome,
+            novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(fixture.session.finish_invocations(), 1);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 1);
+        assert_eq!(commit.affected_rows(), Some(11));
+
+        // The completion was taken by that one commit, so a second attempt
+        // cannot ask the connector again.
+        let error = commit
+            .commit(write_session_fixture::request_context())
+            .expect_err("second commit");
+        assert!(error.contains("already committed"), "unexpected: {error}");
+        assert_eq!(fixture.session.finish_invocations(), 1);
     }
 
     #[test]
-    fn query_execution_result_does_not_treat_empty_commit_info_as_staged_file() {
-        let mut abort = write_abort_with_staged_report();
-        abort.completed_writer_outputs[0]
-            .connector_staged_report_frames
-            .clear();
+    fn an_unknown_commit_outcome_leaves_the_statement_without_reportable_rows() {
+        use crate::query_execution::write_session::tests as write_session_fixture;
+
+        let fixture = write_session_fixture::fixture_with_outcome(
+            1,
+            16,
+            write_session_fixture::commit_unknown(),
+        );
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(abort),
-            connector_completion: None,
+            write_session: Some(
+                crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
+                    Arc::clone(&fixture.session),
+                    crate::query_execution::write_result::DecodedPreparedWriteSet::for_test(
+                        11,
+                        Vec::new(),
+                    ),
+                ),
+            ),
+            fragment_profiles: Vec::new(),
+        });
+        let IcebergWriteReport::CommitRequired(handle) = report else {
+            panic!("a completed write session must require a commit");
+        };
+        let commit = handle
+            .as_any()
+            .downcast_ref::<CoreIcebergInsertCommit>()
+            .expect("core commit handle");
+
+        let outcome = commit
+            .commit(write_session_fixture::request_context())
+            .expect("commit");
+        assert!(matches!(
+            outcome,
+            novarocks_spi::connector::ExternalMutationOutcome::CommitUnknown { .. }
+        ));
+        assert!(
+            commit.affected_rows().is_none(),
+            "an unknown commit outcome must not report success"
+        );
+    }
+
+    #[test]
+    fn query_execution_result_maps_absent_write_session_to_noop() {
+        let report = iceberg_write_report_from_result(QueryExecutionResult {
+            query_result: QueryResult::empty(),
+            write_session: None,
             fragment_profiles: Vec::new(),
         });
 
-        let IcebergWriteReport::Aborted {
-            has_staged_files, ..
-        } = report
-        else {
-            panic!("writer abort must stay an aborted report");
-        };
-        assert!(!has_staged_files);
+        assert!(matches!(report, IcebergWriteReport::NoOp));
     }
 }

@@ -48,6 +48,11 @@ use crate::fragment::decode::plan::layout::Layout;
 /// not keep growing one parameter at a time.
 #[derive(Clone)]
 pub(crate) struct TypedScanRuntime {
+    /// The exact attempt this runtime was leased under. It is the only
+    /// legitimate source of the query and attempt a writer's physical context
+    /// names: a plan node carries no attempt identity, and inventing one from
+    /// the plan would survive a replacement attempt.
+    execution_id: novarocks_types::QueryExecutionId,
     catalog_read_execution: CatalogReadExecutionResolver,
     catalog_write_execution: CatalogWriteExecutionResolver,
     queues: Arc<
@@ -98,7 +103,9 @@ pub(crate) type CatalogWriteExecutionResolver = Arc<
 >;
 
 impl TypedScanRuntime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        execution_id: novarocks_types::QueryExecutionId,
         catalog_read_execution: CatalogReadExecutionResolver,
         catalog_write_execution: CatalogWriteExecutionResolver,
         queues: Arc<
@@ -112,6 +119,7 @@ impl TypedScanRuntime {
         storage_resolver: Arc<dyn novarocks_spi::connector::ConnectorStorageResolver>,
     ) -> Self {
         Self {
+            execution_id,
             catalog_read_execution,
             catalog_write_execution,
             queues,
@@ -120,6 +128,11 @@ impl TypedScanRuntime {
             read_context,
             storage_resolver,
         }
+    }
+
+    /// The attempt this runtime belongs to.
+    pub(crate) const fn execution_id(&self) -> novarocks_types::QueryExecutionId {
+        self.execution_id
     }
 
     pub(crate) fn catalog_read_execution(
@@ -382,6 +395,12 @@ impl NativePlanDecodeContext {
     #[cfg(test)]
     pub(crate) fn with_query_id(mut self, query_id: QueryId) -> Self {
         self.query_id = Some(query_id);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_fragment_instance_id(mut self, id: novarocks_types::UniqueId) -> Self {
+        self.fragment_instance_id = FragmentInstanceId::new(id);
         self
     }
 

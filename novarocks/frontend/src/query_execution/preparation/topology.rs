@@ -23,19 +23,13 @@ use novarocks_sql::plan_read::{DistributedNode, DistributedNodeKind, FragmentId}
 pub(super) fn validate_topology_roles(
     sealed_ids: &BTreeSet<FragmentId>,
     result_fragment_id: Option<FragmentId>,
-    terminal_write_fragment_ids: &BTreeSet<FragmentId>,
     producer_fragment_ids: &BTreeSet<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
 ) -> Result<(), String> {
-    for (label, ids) in [
-        ("terminal write", terminal_write_fragment_ids),
-        ("producer", producer_fragment_ids),
-    ] {
-        if !ids.is_subset(sealed_ids) {
-            return Err(format!(
-                "prepared {label} fragment ids {ids:?} are not a subset of sealed fragment ids {sealed_ids:?}"
-            ));
-        }
+    if !producer_fragment_ids.is_subset(sealed_ids) {
+        return Err(format!(
+            "prepared producer fragment ids {producer_fragment_ids:?} are not a subset of sealed fragment ids {sealed_ids:?}"
+        ));
     }
     if let Some(result_fragment_id) = result_fragment_id {
         if !sealed_ids.contains(&result_fragment_id) {
@@ -43,22 +37,14 @@ pub(super) fn validate_topology_roles(
                 "prepared result fragment {result_fragment_id} is not among sealed fragment ids {sealed_ids:?}"
             ));
         }
-        if terminal_write_fragment_ids.contains(&result_fragment_id)
-            || producer_fragment_ids.contains(&result_fragment_id)
-        {
+        if producer_fragment_ids.contains(&result_fragment_id) {
             return Err(format!(
-                "prepared result fragment {result_fragment_id} overlaps terminal-write or producer roles"
+                "prepared result fragment {result_fragment_id} overlaps the producer role"
             ));
         }
     }
-    if !terminal_write_fragment_ids.is_disjoint(producer_fragment_ids) {
-        return Err(format!(
-            "prepared terminal-write and producer roles overlap: terminal={terminal_write_fragment_ids:?} producer={producer_fragment_ids:?}"
-        ));
-    }
     let classified = producer_fragment_ids
         .iter()
-        .chain(terminal_write_fragment_ids)
         .copied()
         .chain(result_fragment_id)
         .collect::<BTreeSet<_>>();
@@ -116,14 +102,8 @@ mod tests {
 
     #[test]
     fn sealed_topology_roles_reject_unclassified_fragments() {
-        let error = validate_topology_roles(
-            &BTreeSet::from([7, 8]),
-            Some(7),
-            &BTreeSet::new(),
-            &BTreeSet::new(),
-            7,
-        )
-        .expect_err("unclassified sealed fragment must fail");
+        let error = validate_topology_roles(&BTreeSet::from([7, 8]), Some(7), &BTreeSet::new(), 7)
+            .expect_err("unclassified sealed fragment must fail");
 
         assert_eq!(
             error,

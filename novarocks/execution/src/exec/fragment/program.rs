@@ -157,7 +157,6 @@ pub enum FragmentSinkKind {
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
-    ConnectorWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,7 +209,6 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
-            FragmentSinkProgram::ConnectorWrite(_) => (FragmentSinkKind::ConnectorWrite, None),
         };
         Ok(Self {
             program,
@@ -429,6 +427,8 @@ fn root_plan_node_id(plan: &ExecPlan) -> i32 {
         ExecNodeKind::Analytic(node) => node.node_id,
         ExecNodeKind::SetOp(node) => node.node_id,
         ExecNodeKind::RuntimeFilterConsumer(node) => node.owner_node_id,
+        ExecNodeKind::TableWriter(node) => node.node_id,
+        ExecNodeKind::TableFinish(node) => node.node_id,
     }
 }
 

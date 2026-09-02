@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_connector_binding::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
+    ConnectorControlWriteBinding,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCatalogMutationLease, ConnectorCatalogMutationResolver,
@@ -867,6 +868,89 @@ impl ConnectorControlHost {
         .and_then(|lease| lease.with_catalog_properties(catalog_properties))
     }
 
+    /// Acquire the complete typed write group of the generation a caller has
+    /// already retained.
+    ///
+    /// A write must commit through the same incarnation that planned it, so the
+    /// generation is named explicitly rather than resolved as "whatever is
+    /// active now": between planning and commit the active generation can be
+    /// replaced, and committing through the replacement would attach staged
+    /// work to a runtime that never admitted it. Callers pass the runtime id of
+    /// the planning lease they are already holding.
+    pub(crate) fn acquire_exact_write_stack(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        self.acquire_write_stack_inner(control_runtime_id, false)
+    }
+
+    /// Acquire the complete typed write group of the currently active
+    /// generation.
+    ///
+    /// Only for a caller that has not already pinned one; anything that planned
+    /// against a retained generation must use [`Self::acquire_exact_write_stack`].
+    pub(crate) fn acquire_current_write_stack(
+        &self,
+        instance_id: &ConnectorInstanceId,
+    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        let control_runtime_id = {
+            let state = self.lock_state()?;
+            state.active.get(instance_id).copied().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::NotFound,
+                    format!(
+                        "connector control instance `{}` is not active",
+                        instance_id.as_str()
+                    ),
+                )
+            })?
+        };
+        self.acquire_write_stack_inner(control_runtime_id, true)
+    }
+
+    fn acquire_write_stack_inner(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+        require_active: bool,
+    ) -> Result<ConnectorWriteStackLease, ConnectorError> {
+        let group = {
+            let mut state = self.lock_state()?;
+            let generation = state
+                .generations
+                .get_mut(&control_runtime_id)
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "connector control runtime is not registered",
+                    )
+                })?;
+            if require_active && generation.state != ControlGenerationState::Active {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "connector control generation is retiring",
+                ));
+            }
+            let group = generation
+                .role_binding
+                .as_ref()
+                .and_then(|binding| binding.write().cloned())
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Unsupported,
+                        "connector control generation has no distributed write capability",
+                    )
+                })?;
+            generation.write_leases = generation.write_leases.saturating_add(1);
+            group
+        };
+        let state = Arc::downgrade(&self.state);
+        Ok(ConnectorWriteStackLease::new(
+            control_runtime_id,
+            group,
+            move || release_lease(&state, control_runtime_id, LeaseKind::Write),
+        ))
+    }
+
     fn acquire_statistics(
         &self,
         instance_id: &ConnectorInstanceId,
@@ -1086,6 +1170,73 @@ impl ConnectorControlRegistry for ConnectorControlHost {
 
     fn retire_current(&self, instance_id: &ConnectorInstanceId) -> Result<(), ConnectorError> {
         Self::retire_current(self, instance_id)
+    }
+}
+
+/// A retained hold on one exact generation's complete typed write group.
+///
+/// The generation cannot retire out from under an in-flight write while this
+/// lease lives, which is what makes "the recipe that planned the write and the
+/// authority that commits it are the same generation" a fact rather than a
+/// hope. The commit authority itself is reached only through `session()`, and
+/// there is deliberately no way to clone the lease into another owner.
+pub struct ConnectorWriteStackLease {
+    control_runtime_id: ConnectorControlRuntimeId,
+    group: ConnectorControlWriteBinding,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl ConnectorWriteStackLease {
+    pub(crate) fn new(
+        control_runtime_id: ConnectorControlRuntimeId,
+        group: ConnectorControlWriteBinding,
+        release: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            control_runtime_id,
+            group,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    pub const fn control_runtime_id(&self) -> ConnectorControlRuntimeId {
+        self.control_runtime_id
+    }
+
+    /// The begin/finish/abort/reconcile authority. Frontend only.
+    pub fn session(&self) -> Arc<dyn novarocks_spi::connector::write_stack::ConnectorWriteControl> {
+        self.group.session()
+    }
+
+    /// Encodes a logical recipe for submission. It cannot decode one back.
+    pub fn handle_encoder(
+        &self,
+    ) -> Arc<dyn novarocks_proto_codec::connector_write::ConnectorWriteHandleEncoder> {
+        self.group.handle_encoder()
+    }
+
+    /// Decodes a staged artifact the backends reported. It cannot forge one.
+    pub fn fragment_decoder(
+        &self,
+    ) -> Arc<dyn novarocks_proto_codec::connector_write::ConnectorWriteFragmentDecoder> {
+        self.group.fragment_decoder()
+    }
+}
+
+impl Drop for ConnectorWriteStackLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for ConnectorWriteStackLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorWriteStackLease")
+            .field("control_runtime_id", &self.control_runtime_id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1384,6 +1535,33 @@ pub(crate) mod tests {
             None,
         )
         .expect("control binding")
+    }
+
+    /// StarRocks is read-only external data. Its control generation installs
+    /// no write capability, so a statement that tries to write to a StarRocks
+    /// catalog is refused as unsupported while it is still deriving its
+    /// write-stack lease -- before a plan is compiled, a recipe is sealed, or
+    /// a fragment is submitted.
+    #[test]
+    fn a_starrocks_catalog_has_no_distributed_write_capability() {
+        let host = ConnectorControlHost::new();
+        let instance_id = ConnectorInstanceId::parse("catalog.starrocks").expect("instance ID");
+        host.register(starrocks_binding())
+            .expect("register StarRocks generation");
+        let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
+
+        let error =
+            crate::connector::write_target::derive_write_stack_lease(&host, &planning_lease)
+                .expect_err("StarRocks has no distributed write capability");
+        assert!(
+            error.contains("no distributed write capability"),
+            "unexpected error: {error}"
+        );
+
+        let typed_error = host
+            .acquire_exact_write_stack(planning_lease.control_runtime_id())
+            .expect_err("StarRocks has no distributed write capability");
+        assert_eq!(typed_error.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

@@ -77,7 +77,17 @@ pub trait DistributedRewriteSealing {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
+        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
+    ) -> Result<Self::Sealed, String>;
+
+    /// Seal a plan that froze no group. It is a separate entry point rather
+    /// than an argument because a no-op has no write-stack lease to be given.
+    fn seal_noop_distributed_rewrite(
+        &self,
+        plan: ConnectorDistributedRewritePlan,
+        lease: ConnectorDistributedRewriteLease,
     ) -> Result<Self::Sealed, String>;
 }
 
@@ -133,6 +143,7 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
 pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     sealing: &S,
     resolver: &dyn ConnectorDistributedRewriteResolver,
+    control_host: &crate::connector::control_host::ConnectorControlHost,
     instance_id: &ConnectorInstanceId,
     table: ConnectorTableIdentity,
     operation_id: ConnectorWriteOperationId,
@@ -162,7 +173,7 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     let operation = match intent {
         DistributedRewriteIntent::DataFiles { rewrite_all } => {
             ConnectorDistributedRewriteOperation::RewriteDataFiles {
-                table: metadata.table,
+                table: metadata.table.clone(),
                 rewrite_all,
             }
         }
@@ -170,7 +181,7 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
             rewrite_all,
             min_input_files,
         } => ConnectorDistributedRewriteOperation::RewritePositionDeletes {
-            table: metadata.table,
+            table: metadata.table.clone(),
             rewrite_all,
             min_input_files,
         },
@@ -178,7 +189,20 @@ pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     let plan = lease
         .plan_operation(operation_id, operation, context.clone())
         .map_err(|error| format!("plan distributed rewrite: {error}"))?;
-    let session = sealing.seal_distributed_rewrite(plan, lease, context.clone())?;
+    // A rewrite that froze no group writes nothing, so it must not acquire a
+    // write-stack lease at all -- there would be nothing for one to admit. The
+    // lease is derived only on the writing path, on the same generation that
+    // resolved the rewrite, so its writer recipes cannot outlive the metadata
+    // they were planned against.
+    let session = if plan.cohorts().is_empty() {
+        sealing.seal_noop_distributed_rewrite(plan, lease)?
+    } else {
+        let write_stack = crate::connector::write_target::derive_write_stack_lease(
+            control_host,
+            &lease.planning_lease(),
+        )?;
+        sealing.seal_distributed_rewrite(plan, lease, write_stack, &metadata, context.clone())?
+    };
     Ok(DistributedRewriteApplicationSession {
         session,
         context,

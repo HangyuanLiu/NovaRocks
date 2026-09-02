@@ -41,10 +41,9 @@ use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
     ConnectorPreReadyWritePlanningRequest, ConnectorTableHandle, ConnectorWriteActivationIntent,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteCohortId, ConnectorWriteFieldRequest,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -204,25 +203,42 @@ fn prepare_iceberg_distributed_write(
         IcebergWriteMode::FullTableOverwrite => ConnectorWriteIntent::Overwrite,
         IcebergWriteMode::DynamicPartitionOverwrite => ConnectorWriteIntent::PartitionOverwrite,
     };
+    let input = ConnectorWriteInputRequest::Data {
+        fields: write_columns
+            .iter()
+            .map(|column| {
+                ConnectorWriteFieldRequest::new(Field::new(
+                    &column.name,
+                    column.data_type.clone(),
+                    column.nullable,
+                ))
+            })
+            .collect(),
+    };
     let preparation = prepare_iceberg_connector_write(
         &write_lease,
         target,
         target_ref,
         intent,
-        ConnectorWriteInputRequest::Data {
-            fields: write_columns
-                .iter()
-                .map(|column| {
-                    ConnectorWriteFieldRequest::new(Field::new(
-                        &column.name,
-                        column.data_type.clone(),
-                        column.nullable,
-                    ))
-                })
-                .collect(),
-        },
+        input.clone(),
         ConnectorWriteAdmissionPurpose::OrdinaryDml,
         connector_context.clone(),
+    )?;
+    // One logical data branch, admitted on the same generation that resolved
+    // the target. The session is opened before the plan is compiled because it
+    // owns the recipes that plan's writer node carries.
+    let write_session = crate::query_execution::write_session::begin_connector_write_session(
+        write_target.derive_write_stack_lease(state.typed_connector_control())?,
+        &write_lease,
+        connector_write_begin_request(
+            target,
+            target_ref,
+            intent,
+            input,
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::Ordinary,
+            connector_context.clone(),
+        )?,
     )?;
     let table_bindings =
         Arc::new(crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()?);
@@ -249,12 +265,6 @@ fn prepare_iceberg_distributed_write(
     // separately recorded F7 lifecycle change.
     let base_snapshot_id =
         write_target.journal_ref_head_snapshot_id(target_ref, connector_context.clone())?;
-    let connector_write = register_insert_connector_write(
-        preparation,
-        connector_operation_id,
-        connector_context.clone(),
-        &write_lease,
-    )?;
     let semantic_binding = FrozenIcebergWriteSemanticBinding {
         state: state.clone(),
         target: target.clone(),
@@ -263,8 +273,17 @@ fn prepare_iceberg_distributed_write(
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
-        connector_write: connector_write.template,
-        pre_ready_planning_request: connector_write.pre_ready_planning_request,
+        operation_id: connector_operation_id,
+        write_lease: write_lease.clone(),
+        write_session,
+        pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest::new(
+            ConnectorWriteActivationRequest {
+                operation_id: connector_operation_id,
+                source: ConnectorWriteActivationSource::Prepared(preparation),
+                intent: ConnectorWriteActivationIntent::Ordinary,
+                context: connector_context.clone(),
+            },
+        ),
     };
     let spec = IcebergWriteTransactionSpec {
         is_overwrite: overwrite_mode.is_overwrite(),
@@ -288,46 +307,34 @@ fn prepare_iceberg_distributed_write(
     })
 }
 
+/// Build the begin request for one distributed write.
+///
+/// The table is named the way the provider parses it -- namespace-qualified,
+/// last dot separating the table -- so a multi-level namespace round-trips
+/// instead of losing its trailing level.
 #[allow(clippy::too_many_arguments)]
-fn register_insert_connector_write(
-    preparation: ConnectorWritePreparation,
-    operation_id: ConnectorWriteOperationId,
+pub(crate) fn connector_write_begin_request(
+    target: &TargetBackend,
+    target_ref: &str,
+    intent: ConnectorWriteIntent,
+    input: ConnectorWriteInputRequest,
+    purpose: ConnectorWriteAdmissionPurpose,
+    flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor,
     context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<PreparedInsertConnectorWriteBinding, String> {
-    let activation = ConnectorWriteActivationRequest {
-        operation_id,
-        source: ConnectorWriteActivationSource::Prepared(preparation),
-        intent: ConnectorWriteActivationIntent::Ordinary,
-        context: context.clone(),
-    };
-    let pre_ready_planning_request = ConnectorPreReadyWritePlanningRequest::new(activation.clone());
-    let activated = exact_lease
-        .activate_write(activation)
-        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
-    let cohort = activated
-        .cohort(ConnectorWriteCohortId::primary(operation_id))
-        .ok_or_else(|| "exact Iceberg write activation omitted its primary cohort".to_string())?;
-    let template =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
-            cohort,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
+    Ok(
+        novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
+                .map_err(|error| format!("validate connector write target ref: {error}"))?,
+            intent,
+            purpose,
+            input,
+            base: None,
+            flavor,
             context,
-            exact_lease.clone(),
-        )
-        .map_err(|error| format!("seal exact Iceberg write planning template: {error}"))?;
-    Ok(PreparedInsertConnectorWriteBinding {
-        template,
-        pre_ready_planning_request,
-    })
-}
-
-/// Exact activation facts retained with the first-admission INSERT semantic
-/// binding. The provider proof is intentionally requested only if a later
-/// pre-ready topology failure reaches the replan gate: lack of a proof must
-/// not reject the ordinary first round.
-struct PreparedInsertConnectorWriteBinding {
-    template: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
+        },
+    )
 }
 
 /// Request a sealed preparation from the write-control generation retained by
@@ -487,7 +494,7 @@ impl PreparedIcebergWrite {
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
     > {
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
             &self.semantic_binding.state,
             Some(&self.semantic_binding.target.catalog),
             &self.semantic_binding.target.namespace,
@@ -498,7 +505,7 @@ impl PreparedIcebergWrite {
             novarocks_sql::compiler::RootDistributionRequirement::Any,
             execution,
             &self.semantic_binding.connector_context,
-            Some(self.semantic_binding.connector_write.clone()),
+            Arc::clone(&self.semantic_binding.write_session),
         )
     }
 
@@ -547,10 +554,7 @@ impl PreparedIcebergWrite {
                 "prepared Iceberg write attempt reservation was already consumed".to_string()
             })?;
         let publication_id = novarocks_spi::connector::LakePublicationId::try_from_bytes(
-            self.semantic_binding
-                .connector_write
-                .operation_id()
-                .to_bytes(),
+            self.semantic_binding.operation_id.to_bytes(),
         )
         .map_err(|error| {
             format!("Iceberg write operation lacks a UUIDv7 publication identity: {error}")
@@ -571,15 +575,7 @@ impl PreparedIcebergWrite {
             )
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
             .map_err(|error| error.to_string())?;
-        let (query_result, write_commit, write_abort, connector_completion) =
-            outcome.into_parts_with_connector();
-        Ok(QueryExecutionResult {
-            query_result,
-            write_commit,
-            write_abort,
-            connector_completion,
-            fragment_profiles: Vec::new(),
-        })
+        Ok(outcome.into_execution_result())
     }
 
     /// Convert a validated Iceberg write into SQL's inert distributed-write
@@ -590,19 +586,10 @@ impl PreparedIcebergWrite {
     /// Frontend application owners use this form when they must persist their
     /// intent and retain an exact connector lease before submitting native
     /// fragments.
-    pub(crate) fn commit_terminal(
+    pub(crate) fn terminal_request_context(
         &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        completion
-            .session()
-            .commit(completion.terminal_request_context())
-            .map_err(|error| error.to_string())
+    ) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.semantic_binding.connector_context.clone()
     }
 
     pub(crate) fn finalize(&self) -> Result<(), String> {
@@ -628,7 +615,15 @@ struct FrozenIcebergWriteSemanticBinding {
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    /// This statement's durable publication identity. It stays in this
+    /// frontend layer: it never reaches a writer recipe or a commit fragment.
+    operation_id: ConnectorWriteOperationId,
+    /// The exact generation's write lease, retained only so a topology replan
+    /// can ask it for an effect-free planning proof.
+    write_lease: ConnectorWriteLease,
+    /// The one commit authority for this statement. Every round of this
+    /// statement encodes the same sealed recipes from it.
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
 }
 
@@ -647,23 +642,21 @@ impl FrozenIcebergWriteSemanticBinding {
         }
         let execution = self.execution_for_topology(topology)?;
         let proof = self
-            .connector_write
-            .lease()
+            .write_lease
             .certify_pre_ready_write_planning(self.pre_ready_planning_request.clone())
             .map_err(|error| {
                 crate::dml::error::DmlExecutionError::from(format!(
                     "Iceberg write topology replan has no effect-free planning proof: {error}"
                 ))
             })?;
-        self.connector_write
-            .lease()
+        self.write_lease
             .validate_pre_ready_write_planning_proof(&proof, &self.pre_ready_planning_request)
             .map_err(|error| {
                 crate::dml::error::DmlExecutionError::from(format!(
                     "Iceberg write topology replan lost its effect-free planning proof: {error}"
                 ))
             })?;
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
             &self.state,
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -674,7 +667,7 @@ impl FrozenIcebergWriteSemanticBinding {
             novarocks_sql::compiler::RootDistributionRequirement::Any,
             Some(&execution),
             &self.connector_context,
-            Some(self.connector_write.clone()),
+            Arc::clone(&self.write_session),
         )
     }
 
@@ -749,15 +742,16 @@ impl crate::query_execution::completion::PreparedDistributedRequestFactory
                 error.to_string(),
             )
         })?;
-        let native_bundle = crate::native::fragment_encoder::encode_native_fragment_bundle(
-            assembly.encoding().encoding_view(),
-        )
-        .map_err(|error| {
-            crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                error,
+        let native_bundle =
+            crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
+                assembly.encoding(),
             )
-        })?;
+            .map_err(|error| {
+                crate::query_execution::contract::DistributedQueryError::new(
+                    crate::query_execution::contract::DistributedQueryErrorKind::Failed,
+                    error,
+                )
+            })?;
         let (_query_execution, request) =
             assembly.into_request(native_bundle).map_err(|error| {
                 crate::query_execution::contract::DistributedQueryError::new(

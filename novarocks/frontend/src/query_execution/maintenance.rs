@@ -36,15 +36,13 @@ use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
 use crate::maintenance::MaintenanceTarget;
-use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMutationOperationId,
-    ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
+    ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,
+    ConnectorMutationOperationId, ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
@@ -61,22 +59,30 @@ pub struct PreparedDistributedRewriteCohort {
     encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
     query_execution: crate::query_execution::service::QueryExecutionService,
     execution: crate::common::admitted_query_context::QueryExecutionContext,
-    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedDistributedRewriteCohort {
+    /// A rewrite group's plan always carries a writer node, so its encoding
+    /// input always needs this session's sealed recipes. Sealing them here,
+    /// from the very session the cohort commits through, is what keeps the plan
+    /// and the recipes from being two independent caller choices that can
+    /// disagree -- a plan submitted without them fails to encode at all.
     fn new(
         encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
         query_execution: crate::query_execution::service::QueryExecutionService,
         execution: crate::common::admitted_query_context::QueryExecutionContext,
-        connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-    ) -> Self {
-        Self {
-            encoding,
+        write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    ) -> Result<Self, String> {
+        let sealed_write_targets = write_session
+            .seal_write_targets()
+            .map_err(|error| format!("seal distributed rewrite write targets: {error}"))?;
+        Ok(Self {
+            encoding: encoding.with_sealed_write_targets(sealed_write_targets),
             query_execution,
             execution,
-            connector_write,
-        }
+            write_session,
+        })
     }
 
     /// The only read-only Frontend input for native fragment encoding.
@@ -89,7 +95,7 @@ impl PreparedDistributedRewriteCohort {
     pub fn finish(
         self,
         native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<ConnectorWriteCompletion, String> {
+    ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
         if !self.encoding.matches_native_attachment(&native_bundle) {
             return Err(
                 "native fragment bundle does not match the sealed maintenance encoding input"
@@ -106,33 +112,23 @@ impl PreparedDistributedRewriteCohort {
                 &self.execution,
             )
             .map_err(|error| error.to_string())?;
-        let request = crate::query_execution::contract::with_connector_write_operation(
+        let request = crate::query_execution::contract::with_connector_write_session(
             request,
-            self.connector_write,
+            std::sync::Arc::clone(&self.write_session),
         )
         .map_err(|error| error.to_string())?;
-        let (query_result, _write_commit, write_abort, connector_completion) = self
+        let session_completion = self
             .query_execution
             .execute(request)
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
-            .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
+            .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
             .map_err(|error| error.to_string())?;
-        if !query_result.columns.is_empty() || !query_result.chunks.is_empty() {
-            return Err("connector staging terminal returned a result payload".to_string());
-        }
-        if let Some(abort) = write_abort {
-            return Err(format!(
-                "connector staging terminal aborted: {}",
-                abort.reason
-            ));
-        }
-        let completion = connector_completion.ok_or_else(|| {
-            "connector staging terminal has no accepted connector completion".to_string()
-        })?;
-        completion
-            .staging_summary()
-            .map_err(|error| error.to_string())?;
-        Ok(completion)
+        // The dual barrier is what produces a session completion, so its
+        // absence here means the write data plane never closed -- not that the
+        // group happened to stage nothing.
+        session_completion.ok_or_else(|| {
+            "connector staging terminal closed without a prepared write set".to_string()
+        })
     }
 }
 
@@ -559,11 +555,11 @@ pub trait TableMaintenanceEngine: Send + Sync {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
-    fn checkpoint_distributed_rewrite_attempt(
+    fn accumulate_distributed_rewrite_group(
         &self,
         _session: &DistributedRewriteMaintenanceSession,
-        _completion: &ConnectorWriteCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        _completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    ) -> Result<(), String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
     }
 
@@ -1195,15 +1191,16 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
     }
 
-    fn checkpoint_distributed_rewrite_attempt(
+    fn accumulate_distributed_rewrite_group(
         &self,
         session: &DistributedRewriteMaintenanceSession,
-        completion: &ConnectorWriteCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    ) -> Result<(), String> {
+        let (_, prepared) = completion.into_parts();
         session
             .session()
-            .checkpoint_accepted(completion)
-            .map_err(|error| format!("checkpoint distributed rewrite attempt: {error}"))
+            .accumulate(prepared)
+            .map_err(|error| format!("accumulate distributed rewrite group: {error}"))
     }
 
     fn commit_distributed_rewrite(
@@ -1250,6 +1247,7 @@ impl RequestScopedMaintenanceEngine {
         crate::connector::distributed_rewrite_application::plan_distributed_rewrite_session(
             self.kernel.query_execution(),
             self.kernel.connector_control().as_ref(),
+            self.kernel.typed_connector_control(),
             &identity.instance_id.clone(),
             identity,
             operation_id,
@@ -1451,13 +1449,13 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
             .prepare_distributed_rewrite_cohort(session, cohort_id)
     }
 
-    fn checkpoint_distributed_rewrite_attempt(
+    fn accumulate_distributed_rewrite_group(
         &self,
         session: &DistributedRewriteMaintenanceSession,
-        completion: &ConnectorWriteCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, String> {
+        completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    ) -> Result<(), String> {
         self.request_engine()?
-            .checkpoint_distributed_rewrite_attempt(session, completion)
+            .accumulate_distributed_rewrite_group(session, completion)
     }
 
     fn commit_distributed_rewrite(
@@ -1564,23 +1562,27 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             (Box::new(resolver), physical_plan)
         }
     };
+    // The session sealed one logical target per frozen group, so this group's
+    // writer recipe and its ordinal both come from there. Deriving the ordinal
+    // from anything else would let a group's artifacts be attributed to another
+    // group's writer, which the prepared set cannot catch.
+    let write_target = session
+        .write_target(cohort_id)
+        .map_err(|error| format!("resolve frozen rewrite group write target: {error}"))?;
     let target_binding =
-        crate::query_execution::planning::write_sink::admit_prepared_frozen_connector_write_target(
+        crate::query_execution::planning::write_sink::admit_session_connector_write_target(
             table_bindings.as_ref(),
             rewrite_target_identity(session, cohort_id),
-            cohort.preparation().clone(),
+            write_target,
             session.lease().planning_lease(),
         )?;
     let sink =
         crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
             table_bindings.as_ref(),
             target_binding,
-            rewrite_sink_mode(cohort.preparation().input())?,
+            rewrite_sink_mode(write_target.input())?,
             novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
-    let registration = session
-        .execution_registration(cohort_id)
-        .map_err(|error| format!("register frozen rewrite cohort: {error}"))?;
     crate::connector::validate_request_context(context)?;
     let mut optimizer_settings = execution.optimizer_settings().clone();
     if optimizer_settings.cbo_broadcast_backend_count.is_none() {
@@ -1588,9 +1590,10 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             Some(execution.topology().targets().len() as f64);
     }
     let distributed_plan =
-        novarocks_sql::planning::dml::build_frozen_connector_write_distributed_plan(
+        novarocks_sql::planning::dml::build_frozen_connector_write_dataflow_plan(
             physical_plan,
             sink,
+            write_target.ordinal(),
             &optimizer_settings,
         )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -1605,15 +1608,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             execution,
         )?,
     )?;
-    Ok(PreparedDistributedRewriteCohort::new(
+    let write_session = session
+        .write_session()
+        .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
+    PreparedDistributedRewriteCohort::new(
         crate::query_execution::compiler::NativeFragmentEncodingInput::new(
             distributed_plan,
             prepared,
         ),
         query_execution.clone(),
         execution.clone(),
-        registration,
-    ))
+        write_session.clone(),
+    )
 }
 
 fn rewrite_target_identity(

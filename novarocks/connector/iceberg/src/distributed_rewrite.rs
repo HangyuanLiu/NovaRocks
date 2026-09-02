@@ -32,27 +32,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorDistributedRewrite,
-    ConnectorDistributedRewriteAttemptCheckpoint, ConnectorDistributedRewriteAttemptDisposition,
-    ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewriteOperation,
-    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanSummary,
-    ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
-    ConnectorDistributedRewriteReceiptSummary, ConnectorError, ConnectorErrorKind,
-    ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor, ConnectorInstanceId,
+    ConnectorDistributedRewrite, ConnectorDistributedRewriteCohortPlan,
+    ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
+    ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
+    ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
+    ConnectorErrorKind, ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor,
     ConnectorPinnedFileSet, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorRewriteCohortRead, ConnectorStagedReport, ConnectorStagedReportSummary,
-    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
-    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteControl,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteReceipt,
-    ConnectorWriteTargetRef, ConnectorWriterIdentity, ConnectorWriterTerminalState,
-    ProviderBindingEpoch, REWRITE_DATA_FILES_KIND, REWRITE_POSITION_DELETES_KIND,
+    ConnectorRewriteCohortRead, ConnectorTableHandle, ConnectorWriteBaseVersion,
+    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePreparation,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef, ProviderBindingEpoch,
+    REWRITE_POSITION_DELETES_KIND,
 };
 
-use crate::commit::write_control::{
-    IcebergDistributedRewriteActivation, IcebergDistributedRewriteCohortActivation,
-    IcebergDistributedRewriteKind, IcebergWriteControl,
-};
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
 use crate::metadata::IcebergMetadata;
 use crate::metadata_context::IcebergMetadataContext;
@@ -69,8 +61,6 @@ pub(crate) const REWRITE_ARTIFACT_MAX_PARTS: usize = 64;
 pub(crate) const REWRITE_ARTIFACT_MAX_PART_BYTES: usize = 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_ROOT_BYTES: usize = 64 * 1024;
 
-const ATTEMPT_ARTIFACT_MAGIC: &[u8; 8] = b"NRRWAT01";
-const ATTEMPT_ARTIFACT_VERSION: u16 = 2;
 const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v1\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
 
@@ -83,21 +73,18 @@ struct IcebergRewritePlanPayloadV1 {
     target_ref: String,
 }
 
-#[derive(Clone)]
-struct PlannedRewrite {
-    plan: ConnectorDistributedRewritePlan,
-    artifact: IcebergFrozenRewriteArtifactV1,
-    artifact_location: String,
-}
-
 /// Complete distributed-rewrite capability for one provider generation.
 pub struct IcebergDistributedRewriteControl {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
     provider: Arc<IcebergMetadata>,
-    write: Arc<IcebergWriteControl>,
-    plans: Mutex<HashMap<novarocks_spi::connector::ConnectorWriteOperationId, PlannedRewrite>>,
+    plans: Mutex<
+        HashMap<
+            novarocks_spi::connector::ConnectorWriteOperationId,
+            ConnectorDistributedRewritePlan,
+        >,
+    >,
 }
 
 impl IcebergDistributedRewriteControl {
@@ -106,7 +93,6 @@ impl IcebergDistributedRewriteControl {
         incarnation: ProviderBindingEpoch,
         runtime: Arc<IcebergMetadataContext>,
         provider: Arc<IcebergMetadata>,
-        write: Arc<IcebergWriteControl>,
     ) -> Result<Self, ConnectorError> {
         let key = ConnectorProviderBindingKey {
             instance_id: descriptor.instance_id.clone(),
@@ -114,7 +100,6 @@ impl IcebergDistributedRewriteControl {
         };
         if provider.descriptor() != &descriptor
             || provider.incarnation() != incarnation
-            || write.binding_key() != &key
             || !Arc::ptr_eq(provider.runtime(), &runtime)
         {
             return Err(invalid(
@@ -126,27 +111,14 @@ impl IcebergDistributedRewriteControl {
             descriptor,
             runtime,
             provider,
-            write,
             plans: Mutex::new(HashMap::new()),
         })
-    }
-
-    fn planned(
-        &self,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-    ) -> Result<PlannedRewrite, ConnectorError> {
-        self.plans
-            .lock()
-            .map_err(|_| internal("Iceberg distributed rewrite plan cache lock poisoned"))?
-            .get(&operation_id)
-            .cloned()
-            .ok_or_else(|| not_found("Iceberg rewrite operation has no frozen plan"))
     }
 
     fn build_plan(
         &self,
         request: &ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<PlannedRewrite, ConnectorError> {
+    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
         validate_context(&request.context)?;
         let target = self.provider.table_payload(request.operation().table())?;
         if target.metadata_table_type.is_some() {
@@ -184,11 +156,7 @@ impl IcebergDistributedRewriteControl {
                 min_input_files,
                 ..
             } => {
-                let groups = plan_position_delete_groups(
-                    files,
-                    *rewrite_all,
-                    min_input_files.unwrap_or(2) as usize,
-                )?;
+                let groups = plan_position_delete_groups(files, *rewrite_all, *min_input_files)?;
                 if !groups.is_empty()
                     && metadata.format_version() != crate::iceberg::spec::FormatVersion::V3
                 {
@@ -280,40 +248,14 @@ impl IcebergDistributedRewriteControl {
             artifact_location: artifact_location.clone(),
             target_ref: "main".to_string(),
         })?;
-        let plan = ConnectorDistributedRewritePlan::try_new(
+        ConnectorDistributedRewritePlan::try_new(
             request,
             state_digest,
             manifest_digest,
             summary,
             payload,
             cohorts,
-        )?;
-        Ok(PlannedRewrite {
-            plan,
-            artifact,
-            artifact_location,
-        })
-    }
-
-    fn attempt_file_io(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-    ) -> Result<crate::iceberg::io::FileIO, ConnectorError> {
-        if self
-            .runtime
-            .resources()
-            .planning_binding()
-            .requires_request_storage_resolver()
-        {
-            return Err(unavailable(
-                "Iceberg rewrite checkpoint and restore require a request-scoped storage resolver",
-            ));
-        }
-        let target = self.provider.table_payload(plan.target())?;
-        self.runtime
-            .load_table(&target.namespace, &target.table)
-            .map(|table| table.table.file_io().clone())
-            .map_err(unavailable)
+        )
     }
 }
 
@@ -343,8 +285,8 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             .get(&request.operation_id())
             .cloned()
         {
-            return if existing.plan.request_digest() == request.request_digest() {
-                Ok(existing.plan)
+            return if existing.request_digest() == request.request_digest() {
+                Ok(existing)
             } else {
                 Err(invalid(
                     "Iceberg distributed rewrite operation conflicts with cached plan",
@@ -357,174 +299,22 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             .lock()
             .map_err(|_| internal("Iceberg distributed rewrite plan cache lock poisoned"))?;
         match plans.get(&request.operation_id()) {
-            Some(existing) if existing.plan.request_digest() == request.request_digest() => {
-                Ok(existing.plan.clone())
+            Some(existing) if existing.request_digest() == request.request_digest() => {
+                Ok(existing.clone())
             }
             Some(_) => Err(invalid(
                 "Iceberg distributed rewrite operation conflicts with cached plan",
             )),
             None => {
-                let plan = planned.plan.clone();
-                plans.insert(request.operation_id(), planned);
-                Ok(plan)
+                plans.insert(request.operation_id(), planned.clone());
+                Ok(planned)
             }
         }
     }
 
-    fn activate_rewrite(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        validate_context(&context)?;
-        plan.validate()?;
-        if plan.owner() != &self.key {
-            return Err(invalid(
-                "Iceberg rewrite activation has a foreign generation",
-            ));
-        }
-        let planned = self.planned(plan.operation_id())?;
-        if planned.plan.plan_digest() != plan.plan_digest()
-            || planned.plan.manifest_digest() != plan.manifest_digest()
-        {
-            return Err(invalid(
-                "Iceberg rewrite activation does not match its frozen plan",
-            ));
-        }
-        self.runtime
-            .control_state()
-            .invalidate_table_cache(&planned.artifact.namespace, &planned.artifact.table);
-        let table = self
-            .runtime
-            .load_table_for_request(
-                &planned.artifact.namespace,
-                &planned.artifact.table,
-                &context,
-            )
-            .map_err(unavailable)?
-            .into_table();
-        validate_frozen_rewrite_table(&planned.artifact, table.metadata())?;
-        let kind = match plan.operation_kind() {
-            REWRITE_DATA_FILES_KIND => IcebergDistributedRewriteKind::Data,
-            REWRITE_POSITION_DELETES_KIND => IcebergDistributedRewriteKind::PositionDeletes,
-            _ => return Err(invalid("unsupported Iceberg rewrite operation kind")),
-        };
-        let mut cohorts = Vec::with_capacity(plan.cohorts().len());
-        for cohort in plan.cohorts() {
-            let group = planned
-                .artifact
-                .groups
-                .iter()
-                .find(|group| {
-                    decode_digest(&group.group_digest_hex).ok() == Some(cohort.group_digest())
-                })
-                .ok_or_else(|| invalid("Iceberg rewrite cohort names an unknown frozen group"))?;
-            let expected = ConnectorWriteCohortId::derive(
-                plan.operation_id(),
-                b"iceberg-distributed-rewrite-group",
-                cohort.group_digest(),
-            )?;
-            if expected != cohort.cohort_id() {
-                return Err(invalid(
-                    "Iceberg rewrite cohort ID does not match frozen group",
-                ));
-            }
-            let data_paths = group
-                .data_files
-                .iter()
-                .map(|file| file.path.clone())
-                .collect::<BTreeSet<_>>();
-            let delete_paths = match kind {
-                IcebergDistributedRewriteKind::Data => {
-                    group.owned_data_delete_files.iter().cloned().collect()
-                }
-                IcebergDistributedRewriteKind::PositionDeletes => group
-                    .selected_position_delete_files
-                    .iter()
-                    .cloned()
-                    .collect(),
-            };
-            cohorts.push(IcebergDistributedRewriteCohortActivation {
-                cohort_id: cohort.cohort_id(),
-                preparation: cohort.preparation().clone(),
-                control_payload: group_payload(
-                    group,
-                    plan.manifest_digest(),
-                    &planned.artifact_location,
-                )?,
-                data_paths,
-                delete_paths,
-            });
-        }
-        self.write.activate_distributed_rewrite(
-            plan.operation_id(),
-            IcebergDistributedRewriteActivation { kind, cohorts },
-            context,
-        )
-    }
-
-    fn checkpoint_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        disposition: ConnectorDistributedRewriteAttemptDisposition,
-        completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
-        validate_rewrite_attempt(plan, completion)?;
-        let location = attempt_artifact_location(plan, completion, disposition)?;
-        let bytes = encode_attempt_artifact(completion)?;
-        let artifact_digest: [u8; 32] = Sha256::digest(&bytes).into();
-        write_artifact_file(
-            &self.runtime,
-            &self.attempt_file_io(plan)?,
-            &location,
-            bytes,
-        )?;
-        ConnectorDistributedRewriteAttemptCheckpoint::try_new(
-            completion.cohort_id(),
-            completion.execution_id(),
-            disposition,
-            completion.digest(),
-            artifact_digest,
-            checkpoint_handle(plan, disposition, completion, &location, artifact_digest)?,
-        )
-    }
-
-    fn restore_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-        checkpoint.validate()?;
-        let handle: IcebergRewriteAttemptHandleV1 = decode_canonical_json(
-            &checkpoint.artifact_handle,
-            "Iceberg rewrite attempt handle",
-        )?;
-        validate_checkpoint_handle(plan, checkpoint, &handle)?;
-        let bytes = read_artifact_file(
-            &self.runtime,
-            &self.attempt_file_io(plan)?,
-            &handle.location,
-            REWRITE_ARTIFACT_MAX_BYTES,
-        )?;
-        let actual: [u8; 32] = Sha256::digest(&bytes).into();
-        if actual != checkpoint.artifact_digest || actual != handle.artifact_digest()? {
-            return Err(invalid(
-                "Iceberg rewrite attempt artifact digest is invalid",
-            ));
-        }
-        let completion = decode_attempt_artifact(&bytes)?;
-        validate_rewrite_attempt(plan, &completion)?;
-        if completion.execution_id() != checkpoint.execution_id
-            || completion.cohort_id() != checkpoint.cohort_id
-            || completion.digest() != checkpoint.attempt_digest
-        {
-            return Err(invalid(
-                "Iceberg rewrite restored attempt conflicts with its checkpoint",
-            ));
-        }
-        Ok(completion)
-    }
-
+    /// The write session seals a rewrite's branches from the same frozen
+    /// groups this plan names, so a rewrite no longer activates a separate
+    /// writer set. The trait still declares this entry; it has no caller.
     fn finalize_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
@@ -584,7 +374,7 @@ pub(crate) struct IcebergFrozenRewriteArtifactV1 {
     pub groups: Vec<IcebergFrozenRewriteGroupV1>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct IcebergFrozenRewriteGroupV1 {
     pub group_digest_hex: String,
@@ -836,7 +626,7 @@ pub(crate) fn plan_data_file_groups(
 pub(crate) fn plan_position_delete_groups(
     files: Vec<DataFileWithStats>,
     rewrite_all: bool,
-    min_input_files: usize,
+    min_input_files: Option<u32>,
 ) -> Result<Vec<IcebergFrozenRewriteGroupV1>, ConnectorError> {
     group_data_files(
         files
@@ -844,9 +634,22 @@ pub(crate) fn plan_position_delete_groups(
             .map(data_file_with_stats_to_iceberg_data_file_info)
             .collect(),
         rewrite_all,
-        Some(min_input_files),
+        Some(position_delete_min_input_files(min_input_files)),
     )
 }
+
+/// How many attached Puffin deletion vectors make a data file worth repacking.
+///
+/// The default lives here and nowhere else: planning and the write session both
+/// cut the same groups, and a default resolved twice could drift and leave the
+/// two disagreeing about how many branches the rewrite has.
+fn position_delete_min_input_files(min_input_files: Option<u32>) -> usize {
+    min_input_files.unwrap_or(DEFAULT_POSITION_DELETE_MIN_INPUT_FILES) as usize
+}
+
+/// A data file with a single deletion vector is already packed; two is the
+/// smallest input a repack can actually shrink.
+const DEFAULT_POSITION_DELETE_MIN_INPUT_FILES: u32 = 2;
 
 fn group_data_files(
     mut files: Vec<IcebergDataFileInfo>,
@@ -1248,19 +1051,6 @@ pub(crate) fn frozen_rewrite_scan_schema(
     }
 }
 
-fn group_payload(
-    group: &IcebergFrozenRewriteGroupV1,
-    artifact_digest: [u8; 32],
-    artifact_location: &str,
-) -> Result<Bytes, ConnectorError> {
-    canonical_json(&IcebergRewriteGroupPayloadV1 {
-        version: GROUP_PAYLOAD_VERSION,
-        group_digest_hex: group.group_digest_hex.clone(),
-        artifact_digest_hex: hex::encode(artifact_digest),
-        artifact_location: artifact_location.to_string(),
-    })
-}
-
 /// Resolve one frozen rewrite group back to the delete artifacts it names, as
 /// the splits that re-encode them.
 ///
@@ -1351,7 +1141,7 @@ fn live_delete_file_paths(
 }
 
 /// The delete files alive at one exact snapshot of a relation.
-fn live_delete_file_paths_at(
+pub(crate) fn live_delete_file_paths_at(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
@@ -1402,396 +1192,6 @@ fn live_delete_file_paths_of(
         })
         .map_err(unavailable)?
         .map_err(unavailable)
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct IcebergRewriteAttemptHandleV1 {
-    version: u16,
-    operation_id_hex: String,
-    plan_digest_hex: String,
-    cohort_id_hex: String,
-    query_id_hex: String,
-    attempt_id: u64,
-    disposition: String,
-    attempt_digest_hex: String,
-    artifact_digest_hex: String,
-    location: String,
-}
-
-impl IcebergRewriteAttemptHandleV1 {
-    fn disposition(&self) -> Result<ConnectorDistributedRewriteAttemptDisposition, ConnectorError> {
-        match self.disposition.as_str() {
-            "accepted" => Ok(ConnectorDistributedRewriteAttemptDisposition::Accepted),
-            "superseded" => Ok(ConnectorDistributedRewriteAttemptDisposition::Superseded),
-            _ => Err(invalid("Iceberg rewrite checkpoint disposition is invalid")),
-        }
-    }
-
-    fn artifact_digest(&self) -> Result<[u8; 32], ConnectorError> {
-        decode_digest(&self.artifact_digest_hex)
-    }
-}
-
-fn checkpoint_handle(
-    plan: &ConnectorDistributedRewritePlan,
-    disposition: ConnectorDistributedRewriteAttemptDisposition,
-    completion: &ConnectorWriteAttemptCompletion,
-    location: &str,
-    artifact_digest: [u8; 32],
-) -> Result<Bytes, ConnectorError> {
-    canonical_json(&IcebergRewriteAttemptHandleV1 {
-        version: 1,
-        operation_id_hex: hex::encode(plan.operation_id().to_bytes()),
-        plan_digest_hex: hex::encode(plan.plan_digest()),
-        cohort_id_hex: hex::encode(completion.cohort_id().to_bytes()),
-        query_id_hex: hex::encode(completion.execution_id().query_id()),
-        attempt_id: completion.execution_id().attempt_id(),
-        disposition: match disposition {
-            ConnectorDistributedRewriteAttemptDisposition::Accepted => "accepted".to_string(),
-            ConnectorDistributedRewriteAttemptDisposition::Superseded => "superseded".to_string(),
-        },
-        attempt_digest_hex: hex::encode(completion.digest()),
-        artifact_digest_hex: hex::encode(artifact_digest),
-        location: location.to_string(),
-    })
-}
-
-fn validate_checkpoint_handle(
-    plan: &ConnectorDistributedRewritePlan,
-    checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    handle: &IcebergRewriteAttemptHandleV1,
-) -> Result<(), ConnectorError> {
-    if handle.version != 1
-        || handle.location.is_empty()
-        || handle.location.len() > 16 * 1024
-        || handle.operation_id_hex != hex::encode(plan.operation_id().to_bytes())
-        || decode_digest(&handle.plan_digest_hex)? != plan.plan_digest()
-        || decode_digest(&handle.cohort_id_hex)? != checkpoint.cohort_id.to_bytes()
-        || handle.query_id_hex != hex::encode(checkpoint.execution_id.query_id())
-        || handle.attempt_id != checkpoint.execution_id.attempt_id()
-        || handle.disposition()? != checkpoint.disposition
-        || decode_digest(&handle.attempt_digest_hex)? != checkpoint.attempt_digest
-        || handle.artifact_digest()? != checkpoint.artifact_digest
-    {
-        return Err(invalid(
-            "Iceberg rewrite checkpoint handle does not match checkpoint facts",
-        ));
-    }
-    Ok(())
-}
-
-fn attempt_artifact_location(
-    plan: &ConnectorDistributedRewritePlan,
-    completion: &ConnectorWriteAttemptCompletion,
-    disposition: ConnectorDistributedRewriteAttemptDisposition,
-) -> Result<String, ConnectorError> {
-    if !plan
-        .cohorts()
-        .iter()
-        .any(|cohort| cohort.cohort_id() == completion.cohort_id())
-    {
-        return Err(invalid("Iceberg rewrite attempt names an unknown cohort"));
-    }
-    let payload: IcebergRewritePlanPayloadV1 = decode_canonical_json(
-        plan.provider_payload(),
-        "Iceberg distributed rewrite plan payload",
-    )?;
-    if payload.version != 1 {
-        return Err(invalid(
-            "Iceberg rewrite plan payload version is unsupported",
-        ));
-    }
-    Ok(format!(
-        "{}/attempts/{}-{}-{:020}-{}.bin",
-        payload.artifact_location,
-        hex::encode(completion.cohort_id().to_bytes()),
-        hex::encode(completion.execution_id().query_id()),
-        completion.execution_id().attempt_id(),
-        match disposition {
-            ConnectorDistributedRewriteAttemptDisposition::Accepted => "accepted",
-            ConnectorDistributedRewriteAttemptDisposition::Superseded => "superseded",
-        }
-    ))
-}
-
-fn validate_rewrite_attempt(
-    plan: &ConnectorDistributedRewritePlan,
-    completion: &ConnectorWriteAttemptCompletion,
-) -> Result<(), ConnectorError> {
-    if completion.owner() != plan.owner()
-        || completion.operation_id() != plan.operation_id()
-        || !plan
-            .cohorts()
-            .iter()
-            .any(|cohort| cohort.cohort_id() == completion.cohort_id())
-    {
-        return Err(invalid(
-            "Iceberg distributed rewrite completion is foreign to its plan",
-        ));
-    }
-    Ok(())
-}
-
-fn encode_attempt_artifact(
-    completion: &ConnectorWriteAttemptCompletion,
-) -> Result<Bytes, ConnectorError> {
-    let mut out = Vec::new();
-    out.extend_from_slice(ATTEMPT_ARTIFACT_MAGIC);
-    put_u16(&mut out, ATTEMPT_ARTIFACT_VERSION);
-    put_binding_key(&mut out, completion.owner())?;
-    out.extend_from_slice(&completion.operation_id().to_bytes());
-    out.extend_from_slice(&completion.cohort_id().to_bytes());
-    put_execution_id(&mut out, completion.execution_id());
-    out.extend_from_slice(&completion.manifest_digest());
-    put_blob(&mut out, completion.control_payload())?;
-    let report_count = u32::try_from(completion.reports().len())
-        .map_err(|_| exhausted("Iceberg rewrite attempt has too many reports"))?;
-    put_u32(&mut out, report_count);
-    for report in completion.reports() {
-        put_writer(&mut out, report.writer())?;
-        put_u32(&mut out, report.version());
-        out.push(match report.state() {
-            ConnectorWriterTerminalState::Staged => 1,
-            ConnectorWriterTerminalState::Aborted => 2,
-            ConnectorWriterTerminalState::Failed => 3,
-        });
-        let summary = report.summary();
-        put_u64(&mut out, summary.input_rows);
-        put_u64(&mut out, summary.staged_bytes);
-        put_u64(&mut out, summary.artifact_count);
-        put_blob(&mut out, report.payload())?;
-    }
-    if out.len() > REWRITE_ARTIFACT_MAX_BYTES {
-        return Err(exhausted("Iceberg rewrite attempt artifact exceeds 64 MiB"));
-    }
-    Ok(Bytes::from(out))
-}
-
-fn decode_attempt_artifact(
-    payload: &[u8],
-) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-    if payload.len() > REWRITE_ARTIFACT_MAX_BYTES {
-        return Err(exhausted("Iceberg rewrite attempt artifact exceeds 64 MiB"));
-    }
-    let mut cursor = AttemptCursor::new(payload);
-    if cursor.take_exact(ATTEMPT_ARTIFACT_MAGIC.len())? != ATTEMPT_ARTIFACT_MAGIC
-        || cursor.take_u16()? != ATTEMPT_ARTIFACT_VERSION
-    {
-        return Err(invalid(
-            "Iceberg rewrite attempt artifact version is invalid",
-        ));
-    }
-    let owner = cursor.take_binding_key()?;
-    let operation_id =
-        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(cursor.take_array()?);
-    let cohort_id = ConnectorWriteCohortId::from_bytes(cursor.take_array()?);
-    let execution_id = cursor.take_execution_id()?;
-    let manifest_digest = cursor.take_array()?;
-    let control_payload = cursor.take_blob()?;
-    let report_count = cursor.take_u32()? as usize;
-    if report_count == 0
-        || report_count > novarocks_spi::connector::MAX_CONNECTOR_WRITE_OPERATION_WRITERS
-    {
-        return Err(invalid("Iceberg rewrite attempt report count is invalid"));
-    }
-    let mut reports = Vec::with_capacity(report_count);
-    for _ in 0..report_count {
-        let writer = cursor.take_writer()?;
-        let version = cursor.take_u32()?;
-        let state = match cursor.take_u8()? {
-            1 => ConnectorWriterTerminalState::Staged,
-            2 => ConnectorWriterTerminalState::Aborted,
-            3 => ConnectorWriterTerminalState::Failed,
-            _ => return Err(invalid("Iceberg rewrite attempt report state is invalid")),
-        };
-        let summary = ConnectorStagedReportSummary {
-            input_rows: cursor.take_u64()?,
-            staged_bytes: cursor.take_u64()?,
-            artifact_count: cursor.take_u64()?,
-        };
-        reports.push(ConnectorStagedReport::try_new(
-            writer,
-            version,
-            state,
-            summary,
-            cursor.take_blob()?,
-        )?);
-    }
-    if !cursor.is_finished() {
-        return Err(invalid(
-            "Iceberg rewrite attempt artifact has trailing bytes",
-        ));
-    }
-    ConnectorWriteAttemptCompletion::try_new(
-        owner,
-        operation_id,
-        cohort_id,
-        execution_id,
-        manifest_digest,
-        reports,
-        control_payload,
-    )
-}
-
-fn put_u16(out: &mut Vec<u8>, value: u16) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_u64(out: &mut Vec<u8>, value: u64) {
-    out.extend_from_slice(&value.to_be_bytes());
-}
-
-fn put_blob(out: &mut Vec<u8>, value: &[u8]) -> Result<(), ConnectorError> {
-    let length = u32::try_from(value.len())
-        .map_err(|_| exhausted("Iceberg rewrite attempt blob exceeds u32"))?;
-    put_u32(out, length);
-    out.extend_from_slice(value);
-    Ok(())
-}
-
-fn put_binding_key(
-    out: &mut Vec<u8>,
-    key: &ConnectorProviderBindingKey,
-) -> Result<(), ConnectorError> {
-    let instance = key.instance_id.as_str().as_bytes();
-    let length = u16::try_from(instance.len())
-        .map_err(|_| invalid("Iceberg rewrite binding instance ID is too large"))?;
-    put_u16(out, length);
-    out.extend_from_slice(instance);
-    out.extend_from_slice(&key.incarnation.to_bytes());
-    Ok(())
-}
-
-fn put_execution_id(
-    out: &mut Vec<u8>,
-    execution_id: novarocks_spi::connector::ConnectorWriteExecutionId,
-) {
-    out.extend_from_slice(&execution_id.query_id());
-    put_u64(out, execution_id.attempt_id());
-}
-
-fn put_writer(out: &mut Vec<u8>, writer: &ConnectorWriterIdentity) -> Result<(), ConnectorError> {
-    out.extend_from_slice(&writer.operation_id().to_bytes());
-    out.extend_from_slice(&writer.cohort_id().to_bytes());
-    put_execution_id(out, writer.execution_id());
-    out.extend_from_slice(&writer.fragment_instance_id());
-    out.extend_from_slice(&writer.fragment_id().to_be_bytes());
-    out.extend_from_slice(&writer.backend_num().to_be_bytes());
-    put_u32(out, writer.sink_ordinal());
-    put_catalog_handle(out, writer.catalog_handle())
-}
-
-fn put_catalog_handle(out: &mut Vec<u8>, handle: &CatalogHandle) -> Result<(), ConnectorError> {
-    let name = handle.catalog_name().as_str().as_bytes();
-    let length = u16::try_from(name.len())
-        .map_err(|_| exhausted("Iceberg rewrite catalog name exceeds u16 width"))?;
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(name);
-    out.extend_from_slice(handle.version().as_bytes());
-    Ok(())
-}
-
-struct AttemptCursor<'a> {
-    payload: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> AttemptCursor<'a> {
-    fn new(payload: &'a [u8]) -> Self {
-        Self { payload, offset: 0 }
-    }
-
-    fn is_finished(&self) -> bool {
-        self.offset == self.payload.len()
-    }
-
-    fn take_exact(&mut self, length: usize) -> Result<&'a [u8], ConnectorError> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .filter(|end| *end <= self.payload.len())
-            .ok_or_else(|| invalid("Iceberg rewrite attempt artifact is truncated"))?;
-        let value = &self.payload[self.offset..end];
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn take_array<const N: usize>(&mut self) -> Result<[u8; N], ConnectorError> {
-        self.take_exact(N)?
-            .try_into()
-            .map_err(|_| invalid("Iceberg rewrite attempt array is invalid"))
-    }
-
-    fn take_u8(&mut self) -> Result<u8, ConnectorError> {
-        Ok(self.take_exact(1)?[0])
-    }
-
-    fn take_u16(&mut self) -> Result<u16, ConnectorError> {
-        Ok(u16::from_be_bytes(self.take_array()?))
-    }
-
-    fn take_u32(&mut self) -> Result<u32, ConnectorError> {
-        Ok(u32::from_be_bytes(self.take_array()?))
-    }
-
-    fn take_u64(&mut self) -> Result<u64, ConnectorError> {
-        Ok(u64::from_be_bytes(self.take_array()?))
-    }
-
-    fn take_blob(&mut self) -> Result<Bytes, ConnectorError> {
-        let length = self.take_u32()? as usize;
-        if length > REWRITE_ARTIFACT_MAX_BYTES {
-            return Err(exhausted("Iceberg rewrite attempt blob exceeds 64 MiB"));
-        }
-        Ok(Bytes::copy_from_slice(self.take_exact(length)?))
-    }
-
-    fn take_binding_key(&mut self) -> Result<ConnectorProviderBindingKey, ConnectorError> {
-        let length = self.take_u16()? as usize;
-        let instance = std::str::from_utf8(self.take_exact(length)?)
-            .map_err(|_| invalid("Iceberg rewrite instance ID is not UTF-8"))?;
-        Ok(ConnectorProviderBindingKey {
-            instance_id: ConnectorInstanceId::parse(instance)?,
-            incarnation: ProviderBindingEpoch::from_bytes(self.take_array()?),
-        })
-    }
-
-    fn take_catalog_handle(&mut self) -> Result<CatalogHandle, ConnectorError> {
-        let length = self.take_u16()? as usize;
-        let instance = std::str::from_utf8(self.take_exact(length)?)
-            .map_err(|_| invalid("Iceberg rewrite catalog name is not UTF-8"))?;
-        Ok(CatalogHandle::new(
-            ConnectorInstanceId::parse(instance)?,
-            CatalogVersion::from_bytes(self.take_array()?),
-        ))
-    }
-
-    fn take_execution_id(
-        &mut self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteExecutionId, ConnectorError> {
-        Ok(novarocks_spi::connector::ConnectorWriteExecutionId::new(
-            self.take_array()?,
-            self.take_u64()?,
-        ))
-    }
-
-    fn take_writer(&mut self) -> Result<ConnectorWriterIdentity, ConnectorError> {
-        Ok(ConnectorWriterIdentity::new(
-            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes(self.take_array()?),
-            ConnectorWriteCohortId::from_bytes(self.take_array()?),
-            self.take_execution_id()?,
-            self.take_array()?,
-            i32::from_be_bytes(self.take_array()?),
-            i32::from_be_bytes(self.take_array()?),
-            self.take_u32()?,
-            self.take_catalog_handle()?,
-        ))
-    }
 }
 
 fn validate_frozen_rewrite_table(
@@ -2025,10 +1425,6 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
 }
 
-fn not_found(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::NotFound, message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2254,62 +1650,6 @@ mod tests {
         );
         assert_eq!(artifact_digest(b"same"), artifact_digest(b"same"));
         assert_ne!(artifact_digest(b"same"), artifact_digest(b"different"));
-    }
-
-    #[test]
-    fn attempt_artifact_round_trips_exact_writer_reports() {
-        let owner = ConnectorProviderBindingKey {
-            instance_id: ConnectorInstanceId::parse("iceberg.rewrite").unwrap(),
-            incarnation: ProviderBindingEpoch::from_bytes([9; 16]),
-        };
-        let operation = novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([7; 16]);
-        let cohort = ConnectorWriteCohortId::from_bytes([8; 32]);
-        let execution = novarocks_spi::connector::ConnectorWriteExecutionId::new([6; 16], 3);
-        let report = ConnectorStagedReport::try_new(
-            ConnectorWriterIdentity::new(
-                operation,
-                cohort,
-                execution,
-                [5; 16],
-                4,
-                2,
-                1,
-                CatalogHandle::new(
-                    owner.instance_id.clone(),
-                    CatalogVersion::from_bytes([1; 32]),
-                ),
-            ),
-            novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
-            ConnectorWriterTerminalState::Staged,
-            ConnectorStagedReportSummary {
-                input_rows: 11,
-                staged_bytes: 17,
-                artifact_count: 1,
-            },
-            Bytes::from_static(b"opaque-report"),
-        )
-        .unwrap();
-        let completion = ConnectorWriteAttemptCompletion::try_new(
-            owner,
-            operation,
-            cohort,
-            execution,
-            [4; 32],
-            vec![report],
-            Bytes::from_static(b"opaque-control"),
-        )
-        .unwrap();
-        let decoded = decode_attempt_artifact(&encode_attempt_artifact(&completion).unwrap())
-            .expect("round trip");
-        assert_eq!(decoded, completion);
-    }
-
-    #[test]
-    fn attempt_artifact_rejects_trailing_or_truncated_bytes() {
-        let mut artifact = ATTEMPT_ARTIFACT_MAGIC.to_vec();
-        artifact.extend_from_slice(&ATTEMPT_ARTIFACT_VERSION.to_be_bytes());
-        artifact.push(0);
-        assert!(decode_attempt_artifact(&artifact).is_err());
     }
 }
 

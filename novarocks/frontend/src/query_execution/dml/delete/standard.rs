@@ -41,7 +41,7 @@ use crate::query_execution::dml::delete::{
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
+    admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use chrono::NaiveDateTime;
@@ -133,12 +133,12 @@ pub(crate) fn prepare_delete_statement(
     validate_where(where_clause, &target_binding.dml_target_columns())?;
     let where_sql = novarocks_parser::printer::print_expr(where_clause);
 
-    // 4. Ask the provider to plan the row mutation. The physical strategy, the
+    // 4. Ask the provider to admit the row mutation. The physical strategy, the
     //    branch/format admission gates and the base version the frontend
     //    journals all come back signed; nothing here re-derives them. The
     //    provider reservation stays where DELETE has always made it, before the
     //    frontend persists its operation intent -- unlike UPDATE and MERGE,
-    //    which defer activation until after. Aligning the two is a lifecycle
+    //    which defer admission until after. Aligning the two is a lifecycle
     //    change and not part of this cutover.
     let connector_operation_id = publication_id.into();
     let (write_lease, row_mutation) = target_binding.prepare_row_mutation(
@@ -149,25 +149,11 @@ pub(crate) fn prepare_delete_statement(
     )?;
     let strategy = row_mutation.strategy();
     let base_snapshot_id = row_mutation.base_version_ordinal();
-    let routes = write_lease
-        .activate_row_mutation(
-            novarocks_spi::connector::ConnectorRowMutationActivationRequest::Direct {
-                preparation: row_mutation,
-                context: connector_context.clone(),
-            },
-        )
-        .map_err(|error| format!("activate Provider DELETE plan: {error}"))?;
-    let route = routes
-        .routes()
-        .first()
-        .ok_or_else(|| "Provider returned an empty DELETE route set".to_string())?;
-    let preparation = route.preparation().clone();
 
     prepare_delete_write(
         state,
         &target,
         strategy,
-        preparation,
         base_snapshot_id,
         connector_operation_id,
         &write_lease,
@@ -188,7 +174,8 @@ struct DistributedDeleteWriteExecutor {
     table_bindings: Arc<QueryTableBindingStore>,
     execution: QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    /// The one commit authority for this statement.
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     /// Deletion vectors are written one per target data file, so the sink output
     /// is shuffled by its first column. Position deletes have no such
     /// requirement. Both follow from the provider-signed strategy.
@@ -214,7 +201,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
                 novarocks_sql::compiler::RootDistributionRequirement::Any
             };
             *assembly = Some(
-                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_connector_context(
+                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
                     &self.state,
                     Some(&self.target.catalog),
                     &self.target.namespace,
@@ -225,7 +212,7 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
                     distribution,
                     Some(&self.execution),
                     &self.connector_context,
-                    Some(self.connector_write.clone()),
+                    Arc::clone(&self.write_session),
                 )?,
             );
         }
@@ -246,19 +233,8 @@ impl PreparedDeleteExecution for DistributedDeleteWriteExecutor {
             .finish(native_bundle)
     }
 
-    fn commit_terminal(
-        &self,
-        completion: &crate::query_execution::ConnectorWriteCompletion,
-    ) -> Result<
-        novarocks_spi::connector::ExternalMutationOutcome<
-            novarocks_spi::connector::ConnectorWriteReceipt,
-        >,
-        String,
-    > {
-        completion
-            .session()
-            .commit(completion.terminal_request_context())
-            .map_err(|error| error.to_string())
+    fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {
+        self.connector_context.clone()
     }
 
     fn finalize(&self) -> Result<(), String> {
@@ -281,7 +257,6 @@ fn prepare_delete_write(
     state: &DmlExecutionKernel,
     target: &TargetBackend,
     strategy: ConnectorRowMutationStrategy,
-    preparation: novarocks_spi::connector::ConnectorWritePreparation,
     base_snapshot_id: Option<i64>,
     connector_operation_id: ConnectorWriteOperationId,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
@@ -307,15 +282,55 @@ fn prepare_delete_write(
         DmlWriteSinkMode::PositionDeletes
     };
 
+    // One row-mutation delete branch. The provider-signed strategy chooses
+    // between a deletion vector and position deletes; the session admits that
+    // shape and signs back the branch this statement writes.
+    let write_session = crate::query_execution::write_session::begin_connector_write_session(
+        crate::connector::write_target::derive_write_stack_lease(
+            state.typed_connector_control(),
+            &planning_lease,
+        )?,
+        write_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+            target,
+            target_ref,
+            novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            delete_input_request(deletion_vectors),
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::RowMutation,
+            connector_context.clone(),
+        )?,
+    )?;
+    // A DELETE writes exactly one branch, so the session must have sealed
+    // exactly one target and that target must carry the provider's row-mutation
+    // routing facts. Both are proved here rather than assumed: a session that
+    // sealed something else would otherwise plan a writer for a branch this
+    // statement never admitted.
+    let write_target = match write_session.targets() {
+        [write_target] => write_target,
+        targets => {
+            return Err(format!(
+                "DELETE requires exactly one sealed write target, session sealed {}",
+                targets.len()
+            ));
+        }
+    };
+    if write_target.route().is_none() {
+        return Err(format!(
+            "DELETE write target {} carries no provider routing facts",
+            write_target.ordinal().get()
+        ));
+    }
+
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = admit_prepared_frozen_connector_write_target(
+    let target_binding = admit_session_connector_write_target(
         table_bindings.as_ref(),
         FrozenConnectorScanIdentity::new(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
         ),
-        preparation.clone(),
+        write_target,
         planning_lease.clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(
@@ -327,17 +342,9 @@ fn prepare_delete_write(
     let delete_query = build_delete_position_sink_query(
         target,
         where_sql,
-        &write_input_columns(&preparation),
+        &write_input_columns(write_target.input()),
         target_ref,
     )?;
-    let connector_write =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::activate_prepared(
-            connector_operation_id,
-            preparation,
-            connector_context.clone(),
-            write_lease.clone(),
-        )
-        .map_err(|error| format!("activate Provider DELETE write: {error}"))?;
     let executor = DistributedDeleteWriteExecutor {
         state: state.clone(),
         target: target.clone(),
@@ -346,7 +353,7 @@ fn prepare_delete_write(
         table_bindings,
         execution,
         connector_context: connector_context.clone(),
-        connector_write,
+        write_session,
         // Deletion vectors are written one per target data file, so the sink
         // output is shuffled by its first column; position deletes have no such
         // requirement.
@@ -390,11 +397,45 @@ fn build_delete_position_sink_query(
     parse_generated_query(&sql, "DELETE position-delete rewrite")
 }
 
+/// The delete-shaped input this statement asks the session to admit.
+///
+/// The identity columns are the engine's own row-position projection; the
+/// Iceberg Provider derives the frozen partition-source fields from the exact
+/// admitted metadata, so SQL never reconstructs them.
+fn delete_input_request(
+    deletion_vectors: bool,
+) -> novarocks_spi::connector::ConnectorWriteInputRequest {
+    use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
+
+    let identity_fields = vec![
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
+            DataType::Utf8,
+            false,
+        )),
+        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(
+            novarocks_execution::exec::row_position::ICEBERG_ROW_POS_COL,
+            DataType::Int64,
+            false,
+        )),
+    ];
+    if deletion_vectors {
+        ConnectorWriteInputRequest::DeletionVector {
+            identity_fields,
+            partition_source_fields: Vec::new(),
+        }
+    } else {
+        ConnectorWriteInputRequest::PositionDelete {
+            identity_fields,
+            partition_source_fields: Vec::new(),
+        }
+    }
+}
+
 fn write_input_columns(
-    preparation: &novarocks_spi::connector::ConnectorWritePreparation,
+    input: &novarocks_spi::connector::ConnectorWriteInputShape,
 ) -> Vec<ColumnDef> {
-    preparation
-        .input()
+    input
         .fields()
         .into_iter()
         .map(|binding| ColumnDef {

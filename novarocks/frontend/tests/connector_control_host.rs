@@ -30,8 +30,7 @@ use novarocks_spi::connector::{
     ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
     ConnectorDataMutationPlan, ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
-    ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewritePlan,
+    ConnectorDistributedRewrite, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
     ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
@@ -39,13 +38,10 @@ use novarocks_spi::connector::{
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
     ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
     ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteActivation, ConnectorWriteAttemptCompletion, ConnectorWriteCommitRequest,
-    ConnectorWriteControl, ConnectorWritePlan, ConnectorWritePlanningRequest,
-    ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ExternalMutationOutcome,
+    ConnectorTableRequest, ConnectorWriteControl, ConnectorWriteReceipt, ExternalMutationOutcome,
     ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
     StatisticsReadRequest, StatisticsReader, StatisticsRowCoverage,
 };
@@ -420,31 +416,6 @@ impl ConnectorDistributedRewrite for TestDistributedRewrite {
         Err(unsupported())
     }
 
-    fn activate_rewrite(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn checkpoint_attempt(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _disposition: ConnectorDistributedRewriteAttemptDisposition,
-        _completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn restore_attempt(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-        Err(unsupported())
-    }
-
     fn finalize_rewrite(
         &self,
         _plan: &ConnectorDistributedRewritePlan,
@@ -461,34 +432,6 @@ struct TestWrite {
 impl ConnectorWriteControl for TestWrite {
     fn binding_key(&self) -> &ConnectorProviderBindingKey {
         &self.key
-    }
-
-    fn plan_write(
-        &self,
-        _request: ConnectorWritePlanningRequest,
-    ) -> Result<ConnectorWritePlan, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn commit(
-        &self,
-        _request: ConnectorWriteCommitRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn abort(
-        &self,
-        _request: ConnectorWriteAbortRequest,
-    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-        Err(unsupported())
-    }
-
-    fn reconcile(
-        &self,
-        _request: ConnectorWriteReconcileRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        Err(unsupported())
     }
 }
 

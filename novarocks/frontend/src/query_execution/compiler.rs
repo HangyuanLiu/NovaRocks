@@ -21,7 +21,6 @@ use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 #[cfg(test)]
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
 use crate::runtime::query_result::QueryResult;
@@ -849,26 +848,6 @@ struct RejectingTestDistributedQueryCoordinator;
 impl crate::query_execution::contract::DistributedQueryCoordinator
     for RejectingTestDistributedQueryCoordinator
 {
-    fn begin_write_operation(
-        &self,
-        registration: crate::query_execution::contract::ConnectorWriteOperationRegistration,
-        lease: novarocks_spi::connector::ConnectorWriteLease,
-    ) -> Result<
-        crate::query_execution::write_operation::ConnectorWriteOperationSession,
-        crate::query_execution::contract::DistributedQueryError,
-    > {
-        crate::query_execution::write_operation::ConnectorWriteOperationSession::try_begin(
-            registration,
-            lease,
-        )
-        .map_err(|error| {
-            crate::query_execution::contract::DistributedQueryError::new(
-                crate::query_execution::contract::DistributedQueryErrorKind::Failed,
-                format!("seal test connector write operation cohorts: {error}"),
-            )
-        })
-    }
-
     fn execute(
         &self,
         request: crate::query_execution::contract::DistributedQueryRequest,
@@ -1524,45 +1503,14 @@ pub(crate) fn iceberg_write_shuffle_by_output_index(
     novarocks_sql::compiler::RootDistributionRequirement::ShuffleOutputOrdinal(output_index)
 }
 
+/// Compile one DML write query into the NCP-6 dataflow shape, bound to the
+/// session that already admitted it.
+///
+/// The session is both the reason the plan is a dataflow and the source of the
+/// recipes it carries, so it is taken here rather than attached later: a plan
+/// and the session that sealed it must not be separable.
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "Test-only compilation entrypoint is retained for direct Iceberg write planning coverage."
-)]
-pub(crate) fn prepare_query_as_iceberg_write(
-    state: &impl DmlQueryExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
-    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
-    // This public write helper is also used by non-session transaction executors,
-    // so it owns an operation-scoped context when no request signal is available.
-    let connector_context = crate::connector::connector_request_context(
-        query_opts.as_ref(),
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )?;
-    prepare_query_as_iceberg_write_with_connector_context(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        sink,
-        table_bindings,
-        query_opts,
-        root_distribution,
-        execution,
-        &connector_context,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
+pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
@@ -1573,7 +1521,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: Option<crate::query_execution::contract::ConnectorWritePlanningTemplate>,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
@@ -1586,61 +1534,40 @@ pub(crate) fn prepare_query_as_iceberg_write_with_connector_context(
         root_distribution,
         execution,
         connector_context,
-        connector_write.map(DistributedConnectorWrite::Begin),
+        write_session,
+        None,
         None,
         &[],
     )
 }
 
+/// Compile one query of a *multi-target* write session, at the sealed ordinal
+/// that query writes to.
+///
+/// A session spanning several queries -- a copy-on-write mutation compiles one
+/// per rewritten file -- cannot read its ordinal off the sealed set: the set
+/// holds every target, and `sole_target_ordinal` refuses exactly that by
+/// design. Each query names its own, so one file's replacement rows can never
+/// be attributed to another file's writer.
+///
+/// The query-local overlays are how a copy-on-write rewrite reads the file it
+/// replaces: the frozen single-file source is not a durable catalog table, and
+/// the overlay is consumed by the application materializer without ever being
+/// registered in the shared local catalog.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_connector_context(
+pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     state: &impl DmlQueryExecutionKernel,
     current_catalog: Option<&str>,
     current_database: &str,
     query: &Query,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
-    prepare_query_as_iceberg_write_with_connector_binding(
-        state,
-        current_catalog,
-        current_database,
-        query,
-        sink,
-        table_bindings,
-        query_opts,
-        root_distribution,
-        execution,
-        connector_context,
-        Some(DistributedConnectorWrite::Sealed(connector_write)),
-        None,
-        &[],
-    )
-}
-
-/// Execute one generated write query with request-local relation overlays.
-/// This is used by COW rewrite slices whose frozen file input is not a durable
-/// catalog table.  The overlay is consumed by the application materializer
-/// and is never registered in the shared local catalog.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overlays(
-    state: &impl DmlQueryExecutionKernel,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query: &Query,
-    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
-    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
-    query_opts: Option<QueryOptions>,
-    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
-    execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWriteExecutionRegistration,
-    scan_resolver: &dyn crate::query_execution::preparation::scan::ScanBindingResolver,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
@@ -1650,23 +1577,15 @@ pub(crate) fn prepare_query_as_iceberg_write_in_operation_with_query_local_overl
         query,
         sink,
         table_bindings,
-        query_opts,
+        None,
         root_distribution,
         execution,
         connector_context,
-        Some(DistributedConnectorWrite::Sealed(connector_write)),
-        Some(scan_resolver),
+        write_session,
+        scan_resolver,
+        Some(write_target_ordinal),
         overlays,
     )
-}
-
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The sealed variant owns the exact provider registration required to prevent write-session substitution."
-)]
-pub(crate) enum DistributedConnectorWrite {
-    Begin(crate::query_execution::contract::ConnectorWritePlanningTemplate),
-    Sealed(crate::query_execution::contract::ConnectorWriteExecutionRegistration),
 }
 
 /// Core-sealed one-shot DML request awaiting Frontend native wire assembly.
@@ -1679,7 +1598,7 @@ pub(crate) struct PreparedDmlWriteAssembly {
     query_options: Option<QueryOptions>,
     execution: crate::common::admitted_query_context::QueryExecutionContext,
     query_execution: crate::query_execution::service::QueryExecutionService,
-    connector_write: Option<DistributedConnectorWrite>,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedDmlWriteAssembly {
@@ -1688,14 +1607,14 @@ impl PreparedDmlWriteAssembly {
         query_options: Option<QueryOptions>,
         execution: crate::common::admitted_query_context::QueryExecutionContext,
         query_execution: crate::query_execution::service::QueryExecutionService,
-        connector_write: Option<DistributedConnectorWrite>,
+        write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Self {
         Self {
             encoding,
             query_options,
             execution,
             query_execution,
-            connector_write,
+            write_session,
         }
     }
 
@@ -1729,7 +1648,7 @@ impl PreparedDmlWriteAssembly {
             native_bundle,
             self.query_options,
             &self.execution,
-            self.connector_write,
+            self.write_session,
         )?;
         Ok((self.query_execution, request))
     }
@@ -1755,8 +1674,13 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
     execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: Option<DistributedConnectorWrite>,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
+    // `write_target_ordinal` is the sealed target this one query writes to. A
+    // caller that drives several queries against one session names it; a
+    // single-query write leaves it out and the session's sole sealed target is
+    // used.
+    write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
     query_local_overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let maintenance_execution;
@@ -1841,9 +1765,23 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
-    let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_distributed_plan(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+    let optimize_request = novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics);
+    // A write session both selects the dataflow shape and owns the recipes
+    // that shape needs, so the two are decided together rather than by two
+    // independent caller choices that could disagree.
+    let sealed_write_targets = write_session
+        .seal_write_targets()
+        .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
+    let ordinal = match write_target_ordinal {
+        Some(ordinal) => ordinal,
+        None => sealed_write_targets
+            .sole_target_ordinal()
+            .map_err(crate::dml::error::DmlExecutionError::from)?,
+    };
+    let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
+        optimize_request,
         sink,
+        ordinal,
         &optimizer_settings,
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
@@ -1858,12 +1796,14 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
             execution,
         )?,
     )?;
+    let encoding = NativeFragmentEncodingInput::new(distributed_plan, prepared)
+        .with_sealed_write_targets(sealed_write_targets);
     Ok(PreparedDmlWriteAssembly::new(
-        NativeFragmentEncodingInput::new(distributed_plan, prepared),
+        encoding,
         query_opts,
         execution.clone(),
         state.query_execution().clone(),
-        connector_write,
+        write_session,
     ))
 }
 
@@ -1977,9 +1917,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
     if observer.short_circuit_after_build {
         Some(crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
+            write_session: None,
             fragment_profiles: Vec::new(),
         })
     } else {
@@ -2030,7 +1968,12 @@ pub(crate) fn prepare_dml_change_stream_write_with_execution(
 
 /// Prepare an already sealed SQL connector-write plan for the frontend-owned
 /// MV lifecycle.  SQL owns all compile/physical decisions; Core only pairs the
-/// sealed plan with the exact admitted bindings and connector write template.
+/// sealed plan with the exact admitted bindings and the write session that
+/// admitted it.
+///
+/// The sealed targets are taken rather than re-sealed here: the plan was already
+/// compiled against the ordinal they name, so sealing a second set would let the
+/// recipes the plan carries drift from the ones the writer nodes were built for.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
@@ -2038,7 +1981,8 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    connector_write: crate::query_execution::contract::ConnectorWritePlanningTemplate,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+    sealed_write_targets: crate::native::fragment_encoder::plan::write_dataflow::SealedWriteTargets,
 ) -> Result<PreparedMvNativeWriteAssembly, String> {
     crate::connector::validate_request_context(connector_context)?;
     let scan_resolver =
@@ -2054,137 +1998,11 @@ pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
         Some(&scan_resolver),
         scan_preparation_options(typed_connector_control, &settings, execution)?,
     )?;
-    let cohort_id = connector_write.cohort_id();
-    let exact_lease = connector_write.lease();
-    Ok(PreparedMvNativeWriteAssembly::new(
-        NativeFragmentEncodingInput::new(distributed_plan, prepared),
+    Ok(PreparedMvNativeWriteAssembly::session(
+        NativeFragmentEncodingInput::new(distributed_plan, prepared)
+            .with_sealed_write_targets(sealed_write_targets),
         None,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
-            connector_write,
-        ),
-        cohort_id,
-        exact_lease,
-    ))
-}
-
-/// Convert an already planned MV change-stream writer into an inert native
-/// assembly handoff. The caller retains responsibility for the exact connector
-/// write lease and Frontend later encodes the sealed pair before submission.
-pub(crate) fn prepare_planned_iceberg_change_stream_write(
-    encoding: NativeFragmentEncodingInput,
-    query_opts: Option<QueryOptions>,
-    connector_write: Option<DistributedConnectorWrite>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
-        return Err("prepared connector write requires an unsealed write template".to_string());
-    };
-    let cohort_id = template.cohort_id();
-    let exact_lease = template.lease();
-    Ok(PreparedMvNativeWriteAssembly::new(
-        encoding,
-        query_opts,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
-        cohort_id,
-        exact_lease,
-    ))
-}
-
-#[allow(
-    dead_code,
-    reason = "Test-only bound-write assembly remains available to exercise sealed request construction."
-)]
-fn prepare_distributed_write_request_with_execution(
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    _execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    connector_write: Option<DistributedConnectorWrite>,
-) -> Result<PreparedDistributedWriteRequest, String> {
-    let Some(DistributedConnectorWrite::Begin(template)) = connector_write else {
-        return Err("prepared connector write requires an unsealed write template".to_string());
-    };
-    let cohort_id = template.cohort_id();
-    let exact_lease = template.lease();
-    PreparedDistributedWriteRequest::new(
-        prepared,
-        native_bundle,
-        query_options,
-        crate::query_execution::contract::ConnectorWriteOperationRegistration::single(template),
-        cohort_id,
-        exact_lease,
-    )
-    .map_err(|error| error.to_string())
-}
-
-/// The request is bound to a newly-created exact connector operation session.
-/// Callers that need typed abort certainty retain `session` until a terminal
-/// commit or abort decision instead of letting an intermediate error discard
-/// that provider-owned capability.
-#[allow(
-    dead_code,
-    reason = "Test-only sealed request fixture preserves terminal-path assertions."
-)]
-pub(crate) struct BoundDistributedWriteRequest {
-    pub(crate) request: crate::query_execution::contract::DistributedQueryRequest,
-    pub(crate) session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
-}
-
-/// A request-construction failure after `begin_write_operation` still owns an
-/// exact provider session.  The caller must issue its terminal abort through
-/// that session rather than dropping it as an ordinary planning error.
-#[allow(
-    dead_code,
-    reason = "Test-only binding outcome preserves abort-versus-bound request assertions."
-)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The bound variant retains the exact provider session until the caller reaches a terminal decision."
-)]
-pub(crate) enum BoundDistributedWriteBinding {
-    Bound(BoundDistributedWriteRequest),
-    AbortRequired {
-        session: crate::query_execution::write_operation::ConnectorWriteOperationSession,
-        reason: String,
-    },
-}
-
-#[allow(
-    dead_code,
-    reason = "Test-only binding helper preserves sealed distributed write request assertions."
-)]
-pub(crate) fn bind_prepared_distributed_write_request(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    prepared: PreparedDistributedWriteRequest,
-) -> Result<BoundDistributedWriteBinding, String> {
-    let cohort_id = prepared.write_cohort_id();
-    let session = query_execution
-        .begin_write_operation(prepared.registration(), prepared.lease())
-        .map_err(|error| error.to_string())?;
-    let registration =
-        match crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-            session.clone(),
-            cohort_id,
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
-                return Ok(BoundDistributedWriteBinding::AbortRequired {
-                    session,
-                    reason: error.to_string(),
-                });
-            }
-        };
-    let request = match prepared.into_request(execution, registration) {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(BoundDistributedWriteBinding::AbortRequired {
-                session,
-                reason: error.to_string(),
-            });
-        }
-    };
-    Ok(BoundDistributedWriteBinding::Bound(
-        BoundDistributedWriteRequest { request, session },
+        write_session,
     ))
 }
 
@@ -2196,18 +2014,11 @@ fn execute_bound_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let (query_result, write_commit, write_abort, connector_completion) = query_execution
+    query_execution
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
-        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
-        .map_err(|error| error.to_string())?;
-    Ok(crate::query_execution::outcome::QueryExecutionResult {
-        query_result,
-        write_commit,
-        write_abort,
-        connector_completion,
-        fragment_profiles: Vec::new(),
-    })
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
+        .map_err(|error| error.to_string())
 }
 
 fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionOptimizerSettings {
@@ -2461,32 +2272,13 @@ fn execute_distributed_result_with_execution(
         .map_err(|error| error.to_string())
 }
 
-fn execute_distributed_write_with_execution(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    prepared: crate::query_execution::preparation::PreparedFragmentSet,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    connector_write: Option<DistributedConnectorWrite>,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = build_distributed_write_request(
-        query_execution,
-        prepared,
-        native_bundle,
-        query_options,
-        execution,
-        connector_write,
-    )?;
-    execute_distributed_write_request(query_execution, request)
-}
-
 fn build_distributed_write_request(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
+    _query_execution: &crate::query_execution::service::QueryExecutionService,
     prepared: crate::query_execution::preparation::PreparedFragmentSet,
     native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     query_options: Option<QueryOptions>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    connector_write: Option<DistributedConnectorWrite>,
+    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
     let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
         prepared,
@@ -2496,51 +2288,19 @@ fn build_distributed_write_request(
         execution,
     )
     .map_err(|error| error.to_string())?;
-    let request = match connector_write {
-        Some(DistributedConnectorWrite::Begin(template)) => {
-            let cohort_id = template.cohort_id();
-            let exact_lease = template.lease();
-            let session = query_execution
-                .begin_write_operation(
-                    crate::query_execution::contract::ConnectorWriteOperationRegistration::single(
-                        template,
-                    ),
-                    exact_lease,
-                )
-                .map_err(|error| error.to_string())?;
-            let registration =
-                crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-                    session, cohort_id,
-                )
-                .map_err(|error| error.to_string())?;
-            crate::query_execution::contract::with_connector_write_operation(request, registration)
-                .map_err(|error| error.to_string())?
-        }
-        Some(DistributedConnectorWrite::Sealed(registration)) => {
-            crate::query_execution::contract::with_connector_write_operation(request, registration)
-                .map_err(|error| error.to_string())?
-        }
-        None => request,
-    };
-    Ok(request)
+    crate::query_execution::contract::with_connector_write_session(request, write_session)
+        .map_err(|error| error.to_string())
 }
 
 fn execute_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let (query_result, write_commit, write_abort, connector_completion) = query_execution
+    query_execution
         .execute(request)
         .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
-        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_connector)
-        .map_err(|error| error.to_string())?;
-    Ok(crate::query_execution::outcome::QueryExecutionResult {
-        query_result,
-        write_commit,
-        write_abort,
-        connector_completion,
-        fragment_profiles: Vec::new(),
-    })
+        .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
+        .map_err(|error| error.to_string())
 }
 
 #[allow(
@@ -2569,9 +2329,7 @@ fn execute_distributed_profile_with_execution(
         .map_err(|error| error.to_string())?;
     Ok(crate::query_execution::outcome::QueryExecutionResult {
         query_result,
-        write_commit: None,
-        write_abort: None,
-        connector_completion: None,
+        write_session: None,
         fragment_profiles: fragment_profiles.into_profiles(),
     })
 }

@@ -63,6 +63,10 @@ pub enum QueryTableBindingSelector {
     /// distinct bindings, rather than allowing one shape to stand in for
     /// another during SQL sink projection.
     WriteTarget([u8; 32]),
+    /// One logical write target of the query's write session. Within a session
+    /// the ordinal is dense and unique, so it -- not a preparation digest -- is
+    /// what tells two branches of the same physical table apart.
+    SessionWriteTarget(u32),
     Snapshot(i64),
     TimestampMillis(i64),
     Metadata(SqlMetadataTableKind),
@@ -109,6 +113,20 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::WriteTarget(preparation_digest),
+        )
+    }
+
+    pub fn session_write_target(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    ) -> Self {
+        Self::new(
+            catalog,
+            namespace,
+            table,
+            QueryTableBindingSelector::SessionWriteTarget(ordinal.get()),
         )
     }
 
@@ -259,13 +277,19 @@ pub struct QueryTableBinding {
     pub admitted_change_scans: BTreeMap<(i64, i64), novarocks_spi::connector::ConnectorScan>,
 }
 
-/// One Provider-signed terminal write preparation retained beside the SQL
-/// binding token.  Field identity, input shape and opaque table authority are
-/// all sealed by the provider; SQL may project its Arrow layout and field
-/// tokens but must not reconstruct table-format metadata.
+/// One admitted terminal write target retained beside the SQL binding token.
+/// Field identity and input shape are sealed by the provider; SQL may project
+/// the Arrow layout and field tokens but must not reconstruct table-format
+/// metadata.
 #[derive(Clone)]
 pub struct QueryWriteTargetAdmission {
-    pub preparation: ConnectorWritePreparation,
+    /// What SQL is allowed to see: the Arrow layout and field tokens of this
+    /// target's input rows. Both admission paths supply it.
+    pub input: novarocks_spi::connector::ConnectorWriteInputShape,
+    /// The provider-signed preparation. Present only on the legacy
+    /// write-operation path -- a write session admits a target from its sealed
+    /// input shape, and no longer mints a preparation per target.
+    pub preparation: Option<ConnectorWritePreparation>,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg
@@ -669,7 +693,7 @@ impl QueryTableBindingStore {
         binding
             .write_target_admission
             .as_ref()
-            .map(|admission| admission.preparation.clone())
+            .and_then(|admission| admission.preparation.clone())
             .ok_or_else(|| {
                 format!(
                     "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"

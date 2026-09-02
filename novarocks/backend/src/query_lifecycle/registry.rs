@@ -479,48 +479,6 @@ fn participant_attempt_ref(
     .map_err(protocol_contract_error)
 }
 
-fn protocol_connector_staged_report_frame(
-    frame: &novarocks_spi::connector::ConnectorStagedReportFrame,
-) -> novarocks_proto_models::novarocks::ConnectorStagedReportFrame {
-    use novarocks_proto_models::{common, novarocks as wire};
-    use novarocks_spi::connector::ConnectorWriterTerminalState;
-    let writer = frame.writer();
-    let fragment = writer.fragment_instance_id();
-    wire::ConnectorStagedReportFrame {
-        contract_version: frame.version(),
-        writer: Some(novarocks_proto_models::plan::ConnectorWriterIdentity {
-            operation_id: writer.operation_id().to_bytes().to_vec(),
-            cohort_id: writer.cohort_id().to_bytes().to_vec(),
-            execution_query_id: writer.execution_id().query_id().to_vec(),
-            execution_attempt_id: writer.execution_id().attempt_id(),
-            fragment_instance_id: Some(common::UniqueId {
-                hi: i64::from_be_bytes(fragment[..8].try_into().expect("uuid prefix")),
-                lo: i64::from_be_bytes(fragment[8..].try_into().expect("uuid suffix")),
-            }),
-            fragment_id: writer.fragment_id(),
-            backend_num: writer.backend_num(),
-            sink_ordinal: writer.sink_ordinal(),
-            catalog_handle: Some(novarocks_proto_codec::catalog::encode_catalog_handle(
-                writer.catalog_handle(),
-            )),
-        }),
-        terminal_state: match frame.state() {
-            ConnectorWriterTerminalState::Staged => 0,
-            ConnectorWriterTerminalState::Aborted => 1,
-            ConnectorWriterTerminalState::Failed => 2,
-        },
-        input_rows: frame.summary().input_rows,
-        staged_bytes: frame.summary().staged_bytes,
-        artifact_count: frame.summary().artifact_count,
-        part_index: frame.part_index(),
-        part_count: frame.part_count(),
-        logical_payload_len: frame.logical_payload_len(),
-        logical_payload_sha256: frame.logical_payload_digest().to_vec(),
-        frame_payload: frame.frame_payload().to_vec(),
-        frame_payload_sha256: frame.frame_payload_digest().to_vec(),
-    }
-}
-
 #[expect(
     clippy::too_many_arguments,
     reason = "The sealed terminal-fragment carrier has one parameter per required protocol field."
@@ -554,11 +512,6 @@ fn terminal_fragment_snapshot(
         error_code,
         error_detail,
         error_detail_truncated: false,
-        connector_staged_report_frames: sink
-            .connector_staged_report_frames
-            .iter()
-            .map(protocol_connector_staged_report_frame)
-            .collect(),
         tablet_commit_infos: sink
             .tablet_commit_infos
             .into_iter()

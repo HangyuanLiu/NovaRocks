@@ -23,7 +23,6 @@ type BoundaryKey = (FragmentId, Option<i32>, BoundaryKind);
 
 pub(super) fn validate_and_group_boundary_contracts(
     result_fragment_id: Option<FragmentId>,
-    write_contract_fragment_ids: &BTreeSet<FragmentId>,
     edges: &[novarocks_sql::plan_read::FragmentEdge],
     contracts: &[BoundaryContract],
     sealed_ids: &BTreeSet<FragmentId>,
@@ -31,9 +30,6 @@ pub(super) fn validate_and_group_boundary_contracts(
     let mut expected = BTreeSet::<BoundaryKey>::new();
     if let Some(fragment_id) = result_fragment_id {
         expected.insert((fragment_id, None, BoundaryKind::ResultOutput));
-    }
-    for &fragment_id in write_contract_fragment_ids {
-        expected.insert((fragment_id, None, BoundaryKind::IcebergWriteInput));
     }
     for edge in edges {
         expected.insert((
@@ -136,7 +132,7 @@ pub(super) fn validate_and_group_boundary_contracts(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     use super::validate_and_group_boundary_contracts;
     use novarocks_sql::plan_read::{BoundaryContract, FragmentId};
@@ -149,7 +145,6 @@ mod tests {
             novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
         validate_and_group_boundary_contracts(
             facts.result_fragment_id(),
-            &BTreeSet::new(),
             plan.edges(),
             contracts,
             &plan

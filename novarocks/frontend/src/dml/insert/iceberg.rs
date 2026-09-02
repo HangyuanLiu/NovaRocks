@@ -53,7 +53,7 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
             .input()
             .map_err(crate::dml::error::DmlError::executor)?;
         let native_bundle =
-            crate::native::fragment_encoder::encode_native_fragment_bundle(input.encoding_view())
+            crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input)
                 .map_err(crate::dml::error::DmlError::executor)?;
         drop(encoding);
         Ok(
@@ -62,10 +62,6 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
                 .run_iceberg_write_with_native_bundle(self.prepared.handle.as_ref(), native_bundle)
                 .map_err(crate::dml::error::DmlError::executor)?
             {
-                IcebergWriteReport::Aborted {
-                    reason,
-                    has_staged_files: _,
-                } => CoordinatedWriteReport::Aborted { reason },
                 IcebergWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 IcebergWriteReport::CommitRequired(handle) => {
                     CoordinatedWriteReport::CommitRequired(handle)

@@ -2,9 +2,9 @@
 id: ADR-0051
 title: "Exact-generation connector write activation"
 domain: [provider-spi, frontend-dml, frontend-mv]
-status: active
+status: superseded
 supersedes: [ADR-0048]
-superseded-by: null
+superseded-by: ADR-0133
 date: 2026-08-10
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/861"

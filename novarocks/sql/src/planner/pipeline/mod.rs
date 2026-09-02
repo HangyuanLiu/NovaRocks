@@ -60,54 +60,49 @@ pub(crate) fn build_statistics_distributed_plan_with_settings(
     crate::planner::distributed::build::build_statistics_distributed_plan(&physical, metrics)
 }
 
-pub(crate) fn build_connector_write_distributed_plan(
+/// Build a distributed plan whose writer is an ordinary node emitting the write
+/// relation, with every writer gathering into a single Root finish fragment.
+pub(crate) fn build_connector_write_dataflow_plan(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::sink::ConnectorWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_connector_write_distributed_plan(
-        &physical, sink,
+    crate::planner::distributed::write::plan::build_table_writer_finish_distributed_plan(
+        &physical,
+        sink,
+        write_target_ordinal,
     )
 }
 
-/// Compile a SQL-owned terminal write contract.  Provider metadata and writer
-/// handles are intentionally absent; application code resolves those from the
-/// request-local binding token after this plan has been sealed.
-pub(crate) fn build_sql_write_distributed_plan_with_settings(
+/// Compile a SQL-owned write contract into the dataflow writer/finish shape.
+/// Provider metadata and writer handles are intentionally absent; application
+/// code resolves those from the request-local binding token after this plan has
+/// been sealed.
+pub(crate) fn build_sql_write_dataflow_plan_with_settings(
     mut physical: PhysicalPlanNode,
     sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     settings: &crate::optimizer::options::SessionOptimizerSettings,
 ) -> Result<DistributedPlan, String> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_sql_write_distributed_plan(&physical, sink)
-}
-
-#[allow(
-    dead_code,
-    reason = "Change-stream distributed planning remains available to mutation compilation surfaces."
-)]
-pub(crate) fn build_sql_change_stream_distributed_plan(
-    physical: PhysicalPlanNode,
-    dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
-    keyed_assert: Option<PreExpandKeyedAssertSpec>,
-) -> Result<crate::planner::distributed::write::plan::PlannedSqlChangeStreamDistributedPlan, String>
-{
-    build_sql_change_stream_distributed_plan_with_settings(
-        physical,
-        dag,
-        keyed_assert,
-        &crate::optimizer::options::SessionOptimizerSettings::default(),
+    crate::planner::distributed::write::plan::build_sql_table_writer_finish_distributed_plan(
+        &physical,
+        sink,
+        write_target_ordinal,
     )
 }
 
-pub(crate) fn build_sql_change_stream_distributed_plan_with_settings(
+/// Compile a change-stream write into the dataflow writer/finish shape. Every
+/// route's writer gathers into the same single Root finish fragment.
+pub(crate) fn build_sql_change_stream_dataflow_plan_with_settings(
     mut physical: PhysicalPlanNode,
     dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
     keyed_assert: Option<PreExpandKeyedAssertSpec>,
@@ -121,7 +116,7 @@ pub(crate) fn build_sql_change_stream_distributed_plan_with_settings(
         &mut physical,
         settings,
     );
-    crate::planner::distributed::write::plan::build_sql_change_stream_distributed_plan(
+    crate::planner::distributed::write::plan::build_sql_change_stream_table_writer_finish_distributed_plan(
         &physical, dag,
     )
 }

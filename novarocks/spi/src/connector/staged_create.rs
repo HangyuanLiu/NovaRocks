@@ -26,7 +26,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
-use arrow::datatypes::SchemaRef;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
@@ -34,9 +33,8 @@ use super::{
     ConnectorColumnDefinition, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
     ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationCompletion, ConnectorWriteOperationId, CreatePolicy,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
+    ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteLease, ConnectorWriteReceipt,
+    CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
     LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
@@ -106,35 +104,29 @@ impl ConnectorStagedTableHandle {
 #[derive(Clone)]
 pub struct ConnectorStagedWritePlanningRequest {
     pub handle: ConnectorStagedTableHandle,
-    pub operation_id: ConnectorWriteOperationId,
-    pub intent: ConnectorWriteIntent,
-    pub input_schema: SchemaRef,
     pub context: ConnectorRequestContext,
 }
 
-/// Provider-neutral writer facts derived from one exact invisible target.
-/// The table and provider payload remain opaque to generic CTAS orchestration;
-/// they are consumed only by the existing connector writer planner.
+/// The frozen facts a write session needs to open on one exact invisible
+/// target.
+///
+/// This carries no write operation, cohort, or input shape: a staged target is
+/// a *place to write*, and what is written there — the intent, the fields, the
+/// branches — is decided by the session that opens on it. The table handle
+/// stays opaque; only the provider that minted it can read it.
 #[derive(Clone)]
 pub struct ConnectorStagedWritePlanningBinding {
     owner: ConnectorProviderBindingKey,
     target_operation_id: ConnectorStagedCreateOperationId,
     target_handle_digest: [u8; 32],
-    operation_id: ConnectorWriteOperationId,
-    intent: ConnectorWriteIntent,
-    input_schema: SchemaRef,
     table: ConnectorTableHandle,
     provider_payload: Bytes,
     context: ConnectorRequestContext,
 }
 
 impl ConnectorStagedWritePlanningBinding {
-    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         handle: &ConnectorStagedTableHandle,
-        operation_id: ConnectorWriteOperationId,
-        intent: ConnectorWriteIntent,
-        input_schema: SchemaRef,
         table: ConnectorTableHandle,
         provider_payload: Bytes,
         context: ConnectorRequestContext,
@@ -153,9 +145,6 @@ impl ConnectorStagedWritePlanningBinding {
             owner: handle.owner().clone(),
             target_operation_id: handle.operation_id(),
             target_handle_digest: handle.digest(),
-            operation_id,
-            intent,
-            input_schema,
             table,
             provider_payload,
             context,
@@ -174,18 +163,6 @@ impl ConnectorStagedWritePlanningBinding {
         self.target_handle_digest
     }
 
-    pub const fn operation_id(&self) -> ConnectorWriteOperationId {
-        self.operation_id
-    }
-
-    pub const fn intent(&self) -> ConnectorWriteIntent {
-        self.intent
-    }
-
-    pub fn input_schema(&self) -> &SchemaRef {
-        &self.input_schema
-    }
-
     pub fn table(&self) -> &ConnectorTableHandle {
         &self.table
     }
@@ -196,6 +173,41 @@ impl ConnectorStagedWritePlanningBinding {
 
     pub fn context(&self) -> &ConnectorRequestContext {
         &self.context
+    }
+}
+
+/// Everything a staged publication learns from the write that filled it.
+///
+/// A completed write session produces exactly one receipt, and the rows it
+/// made durable are counted beside it. Those two facts are the whole boundary:
+/// there is deliberately no operation id, no cohort set, no per-attempt
+/// aggregate, and no writer manifest here, because a publication decides
+/// nothing from any of them. If a provider needs more than this to publish, the
+/// missing fact belongs *inside* the receipt its own session minted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConnectorStagedWriteProof {
+    receipt: ConnectorWriteReceipt,
+    row_count: u64,
+}
+
+impl ConnectorStagedWriteProof {
+    pub fn try_new(receipt: ConnectorWriteReceipt, row_count: u64) -> Result<Self, ConnectorError> {
+        receipt.validate()?;
+        Ok(Self { receipt, row_count })
+    }
+
+    pub const fn receipt(&self) -> &ConnectorWriteReceipt {
+        &self.receipt
+    }
+
+    pub const fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// The identity two references to the same sealed write share. A staged
+    /// target binds one of these and refuses to publish under another.
+    pub const fn digest(&self) -> [u8; 32] {
+        self.receipt.digest()
     }
 }
 
@@ -306,7 +318,7 @@ pub enum ConnectorStagedCreatePrepareOutcome {
 pub struct ConnectorStagedCreatePublishRequest {
     pub operation_id: ConnectorMutationOperationId,
     pub handle: ConnectorStagedTableHandle,
-    pub completion: ConnectorWriteOperationCompletion,
+    pub write: ConnectorStagedWriteProof,
     pub context: ConnectorRequestContext,
 }
 
@@ -336,7 +348,7 @@ pub enum ConnectorStagedCreatePublishOutcome {
 pub struct ConnectorStagedCreateAbortRequest {
     pub operation_id: ConnectorMutationOperationId,
     pub handle: ConnectorStagedTableHandle,
-    pub completion: Option<ConnectorWriteOperationCompletion>,
+    pub write: Option<ConnectorStagedWriteProof>,
     pub context: ConnectorRequestContext,
 }
 
@@ -388,13 +400,13 @@ pub trait ConnectorStagedCreate: Send + Sync {
         request: ConnectorStagedWritePlanningRequest,
     ) -> Result<ConnectorStagedWritePlanningBinding, ConnectorError>;
 
-    /// Bind one sealed writer aggregate to the exact opaque staged target.
-    /// This is provider-local and must complete before the application records
-    /// the write as ready for publication.
+    /// Bind one sealed write to the exact opaque staged target. This is
+    /// provider-local and must complete before the application records the
+    /// write as ready for publication.
     fn bind_write(
         &self,
         handle: ConnectorStagedTableHandle,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), ConnectorError>;
 
     fn publish(
@@ -697,10 +709,24 @@ enum LeaseOperationState {
     },
 }
 
+/// What the lease remembers about the one write bound to a staged target.
+///
+/// It is the sealed write's own identity — its receipt digest and the rows it
+/// carries — so a publication offered a different write is refused without the
+/// lease holding the write itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoundWriteProof {
-    operation_id: super::ConnectorWriteOperationId,
-    aggregate_digest: [u8; 32],
+    receipt_digest: [u8; 32],
+    row_count: u64,
+}
+
+impl BoundWriteProof {
+    fn of(write: &ConnectorStagedWriteProof) -> Self {
+        Self {
+            receipt_digest: write.digest(),
+            row_count: write.row_count(),
+        }
+    }
 }
 
 struct StagedCreateLeaseRelease {
@@ -874,20 +900,12 @@ impl ConnectorStagedCreateLease {
     pub fn bind_write(
         &self,
         handle: ConnectorStagedTableHandle,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), ConnectorError> {
         self.require_unpublished(&handle)?;
-        if completion.owner() != &self.provider_binding_key {
-            return Err(invalid(
-                "staged-create write completion has a foreign owner",
-            ));
-        }
         let target_operation_id = handle.operation_id();
-        let proof = BoundWriteProof {
-            operation_id: completion.sealed().operation_id(),
-            aggregate_digest: completion.aggregate_digest(),
-        };
-        if let Err(error) = self.capability.bind_write(handle.clone(), completion) {
+        let proof = BoundWriteProof::of(&write);
+        if let Err(error) = self.capability.bind_write(handle.clone(), write) {
             self.record_after_dispatch(
                 target_operation_id,
                 Some(LeaseOperationState::Unknown {
@@ -918,9 +936,6 @@ impl ConnectorStagedCreateLease {
         let target_operation_id = request.handle.operation_id();
         let target_handle_digest = request.handle.digest();
         let prior_bound_write = self.bound_write_for_abort(&request.handle, None)?;
-        let write_operation_id = request.operation_id;
-        let intent = request.intent;
-        let input_schema = Arc::clone(&request.input_schema);
         let binding = match self.capability.plan_write(request) {
             Ok(binding) => binding,
             Err(error) => {
@@ -937,9 +952,6 @@ impl ConnectorStagedCreateLease {
         if binding.owner() != &self.provider_binding_key
             || binding.target_operation_id() != target_operation_id
             || binding.target_handle_digest() != target_handle_digest
-            || binding.operation_id() != write_operation_id
-            || binding.intent() != intent
-            || binding.input_schema().as_ref() != input_schema.as_ref()
         {
             self.set_unknown_without_evidence(
                 target_operation_id,
@@ -964,12 +976,7 @@ impl ConnectorStagedCreateLease {
         &self,
         request: ConnectorStagedCreatePublishRequest,
     ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
-        let bound_write = self.require_bound_write(&request.handle, &request.completion)?;
-        if request.completion.owner() != &self.provider_binding_key {
-            return Err(invalid(
-                "staged-create publish completion has a foreign owner",
-            ));
-        }
+        let bound_write = self.require_bound_write(&request.handle, &request.write)?;
         let operation_id = request.handle.operation_id();
         let handle_digest = request.handle.digest();
         let dispatch_operation_id = request.operation_id;
@@ -1050,25 +1057,20 @@ impl ConnectorStagedCreateLease {
         Ok(())
     }
 
-    /// Restore an unpublished staged target after the generic writer session
-    /// proves its exact sealed aggregate complete. This is an explicit
-    /// recovery path for write-staging uncertainty; it never dispatches a
-    /// catalog mutation and cannot substitute a different writer operation.
-    pub fn reconcile_write_completion(
+    /// Restore an unpublished staged target after the write session proves its
+    /// sealed write complete. This is an explicit recovery path for
+    /// write-staging uncertainty; it never dispatches a catalog mutation and
+    /// cannot substitute a different write.
+    pub fn reconcile_write_proof(
         &self,
         handle: ConnectorStagedTableHandle,
-        completion: ConnectorWriteOperationCompletion,
+        write: ConnectorStagedWriteProof,
     ) -> Result<(), ConnectorError> {
-        if handle.owner() != &self.provider_binding_key
-            || completion.owner() != &self.provider_binding_key
-        {
+        if handle.owner() != &self.provider_binding_key {
             return Err(invalid("staged-create writer recovery has a foreign owner"));
         }
         let target_operation_id = handle.operation_id();
-        let proof = BoundWriteProof {
-            operation_id: completion.sealed().operation_id(),
-            aggregate_digest: completion.aggregate_digest(),
-        };
+        let proof = BoundWriteProof::of(&write);
         {
             let operations = self
                 .operations
@@ -1087,7 +1089,7 @@ impl ConnectorStagedCreateLease {
                 }
             }
         }
-        if let Err(error) = self.capability.bind_write(handle.clone(), completion) {
+        if let Err(error) = self.capability.bind_write(handle.clone(), write) {
             self.record_after_dispatch(
                 target_operation_id,
                 Some(LeaseOperationState::Unknown {
@@ -1111,17 +1113,7 @@ impl ConnectorStagedCreateLease {
         &self,
         request: ConnectorStagedCreateAbortRequest,
     ) -> Result<ConnectorStagedCreateAbortOutcome, ConnectorError> {
-        let bound_write =
-            self.bound_write_for_abort(&request.handle, request.completion.as_ref())?;
-        if request
-            .completion
-            .as_ref()
-            .is_some_and(|completion| completion.owner() != &self.provider_binding_key)
-        {
-            return Err(invalid(
-                "staged-create abort completion has a foreign owner",
-            ));
-        }
+        let bound_write = self.bound_write_for_abort(&request.handle, request.write.as_ref())?;
         let operation_id = request.handle.operation_id();
         let handle_digest = request.handle.digest();
         let dispatch_operation_id = request.operation_id;
@@ -1273,18 +1265,16 @@ impl ConnectorStagedCreateLease {
     fn require_bound_write(
         &self,
         handle: &ConnectorStagedTableHandle,
-        completion: &ConnectorWriteOperationCompletion,
+        write: &ConnectorStagedWriteProof,
     ) -> Result<BoundWriteProof, ConnectorError> {
-        let bound = self.bound_write_for_abort(handle, Some(completion))?;
-        bound.ok_or_else(|| {
-            invalid("staged-create publish requires an exact bound writer aggregate")
-        })
+        let bound = self.bound_write_for_abort(handle, Some(write))?;
+        bound.ok_or_else(|| invalid("staged-create publish requires an exact bound write"))
     }
 
     fn bound_write_for_abort(
         &self,
         handle: &ConnectorStagedTableHandle,
-        completion: Option<&ConnectorWriteOperationCompletion>,
+        write: Option<&ConnectorStagedWriteProof>,
     ) -> Result<Option<BoundWriteProof>, ConnectorError> {
         if handle.owner() != &self.provider_binding_key {
             return Err(invalid("staged table handle has a foreign owner"));
@@ -1305,14 +1295,11 @@ impl ConnectorStagedCreateLease {
         if handle_digest != &handle.digest() {
             return Err(invalid("staged table handle digest mismatch"));
         }
-        if let Some(completion) = completion {
-            let observed = BoundWriteProof {
-                operation_id: completion.sealed().operation_id(),
-                aggregate_digest: completion.aggregate_digest(),
-            };
+        if let Some(write) = write {
+            let observed = BoundWriteProof::of(write);
             if bound_write.as_ref() != Some(&observed) {
                 return Err(invalid(
-                    "staged-create completion is not bound to this exact opaque target",
+                    "staged-create write is not bound to this exact opaque target",
                 ));
             }
         }
@@ -1514,14 +1501,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogVersion, ConnectorCancellation,
-        ConnectorInstanceId, ConnectorProviderId, ConnectorSealedWriteCohortSet,
-        ConnectorStagedReport, ConnectorStagedReportSummary, ConnectorWriteAttemptCompletion,
-        ConnectorWriteCohortCompletion, ConnectorWriteCohortDescriptor, ConnectorWriteCohortId,
-        ConnectorWriteExecutionId, ConnectorWriteIntent, ConnectorWriteOperationId,
-        ConnectorWriterIdentity, ConnectorWriterTerminalState,
-    };
+    use crate::connector::{ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId};
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {
@@ -1575,6 +1555,7 @@ mod tests {
         fail_prepare: bool,
         malformed_prepare: bool,
         noop_publish: bool,
+        conflict_publish: bool,
         unknown_abort: bool,
         binds: AtomicUsize,
         publishes: AtomicUsize,
@@ -1673,6 +1654,14 @@ mod tests {
             request: ConnectorStagedCreatePublishRequest,
         ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
             self.publishes.fetch_add(1, Ordering::SeqCst);
+            if self.conflict_publish {
+                return Ok(ConnectorStagedCreatePublishOutcome::Conflict {
+                    failure: ConnectorMutationFailure::new(
+                        super::super::ConnectorMutationFailureKind::AlreadyExists,
+                        "the staged-create target already exists",
+                    ),
+                });
+            }
             if self.noop_publish {
                 return Ok(ConnectorStagedCreatePublishOutcome::NoOp {
                     receipt: self.receipt(
@@ -1694,9 +1683,6 @@ mod tests {
             )?;
             ConnectorStagedWritePlanningBinding::try_new(
                 &request.handle,
-                request.operation_id,
-                request.intent,
-                request.input_schema,
                 table,
                 Bytes::new(),
                 request.context,
@@ -1705,7 +1691,7 @@ mod tests {
         fn bind_write(
             &self,
             _: ConnectorStagedTableHandle,
-            _: ConnectorWriteOperationCompletion,
+            _: ConnectorStagedWriteProof,
         ) -> Result<(), ConnectorError> {
             self.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1798,9 +1784,9 @@ mod tests {
         fn bind_write(
             &self,
             handle: ConnectorStagedTableHandle,
-            completion: ConnectorWriteOperationCompletion,
+            write: ConnectorStagedWriteProof,
         ) -> Result<(), ConnectorError> {
-            self.inner.bind_write(handle, completion)
+            self.inner.bind_write(handle, write)
         }
 
         fn abort(
@@ -1866,64 +1852,15 @@ mod tests {
         }
     }
 
-    fn completion(owner: ConnectorProviderBindingKey) -> ConnectorWriteOperationCompletion {
-        completion_for(owner, ConnectorWriteOperationId::new())
-    }
-
-    fn completion_for(
-        owner: ConnectorProviderBindingKey,
-        operation_id: ConnectorWriteOperationId,
-    ) -> ConnectorWriteOperationCompletion {
-        let cohort_id = ConnectorWriteCohortId::primary(operation_id);
-        let execution_id = ConnectorWriteExecutionId::new([11; 16], 1);
-        let writer = ConnectorWriterIdentity::new(
-            operation_id,
-            cohort_id,
-            execution_id,
-            [12; 16],
-            1,
-            0,
-            0,
-            CatalogHandle::new(
-                owner.instance_id.clone(),
-                CatalogVersion::from_bytes([1; 32]),
-            ),
-        );
-        let report = ConnectorStagedReport::try_new(
-            writer,
-            CONNECTOR_WRITE_CONTRACT_VERSION,
-            ConnectorWriterTerminalState::Staged,
-            ConnectorStagedReportSummary::default(),
-            Bytes::from_static(b"report"),
+    /// A sealed write, as a session would hand it over: one receipt and the
+    /// rows behind it.
+    fn write_proof(marker: u8) -> ConnectorStagedWriteProof {
+        ConnectorStagedWriteProof::try_new(
+            super::super::ConnectorWriteReceipt::try_new(Bytes::from(vec![marker; 8]))
+                .expect("receipt"),
+            u64::from(marker),
         )
-        .unwrap();
-        let accepted = ConnectorWriteAttemptCompletion::try_new(
-            owner.clone(),
-            operation_id,
-            cohort_id,
-            execution_id,
-            [13; 32],
-            vec![report],
-            Bytes::new(),
-        )
-        .unwrap();
-        let sealed = ConnectorSealedWriteCohortSet::try_new(
-            operation_id,
-            vec![ConnectorWriteCohortDescriptor::new(
-                cohort_id,
-                ConnectorWriteIntent::Append,
-                [14; 32],
-            )],
-        )
-        .unwrap();
-        ConnectorWriteOperationCompletion::try_new(
-            owner,
-            sealed,
-            vec![
-                ConnectorWriteCohortCompletion::try_new(cohort_id, Some(accepted), vec![]).unwrap(),
-            ],
-        )
-        .unwrap()
+        .expect("write proof")
     }
 
     #[test]
@@ -1938,6 +1875,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -1960,28 +1898,23 @@ mod tests {
         else {
             panic!("expected prepared target")
         };
-        let write_operation_id = ConnectorWriteOperationId::new();
         let binding = lease
             .plan_write(ConnectorStagedWritePlanningRequest {
                 handle: handle.clone(),
-                operation_id: write_operation_id,
-                intent: ConnectorWriteIntent::Append,
-                input_schema: Arc::new(arrow::datatypes::Schema::empty()),
                 context: context(),
             })
             .unwrap();
-        assert_eq!(binding.operation_id(), write_operation_id);
         assert_eq!(binding.target_handle_digest(), handle.digest());
-        let completion = completion_for(lease.owner().clone(), write_operation_id);
+        let write = write_proof(3);
         lease.mark_write_unknown(&handle).unwrap();
         lease
-            .reconcile_write_completion(handle.clone(), completion.clone())
+            .reconcile_write_proof(handle.clone(), write.clone())
             .unwrap();
         lease
             .abort(ConnectorStagedCreateAbortRequest {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle,
-                completion: Some(completion),
+                write: Some(write),
                 context: context(),
             })
             .unwrap();
@@ -2002,6 +1935,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2035,7 +1969,7 @@ mod tests {
                 .abort(ConnectorStagedCreateAbortRequest {
                     operation_id: ConnectorMutationOperationId::new(),
                     handle: foreign,
-                    completion: None,
+                    write: None,
                     context: context(),
                 })
                 .is_err()
@@ -2044,7 +1978,7 @@ mod tests {
             .abort(ConnectorStagedCreateAbortRequest {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle: handle.clone(),
-                completion: None,
+                write: None,
                 context: context(),
             })
             .unwrap();
@@ -2054,7 +1988,7 @@ mod tests {
                 .abort(ConnectorStagedCreateAbortRequest {
                     operation_id: ConnectorMutationOperationId::new(),
                     handle,
-                    completion: None,
+                    write: None,
                     context: context(),
                 })
                 .is_err()
@@ -2073,6 +2007,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2105,7 +2040,7 @@ mod tests {
                 .abort(ConnectorStagedCreateAbortRequest {
                     operation_id: ConnectorMutationOperationId::new(),
                     handle: forged,
-                    completion: None,
+                    write: None,
                     context: context(),
                 })
                 .is_err()
@@ -2125,6 +2060,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2162,6 +2098,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2200,6 +2137,7 @@ mod tests {
             fail_prepare: true,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2239,6 +2177,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: true,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2267,7 +2206,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_bound_to_one_target_cannot_publish_another_target() {
+    fn a_write_bound_to_one_target_cannot_publish_another_target() {
         let (descriptor, incarnation) = owner();
         let capability = Arc::new(FakeCapability {
             descriptor: descriptor.clone(),
@@ -2278,6 +2217,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2309,14 +2249,14 @@ mod tests {
         else {
             panic!("expected second prepared target")
         };
-        let completion = completion(lease.owner().clone());
-        lease.bind_write(first, completion.clone()).unwrap();
+        let write = write_proof(5);
+        lease.bind_write(first, write.clone()).unwrap();
         assert!(
             lease
                 .publish(ConnectorStagedCreatePublishRequest {
                     operation_id: ConnectorMutationOperationId::new(),
                     handle: second,
-                    completion,
+                    write,
                     context: context(),
                 })
                 .is_err()
@@ -2337,6 +2277,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: true,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2359,15 +2300,13 @@ mod tests {
         else {
             panic!("expected prepared target")
         };
-        let completion = completion(lease.owner().clone());
-        lease
-            .bind_write(handle.clone(), completion.clone())
-            .unwrap();
+        let write = write_proof(6);
+        lease.bind_write(handle.clone(), write.clone()).unwrap();
         let outcome = lease
             .publish(ConnectorStagedCreatePublishRequest {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle: handle.clone(),
-                completion: completion.clone(),
+                write: write.clone(),
                 context: context(),
             })
             .unwrap();
@@ -2379,7 +2318,7 @@ mod tests {
             .abort(ConnectorStagedCreateAbortRequest {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle,
-                completion: Some(completion),
+                write: Some(write),
                 context: context(),
             })
             .unwrap();
@@ -2399,6 +2338,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2442,6 +2382,7 @@ mod tests {
                 fail_prepare: false,
                 malformed_prepare: false,
                 noop_publish: false,
+                conflict_publish: false,
                 unknown_abort: false,
                 binds: AtomicUsize::new(0),
                 publishes: AtomicUsize::new(0),
@@ -2470,7 +2411,7 @@ mod tests {
             .abort(ConnectorStagedCreateAbortRequest {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle,
-                completion: None,
+                write: None,
                 context: context(),
             })
             .unwrap();
@@ -2502,6 +2443,7 @@ mod tests {
                 fail_prepare: false,
                 malformed_prepare: false,
                 noop_publish: false,
+                conflict_publish: false,
                 unknown_abort: false,
                 binds: AtomicUsize::new(0),
                 publishes: AtomicUsize::new(0),
@@ -2526,18 +2468,13 @@ mod tests {
             panic!("expected prepared target")
         };
         *capability.poison_on_plan_write.lock().unwrap() = Some(Arc::clone(&lease.operations));
-        let write_operation_id = ConnectorWriteOperationId::new();
         lease
             .plan_write(ConnectorStagedWritePlanningRequest {
                 handle: handle.clone(),
-                operation_id: write_operation_id,
-                intent: ConnectorWriteIntent::Append,
-                input_schema: Arc::new(arrow::datatypes::Schema::empty()),
                 context: context(),
             })
             .unwrap();
-        let completion = completion_for(lease.owner().clone(), write_operation_id);
-        lease.bind_write(handle, completion).unwrap();
+        lease.bind_write(handle, write_proof(4)).unwrap();
         assert_eq!(capability.inner.binds.load(Ordering::SeqCst), 1);
     }
 
@@ -2553,6 +2490,7 @@ mod tests {
             fail_prepare: false,
             malformed_prepare: false,
             noop_publish: false,
+            conflict_publish: false,
             unknown_abort: false,
             binds: AtomicUsize::new(0),
             publishes: AtomicUsize::new(0),
@@ -2575,8 +2513,8 @@ mod tests {
                 evidence_digest: evidence.digest(),
                 handle_digest: [7; 32],
                 bound_write: BoundWriteProof {
-                    operation_id: ConnectorWriteOperationId::new(),
-                    aggregate_digest: [8; 32],
+                    receipt_digest: [8; 32],
+                    row_count: 9,
                 },
             },
         );
@@ -2614,5 +2552,76 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    /// The absent-target fence, seen from the lease.
+    ///
+    /// A target that already exists is a refusal, not a publication: the write
+    /// stays bound, the target stays unpublished, and the statement can still
+    /// abort it to clean up what it staged. Reporting this as published — or as
+    /// unknown — would either claim a table this statement did not create or
+    /// strand the objects it wrote.
+    #[test]
+    fn a_publication_onto_an_existing_target_is_refused_and_stays_abortable() {
+        let (descriptor, incarnation) = owner();
+        let capability = Arc::new(FakeCapability {
+            descriptor: descriptor.clone(),
+            incarnation,
+            aborts: AtomicUsize::new(0),
+            prepares: AtomicUsize::new(0),
+            unknown_prepare: false,
+            fail_prepare: false,
+            malformed_prepare: false,
+            noop_publish: false,
+            conflict_publish: true,
+            unknown_abort: false,
+            binds: AtomicUsize::new(0),
+            publishes: AtomicUsize::new(0),
+        });
+        let lease = ConnectorStagedCreateLease::new(
+            ConnectorProviderBindingKey {
+                instance_id: descriptor.instance_id.clone(),
+                incarnation,
+            },
+            capability.clone(),
+            || {},
+        )
+        .unwrap();
+        let ConnectorStagedCreatePrepareOutcome::Prepared { handle, .. } = lease
+            .prepare(prepare_request(
+                lease.owner().clone(),
+                ConnectorMutationOperationId::new(),
+            ))
+            .unwrap()
+        else {
+            panic!("expected prepared target")
+        };
+        let write = write_proof(7);
+        lease.bind_write(handle.clone(), write.clone()).unwrap();
+
+        let outcome = lease
+            .publish(ConnectorStagedCreatePublishRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle: handle.clone(),
+                write: write.clone(),
+                context: context(),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectorStagedCreatePublishOutcome::Conflict { .. }
+        ));
+
+        // Still unpublished, so the exact bound write can still be aborted.
+        lease
+            .abort(ConnectorStagedCreateAbortRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                handle,
+                write: Some(write),
+                context: context(),
+            })
+            .unwrap();
+        assert_eq!(capability.publishes.load(Ordering::SeqCst), 1);
+        assert_eq!(capability.aborts.load(Ordering::SeqCst), 1);
     }
 }

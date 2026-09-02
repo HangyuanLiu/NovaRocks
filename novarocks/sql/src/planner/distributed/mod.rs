@@ -39,8 +39,8 @@ pub use node::{
     distributed_kind_to_physical,
 };
 pub use output::{
-    FragmentEdgeOutputCatalog, NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog,
-    WriteContractCatalog,
+    ConnectorWriteOutputContract, FinalizedWriteTargetColumn, FragmentEdgeOutputCatalog,
+    NodeExecutionColumn, NodeExecutionOutput, NodeOutputCatalog, WriteContractCatalog,
 };
 #[cfg(test)]
 pub(crate) use runtime_filter_progress::FrontierEdge;

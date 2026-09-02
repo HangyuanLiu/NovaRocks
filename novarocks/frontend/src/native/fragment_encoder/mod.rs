@@ -24,6 +24,7 @@ pub(crate) mod plan;
 pub(crate) mod submission;
 
 pub use bundle::encode_native_fragment_bundle;
+pub(crate) use bundle::encode_native_fragment_bundle_for_input;
 pub(crate) use instance::encode_instance_params;
 pub(crate) use plan::encode_data_partition;
 

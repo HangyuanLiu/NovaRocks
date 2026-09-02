@@ -37,7 +37,6 @@ pub(crate) struct PreparedOutputColumn {
 pub(crate) enum PreparedFragmentRole {
     Result,
     Statistics,
-    TerminalWrite,
     NonTerminal,
 }
 
@@ -48,10 +47,6 @@ impl PreparedFragmentRole {
 
     pub(crate) fn is_statistics(self) -> bool {
         matches!(self, Self::Statistics)
-    }
-
-    pub(crate) fn is_terminal_write(self) -> bool {
-        matches!(self, Self::TerminalWrite)
     }
 }
 

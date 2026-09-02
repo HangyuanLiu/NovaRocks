@@ -526,6 +526,15 @@ fn node_execution_output_columns(
         DistributedNodeKind::Exchange(exchange) => {
             exchange_execution_output_columns(exchange, fragment_roots)
         }
+        // The NCP-6 write nodes replace their input with the frozen
+        // write-result relation, so their execution output never depends on a
+        // child. `write::node` is the single definition point of both shapes.
+        DistributedNodeKind::TableWriter(_) => {
+            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
+        }
+        DistributedNodeKind::TableFinish(_) => {
+            Ok(crate::planner::distributed::write::node::table_finish_output_columns())
+        }
         DistributedNodeKind::Repeat(_) => Err(NodeOutputError::NonDerivableChildOutput {
             fragment_id: node.fragment_id,
             node_id: node.node_id,
@@ -1010,14 +1019,6 @@ pub(in crate::planner::distributed) fn build_fragment_edge_output_catalog(
 ) -> Result<FragmentEdgeOutputCatalog, NodeOutputError> {
     let mut fragment_outputs = BTreeMap::new();
     for fragment in fragments {
-        // Connector writer output schema is sealed separately; skip it here so
-        // the native encoder maps that contract 1:1.
-        if matches!(
-            fragment.sink,
-            DataSink::ConnectorWrite(ref sink) if sink.output_contract.is_some()
-        ) {
-            continue;
-        }
         let columns = finalize_fragment_output_columns(fragment, node_outputs);
         fragment_outputs.insert(fragment.fragment_id, columns);
     }
@@ -1402,6 +1403,14 @@ fn wire_node_output_columns(
             sealed_covered_output(node, fragment_id, node_outputs, &set_op.output_columns)
         }
         DistributedNodeKind::Exchange(exchange) => Ok(exchange.output_columns.clone()),
+        // The NCP-6 write nodes emit the frozen write-result relation on the
+        // wire exactly as they emit it at execution.
+        DistributedNodeKind::TableWriter(_) => {
+            Ok(crate::planner::distributed::write::node::table_writer_output_columns())
+        }
+        DistributedNodeKind::TableFinish(_) => {
+            Ok(crate::planner::distributed::write::node::table_finish_output_columns())
+        }
         DistributedNodeKind::Repeat(_) => Err(NodeOutputError::NonDerivableChildOutput {
             fragment_id,
             node_id: node.node_id,
@@ -1769,17 +1778,14 @@ pub struct ConnectorWriteOutputContract {
     pub target_schema: Vec<FinalizedWriteTargetColumn>,
 }
 
-/// Finalized write-path contracts for a sealed distributed plan: Iceberg write
-/// fragment outputs and change-stream router branch partitions. The native
-/// encoder reads both instead of synthesizing/reconstructing them.
+/// Finalized write-path contracts for a sealed distributed plan: change-stream
+/// router branch partitions. The native encoder reads them instead of
+/// synthesizing/reconstructing them.
 ///
-/// (`TypedExpr` / `DataPartition` carry an arrow `DataType` and do not implement
-/// `Eq`, so this catalog is `Clone, Debug` only, like [`FragmentEdgeOutputCatalog`].)
+/// (`DataPartition` carries an arrow `DataType` and does not implement `Eq`, so
+/// this catalog is `Clone, Debug` only, like [`FragmentEdgeOutputCatalog`].)
 #[derive(Clone, Debug)]
 pub struct WriteContractCatalog {
-    /// Finalized Iceberg write output/target-schema, keyed by fragment id. Only
-    /// Connector-write fragments with a frozen output contract are present.
-    connector_write_outputs: BTreeMap<FragmentId, ConnectorWriteOutputContract>,
     /// Finalized row-mutation router partition, keyed by the router fragment
     /// id and opaque route id. Only `DataSink::ChangeStreamRouter`
     /// fragments contribute entries.
@@ -1788,15 +1794,6 @@ pub struct WriteContractCatalog {
 }
 
 impl WriteContractCatalog {
-    /// The finalized write output/target-schema of the Iceberg write fragment
-    /// identified by `fragment_id`, or `None` for a non-write fragment.
-    pub fn connector_write_output(
-        &self,
-        fragment_id: FragmentId,
-    ) -> Option<&ConnectorWriteOutputContract> {
-        self.connector_write_outputs.get(&fragment_id)
-    }
-
     /// The finalized partition of the row-mutation router route identified by
     /// `(fragment_id, route_id)`, or `None` if that fragment is not a router or
     /// the opaque route id is unknown.
@@ -1911,16 +1908,10 @@ impl fmt::Display for WriteContractError {
 pub(in crate::planner::distributed) fn build_write_contract_catalog(
     fragments: &[PlanFragment],
 ) -> Result<WriteContractCatalog, WriteContractError> {
-    let mut connector_write_outputs = BTreeMap::new();
     let mut router_branch_partitions = BTreeMap::new();
 
     for fragment in fragments {
         match &fragment.sink {
-            DataSink::ConnectorWrite(sink) => {
-                if let Some(contract) = &sink.output_contract {
-                    connector_write_outputs.insert(fragment.fragment_id, contract.clone());
-                }
-            }
             DataSink::ChangeStreamRouter(router) => {
                 for route in &router.routes {
                     let partition = finalize_router_route_partition(fragment, route)?;
@@ -1933,7 +1924,6 @@ pub(in crate::planner::distributed) fn build_write_contract_catalog(
     }
 
     Ok(WriteContractCatalog {
-        connector_write_outputs,
         router_branch_partitions,
     })
 }
@@ -3362,50 +3352,36 @@ mod tests {
     }
 
     /// Builds a SQL-only terminal schema and freezes it into the generic
-    /// connector-write contract used by a sealed fragment.
-    fn try_write_fragment(
+    /// connector-write contract a table-writer node carries.
+    fn try_write_contract(
         output_columns: Vec<OutputColumn>,
         output_exprs: Option<Vec<TypedExpr>>,
         input: ConnectorWriteInputBinding,
         target_columns: Vec<ColumnDef>,
-    ) -> Result<PlanFragment, super::WriteContractError> {
+    ) -> Result<super::ConnectorWriteOutputContract, super::WriteContractError> {
         let planning_input =
-            ConnectorWritePlanInput::from_target_columns(&target_columns, input.clone(), None);
-        let mut fragment = PlanFragment {
+            ConnectorWritePlanInput::from_target_columns(&target_columns, input, None);
+        let fragment = PlanFragment {
             fragment_id: 0,
             root: values_node(10, output_columns.clone()),
             data_partition: DataPartition::unpartitioned(),
             output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::ConnectorWrite(
-                crate::planner::distributed::write::sink::ConnectorWriteFragmentSink {
-                    handle: None,
-                    input: input.clone(),
-                    output_contract: None,
-                },
-            ),
+            sink: DataSink::Result,
             output_exprs,
             output_columns,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         };
-        let contract = super::finalize_connector_write_output(&fragment, &planning_input)?;
-        fragment.sink = DataSink::ConnectorWrite(
-            crate::planner::distributed::write::sink::ConnectorWriteFragmentSink {
-                handle: None,
-                input,
-                output_contract: Some(contract),
-            },
-        );
-        Ok(fragment)
+        super::finalize_connector_write_output(&fragment, &planning_input)
     }
 
-    fn write_fragment(
+    fn write_contract(
         output_columns: Vec<OutputColumn>,
         output_exprs: Option<Vec<TypedExpr>>,
         input: ConnectorWriteInputBinding,
         target_columns: Vec<ColumnDef>,
-    ) -> PlanFragment {
-        try_write_fragment(output_columns, output_exprs, input, target_columns)
+    ) -> super::ConnectorWriteOutputContract {
+        try_write_contract(output_columns, output_exprs, input, target_columns)
             .expect("write fixture must freeze a valid connector contract")
     }
 
@@ -3435,14 +3411,17 @@ mod tests {
 
     fn route_for_test(
         route_byte: u8,
+        write_target_ordinal: u32,
         input_ordinals: Vec<usize>,
         output_partition_ordinals: Vec<usize>,
     ) -> ChangeStreamRoute {
         ChangeStreamRoute {
             route_id: novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([route_byte; 32]),
-            cohort_id: novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(
-                [route_byte.wrapping_add(1); 32],
-            ),
+            write_target_ordinal:
+                novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(
+                    write_target_ordinal,
+                )
+                .expect("bounded ordinal"),
             accepted_effects: vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
             input_ordinals: input_ordinals
                 .into_iter()
@@ -3474,7 +3453,7 @@ mod tests {
     fn write_contract_rejects_output_expr_arity_mismatch() {
         // Declared `output_exprs` whose count differs from the target columns must
         // fail fast, reproducing the encoder's arity check.
-        let error = try_write_fragment(
+        let error = try_write_contract(
             vec![output_col(1, "a"), output_col(2, "b")],
             Some(vec![super::column_ref_expr(&output_col(1, "a"))]),
             ConnectorWriteInputBinding::RootOutputByOrdinal,
@@ -3498,7 +3477,7 @@ mod tests {
     fn write_contract_rejects_input_arity_mismatch() {
         // With no declared `output_exprs`, a bound input column count that differs
         // from the target columns must fail fast (encoder's input-binding check).
-        let error = try_write_fragment(
+        let error = try_write_contract(
             vec![output_col(1, "a"), output_col(2, "b")],
             None,
             ConnectorWriteInputBinding::RootOutputByOrdinal,
@@ -3517,7 +3496,7 @@ mod tests {
 
     #[test]
     fn sqlx2_write_contract_casts_narrow_binary_to_variant_target() {
-        let fragment = try_write_fragment(
+        let contract = try_write_contract(
             vec![OutputColumn {
                 data_type: DataType::Binary,
                 nullable: true,
@@ -3528,12 +3507,6 @@ mod tests {
             vec![target_column("variant_value", DataType::LargeBinary, true)],
         )
         .expect("SQL write contract must align the terminal variant representation");
-        let DataSink::ConnectorWrite(sink) = fragment.sink else {
-            panic!("write fixture must retain connector sink");
-        };
-        let contract = sink
-            .output_contract
-            .expect("write fixture must finalize output contract");
         assert!(matches!(
             contract.output_exprs.as_slice(),
             [TypedExpr {
@@ -3546,7 +3519,7 @@ mod tests {
 
     #[test]
     fn write_contract_preserves_narrowed_dv_input_schema() {
-        let fragment = try_write_fragment(
+        let contract = try_write_contract(
             vec![output_col(10, "file_path"), output_col(11, "row_position")],
             None,
             ConnectorWriteInputBinding::OutputOrdinals(vec![0, 1]),
@@ -3557,11 +3530,6 @@ mod tests {
         )
         .expect("DV position input must freeze a connector contract");
 
-        let catalog = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
-            .expect("DV position input must seal without projecting user-table columns");
-        let contract = catalog
-            .connector_write_output(0)
-            .expect("DV fragment must have a write contract");
         assert_eq!(contract.output_exprs.len(), 2);
         assert_eq!(contract.target_schema.len(), 2);
         assert_eq!(contract.target_schema[0].name, "file_path");
@@ -3573,7 +3541,7 @@ mod tests {
         // An `OutputOrdinals` binding referencing a nonexistent fragment output
         // column must fail fast (the defensive twin of the encoder's check; the
         // boundary catalog also rejects this earlier through a full seal).
-        let error = try_write_fragment(
+        let error = try_write_contract(
             vec![output_col(1, "a")],
             None,
             ConnectorWriteInputBinding::OutputOrdinals(vec![5]),
@@ -3600,7 +3568,7 @@ mod tests {
                 output_col(2, "route"),
                 output_col(3, "bucket"),
             ],
-            vec![route_for_test(7, vec![2], vec![5])],
+            vec![route_for_test(7, 0, vec![2], vec![5])],
         );
         let error = super::build_write_contract_catalog(std::slice::from_ref(&fragment))
             .expect_err("out-of-range router partition ordinal must not finalize");
@@ -3616,31 +3584,19 @@ mod tests {
     }
 
     #[test]
-    fn seal_finalizes_write_output_exprs_and_positional_target_schema() {
+    fn finalize_write_output_exprs_and_positional_target_schema() {
         // RootOutputByOrdinal: the write output expressions are column refs into
         // the fragment output columns (real logical ids), and the target schema
         // carries positional 1-based ids with the target column metadata.
-        let plan = DistributedPlanDraftBuilder::new(
-            vec![write_fragment(
-                vec![output_col(7, "a"), output_col(9, "b")],
-                None,
-                ConnectorWriteInputBinding::RootOutputByOrdinal,
-                vec![
-                    target_column("ta", DataType::Int32, false),
-                    target_column("tb", DataType::Int64, true),
-                ],
-            )],
-            Some(0),
-            Vec::new(),
-            Default::default(),
-        )
-        .seal()
-        .expect("write plan seals");
-
-        let contract = plan
-            .write_contracts()
-            .connector_write_output(0)
-            .expect("write fragment has a finalized contract");
+        let contract = write_contract(
+            vec![output_col(7, "a"), output_col(9, "b")],
+            None,
+            ConnectorWriteInputBinding::RootOutputByOrdinal,
+            vec![
+                target_column("ta", DataType::Int32, false),
+                target_column("tb", DataType::Int64, true),
+            ],
+        );
         assert_eq!(
             contract
                 .output_exprs
@@ -3671,30 +3627,18 @@ mod tests {
     }
 
     #[test]
-    fn seal_finalizes_write_output_exprs_by_output_ordinals() {
-        // OutputOrdinals reorders the fragment output columns feeding the sink;
+    fn finalize_write_output_exprs_by_output_ordinals() {
+        // OutputOrdinals reorders the fragment output columns feeding the writer;
         // the finalized output expressions follow that order.
-        let plan = DistributedPlanDraftBuilder::new(
-            vec![write_fragment(
-                vec![output_col(7, "a"), output_col(9, "b")],
-                None,
-                ConnectorWriteInputBinding::OutputOrdinals(vec![1, 0]),
-                vec![
-                    target_column("ta", DataType::Int64, false),
-                    target_column("tb", DataType::Int64, false),
-                ],
-            )],
-            Some(0),
-            Vec::new(),
-            Default::default(),
-        )
-        .seal()
-        .expect("write plan seals");
-
-        let contract = plan
-            .write_contracts()
-            .connector_write_output(0)
-            .expect("write fragment has a finalized contract");
+        let contract = write_contract(
+            vec![output_col(7, "a"), output_col(9, "b")],
+            None,
+            ConnectorWriteInputBinding::OutputOrdinals(vec![1, 0]),
+            vec![
+                target_column("ta", DataType::Int64, false),
+                target_column("tb", DataType::Int64, false),
+            ],
+        );
         assert_eq!(
             contract
                 .output_exprs
@@ -3718,8 +3662,8 @@ mod tests {
                     output_col(3, "bucket"),
                 ],
                 vec![
-                    route_for_test(7, vec![2], vec![2]),
-                    route_for_test(8, vec![2], Vec::new()),
+                    route_for_test(7, 0, vec![2], vec![2]),
+                    route_for_test(8, 1, vec![2], Vec::new()),
                 ],
             )],
             Some(0),
@@ -3760,7 +3704,6 @@ mod tests {
             vec![output_col(1, "a")],
         )
         .expect("result plan seals");
-        assert!(plan.write_contracts().connector_write_output(0).is_none());
         assert!(
             plan.write_contracts()
                 .router_route_partition(

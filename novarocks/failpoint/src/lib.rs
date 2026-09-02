@@ -66,10 +66,17 @@ pub enum QueryLifecycleFaultKind {
     StartDigestCorrupt,
     ObservationForeignParticipant,
     RuntimeFilterFeedbackForeignParticipant,
+    /// Fails one connector writer at commit-fragment egress. It only fails a
+    /// writer that already staged its artifacts; it never substitutes a
+    /// fabricated carrier, so it cannot become a production fallback.
+    ConnectorWriteWriterFailure,
+    /// Fails the single root aggregation at commit-fragment carrier
+    /// validation. Like the writer fault it only rejects, never repairs.
+    ConnectorWriteRootFailure,
 }
 
 impl QueryLifecycleFaultKind {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 30] = [
         Self::InitAckDrop,
         Self::StageAckDrop,
         Self::StartAckDrop,
@@ -98,6 +105,8 @@ impl QueryLifecycleFaultKind {
         Self::StartDigestCorrupt,
         Self::ObservationForeignParticipant,
         Self::RuntimeFilterFeedbackForeignParticipant,
+        Self::ConnectorWriteWriterFailure,
+        Self::ConnectorWriteRootFailure,
     ];
 
     pub const fn file_stem(self) -> &'static str {
@@ -134,6 +143,8 @@ impl QueryLifecycleFaultKind {
             Self::RuntimeFilterFeedbackForeignParticipant => {
                 "runtime-filter-feedback-foreign-participant"
             }
+            Self::ConnectorWriteWriterFailure => "connector-write-writer-failure",
+            Self::ConnectorWriteRootFailure => "connector-write-root-failure",
         }
     }
 
@@ -146,10 +157,14 @@ impl QueryLifecycleFaultKind {
     }
 }
 
-/// The runner can request only the explicitly allowlisted closeout fault
-/// subset, never a generic lifecycle hook. This is intentionally a separate
-/// parsing surface.
-pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 18] = [
+/// The faults a test harness may arm by name.
+///
+/// It is deliberately an allowlist rather than the whole declared set: a
+/// harness gets the closeout faults it needs, never a generic lifecycle hook.
+/// Both the SQL runner's directive vocabulary and the cluster harness's
+/// arm-by-kind path read this list, so a fault that belongs to one belongs to
+/// both.
+pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 20] = [
     QueryLifecycleFaultKind::ObservationP2AssemblyFailure,
     QueryLifecycleFaultKind::ObservationP2BudgetPressure,
     QueryLifecycleFaultKind::TerminalP0RetainedSlotExhausted,
@@ -168,6 +183,11 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 18] = [
     QueryLifecycleFaultKind::StartDigestCorrupt,
     QueryLifecycleFaultKind::ObservationForeignParticipant,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignParticipant,
+    // The write data plane's two faults. Both only ever fail: a writer fault
+    // fires at commit-fragment egress, after the writer already staged, and a
+    // root fault fires at carrier validation. Neither substitutes a value.
+    QueryLifecycleFaultKind::ConnectorWriteWriterFailure,
+    QueryLifecycleFaultKind::ConnectorWriteRootFailure,
 ];
 
 pub fn parse_runner_rfo_kind(value: &str) -> Option<QueryLifecycleFaultKind> {
@@ -610,14 +630,14 @@ mod tests {
     use super::*;
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
-        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 28);
+        assert_eq!(QueryLifecycleFaultKind::ALL.len(), 30);
         for kind in QueryLifecycleFaultKind::ALL {
             assert_eq!(QueryLifecycleFaultKind::parse(kind.file_stem()), Some(kind));
         }
     }
     #[test]
     fn runner_parser_rejects_non_rfo_kinds() {
-        assert_eq!(RUNNER_RFO_KINDS.len(), 18);
+        assert_eq!(RUNNER_RFO_KINDS.len(), 20);
         assert_eq!(
             parse_runner_rfo_kind("terminal-outcome-suppress"),
             Some(QueryLifecycleFaultKind::TerminalOutcomeSuppress)
@@ -630,6 +650,15 @@ mod tests {
             parse_runner_rfo_kind("task-update-terminal-ack-drop"),
             Some(QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop)
         );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-writer-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteWriterFailure)
+        );
+        assert_eq!(
+            parse_runner_rfo_kind("connector-write-root-failure"),
+            Some(QueryLifecycleFaultKind::ConnectorWriteRootFailure)
+        );
+        // A generic lifecycle hook stays out of reach of a harness.
         assert_eq!(parse_runner_rfo_kind("init-ack-drop"), None);
     }
     #[test]

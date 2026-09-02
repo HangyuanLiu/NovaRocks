@@ -17,52 +17,10 @@
 
 use super::type_mapping::{encode_data_partition, encode_row_mutation_effect, usize_to_u64};
 use super::{NativePlanEncodeContext, required_context_ref};
-use novarocks_proto_codec::catalog::encode_catalog_handle;
-use novarocks_proto_models::{common, plan};
-use novarocks_sql::plan_read::{
-    ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding, FragmentId,
-};
+use novarocks_proto_models::plan;
+use novarocks_sql::plan_read::{ChangeStreamRouterSink, ConnectorWriteInputBinding, FragmentId};
 
-/// Encode the generic writer envelope without inspecting the provider payload.
-/// The payload is authenticated by its SPI digest and is interpreted only by
-/// the exact query-leased catalog runtime on the backend.
-pub(super) fn encode_connector_write_fragment_sink(
-    src: &ConnectorWriteFragmentSink,
-) -> plan::ConnectorWriteFragmentSink {
-    plan::ConnectorWriteFragmentSink {
-        handle: src.handle().map(|handle| {
-            let writer = handle.writer();
-            plan::ConnectorWriterHandleEnvelope {
-                contract_version: handle.version(),
-                writer: Some(plan::ConnectorWriterIdentity {
-                    operation_id: writer.operation_id().to_bytes().to_vec(),
-                    cohort_id: writer.cohort_id().to_bytes().to_vec(),
-                    execution_query_id: writer.execution_id().query_id().to_vec(),
-                    execution_attempt_id: writer.execution_id().attempt_id(),
-                    fragment_instance_id: Some(encode_writer_unique_id(
-                        writer.fragment_instance_id(),
-                    )),
-                    fragment_id: writer.fragment_id(),
-                    backend_num: writer.backend_num(),
-                    sink_ordinal: writer.sink_ordinal(),
-                    catalog_handle: Some(encode_catalog_handle(writer.catalog_handle())),
-                }),
-                payload: handle.payload().to_vec(),
-                payload_sha256: handle.payload_digest().to_vec(),
-            }
-        }),
-        input: Some(encode_connector_write_input_binding(src.input())),
-    }
-}
-
-fn encode_writer_unique_id(value: [u8; 16]) -> common::UniqueId {
-    common::UniqueId {
-        hi: i64::from_be_bytes(value[..8].try_into().expect("fixed UUID prefix")),
-        lo: i64::from_be_bytes(value[8..].try_into().expect("fixed UUID suffix")),
-    }
-}
-
-fn encode_connector_write_input_binding(
+pub(super) fn encode_connector_write_input_binding(
     src: &ConnectorWriteInputBinding,
 ) -> plan::ConnectorWriteInputBinding {
     use plan::connector_write_input_binding::Kind;
@@ -105,7 +63,7 @@ pub(super) fn encode_change_stream_router_sink(
                     )?),
                     destinations: None,
                     route_id: route.route_id().to_bytes().to_vec(),
-                    cohort_id: route.cohort_id().to_bytes().to_vec(),
+                    write_target_ordinal: route.write_target_ordinal().get(),
                     accepted_effects: route
                         .accepted_effects()
                         .iter()

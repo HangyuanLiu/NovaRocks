@@ -45,8 +45,6 @@ pub struct RuntimeState {
     spill_config: Option<SpillConfig>,
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
-    connector_staged_report_collector:
-        Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
     scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
 }
@@ -94,7 +92,6 @@ impl Default for RuntimeState {
             spill_config: None,
             spill_manager: None,
             runtime_filter_session: None,
-            connector_staged_report_collector: None,
             execution_runtime: None,
             scan_registration: None,
         }
@@ -117,7 +114,6 @@ impl Clone for RuntimeState {
             spill_config: self.spill_config.clone(),
             spill_manager: self.spill_manager.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
-            connector_staged_report_collector: self.connector_staged_report_collector.clone(),
             execution_runtime: self.execution_runtime.clone(),
             scan_registration: self.scan_registration.clone(),
         }
@@ -168,7 +164,6 @@ impl RuntimeState {
             spill_config,
             spill_manager,
             runtime_filter_session: None,
-            connector_staged_report_collector: None,
             execution_runtime,
             scan_registration,
         }
@@ -177,29 +172,6 @@ impl RuntimeState {
     pub fn with_runtime_filter_session(mut self, session: Option<RuntimeFilterSessionRef>) -> Self {
         self.runtime_filter_session = session;
         self
-    }
-
-    pub fn with_connector_staged_report_collector(
-        mut self,
-        collector: Option<crate::runtime::connector_write_report::ConnectorStagedReportCollector>,
-    ) -> Self {
-        self.connector_staged_report_collector = collector;
-        self
-    }
-
-    pub(crate) fn connector_staged_report_collector(
-        &self,
-    ) -> Option<&crate::runtime::connector_write_report::ConnectorStagedReportCollector> {
-        self.connector_staged_report_collector.as_ref()
-    }
-
-    pub fn take_connector_staged_report_frames(
-        &self,
-    ) -> Vec<novarocks_spi::connector::ConnectorStagedReportFrame> {
-        self.connector_staged_report_collector
-            .as_ref()
-            .map(|collector| collector.take())
-            .unwrap_or_default()
     }
 
     pub(crate) fn runtime_filter_session(&self) -> Option<&RuntimeFilterSessionRef> {

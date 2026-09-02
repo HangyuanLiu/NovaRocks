@@ -563,7 +563,50 @@ fn format_distributed_node<M>(
             );
             format_children(node, level, indent, actuals, out);
         }
+        DistributedNodeKind::TableWriter(writer) => {
+            format_table_writer_node(node, writer, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, actuals, out);
+        }
+        DistributedNodeKind::TableFinish(finish) => {
+            format_table_finish_node(node, finish, &pad, &costs_suffix, &stats_suffix, out);
+            format_children(node, level, indent, actuals, out);
+        }
     }
+}
+
+fn format_table_writer_node(
+    node: &DistributedNode,
+    writer: &crate::planner::distributed::write::TableWriterNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    out.push(format!(
+        "{pad}{} TABLE WRITER (write_target_ordinal={}){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+        writer.write_target_ordinal().get(),
+    ));
+}
+
+fn format_table_finish_node(
+    node: &DistributedNode,
+    finish: &crate::planner::distributed::write::TableFinishNode,
+    pad: &str,
+    costs_suffix: &str,
+    stats_suffix: &str,
+    out: &mut Vec<String>,
+) {
+    let ordinals = finish
+        .expected_target_ordinals()
+        .iter()
+        .map(|ordinal| ordinal.get().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    out.push(format!(
+        "{pad}{} TABLE FINISH (write_target_ordinals=[{ordinals}]){costs_suffix}{stats_suffix}",
+        node_prefix(node),
+    ));
 }
 
 fn format_children<M>(
@@ -586,7 +629,11 @@ fn node_prefix(node: &DistributedNode) -> String {
 
 fn physical_payload(node: &DistributedNode) -> Option<PhysicalPlanKind> {
     match &node.payload {
-        DistributedNodeKind::Exchange(_) => None,
+        // Overlay-only kinds have no physical twin; `distributed_kind_to_physical`
+        // refuses them, so they must be filtered out here.
+        DistributedNodeKind::Exchange(_)
+        | DistributedNodeKind::TableWriter(_)
+        | DistributedNodeKind::TableFinish(_) => None,
         kind => Some(crate::planner::distributed::distributed_kind_to_physical(
             kind,
         )),
@@ -613,6 +660,8 @@ fn physical_kind_name(payload: &DistributedNodeKind) -> &'static str {
         DistributedNodeKind::SetOp(_) => "SetOp",
         DistributedNodeKind::ChangeEventExpand(_) => "ChangeEventExpand",
         DistributedNodeKind::Exchange(_) => "Exchange",
+        DistributedNodeKind::TableWriter(_) => "TableWriter",
+        DistributedNodeKind::TableFinish(_) => "TableFinish",
     }
 }
 
