@@ -67,6 +67,15 @@ FE；只有 FE 能调用 provider 的 finish 并提交 snapshot。
 序号、以及 attempt-local 的物理位置。它们各自只被自己的 owner 使用，commit fragment 不重复携带
 其中任何一层。
 
+**独占性由分区承担，不再由锁承担。** 删掉共享 writer 的锁，就把「同一个 provider 对象只能由一个
+writer 产出」这件事从运行时互斥变成了计划责任。provider 声明该分支的分区键（例如删除向量分支按
+`_file`），交换按该键哈希——但哈希只分发到 fragment **实例**，实例内的每个 driver 仍从同一个接收器
+取数据。因此 writer 的输入还必须按同一个键在它自己 pipeline 的 driver 之间再分一次，独占性才落到
+driver 这一层。少了这一步，一个数据文件的行会被两个 driver 取走，各自产出一份完整产物；这在实现
+期是一个真实的正确性缺陷，且只在单个文件的行跨越多个 chunk 时才出现——小规模 fixture 永远测不到。
+任何新增的、要求「每个对象只由一个 writer 产出」的分支都必须声明它的键，并确认这次 driver 级重分
+区确实作用到了它。
+
 **提交门是两个互不蕴含的事实的合取。** 读到 result 的 end-of-stream 证明写数据面闭合了；lifecycle
 terminal 证明这次 attempt 的每个 participant 都成功了。前者不能证明别的 participant 没失败；后者
 因为 terminal 不再携带产物，也不能证明 FE 收到了数据。两者缺一都不提交。
