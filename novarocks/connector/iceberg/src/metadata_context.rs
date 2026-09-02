@@ -291,8 +291,13 @@ impl IcebergMetadataContext {
         // deliberately dropped the collector and carries a replacement
         // terminal-only resolver; it must reload through that resolver rather
         // than reuse a FileIO that was bound to the active attempt lease.
+        //
+        // It must also reach the catalog rather than the control-state table
+        // cache: this is the observation a commit decides against, so a cached
+        // table would let it compute replacements from a snapshot the branch
+        // has already moved past.
         if request_context.vended_credential_lease_sink().is_none() {
-            return self.load_table_classified_uncached(
+            return self.observe_table_classified(
                 &namespace,
                 &table,
                 credential_lease_collection,
@@ -321,6 +326,13 @@ impl IcebergMetadataContext {
     /// Perform the one physical catalog observation for a cache miss. The
     /// caller owns normalization and, when applicable, the attempt-local
     /// single-flight entry that memoizes both its value and failure.
+    /// Load past the attempt-local cache, but still accept a control-state
+    /// cached table when no vended credential collection forces a fresh
+    /// observation.
+    ///
+    /// This is a read-side reuse. A caller whose result decides an external
+    /// effect must use [`Self::observe_table_classified`] instead: the name of
+    /// this one says only that it skips the *attempt* cache.
     fn load_table_classified_uncached(
         &self,
         namespace: &str,
@@ -338,6 +350,22 @@ impl IcebergMetadataContext {
                 return Ok(table);
             }
         }
+        self.observe_table_classified(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+        )
+    }
+
+    /// Observe the catalog now, reusing no cache at any level.
+    fn observe_table_classified(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
         let ident = TableIdent::from_strs([namespace, table])
             .map_err(|error| invalid_request(format!("build Iceberg table identity: {error}")))?;
         let owner = Arc::clone(self.novarocks_catalog());
