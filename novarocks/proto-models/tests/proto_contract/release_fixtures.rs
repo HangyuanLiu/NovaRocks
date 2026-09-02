@@ -388,7 +388,6 @@ fn release_report_query_terminal_request() -> novarocks::ReportQueryTerminalRequ
             error_code: String::new(),
             error_detail: String::new(),
             error_detail_truncated: false,
-            connector_staged_report_frames: vec![],
             tablet_commit_infos: vec![novarocks::QueryTerminalTabletInfo {
                 tablet_id: 100,
                 backend_id: 9,

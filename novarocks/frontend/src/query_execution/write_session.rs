@@ -34,8 +34,8 @@
 //! "the connector was never asked to commit" an assertable fact rather than an
 //! inference.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
@@ -46,8 +46,8 @@ use novarocks_spi::connector::write_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEvidence,
-    ExternalMutationOutcome,
+    ConnectorStorageResolver, ConnectorWriteAbortOutcome, ConnectorWriteReceipt,
+    ExternalMutationEvidence, ExternalMutationOutcome,
 };
 
 use crate::connector::control_host::ConnectorWriteStackLease;
@@ -77,6 +77,21 @@ pub(crate) struct ConnectorWriteSession {
     accumulated: Mutex<AccumulatedWriteSet>,
     terminal: Mutex<Option<TerminalDecision>>,
     finish_invocations: AtomicUsize,
+    /// The frontend-local, terminal-only storage capability of the query
+    /// attempt whose fragments this session commits.
+    ///
+    /// A distributed write reaches its external effect *after* its lifecycle
+    /// attempt finalizes: the commit reloads table metadata and writes
+    /// manifests through object storage once every participant has converged.
+    /// The attempt's live storage authority already refuses a resolve by then,
+    /// so on a vended-credential deployment this capability is the only thing
+    /// the commit can read storage through -- and holding it is what defers
+    /// the attempt's credential cleanup past finalization.
+    ///
+    /// It is cleared as soon as no further external decision can need storage,
+    /// and dropping the session clears it too, so a write that neither commits
+    /// nor reconciles cannot pin credential material.
+    terminal_storage: Mutex<Option<Arc<dyn ConnectorStorageResolver>>>,
 }
 
 /// What a session has collected so far across the queries it drives.
@@ -114,7 +129,28 @@ impl ConnectorWriteSession {
             accumulated: Mutex::new(AccumulatedWriteSet::default()),
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
+            terminal_storage: Mutex::new(None),
         })
+    }
+
+    /// Retain the query attempt's terminal-only storage capability for this
+    /// session's external decision.
+    ///
+    /// The caller takes the capability from a lifecycle lease that has not yet
+    /// been finalized, because the hold it carries is what tells finalization
+    /// that a connector write still needs the attempt's credential leases.
+    ///
+    /// A statement that drives several rounds against one session installs the
+    /// newest round's capability. The one it replaces releases its hold right
+    /// away: the round that produced it can no longer be the round that
+    /// commits, so its credential material is nothing this session still needs.
+    pub(crate) fn retain_terminal_storage_resolver(
+        &self,
+        resolver: Arc<dyn ConnectorStorageResolver>,
+    ) {
+        if let Ok(mut terminal_storage) = self.terminal_storage.lock() {
+            *terminal_storage = Some(resolver);
+        }
     }
 
     /// The sealed ordinal set a prepared write set may not exceed.
@@ -272,6 +308,22 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         self.claim_terminal(TerminalDecision::Committed)?;
+        let outcome = self.commit_accumulated(context);
+        // Reconciliation is the one decision that may still follow a commit,
+        // and it reads the same object store. Every other way out of here --
+        // committed, uncommitted, or an error that leaves neither a retry nor
+        // an abort reachable -- settles the session.
+        if !self.awaits_reconciliation() {
+            self.release_terminal_storage_resolver();
+        }
+        outcome
+    }
+
+    fn commit_accumulated(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let context = self.terminal_context(context)?;
         let (row_count, fragments) = {
             let mut accumulated = self.lock_accumulated()?;
             (
@@ -322,6 +374,19 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         self.claim_terminal(TerminalDecision::Committed)?;
+        let outcome = self.commit_single(prepared, context);
+        if !self.awaits_reconciliation() {
+            self.release_terminal_storage_resolver();
+        }
+        outcome
+    }
+
+    fn commit_single(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        let context = self.terminal_context(context)?;
         let prepared = self.interpret(prepared)?;
         self.finish_invocations.fetch_add(1, Ordering::SeqCst);
         let outcome = self
@@ -344,12 +409,18 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
         self.claim_terminal(TerminalDecision::Aborted)?;
-        self.lease
-            .session()
-            .abort_write(ConnectorWriteSessionAbortRequest {
-                commit: self.plan.commit_handle(),
-                context,
-            })
+        let outcome = self.terminal_context(context).and_then(|context| {
+            self.lease
+                .session()
+                .abort_write(ConnectorWriteSessionAbortRequest {
+                    commit: self.plan.commit_handle(),
+                    context,
+                })
+        });
+        // An aborted session can reach nothing else, whether the provider's
+        // cleanup succeeded or not.
+        self.release_terminal_storage_resolver();
+        outcome
     }
 
     /// Resolve a commit whose external outcome is unknown. Only reachable after
@@ -368,13 +439,69 @@ impl ConnectorWriteSession {
                 ));
             }
         }
-        self.lease
-            .session()
-            .reconcile_write(ConnectorWriteSessionReconcileRequest {
-                commit: self.plan.commit_handle(),
-                evidence,
-                context,
-            })
+        let outcome = self.terminal_context(context).and_then(|context| {
+            self.lease
+                .session()
+                .reconcile_write(ConnectorWriteSessionReconcileRequest {
+                    commit: self.plan.commit_handle(),
+                    evidence,
+                    context,
+                })
+        });
+        // A reconciliation that came back unknown, or that failed to reach the
+        // provider at all, may be asked again and needs the same capability.
+        // Anything else is the session's last external decision.
+        let settled = matches!(
+            &outcome,
+            Ok(outcome) if !matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. })
+        );
+        if settled {
+            self.release_terminal_storage_resolver();
+        }
+        outcome
+    }
+
+    /// Decorate one terminal request with this session's retained capability.
+    ///
+    /// The vended-credential sink is removed with it: the attempt's credential
+    /// descriptors were frozen at Init, so a terminal metadata reload may
+    /// consume an existing lease but can never contribute a new one.
+    fn terminal_context(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorRequestContext, ConnectorError> {
+        let context = context.without_vended_credential_lease_sink();
+        Ok(match self.lock_terminal_storage()?.as_ref() {
+            Some(resolver) => context.with_storage_resolver(Arc::clone(resolver)),
+            None => context,
+        })
+    }
+
+    /// Whether a commit reported an unknown outcome that reconciliation has
+    /// not answered yet.
+    fn awaits_reconciliation(&self) -> bool {
+        self.lock_terminal()
+            .is_ok_and(|terminal| *terminal == Some(TerminalDecision::CommitUnknown))
+    }
+
+    /// Drop the retained capability, releasing the hold that deferred the
+    /// attempt's credential cleanup.
+    fn release_terminal_storage_resolver(&self) {
+        if let Ok(mut terminal_storage) = self.terminal_storage.lock() {
+            *terminal_storage = None;
+        }
+    }
+
+    fn lock_terminal_storage(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Arc<dyn ConnectorStorageResolver>>>, ConnectorError>
+    {
+        self.terminal_storage.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write session terminal storage capability is poisoned",
+            )
+        })
     }
 
     fn lock_accumulated(
@@ -501,7 +628,8 @@ pub(crate) mod tests {
     use novarocks_spi::connector::{
         CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
         ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorWriteControl as LegacyWriteControl,
+        ConnectorWriteControl as LegacyWriteControl, CredentialLeaseId, ResolvedVendedS3Access,
+        StorageAccessDomainId, StorageAccessRequest, StorageCredentialScopePrefix,
     };
 
     use super::*;
@@ -570,6 +698,11 @@ pub(crate) mod tests {
         pub(crate) finish: usize,
         pub(crate) abort: usize,
         pub(crate) reconcile: usize,
+        /// What the last terminal request could actually read object storage
+        /// with. A real provider resolves this before it reloads table metadata
+        /// or writes a manifest, so recording it here is recording whether the
+        /// commit could have happened at all.
+        pub(crate) terminal_storage: Option<Result<String, String>>,
     }
 
     struct FakeSession {
@@ -621,9 +754,13 @@ pub(crate) mod tests {
 
         fn finish_write(
             &self,
-            _request: ConnectorWriteFinishRequest<'_>,
+            request: ConnectorWriteFinishRequest<'_>,
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            self.recorded.lock().expect("recorded").finish += 1;
+            {
+                let mut recorded = self.recorded.lock().expect("recorded");
+                recorded.finish += 1;
+                recorded.terminal_storage = Some(probe_vended_storage(&request.context));
+            }
             self.finish_outcome
                 .lock()
                 .expect("outcome")
@@ -635,9 +772,11 @@ pub(crate) mod tests {
 
         fn abort_write(
             &self,
-            _request: ConnectorWriteSessionAbortRequest<'_>,
+            request: ConnectorWriteSessionAbortRequest<'_>,
         ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            self.recorded.lock().expect("recorded").abort += 1;
+            let mut recorded = self.recorded.lock().expect("recorded");
+            recorded.abort += 1;
+            recorded.terminal_storage = Some(probe_vended_storage(&request.context));
             Ok(ConnectorWriteAbortOutcome::KnownUncommitted {
                 cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             })
@@ -645,9 +784,11 @@ pub(crate) mod tests {
 
         fn reconcile_write(
             &self,
-            _request: ConnectorWriteSessionReconcileRequest<'_>,
+            request: ConnectorWriteSessionReconcileRequest<'_>,
         ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            self.recorded.lock().expect("recorded").reconcile += 1;
+            let mut recorded = self.recorded.lock().expect("recorded");
+            recorded.reconcile += 1;
+            recorded.terminal_storage = Some(probe_vended_storage(&request.context));
             Err(ConnectorError::new(
                 ConnectorErrorKind::Internal,
                 "reconcile outcome is not scripted in this test",
@@ -828,6 +969,171 @@ pub(crate) mod tests {
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("request context")
+    }
+
+    // ---- the terminal storage capability ----------------------------------
+
+    /// The table location the commit reads and writes through. The provider
+    /// resolves object-store access for it before it can reload metadata or
+    /// write a manifest.
+    const TABLE_LOCATION: &str = "s3://warehouse/db/t/metadata/v2.metadata.json";
+    const TABLE_PREFIX: &str = "s3://warehouse/db/t";
+
+    /// What a provider does at commit time. A terminal request that cannot
+    /// answer this cannot commit, whatever else it carries.
+    fn probe_vended_storage(context: &ConnectorRequestContext) -> Result<String, String> {
+        let resolver = context
+            .storage_resolver()
+            .ok_or_else(|| "terminal request has no storage resolver".to_string())?;
+        let request = StorageAccessRequest::try_new(catalog_handle(), TABLE_LOCATION)
+            .map_err(|error| error.to_string())?;
+        resolver
+            .resolve_vended_s3(&request)
+            .map(|access| access.matched_prefix().as_str().to_string())
+            .map_err(|error| error.to_string())
+    }
+
+    /// The frontend accounting a real query attempt keeps around its vended
+    /// credential leases, reduced to what a write session can observe: the
+    /// terminal capability resolves only after the attempt finalized, an
+    /// outstanding hold defers the lease cleanup that finalization would
+    /// otherwise perform, and releasing the last hold performs it.
+    #[derive(Default)]
+    struct TerminalCredentialAccounting {
+        holds: AtomicUsize,
+        finalized: std::sync::atomic::AtomicBool,
+        leases_cleared: std::sync::atomic::AtomicBool,
+    }
+
+    impl TerminalCredentialAccounting {
+        fn finalize(&self) {
+            self.finalized.store(true, Ordering::SeqCst);
+            if self.holds.load(Ordering::SeqCst) == 0 {
+                self.leases_cleared.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn release_hold(&self) {
+            if self.holds.fetch_sub(1, Ordering::SeqCst) == 1
+                && self.finalized.load(Ordering::SeqCst)
+            {
+                self.leases_cleared.store(true, Ordering::SeqCst);
+            }
+        }
+
+        fn leases_cleared(&self) -> bool {
+            self.leases_cleared.load(Ordering::SeqCst)
+        }
+
+        fn holds(&self) -> usize {
+            self.holds.load(Ordering::SeqCst)
+        }
+    }
+
+    struct TerminalCredentialCapability {
+        accounting: Arc<TerminalCredentialAccounting>,
+    }
+
+    impl ConnectorStorageResolver for TerminalCredentialCapability {
+        fn resolve_vended_s3(
+            &self,
+            request: &StorageAccessRequest,
+        ) -> Result<ResolvedVendedS3Access, ConnectorError> {
+            if !self.accounting.finalized.load(Ordering::SeqCst) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "vended storage terminal capability is unavailable before finalization",
+                ));
+            }
+            if self.accounting.leases_cleared() {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "vended storage access is unavailable for this query attempt",
+                ));
+            }
+            let prefix =
+                StorageCredentialScopePrefix::try_from_normalized(TABLE_PREFIX).expect("prefix");
+            if !request.location().starts_with(prefix.as_str()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "vended storage access is out of the leased scope",
+                ));
+            }
+            Ok(ResolvedVendedS3Access::new(
+                StorageAccessDomainId::from_bytes([9; 32]),
+                CredentialLeaseId::try_from_bytes([5; 16]).expect("lease id"),
+                1,
+                prefix,
+                u64::MAX,
+                novarocks_secret::SecretValue::new("access"),
+                novarocks_secret::SecretValue::new("secret"),
+                novarocks_secret::SecretValue::new("token"),
+            ))
+        }
+    }
+
+    impl Drop for TerminalCredentialCapability {
+        fn drop(&mut self) {
+            self.accounting.release_hold();
+        }
+    }
+
+    /// A lifecycle guard that offers the same terminal-only capability a real
+    /// vended-credential attempt offers, with the same hold accounting.
+    struct TerminalCredentialGuard {
+        accounting: Arc<TerminalCredentialAccounting>,
+    }
+
+    impl crate::query_execution::lifecycle_plan::QueryLifecycleLeaseGuard for TerminalCredentialGuard {
+        fn retain_terminal_storage_resolver(&self) -> Option<Arc<dyn ConnectorStorageResolver>> {
+            self.accounting.holds.fetch_add(1, Ordering::SeqCst);
+            Some(Arc::new(TerminalCredentialCapability {
+                accounting: Arc::clone(&self.accounting),
+            }))
+        }
+
+        fn finalize(
+            self: Box<Self>,
+        ) -> Result<
+            crate::query_execution::terminal_set::QueryTerminalSet,
+            crate::query_execution::contract::DistributedQueryError,
+        > {
+            self.accounting.finalize();
+            Ok(
+                crate::query_execution::terminal_set::QueryTerminalSet::new(Vec::new())
+                    .expect("empty terminal set"),
+            )
+        }
+
+        fn abort_preserving(
+            self: Box<Self>,
+            primary_error: String,
+        ) -> crate::query_execution::lifecycle_plan::QueryLifecycleAbortOutcome {
+            crate::query_execution::lifecycle_plan::QueryLifecycleAbortOutcome::new(
+                primary_error,
+                None,
+            )
+        }
+    }
+
+    /// Drive the two coordinator steps that stand between an attempt's
+    /// credential leases and a write's external commit: retain the terminal
+    /// capability while the lease is alive, then finalize the attempt.
+    fn finalize_attempt_retaining_terminal_storage(
+        session: &Arc<ConnectorWriteSession>,
+    ) -> Arc<TerminalCredentialAccounting> {
+        let accounting = Arc::new(TerminalCredentialAccounting::default());
+        let lease = crate::query_execution::lifecycle_plan::QueryLifecycleLease::new(Box::new(
+            TerminalCredentialGuard {
+                accounting: Arc::clone(&accounting),
+            },
+        ));
+        let resolver = lease
+            .retain_terminal_storage_resolver()
+            .expect("a vended attempt offers a terminal capability");
+        session.retain_terminal_storage_resolver(resolver);
+        lease.finalize().expect("lifecycle finalizes");
+        accounting
     }
 
     /// A real canonical commit fragment. The session decodes what it commits,
@@ -1229,5 +1535,111 @@ pub(crate) mod tests {
             .expect_err("nothing to reconcile");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(fixture.recorded.lock().expect("recorded").reconcile, 0);
+    }
+
+    /// The commit happens after the lifecycle attempt finalizes -- that is the
+    /// whole reason the capability is retained rather than read from the live
+    /// attempt. A session that took the hold commits through storage the
+    /// attempt no longer serves; on a vended-credential deployment, a session
+    /// that took no hold would have watched the credential leases be cleared at
+    /// finalization and then reached the object store with nothing to
+    /// authenticate.
+    #[test]
+    fn a_commit_after_finalization_still_resolves_vended_storage() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
+
+        // The outstanding hold is what kept the leases alive across finalize.
+        assert_eq!(accounting.holds(), 1);
+        assert!(!accounting.leases_cleared());
+
+        let committed = finish_write_session(completion(&fixture.session, 7), request_context())
+            .expect("finish");
+
+        assert_eq!(committed.affected_rows(), Some(7));
+        assert_eq!(
+            fixture.recorded.lock().expect("recorded").terminal_storage,
+            Some(Ok(TABLE_PREFIX.to_string()))
+        );
+        // The decision is made, so the credentials are not pinned any longer.
+        assert_eq!(accounting.holds(), 0);
+        assert!(accounting.leases_cleared());
+    }
+
+    /// A commit whose external outcome is unknown is not finished with storage:
+    /// reconciliation reads the same object store, and it is the only decision
+    /// still reachable.
+    #[test]
+    fn a_commit_with_an_unknown_outcome_keeps_its_capability_for_reconciliation() {
+        let fixture = fixture_with_outcome(1, 16, commit_unknown());
+        let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
+
+        let _ = fixture.session.finish(empty_prepared(), request_context());
+        assert_eq!(
+            fixture.recorded.lock().expect("recorded").terminal_storage,
+            Some(Ok(TABLE_PREFIX.to_string()))
+        );
+        assert_eq!(accounting.holds(), 1);
+        assert!(!accounting.leases_cleared());
+
+        // Reconciliation reaches the provider with the same capability. This
+        // fixture scripts no reconcile outcome, so the session stays
+        // reconcilable and keeps holding.
+        let _ = fixture.session.reconcile(evidence(), request_context());
+        assert_eq!(fixture.recorded.lock().expect("recorded").reconcile, 1);
+        assert_eq!(
+            fixture.recorded.lock().expect("recorded").terminal_storage,
+            Some(Ok(TABLE_PREFIX.to_string()))
+        );
+        assert!(!accounting.leases_cleared());
+    }
+
+    /// An abort is a terminal decision too: the provider may clean up staged
+    /// objects, and nothing can follow it.
+    #[test]
+    fn an_abort_carries_the_capability_and_then_releases_it() {
+        let fixture = fixture(1, 16);
+        let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
+
+        fixture.session.abort(request_context()).expect("abort");
+
+        assert_eq!(
+            fixture.recorded.lock().expect("recorded").terminal_storage,
+            Some(Ok(TABLE_PREFIX.to_string()))
+        );
+        assert_eq!(accounting.holds(), 0);
+        assert!(accounting.leases_cleared());
+    }
+
+    /// A query that neither commits nor reconciles must not pin credential
+    /// material for as long as anything happens to keep a reference to it.
+    #[test]
+    fn a_session_that_never_decides_releases_its_hold_when_dropped() {
+        let fixture = fixture(1, 16);
+        let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
+        assert!(!accounting.leases_cleared());
+
+        drop(fixture);
+
+        assert_eq!(accounting.holds(), 0);
+        assert!(accounting.leases_cleared());
+    }
+
+    /// The hold accounting exists so credentials are cleared promptly when
+    /// nothing needs them. An attempt that no write session held -- every read
+    /// query -- must still clear at finalization.
+    #[test]
+    fn finalization_clears_credential_leases_when_no_write_holds_them() {
+        let accounting = Arc::new(TerminalCredentialAccounting::default());
+        crate::query_execution::lifecycle_plan::QueryLifecycleLease::new(Box::new(
+            TerminalCredentialGuard {
+                accounting: Arc::clone(&accounting),
+            },
+        ))
+        .finalize()
+        .expect("lifecycle finalizes");
+
+        assert_eq!(accounting.holds(), 0);
+        assert!(accounting.leases_cleared());
     }
 }

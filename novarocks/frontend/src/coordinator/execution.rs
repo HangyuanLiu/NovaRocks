@@ -1227,6 +1227,23 @@ impl FrontendDistributedQueryCoordinator {
             novarocks_spi::connector::read_stack::SplitSourceProfile::default()
         };
 
+        // A connector write reaches its external commit only after this
+        // attempt finalizes: the frontend reloads table metadata and writes
+        // manifests through object storage once every participant has
+        // converged. Retain the attempt's terminal-only storage capability
+        // while the lease still exists and hand it to the session that owns
+        // the commit decision. Taking it is also what tells finalization that
+        // a write still needs the attempt's credential leases; on a
+        // vended-credential deployment they would otherwise be cleared before
+        // the commit could read a single object. A deployment with no vended
+        // lease has no capability to retain and is unaffected.
+        if let Some(session) = write_stack_session.as_ref()
+            && let Some(resolver) = query_lifecycle_lease
+                .as_ref()
+                .and_then(QueryLifecycleLease::retain_terminal_storage_resolver)
+        {
+            session.retain_terminal_storage_resolver(resolver);
+        }
         let terminal_set = query_lifecycle_lease
             .take()
             .expect("query lifecycle lease is present through query completion")

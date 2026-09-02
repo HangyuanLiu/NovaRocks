@@ -127,10 +127,6 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                 .map(FragmentSinkProgram::MultiCastDataStream)
                 .map_err(NativeFragmentDecodeError::from)
         }
-        plan::data_sink::Kind::ConnectorWrite(_) => Err(NativeFragmentDecodeError::unsupported(
-            path.field("connector_write"),
-            "native CONNECTOR_WRITE sink is not supported",
-        )),
         plan::data_sink::Kind::ChangeStreamRouter(router) => decode_change_stream_router_program(
             router,
             &fragment.output_exprs,
@@ -270,8 +266,7 @@ pub(crate) fn decode_fragment_sink_assignment(
         }
         plan::data_sink::Kind::Result(_)
         | plan::data_sink::Kind::Noop(_)
-        | plan::data_sink::Kind::Statistics(_)
-        | plan::data_sink::Kind::ConnectorWrite(_) => {
+        | plan::data_sink::Kind::Statistics(_) => {
             if instance.destinations.is_empty() {
                 Ok(FragmentSinkAssignment::None)
             } else {
@@ -805,6 +800,7 @@ mod tests {
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
+    use prost::Message;
 
     use super::{
         decode_fragment_sink_assignment, decode_fragment_sink_program,
@@ -998,16 +994,19 @@ mod tests {
     }
 
     /// The connector write sink is no longer a fragment terminal: writing is a
-    /// dataflow shape rooted at a table writer node. A plan that still carries
-    /// the retired sink is refused at its exact field instead of being decoded.
+    /// dataflow shape rooted at a table writer node, and `DataSink` tag 7 is
+    /// reserved. A plan that still carries the retired sink decodes it as an
+    /// unknown field and is refused for having no sink kind at all, so the
+    /// retired tag can never be mistaken for a decodable terminal.
     #[test]
-    fn connector_write_sink_is_refused_as_unsupported() {
+    fn the_retired_connector_write_sink_tag_fails_closed() {
+        // DataSink field 7, wire type 2: the retired `connector_write` arm.
+        let sink =
+            plan::DataSink::decode(&[0x3a, 0x00][..]).expect("retired sink tag stays decodable");
+        assert!(sink.kind.is_none());
+
         let fragment = plan::PlanFragment {
-            sink: Some(plan::DataSink {
-                kind: Some(plan::data_sink::Kind::ConnectorWrite(
-                    plan::ConnectorWriteFragmentSink::default(),
-                )),
-            }),
+            sink: Some(sink),
             ..Default::default()
         };
 
@@ -1018,11 +1017,8 @@ mod tests {
         )
         .expect_err("the retired connector write sink must fail closed");
         let protocol = error.protocol().expect("typed protocol error");
-        assert_eq!(
-            protocol.path().to_string(),
-            "plan_fragment.sink.connector_write"
-        );
-        assert_eq!(protocol.kind(), ProtocolErrorKind::Unsupported);
+        assert_eq!(protocol.path().to_string(), "plan_fragment.sink.kind");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
     }
 
     fn router_fragment(route: plan::ChangeStreamBranchRoute) -> plan::PlanFragment {

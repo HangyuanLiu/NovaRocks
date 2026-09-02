@@ -484,9 +484,10 @@ message DataSink {
     ChangeStreamRouterSink change_stream_router = 4; // Iceberg change-stream router sink.
     DataStreamSink data_stream = 5;                       // Exchange stream sink.
     MultiCastDataStreamSink multi_cast_data_stream = 6;   // CTE-style multicast stream sink.
-    ConnectorWriteFragmentSink connector_write = 7;       // Provider-neutral staged writer sink.
     StatisticsSink statistics = 8;                        // Internal typed statistics partial sink.
   }
+  reserved 7;
+  reserved "connector_write"; // former opaque staged connector-writer sink.
 }
 
 // Core-internal statistics collection sink. This carries only the stable
@@ -536,30 +537,6 @@ message MultiCastDataStreamSink {
   repeated DataStreamSink sinks = 1;
   repeated StreamDestinationList destinations = 2;
 }
-// Provider-neutral writer owner. This carrier intentionally contains no
-// catalog client, credential or provider-specific table/file metadata.
-message ConnectorWriterIdentity {
-  bytes operation_id = 1;                         // UUID v7 bytes.
-  bytes execution_query_id = 2;                   // native query UUID bytes.
-  uint64 execution_attempt_id = 3;                // exact query attempt.
-  novarocks.common.UniqueId fragment_instance_id = 4;
-  int32 fragment_id = 5;
-  int32 backend_num = 6;
-  uint32 sink_ordinal = 7;
-  reserved 8, 9;
-  reserved "connector_instance_id", "connector_incarnation";
-  bytes cohort_id = 10;                           // stable 32-byte semantic cohort identity.
-  novarocks.catalog.CatalogHandle catalog_handle = 11; // exact query-leased BE runtime identity.
-}
-
-// Bounded opaque handle produced by FE control planning and consumed only by
-// the exact query-leased BE catalog runtime.
-message ConnectorWriterHandleEnvelope {
-  uint32 contract_version = 1;
-  ConnectorWriterIdentity writer = 2;
-  bytes payload = 3;
-  bytes payload_sha256 = 4;
-}
 
 // Mapping from fragment output columns to a provider-neutral writer input.
 message ConnectorWriteInputBinding {
@@ -567,11 +544,6 @@ message ConnectorWriteInputBinding {
     bool root_output_by_ordinal = 1;
     UInt64List output_ordinals = 2;
   }
-}
-
-message ConnectorWriteFragmentSink {
-  ConnectorWriterHandleEnvelope handle = 1;
-  ConnectorWriteInputBinding input = 2;
 }
 
 // Iceberg change-stream router sink payload.

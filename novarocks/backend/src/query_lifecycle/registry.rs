@@ -512,7 +512,6 @@ fn terminal_fragment_snapshot(
         error_code,
         error_detail,
         error_detail_truncated: false,
-        connector_staged_report_frames: Vec::new(),
         tablet_commit_infos: sink
             .tablet_commit_infos
             .into_iter()

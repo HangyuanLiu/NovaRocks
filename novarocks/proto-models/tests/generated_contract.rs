@@ -949,6 +949,7 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
             "data_file".to_string(),
             "position_delete_file".to_string(),
             "deletion_vector".to_string(),
+            "equality_delete_file".to_string(),
         ]
     );
     // A fragment carries no writer identity, attempt id, or aggregate summary:
@@ -957,7 +958,7 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
         .fields()
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(field_names.len(), 3);
+    assert_eq!(field_names.len(), 4);
     for forbidden in [
         "writer",
         "operation_id",
@@ -970,4 +971,72 @@ fn an_iceberg_commit_fragment_describes_exactly_one_artifact() {
             "commit fragment must not carry {forbidden}"
         );
     }
+}
+
+/// The write-operation aggregate carried three plan messages and one terminal
+/// report list. They are gone; their tags must stay reserved so a later field
+/// cannot silently occupy a number an older encoder still fills.
+#[test]
+fn retired_write_operation_aggregate_fields_remain_reserved() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+
+    for (message_name, field_number, field_name) in [
+        ("novarocks.plan.DataSink", 7, "connector_write"),
+        (
+            "novarocks.QueryTerminalFragmentSnapshot",
+            11,
+            "connector_staged_report_frames",
+        ),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(
+            message
+                .reserved_ranges()
+                .any(|range| range.contains(&field_number)),
+            "{message_name} field {field_number} must remain reserved"
+        );
+        assert!(
+            message.reserved_names().any(|name| name == field_name),
+            "{message_name} {field_name} must remain reserved"
+        );
+        assert!(
+            message.fields().all(|field| field.number() != field_number),
+            "{message_name} must not reuse tag {field_number}"
+        );
+        assert!(
+            message.fields().all(|field| field.name() != field_name),
+            "{message_name} must not reuse name {field_name}"
+        );
+    }
+
+    // The aggregate's own carriers are gone, not merely unreferenced.
+    for retired in [
+        "novarocks.plan.ConnectorWriterIdentity",
+        "novarocks.plan.ConnectorWriterHandleEnvelope",
+        "novarocks.plan.ConnectorWriteFragmentSink",
+        "novarocks.ConnectorStagedReportFrame",
+    ] {
+        assert!(
+            pool.get_message_by_name(retired).is_none(),
+            "{retired} must not exist in the native schema"
+        );
+    }
+}
+
+#[test]
+fn retired_write_operation_aggregate_wire_fields_fail_closed() {
+    // DataSink field 7, wire type 2: the retired `connector_write` sink arm.
+    let sink = plan::DataSink::decode(&[0x3a, 0x00][..])
+        .expect("retired sink field remains decodable as an unknown field");
+    assert!(sink.kind.is_none());
+
+    // QueryTerminalFragmentSnapshot field 11, wire type 2: the retired staged
+    // report frame list. It decodes away instead of reviving a staged writer.
+    let snapshot = novarocks::QueryTerminalFragmentSnapshot::decode(&[0x5a, 0x00][..])
+        .expect("retired snapshot field remains decodable as an unknown field");
+    assert_eq!(snapshot.backend_num, 0);
+    assert!(snapshot.tablet_commit_infos.is_empty());
 }

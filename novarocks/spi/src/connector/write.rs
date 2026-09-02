@@ -2146,7 +2146,7 @@ impl ConnectorWritePlanningRequest {
         // This digest is also used while sealing a preparation, before the
         // placement-frozen writer set exists. Writer validation remains
         // mandatory in `validate`, which every provider planning request
-        // invokes after `ConnectorWriteManifest::plan` fills that set.
+        // invokes once that set is filled.
         self.activation.validate()?;
         if self.activation.owner() != owner
             || self.activation.operation_id() != self.operation_id

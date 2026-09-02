@@ -504,23 +504,6 @@ message QueryTerminalLoadStats {
   int64 filtered_rows = 3;
 }
 
-// One bounded fragment of an opaque provider staged report. The frontend
-// validates every frame before counting the logical writer as staged.
-message ConnectorStagedReportFrame {
-  uint32 contract_version = 1;
-  novarocks.plan.ConnectorWriterIdentity writer = 2;
-  uint32 terminal_state = 3;
-  uint64 input_rows = 4;
-  uint64 staged_bytes = 5;
-  uint64 artifact_count = 6;
-  uint32 part_index = 7;
-  uint32 part_count = 8;
-  uint64 logical_payload_len = 9;
-  bytes logical_payload_sha256 = 10;
-  bytes frame_payload = 11;
-  bytes frame_payload_sha256 = 12;
-}
-
 message QueryTerminalFragmentSnapshot {
   novarocks.common.UniqueId fragment_instance_id = 1;
   int32 backend_num = 2;
@@ -533,7 +516,11 @@ message QueryTerminalFragmentSnapshot {
   repeated QueryTerminalTabletInfo tablet_fail_infos = 8;
   QueryTerminalLoadStats load_stats = 9;
   FragmentTerminalProfileTelemetry profile = 10;
-  repeated ConnectorStagedReportFrame connector_staged_report_frames = 11;
+  reserved 11;
+  // Former per-writer staged-report frame list. The ConnectorStagedReportFrame
+  // message tree was removed with the write-operation aggregate; the write
+  // stack reports staged artifacts as commit fragments in the write relation.
+  reserved "connector_staged_report_frames";
   // Bounded, opaque statistics collection state. It is internal to the
   // native lifecycle and never encoded as a client result row.
   bytes statistics_payload = 12;
