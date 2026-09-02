@@ -301,22 +301,38 @@ fn group_selection(
     })
 }
 
-/// Prove every matched row belongs to the file it named.
+/// Prove every matched row is a row of the file it named.
 ///
-/// Iceberg row lineage makes `_row_id` a function of the file's `first_row_id`
-/// and the row's position, so a row that fails this check would put a
-/// `first_row_id` on the replacement manifest that does not describe the rows
-/// inside it.
+/// What is provable here is positional: a matched row must sit at a real
+/// position inside the frozen file, and no two matched rows of one file may
+/// claim the same position. A synthesized identity fails that, and would
+/// otherwise reach the commit as a replacement record for a row nobody read.
+///
+/// What is deliberately *not* asserted is `_row_id == first_row_id + position`.
+/// That equation holds only for rows whose lineage is inherited. A file that
+/// materializes `_row_id` -- which is exactly what this provider's own
+/// copy-on-write writer produces, because carrying the stored id forward is how
+/// a rewrite preserves row identity -- carries ids that are decoupled from both
+/// its `first_row_id` and its row order. Concretely, a rewrite stamps
+/// `first_row_id = min(matched row ids)` on the replacement manifest
+/// ([`update_cow`](crate::commit::update_cow)) while the file also carries the
+/// unmatched rows it copied over, whose stored ids may be lower and in any
+/// order. Asserting the equation would refuse the second mutation of every
+/// file the first one rewrote.
+///
+/// The file's own lineage metadata is still required: the replacement manifest
+/// is written from it, so a source missing `first_row_id`, a record count, or a
+/// data sequence cannot be rewritten at all.
 fn validate_matched_rows(
     old_file: &str,
     rows: &[IcebergCowMatchedRow],
     data_file: &DataFileWithStats,
 ) -> Result<(), ConnectorError> {
-    let first_row_id = data_file.first_row_id.ok_or_else(|| {
-        invalid(format!(
+    if data_file.first_row_id.is_none() {
+        return Err(invalid(format!(
             "Iceberg copy-on-write source `{old_file}` is missing first_row_id"
-        ))
-    })?;
+        )));
+    }
     let record_count = data_file
         .record_count
         .filter(|count| *count >= 0)
@@ -330,26 +346,24 @@ fn validate_matched_rows(
             "Iceberg copy-on-write source `{old_file}` is missing its data sequence"
         )));
     }
-    let row_id_end = first_row_id.checked_add(record_count).ok_or_else(|| {
-        corrupt(format!(
-            "Iceberg copy-on-write source `{old_file}` row lineage overflowed"
-        ))
-    })?;
+    let mut positions = BTreeSet::new();
     for row in rows {
-        let expected_position = row.row_id.checked_sub(first_row_id).ok_or_else(|| {
-            invalid(format!(
-                "Iceberg copy-on-write row {} precedes source `{old_file}` lineage",
-                row.row_id
-            ))
-        })?;
-        if row.row_id < first_row_id
-            || row.row_id >= row_id_end
-            || row.position != expected_position
-            || row.last_updated_sequence_number < 0
-        {
+        if row.position < 0 || row.position >= record_count || row.row_id < 0 {
             return Err(invalid(format!(
                 "Iceberg copy-on-write row {} does not belong to admitted source `{old_file}`",
                 row.row_id
+            )));
+        }
+        if row.last_updated_sequence_number < 0 {
+            return Err(invalid(format!(
+                "Iceberg copy-on-write row {} carries a negative written version in source `{old_file}`",
+                row.row_id
+            )));
+        }
+        if !positions.insert(row.position) {
+            return Err(invalid(format!(
+                "Iceberg copy-on-write source `{old_file}` matched position {} more than once",
+                row.position
             )));
         }
     }
@@ -541,11 +555,11 @@ fn branch_scan_bindings(
             ordinal,
         ));
     }
-    // `_row_id` is the whole match key. Within one rewritten file it is exactly
-    // the row's identity -- `first_row_id + position`, proven above -- so a
-    // join on it selects precisely the matched rows and nothing else. `_file`
-    // and `_pos` are not available here and would be redundant if they were:
-    // the branch reads one file, so the file is already fixed.
+    // `_row_id` is the whole match key. Row lineage makes it unique per row for
+    // the life of the table, whether the row inherits it or the file stores it,
+    // so a join on it selects precisely the matched rows and nothing else.
+    // `_file` and `_pos` are not available here and would be redundant if they
+    // were: the branch reads one file, so the file is already fixed.
     let match_tokens = row_identity_fields
         .iter()
         .filter(|binding| {
@@ -753,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn a_matched_row_outside_its_file_lineage_is_refused() {
+    fn a_matched_row_outside_its_file_is_refused() {
         let file = frozen_file("s3://b/a.parquet", 100, 4);
         assert!(
             validate_matched_rows(
@@ -767,19 +781,68 @@ mod tests {
             )
             .is_ok()
         );
-        // The row id and the position must agree with the file's own lineage;
-        // a synthesized pair would put a wrong `first_row_id` on the
-        // replacement manifest instead of failing.
+        // A position past the file's own record count names a row the frozen
+        // source does not hold.
         let error = validate_matched_rows(
             "s3://b/a.parquet",
             &[IcebergCowMatchedRow {
                 row_id: 102,
-                position: 3,
+                position: 4,
                 last_updated_sequence_number: 1,
             }],
             &file,
         )
-        .expect_err("position disagrees with the row id");
+        .expect_err("position past the end of the file");
         assert!(error.message().contains("does not belong"), "{error}");
+    }
+
+    /// A second copy-on-write mutation of a file the first one rewrote is
+    /// admitted.
+    ///
+    /// A rewrite stamps `first_row_id = min(matched row ids)` on the
+    /// replacement manifest while the file also materializes the stored
+    /// `_row_id` of every unmatched row it copied over, so the file's rows are
+    /// routinely below its own `first_row_id` and out of positional order.
+    /// This is the exact shape `UPDATE ... ; UPDATE ...` produces on a v3
+    /// row-lineage table: refusing it made the second statement fail.
+    #[test]
+    fn a_rewritten_file_whose_stored_row_ids_precede_its_first_row_id_is_admitted() {
+        // Row id 2 sits at position 0 and row id 1 at position 1, under a
+        // `first_row_id` of 2 -- the file a rewrite of the matched row id 2
+        // leaves behind.
+        let file = frozen_file("s3://b/a.parquet", 2, 2);
+        validate_matched_rows(
+            "s3://b/a.parquet",
+            &[IcebergCowMatchedRow {
+                row_id: 1,
+                position: 1,
+                last_updated_sequence_number: 1,
+            }],
+            &file,
+        )
+        .expect("a stored row id below the file's first_row_id is still its own row");
+    }
+
+    #[test]
+    fn two_matched_rows_of_one_file_cannot_claim_the_same_position() {
+        let file = frozen_file("s3://b/a.parquet", 100, 4);
+        let error = validate_matched_rows(
+            "s3://b/a.parquet",
+            &[
+                IcebergCowMatchedRow {
+                    row_id: 100,
+                    position: 1,
+                    last_updated_sequence_number: 1,
+                },
+                IcebergCowMatchedRow {
+                    row_id: 101,
+                    position: 1,
+                    last_updated_sequence_number: 1,
+                },
+            ],
+            &file,
+        )
+        .expect_err("two rows cannot share one physical position");
+        assert!(error.message().contains("more than once"), "{error}");
     }
 }

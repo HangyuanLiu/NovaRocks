@@ -63,18 +63,26 @@ pub struct PreparedDistributedRewriteCohort {
 }
 
 impl PreparedDistributedRewriteCohort {
+    /// A rewrite group's plan always carries a writer node, so its encoding
+    /// input always needs this session's sealed recipes. Sealing them here,
+    /// from the very session the cohort commits through, is what keeps the plan
+    /// and the recipes from being two independent caller choices that can
+    /// disagree -- a plan submitted without them fails to encode at all.
     fn new(
         encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
         query_execution: crate::query_execution::service::QueryExecutionService,
         execution: crate::common::admitted_query_context::QueryExecutionContext,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    ) -> Self {
-        Self {
-            encoding,
+    ) -> Result<Self, String> {
+        let sealed_write_targets = write_session
+            .seal_write_targets()
+            .map_err(|error| format!("seal distributed rewrite write targets: {error}"))?;
+        Ok(Self {
+            encoding: encoding.with_sealed_write_targets(sealed_write_targets),
             query_execution,
             execution,
             write_session,
-        }
+        })
     }
 
     /// The only read-only Frontend input for native fragment encoding.
@@ -1600,18 +1608,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             execution,
         )?,
     )?;
-    Ok(PreparedDistributedRewriteCohort::new(
+    let write_session = session
+        .write_session()
+        .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
+    PreparedDistributedRewriteCohort::new(
         crate::query_execution::compiler::NativeFragmentEncodingInput::new(
             distributed_plan,
             prepared,
         ),
         query_execution.clone(),
         execution.clone(),
-        session
-            .write_session()
-            .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?
-            .clone(),
-    ))
+        write_session.clone(),
+    )
 }
 
 fn rewrite_target_identity(

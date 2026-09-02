@@ -238,7 +238,7 @@ impl ConnectorDistributedRewriteSession {
             let session = crate::query_execution::write_session::begin_connector_write_session(
                 write_stack,
                 &write_lease,
-                rewrite_begin_request(table, context).map_err(invalid)?,
+                rewrite_begin_request(&plan, table, context).map_err(invalid)?,
             )
             .map_err(invalid)?;
             let sealed = session.expected_targets().len();
@@ -353,40 +353,56 @@ impl ConnectorDistributedRewriteSession {
     }
 }
 
-/// A rewrite republishes the target's own data columns, so its input is the
-/// table's schema. It is a data write: `flavor.rs` refuses a row-level delete
-/// input for a rewrite, and the provider derives one branch per frozen group
-/// from the loaded table rather than from anything named here.
+/// A rewrite republishes exactly the rows its frozen groups read, so its writer
+/// input is the provider-signed shape those groups froze.
+///
+/// It is deliberately not derived from the loaded table's schema. That schema is
+/// the SQL-visible one and also carries the Iceberg metadata columns -- `_file`,
+/// `_pos`, and, on a row-lineage table, `_row_id` and
+/// `_last_updated_sequence_number` -- so a request built from it seals a target
+/// wider than the group's own scan, and the write plan's sink and target then
+/// disagree on column count. Projecting the signed shape cannot drift from what
+/// planning admitted; rebuilding it from field names can.
+///
+/// Every frozen group signs the same preparation, because one rewrite reads one
+/// relation through one scan schema. That is asserted rather than assumed: two
+/// groups signing different inputs would seal one session whose targets
+/// disagree about what their writers accept.
+///
+/// The provider derives one branch per frozen group from the loaded table rather
+/// than from anything named here, and `flavor.rs` refuses a row-level delete
+/// input for a rewrite.
 fn rewrite_begin_request(
+    plan: &ConnectorDistributedRewritePlan,
     table: &novarocks_spi::connector::ConnectorTableMetadata,
     context: ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
-    use novarocks_spi::connector::{
-        ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
-        ConnectorWriteIntent, ConnectorWriteTargetRef,
-    };
+    use novarocks_spi::connector::ConnectorWriteAdmissionPurpose;
+
+    let mut cohorts = plan.cohorts().iter();
+    let preparation = cohorts
+        .next()
+        .ok_or_else(|| "distributed rewrite plan froze no group to write".to_string())?
+        .preparation();
+    if cohorts.any(|cohort| cohort.preparation().digest() != preparation.digest()) {
+        return Err("distributed rewrite groups signed different writer inputs".to_string());
+    }
 
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(
                 format!("{}.{}", table.identity.namespace, table.identity.table).as_str(),
             ),
-            target_ref: ConnectorWriteTargetRef::parse("main")
-                .map_err(|error| format!("validate rewrite write target ref: {error}"))?,
-            intent: ConnectorWriteIntent::Overwrite,
+            target_ref: preparation.target_ref().clone(),
+            intent: preparation.intent(),
             // A rewrite is arbitrated by the provider's ordinary base-state
             // compare and swap, so it presents as ordinary DML. What makes it
             // a rewrite is the flavor; saying it twice here would let the two
             // disagree.
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
-            input: ConnectorWriteInputRequest::Data {
-                fields: table
-                    .schema
-                    .fields()
-                    .iter()
-                    .map(|field| ConnectorWriteFieldRequest::new(field.as_ref().clone()))
-                    .collect(),
-            },
+            input: crate::connector::write_target::write_input_request_for_shape(
+                preparation.input(),
+            ),
             base: None,
             flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite,
             context,
@@ -470,21 +486,34 @@ mod tests {
         .expect("valid catalog properties")
     }
 
+    /// The signed writer contract one row-lineage rewrite group froze: the
+    /// table's own data columns plus the two lineage columns the rewrite must
+    /// carry forward, and nothing else.
     fn preparation(
         owner: ConnectorProviderBindingKey,
         table: ConnectorTableHandle,
         schema: &arrow::datatypes::SchemaRef,
     ) -> ConnectorWritePreparation {
-        let fields = schema
+        let binding = |index: usize, field: &Field| {
+            ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([index as u8 + 1; 32]),
+                field.clone(),
+            )
+        };
+        let lineage = |name: &str| matches!(name, "_row_id" | "_last_updated_sequence_number");
+        let data_fields = schema
             .fields()
             .iter()
             .enumerate()
-            .map(|(index, field)| {
-                ConnectorWriteFieldBinding::new(
-                    ConnectorWriteFieldToken::from_bytes([index as u8 + 1; 32]),
-                    field.as_ref().clone(),
-                )
-            })
+            .filter(|(_, field)| !lineage(field.name()))
+            .map(|(index, field)| binding(index, field.as_ref()))
+            .collect();
+        let row_identity_fields = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| lineage(field.name()))
+            .map(|(index, field)| binding(index, field.as_ref()))
             .collect();
         ConnectorWritePreparation::try_new(
             owner,
@@ -492,10 +521,41 @@ mod tests {
             novarocks_spi::connector::ConnectorWriteTargetRef::main(),
             ConnectorWriteIntent::Overwrite,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).unwrap(),
-            ConnectorWriteInputShape::Data { fields },
+            ConnectorWriteInputShape::RowLineage {
+                data_fields,
+                row_identity_fields,
+            },
             Bytes::from_static(b"prepared"),
         )
         .unwrap()
+    }
+
+    /// The loaded target metadata a rewrite begins against.
+    ///
+    /// Its schema is the SQL-visible one, so it also carries the Iceberg
+    /// metadata columns the provider exposes for reads. None of them is a
+    /// writer input.
+    fn table_metadata() -> novarocks_spi::connector::ConnectorTableMetadata {
+        let instance = ConnectorInstanceId::parse("rewrite-session-instance").unwrap();
+        novarocks_spi::connector::ConnectorTableMetadata {
+            identity: novarocks_spi::connector::ConnectorTableIdentity {
+                instance_id: instance.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            schema: Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int64, true),
+                Field::new("_file", DataType::Utf8, true),
+                Field::new("_pos", DataType::Int64, true),
+                Field::new("_row_id", DataType::Int64, true),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ])),
+            planning_facts: novarocks_spi::connector::ConnectorTablePlanningFacts::empty(),
+            definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+            version: None,
+            statistics_data_version: None,
+            table: ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).unwrap(),
+        }
     }
 
     struct TestMetadata {
@@ -615,12 +675,36 @@ mod tests {
         }
     }
 
+    /// The frozen scan schema of a row-lineage rewrite: the table's data
+    /// columns plus the two lineage columns, and none of the `_file` / `_pos`
+    /// metadata columns a read exposes.
+    fn rewrite_scan_schema() -> arrow::datatypes::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("_row_id", DataType::Int64, true),
+            Field::new("_last_updated_sequence_number", DataType::Int64, true),
+        ]))
+    }
+
     fn fixture(
         cohorts: usize,
     ) -> (
         ConnectorDistributedRewritePlan,
         ConnectorDistributedRewriteLease,
     ) {
+        fixture_with_group_schemas(&vec![rewrite_scan_schema(); cohorts])
+    }
+
+    /// One plan per frozen group schema. Every group of a real rewrite reads
+    /// the same relation, so they normally share one; passing different ones
+    /// builds the disagreement a real plan cannot contain.
+    fn fixture_with_group_schemas(
+        group_schemas: &[arrow::datatypes::SchemaRef],
+    ) -> (
+        ConnectorDistributedRewritePlan,
+        ConnectorDistributedRewriteLease,
+    ) {
+        let cohorts = group_schemas.len();
         let provider = ConnectorProviderId::parse("rewrite-session-test").unwrap();
         let instance = ConnectorInstanceId::parse("rewrite-session-instance").unwrap();
         let descriptor = ConnectorInstanceDescriptor {
@@ -644,13 +728,10 @@ mod tests {
             context(),
         )
         .unwrap();
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "value",
-            DataType::Int64,
-            true,
-        )]));
-        let cohort_plans = (0..cohorts)
-            .map(|index| {
+        let cohort_plans = group_schemas
+            .iter()
+            .enumerate()
+            .map(|(index, schema)| {
                 let digest = [u8::try_from(index).unwrap_or_default(); 32];
                 ConnectorDistributedRewriteCohortPlan::try_new(
                     ConnectorWriteCohortId::derive(operation_id, b"test", digest).unwrap(),
@@ -665,7 +746,7 @@ mod tests {
                     ),
                     schema.clone(),
                     [3; 32],
-                    preparation(key.clone(), table.clone(), &schema),
+                    preparation(key.clone(), table.clone(), schema),
                     digest,
                 )
                 .unwrap()
@@ -775,5 +856,72 @@ mod tests {
             panic!("a plan that froze a group must open a write session");
         };
         assert!(error.to_string().contains("not a no-op"), "{error}");
+    }
+
+    /// The begin request describes the writer input the frozen groups signed,
+    /// never the loaded table's SQL-visible schema.
+    ///
+    /// A rewrite writes exactly the rows its groups read, so its input is the
+    /// groups' own scan shape. The table schema additionally carries the
+    /// Iceberg metadata columns (`_file`, `_pos`, and the lineage pair), so a
+    /// request built from it seals a target wider than the group's plan and the
+    /// write plan's sink and target then disagree on column count.
+    #[test]
+    fn the_begin_request_projects_the_frozen_writer_input_not_the_table_schema() {
+        use novarocks_spi::connector::ConnectorWriteInputRequest;
+
+        let (plan, _lease) = fixture(2);
+        let table = table_metadata();
+        let request = rewrite_begin_request(&plan, &table, context())
+            .expect("a frozen plan describes its own writer input");
+
+        let ConnectorWriteInputRequest::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } = &request.input
+        else {
+            panic!("a row-lineage rewrite must keep the shape its groups signed");
+        };
+        let names = |fields: &[novarocks_spi::connector::ConnectorWriteFieldRequest]| {
+            fields
+                .iter()
+                .map(|field| field.field().name().clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(data_fields), vec!["value".to_string()]);
+        assert_eq!(
+            names(row_identity_fields),
+            vec![
+                "_row_id".to_string(),
+                "_last_updated_sequence_number".to_string()
+            ]
+        );
+        assert_eq!(
+            data_fields.len() + row_identity_fields.len(),
+            plan.cohorts()[0].scan_schema().fields().len(),
+            "the writer input stands one-to-one with the frozen scan, not with the \
+             {} column table schema",
+            table.schema.fields().len()
+        );
+        assert_eq!(request.intent, ConnectorWriteIntent::Overwrite);
+        assert_eq!(request.target_ref.as_str(), "main");
+    }
+
+    /// One rewrite reads one relation, so its groups sign one writer contract.
+    /// Groups that disagree would seal a session whose targets accept different
+    /// inputs, which no single plan could feed.
+    #[test]
+    fn groups_that_signed_different_writer_inputs_are_refused() {
+        let widened = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int64, true),
+            Field::new("extra", DataType::Int64, true),
+            Field::new("_row_id", DataType::Int64, true),
+            Field::new("_last_updated_sequence_number", DataType::Int64, true),
+        ]));
+        let (plan, _lease) = fixture_with_group_schemas(&[rewrite_scan_schema(), widened]);
+        let Err(error) = rewrite_begin_request(&plan, &table_metadata(), context()) else {
+            panic!("two groups cannot sign different writer inputs");
+        };
+        assert!(error.contains("different writer inputs"), "{error}");
     }
 }
