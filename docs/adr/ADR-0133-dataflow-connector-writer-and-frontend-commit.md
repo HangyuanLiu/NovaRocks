@@ -67,6 +67,18 @@ FE；只有 FE 能调用 provider 的 finish 并提交 snapshot。
 序号、以及 attempt-local 的物理位置。它们各自只被自己的 owner 使用，commit fragment 不重复携带
 其中任何一层。
 
+**去掉共享 writer 锁没有带来可测的吞吐收益。** 实现期在同一台机器、同一 profile、同一 all-in-one
+拓扑下与 `origin/main` 对照：4,000,000 行、源表 984 个数据文件（保证扫描扇出）的 `INSERT … SELECT`，
+基线 10,159 / 10,163 ms，实现 10,315 / 10,947 ms——实现侧慢 1.5–8%，在噪声与轻微劣化之间。结构性
+变化本身是真实且可测的：一次 INSERT 的 writer open 数为 5（每 driver 一个），而基线按构造恒为 1。
+但在这个 fixture 上，写入被对象存储 PUT 与 parquet 编码限制，共享锁根本不是瓶颈，去掉它无从获利，
+而每 driver 一份 writer 状态还要付一点代价。
+
+因此本裁决**不以吞吐为理由**。它的理由是前面那三条边界（writer 是普通算子、产物走普通数据流、
+external commit 归 FE）。若将来有人为了性能回退这条裁决，应当先证明 writer 在其负载上是 CPU 受限
+的——更宽的 schema、更重的编码或更快的对象存储——那才是差异可能出现的地方。同时要注意：每 driver
+独占 writer 正是「每目标独占性成为计划责任」的前提，故障矩阵与边界矩阵都建立在它之上。
+
 **独占性由分区承担，不再由锁承担。** 删掉共享 writer 的锁，就把「同一个 provider 对象只能由一个
 writer 产出」这件事从运行时互斥变成了计划责任。provider 声明该分支的分区键（例如删除向量分支按
 `_file`），交换按该键哈希——但哈希只分发到 fragment **实例**，实例内的每个 driver 仍从同一个接收器
