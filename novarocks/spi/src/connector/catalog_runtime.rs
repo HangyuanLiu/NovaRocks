@@ -25,10 +25,7 @@
 
 use std::sync::Arc;
 
-use super::{
-    CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorBatchWriter, ConnectorError,
-    ConnectorOpenWriterRequest,
-};
+use super::{CatalogHandle, CatalogProperties, CatalogProviderKind, ConnectorError};
 
 /// One exact backend-local catalog materialization.
 ///
@@ -57,18 +54,11 @@ pub trait CatalogRuntimeMaterializer: Send + Sync {
 /// One exact backend-local catalog-scoped writer capability.
 ///
 /// The capability is created only after the backend has materialized and
-/// identity-checked its `CatalogHandle`. Fragment decode must first resolve it
-/// through the admitted query lease; it must not reconstruct a writer from a
-/// retained catalog or an effect-generation registry. The request retains the
-/// existing opaque writer facts because those identify the operation and its
-/// report cohort, not this catalog runtime.
+/// identity-checked its `CatalogHandle`. It exposes that handle and nothing
+/// else: writers are opened, driven and finished through the write stack's own
+/// execution binding, which is minted from this same catalog generation.
 pub trait CatalogWriteExecution: Send + Sync {
     fn catalog_handle(&self) -> &CatalogHandle;
-
-    fn open_writer(
-        &self,
-        request: ConnectorOpenWriterRequest,
-    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError>;
 }
 
 /// Complete catalog-scoped writer unit for one exact immutable handle.

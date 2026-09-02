@@ -5712,50 +5712,6 @@ mod tests {
         fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
             unreachable!("the legacy control is not exercised by a write session")
         }
-
-        fn plan_write(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorWritePlan,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            unreachable!("the legacy control is not exercised by a write session")
-        }
-
-        fn commit(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<
-                novarocks_spi::connector::ConnectorWriteReceipt,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            unreachable!("the legacy control is not exercised by a write session")
-        }
-
-        fn abort(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorWriteAbortOutcome,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            unreachable!("the legacy control is not exercised by a write session")
-        }
-
-        fn reconcile(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<
-                novarocks_spi::connector::ConnectorWriteReceipt,
-            >,
-            novarocks_spi::connector::ConnectorError,
-        > {
-            unreachable!("the legacy control is not exercised by a write session")
-        }
     }
 
     struct RowMutationSessionFixture {

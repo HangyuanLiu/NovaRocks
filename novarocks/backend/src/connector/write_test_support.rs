@@ -209,9 +209,9 @@ impl ConnectorWriteExecution for RecordingWriteExecution {
     }
 }
 
-/// The legacy catalog-scoped writer member of the role binding. The dataflow
-/// path never reaches it; it exists only because a write binding is a complete
-/// group by construction.
+/// The catalog-scoped capability member of the role binding. It carries the
+/// handle and nothing else; a write binding is a complete group by
+/// construction.
 struct UnusedCatalogWriteExecution {
     catalog_handle: CatalogHandle,
 }
@@ -219,16 +219,6 @@ struct UnusedCatalogWriteExecution {
 impl CatalogWriteExecution for UnusedCatalogWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
-    }
-
-    fn open_writer(
-        &self,
-        _request: novarocks_spi::connector::ConnectorOpenWriterRequest,
-    ) -> Result<Box<dyn novarocks_spi::connector::ConnectorBatchWriter>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "the dataflow write path never uses the legacy catalog writer",
-        ))
     }
 }
 

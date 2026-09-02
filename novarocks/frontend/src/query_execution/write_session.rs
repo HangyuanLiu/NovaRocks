@@ -852,34 +852,6 @@ pub(crate) mod tests {
         fn binding_key(&self) -> &ConnectorProviderBindingKey {
             unreachable!("the legacy control is not exercised by the write session")
         }
-
-        fn plan_write(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWritePlanningRequest,
-        ) -> Result<novarocks_spi::connector::ConnectorWritePlan, ConnectorError> {
-            unreachable!("the legacy control is not exercised by the write session")
-        }
-
-        fn commit(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!("the legacy control is not exercised by the write session")
-        }
-
-        fn abort(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
-        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            unreachable!("the legacy control is not exercised by the write session")
-        }
-
-        fn reconcile(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!("the legacy control is not exercised by the write session")
-        }
     }
 
     pub(crate) struct Fixture {

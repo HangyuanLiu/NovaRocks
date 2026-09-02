@@ -431,12 +431,10 @@ mod tests {
         ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
         ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteActivationIntent,
-        ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
+        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteBaseVersion,
         ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
         ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
-        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
-        ProviderBindingEpoch,
+        ConnectorWritePreparation, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -579,50 +577,6 @@ mod tests {
         ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
             unreachable!()
         }
-        fn activate_rewrite(
-            &self,
-            plan: &ConnectorDistributedRewritePlan,
-            context: ConnectorRequestContext,
-        ) -> Result<novarocks_spi::connector::ConnectorWriteActivation, ConnectorError> {
-            let source = plan.cohorts().first().ok_or_else(|| {
-                ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "test rewrite activation requires a cohort",
-                )
-            })?;
-            novarocks_spi::connector::ConnectorWriteActivation::try_new(
-                self.key.clone(),
-                &ConnectorWriteActivationRequest {
-                    operation_id: plan.operation_id(),
-                    source: ConnectorWriteActivationSource::Prepared(source.preparation().clone()),
-                    intent: ConnectorWriteActivationIntent::Ordinary,
-                    context,
-                },
-                plan.cohorts()
-                    .iter()
-                    .map(|cohort| (cohort.cohort_id(), cohort.preparation().clone()))
-                    .collect(),
-            )
-        }
-        fn checkpoint_attempt(
-            &self,
-            _plan: &ConnectorDistributedRewritePlan,
-            _disposition: novarocks_spi::connector::ConnectorDistributedRewriteAttemptDisposition,
-            _completion: &novarocks_spi::connector::ConnectorWriteAttemptCompletion,
-        ) -> Result<
-            novarocks_spi::connector::ConnectorDistributedRewriteAttemptCheckpoint,
-            ConnectorError,
-        > {
-            unreachable!()
-        }
-        fn restore_attempt(
-            &self,
-            _plan: &ConnectorDistributedRewritePlan,
-            _checkpoint: &novarocks_spi::connector::ConnectorDistributedRewriteAttemptCheckpoint,
-        ) -> Result<novarocks_spi::connector::ConnectorWriteAttemptCompletion, ConnectorError>
-        {
-            unreachable!()
-        }
         fn finalize_rewrite(
             &self,
             _plan: &ConnectorDistributedRewritePlan,
@@ -638,30 +592,6 @@ mod tests {
     impl ConnectorWriteControl for TestWrite {
         fn binding_key(&self) -> &ConnectorProviderBindingKey {
             &self.key
-        }
-        fn plan_write(
-            &self,
-            _request: ConnectorWritePlanningRequest,
-        ) -> Result<ConnectorWritePlan, ConnectorError> {
-            unreachable!()
-        }
-        fn commit(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteCommitRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!()
-        }
-        fn abort(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteAbortRequest,
-        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            unreachable!()
-        }
-        fn reconcile(
-            &self,
-            _request: novarocks_spi::connector::ConnectorWriteReconcileRequest,
-        ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-            unreachable!()
         }
     }
 

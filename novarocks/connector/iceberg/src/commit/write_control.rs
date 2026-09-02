@@ -44,11 +44,8 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedPartitionSpecPreview, ConnectorManagedPartitionSpecPreviewRequest,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest,
-    ConnectorWriteCommitRequest, ConnectorWriteControl, ConnectorWritePlan,
-    ConnectorWritePlanningRequest, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest, ConnectorWriteReceipt, ConnectorWriteReconcileRequest,
-    ExternalMutationOutcome, ProviderBindingEpoch,
+    ConnectorRowMutationPreparationRequest, ConnectorWriteControl,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ProviderBindingEpoch,
 };
 
 use crate::metadata::IcebergMetadata;
@@ -134,34 +131,6 @@ impl ConnectorWriteControl for IcebergWriteControl {
             prepared.committed().clone(),
         )
     }
-
-    fn plan_write(
-        &self,
-        _request: ConnectorWritePlanningRequest,
-    ) -> Result<ConnectorWritePlan, ConnectorError> {
-        Err(retired("writer placement planning"))
-    }
-
-    fn commit(
-        &self,
-        _request: ConnectorWriteCommitRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        Err(retired("write commit"))
-    }
-
-    fn abort(
-        &self,
-        _request: ConnectorWriteAbortRequest,
-    ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-        Err(retired("write abort"))
-    }
-
-    fn reconcile(
-        &self,
-        _request: ConnectorWriteReconcileRequest,
-    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
-        Err(retired("write reconciliation"))
-    }
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
@@ -178,17 +147,6 @@ fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorEr
         ));
     }
     Ok(())
-}
-
-/// The four methods the retired write-operation aggregate implemented and the
-/// write session now owns. They have no caller; the trait declares them
-/// without a default, so they are rejected here until the trait itself loses
-/// them.
-fn retired(subject: &str) -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        format!("Iceberg {subject} belongs to the write session, not the write control"),
-    )
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {

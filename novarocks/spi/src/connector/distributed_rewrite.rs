@@ -29,8 +29,7 @@ use super::{
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorMetadata, ConnectorPinnedFileSet, ConnectorProviderBinding,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorScanPlanning,
-    ConnectorTableHandle, ConnectorWriteActivation, ConnectorWriteAttemptCompletion,
-    ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteExecutionId, ConnectorWriteIntent,
+    ConnectorTableHandle, ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteIntent,
     ConnectorWriteLease, ConnectorWriteOperationId, ConnectorWritePreparation,
     ConnectorWriteReceipt, ProviderBindingEpoch,
 };
@@ -41,7 +40,6 @@ pub const MAX_CONNECTOR_DISTRIBUTED_REWRITE_COHORTS: usize = 4096;
 
 const REQUEST_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.request.v1\0";
 const PLAN_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.plan.v1\0";
-const CHECKPOINT_DOMAIN: &[u8] = b"novarocks.connector-distributed-rewrite.checkpoint.v1\0";
 
 pub const REWRITE_DATA_FILES_KIND: &str = "rewrite-data-files";
 pub const REWRITE_POSITION_DELETES_KIND: &str = "rewrite-position-deletes";
@@ -548,68 +546,6 @@ impl fmt::Debug for ConnectorDistributedRewritePlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorDistributedRewriteAttemptDisposition {
-    Accepted,
-    Superseded,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorDistributedRewriteAttemptCheckpoint {
-    pub cohort_id: ConnectorWriteCohortId,
-    pub execution_id: ConnectorWriteExecutionId,
-    pub disposition: ConnectorDistributedRewriteAttemptDisposition,
-    pub attempt_digest: [u8; 32],
-    pub artifact_digest: [u8; 32],
-    pub artifact_handle: Bytes,
-    pub checkpoint_digest: [u8; 32],
-}
-
-impl ConnectorDistributedRewriteAttemptCheckpoint {
-    pub fn try_new(
-        cohort_id: ConnectorWriteCohortId,
-        execution_id: ConnectorWriteExecutionId,
-        disposition: ConnectorDistributedRewriteAttemptDisposition,
-        attempt_digest: [u8; 32],
-        artifact_digest: [u8; 32],
-        artifact_handle: Bytes,
-    ) -> Result<Self, ConnectorError> {
-        validate_payload(&artifact_handle, "attempt checkpoint")?;
-        let checkpoint_digest = checkpoint_digest(
-            cohort_id,
-            &execution_id,
-            disposition,
-            attempt_digest,
-            artifact_digest,
-            &artifact_handle,
-        );
-        Ok(Self {
-            cohort_id,
-            execution_id,
-            disposition,
-            attempt_digest,
-            artifact_digest,
-            artifact_handle,
-            checkpoint_digest,
-        })
-    }
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        validate_payload(&self.artifact_handle, "attempt checkpoint")?;
-        let expected = checkpoint_digest(
-            self.cohort_id,
-            &self.execution_id,
-            self.disposition,
-            self.attempt_digest,
-            self.artifact_digest,
-            &self.artifact_handle,
-        );
-        if self.checkpoint_digest != expected {
-            return Err(invalid("distributed rewrite checkpoint digest is invalid"));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConnectorDistributedRewriteReceiptSummary {
     pub input_data_files: u64,
@@ -666,22 +602,6 @@ pub trait ConnectorDistributedRewrite: Send + Sync {
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
     ) -> Result<ConnectorDistributedRewritePlan, ConnectorError>;
-    fn activate_rewrite(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteActivation, ConnectorError>;
-    fn checkpoint_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        disposition: ConnectorDistributedRewriteAttemptDisposition,
-        completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError>;
-    fn restore_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError>;
     fn finalize_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
@@ -839,72 +759,6 @@ impl ConnectorDistributedRewriteLease {
         )?;
         self.plan_rewrite(request)
     }
-    pub fn activate_rewrite(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        self.validate_plan(plan)?;
-        let activation = self.rewrite.activate_rewrite(plan, context)?;
-        activation.validate()?;
-        if activation.owner() != &self.provider_binding_key
-            || activation.operation_id() != plan.operation_id()
-        {
-            return Err(invalid(
-                "distributed rewrite activation does not match exact lease generation",
-            ));
-        }
-        Ok(activation)
-    }
-    pub fn checkpoint_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        disposition: ConnectorDistributedRewriteAttemptDisposition,
-        completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
-        self.validate_plan(plan)?;
-        self.validate_attempt(plan, completion)?;
-        let checkpoint = self
-            .rewrite
-            .checkpoint_attempt(plan, disposition, completion)?;
-        checkpoint.validate()?;
-        if checkpoint.cohort_id != completion.cohort_id()
-            || checkpoint.execution_id != completion.execution_id()
-            || checkpoint.attempt_digest != completion.digest()
-        {
-            return Err(invalid(
-                "distributed rewrite checkpoint does not match attempt completion",
-            ));
-        }
-        Ok(checkpoint)
-    }
-    pub fn restore_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-        self.validate_plan(plan)?;
-        checkpoint.validate()?;
-        if !plan
-            .cohorts
-            .iter()
-            .any(|cohort| cohort.cohort_id == checkpoint.cohort_id)
-        {
-            return Err(invalid(
-                "distributed rewrite checkpoint names unknown cohort",
-            ));
-        }
-        let completion = self.rewrite.restore_attempt(plan, checkpoint)?;
-        self.validate_attempt(plan, &completion)?;
-        if completion.execution_id() != checkpoint.execution_id
-            || completion.digest() != checkpoint.attempt_digest
-        {
-            return Err(invalid(
-                "distributed rewrite restored attempt digest does not match checkpoint",
-            ));
-        }
-        Ok(completion)
-    }
     pub fn finalize_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
@@ -936,24 +790,6 @@ impl ConnectorDistributedRewriteLease {
         plan.validate()?;
         if plan.owner != self.provider_binding_key {
             return Err(invalid("distributed rewrite plan does not match lease"));
-        }
-        Ok(())
-    }
-    fn validate_attempt(
-        &self,
-        plan: &ConnectorDistributedRewritePlan,
-        completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<(), ConnectorError> {
-        if completion.owner() != &self.provider_binding_key
-            || completion.operation_id() != plan.operation_id
-            || !plan
-                .cohorts
-                .iter()
-                .any(|cohort| cohort.cohort_id == completion.cohort_id())
-        {
-            return Err(invalid(
-                "distributed rewrite attempt does not belong to plan or exact lease",
-            ));
         }
         Ok(())
     }
@@ -1031,25 +867,6 @@ fn plan_digest(
     for cohort in cohorts {
         cohort.digest_into(&mut hash);
     }
-    hash.finalize().into()
-}
-fn checkpoint_digest(
-    cohort: ConnectorWriteCohortId,
-    execution: &ConnectorWriteExecutionId,
-    disposition: ConnectorDistributedRewriteAttemptDisposition,
-    attempt: [u8; 32],
-    artifact: [u8; 32],
-    handle: &Bytes,
-) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(CHECKPOINT_DOMAIN);
-    hash.update(cohort.to_bytes());
-    hash.update(execution.query_id());
-    hash.update(execution.attempt_id().to_be_bytes());
-    hash.update([disposition as u8]);
-    hash.update(attempt);
-    hash.update(artifact);
-    digest_bytes(&mut hash, handle);
     hash.finalize().into()
 }
 fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
@@ -1259,26 +1076,5 @@ mod tests {
                 .is_err()
             );
         }
-    }
-
-    #[test]
-    fn checkpoint_digest_binds_the_execution_attempt_and_artifact() {
-        let cohort = ConnectorWriteCohortId::from_bytes([4; 32]);
-        let execution = ConnectorWriteExecutionId::new([5; 16], 6);
-        let checkpoint = ConnectorDistributedRewriteAttemptCheckpoint::try_new(
-            cohort,
-            execution,
-            ConnectorDistributedRewriteAttemptDisposition::Accepted,
-            [7; 32],
-            [8; 32],
-            Bytes::from_static(b"artifact"),
-        )
-        .unwrap();
-        let mut changed = checkpoint.clone();
-        changed.execution_id = ConnectorWriteExecutionId::new([5; 16], 9);
-        assert!(changed.validate().is_err());
-        let mut changed = checkpoint;
-        changed.artifact_digest = [9; 32];
-        assert!(changed.validate().is_err());
     }
 }

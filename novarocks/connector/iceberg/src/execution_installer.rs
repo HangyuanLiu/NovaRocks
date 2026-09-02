@@ -152,27 +152,17 @@ impl IcebergExecutionBindingFactory {
             // The slot stays occupied because the role binding requires the
             // generic and typed write groups to agree about whether this
             // provider writes at all.
-            Some(Arc::new(IcebergRetiredWriteExecution)),
+            Some(Arc::new(IcebergWriteCapability)),
         )
     }
 }
 
-/// The generic writer entry the write session replaced. It exists so the
-/// execution role binding can still see that this provider writes; nothing
-/// opens a writer through it.
-struct IcebergRetiredWriteExecution;
+/// The generic write capability marker. It exists so the execution role
+/// binding can see that this provider writes (ADR-0130); writers themselves are
+/// opened through the write stack's own execution binding.
+struct IcebergWriteCapability;
 
-impl novarocks_spi::connector::ConnectorWriteExecution for IcebergRetiredWriteExecution {
-    fn open_writer(
-        &self,
-        _request: novarocks_spi::connector::ConnectorOpenWriterRequest,
-    ) -> Result<Box<dyn novarocks_spi::connector::ConnectorBatchWriter>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg writers are opened through the write session, not the execution binding",
-        ))
-    }
-}
+impl novarocks_spi::connector::ConnectorWriteExecution for IcebergWriteCapability {}
 
 /// Materializes only FE-frozen membership into local read units. Catalog
 /// access and all planning remain outside this BE execution object.

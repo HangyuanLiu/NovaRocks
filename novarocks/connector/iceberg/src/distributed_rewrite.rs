@@ -32,18 +32,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use novarocks_spi::connector::{
-    ConnectorDistributedRewrite, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteAttemptDisposition, ConnectorDistributedRewriteCohortPlan,
+    ConnectorDistributedRewrite, ConnectorDistributedRewriteCohortPlan,
     ConnectorDistributedRewriteOperation, ConnectorDistributedRewritePlan,
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor,
     ConnectorPinnedFileSet, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorRewriteCohortRead, ConnectorTableHandle, ConnectorWriteActivation,
-    ConnectorWriteAttemptCompletion, ConnectorWriteBaseVersion, ConnectorWriteCohortId,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
-    ConnectorWriteIntent, ConnectorWritePreparation, ConnectorWriteReceipt,
-    ConnectorWriteTargetRef, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    ConnectorRewriteCohortRead, ConnectorTableHandle, ConnectorWriteBaseVersion,
+    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePreparation,
+    ConnectorWriteReceipt, ConnectorWriteTargetRef, ProviderBindingEpoch,
+    REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
@@ -320,44 +319,6 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
     /// The write session seals a rewrite's branches from the same frozen
     /// groups this plan names, so a rewrite no longer activates a separate
     /// writer set. The trait still declares this entry; it has no caller.
-    fn activate_rewrite(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _context: ConnectorRequestContext,
-    ) -> Result<ConnectorWriteActivation, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg distributed rewrite is sealed by the write session, not by a write activation",
-        ))
-    }
-
-    /// Attempt-level durable recovery is gone with the write-operation
-    /// aggregate (ADR-0133): a rewrite that loses its frontend restarts from
-    /// scratch and orphan objects fall back to crash-only GC. Reintroducing it
-    /// is a durable staged-manifest design, not a checkpoint under this name.
-    fn checkpoint_attempt(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _disposition: ConnectorDistributedRewriteAttemptDisposition,
-        _completion: &ConnectorWriteAttemptCompletion,
-    ) -> Result<ConnectorDistributedRewriteAttemptCheckpoint, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg distributed rewrite no longer checkpoints an attempt",
-        ))
-    }
-
-    fn restore_attempt(
-        &self,
-        _plan: &ConnectorDistributedRewritePlan,
-        _checkpoint: &ConnectorDistributedRewriteAttemptCheckpoint,
-    ) -> Result<ConnectorWriteAttemptCompletion, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg distributed rewrite no longer restores an attempt",
-        ))
-    }
-
     fn finalize_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,

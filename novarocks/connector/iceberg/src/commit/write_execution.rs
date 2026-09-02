@@ -28,8 +28,7 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogWriteExecution, CatalogWriteExecutionBundle,
-    CatalogWriteExecutionBundleFactory, ConnectorBatchWriter, ConnectorError, ConnectorErrorKind,
-    ConnectorOpenWriterRequest,
+    CatalogWriteExecutionBundleFactory, ConnectorError,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -75,15 +74,5 @@ struct IcebergRetiredCatalogWriteExecution {
 impl CatalogWriteExecution for IcebergRetiredCatalogWriteExecution {
     fn catalog_handle(&self) -> &CatalogHandle {
         &self.catalog_handle
-    }
-
-    fn open_writer(
-        &self,
-        _request: ConnectorOpenWriterRequest,
-    ) -> Result<Box<dyn ConnectorBatchWriter>, ConnectorError> {
-        Err(ConnectorError::new(
-            ConnectorErrorKind::Unsupported,
-            "Iceberg writers are opened through the write session, not the catalog write execution",
-        ))
     }
 }
