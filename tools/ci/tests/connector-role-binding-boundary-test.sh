@@ -74,6 +74,10 @@ if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
 fi
 grep -Fq "legacy parallel registry must be removed" "$tmpdir/source.stderr"
 
+# Keep the source mutation fixtures independent so the next check reaches its
+# intended server-adapter validation instead of failing on this legacy marker.
+rm "$source_root/novarocks/backend/src/connector/typed_registry.rs"
+
 touch "$source_root/novarocks-server/src/connector_role_binding.rs"
 if "$CHECKER" --metadata-path "$metadata" --source-root "$source_root" \
   >"$tmpdir/server.stdout" 2>"$tmpdir/server.stderr"; then
