@@ -30,8 +30,7 @@ pub use crate::common::expr::{
 pub use crate::common::plan_hints::{ScanVariantColumn, SqlTopNType};
 pub use crate::common::schema::OutputColumn;
 pub use crate::planner::distributed::write::{
-    ChangeStreamRouterSink, ConnectorWriteFragmentSink, ConnectorWriteInputBinding,
-    TableFinishNode, TableWriterNode,
+    ChangeStreamRouterSink, ConnectorWriteInputBinding, TableFinishNode, TableWriterNode,
 };
 pub use crate::planner::distributed::{
     BoundaryColumn, BoundaryContract, BoundaryKind, ConnectorWriteOutputContract, DataPartition,
@@ -56,23 +55,6 @@ impl DistributedNode {
         self.runtime_filter_binding_ids
             .iter()
             .map(|binding_id| binding_id.get())
-    }
-}
-
-/// Read-only access to one sealed connector writer sink. The opaque provider
-/// payload remains inside the signed SPI handle; plan readers can only encode
-/// its immutable envelope.
-impl ConnectorWriteFragmentSink {
-    pub fn handle(&self) -> Option<&novarocks_spi::connector::ConnectorWriterHandle> {
-        self.handle.as_ref()
-    }
-
-    pub fn input(&self) -> &ConnectorWriteInputBinding {
-        &self.input
-    }
-
-    pub fn has_output_contract(&self) -> bool {
-        self.output_contract.is_some()
     }
 }
 
@@ -948,7 +930,6 @@ pub enum SqlBoundaryKindRead {
     ResultOutput,
     ExchangeSend,
     ExchangeReceive,
-    IcebergWriteInput,
     ChangeStreamRouterInput,
 }
 
@@ -978,9 +959,6 @@ pub fn boundary_contract_reads(plan: &DistributedPlan) -> Vec<SqlBoundaryContrac
                 }
                 crate::planner::distributed::BoundaryKind::ExchangeReceive => {
                     SqlBoundaryKindRead::ExchangeReceive
-                }
-                crate::planner::distributed::BoundaryKind::IcebergWriteInput => {
-                    SqlBoundaryKindRead::IcebergWriteInput
                 }
                 crate::planner::distributed::BoundaryKind::ChangeStreamRouterInput => {
                     SqlBoundaryKindRead::ChangeStreamRouterInput

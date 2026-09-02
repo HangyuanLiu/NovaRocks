@@ -264,28 +264,24 @@ fn validate_structure(
         if fragment.fragment_id == root_fragment_id {
             let root_sink_supported = matches!(
                 fragment.sink,
-                DataSink::Result
-                    | DataSink::Statistics(_)
-                    | DataSink::ConnectorWrite(_)
-                    | DataSink::ChangeStreamRouter(_)
+                DataSink::Result | DataSink::Statistics(_) | DataSink::ChangeStreamRouter(_)
             );
             if !root_sink_supported {
                 return Err(format!(
-                    "lower_distributed_plan root fragment id={} must use result, statistics, connector write, or change-stream router sink",
+                    "lower_distributed_plan root fragment id={} must use result, statistics, or change-stream router sink",
                     fragment.fragment_id
                 ));
             }
             ensure_unpartitioned("root output_partition", &fragment.output_partition)?;
         } else {
-            let non_root_sink_supported =
-                matches!(fragment.sink, DataSink::Noop | DataSink::ConnectorWrite(_))
-                    || (dataflow_write_root
-                        && matches!(fragment.sink, DataSink::ChangeStreamRouter(_)));
+            let non_root_sink_supported = matches!(fragment.sink, DataSink::Noop)
+                || (dataflow_write_root
+                    && matches!(fragment.sink, DataSink::ChangeStreamRouter(_)));
             if non_root_sink_supported {
                 continue;
             }
             return Err(format!(
-                "lower_distributed_plan non-root fragment id={} must use noop or Iceberg write sink",
+                "lower_distributed_plan non-root fragment id={} must use noop sink",
                 fragment.fragment_id
             ));
         }
@@ -1271,7 +1267,7 @@ mod tests {
                 0,
                 vec![route],
             );
-        crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan(dp, dag)
+        crate::planner::distributed::write::plan::finalize_sql_change_stream_table_writer_finish_test_plan(dp, dag)
             .expect("plan change-stream write")
     }
 
@@ -1488,8 +1484,13 @@ mod tests {
     #[test]
     fn finalized_router_validation_rejects_stale_contracts() {
         let planned = finalized_router_plan();
-        let source_fragment_id = planned.edges()[0].source_fragment_id;
-        let target_fragment_id = planned.edges()[0].target_fragment_id;
+        let router_edge = planned
+            .edges()
+            .iter()
+            .find(|edge| matches!(edge.edge_kind, FragmentEdgeKind::ChangeStreamRouter { .. }))
+            .expect("router edge");
+        let source_fragment_id = router_edge.source_fragment_id;
+        let target_fragment_id = router_edge.target_fragment_id;
 
         let mut wrong_sink = draft_builder_from_plan(&planned, Default::default());
         wrong_sink
@@ -1497,7 +1498,7 @@ mod tests {
             .iter_mut()
             .find(|fragment| fragment.fragment_id == source_fragment_id)
             .expect("router source fragment")
-            .sink = DataSink::Result;
+            .sink = DataSink::Noop;
         let err = wrong_sink
             .seal()
             .expect_err("router edge without router sink must fail");
@@ -1550,7 +1551,10 @@ mod tests {
                 .iter_mut()
                 .find(|fragment| fragment.fragment_id == target_fragment_id)
                 .expect("router target fragment");
-            let DistributedNodeKind::Exchange(exchange) = &mut target.root.payload else {
+            // The route's writer fragment is `Exchange -> TableWriter`, so the
+            // receiver the router edge points at is the writer node's child.
+            let DistributedNodeKind::Exchange(exchange) = &mut target.root.children[0].payload
+            else {
                 panic!("expected router Exchange receiver");
             };
             exchange.partition = DataPartition::unpartitioned();

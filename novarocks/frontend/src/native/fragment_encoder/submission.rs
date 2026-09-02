@@ -23,18 +23,14 @@
 //! those frozen facts without reacquiring planning, topology, or control
 //! state, then seals the complete payload back into Core's neutral attachment.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use crate::query_execution::FragmentInstancePlacement;
 use crate::query_execution::artifact::{
     NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentRole,
-    ValidatedNativeSubmission, WriterRegistration, WriterRegistrationSet,
+    ValidatedNativeSubmission,
 };
 use crate::query_execution::assembly;
-use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
-use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};
-use novarocks_types::UniqueId;
 
 use super::{encode_data_partition, encode_instance_params};
 
@@ -108,29 +104,7 @@ pub(crate) fn encode_native_submission(
         .native_fragments_in_id_order()
         .map(|(fragment_id, fragment)| (fragment_id, fragment.clone()))
         .collect::<BTreeMap<_, _>>();
-    let connector_write_plans = view.connector_write_plans();
-    let mut connector_attachment_by_fragment =
-        BTreeMap::<FragmentId, &ConnectorWritePlanAttachment>::new();
-    for attachment in connector_write_plans.values() {
-        for writer in attachment.manifest().writers() {
-            let fragment_id = u32::try_from(writer.fragment_id())
-                .map_err(|_| "connector writer manifest contains a negative fragment ID")?;
-            if connector_attachment_by_fragment
-                .insert(fragment_id, attachment)
-                .is_some_and(|previous| {
-                    previous.manifest().cohort_id() != attachment.manifest().cohort_id()
-                })
-            {
-                return Err(format!(
-                    "connector write plans assign terminal fragment {fragment_id} to multiple cohorts"
-                ));
-            }
-        }
-    }
-
     let mut submissions_by_fragment = BTreeMap::new();
-    let mut writer_registrations = Vec::new();
-    let mut consumed_connector_writers = BTreeSet::new();
     let query_id = view.query_id();
     for (&fragment_id, placements) in &schedule.by_fragment {
         let facts = view
@@ -142,17 +116,12 @@ pub(crate) fn encode_native_submission(
         let is_root = fragment_id == root_fragment_id;
         let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
         let router_edges = router_edges_by_source.get(&fragment_id);
-        let is_writer = stream_edge.is_none()
-            && router_edges.is_none()
-            && facts.cte_id().is_none()
-            && facts.role().is_terminal_write();
         let is_producer =
             stream_edge.is_some() || router_edges.is_some() || facts.cte_id().is_some();
-        validate_fragment_output_kind(fragment_id, is_root, is_writer, is_producer, facts.role())?;
+        validate_fragment_output_kind(fragment_id, is_root, is_producer, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(
             fragment_id,
             is_root,
-            is_writer,
             stream_edge.is_some(),
             router_edges.is_some(),
             facts.cte_id().is_some(),
@@ -160,35 +129,8 @@ pub(crate) fn encode_native_submission(
         let fragment_submissions = placements
             .iter()
             .map(|placement| {
-                let connector_attachment = connector_attachment_by_fragment
-                    .get(&fragment_id)
-                    .copied();
-                if is_writer && !connector_write_plans.is_empty() && connector_attachment.is_none() {
-                    return Err(format!(
-                        "connector write plans have no cohort attachment for terminal writer fragment {fragment_id}"
-                    ));
-                }
-                if is_writer {
-                    writer_registrations.push(WriterRegistration::new(
-                        query_id,
-                        view.execution_id(),
-                        fragment_id,
-                        placement.finst_id,
-                        placement.instance_index as i32,
-                        connector_attachment.map(|attachment| attachment.manifest().cohort_id()),
-                    ));
-                }
                 let mut native_fragment = template.clone();
-                if is_writer && let Some(attachment) = connector_attachment {
-                    patch_connector_writer(
-                        &mut native_fragment,
-                        fragment_id,
-                        placement,
-                        attachment,
-                        &mut consumed_connector_writers,
-                    )?;
-                }
-                if !is_root && !is_writer && stream_edge.is_none() {
+                if !is_root && stream_edge.is_none() {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         assembly::patch_native_change_stream_router_sink(
                             &mut native_fragment,
@@ -247,36 +189,25 @@ pub(crate) fn encode_native_submission(
     if !submissions_by_fragment.is_empty() {
         return Err("assembled submissions contain unknown fragments".to_string());
     }
-    validate_connector_writer_coverage(connector_write_plans, &consumed_connector_writers)?;
-
-    view.seal(
-        submissions,
-        WriterRegistrationSet::new(writer_registrations),
-    )
-    .map_err(|error| error.message().to_string())
+    view.seal(submissions)
+        .map_err(|error| error.message().to_string())
 }
 
 fn validate_fragment_output_kind(
     fragment_id: FragmentId,
     is_root: bool,
-    is_terminal_write: bool,
     is_producer: bool,
     role: NativeSubmissionFragmentRole,
 ) -> Result<(), String> {
     if is_root {
         return match role {
-            NativeSubmissionFragmentRole::Result
-            | NativeSubmissionFragmentRole::Statistics
-            | NativeSubmissionFragmentRole::TerminalWrite => Ok(()),
+            NativeSubmissionFragmentRole::Result | NativeSubmissionFragmentRole::Statistics => {
+                Ok(())
+            }
             NativeSubmissionFragmentRole::NonTerminal => Err(format!(
-                "root fragment {fragment_id} must have Result or TerminalWrite output kind"
+                "root fragment {fragment_id} must have Result output kind"
             )),
         };
-    }
-    if is_terminal_write && role != NativeSubmissionFragmentRole::TerminalWrite {
-        return Err(format!(
-            "terminal write fragment {fragment_id} must have TerminalWrite output kind, got {role:?}"
-        ));
     }
     if is_producer && role != NativeSubmissionFragmentRole::NonTerminal {
         return Err(format!(
@@ -284,72 +215,4 @@ fn validate_fragment_output_kind(
         ));
     }
     Ok(())
-}
-
-fn patch_connector_writer(
-    native_fragment: &mut novarocks_proto_models::plan::PlanFragment,
-    fragment_id: FragmentId,
-    placement: &FragmentInstancePlacement,
-    attachment: &ConnectorWritePlanAttachment,
-    consumed: &mut BTreeSet<novarocks_spi::connector::ConnectorWriterIdentity>,
-) -> Result<(), String> {
-    let backend_num = i32::try_from(placement.instance_index)
-        .map_err(|_| "connector writer backend number exceeds i32 width")?;
-    let writer_fragment_id =
-        i32::try_from(fragment_id).map_err(|_| "connector writer fragment ID exceeds i32 width")?;
-    let handle = attachment
-        .plan()
-        .handles()
-        .iter()
-        .find(|handle| {
-            let writer = handle.writer();
-            writer.fragment_id() == writer_fragment_id
-                && writer.backend_num() == backend_num
-                && writer.fragment_instance_id() == unique_id_bytes(placement.finst_id)
-                && writer.sink_ordinal() == 0
-        })
-        .ok_or_else(|| format!(
-            "connector write plan has no handle for terminal writer fragment={fragment_id} backend_num={backend_num} finst={:?}",
-            placement.finst_id
-        ))?;
-    if !consumed.insert(handle.writer().clone()) {
-        return Err(format!(
-            "connector write plan reuses a writer handle for terminal writer fragment={fragment_id} backend_num={backend_num}"
-        ));
-    }
-    assembly::patch_native_connector_write_sink(
-        native_fragment,
-        fragment_id,
-        placement.finst_id,
-        backend_num,
-        handle,
-    )
-}
-
-fn validate_connector_writer_coverage(
-    plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    consumed: &BTreeSet<novarocks_spi::connector::ConnectorWriterIdentity>,
-) -> Result<(), String> {
-    if plans.is_empty() {
-        return Ok(());
-    }
-    let expected = plans
-        .values()
-        .flat_map(|attachment| attachment.manifest().writers().iter().cloned())
-        .collect::<BTreeSet<_>>();
-    if *consumed != expected {
-        let missing = expected.difference(consumed).collect::<Vec<_>>();
-        let unexpected = consumed.difference(&expected).collect::<Vec<_>>();
-        return Err(format!(
-            "connector write plan consumption does not exactly cover the frozen manifests: missing={missing:?} unexpected={unexpected:?}"
-        ));
-    }
-    Ok(())
-}
-
-fn unique_id_bytes(value: UniqueId) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&value.high().to_be_bytes());
-    bytes[8..].copy_from_slice(&value.low().to_be_bytes());
-    bytes
 }

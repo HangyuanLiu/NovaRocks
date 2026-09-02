@@ -62,7 +62,6 @@ pub mod resources;
 /// Iceberg virtual-column and row-lineage facts. These names and reserved
 /// field IDs are defined by the table format, not by the execution engine.
 pub mod row_lineage_synth;
-pub mod row_mutation_payload;
 pub mod scan_model;
 pub mod schema_facts;
 pub mod schema_mapping;
@@ -77,10 +76,8 @@ pub mod theta_sketch;
 pub mod typed_boundary;
 pub mod typed_provider_factory;
 pub mod typed_read;
-pub mod write_activation;
 pub mod write_codec;
 pub mod write_descriptor;
-pub mod write_payload;
 
 pub use commit::write_execution::IcebergCatalogWriteExecutionFactory;
 pub use file_reader::execution_installer::IcebergCatalogRuntimeMaterializer;

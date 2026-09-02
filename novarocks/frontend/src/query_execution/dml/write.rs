@@ -1,79 +1,9 @@
 //! Sealed distributed-write dispatch for DML reverse ports.
-//!
-//! The binding retains the exact connector operation session created from the
-//! admitted write template. It never reacquires a current connector generation.
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::query_execution::contract::{DistributedQueryOutcome, DistributedQueryRequest};
 use crate::query_execution::outcome::{QueryExecutionResult, WriteExecutionOutcome};
-use crate::query_execution::prepared_write::PreparedDistributedWriteRequest;
 use crate::query_execution::service::QueryExecutionService;
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged query-execution DML recovery and connector wiring."
-)]
-pub(crate) struct BoundDistributedWriteRequest {
-    pub(crate) request: DistributedQueryRequest,
-    pub(crate) session: ConnectorWriteOperationSession,
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged query-execution DML recovery and connector wiring."
-)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The write binding keeps its exact distributed request payload unboxed at the execution boundary."
-)]
-pub(crate) enum BoundDistributedWriteBinding {
-    Bound(BoundDistributedWriteRequest),
-    AbortRequired {
-        session: ConnectorWriteOperationSession,
-        reason: String,
-    },
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged query-execution DML recovery and connector wiring."
-)]
-pub(crate) fn bind_prepared_distributed_write_request(
-    query_execution: &QueryExecutionService,
-    execution: &QueryExecutionContext,
-    prepared: PreparedDistributedWriteRequest,
-) -> Result<BoundDistributedWriteBinding, String> {
-    let cohort_id = prepared.write_cohort_id();
-    let session = query_execution
-        .begin_write_operation(prepared.registration(), prepared.lease())
-        .map_err(|error| error.to_string())?;
-    let registration =
-        match crate::query_execution::contract::ConnectorWriteExecutionRegistration::try_new(
-            session.clone(),
-            cohort_id,
-        ) {
-            Ok(registration) => registration,
-            Err(error) => {
-                return Ok(BoundDistributedWriteBinding::AbortRequired {
-                    session,
-                    reason: error.to_string(),
-                });
-            }
-        };
-    let request = match prepared.into_request(execution, registration) {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(BoundDistributedWriteBinding::AbortRequired {
-                session,
-                reason: error.to_string(),
-            });
-        }
-    };
-    Ok(BoundDistributedWriteBinding::Bound(
-        BoundDistributedWriteRequest { request, session },
-    ))
-}
 
 pub(crate) fn execute_bound_distributed_write_request(
     query_execution: &QueryExecutionService,

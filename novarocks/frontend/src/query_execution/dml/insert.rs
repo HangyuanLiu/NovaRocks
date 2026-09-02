@@ -177,10 +177,6 @@ pub struct PreparedIcebergInsert {
 
 /// Connector-neutral result of the coordinated writer phase.
 pub enum IcebergWriteReport {
-    Aborted {
-        reason: String,
-        has_staged_files: bool,
-    },
     NoOp,
     CommitRequired(Arc<dyn IcebergInsertCommit>),
 }
@@ -603,16 +599,6 @@ fn downcast_prepared(
 fn iceberg_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
 ) -> IcebergWriteReport {
-    if let Some(abort) = result.write_abort {
-        let has_staged_files = abort
-            .completed_writer_outputs
-            .iter()
-            .any(|writer| !writer.connector_staged_report_frames.is_empty());
-        return IcebergWriteReport::Aborted {
-            reason: abort.reason,
-            has_staged_files,
-        };
-    }
     let Some(completion) = result.write_session else {
         return IcebergWriteReport::NoOp;
     };
@@ -645,20 +631,14 @@ fn insert_value_to_literal(value: &InsertValue) -> Literal {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
     use crate::common::backend_topology::BackendTopologySnapshot;
     use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
-    use crate::query_execution::write::{
-        WriteAbortInput, WriteCommitInput, WriterCommitInput, WriterKey,
-    };
     use crate::runtime::query_result::QueryResult;
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
-    use novarocks_types::UniqueId;
 
     fn cancelled_execution() -> QueryExecutionContext {
         let cancellation = QueryCancellationSource::new();
@@ -687,32 +667,6 @@ mod tests {
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
         )
-    }
-
-    fn write_abort_with_staged_report() -> WriteAbortInput {
-        let write_id = UniqueId::new(10, 20);
-        let writer_key = WriterKey {
-            query_id: write_id,
-            fragment_instance_id: UniqueId::new(101, 201),
-            backend_num: 0,
-        };
-        WriteAbortInput {
-            write_id,
-            reason: "query timed out waiting for write final reports".to_string(),
-            completed_writer_outputs: vec![WriterCommitInput {
-                writer_id: 0,
-                fragment_id: 0,
-                writer_key,
-                connector_staged_report_frames: vec![
-                    novarocks_proto_models::novarocks::ConnectorStagedReportFrame::default(),
-                ],
-                load_counters: BTreeMap::from([("loaded.rows".to_string(), "11".to_string())]),
-                loaded_rows: 11,
-                loaded_bytes: 110,
-                filtered_rows: 0,
-            }],
-            incomplete_writers: Vec::new(),
-        }
     }
 
     #[test]
@@ -753,9 +707,6 @@ mod tests {
         );
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
             write_session: Some(
                 crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
                     Arc::clone(&fixture.session),
@@ -812,9 +763,6 @@ mod tests {
         );
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
             write_session: Some(
                 crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
                     Arc::clone(&fixture.session),
@@ -848,96 +796,13 @@ mod tests {
     }
 
     #[test]
-    fn query_execution_result_ignores_legacy_fileless_overwrite_carrier() {
+    fn query_execution_result_maps_absent_write_session_to_noop() {
         let report = iceberg_write_report_from_result(QueryExecutionResult {
             query_result: QueryResult::empty(),
-            write_commit: Some(WriteCommitInput {
-                write_id: UniqueId::new(1, 2),
-                writers: Vec::new(),
-            }),
-            write_abort: None,
-            connector_completion: None,
             write_session: None,
             fragment_profiles: Vec::new(),
         });
 
         assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_absent_commit_to_noop() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_fileless_fast_append_to_noop() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: Some(WriteCommitInput {
-                write_id: UniqueId::new(1, 2),
-                writers: Vec::new(),
-            }),
-            write_abort: None,
-            connector_completion: None,
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        assert!(matches!(report, IcebergWriteReport::NoOp));
-    }
-
-    #[test]
-    fn query_execution_result_maps_writer_abort_with_staged_files() {
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(write_abort_with_staged_report()),
-            connector_completion: None,
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        let IcebergWriteReport::Aborted {
-            reason,
-            has_staged_files,
-        } = report
-        else {
-            panic!("writer abort must stay an aborted report");
-        };
-        assert!(reason.contains("timed out"));
-        assert!(has_staged_files);
-    }
-
-    #[test]
-    fn query_execution_result_does_not_treat_empty_commit_info_as_staged_file() {
-        let mut abort = write_abort_with_staged_report();
-        abort.completed_writer_outputs[0]
-            .connector_staged_report_frames
-            .clear();
-        let report = iceberg_write_report_from_result(QueryExecutionResult {
-            query_result: QueryResult::empty(),
-            write_commit: None,
-            write_abort: Some(abort),
-            connector_completion: None,
-            write_session: None,
-            fragment_profiles: Vec::new(),
-        });
-
-        let IcebergWriteReport::Aborted {
-            has_staged_files, ..
-        } = report
-        else {
-            panic!("writer abort must stay an aborted report");
-        };
-        assert!(!has_staged_files);
     }
 }

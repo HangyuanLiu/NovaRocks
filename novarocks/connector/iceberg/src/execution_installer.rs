@@ -31,7 +31,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::access_binding::IcebergReadBinding;
-use crate::commit::write_execution::IcebergDataWriteExecution;
 use crate::file_reader::batch_reader::IcebergBatchReader;
 use crate::file_reader::delta_reader::IcebergDeltaBatchReader;
 use crate::file_reader::execution_payload::{
@@ -148,11 +147,30 @@ impl IcebergExecutionBindingFactory {
                 key: key.clone(),
                 binding: binding.clone(),
             })),
-            Some(Arc::new(IcebergDataWriteExecution::new(
-                binding,
-                self.resources.runtime().clone(),
-            ))),
+            // Writers are opened through the write stack's own execution
+            // binding, which the role binding publishes alongside this one.
+            // The slot stays occupied because the role binding requires the
+            // generic and typed write groups to agree about whether this
+            // provider writes at all.
+            Some(Arc::new(IcebergRetiredWriteExecution)),
         )
+    }
+}
+
+/// The generic writer entry the write session replaced. It exists so the
+/// execution role binding can still see that this provider writes; nothing
+/// opens a writer through it.
+struct IcebergRetiredWriteExecution;
+
+impl novarocks_spi::connector::ConnectorWriteExecution for IcebergRetiredWriteExecution {
+    fn open_writer(
+        &self,
+        _request: novarocks_spi::connector::ConnectorOpenWriterRequest,
+    ) -> Result<Box<dyn novarocks_spi::connector::ConnectorBatchWriter>, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg writers are opened through the write session, not the execution binding",
+        ))
     }
 }
 

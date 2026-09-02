@@ -51,7 +51,6 @@ use arrow::datatypes::DataType;
 use crate::analysis::OutputColumn;
 use crate::column_id::ColumnId;
 
-use super::write::contract::ConnectorWriteInputBinding;
 use super::{
     DataSink, DistributedNode, DistributedNodeKind, ExchangeReceiver, FragmentEdge, FragmentId,
     PlanFragment,
@@ -142,7 +141,6 @@ pub enum BoundaryKind {
     /// The receiver side of an Exchange edge.
     ExchangeReceive,
     /// The input columns feeding an Iceberg write sink.
-    IcebergWriteInput,
     /// The full input feeding an Iceberg change-stream router sink.
     ChangeStreamRouterInput,
 }
@@ -153,7 +151,6 @@ impl fmt::Display for BoundaryKind {
             Self::ResultOutput => "result-output",
             Self::ExchangeSend => "exchange-send",
             Self::ExchangeReceive => "exchange-receive",
-            Self::IcebergWriteInput => "iceberg-write-input",
             Self::ChangeStreamRouterInput => "change-stream-router-input",
         })
     }
@@ -283,20 +280,6 @@ pub(in crate::planner::distributed) fn build_boundary_catalog(
             }
             DataSink::Noop => {}
             DataSink::Statistics(_) => {}
-            DataSink::ConnectorWrite(sink) => {
-                let columns = connector_write_input_columns(
-                    fragment.fragment_id,
-                    &fragment.output_columns,
-                    &sink.input,
-                    allocator,
-                )?;
-                contracts.push(BoundaryContract {
-                    fragment_id: fragment.fragment_id,
-                    node_id: None,
-                    kind: BoundaryKind::IcebergWriteInput,
-                    columns,
-                });
-            }
             DataSink::ChangeStreamRouter(_) => {
                 contracts.push(BoundaryContract {
                     fragment_id: fragment.fragment_id,
@@ -350,85 +333,6 @@ fn occurrence_columns(
         .collect()
 }
 
-/// Resolve the input columns of an Iceberg write sink from its binding, failing
-/// fast on any ordinal that does not exist in the fragment's output columns.
-fn iceberg_write_input_columns(
-    fragment_id: FragmentId,
-    outputs: &[OutputColumn],
-    binding: &ConnectorWriteInputBinding,
-    allocator: &mut ExecutionColumnIdAllocator,
-) -> Result<Vec<BoundaryColumn>, BoundaryError> {
-    match binding {
-        ConnectorWriteInputBinding::RootOutputByOrdinal => {
-            Ok(occurrence_columns(outputs, allocator))
-        }
-        ConnectorWriteInputBinding::OutputOrdinals(ordinals) => {
-            let mut columns = Vec::with_capacity(ordinals.len());
-            for (output_ordinal, source_ordinal) in ordinals.iter().enumerate() {
-                let column =
-                    outputs
-                        .get(*source_ordinal)
-                        .ok_or(BoundaryError::OutputOrdinalOutOfRange {
-                            fragment_id,
-                            kind: BoundaryKind::IcebergWriteInput,
-                            ordinal: *source_ordinal,
-                            available: outputs.len(),
-                        })?;
-                columns.push(BoundaryColumn {
-                    execution_column_id: allocator.allocate(),
-                    column_id: column.column_id,
-                    output_ordinal,
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
-                    is_internal: column.is_internal,
-                });
-            }
-            Ok(columns)
-        }
-    }
-}
-
-/// Resolve the input columns of a provider-neutral connector sink.  Keep this
-/// separate from the Iceberg compatibility helper so the generic carrier does
-/// not depend on a provider-named input binding.
-fn connector_write_input_columns(
-    fragment_id: FragmentId,
-    outputs: &[OutputColumn],
-    binding: &ConnectorWriteInputBinding,
-    allocator: &mut ExecutionColumnIdAllocator,
-) -> Result<Vec<BoundaryColumn>, BoundaryError> {
-    match binding {
-        ConnectorWriteInputBinding::RootOutputByOrdinal => {
-            Ok(occurrence_columns(outputs, allocator))
-        }
-        ConnectorWriteInputBinding::OutputOrdinals(ordinals) => {
-            let mut columns = Vec::with_capacity(ordinals.len());
-            for (output_ordinal, source_ordinal) in ordinals.iter().enumerate() {
-                let column =
-                    outputs
-                        .get(*source_ordinal)
-                        .ok_or(BoundaryError::OutputOrdinalOutOfRange {
-                            fragment_id,
-                            kind: BoundaryKind::IcebergWriteInput,
-                            ordinal: *source_ordinal,
-                            available: outputs.len(),
-                        })?;
-                columns.push(BoundaryColumn {
-                    execution_column_id: allocator.allocate(),
-                    column_id: column.column_id,
-                    output_ordinal,
-                    name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
-                    is_internal: column.is_internal,
-                });
-            }
-            Ok(columns)
-        }
-    }
-}
-
 /// Resolve the `ExchangeReceiver` an edge points at. Structural validation
 /// already guarantees this resolves for sealed plans; this re-checks rather
 /// than unwrapping so a future invariant regression fails loudly.
@@ -474,7 +378,7 @@ mod tests {
     };
     use crate::planner::distributed::write::contract::ConnectorWriteInputBinding;
     use crate::planner::distributed::write::contract::test_support;
-    use crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
+    use crate::planner::distributed::write::plan::finalize_sql_change_stream_table_writer_finish_test_plan;
     use crate::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
@@ -747,10 +651,11 @@ mod tests {
                 ),
             }],
         );
-        finalize_sql_change_stream_test_plan(builder, dag).expect("router plan seals")
+        finalize_sql_change_stream_table_writer_finish_test_plan(builder, dag)
+            .expect("router plan seals")
     }
 
-    fn iceberg_write_plan(
+    fn table_writer_plan(
         input: ConnectorWriteInputBinding,
         columns: Vec<OutputColumn>,
     ) -> Result<DistributedPlan, String> {
@@ -788,10 +693,10 @@ mod tests {
             Some(0),
             Vec::new(),
             Default::default(),
+        );
+        crate::planner::distributed::write::plan::finalize_sql_table_writer_finish_test_plan(
+            draft, sink,
         )
-        .into_draft();
-        let draft = crate::planner::distributed::write::plan::with_sql_write_sink(draft, sink)?;
-        crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
     }
 
     #[test]
@@ -900,42 +805,8 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_write_input_boundary_lists_bound_input_columns() {
-        let plan = iceberg_write_plan(
-            ConnectorWriteInputBinding::RootOutputByOrdinal,
-            vec![output_col(1, "id_col")],
-        )
-        .expect("iceberg write plan seals");
-        let input = find_boundary(&plan, BoundaryKind::IcebergWriteInput);
-
-        assert_eq!(input.fragment_id, 0);
-        assert_eq!(input.node_id, None);
-        assert_eq!(input.columns.len(), 1);
-        assert_eq!(input.columns[0].column_id, ColumnId::new_for_test(1));
-        assert_eq!(input.columns[0].name, "id_col");
-    }
-
-    #[test]
-    fn iceberg_write_input_boundary_projects_output_ordinals_with_local_positions() {
-        // Two source columns; the binding selects source ordinal 1 then 0, so the
-        // boundary carries them at boundary-local ordinals 0 and 1.
-        let plan = iceberg_write_plan(
-            ConnectorWriteInputBinding::OutputOrdinals(vec![1, 0]),
-            vec![output_col(1, "a"), output_col(2, "b")],
-        )
-        .expect("iceberg write plan seals");
-        let input = find_boundary(&plan, BoundaryKind::IcebergWriteInput);
-
-        assert_eq!(input.columns.len(), 2);
-        assert_eq!(input.columns[0].column_id, ColumnId::new_for_test(2));
-        assert_eq!(input.columns[0].output_ordinal, 0);
-        assert_eq!(input.columns[1].column_id, ColumnId::new_for_test(1));
-        assert_eq!(input.columns[1].output_ordinal, 1);
-    }
-
-    #[test]
-    fn iceberg_write_input_boundary_fails_fast_on_out_of_range_ordinal() {
-        let error = iceberg_write_plan(
+    fn write_input_binding_fails_fast_on_out_of_range_ordinal() {
+        let error = table_writer_plan(
             ConnectorWriteInputBinding::OutputOrdinals(vec![99]),
             vec![output_col(1, "id")],
         )
@@ -1013,9 +884,10 @@ mod tests {
         let first = router_plan();
         let second = router_plan();
 
-        // A change-stream router plan exercises router input, one send, one
-        // receive, and the writer's Iceberg write input: four boundaries.
-        assert_eq!(first.boundaries().contracts().len(), 4);
+        // A dataflow change-stream router plan exercises the router input plus
+        // the send/receive pair of both the router-to-writer edge and the
+        // writer-to-finish edge, and the finish fragment's result output.
+        assert_eq!(first.boundaries().contracts().len(), 6);
         // Same draft shape derives an identical catalog, occurrence ids included.
         assert_eq!(first.boundaries(), second.boundaries());
 
@@ -1043,7 +915,7 @@ mod tests {
             .iter()
             .map(|contract| contract.columns.len())
             .sum();
-        assert_eq!(total_columns, 6);
+        assert_eq!(total_columns, 17);
 
         // The single allocator's final state is stored in the sealed plan: its
         // next id is one past the last boundary occurrence. CGO-9C resumes from

@@ -17,32 +17,17 @@
 
 //! Intent-bound completion capability.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::statistics::StatisticsCollectionProgram;
-use crate::query_execution::write::{ConnectorWriteCommitInput, WriteAbortInput, WriteCommitInput};
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
-use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use crate::runtime::query_result::QueryResult;
 use novarocks_execution::runtime::profile::RuntimeProfileTree;
-use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorStorageResolver, ConnectorWriteCohortId,
-};
-use std::sync::Arc;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
 pub(crate) struct QueryExecutionResult {
     pub(crate) query_result: QueryResult,
-    pub(crate) write_commit: Option<WriteCommitInput>,
-    pub(crate) write_abort: Option<WriteAbortInput>,
-    /// Present only when a native distributed writer completed through the
-    /// provider-neutral carrier.  It owns the exact control lease until the
-    /// engine transaction layer makes the terminal decision.
-    pub(crate) connector_completion: Option<ConnectorWriteCompletion>,
     /// Present only when this write travelled the NCP-6 write-session data
     /// plane. It carries the commit authority and the rows every writer
     /// accepted; neither may be surfaced before the external commit succeeds.
@@ -55,12 +40,6 @@ impl std::fmt::Debug for QueryExecutionResult {
         formatter
             .debug_struct("QueryExecutionResult")
             .field("query_result", &self.query_result)
-            .field("write_commit", &self.write_commit)
-            .field("write_abort", &self.write_abort)
-            .field(
-                "has_connector_completion",
-                &self.connector_completion.is_some(),
-            )
             .field("has_write_session", &self.write_session.is_some())
             .field("fragment_profiles", &self.fragment_profiles)
             .finish()
@@ -85,10 +64,6 @@ impl ResultExecutionOutcome {
 }
 
 pub struct WriteExecutionOutcome {
-    result: QueryResult,
-    commit: Option<WriteCommitInput>,
-    abort: Option<WriteAbortInput>,
-    connector_completion: Option<ConnectorWriteCompletion>,
     write_session: Option<ConnectorWriteSessionCompletion>,
 }
 
@@ -150,28 +125,6 @@ impl ConnectorWriteSessionCompletion {
 impl WriteExecutionOutcome {
     /// The NCP-6 session completion, present exactly when this query used the
     /// write-session data plane.
-    /// Split a write outcome into every part, including the session
-    /// completion. The legacy connector completion stays in the tuple until the
-    /// old path is deleted, so a caller cannot silently read one when it meant
-    /// the other.
-    pub(crate) fn into_parts_with_session(
-        self,
-    ) -> (
-        QueryResult,
-        Option<WriteCommitInput>,
-        Option<WriteAbortInput>,
-        Option<ConnectorWriteCompletion>,
-        Option<ConnectorWriteSessionCompletion>,
-    ) {
-        (
-            self.result,
-            self.commit,
-            self.abort,
-            self.connector_completion,
-            self.write_session,
-        )
-    }
-
     pub(crate) fn into_write_session(self) -> Option<ConnectorWriteSessionCompletion> {
         self.write_session
     }
@@ -180,412 +133,18 @@ impl WriteExecutionOutcome {
         self.write_session.as_ref()
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution contract and lifecycle integration."
-    )]
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        QueryResult,
-        Option<WriteCommitInput>,
-        Option<WriteAbortInput>,
-    ) {
-        (self.result, self.commit, self.abort)
-    }
-
-    pub fn into_parts_with_connector(
-        self,
-    ) -> (
-        QueryResult,
-        Option<WriteCommitInput>,
-        Option<WriteAbortInput>,
-        Option<ConnectorWriteCompletion>,
-    ) {
-        (
-            self.result,
-            self.commit,
-            self.abort,
-            self.connector_completion,
-        )
-    }
-
-    /// Carry every write terminal this outcome holds into the role-neutral
+    /// Carry the write terminal this outcome holds into the role-neutral
     /// execution result.
-    ///
-    /// Both write data planes converge here so a statement owner reads one
-    /// value: the write-session carrier and the staged-report carrier are
-    /// mutually exclusive by construction, and a caller that projected only
-    /// one of them would silently lose the other's commit authority.
     pub(crate) fn into_execution_result(self) -> QueryExecutionResult {
         QueryExecutionResult {
-            query_result: self.result,
-            write_commit: self.commit,
-            write_abort: self.abort,
-            connector_completion: self.connector_completion,
+            query_result: QueryResult {
+                columns: Vec::new(),
+                chunks: Vec::new(),
+            },
             write_session: self.write_session,
             fragment_profiles: Vec::new(),
         }
     }
-
-    /// Consume a native connector-write terminal without exposing a client row
-    /// transport. A connector staging request has exactly one completion
-    /// carrier: its complete accepted SPI report set.
-    pub fn into_connector_staging(self) -> Result<ConnectorWriteCompletion, DistributedQueryError> {
-        if !self.result.columns.is_empty() || !self.result.chunks.is_empty() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector staging terminal returned a result payload",
-            ));
-        }
-        if self.abort.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector staging terminal returned an abort payload",
-            ));
-        }
-        if self.commit.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector staging terminal returned a legacy direct commit payload",
-            ));
-        }
-        self.connector_completion.ok_or_else(|| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector staging terminal has no accepted connector completion",
-            )
-        })
-    }
-}
-
-/// Bounded, provider-neutral aggregate of an accepted staged-report set.
-/// Frontend/application code may observe these counters but cannot inspect the
-/// provider-owned report payloads that produced them.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ConnectorWriteStagingSummary {
-    input_rows: u64,
-    staged_bytes: u64,
-    artifact_count: u64,
-    writer_count: u32,
-}
-
-impl ConnectorWriteStagingSummary {
-    pub const fn input_rows(self) -> u64 {
-        self.input_rows
-    }
-
-    pub const fn staged_bytes(self) -> u64 {
-        self.staged_bytes
-    }
-
-    pub const fn artifact_count(self) -> u64 {
-        self.artifact_count
-    }
-
-    pub const fn writer_count(self) -> u32 {
-        self.writer_count
-    }
-}
-
-/// Successful provider-neutral terminal write facts.  The attachment owns the
-/// exact FE generation lease that issued the handles; carrying it through the
-/// outcome prevents a newer control generation from committing an older BE
-/// report set.
-pub struct ConnectorWriteCompletion {
-    session: ConnectorWriteOperationSession,
-    attempts:
-        BTreeMap<ConnectorWriteCohortId, (ConnectorWritePlanAttachment, ConnectorWriteCommitInput)>,
-    terminal_storage_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
-}
-
-impl ConnectorWriteCompletion {
-    pub fn from_write_commit(
-        session: ConnectorWriteOperationSession,
-        attachment: ConnectorWritePlanAttachment,
-        commit: &WriteCommitInput,
-    ) -> Result<Self, DistributedQueryError> {
-        Self::from_write_commits(session, std::iter::once(attachment), commit)
-    }
-
-    pub fn from_write_commits(
-        session: ConnectorWriteOperationSession,
-        attachments: impl IntoIterator<Item = ConnectorWritePlanAttachment>,
-        commit: &WriteCommitInput,
-    ) -> Result<Self, DistributedQueryError> {
-        let inputs = ConnectorWriteCommitInput::try_extract_grouped(commit)?;
-        if inputs.is_empty() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write attachments completed without generic staged reports",
-            ));
-        }
-        let mut attachments_by_cohort = BTreeMap::new();
-        for attachment in attachments {
-            if attachments_by_cohort
-                .insert(attachment.manifest().cohort_id(), attachment)
-                .is_some()
-            {
-                return Err(DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "connector write completion contains duplicate cohort attachments",
-                ));
-            }
-        }
-        let mut attachments = attachments_by_cohort;
-        if attachments.len() != inputs.len()
-            || attachments.keys().copied().collect::<BTreeSet<_>>()
-                != inputs.keys().copied().collect::<BTreeSet<_>>()
-        {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "generic staged report cohorts do not exactly match connector write attachments",
-            ));
-        }
-        let mut attempts = BTreeMap::new();
-        for (cohort_id, input) in inputs {
-            let attachment = attachments.remove(&cohort_id).ok_or_else(|| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "generic staged report cohort has no connector write attachment",
-                )
-            })?;
-            validate_connector_write_attempt(&attachment, &input)?;
-            attempts.insert(cohort_id, (attachment, input));
-        }
-        let accepted = attempts
-            .values()
-            .map(|(attachment, input)| session.completed_attempt(attachment, input))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    format!("materialize accepted connector write attempts: {error}"),
-                )
-            })?;
-        session.accept_attempts(accepted).map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                format!("register accepted connector write attempts: {error}"),
-            )
-        })?;
-        Ok(Self {
-            session,
-            attempts,
-            terminal_storage_resolver: None,
-        })
-    }
-
-    fn single_attempt(
-        &self,
-    ) -> Result<(&ConnectorWritePlanAttachment, &ConnectorWriteCommitInput), ConnectorError> {
-        if self.attempts.len() != 1 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "single-cohort connector write attempt access requires exactly one cohort",
-            ));
-        }
-        let (attachment, input) = self
-            .attempts
-            .values()
-            .next()
-            .expect("one connector write attempt");
-        Ok((attachment, input))
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution contract and lifecycle integration."
-    )]
-    pub(crate) fn commit_context(&self) -> &novarocks_spi::connector::ConnectorRequestContext {
-        self.session.request_context()
-    }
-
-    /// Uses the short-lived FE terminal capability when this completion came
-    /// from a vended-credential write. It also removes the collector sink:
-    /// descriptors were frozen at Init, so terminal reloads may consume an
-    /// existing lease but can never contribute a new one.
-    pub(crate) fn terminal_request_context(
-        &self,
-    ) -> novarocks_spi::connector::ConnectorRequestContext {
-        let context = self
-            .session
-            .request_context()
-            .clone()
-            .without_vended_credential_lease_sink();
-        self.terminal_storage_resolver
-            .as_ref()
-            .map_or(context.clone(), |resolver| {
-                context.with_storage_resolver(Arc::clone(resolver))
-            })
-    }
-
-    pub(crate) fn with_terminal_storage_resolver(
-        mut self,
-        terminal_storage_resolver: Arc<dyn ConnectorStorageResolver>,
-    ) -> Self {
-        debug_assert!(self.terminal_storage_resolver.is_none());
-        self.terminal_storage_resolver = Some(terminal_storage_resolver);
-        self
-    }
-
-    pub(crate) fn attachment(&self) -> Result<&ConnectorWritePlanAttachment, ConnectorError> {
-        self.single_attempt().map(|(attachment, _)| attachment)
-    }
-
-    pub(crate) fn input(&self) -> Result<&ConnectorWriteCommitInput, ConnectorError> {
-        self.single_attempt().map(|(_, input)| input)
-    }
-
-    /// Return the exact accepted staged reports as an SPI attempt completion.
-    /// This is crate-visible because only core orchestration may hand the
-    /// opaque reports to a provider-owned durable checkpoint.
-    pub(crate) fn attempt_completion(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteAttemptCompletion, ConnectorError> {
-        let (attachment, input) = self.single_attempt()?;
-        self.session.completed_attempt(attachment, input)
-    }
-
-    pub fn session(&self) -> &ConnectorWriteOperationSession {
-        &self.session
-    }
-
-    /// Return the complete generic writer aggregate without invoking the
-    /// ordinary connector commit path or making a terminal session decision.
-    pub fn sealed_operation_completion(
-        &self,
-    ) -> Result<novarocks_spi::connector::ConnectorWriteOperationCompletion, DistributedQueryError>
-    {
-        self.session.sealed_operation_completion().map_err(|error| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                format!("seal read-only connector write completion: {error}"),
-            )
-        })
-    }
-
-    pub fn staging_summary(&self) -> Result<ConnectorWriteStagingSummary, DistributedQueryError> {
-        let report_count = self
-            .attempts
-            .values()
-            .map(|(_, input)| input.reports().len())
-            .try_fold(0usize, |total, count| total.checked_add(count))
-            .ok_or_else(|| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    "connector staging report count overflow",
-                )
-            })?;
-        let writer_count = u32::try_from(report_count).map_err(|_| {
-            DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector staging report count exceeds bounded summary range",
-            )
-        })?;
-        self.attempts
-            .values()
-            .flat_map(|(_, input)| input.reports())
-            .try_fold(
-                ConnectorWriteStagingSummary {
-                    writer_count,
-                    ..ConnectorWriteStagingSummary::default()
-                },
-                |summary, report| {
-                    let report_summary = report.summary();
-                    Ok(ConnectorWriteStagingSummary {
-                        input_rows: summary
-                            .input_rows
-                            .checked_add(report_summary.input_rows)
-                            .ok_or_else(|| {
-                                DistributedQueryError::new(
-                                    DistributedQueryErrorKind::ContractViolation,
-                                    "connector staging input row summary overflow",
-                                )
-                            })?,
-                        staged_bytes: summary
-                            .staged_bytes
-                            .checked_add(report_summary.staged_bytes)
-                            .ok_or_else(|| {
-                                DistributedQueryError::new(
-                                    DistributedQueryErrorKind::ContractViolation,
-                                    "connector staging byte summary overflow",
-                                )
-                            })?,
-                        artifact_count: summary
-                            .artifact_count
-                            .checked_add(report_summary.artifact_count)
-                            .ok_or_else(|| {
-                                DistributedQueryError::new(
-                                    DistributedQueryErrorKind::ContractViolation,
-                                    "connector staging artifact summary overflow",
-                                )
-                            })?,
-                        writer_count: summary.writer_count,
-                    })
-                },
-            )
-    }
-
-    /// Return whether this accepted aggregate contains no input, staged bytes
-    /// or provider artifacts. Its report envelopes are transport metadata only
-    /// and are discarded before the session makes a terminal no-op decision.
-    pub(crate) fn is_known_empty(&self) -> Result<bool, DistributedQueryError> {
-        let summary = self.staging_summary()?;
-        Ok(summary.input_rows == 0 && summary.staged_bytes == 0 && summary.artifact_count == 0)
-    }
-
-    /// Undo the metadata-only accepted attempt and terminalize the exact
-    /// session as a known-empty no-op. No provider RPC is issued.
-    pub(crate) fn finish_known_empty_noop(&self) -> Result<(), DistributedQueryError> {
-        if !self.is_known_empty()? {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write completion has input, staged bytes, or artifacts and cannot finish as known-empty",
-            ));
-        }
-        self.attempts
-            .values()
-            .try_for_each(|(attachment, input)| {
-                self.session.discard_known_empty_attempt(attachment, input)
-            })
-            .and_then(|_| self.session.finish_known_empty_noop())
-            .map_err(|error| {
-                DistributedQueryError::new(
-                    DistributedQueryErrorKind::ContractViolation,
-                    format!("terminalize connector write known-empty session: {error}"),
-                )
-            })
-    }
-}
-
-fn validate_connector_write_attempt(
-    attachment: &ConnectorWritePlanAttachment,
-    input: &ConnectorWriteCommitInput,
-) -> Result<(), DistributedQueryError> {
-    let manifest = attachment.manifest();
-    if input.operation_id() != manifest.operation_id()
-        || input.cohort_id() != manifest.cohort_id()
-        || input.execution_id() != manifest.execution_id()
-    {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "generic staged reports do not match the frozen connector write attachment",
-        ));
-    }
-    let expected = manifest.writers().iter().cloned().collect::<BTreeSet<_>>();
-    let actual = input
-        .reports()
-        .iter()
-        .map(|report| report.writer().clone())
-        .collect::<BTreeSet<_>>();
-    if expected != actual || input.reports().len() != actual.len() {
-        return Err(DistributedQueryError::new(
-            DistributedQueryErrorKind::ContractViolation,
-            "generic staged reports do not exactly cover the frozen connector writer manifest",
-        ));
-    }
-    Ok(())
 }
 
 pub struct FragmentProfileSet {
@@ -638,10 +197,9 @@ impl DistributedQueryOutcome {
 
     /// Consume the outcome as a distributed write terminal result.
     ///
-    /// Frontend-owned application lifecycles use the returned typed connector
+    /// Frontend-owned application lifecycles use the returned write-session
     /// completion to decide commit, abort, or authoritative reconciliation on
-    /// their retained exact lease. They never need a Core transaction helper
-    /// (or provider-specific receipt decoder) to make that decision.
+    /// their retained commit authority.
     pub fn into_write(self) -> Result<WriteExecutionOutcome, DistributedQueryError> {
         match self {
             Self::Write(outcome) => Ok(outcome),
@@ -696,15 +254,6 @@ impl QueryOutcomeFactory {
         self.intent
     }
 
-    pub fn write(
-        self,
-        result: QueryResult,
-        commit: Option<WriteCommitInput>,
-        abort: Option<WriteAbortInput>,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        self.write_with_connector(result, commit, abort, None)
-    }
-
     /// Hand a completed write session to its statement owner.
     ///
     /// The client result is deliberately empty: the root write relation is
@@ -718,50 +267,10 @@ impl QueryOutcomeFactory {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.require_intent(DistributedQueryIntent::Write)?;
         Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
-            result: QueryResult {
-                columns: Vec::new(),
-                chunks: Vec::new(),
-            },
-            commit: None,
-            abort: None,
-            connector_completion: None,
             write_session: Some(ConnectorWriteSessionCompletion { session, prepared }),
         }))
     }
 
-    pub fn write_with_connector(
-        self,
-        result: QueryResult,
-        commit: Option<WriteCommitInput>,
-        abort: Option<WriteAbortInput>,
-        connector_completion: Option<ConnectorWriteCompletion>,
-    ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        self.require_intent(DistributedQueryIntent::Write)?;
-        if commit.is_some() && abort.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "Write outcome cannot contain both commit and abort payloads",
-            ));
-        }
-        if connector_completion.is_some() && commit.is_some() {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "connector write completion cannot expose a legacy direct commit payload",
-            ));
-        }
-        Ok(DistributedQueryOutcome::Write(WriteExecutionOutcome {
-            result,
-            write_session: None,
-            commit,
-            abort,
-            connector_completion,
-        }))
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution contract and lifecycle integration."
-    )]
     #[expect(
         clippy::wrong_self_convention,
         reason = "The established outcome translator name describes its execution-result input."
@@ -772,9 +281,6 @@ impl QueryOutcomeFactory {
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let QueryExecutionResult {
             query_result,
-            write_commit,
-            write_abort,
-            connector_completion,
             write_session,
             fragment_profiles,
         } = result;
@@ -786,37 +292,26 @@ impl QueryOutcomeFactory {
                         "Write outcome cannot contain fragment profiles",
                     ));
                 }
-                if let Some(completion) = write_session {
-                    let (session, prepared) = completion.into_parts();
-                    return self.write_session_outcome(session, prepared);
-                }
-                self.write_with_connector(
-                    query_result,
-                    write_commit,
-                    write_abort,
-                    connector_completion,
-                )
+                let completion = write_session.ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "Write outcome requires a connector write session completion",
+                    )
+                })?;
+                let (session, prepared) = completion.into_parts();
+                self.write_session_outcome(session, prepared)
             }
             DistributedQueryIntent::Profile => {
-                if write_commit.is_some()
-                    || write_abort.is_some()
-                    || connector_completion.is_some()
-                    || write_session.is_some()
-                {
+                if write_session.is_some() {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
-                        "Profile outcome cannot contain write commit or abort payloads",
+                        "Profile outcome cannot contain a write session completion",
                     ));
                 }
                 self.profile(query_result, FragmentProfileSet::new(fragment_profiles))
             }
             DistributedQueryIntent::Result => {
-                if write_commit.is_some()
-                    || write_abort.is_some()
-                    || connector_completion.is_some()
-                    || write_session.is_some()
-                    || !fragment_profiles.is_empty()
-                {
+                if write_session.is_some() || !fragment_profiles.is_empty() {
                     return Err(DistributedQueryError::new(
                         DistributedQueryErrorKind::ContractViolation,
                         "Result outcome cannot contain write or profile payloads",

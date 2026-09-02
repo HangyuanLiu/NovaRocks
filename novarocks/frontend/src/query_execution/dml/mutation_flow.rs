@@ -512,10 +512,6 @@ pub(crate) trait MutationExecution: Send + Sync {
         String,
     > {
         match completion {
-            MutationCommitCompletion::Operation(completion) => completion
-                .session()
-                .commit(completion.terminal_request_context())
-                .map_err(|error| error.to_string()),
             MutationCommitCompletion::Session(completion) => {
                 crate::query_execution::write_session::finish_write_session(
                     completion,
@@ -534,14 +530,12 @@ pub(crate) trait MutationExecution: Send + Sync {
 
 /// The one commit authority a staged mutation hands its statement owner.
 ///
-/// A merge-on-read change stream writes through the NCP-6 write session, while
-/// distributed copy-on-write still writes through the staged-report operation.
-/// They are two different data planes with two different commit authorities, so
-/// the carrier names which one it is instead of letting a caller guess.
+/// Every mutation writes through the NCP-6 write session, but a single-query
+/// mutation hands over the set its last execution produced while a
+/// copy-on-write mutation hands over the session that already accumulated
+/// every query it drove, so the carrier names which one it is instead of
+/// letting a caller guess.
 pub(crate) enum MutationCommitCompletion {
-    /// The staged-report carrier of a mutation that still writes through an
-    /// operation.
-    Operation(crate::query_execution::ConnectorWriteCompletion),
     /// The write-session carrier of a merge-on-read change-stream mutation.
     Session(crate::query_execution::outcome::ConnectorWriteSessionCompletion),
     /// A session that already accumulated every query it drove.
@@ -559,16 +553,12 @@ pub(crate) enum MutationCommitCompletion {
 /// the commit itself, and an unknown outcome must be adjudicated through the
 /// exact authority that issued that commit, never through a replacement.
 pub(crate) enum MutationPublicationAuthority {
-    Operation(crate::query_execution::write_operation::ConnectorWriteOperationSession),
     Session(Arc<ConnectorWriteSession>),
 }
 
 impl MutationCommitCompletion {
     pub(crate) fn publication_authority(&self) -> MutationPublicationAuthority {
         match self {
-            Self::Operation(completion) => {
-                MutationPublicationAuthority::Operation(completion.session().clone())
-            }
             Self::Session(completion) => {
                 MutationPublicationAuthority::Session(Arc::clone(completion.session()))
             }
@@ -584,10 +574,7 @@ impl MutationPublicationAuthority {
     /// became visible.
     ///
     /// `context` is the statement's own terminal context and is what the write
-    /// session reconciles under. A staged-report operation ignores it and uses
-    /// the context it was begun on, minus its vended credential sink: that
-    /// context is the one its attempts were accepted under, and adjudicating
-    /// under a different one would ask a different request.
+    /// session reconciles under.
     pub(crate) fn adjudicate(
         &self,
         evidence: novarocks_spi::connector::ExternalMutationEvidence,
@@ -599,15 +586,6 @@ impl MutationPublicationAuthority {
         String,
     > {
         match self {
-            Self::Operation(session) => session
-                .adjudicate_publication(
-                    evidence,
-                    session
-                        .request_context()
-                        .clone()
-                        .without_vended_credential_lease_sink(),
-                )
-                .map_err(|error| error.to_string()),
             Self::Session(session) => session
                 .reconcile(evidence, context)
                 .map_err(|error| error.to_string()),
@@ -2624,9 +2602,6 @@ fn run_cow_target_writes(
             connector_context,
             native_encoder,
         )?;
-        if let Some(abort) = &result.write_abort {
-            return Err(format!("COW branch aborted: {}", abort.reason).into());
-        }
         let completion = result
             .write_session
             .ok_or_else(|| "COW branch closed without a write-session completion".to_string())?;

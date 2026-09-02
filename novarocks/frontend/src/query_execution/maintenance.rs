@@ -41,9 +41,8 @@ use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::runtime::query_result::QueryResult;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
-    ConnectorControlResolver, ConnectorDistributedRewriteAttemptCheckpoint,
-    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorMutationOperationId,
-    ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
+    ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,
+    ConnectorMutationOperationId, ConnectorRewriteCohortRead, ConnectorTableObjectBindingFailure,
     ConnectorTableObjectCaptureRequest, ConnectorTableObjectId, ConnectorTableObjectRebindRequest,
     ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
@@ -110,21 +109,12 @@ impl PreparedDistributedRewriteCohort {
             std::sync::Arc::clone(&self.write_session),
         )
         .map_err(|error| error.to_string())?;
-        let (query_result, _commit, abort, _legacy, session_completion) = self
+        let session_completion = self
             .query_execution
             .execute(request)
             .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
-            .map(crate::query_execution::outcome::WriteExecutionOutcome::into_parts_with_session)
+            .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
             .map_err(|error| error.to_string())?;
-        if !query_result.columns.is_empty() || !query_result.chunks.is_empty() {
-            return Err("connector staging terminal returned a result payload".to_string());
-        }
-        if let Some(abort) = abort {
-            return Err(format!(
-                "connector staging terminal aborted: {}",
-                abort.reason
-            ));
-        }
         // The dual barrier is what produces a session completion, so its
         // absence here means the write data plane never closed -- not that the
         // group happened to stage nothing.

@@ -23,15 +23,13 @@ use crate::query_execution::completion::{
     PreparedDistributedQuery, PreparedRetriableDistributedRequest, QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
-    ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
-    DistributedQueryOutcome, DistributedQueryRequest,
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
+    DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
-    ConnectorWriteLease,
 };
 
 #[derive(Clone)]
@@ -87,16 +85,6 @@ impl QueryExecutionService {
         operation: PreparedRetriableDistributedRequest,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         self.coordinator.execute_prepared_raw(operation)
-    }
-
-    /// Seal every cohort against the application-retained exact control lease
-    /// before any distributed writer attempt is staged.
-    pub fn begin_write_operation(
-        &self,
-        registration: ConnectorWriteOperationRegistration,
-        lease: ConnectorWriteLease,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        self.coordinator.begin_write_operation(registration, lease)
     }
 
     /// Seal a provider-frozen distributed rewrite against the composite lease

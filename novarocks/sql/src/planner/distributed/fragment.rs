@@ -95,7 +95,6 @@ pub enum DataSink {
     Result,
     Noop,
     Statistics(novarocks_spi::connector::StatisticsMetricRequest),
-    ConnectorWrite(super::write::sink::ConnectorWriteFragmentSink),
     ChangeStreamRouter(super::write::change_stream::ChangeStreamRouterSink),
 }
 

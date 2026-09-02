@@ -24,4 +24,3 @@ pub(crate) mod sink;
 pub use change_stream::ChangeStreamRouterSink;
 pub use contract::ConnectorWriteInputBinding;
 pub use node::{TableFinishNode, TableWriterNode};
-pub use sink::ConnectorWriteFragmentSink;

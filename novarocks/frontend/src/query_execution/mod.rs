@@ -28,7 +28,6 @@ pub mod completion;
     reason = "Consumed by the frontend typed-scan lowering in the same PR."
 )]
 pub(crate) mod connector_domain;
-pub(crate) mod connector_write_transaction;
 pub mod constant_eval;
 pub mod contract;
 pub mod control;
@@ -51,7 +50,7 @@ pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
     PreparedQueryCompletion, PreparedQueryOperation,
 };
-pub use outcome::{ConnectorWriteCompletion, ConnectorWriteStagingSummary, WriteExecutionOutcome};
+pub use outcome::WriteExecutionOutcome;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
 pub mod preparation;
 pub use preparation::runtime_filter_view::{
@@ -71,7 +70,6 @@ pub use preparation::runtime_filter_view::{
 };
 pub use schedule::FragmentInstancePlacement;
 pub mod post_compile;
-pub mod prepared_write;
 pub(crate) mod profile;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
@@ -87,10 +85,7 @@ pub(crate) mod split_assignment;
 pub mod statistics;
 pub(crate) mod terminal_codec;
 pub mod terminal_set;
-pub mod write;
 pub(crate) mod write_barrier;
-pub mod write_operation;
-pub mod write_plan;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
 pub(crate) mod write_transaction;

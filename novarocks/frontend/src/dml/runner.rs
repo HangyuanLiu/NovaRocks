@@ -54,7 +54,6 @@ pub struct WriteTransactionOutcome {
 
 #[derive(Clone, Debug)]
 pub enum CoordinatedWriteReport<H, A = Infallible> {
-    Aborted { reason: String },
     NoOp,
     CommitRequired(H),
     AbortRequired { reason: String, handle: A },
@@ -133,12 +132,6 @@ impl<'a, E: WriteExecutor> StatementWriteTransactionRunner<'a, E> {
             }
         };
         match report {
-            CoordinatedWriteReport::Aborted { reason } => {
-                attempt
-                    .terminal_pre_dispatch_uncommitted()
-                    .map_err(attempt_error)?;
-                Err(with_terminal(DmlError::executor(reason), &attempt))
-            }
             CoordinatedWriteReport::NoOp => {
                 attempt.mark_dispatch_possible().map_err(attempt_error)?;
                 self.finish_committed(&spec, &mut attempt, None)

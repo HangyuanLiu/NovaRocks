@@ -17,7 +17,6 @@
 
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -30,15 +29,14 @@ use crate::common::backend_topology::{
     BackendTopologyPort, BackendTopologySnapshot, BackendTopologyValidationError, LiveBackendTarget,
 };
 use crate::native::fragment_transport::{FetchOutcome, FragmentDispatcher};
-use crate::query_execution::ConnectorWriteCompletion;
 use crate::query_execution::artifact::{
     PreparedDistributedQuery, RunningNativeExecutionParts, ValidatedFragmentSchedule,
 };
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
-    ConnectorWriteOperationRegistration, DistributedQueryCoordinator, DistributedQueryError,
-    DistributedQueryErrorKind, DistributedQueryIntent, DistributedQueryOutcome,
-    DistributedQueryRequest, PreReadyTopologyOutcome, ProfileTerminalBuilder,
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
+    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
+    PreReadyTopologyOutcome, ProfileTerminalBuilder,
 };
 #[cfg(test)]
 use crate::query_execution::lifecycle_plan::QueryLifecycleTarget;
@@ -48,11 +46,8 @@ use crate::query_execution::lifecycle_plan::{
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::RoundSplitSource;
-use crate::query_execution::write::WriteTerminalBuilder;
-use crate::query_execution::write_operation::ConnectorWriteOperationSession;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
-use novarocks_spi::connector::ConnectorWriteLease;
 use novarocks_types::{
     AttemptId, LocalQuerySequence, NativeCompatibilityId, QueryExecutionId, QueryId,
     QueryIdAttribution, QueryProcessNamespace,
@@ -934,10 +929,6 @@ impl FrontendDistributedQueryCoordinator {
         credential_lease_source: RoundCredentialLeaseSource,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
         let parts = request.into_parts();
-        let connector_write_session = parts
-            .connector_write
-            .as_ref()
-            .map(|registration| registration.session().clone());
         let write_stack_session = parts.write_stack_session.clone();
         let intent = parts.completion.intent();
         // Statistics collection enters only with its Core-owned typed program.
@@ -1001,42 +992,6 @@ impl FrontendDistributedQueryCoordinator {
             .artifacts
             .attach_runtime_filter_bindings(binding_attachment)?
             .bind_schedule(schedule)?;
-        let scheduled = match parts.connector_write {
-            Some(registration) => {
-                let session = registration.session();
-                let terminal_writer_fragment_ids = scheduled.terminal_write_fragment_ids();
-                let routing = registration.resolve_writer_fragment_cohorts(
-                    terminal_writer_fragment_ids.iter().copied(),
-                )?;
-                let mut fragments_by_cohort = BTreeMap::<
-                    novarocks_spi::connector::ConnectorWriteCohortId,
-                    BTreeSet<u32>,
-                >::new();
-                for (fragment_id, cohort_id) in routing {
-                    fragments_by_cohort
-                        .entry(cohort_id)
-                        .or_default()
-                        .insert(fragment_id);
-                }
-                let mut attachments = Vec::with_capacity(fragments_by_cohort.len());
-                for (cohort_id, fragment_ids) in fragments_by_cohort {
-                    let manifest = scheduled.freeze_connector_write_manifest(
-                        &fragment_ids,
-                        session.operation_id(),
-                        cohort_id,
-                        session.catalog_handle().map_err(|error| {
-                            failed(format!("resolve connector writer catalog handle: {error}"))
-                        })?,
-                        session.owner().clone(),
-                    )?;
-                    attachments.push(session.plan_manifest(&manifest).map_err(|error| {
-                        failed(format!("plan connector writer manifest: {error}"))
-                    })?);
-                }
-                scheduled.attach_connector_write_plans(attachments)?
-            }
-            None => scheduled,
-        };
         let deployment = compile_scheduled_runtime_filter_deployment(
             scheduled.runtime_filter_scheduled_view()?,
             FrontendRuntimeFilterDeploymentCompilerConfig::from_query_lifecycle(
@@ -1164,10 +1119,8 @@ impl FrontendDistributedQueryCoordinator {
             .and_then(|plan| SplitAssignmentRoundGuard::start(execution_id, plan));
         let RunningNativeExecutionParts {
             root_fetch,
-            writer_registrations,
             expected_output,
             query_lifecycle_lease,
-            connector_write_plans,
         } = execution.into_parts();
         let mut query_lifecycle_lease = Some(query_lifecycle_lease);
         if let Some(message) = self.registry.first_failure(query_id)
@@ -1274,19 +1227,6 @@ impl FrontendDistributedQueryCoordinator {
             novarocks_spi::connector::read_stack::SplitSourceProfile::default()
         };
 
-        // A vended connector write needs one final FE-local metadata reload to
-        // commit or reconcile after the BE terminal reports converge. Retain
-        // only that opaque terminal capability before lifecycle finalization;
-        // it is attached to the completion and clears itself after the SQL
-        // terminal decision.
-        let terminal_storage_resolver =
-            if intent == DistributedQueryIntent::Write && !connector_write_plans.is_empty() {
-                query_lifecycle_lease
-                    .as_ref()
-                    .and_then(|lease| lease.retain_terminal_storage_resolver())
-            } else {
-                None
-            };
         let terminal_set = query_lifecycle_lease
             .take()
             .expect("query lifecycle lease is present through query completion")
@@ -1299,8 +1239,8 @@ impl FrontendDistributedQueryCoordinator {
 
         // A failure recorded after this point cannot invalidate the query. Every
         // participant already converged on a Succeeded terminal, so the work
-        // finished and a write's staged reports are all in hand; the pre-finalize
-        // check above is what fails a query that actually failed. Heartbeat
+        // finished and a write's commit fragments are all in hand; the
+        // pre-finalize check above is what fails a query that actually failed. Heartbeat
         // observations keep latching into active queries regardless -- a backend
         // briefly marked unavailable under load latches into every query
         // scheduled on it -- and consuming that here turned a completed
@@ -1320,8 +1260,13 @@ impl FrontendDistributedQueryCoordinator {
             DistributedQueryIntent::Result => parts
                 .completion
                 .result(expected_output.into_query_result(batches)?),
-            DistributedQueryIntent::Write if write_stack_session.is_some() => {
-                let session = write_stack_session.expect("checked by the guard");
+            DistributedQueryIntent::Write => {
+                let session = write_stack_session.ok_or_else(|| {
+                    DistributedQueryError::new(
+                        DistributedQueryErrorKind::ContractViolation,
+                        "distributed write execution has no connector write session",
+                    )
+                })?;
                 // The write relation is engine machinery: the client's result
                 // is empty, and the rows are decoded by position against the
                 // frozen relation instead.
@@ -1369,56 +1314,6 @@ impl FrontendDistributedQueryCoordinator {
                     )
                 })?;
                 parts.completion.write_session_outcome(session, prepared)
-            }
-            DistributedQueryIntent::Write => {
-                let result = expected_output.into_query_result(batches)?;
-                let mut builder = WriteTerminalBuilder::new(writer_registrations)?;
-                for fragment in terminal_set.fragments() {
-                    builder.apply_terminal(fragment)?;
-                }
-                let report_outcome = builder.finish()?;
-                let (commit, abort) = report_outcome.into_payloads();
-                let connector_completion = match (
-                    connector_write_session,
-                    connector_write_plans,
-                    commit.as_ref(),
-                ) {
-                    (Some(session), attachments, Some(commit)) if !attachments.is_empty() => {
-                        let completion = ConnectorWriteCompletion::from_write_commits(
-                            session,
-                            attachments.into_values(),
-                            commit,
-                        )?;
-                        Some(match terminal_storage_resolver {
-                            Some(resolver) => completion.with_terminal_storage_resolver(resolver),
-                            None => completion,
-                        })
-                    }
-                    (Some(_), attachments, None) if !attachments.is_empty() => {
-                        return Err(DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            "connector write execution ended without a complete staged-report commit",
-                        ));
-                    }
-                    (None, attachments, _) if attachments.is_empty() => None,
-                    _ => {
-                        return Err(DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            "connector write operation session and planned attachment disagree",
-                        ));
-                    }
-                };
-                let direct_commit = if connector_completion.is_some() {
-                    None
-                } else {
-                    commit
-                };
-                parts.completion.write_with_connector(
-                    result,
-                    direct_commit,
-                    abort,
-                    connector_completion,
-                )
             }
             DistributedQueryIntent::Profile => {
                 let result = expected_output.into_query_result(batches)?;
@@ -1502,20 +1397,6 @@ impl DistributedQueryCoordinator for FrontendDistributedQueryCoordinator {
         crate::query_execution::completion::QueryAttemptReservation::first(
             self.query_ids.next_query_id()?,
         )
-    }
-
-    fn begin_write_operation(
-        &self,
-        registration: ConnectorWriteOperationRegistration,
-        lease: ConnectorWriteLease,
-    ) -> Result<ConnectorWriteOperationSession, DistributedQueryError> {
-        if !lease.matches_provider_binding_key(registration.owner()) {
-            return Err(failed(
-                "connector write registration does not match caller-retained lease",
-            ));
-        }
-        ConnectorWriteOperationSession::try_begin(registration, lease)
-            .map_err(|error| failed(format!("seal connector write operation cohorts: {error}")))
     }
 
     fn execute(

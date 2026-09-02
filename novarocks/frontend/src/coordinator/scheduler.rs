@@ -255,7 +255,7 @@ impl FrontendFragmentScheduler {
         // A statistics root is an internal fanout terminal: unlike a client
         // result root it must retain its scan-derived cardinality so every
         // scheduled backend contributes a bounded partial report.
-        if !root.is_terminal_write() && !root.is_statistics() {
+        if !root.is_statistics() {
             counts.insert(root_fragment_id, 1);
         }
 

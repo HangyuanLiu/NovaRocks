@@ -1069,6 +1069,73 @@ fn partition_source(field: &ConnectorPartitionTransform) -> &str {
     }
 }
 
+/// Project the table's committed partitioning into the neutral vocabulary the
+/// guarded property mutation compares against.
+///
+/// The guard is an optimistic-concurrency fence: the caller states the
+/// partitioning it observed when it decided to write these properties, and the
+/// mutation refuses if the default spec has moved since. That comparison is
+/// only sound if both sides describe the same physical spec by field ID, name,
+/// source column and transform, so every one of those is read off the exact
+/// metadata this mutation is about to commit against.
+fn committed_partitioning_from_metadata(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    spec_id: i32,
+) -> Result<ConnectorCommittedPartitioning, ConnectorError> {
+    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg committed partition spec {spec_id} is absent from table metadata"
+        ))
+    })?;
+    let fields = spec
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(position, field)| {
+            let source = metadata
+                .current_schema()
+                .field_by_id(field.source_id)
+                .ok_or_else(|| {
+                    corrupt(format!(
+                        "Iceberg committed partition source field {} is missing",
+                        field.source_id
+                    ))
+                })?;
+            novarocks_spi::connector::ConnectorCommittedPartitionField::try_new(
+                field.field_id,
+                field.name.clone(),
+                field.source_id,
+                source.name.clone(),
+                u32::try_from(position)
+                    .map_err(|_| corrupt("Iceberg committed partition position exceeds u32"))?,
+                committed_partition_transform(&field.transform)?,
+            )
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    ConnectorCommittedPartitioning::try_new(spec_id, fields)
+}
+
+fn committed_partition_transform(
+    transform: &Transform,
+) -> Result<novarocks_spi::connector::ConnectorManagedPartitionTransform, ConnectorError> {
+    use novarocks_spi::connector::ConnectorManagedPartitionTransform as Neutral;
+
+    match transform {
+        Transform::Identity => Ok(Neutral::Identity),
+        Transform::Year => Ok(Neutral::Year),
+        Transform::Month => Ok(Neutral::Month),
+        Transform::Day => Ok(Neutral::Day),
+        Transform::Hour => Ok(Neutral::Hour),
+        Transform::Bucket(buckets) => Ok(Neutral::Bucket { buckets: *buckets }),
+        Transform::Truncate(width) => Ok(Neutral::Truncate { width: *width }),
+        Transform::Void => Ok(Neutral::Void),
+        Transform::Unknown => Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "Iceberg committed partitioning cannot observe an unknown transform",
+        )),
+    }
+}
+
 fn partition_transform(field: &ConnectorPartitionTransform) -> Transform {
     match field {
         ConnectorPartitionTransform::Identity { .. } => Transform::Identity,
@@ -2177,10 +2244,8 @@ fn execute_guarded_properties(
         Err(error) => return Ok(known_uncommitted(unavailable(error))),
     };
     let metadata = loaded.table.metadata();
-    let current = crate::commit::write_control::committed_partitioning_from_metadata(
-        metadata,
-        metadata.default_partition_spec_id(),
-    )?;
+    let current =
+        committed_partitioning_from_metadata(metadata, metadata.default_partition_spec_id())?;
     if &current != expected {
         return Ok(known_conflict(
             "Iceberg default partitioning changed before guarded property mutation",
@@ -3079,6 +3144,10 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
+fn corrupt(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::CorruptData, message.into())
+}
+
 fn not_found(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::NotFound, message.into())
 }
@@ -3470,7 +3539,7 @@ mod tests {
             .runtime()
             .load_table(&table.namespace, &table.table)
             .expect("load guarded table");
-        let current = crate::commit::write_control::committed_partitioning_from_metadata(
+        let current = committed_partitioning_from_metadata(
             loaded.table.metadata(),
             loaded.table.metadata().default_partition_spec_id(),
         )

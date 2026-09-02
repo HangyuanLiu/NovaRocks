@@ -17,29 +17,20 @@
 
 //! Fragment-native proto sink lowering.
 
-use std::sync::Arc;
-use std::time::Instant;
-
-use arrow::datatypes::{Schema, SchemaRef};
-use bytes::Bytes;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::exec::fragment::sink::{
-    ConnectorWriteSinkProgram, DataStreamSinkBranchProgram, FragmentSinkProgram,
-    MultiCastDataStreamSinkProgram, SplitDataStreamSinkProgram,
-    build_change_stream_split_predicate,
+    DataStreamSinkBranchProgram, FragmentSinkProgram, MultiCastDataStreamSinkProgram,
+    SplitDataStreamSinkProgram, build_change_stream_split_predicate,
 };
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
-use novarocks_execution::runtime::query_options::query_expire_durations;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as native_proto;
 use novarocks_proto_models::{common, expr, plan};
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::{
-    ConnectorOpenWriterRequest, ConnectorRequestContext, ConnectorRowMutationEffect,
-    ConnectorWriteExecutionId, ConnectorWriteOperationId, ConnectorWriterHandle,
-    ConnectorWriterIdentity, StatisticsMetric, StatisticsMetricRequest,
+    ConnectorRowMutationEffect, StatisticsMetric, StatisticsMetricRequest,
 };
 use novarocks_types::SlotId;
 
@@ -136,17 +127,10 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                 .map(FragmentSinkProgram::MultiCastDataStream)
                 .map_err(NativeFragmentDecodeError::from)
         }
-        plan::data_sink::Kind::ConnectorWrite(connector) => {
-            let context = ctx.ok_or_else(|| {
-                NativeFragmentDecodeError::unsupported(
-                    path.clone().field("connector_write"),
-                    "native connector writer requires the backend decode context",
-                )
-            })?;
-            decode_connector_write_sink_program(connector, fragment, layout, context)
-                .map(FragmentSinkProgram::ConnectorWrite)
-                .map_err(|error| error.into_native(path.field("connector_write")))
-        }
+        plan::data_sink::Kind::ConnectorWrite(_) => Err(NativeFragmentDecodeError::unsupported(
+            path.field("connector_write"),
+            "native CONNECTOR_WRITE sink is not supported",
+        )),
         plan::data_sink::Kind::ChangeStreamRouter(router) => decode_change_stream_router_program(
             router,
             &fragment.output_exprs,
@@ -216,367 +200,6 @@ fn decode_statistics_sink(
         .map_err(|error| {
             NativeFragmentLeafDecodeError::at_collection(ProtocolErrorKind::InvalidValue, error)
         })
-}
-
-fn decode_connector_write_sink_program(
-    sink: &plan::ConnectorWriteFragmentSink,
-    fragment: &plan::PlanFragment,
-    layout: &Layout,
-    context: &NativePlanDecodeContext,
-) -> Result<ConnectorWriteSinkProgram, NativeFragmentLeafDecodeError> {
-    let envelope = sink.handle.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "native connector write sink requires a writer handle",
-        )
-    })?;
-    let wire_writer = envelope.writer.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "native connector writer handle requires writer identity",
-        )
-        .append_field("writer")
-    })?;
-    if envelope.contract_version != novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "handle",
-            format!(
-                "native connector writer contract version {} is unsupported; expected {}",
-                envelope.contract_version,
-                novarocks_spi::connector::CONNECTOR_WRITE_CONTRACT_VERSION,
-            ),
-        )
-        .append_field("contract_version"));
-    }
-    let operation_id = ConnectorWriteOperationId::from_bytes(required_uuid_bytes(
-        &wire_writer.operation_id,
-        "operation_id",
-    )?);
-    let execution_id = ConnectorWriteExecutionId::new(
-        required_uuid_bytes(&wire_writer.execution_query_id, "execution_query_id")?,
-        wire_writer.execution_attempt_id,
-    );
-    let wire_finst = wire_writer.fragment_instance_id.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "native connector writer identity requires fragment_instance_id",
-        )
-        .append_field("writer")
-        .append_field("fragment_instance_id")
-    })?;
-    let fragment_instance_id = unique_id_bytes(wire_finst.hi, wire_finst.lo);
-    let context_finst = context.fragment_instance_id().get();
-    if fragment_instance_id != unique_id_bytes(context_finst.high(), context_finst.low()) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "handle",
-            "connector writer identity fragment instance does not match native submission",
-        )
-        .append_field("writer")
-        .append_field("fragment_instance_id"));
-    }
-    if wire_writer.fragment_id != fragment.fragment_id as i32 {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "handle",
-            "connector writer identity fragment id does not match native fragment",
-        )
-        .append_field("writer")
-        .append_field("fragment_id"));
-    }
-    let query_id = context.query_id().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "connector writer handle requires native query identity",
-        )
-    })?;
-    if execution_id.query_id() != unique_id_bytes(query_id.high(), query_id.low()) {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "handle",
-            "connector writer execution query id does not match native submission",
-        )
-        .append_field("writer")
-        .append_field("execution_query_id"));
-    }
-    let catalog_handle = wire_writer.catalog_handle.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "connector writer identity requires an exact catalog handle",
-        )
-        .append_field("writer")
-        .append_field("catalog_handle")
-    })?;
-    let catalog_handle = novarocks_proto_codec::catalog::decode_catalog_handle(
-        catalog_handle.clone(),
-        FieldPath::root("plan_fragment")
-            .field("sink")
-            .field("connector_write")
-            .field("handle")
-            .field("writer")
-            .field("catalog_handle"),
-    )
-    .map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "handle",
-            error.to_string(),
-        )
-        .append_field("writer")
-        .append_field("catalog_handle")
-    })?;
-    let writer = ConnectorWriterIdentity::new(
-        operation_id,
-        novarocks_spi::connector::ConnectorWriteCohortId::from_bytes(required_digest_bytes(
-            &wire_writer.cohort_id,
-            "cohort_id",
-        )?),
-        execution_id,
-        fragment_instance_id,
-        wire_writer.fragment_id,
-        wire_writer.backend_num,
-        wire_writer.sink_ordinal,
-        catalog_handle,
-    );
-    let writer_catalog_handle = writer.catalog_handle().clone();
-    let handle = ConnectorWriterHandle::try_new(
-        writer,
-        envelope.contract_version,
-        Bytes::copy_from_slice(&envelope.payload),
-    )
-    .map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "handle",
-            error.to_string(),
-        )
-    })?;
-    if envelope.payload_sha256.as_slice() != handle.payload_digest() {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InconsistentFields,
-            "handle",
-            "connector writer handle payload digest does not match payload",
-        )
-        .append_field("payload_sha256"));
-    }
-    let runtime = context.typed_scan_runtime().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "handle",
-            "connector writer requires a query-leased catalog runtime",
-        )
-    })?;
-    let write_execution = runtime
-        .catalog_write_execution(&writer_catalog_handle)
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "handle",
-                format!("resolve query-leased connector writer runtime: {error}"),
-            )
-            .append_field("writer")
-            .append_field("catalog_handle")
-        })?;
-    let execution = write_execution.write();
-    let root_schema = context
-        .decode_output_layout(
-            &fragment.output_columns,
-            FieldPath::root("plan_fragment").field("output_columns"),
-        )
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "input",
-                error.to_string(),
-            )
-        })?
-        .chunk_schema()
-        .arrow_schema_ref();
-    let root_input_width = root_schema.fields().len();
-    let (expected_schema, input_ordinals) =
-        decode_connector_write_input(sink.input.as_ref(), root_schema)?;
-    let expression_projection = if fragment.output_exprs.is_empty() {
-        None
-    } else {
-        Some(decode_connector_write_output_expressions(
-            &fragment.output_exprs,
-            layout,
-            context,
-        )?)
-    };
-    let (_, query_expire) = query_expire_durations(context.query_options());
-    let request = ConnectorOpenWriterRequest {
-        handle,
-        expected_schema: Arc::clone(&expected_schema),
-        context: ConnectorRequestContext::try_new(
-            Instant::now() + query_expire,
-            context.connector_cancellation()?,
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map(|request| request.with_storage_resolver(runtime.storage_resolver()))
-        .map_err(|error| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "handle",
-                error.to_string(),
-            )
-        })?,
-    };
-    match expression_projection {
-        Some((arena, exprs)) => ConnectorWriteSinkProgram::try_new_with_expression_projection(
-            execution,
-            request,
-            root_input_width,
-            arena,
-            exprs,
-            expected_schema,
-        ),
-        None => {
-            ConnectorWriteSinkProgram::try_new(execution, request, root_input_width, input_ordinals)
-        }
-    }
-    .map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "handle", error)
-    })
-}
-
-fn decode_connector_write_output_expressions(
-    output_exprs: &[expr::Expr],
-    layout: &Layout,
-    context: &NativePlanDecodeContext,
-) -> Result<(ExprArena, Vec<novarocks_execution::exec::expr::ExprId>), NativeFragmentLeafDecodeError>
-{
-    let mut arena = ExprArena::default();
-    let exprs = output_exprs
-        .iter()
-        .enumerate()
-        .map(|(index, expression)| {
-            decode_sink_expression(
-                expression,
-                &mut arena,
-                layout,
-                Some(context),
-                FieldPath::root("plan_fragment")
-                    .field("output_exprs")
-                    .index(index),
-            )
-            .map_err(|error| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "output_exprs",
-                    error,
-                )
-                .append_index(index)
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok((arena, exprs))
-}
-
-fn decode_connector_write_input(
-    input: Option<&plan::ConnectorWriteInputBinding>,
-    root_schema: SchemaRef,
-) -> Result<(SchemaRef, Option<Vec<usize>>), NativeFragmentLeafDecodeError> {
-    let input = input.ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "input",
-            "native connector write sink requires input binding",
-        )
-    })?;
-    match input.kind.as_ref() {
-        Some(plan::connector_write_input_binding::Kind::RootOutputByOrdinal(true)) => {
-            Ok((root_schema, None))
-        }
-        Some(plan::connector_write_input_binding::Kind::RootOutputByOrdinal(false)) => {
-            Err(NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::InvalidValue,
-                "input",
-                "connector write root_output_by_ordinal marker must be true",
-            ))
-        }
-        Some(plan::connector_write_input_binding::Kind::OutputOrdinals(ordinals)) => {
-            if ordinals.values.is_empty() {
-                return Err(NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "input",
-                    "connector writer output_ordinals must not be empty",
-                ));
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            let ordinals = ordinals
-                .values
-                .iter()
-                .map(|value| {
-                    let ordinal = usize::try_from(*value).map_err(|_| {
-                        NativeFragmentLeafDecodeError::at_field(
-                            ProtocolErrorKind::OutOfRange,
-                            "input",
-                            "connector writer output ordinal does not fit usize",
-                        )
-                    })?;
-                    if ordinal >= root_schema.fields().len() || !seen.insert(ordinal) {
-                        return Err(NativeFragmentLeafDecodeError::at_field(
-                            ProtocolErrorKind::InvalidValue,
-                            "input",
-                            "connector writer output ordinal is duplicated or outside root output",
-                        ));
-                    }
-                    Ok(ordinal)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let fields = ordinals
-                .iter()
-                .map(|ordinal| root_schema.fields()[*ordinal].clone())
-                .collect::<Vec<_>>();
-            Ok((Arc::new(Schema::new(fields)), Some(ordinals)))
-        }
-        None => Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "input",
-            "connector write input requires kind",
-        )),
-    }
-}
-
-fn required_uuid_bytes(
-    value: &[u8],
-    field: &'static str,
-) -> Result<[u8; 16], NativeFragmentLeafDecodeError> {
-    value.try_into().map_err(|_| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            field,
-            format!("connector write {field} must contain exactly 16 bytes"),
-        )
-    })
-}
-
-fn required_digest_bytes(
-    value: &[u8],
-    field: &'static str,
-) -> Result<[u8; 32], NativeFragmentLeafDecodeError> {
-    value.try_into().map_err(|_| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            field,
-            format!("connector write {field} must contain exactly 32 bytes"),
-        )
-    })
-}
-
-fn unique_id_bytes(hi: i64, lo: i64) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[..8].copy_from_slice(&hi.to_be_bytes());
-    bytes[8..].copy_from_slice(&lo.to_be_bytes());
-    bytes
 }
 
 #[allow(
@@ -1178,98 +801,17 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{Array, BinaryArray, LargeBinaryArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
     use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
     use novarocks_proto_codec::ProtocolErrorKind;
-    use novarocks_proto_models::{common, expr, novarocks as proto, plan};
+    use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
-    use novarocks_types::SlotId;
 
     use super::{
-        decode_connector_write_output_expressions, decode_fragment_sink_assignment,
-        decode_fragment_sink_program, decode_fragment_sink_program_with_context,
-        decode_row_mutation_effect,
+        decode_fragment_sink_assignment, decode_fragment_sink_program,
+        decode_fragment_sink_program_with_context, decode_row_mutation_effect,
     };
     use crate::fragment::decode::plan::context::NativePlanDecodeContext;
     use crate::fragment::decode::plan::layout::Layout;
-    use crate::fragment::decode::type_decode::encode_type;
-
-    fn binary_to_variant_expression(column_id: u32) -> expr::Expr {
-        let operand = expr::Expr {
-            r#type: Some(encode_type(&DataType::Binary).expect("binary type")),
-            nullable: true,
-            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
-                column_id,
-                qualifier: None,
-                column: None,
-            })),
-        };
-        let target = encode_type(&DataType::LargeBinary).expect("variant type");
-        expr::Expr {
-            r#type: Some(target.clone()),
-            nullable: true,
-            kind: Some(expr::expr::Kind::Cast(Box::new(expr::CastExpr {
-                operand: Some(Box::new(operand)),
-                target: Some(target),
-            }))),
-        }
-    }
-
-    #[test]
-    fn connector_write_output_expressions_project_binary_to_exact_variant_layout() {
-        let slot = SlotId::new(17);
-        let layout = Layout::for_slots([slot]);
-        let context = NativePlanDecodeContext::default();
-        let (arena, exprs) = decode_connector_write_output_expressions(
-            &[binary_to_variant_expression(slot.as_u32())],
-            &layout,
-            &context,
-        )
-        .expect("connector write output expression decodes");
-
-        let input_schema = Arc::new(Schema::new(vec![Field::new(
-            "state",
-            DataType::Binary,
-            true,
-        )]));
-        let input = Arc::new(BinaryArray::from(vec![
-            Some(b"one".as_slice()),
-            None,
-            Some(b"three".as_slice()),
-        ]));
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(input_schema.as_ref(), &[slot])
-                .expect("input chunk schema");
-        let chunk = Chunk::try_new_with_columns(chunk_schema, vec![input]).expect("input chunk");
-        let arrays = exprs
-            .iter()
-            .map(|expr| arena.eval(*expr, &chunk))
-            .collect::<Result<Vec<_>, _>>()
-            .expect("projection evaluates");
-        let target_schema = Arc::new(Schema::new(vec![Field::new(
-            "state",
-            DataType::LargeBinary,
-            true,
-        )]));
-        let projected =
-            RecordBatch::try_new(Arc::clone(&target_schema), arrays).expect("projected batch");
-
-        assert_eq!(projected.schema().as_ref(), target_schema.as_ref());
-        assert_eq!(projected.column(0).data_type(), &DataType::LargeBinary);
-        let values = projected
-            .column(0)
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .expect("variant array");
-        assert_eq!(values.value(0), b"one");
-        assert!(values.is_null(1));
-        assert_eq!(values.value(2), b"three");
-    }
 
     #[test]
     fn row_mutation_effect_decoding_rejects_unspecified_and_unknown_values() {
@@ -1455,8 +997,11 @@ mod tests {
         assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
     }
 
+    /// The connector write sink is no longer a fragment terminal: writing is a
+    /// dataflow shape rooted at a table writer node. A plan that still carries
+    /// the retired sink is refused at its exact field instead of being decoded.
     #[test]
-    fn connector_write_missing_handle_fails_closed() {
+    fn connector_write_sink_is_refused_as_unsupported() {
         let fragment = plan::PlanFragment {
             sink: Some(plan::DataSink {
                 kind: Some(plan::data_sink::Kind::ConnectorWrite(
@@ -1471,13 +1016,13 @@ mod tests {
             &Layout::default(),
             Some(&NativePlanDecodeContext::default()),
         )
-        .expect_err("connector carrier must require a bounded writer handle");
+        .expect_err("the retired connector write sink must fail closed");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
             protocol.path().to_string(),
-            "plan_fragment.sink.connector_write.handle"
+            "plan_fragment.sink.connector_write"
         );
-        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(protocol.kind(), ProtocolErrorKind::Unsupported);
     }
 
     fn router_fragment(route: plan::ChangeStreamBranchRoute) -> plan::PlanFragment {

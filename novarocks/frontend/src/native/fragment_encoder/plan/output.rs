@@ -28,41 +28,6 @@ pub(super) fn encode_fragment_output_contract(
     ),
     String,
 > {
-    if matches!(&src.sink, DataSink::ConnectorWrite(sink) if sink.has_output_contract()) {
-        // The planner finalized the connector writer output expressions and target output
-        // schema at seal (CGO-9C Task 3). The encoder maps them 1:1 instead of
-        // synthesizing the target schema or falling back to the fragment's output
-        // columns / input binding.
-        let contract = required_context_ref(ctx.write_contracts, || {
-            format!(
-                "native connector write fragment {} has no sealed write contract",
-                src.fragment_id
-            )
-        })?
-        .connector_write_output(src.fragment_id)
-        .ok_or_else(|| {
-            format!(
-                "native connector write fragment {} is missing from the sealed write contract",
-                src.fragment_id
-            )
-        })?;
-        let output_exprs = encode_exprs(&contract.output_exprs)?;
-        let output_columns = contract
-            .target_schema
-            .iter()
-            .map(|column| {
-                Ok(common::OutputColumn {
-                    column_id: column.column_id,
-                    name: column.name.clone(),
-                    r#type: Some(encode_type(&column.data_type)?),
-                    nullable: column.nullable,
-                    is_internal: column.is_internal,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        return Ok((output_exprs, output_columns));
-    }
-
     let output_exprs = src
         .output_exprs
         .as_ref()

@@ -232,7 +232,6 @@ impl IcebergConnectorFactory {
             incarnation,
             Arc::clone(&unpublished.runtime),
             Arc::clone(&provider),
-            Arc::clone(&write_control),
         )?);
         let cleanup_maintenance = Arc::new(IcebergCleanupMaintenanceAdapter::new(
             key.clone(),

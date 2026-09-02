@@ -127,7 +127,6 @@ pub struct IcebergMetadataContext {
     /// Proven-committed drops awaiting collection. Generation-local and
     /// bounded; retired with the generation.
     drop_cleanup: Arc<crate::catalog_control::drop_cleanup::DropCleanupQueue>,
-    write_activations: Arc<crate::write_activation::IcebergWriteActivationReservations>,
     /// Opaque per-generation cache identity. It is local-only and prevents
     /// two catalog generations in one query scope from sharing a table view.
     attempt_metadata_cache_owner: u64,
@@ -183,9 +182,6 @@ impl IcebergMetadataContext {
             resources,
             novarocks_catalog,
             drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
-            write_activations: Arc::new(
-                crate::write_activation::IcebergWriteActivationReservations::default(),
-            ),
             attempt_metadata_cache_owner: NEXT_ATTEMPT_METADATA_CACHE_OWNER
                 .fetch_add(1, Ordering::Relaxed),
         })
@@ -501,14 +497,6 @@ impl IcebergMetadataContext {
             .block_on(async move { owner.table_exists(target).await })?
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
-
-    /// Shared reservation scope for every write capability assembled from
-    /// this exact control generation.
-    pub(crate) fn write_activation_reservations(
-        &self,
-    ) -> &Arc<crate::write_activation::IcebergWriteActivationReservations> {
-        &self.write_activations
-    }
 }
 
 fn invalid_request(message: String) -> (ConnectorErrorKind, String) {
@@ -564,7 +552,6 @@ mod tests {
         .expect("generation runtime");
 
         assert_eq!(generation.control_state().properties().len(), 2);
-        assert!(Arc::strong_count(generation.write_activation_reservations()) >= 1);
 
         // Every vendored handle the generation hands out is the same
         // allocation. Two clients built from one configuration would have

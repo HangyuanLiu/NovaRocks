@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
-use novarocks_spi::connector::ConnectorWriterHandle;
 use novarocks_types::schema::ColumnDef;
 
 use crate::analysis::TypedExpr;
@@ -70,19 +69,4 @@ impl ConnectorWritePlanInput {
             sink.root_output_exprs,
         )
     }
-}
-
-/// Provider-neutral distributed writer sink. The opaque handle was planned by
-/// the FE control binding for one exact writer identity; generic planner code
-/// does not inspect its provider payload.
-#[derive(Clone, Debug)]
-pub struct ConnectorWriteFragmentSink {
-    /// Absent only in a frontend-side template before exact placement freezes
-    /// the writer identity. A submitted native fragment always carries one.
-    pub(crate) handle: Option<ConnectorWriterHandle>,
-    pub(crate) input: ConnectorWriteInputBinding,
-    /// Sealed generic Arrow output contract. It contains only expression and
-    /// schema facts, never provider payload or credentials.
-    pub(crate) output_contract:
-        Option<crate::planner::distributed::output::ConnectorWriteOutputContract>,
 }

@@ -32,7 +32,7 @@ use novarocks_spi::connector::{
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::mv::domain::application::MvIncrementalWriteMode;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::storage_observation::{MvLakePublishedProjection, observe_lake_package};
+use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWriteRequest, MvRefreshCommittedFacts, MvRefreshPublicationIntent,

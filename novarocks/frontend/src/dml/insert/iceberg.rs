@@ -62,10 +62,6 @@ impl WriteExecutor for IcebergInsertWriteExecutor<'_> {
                 .run_iceberg_write_with_native_bundle(self.prepared.handle.as_ref(), native_bundle)
                 .map_err(crate::dml::error::DmlError::executor)?
             {
-                IcebergWriteReport::Aborted {
-                    reason,
-                    has_staged_files: _,
-                } => CoordinatedWriteReport::Aborted { reason },
                 IcebergWriteReport::NoOp => CoordinatedWriteReport::NoOp,
                 IcebergWriteReport::CommitRequired(handle) => {
                     CoordinatedWriteReport::CommitRequired(handle)

@@ -237,7 +237,7 @@ impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
                 "prepared equality DELETE native assembly was already consumed".to_string()
             })?
             .finish(native_bundle)?;
-        if result.write_abort.is_none() && result.write_session.is_none() {
+        if result.write_session.is_none() {
             return Err(
                 "ADD EQUALITY DELETE completed without a sealed connector write session for non-empty input"
                     .to_string(),

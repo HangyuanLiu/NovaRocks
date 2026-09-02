@@ -1163,8 +1163,7 @@ fn consume_terminal_fact(
     if let FragmentOutcome::Failed(execution_error) = fact.outcome() {
         error!(target: "novarocks_execution", finst_id = %fragment_instance_id, error = %execution_error, "native fragment execution failed");
     }
-    let sink = crate::runtime::sink_commit::report_snapshot(fragment_instance_id)
-        .with_connector_staged_report_frames(running.take_connector_staged_report_frames());
+    let sink = crate::runtime::sink_commit::report_snapshot(fragment_instance_id);
     let succeeded = matches!(fact.outcome(), FragmentOutcome::Succeeded);
     // QLC terminal facts are transferred before local runtime cleanup.
     lifecycle.record_fragment_terminal_fact(execution_id, fact, backend_num, sink);

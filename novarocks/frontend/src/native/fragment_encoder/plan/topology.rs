@@ -16,7 +16,7 @@
 // under the License.
 
 use super::type_mapping::{encode_data_partition, encode_edge_partition_type};
-use super::write::{encode_change_stream_router_sink, encode_connector_write_fragment_sink};
+use super::write::encode_change_stream_router_sink;
 use super::*;
 use novarocks_sql::plan_read::FragmentId;
 
@@ -153,9 +153,6 @@ fn encode_data_sink(
             DataSink::Result => Kind::Result(true),
             DataSink::Noop => Kind::Noop(true),
             DataSink::Statistics(metrics) => Kind::Statistics(encode_statistics_sink(metrics)),
-            DataSink::ConnectorWrite(sink) => {
-                Kind::ConnectorWrite(encode_connector_write_fragment_sink(sink))
-            }
             DataSink::ChangeStreamRouter(sink) => {
                 Kind::ChangeStreamRouter(encode_change_stream_router_sink(sink, fragment_id, ctx)?)
             }

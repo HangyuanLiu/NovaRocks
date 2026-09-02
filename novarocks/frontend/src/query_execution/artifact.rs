@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
-use novarocks_spi::connector::{CatalogHandle, CatalogProperties, ConnectorWriteCohortId};
+use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::LiveBackendTarget;
@@ -48,7 +48,6 @@ use crate::query_execution::preparation::{
 use crate::query_execution::schedule::{
     FragmentInstancePlacement, FragmentLifecycleProjection, SchedulingPlan,
 };
-use crate::query_execution::write_plan::{ConnectorWriteManifest, ConnectorWritePlanAttachment};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -214,7 +213,6 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule,
-            connector_write_plans: BTreeMap::new(),
         })
     }
 }
@@ -312,7 +310,6 @@ pub struct ScheduleBoundDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 impl ScheduleBoundDistributedQuery {
@@ -389,68 +386,8 @@ impl ScheduleBoundDistributedQuery {
             prepared: self.prepared,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
-            connector_write_plans: self.connector_write_plans,
             runtime_filter_contributions: attachment.contributions,
         })
-    }
-    /// Terminal write fragments derived from the same prepared artifact that
-    /// was sealed before scheduling.  Callers cannot nominate an arbitrary
-    /// fragment set when creating a connector writer manifest.
-    pub fn terminal_write_fragment_ids(&self) -> BTreeSet<FragmentId> {
-        self.prepared
-            .scheduling_view()
-            .fragments()
-            .filter(|fragment| fragment.execution_role().is_terminal_write())
-            .map(|fragment| fragment.fragment_id())
-            .collect()
-    }
-
-    /// Freeze the writer identities after placement and before the BE binding
-    /// barrier.  Planning remains caller-owned because only the DML owner has
-    /// the operation-specific table, intent, and provider payload.
-    pub fn freeze_connector_write_manifest(
-        &self,
-        terminal_write_fragment_ids: &BTreeSet<FragmentId>,
-        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
-        cohort_id: novarocks_spi::connector::ConnectorWriteCohortId,
-        catalog_handle: novarocks_spi::connector::CatalogHandle,
-        owner: novarocks_spi::connector::ConnectorProviderBindingKey,
-    ) -> Result<ConnectorWriteManifest, DistributedQueryError> {
-        ConnectorWriteManifest::freeze(
-            self.schedule.planning_schedule(),
-            terminal_write_fragment_ids,
-            operation_id,
-            cohort_id,
-            catalog_handle,
-            owner,
-            self.schedule.execution_id(),
-        )
-        .map_err(|error| contract_error(error.to_string()))
-    }
-
-    /// Atomically attach every already-frozen provider-neutral cohort plan for
-    /// one write operation. The attachment set must partition and exactly
-    /// cover the prepared terminal writer fragments.
-    pub fn attach_connector_write_plans(
-        mut self,
-        attachments: impl IntoIterator<Item = ConnectorWritePlanAttachment>,
-    ) -> Result<Self, DistributedQueryError> {
-        let terminal_write_fragment_ids = self.terminal_write_fragment_ids();
-        attach_connector_write_plans(
-            &mut self.connector_write_plans,
-            self.schedule.planning_schedule(),
-            self.schedule.execution_id(),
-            &terminal_write_fragment_ids,
-            attachments,
-        )?;
-        Ok(self)
-    }
-
-    pub fn attach_connector_write_plan(
-        self,
-        attachment: ConnectorWritePlanAttachment,
-    ) -> Result<Self, DistributedQueryError> {
-        self.attach_connector_write_plans(std::iter::once(attachment))
     }
 }
 
@@ -583,7 +520,6 @@ pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     prepared: PreparedFragmentSet,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     runtime_filter_contributions:
         BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
 }
@@ -605,11 +541,8 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
                 "query initialization execution id does not match validated schedule",
             ));
         }
-        let query_catalog_lease = freeze_query_catalog_lease(
-            &self.prepared,
-            &self.connector_write_plans,
-            options.catalog_set(),
-        )?;
+        let query_catalog_lease =
+            freeze_query_catalog_lease(&self.prepared, options.catalog_set())?;
         let options = options.with_catalog_set(query_catalog_lease.catalog_set().clone());
         let runtime_filters = self
             .runtime_filter_contributions
@@ -637,7 +570,6 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
             options,
             query_lifecycle_lease,
             stage_bindings,
-            connector_write_plans: self.connector_write_plans,
         })
     }
 }
@@ -647,13 +579,11 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 /// recover these values from the current FE control host after query assembly
 /// has started.
 /// Freeze every catalog-bound execution artifact into one exact query set and
-/// retain the FE control leases that produced typed reads.  Write attachments
-/// retain their source planning leases through `ConnectorWriteLease`; keeping
-/// those attachments in the existing query typestates therefore supplies the
-/// same terminal ownership without reopening SPI internals here.
+/// retain the FE control leases that produced typed reads.  A write session
+/// contributes its own catalog through the query's Init options, so only typed
+/// reads are merged here.
 fn freeze_query_catalog_lease(
     prepared: &PreparedFragmentSet,
-    connector_write_plans: &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     existing: &CatalogSet,
 ) -> Result<QueryCatalogLease, DistributedQueryError> {
     let typed_reads = prepared
@@ -661,19 +591,9 @@ fn freeze_query_catalog_lease(
         .typed_scans()
         .map(|(_, _, scan)| (scan.catalog_properties.clone(), scan.planning_lease.clone()))
         .collect::<Vec<_>>();
-    let writes = connector_write_plans.values().map(|attachment| {
-        attachment.catalog_properties().cloned().ok_or_else(|| {
-            contract_error(
-                "native connector write attachment has no desired-state catalog properties",
-            )
-        })
-    });
     let catalog_set = merge_catalog_properties(
         existing,
-        typed_reads
-            .iter()
-            .map(|(properties, _)| properties.clone())
-            .chain(writes.collect::<Result<Vec<_>, _>>()?),
+        typed_reads.iter().map(|(properties, _)| properties.clone()),
     )?;
     Ok(QueryCatalogLease::new(
         catalog_set,
@@ -712,78 +632,6 @@ fn merge_catalog_properties(
         .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
 }
 
-fn attach_connector_write_plans(
-    slot: &mut BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
-    schedule: &SchedulingPlan,
-    execution_id: QueryExecutionId,
-    terminal_write_fragment_ids: &BTreeSet<FragmentId>,
-    attachments: impl IntoIterator<Item = ConnectorWritePlanAttachment>,
-) -> Result<(), DistributedQueryError> {
-    if !slot.is_empty() {
-        return Err(contract_error(
-            "distributed query already has connector write plan attachments",
-        ));
-    }
-    let attachments = attachments.into_iter().collect::<Vec<_>>();
-    let first = attachments
-        .first()
-        .ok_or_else(|| contract_error("connector write plan attachment set cannot be empty"))?;
-    let expected_operation = first.manifest().operation_id();
-    let expected_owner = first.manifest().owner().clone();
-    let mut by_cohort = BTreeMap::new();
-    let mut cohort_by_fragment = BTreeMap::<FragmentId, ConnectorWriteCohortId>::new();
-    for attachment in attachments {
-        let manifest = attachment.manifest();
-        manifest
-            .validate_schedule(schedule, execution_id)
-            .map_err(|error| contract_error(error.to_string()))?;
-        if manifest.operation_id() != expected_operation || manifest.owner() != &expected_owner {
-            return Err(contract_error(
-                "connector write plan attachments contain multiple operations or connector owners",
-            ));
-        }
-        let cohort_id = manifest.cohort_id();
-        if by_cohort.contains_key(&cohort_id) {
-            return Err(contract_error(
-                "connector write plan attachment repeats a cohort",
-            ));
-        }
-        for writer in manifest.writers() {
-            let fragment_id = u32::try_from(writer.fragment_id()).map_err(|_| {
-                contract_error("connector writer manifest contains a negative fragment ID")
-            })?;
-            // A manifest carries one writer per scheduled placement, so the same
-            // terminal fragment legitimately repeats within a cohort. Only two
-            // different cohorts claiming one fragment breaks the partition.
-            if cohort_by_fragment
-                .insert(fragment_id, cohort_id)
-                .is_some_and(|previous| previous != cohort_id)
-            {
-                return Err(contract_error(format!(
-                    "connector write plan manifests overlap at terminal fragment {fragment_id}"
-                )));
-            }
-        }
-        by_cohort.insert(cohort_id, attachment);
-    }
-    let actual_fragment_ids = cohort_by_fragment.keys().copied().collect::<BTreeSet<_>>();
-    if actual_fragment_ids != *terminal_write_fragment_ids {
-        let missing = terminal_write_fragment_ids
-            .difference(&actual_fragment_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        let unknown = actual_fragment_ids
-            .difference(terminal_write_fragment_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        return Err(contract_error(format!(
-            "connector write plan attachments do not exactly cover terminal writer fragments: missing={missing:?} unknown={unknown:?}"
-        )));
-    }
-    *slot = by_cohort;
-    Ok(())
-}
-
 /// Query lifecycle is ready and the complete CatalogSet was established during
 /// Init, before Stage becomes admissible.
 pub struct ControlReadyDistributedQuery {
@@ -794,7 +642,6 @@ pub struct ControlReadyDistributedQuery {
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
     stage_bindings: Vec<StageParticipantBinding>,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 impl ControlReadyDistributedQuery {
@@ -807,7 +654,6 @@ impl ControlReadyDistributedQuery {
             options: self.options,
             query_lifecycle_lease: self.query_lifecycle_lease,
             stage_bindings: self.stage_bindings,
-            connector_write_plans: self.connector_write_plans,
         }
     }
 }
@@ -823,16 +669,9 @@ pub struct CatalogReadyDistributedQuery {
     options: QueryInitOptions,
     query_lifecycle_lease: QueryLifecycleLease,
     stage_bindings: Vec<StageParticipantBinding>,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 impl CatalogReadyDistributedQuery {
-    pub fn connector_write_plans(
-        &self,
-    ) -> &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
-        &self.connector_write_plans
-    }
-
     /// Stable placement identity facts for the owner-local native submission
     /// mapper.  The view carries neither schedule mutation nor lifecycle or
     /// connector leases.
@@ -846,7 +685,6 @@ impl CatalogReadyDistributedQuery {
             &self.native_bundle,
             &self.schedule.inner,
             self.options.native_submission_options(),
-            &self.connector_write_plans,
         )
     }
 
@@ -859,13 +697,12 @@ impl CatalogReadyDistributedQuery {
     ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
         let CatalogReadyDistributedQuery {
             handoff_id,
-            prepared,
+            prepared: _,
             native_bundle: _,
             schedule,
             options: _,
             query_lifecycle_lease,
             stage_bindings,
-            connector_write_plans,
         } = self;
         finish_sealed_native_submission(
             attachment,
@@ -873,7 +710,6 @@ impl CatalogReadyDistributedQuery {
             schedule.execution_id,
             stage_bindings,
             query_lifecycle_lease,
-            connector_write_plans,
         )
     }
 }
@@ -952,10 +788,6 @@ impl<'a> SchedulingFragmentView<'a> {
     ) -> Option<novarocks_spi::connector::read_stack::ConnectorReadWorkSource> {
         self.view
             .typed_connector_work_source(self.fragment.fragment_id(), node_id)
-    }
-
-    pub fn is_terminal_write(self) -> bool {
-        self.fragment.execution_role().is_terminal_write()
     }
 
     pub fn is_statistics(self) -> bool {
@@ -1581,75 +1413,6 @@ impl RootFetchMetadata {
     }
 }
 
-pub struct WriterRegistration {
-    pub(crate) query_id: UniqueId,
-    /// The immutable native query attempt that owns this writer.  The staged
-    /// report envelope repeats this identity, so report aggregation can reject
-    /// a late report from a previous attempt before any provider commit work.
-    pub(crate) execution_id: QueryExecutionId,
-    pub(crate) fragment_id: FragmentId,
-    pub(crate) fragment_instance_id: UniqueId,
-    pub(crate) backend_num: i32,
-    pub(crate) expected_connector_cohort_id: Option<ConnectorWriteCohortId>,
-}
-
-impl WriterRegistration {
-    pub fn new(
-        query_id: UniqueId,
-        execution_id: QueryExecutionId,
-        fragment_id: FragmentId,
-        fragment_instance_id: UniqueId,
-        backend_num: i32,
-        expected_connector_cohort_id: Option<ConnectorWriteCohortId>,
-    ) -> Self {
-        Self {
-            query_id,
-            execution_id,
-            fragment_id,
-            fragment_instance_id,
-            backend_num,
-            expected_connector_cohort_id,
-        }
-    }
-}
-
-pub struct WriterRegistrationSet {
-    registrations: Vec<WriterRegistration>,
-}
-
-impl WriterRegistrationSet {
-    pub fn new(registrations: impl IntoIterator<Item = WriterRegistration>) -> Self {
-        Self {
-            registrations: registrations.into_iter().collect(),
-        }
-    }
-    pub fn is_empty(&self) -> bool {
-        self.registrations.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.registrations.len()
-    }
-
-    pub fn fragment_instance_ids(&self) -> Vec<UniqueId> {
-        self.registrations
-            .iter()
-            .map(|registration| registration.fragment_instance_id)
-            .collect()
-    }
-
-    pub fn writer_identities(&self) -> Vec<(UniqueId, i32)> {
-        self.registrations
-            .iter()
-            .map(|registration| (registration.fragment_instance_id, registration.backend_num))
-            .collect()
-    }
-
-    pub(crate) fn into_registrations(self) -> Vec<WriterRegistration> {
-        self.registrations
-    }
-}
-
 #[derive(Clone)]
 pub struct ExpectedOutputSchema {
     output_columns: Vec<PreparedOutputColumn>,
@@ -1693,10 +1456,8 @@ impl ExpectedOutputSchema {
 pub struct StagePreparedDistributedQuery {
     batches: Vec<StageBatch>,
     root_fetch: RootFetchMetadata,
-    writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 fn native_submission_encoding_view<'a>(
@@ -1706,7 +1467,6 @@ fn native_submission_encoding_view<'a>(
     native_bundle: &'a NativeFragmentAttachment,
     schedule: &'a SchedulingPlan,
     options: &'a novarocks_execution::runtime::query_options::QueryOptions,
-    connector_write_plans: &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<NativeSubmissionEncodingView<'a>, DistributedQueryError> {
     crate::query_execution::assembly::validate_prepared_native_payloads(prepared, native_bundle)
         .map_err(contract_error)?;
@@ -1751,7 +1511,6 @@ fn native_submission_encoding_view<'a>(
         native_bundle,
         schedule,
         options,
-        connector_write_plans,
         root_fetch,
         expected_output,
     )
@@ -1764,7 +1523,6 @@ fn finish_sealed_native_submission(
     execution_id: QueryExecutionId,
     stage_bindings: Vec<StageParticipantBinding>,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 ) -> Result<StagePreparedDistributedQuery, DistributedQueryError> {
     if !attachment.matches(handoff_id, execution_id) {
         let error =
@@ -1773,7 +1531,7 @@ fn finish_sealed_native_submission(
         let message = query_lifecycle_lease.abort_preserving(error.message().to_string());
         return Err(DistributedQueryError::new(kind, message));
     }
-    let (submissions, root_fetch, writer_registrations, expected_output) = attachment.into_parts();
+    let (submissions, root_fetch, expected_output) = attachment.into_parts();
     let mut fragments_by_backend = BTreeMap::<usize, Vec<StageFragment>>::new();
     for submission in submissions {
         let (backend_idx, fragment) = match submission.into_stage_fragment() {
@@ -1825,20 +1583,12 @@ fn finish_sealed_native_submission(
     Ok(StagePreparedDistributedQuery {
         batches,
         root_fetch,
-        writer_registrations,
         expected_output,
         query_lifecycle_lease,
-        connector_write_plans,
     })
 }
 
 impl StagePreparedDistributedQuery {
-    pub fn connector_write_plans(
-        &self,
-    ) -> &BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
-        &self.connector_write_plans
-    }
-
     pub fn batches(&self) -> &[StageBatch] {
         &self.batches
     }
@@ -1861,7 +1611,6 @@ impl StagePreparedDistributedQuery {
                         })
                 })
                 .collect(),
-            writer_identities: self.writer_registrations.writer_identities(),
         }
     }
 
@@ -1879,10 +1628,8 @@ impl StagePreparedDistributedQuery {
         Ok(StagedDistributedQuery {
             batches: self.batches,
             root_fetch: self.root_fetch,
-            writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_write_plans: self.connector_write_plans,
         })
     }
 }
@@ -1891,26 +1638,19 @@ impl StagePreparedDistributedQuery {
 /// result/fetch ownership, which remains unavailable until Running.
 pub struct ExecutionRegistrationView {
     attempted_instances: Vec<(usize, UniqueId)>,
-    writer_identities: Vec<(UniqueId, i32)>,
 }
 
 impl ExecutionRegistrationView {
     pub fn attempted_instances(&self) -> &[(usize, UniqueId)] {
         &self.attempted_instances
     }
-
-    pub fn writer_identities(&self) -> &[(UniqueId, i32)] {
-        &self.writer_identities
-    }
 }
 
 pub struct StagedDistributedQuery {
     batches: Vec<StageBatch>,
     root_fetch: RootFetchMetadata,
-    writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 impl StagedDistributedQuery {
@@ -1931,10 +1671,8 @@ impl StagedDistributedQuery {
         }
         Ok(RunningDistributedQuery {
             root_fetch: self.root_fetch,
-            writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_write_plans: self.connector_write_plans,
         })
     }
 }
@@ -1943,30 +1681,24 @@ impl StagedDistributedQuery {
 /// recombination API exists.
 pub struct RunningDistributedQuery {
     root_fetch: RootFetchMetadata,
-    writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
     query_lifecycle_lease: QueryLifecycleLease,
-    connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 impl RunningDistributedQuery {
     pub fn into_parts(self) -> RunningNativeExecutionParts {
         RunningNativeExecutionParts {
             root_fetch: self.root_fetch,
-            writer_registrations: self.writer_registrations,
             expected_output: self.expected_output,
             query_lifecycle_lease: self.query_lifecycle_lease,
-            connector_write_plans: self.connector_write_plans,
         }
     }
 }
 
 pub struct RunningNativeExecutionParts {
     pub root_fetch: RootFetchMetadata,
-    pub writer_registrations: WriterRegistrationSet,
     pub expected_output: ExpectedOutputSchema,
     pub query_lifecycle_lease: QueryLifecycleLease,
-    pub connector_write_plans: BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
 }
 
 fn build_expected_output_schema(
@@ -2005,29 +1737,16 @@ fn build_expected_output_schema(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::collections::BTreeMap;
 
-    use arrow::datatypes::{DataType, Field};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CONNECTOR_WRITE_CONTRACT_VERSION, CatalogHandle, CatalogProperties, CatalogProperty,
-        CatalogProviderKind, CatalogVersion, ConnectorError, ConnectorErrorKind,
-        ConnectorExecutionDistribution, ConnectorInstanceId, ConnectorProviderBinding,
-        ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorSplit, ConnectorTableHandle,
-        ConnectorWriteAbortOutcome, ConnectorWriteAbortRequest, ConnectorWriteBaseVersion,
-        ConnectorWriteCohortId, ConnectorWriteCommitRequest, ConnectorWriteControl,
-        ConnectorWriteExecutionId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-        ConnectorWriteInputShape, ConnectorWriteLease, ConnectorWriteOperationId,
-        ConnectorWritePlan, ConnectorWritePlanningRequest, ConnectorWritePreparation,
-        ConnectorWriteReceipt, ConnectorWriteReconcileRequest, ConnectorWriterHandle,
-        ProviderBindingEpoch,
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogProviderKind, CatalogVersion,
+        ConnectorInstanceId, ConnectorSplit,
     };
 
     use super::{
-        attach_connector_write_plans, build_fragment_lifecycle_projection,
-        derive_fragment_instance_id, merge_catalog_properties,
+        build_fragment_lifecycle_projection, derive_fragment_instance_id, merge_catalog_properties,
     };
     use crate::common::backend_topology::LiveBackendTarget;
     use crate::query_execution::contract::QueryId;
@@ -2182,453 +1901,6 @@ mod tests {
             edge_kind: FragmentEdgeKind::Stream,
             output_slot_ids: Vec::new(),
         }
-    }
-
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct TestWriteControl {
-        key: ConnectorProviderBindingKey,
-    }
-
-    struct TestWriteDistribution {
-        key: ConnectorProviderBindingKey,
-    }
-
-    impl ConnectorExecutionDistribution for TestWriteDistribution {
-        fn declaration(
-            &self,
-            _context: &ConnectorRequestContext,
-        ) -> Result<ConnectorProviderBinding, ConnectorError> {
-            ConnectorProviderBinding::iceberg(
-                self.key.instance_id.as_str(),
-                self.key.incarnation.to_bytes(),
-                "test-write-binding",
-            )
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
-            })
-        }
-    }
-
-    impl ConnectorWriteControl for TestWriteControl {
-        fn binding_key(&self) -> &ConnectorProviderBindingKey {
-            &self.key
-        }
-
-        fn plan_write(
-            &self,
-            request: ConnectorWritePlanningRequest,
-        ) -> Result<ConnectorWritePlan, ConnectorError> {
-            let handles = request
-                .expected_writers
-                .into_iter()
-                .map(|writer| {
-                    ConnectorWriterHandle::try_new(
-                        writer,
-                        CONNECTOR_WRITE_CONTRACT_VERSION,
-                        Bytes::from_static(b"test-handle"),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            ConnectorWritePlan::try_new(
-                self.key.clone(),
-                request.operation_id,
-                request.cohort_id,
-                request.execution_id,
-                handles,
-                Bytes::new(),
-            )
-        }
-
-        fn commit(
-            &self,
-            _request: ConnectorWriteCommitRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<ConnectorWriteReceipt>,
-            ConnectorError,
-        > {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "test control does not commit",
-            ))
-        }
-
-        fn abort(
-            &self,
-            _request: ConnectorWriteAbortRequest,
-        ) -> Result<ConnectorWriteAbortOutcome, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "test control does not abort",
-            ))
-        }
-
-        fn reconcile(
-            &self,
-            _request: ConnectorWriteReconcileRequest,
-        ) -> Result<
-            novarocks_spi::connector::ExternalMutationOutcome<ConnectorWriteReceipt>,
-            ConnectorError,
-        > {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "test control does not reconcile",
-            ))
-        }
-    }
-
-    fn write_owner() -> ConnectorProviderBindingKey {
-        ConnectorProviderBindingKey {
-            instance_id: ConnectorInstanceId::parse("test-write").expect("valid instance"),
-            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
-        }
-    }
-
-    fn write_execution() -> QueryExecutionId {
-        QueryExecutionId::new(
-            QueryId::new(41, 73),
-            AttemptId::new(3).expect("valid attempt"),
-        )
-        .expect("valid execution")
-    }
-
-    fn write_schedule(finst_id: UniqueId) -> SchedulingPlan {
-        SchedulingPlan {
-            root_fragment_id: 3,
-            by_fragment: BTreeMap::from([(3, vec![placement(3, 0, finst_id, 8)])]),
-            root_finst_id: finst_id,
-            root_backend_idx: 8,
-        }
-    }
-
-    fn planned_attachment(schedule: &SchedulingPlan) -> super::ConnectorWritePlanAttachment {
-        let operation_id = ConnectorWriteOperationId::from_bytes([4; 16]);
-        planned_attachment_for(
-            schedule,
-            &BTreeSet::from([3]),
-            novarocks_spi::connector::ConnectorWriteCohortId::primary(operation_id),
-            write_owner(),
-            operation_id,
-        )
-    }
-
-    #[test]
-    fn planned_write_attachment_retains_catalog_materialization() {
-        let attachment = planned_attachment(&write_schedule(UniqueId::new(3, 30)));
-        let catalog_properties = attachment
-            .catalog_properties()
-            .expect("native write attachment retains desired-state catalog properties");
-        assert_eq!(
-            catalog_properties.handle().catalog_name().as_str(),
-            "test-write"
-        );
-        assert_eq!(catalog_properties.handle().version().as_bytes(), &[3; 32]);
-    }
-
-    fn planned_attachment_for(
-        schedule: &SchedulingPlan,
-        fragment_ids: &BTreeSet<u32>,
-        cohort_id: ConnectorWriteCohortId,
-        owner: ConnectorProviderBindingKey,
-        operation_id: ConnectorWriteOperationId,
-    ) -> super::ConnectorWritePlanAttachment {
-        let execution_id = write_execution();
-        let manifest = crate::query_execution::write_plan::ConnectorWriteManifest::freeze(
-            schedule,
-            fragment_ids,
-            operation_id,
-            cohort_id,
-            novarocks_spi::connector::CatalogHandle::new(
-                owner.instance_id.clone(),
-                novarocks_spi::connector::CatalogVersion::from_bytes([3; 32]),
-            ),
-            owner.clone(),
-            execution_id,
-        )
-        .expect("freeze manifest");
-        let control: Arc<dyn ConnectorWriteControl> =
-            Arc::new(TestWriteControl { key: owner.clone() });
-        let lease = ConnectorWriteLease::new_with_execution_distribution(
-            novarocks_spi::connector::ConnectorControlRuntimeId::new(),
-            owner.clone(),
-            control,
-            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").expect("provider ID"),
-            Arc::new(TestWriteDistribution { key: owner.clone() }),
-            || {},
-        )
-        .expect("valid exact control lease")
-        .with_catalog_properties(catalog_properties(
-            owner.instance_id.as_str(),
-            3,
-            "s3://test-write",
-        ))
-        .expect("write catalog properties match the exact effect owner");
-        let query_id = execution_id.query_id();
-        let mut query_id_bytes = [0; 16];
-        query_id_bytes[..8].copy_from_slice(&query_id.high().to_be_bytes());
-        query_id_bytes[8..].copy_from_slice(&query_id.low().to_be_bytes());
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .expect("valid context");
-        let preparation = ConnectorWritePreparation::try_new(
-            owner.clone(),
-            ConnectorTableHandle::try_new(
-                owner.instance_id.clone(),
-                Bytes::from_static(b"test-table"),
-            )
-            .expect("valid table"),
-            novarocks_spi::connector::ConnectorWriteTargetRef::main(),
-            novarocks_spi::connector::ConnectorWriteIntent::Append,
-            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"test-base"))
-                .expect("valid base version"),
-            ConnectorWriteInputShape::Data {
-                fields: vec![ConnectorWriteFieldBinding::new(
-                    ConnectorWriteFieldToken::from_bytes([1; 32]),
-                    Field::new("value", DataType::Int64, false),
-                )],
-            },
-            Bytes::from_static(b"test-preparation"),
-        )
-        .expect("valid preparation");
-        let activation = novarocks_spi::connector::ConnectorWriteActivation::try_new(
-            owner.clone(),
-            &novarocks_spi::connector::ConnectorWriteActivationRequest {
-                operation_id,
-                source: novarocks_spi::connector::ConnectorWriteActivationSource::Prepared(
-                    preparation.clone(),
-                ),
-                intent: novarocks_spi::connector::ConnectorWriteActivationIntent::Ordinary,
-                context: context.clone(),
-            },
-            vec![(cohort_id, preparation)],
-        )
-        .expect("valid activation");
-        manifest
-            .plan(
-                lease,
-                ConnectorWritePlanningRequest {
-                    operation_id,
-                    cohort_id,
-                    execution_id: ConnectorWriteExecutionId::new(
-                        query_id_bytes,
-                        execution_id.attempt_id().get(),
-                    ),
-                    activation: activation.cohort(cohort_id).expect("activated cohort"),
-                    expected_writers: Vec::new(),
-                    context,
-                },
-            )
-            .expect("provider returns the frozen writer manifest")
-    }
-
-    #[test]
-    fn connector_write_attachment_rejects_duplicate_and_mismatched_placements() {
-        let execution = write_execution();
-        let schedule = write_schedule(UniqueId::new(3, 30));
-        let terminal_fragments = BTreeSet::from([3]);
-        let mut slot = BTreeMap::new();
-        attach_connector_write_plans(
-            &mut slot,
-            &schedule,
-            execution,
-            &terminal_fragments,
-            std::iter::once(planned_attachment(&schedule)),
-        )
-        .expect("first attachment belongs to the exact schedule");
-        let duplicate = attach_connector_write_plans(
-            &mut slot,
-            &schedule,
-            execution,
-            &terminal_fragments,
-            std::iter::once(planned_attachment(&schedule)),
-        )
-        .expect_err("a query may carry only one write attachment");
-        assert!(duplicate.message().contains("already has"));
-
-        let mismatched = write_schedule(UniqueId::new(3, 31));
-        let mut mismatched_slot = BTreeMap::new();
-        let mismatch = attach_connector_write_plans(
-            &mut mismatched_slot,
-            &mismatched,
-            execution,
-            &terminal_fragments,
-            std::iter::once(planned_attachment(&schedule)),
-        )
-        .expect_err("an attachment cannot cross placement manifests");
-        assert!(
-            mismatch
-                .message()
-                .contains("does not match a validated fragment placement")
-        );
-        assert!(mismatched_slot.is_empty());
-    }
-
-    #[test]
-    fn connector_write_attachment_accepts_one_fragment_placed_on_every_backend() {
-        // A distributed writer fragment is placed once per backend, so its
-        // cohort manifest carries three writers that all report fragment 3.
-        let execution = write_execution();
-        let schedule = SchedulingPlan {
-            root_fragment_id: 3,
-            by_fragment: BTreeMap::from([(
-                3,
-                vec![
-                    placement(3, 0, UniqueId::new(3, 30), 8),
-                    placement(3, 1, UniqueId::new(3, 31), 9),
-                    placement(3, 2, UniqueId::new(3, 32), 10),
-                ],
-            )]),
-            root_finst_id: UniqueId::new(3, 30),
-            root_backend_idx: 8,
-        };
-        let terminal_fragments = BTreeSet::from([3]);
-        let mut slot = BTreeMap::new();
-        attach_connector_write_plans(
-            &mut slot,
-            &schedule,
-            execution,
-            &terminal_fragments,
-            std::iter::once(planned_attachment(&schedule)),
-        )
-        .expect("one cohort covers every placement of its terminal writer fragment");
-        assert_eq!(slot.len(), 1);
-        assert_eq!(
-            slot.values()
-                .flat_map(|attachment| attachment.manifest().writers())
-                .count(),
-            3
-        );
-    }
-
-    #[test]
-    fn connector_write_attachments_partition_three_writers_across_two_cohorts() {
-        let execution = write_execution();
-        let schedule = SchedulingPlan {
-            root_fragment_id: 3,
-            by_fragment: BTreeMap::from([
-                (3, vec![placement(3, 0, UniqueId::new(3, 30), 8)]),
-                (4, vec![placement(4, 0, UniqueId::new(4, 40), 8)]),
-                (5, vec![placement(5, 0, UniqueId::new(5, 50), 8)]),
-            ]),
-            root_finst_id: UniqueId::new(3, 30),
-            root_backend_idx: 8,
-        };
-        let operation_id = ConnectorWriteOperationId::from_bytes([4; 16]);
-        let first_cohort = ConnectorWriteCohortId::derive(operation_id, b"rewrite", [1; 32])
-            .expect("first cohort");
-        let second_cohort = ConnectorWriteCohortId::derive(operation_id, b"append", [2; 32])
-            .expect("second cohort");
-        let first = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([3, 4]),
-            first_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let second = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([5]),
-            second_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let terminal_fragments = BTreeSet::from([3, 4, 5]);
-        let mut slot = BTreeMap::new();
-        attach_connector_write_plans(
-            &mut slot,
-            &schedule,
-            execution,
-            &terminal_fragments,
-            [first, second],
-        )
-        .expect("two cohort attachments exactly partition three terminal writers");
-        assert_eq!(
-            slot.keys().copied().collect::<BTreeSet<_>>(),
-            BTreeSet::from([first_cohort, second_cohort])
-        );
-
-        let missing = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([3, 4]),
-            first_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let error = attach_connector_write_plans(
-            &mut BTreeMap::new(),
-            &schedule,
-            execution,
-            &terminal_fragments,
-            [missing],
-        )
-        .expect_err("missing cohort attachment must fail closed");
-        assert!(error.message().contains("do not exactly cover"));
-
-        let overlap_first = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([3, 4]),
-            first_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let overlap_second = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([4, 5]),
-            second_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let error = attach_connector_write_plans(
-            &mut BTreeMap::new(),
-            &schedule,
-            execution,
-            &terminal_fragments,
-            [overlap_first, overlap_second],
-        )
-        .expect_err("overlapping cohort attachments must fail closed");
-        assert!(error.message().contains("overlap"));
-
-        let foreign_owner = ConnectorProviderBindingKey {
-            instance_id: ConnectorInstanceId::parse("foreign-write").expect("foreign instance"),
-            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
-        };
-        let owner_first = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([3, 4]),
-            first_cohort,
-            write_owner(),
-            operation_id,
-        );
-        let owner_second = planned_attachment_for(
-            &schedule,
-            &BTreeSet::from([5]),
-            second_cohort,
-            foreign_owner,
-            operation_id,
-        );
-        let error = attach_connector_write_plans(
-            &mut BTreeMap::new(),
-            &schedule,
-            execution,
-            &terminal_fragments,
-            [owner_first, owner_second],
-        )
-        .expect_err("foreign connector owner must fail closed");
-        assert!(
-            error
-                .message()
-                .contains("multiple operations or connector owners")
-        );
     }
 
     #[test]

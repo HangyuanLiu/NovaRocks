@@ -53,7 +53,6 @@ pub struct SqlExecutionPreparationFacts {
     topological_fragment_order: Vec<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
     result_fragment_id: Option<FragmentId>,
-    terminal_write_fragment_ids: Vec<FragmentId>,
     producer_fragment_ids: Vec<FragmentId>,
     boundary_contracts: Vec<BoundaryContract>,
 }
@@ -69,10 +68,6 @@ impl SqlExecutionPreparationFacts {
 
     pub fn result_fragment_id(&self) -> Option<FragmentId> {
         self.result_fragment_id
-    }
-
-    pub fn terminal_write_fragment_ids(&self) -> &[FragmentId] {
-        &self.terminal_write_fragment_ids
     }
 
     pub fn producer_fragment_ids(&self) -> &[FragmentId] {
@@ -92,7 +87,6 @@ pub fn project_execution_preparation_facts(plan: &DistributedPlan) -> SqlExecuti
         topological_fragment_order: topology.topological_fragment_order().to_vec(),
         execution_anchor_fragment_id: topology.execution_anchor_fragment_id(),
         result_fragment_id: topology.result_fragment_id(),
-        terminal_write_fragment_ids: topology.terminal_write_fragment_ids().to_vec(),
         producer_fragment_ids: topology.producer_fragment_ids().to_vec(),
         boundary_contracts: plan.boundaries().contracts().to_vec(),
     }
@@ -940,15 +934,7 @@ mod tests {
         assert_eq!(result_facts.topological_fragment_order(), [7]);
         assert_eq!(result_facts.execution_anchor_fragment_id(), 7);
         assert_eq!(result_facts.result_fragment_id(), Some(7));
-        assert!(result_facts.terminal_write_fragment_ids().is_empty());
         assert!(result_facts.producer_fragment_ids().is_empty());
         assert_eq!(result_facts.boundary_contracts().len(), 1);
-
-        let write = native_preparation_plan(NativePreparationFixture::TerminalWrite)
-            .expect("sealed terminal-write fixture");
-        let write_facts = project_execution_preparation_facts(&write);
-        assert_eq!(write_facts.result_fragment_id(), None);
-        assert_eq!(write_facts.terminal_write_fragment_ids(), [9]);
-        assert_eq!(write_facts.boundary_contracts().len(), 1);
     }
 }

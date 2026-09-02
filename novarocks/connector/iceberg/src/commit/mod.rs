@@ -44,7 +44,6 @@ mod row_delta;
 mod row_delta_dv;
 mod row_delta_dv_from_files;
 pub mod row_delta_dv_metadata;
-mod row_mutation_activation;
 mod row_mutation_preparation;
 mod run;
 mod selected_rewrite;
@@ -113,7 +112,7 @@ pub use validation::{
     ensure_partition_id_not_regressed, ensure_single_partition_spec, match_select_schema_to_table,
     row_mutation_strategy_from_metadata,
 };
-pub use write_control::{IcebergWriteControl, IcebergWriteReconcileEvidenceV1};
+pub use write_control::IcebergWriteControl;
 
 pub(crate) use action::CommitCtx;
 pub(crate) use collector::IcebergCommitCollector;

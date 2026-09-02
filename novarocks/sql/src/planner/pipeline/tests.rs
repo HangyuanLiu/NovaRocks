@@ -273,38 +273,42 @@ fn plain_write_and_change_stream_entrypoints_return_sealed_plans() {
         crate::planner::distributed::DataSink::Result
     ));
 
-    let write = build_sql_write_distributed_plan_with_settings(
+    let write = build_sql_write_dataflow_plan_with_settings(
         physical_values_node(vec![id.clone()]),
         crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
             crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
         ),
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0)
+            .expect("test write target ordinal"),
         &crate::optimizer::options::SessionOptimizerSettings::default(),
     )
-    .expect("write entrypoint seals after sink decoration");
+    .expect("write entrypoint seals after writer decoration");
     assert_sealed_plan(&write);
     assert!(matches!(
         write.fragments()[0].sink,
-        crate::planner::distributed::DataSink::ConnectorWrite(_)
+        crate::planner::distributed::DataSink::Noop
     ));
 
-    let change = build_sql_change_stream_distributed_plan(
+    let change = build_sql_change_stream_dataflow_plan_with_settings(
         physical_values_node(vec![id]),
         row_mutation_dag(0, 0),
         None,
+        &crate::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("change-stream entrypoint seals after router decoration");
     assert_sealed_plan(&change.distributed_plan);
-    assert_eq!(change.distributed_plan.fragments().len(), 2);
-    let root = change
-        .distributed_plan
-        .fragments()
-        .iter()
-        .find(|fragment| fragment.fragment_id == change.distributed_plan.root_fragment_id())
-        .expect("change-stream root");
-    assert!(matches!(
-        root.sink,
-        crate::planner::distributed::DataSink::ChangeStreamRouter(_)
-    ));
+    assert_eq!(change.distributed_plan.fragments().len(), 3);
+    assert!(
+        change
+            .distributed_plan
+            .fragments()
+            .iter()
+            .any(|fragment| matches!(
+                fragment.sink,
+                crate::planner::distributed::DataSink::ChangeStreamRouter(_)
+            )),
+        "the change-stream producer keeps its router sink"
+    );
 }
 
 #[test]
@@ -362,7 +366,7 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
         probe_runtime_filters: vec![],
     };
 
-    let planned = build_sql_change_stream_distributed_plan(
+    let planned = build_sql_change_stream_dataflow_plan_with_settings(
         physical,
         row_mutation_dag(2, 0),
         Some(PreExpandKeyedAssertSpec {
@@ -370,11 +374,24 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
             key_label: "_row_id".to_string(),
             message_prefix: "MOR UPDATE matched target row".to_string(),
         }),
+        &crate::optimizer::options::SessionOptimizerSettings::default(),
     )
     .expect("plan keyed assertion through the real change-stream entrypoint");
 
     let distributed = &planned.distributed_plan;
-    let root = &distributed.fragments()[distributed.root_fragment_id() as usize].root;
+    // The change-stream producer keeps its router sink; the plan root is the
+    // dataflow finish fragment the route writers stream into.
+    let root = &distributed
+        .fragments()
+        .iter()
+        .find(|fragment| {
+            matches!(
+                fragment.sink,
+                crate::planner::distributed::DataSink::ChangeStreamRouter(_)
+            )
+        })
+        .expect("change-stream producer fragment")
+        .root;
     assert!(matches!(
         root.payload,
         crate::planner::distributed::DistributedNodeKind::ChangeEventExpand(_)
@@ -409,7 +426,8 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
             .collect::<Vec<_>>()
     );
     assert_eq!(planned.topology.writer_routes.len(), 1);
-    assert_eq!(distributed.fragments().len(), 2);
+    // Producer, one route writer, and the Root finish fragment.
+    assert_eq!(distributed.fragments().len(), 3);
 }
 
 #[test]

@@ -1434,6 +1434,16 @@ impl IcebergWriteSessionControl {
                 (Some(table), metadata)
             }
         };
+        // The session is the write's admission point, so it applies the same
+        // support guards the separate preparation call applies. Without this a
+        // session would admit a write this table cannot encode, and only a
+        // caller that happened to also prepare would find out. A staged target
+        // is exempt: it is a table this statement is creating, so there is no
+        // existing schema or spec history to be unsupported.
+        if staged.is_none() {
+            crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
+                .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
+        }
         let target_ref = request.target_ref.as_str();
         let base_snapshot_id = match &staged {
             // A staged target holds no snapshot, and resolving a branch head

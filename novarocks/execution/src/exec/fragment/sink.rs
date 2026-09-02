@@ -16,26 +16,15 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, SchemaRef};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 
-use crate::exec::chunk::Chunk;
-use crate::exec::expr::{ExprArena, ExprId, cast_with_special_rules};
+use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
-use crate::runtime::connector_write_report::ConnectorStagedReportCollector;
 use crate::runtime::endpoint::FragmentDestination;
-use novarocks_spi::connector::{
-    CatalogWriteExecution, ConnectorOpenWriterRequest, StatisticsMetricRequest,
-};
+use novarocks_spi::connector::StatisticsMetricRequest;
 use novarocks_types::SlotId;
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The frozen fragment sink program keeps its typed payload inline for transport clarity."
-)]
 #[derive(Clone, Debug)]
 pub enum FragmentSinkProgram {
     Result,
@@ -44,7 +33,6 @@ pub enum FragmentSinkProgram {
     DataStream(DataStreamSinkProgram),
     MultiCastDataStream(MultiCastDataStreamSinkProgram),
     SplitDataStream(SplitDataStreamSinkProgram),
-    ConnectorWrite(ConnectorWriteSinkProgram),
 }
 
 impl FragmentSinkProgram {
@@ -54,14 +42,6 @@ impl FragmentSinkProgram {
             Self::DataStream(program) => program.validate(),
             Self::MultiCastDataStream(program) => program.validate(),
             Self::SplitDataStream(program) => program.validate(),
-            Self::ConnectorWrite(program) => program.validate(),
-        }
-    }
-
-    pub fn connector_staged_report_collector(&self) -> Option<ConnectorStagedReportCollector> {
-        match self {
-            Self::ConnectorWrite(program) => Some(program.report_collector()),
-            _ => None,
         }
     }
 }
@@ -170,214 +150,6 @@ impl DataStreamSinkFactoryInput {
             parsed_output_columns,
             destinations,
         )
-    }
-}
-
-/// Provider-neutral terminal writer.  The program carries an already-resolved
-/// query-leased catalog writer capability and a FE-issued opaque handle; it has no provider
-/// control capability and cannot commit external table state.
-#[derive(Clone)]
-pub struct ConnectorWriteSinkProgram {
-    name: String,
-    execution: Arc<dyn CatalogWriteExecution>,
-    request: ConnectorOpenWriterRequest,
-    root_input_width: usize,
-    input_ordinals: Option<Vec<usize>>,
-    input_projection: Option<ConnectorWriteInputProjection>,
-    report_collector: ConnectorStagedReportCollector,
-}
-
-#[derive(Clone)]
-pub struct ConnectorWriteInputProjection {
-    arena: ExprArena,
-    exprs: Vec<ExprId>,
-    schema: SchemaRef,
-}
-
-impl ConnectorWriteInputProjection {
-    fn try_new(
-        arena: ExprArena,
-        exprs: Vec<ExprId>,
-        schema: SchemaRef,
-    ) -> Result<Self, ExecPlanBuildError> {
-        if exprs.is_empty() || exprs.len() != schema.fields().len() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Sink,
-                "connector writer expression projection does not match its output schema",
-            ));
-        }
-        validate_expr_ids(&arena, &exprs, "connector writer input")?;
-        Ok(Self {
-            arena,
-            exprs,
-            schema,
-        })
-    }
-
-    pub fn project(&self, chunk: &Chunk) -> Result<RecordBatch, String> {
-        let arrays = self
-            .exprs
-            .iter()
-            .map(|expr| self.arena.eval(*expr, chunk))
-            .collect::<Result<Vec<_>, _>>()?;
-        let arrays = arrays
-            .into_iter()
-            .zip(self.schema.fields())
-            .enumerate()
-            .map(|(index, (array, field))| {
-                if array.data_type() == field.data_type() {
-                    return Ok(array);
-                }
-                let casted = if matches!(
-                    field.data_type(),
-                    DataType::FixedSizeBinary(width)
-                        if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH
-                    )
-                {
-                    cast_with_special_rules(&array, field.data_type())
-                } else {
-                    cast(array.as_ref(), field.data_type()).map_err(|error| error.to_string())
-                };
-                casted.map_err(|error| {
-                    format!(
-                        "connector writer projection cast failed at column {index} from {:?} to {:?}: {error}",
-                        array.data_type(),
-                        field.data_type()
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        RecordBatch::try_new(Arc::clone(&self.schema), arrays)
-            .map_err(|error| format!("build connector writer projected batch: {error}"))
-    }
-}
-
-impl std::fmt::Debug for ConnectorWriteSinkProgram {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ConnectorWriteSinkProgram")
-            .field(
-                "catalog_handle",
-                self.request.handle.writer().catalog_handle(),
-            )
-            .field("writer", self.request.handle.writer())
-            .field("input_ordinals", &self.input_ordinals)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ConnectorWriteSinkProgram {
-    pub fn try_new(
-        execution: Arc<dyn CatalogWriteExecution>,
-        request: ConnectorOpenWriterRequest,
-        root_input_width: usize,
-        input_ordinals: Option<Vec<usize>>,
-    ) -> Result<Self, ExecPlanBuildError> {
-        let program = Self {
-            name: "CONNECTOR_WRITE_SINK".to_string(),
-            execution,
-            request,
-            root_input_width,
-            input_ordinals,
-            input_projection: None,
-            report_collector: ConnectorStagedReportCollector::default(),
-        };
-        program.validate()?;
-        Ok(program)
-    }
-
-    pub fn try_new_with_expression_projection(
-        execution: Arc<dyn CatalogWriteExecution>,
-        request: ConnectorOpenWriterRequest,
-        root_input_width: usize,
-        arena: ExprArena,
-        exprs: Vec<ExprId>,
-        schema: SchemaRef,
-    ) -> Result<Self, ExecPlanBuildError> {
-        if request.expected_schema.as_ref() != schema.as_ref() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Sink,
-                "connector writer request schema does not match its expression projection",
-            ));
-        }
-        let program = Self {
-            name: "CONNECTOR_WRITE_SINK".to_string(),
-            execution,
-            request,
-            root_input_width,
-            input_ordinals: None,
-            input_projection: Some(ConnectorWriteInputProjection::try_new(
-                arena, exprs, schema,
-            )?),
-            report_collector: ConnectorStagedReportCollector::default(),
-        };
-        program.validate()?;
-        Ok(program)
-    }
-
-    fn validate(&self) -> Result<(), ExecPlanBuildError> {
-        self.request.handle.validate().map_err(|error| {
-            ExecPlanBuildError::new(
-                ExecPlanInvariant::Sink,
-                format!("connector writer handle: {error}"),
-            )
-        })?;
-        if self.execution.catalog_handle() != self.request.handle.writer().catalog_handle() {
-            return Err(ExecPlanBuildError::new(
-                ExecPlanInvariant::Sink,
-                "connector writer catalog handle does not match query-leased write execution",
-            ));
-        }
-        if let Some(ordinals) = &self.input_ordinals {
-            if ordinals.is_empty()
-                || ordinals
-                    .iter()
-                    .any(|ordinal| *ordinal >= self.root_input_width)
-            {
-                return Err(ExecPlanBuildError::new(
-                    ExecPlanInvariant::Sink,
-                    "connector writer input ordinals are empty or outside the root output schema",
-                ));
-            }
-            let mut unique = HashSet::new();
-            if ordinals.iter().any(|ordinal| !unique.insert(*ordinal)) {
-                return Err(ExecPlanBuildError::new(
-                    ExecPlanInvariant::Sink,
-                    "connector writer input ordinals contain duplicates",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn execution(&self) -> &Arc<dyn CatalogWriteExecution> {
-        &self.execution
-    }
-
-    pub fn request(&self) -> &ConnectorOpenWriterRequest {
-        &self.request
-    }
-
-    pub fn input_ordinals(&self) -> Option<&[usize]> {
-        self.input_ordinals.as_deref()
-    }
-
-    pub fn input_projection(&self) -> Option<ConnectorWriteInputProjection> {
-        self.input_projection.clone()
-    }
-
-    pub fn expression_projection_arena_mut(&mut self) -> Option<&mut ExprArena> {
-        self.input_projection
-            .as_mut()
-            .map(|projection| &mut projection.arena)
-    }
-
-    pub fn report_collector(&self) -> ConnectorStagedReportCollector {
-        self.report_collector.clone()
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
     }
 }
 

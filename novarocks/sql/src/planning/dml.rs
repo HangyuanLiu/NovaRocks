@@ -426,26 +426,13 @@ impl DmlWritePlanInput {
 }
 
 /// Seal one application-admitted frozen connector source into an immutable
-/// distributed terminal-write plan. The physical source and write contract
-/// remain opaque outside SQL; provider bindings, leases, and provenance stay
-/// retained by the application that admitted them.
-pub fn build_frozen_connector_write_distributed_plan(
-    source: crate::planning::query_execution::FrozenConnectorScanPlan,
-    sink: DmlWritePlanInput,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
-        source.into_physical(),
-        sink.0,
-        settings,
-    )
-}
-
-/// The NCP-6 dataflow form of [`build_frozen_connector_write_distributed_plan`].
+/// distributed write plan.
 ///
-/// The writer becomes an ordinary node emitting the write relation, and every
-/// writer gathers into one Root finish fragment whose terminal is the ordinary
-/// result sink. Both forms exist while callers move over one at a time.
+/// The writer is an ordinary node emitting the write relation, and every writer
+/// gathers into one Root finish fragment whose terminal is the ordinary result
+/// sink. The physical source and write contract remain opaque outside SQL;
+/// provider bindings, leases, and provenance stay retained by the application
+/// that admitted them.
 pub fn build_frozen_connector_write_dataflow_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -462,24 +449,8 @@ pub fn build_frozen_connector_write_dataflow_plan(
 
 /// Compile an immutable SQL request into a sealed connector-write plan.
 /// Application code supplies only the already-admitted request context and
-/// opaque terminal sink; optimizer and physical planner artifacts do not
+/// opaque write contract; optimizer and physical planner artifacts do not
 /// cross this boundary.
-pub fn compile_connector_write_distributed_plan(
-    request: crate::compiler::SqlOptimizeRequest<'_>,
-    sink: DmlWritePlanInput,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
-        .into_optimized_output()
-        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    crate::planner::pipeline::build_sql_write_distributed_plan_with_settings(
-        physical, sink.0, settings,
-    )
-}
-
-/// The NCP-6 dataflow form of [`compile_connector_write_distributed_plan`].
 pub fn compile_connector_write_dataflow_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     sink: DmlWritePlanInput,
@@ -575,24 +546,6 @@ pub fn compile_ctas_source(
 
 /// Attach an already admitted CTAS write schema to its frozen source and
 /// return the sealed distributed write plan.
-pub fn build_ctas_connector_write_distributed_plan(
-    source: &DmlCtasSourcePlan,
-    target_schema: arrow::datatypes::SchemaRef,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
-    crate::planner::pipeline::build_connector_write_distributed_plan(
-        physical,
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput {
-            target_schema,
-            input: crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            root_output_exprs: None,
-        },
-        settings,
-    )
-}
-
-/// The NCP-6 dataflow form of [`build_ctas_connector_write_distributed_plan`].
 pub fn build_ctas_connector_write_dataflow_plan(
     source: &DmlCtasSourcePlan,
     target_schema: arrow::datatypes::SchemaRef,
@@ -686,11 +639,9 @@ pub struct DmlChangeStreamCompileRequest<'a> {
 /// failure rather than a compile error.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DmlWritePlanShape {
-    /// The writer terminates its fragment in a connector sink.
-    #[default]
-    TerminalSink,
     /// The writer is an ordinary node whose rows gather into one Root finish
     /// fragment ending in the ordinary result sink.
+    #[default]
     Dataflow,
 }
 
@@ -831,14 +782,6 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
     let settings = dml_change_stream_optimizer_settings();
     let planned = match shape {
-        DmlWritePlanShape::TerminalSink => {
-            crate::planner::pipeline::build_sql_change_stream_distributed_plan_with_settings(
-                physical,
-                dag,
-                keyed_assert,
-                &settings,
-            )?
-        }
         DmlWritePlanShape::Dataflow => {
             crate::planner::pipeline::build_sql_change_stream_dataflow_plan_with_settings(
                 physical,

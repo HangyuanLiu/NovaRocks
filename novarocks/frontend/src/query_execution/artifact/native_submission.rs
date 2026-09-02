@@ -23,21 +23,15 @@
 
 use std::collections::BTreeSet;
 
-use super::{
-    ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission,
-    WriterRegistrationSet,
-};
+use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
-use crate::query_execution::write_plan::ConnectorWritePlanAttachment;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_spi::connector::ConnectorWriteCohortId;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
 use novarocks_types::UniqueId;
-use std::collections::BTreeMap;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
@@ -90,7 +84,6 @@ pub struct NativeSubmissionEncodingView<'a> {
     native_fragments: &'a NativeFragmentAttachment,
     schedule: &'a SchedulingPlan,
     options: &'a QueryOptions,
-    connector_write_plans: &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
     root_fetch: RootFetchMetadata,
     expected_output: ExpectedOutputSchema,
 }
@@ -109,7 +102,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         native_fragments: &'a NativeFragmentAttachment,
         schedule: &'a SchedulingPlan,
         options: &'a QueryOptions,
-        connector_write_plans: &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment>,
         root_fetch: RootFetchMetadata,
         expected_output: ExpectedOutputSchema,
     ) -> Result<Self, DistributedQueryError> {
@@ -123,7 +115,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             native_fragments,
             schedule,
             options,
-            connector_write_plans,
             root_fetch,
             expected_output,
         })
@@ -162,12 +153,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.options
     }
 
-    pub fn connector_write_plans(
-        &self,
-    ) -> &'a BTreeMap<ConnectorWriteCohortId, ConnectorWritePlanAttachment> {
-        self.connector_write_plans
-    }
-
     pub fn query_id(&self) -> UniqueId {
         let query_id = self.execution_id.query_id();
         UniqueId::new(query_id.high(), query_id.low())
@@ -200,7 +185,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
     pub fn seal(
         &self,
         submissions: Vec<ValidatedNativeSubmission>,
-        writer_registrations: WriterRegistrationSet,
     ) -> Result<NativeSubmissionAttachment, DistributedQueryError> {
         let expected = self.keys.iter().copied().collect::<BTreeSet<_>>();
         let mut actual = BTreeSet::new();
@@ -243,7 +227,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             execution_id: self.execution_id,
             submissions,
             root_fetch: self.root_fetch.clone(),
-            writer_registrations,
             expected_output: self.expected_output.clone(),
         })
     }
@@ -292,9 +275,6 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
             crate::query_execution::preparation::PreparedFragmentRole::Statistics => {
                 NativeSubmissionFragmentRole::Statistics
             }
-            crate::query_execution::preparation::PreparedFragmentRole::TerminalWrite => {
-                NativeSubmissionFragmentRole::TerminalWrite
-            }
             crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
                 NativeSubmissionFragmentRole::NonTerminal
             }
@@ -314,17 +294,12 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
 pub enum NativeSubmissionFragmentRole {
     Result,
     Statistics,
-    TerminalWrite,
     NonTerminal,
 }
 
 impl NativeSubmissionFragmentRole {
     pub const fn uses_result_buffer(self) -> bool {
         matches!(self, Self::Result)
-    }
-
-    pub const fn is_terminal_write(self) -> bool {
-        matches!(self, Self::TerminalWrite)
     }
 }
 
@@ -335,7 +310,6 @@ pub struct NativeSubmissionAttachment {
     execution_id: QueryExecutionId,
     submissions: Vec<ValidatedNativeSubmission>,
     root_fetch: RootFetchMetadata,
-    writer_registrations: WriterRegistrationSet,
     expected_output: ExpectedOutputSchema,
 }
 
@@ -349,15 +323,9 @@ impl NativeSubmissionAttachment {
     ) -> (
         Vec<ValidatedNativeSubmission>,
         RootFetchMetadata,
-        WriterRegistrationSet,
         ExpectedOutputSchema,
     ) {
-        (
-            self.submissions,
-            self.root_fetch,
-            self.writer_registrations,
-            self.expected_output,
-        )
+        (self.submissions, self.root_fetch, self.expected_output)
     }
 }
 

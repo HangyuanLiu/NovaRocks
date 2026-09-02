@@ -3,7 +3,6 @@
 //! The execution kernel only produces neutral facts. Query-lifecycle ownership,
 //! durable finalization, and protocol encoding remain application concerns.
 
-use novarocks_spi::connector::ConnectorStagedReportFrame;
 use novarocks_types::UniqueId;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -33,7 +32,6 @@ pub struct TabletFailInfo {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FragmentCommitReport {
-    pub connector_staged_report_frames: Vec<ConnectorStagedReportFrame>,
     pub tablet_commit_infos: Vec<TabletCommitInfo>,
     pub tablet_fail_infos: Vec<TabletFailInfo>,
     pub load_stats: FragmentSinkLoadStats,
@@ -44,9 +42,6 @@ pub struct FragmentCommitReport {
 /// Dropping an active lease rolls the registration back. `finish` transfers
 /// its facts to the host and prevents a second rollback.
 pub trait FragmentCommitLease: Send {
-    /// The single per-fragment budget for connector frames and tablet facts.
-    /// It must be obtained before either producer publishes terminal evidence.
-    fn write_commit_evidence_ledger(&self) -> novarocks_spi::connector::WriteCommitEvidenceLedger;
     fn add_load_stats(&mut self, stats: FragmentSinkLoadStats);
     fn add_tablet_commit_info(&mut self, info: TabletCommitInfo) -> Result<(), String>;
     fn add_tablet_fail_info(&mut self, info: TabletFailInfo) -> Result<(), String>;
@@ -58,8 +53,8 @@ pub trait FragmentCommitLease: Send {
 
 /// Application-owned admission for fragment commit/report facts.
 ///
-/// This deliberately has no provider-specific payloads: connector providers
-/// publish their neutral staged frames and the host owns provider finalization.
+/// This deliberately has no provider-specific payloads: the host owns provider
+/// finalization.
 pub trait FragmentCommitPort: Send + Sync + 'static {
     fn acquire(
         &self,

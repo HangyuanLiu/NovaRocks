@@ -24,7 +24,7 @@ use super::node::{
     TableFinishNode, TableWriterNode, table_finish_output_columns, table_writer_output_columns,
     write_relation_output_slot_ids,
 };
-use super::sink::{ConnectorWriteFragmentSink, ConnectorWritePlanInput};
+use super::sink::ConnectorWritePlanInput;
 use crate::analysis::{ExprKind, OutputColumn, TypedExpr};
 use crate::planner::distributed::fragment::DistributedPlanDraft;
 use crate::planner::distributed::{
@@ -46,293 +46,17 @@ pub(in crate::planner::distributed) struct PlannedSqlChangeStreamDistributedPlan
     topology: SqlChangeStreamWriteTopology,
 }
 
-/// Build a distributed plan whose terminal is a provider-neutral connector
-/// writer. The supplied Arrow/output contract is the complete SQL-owned
-/// boundary; provider payload is attached only after placement has frozen a
-/// writer identity.
-pub(crate) fn build_connector_write_distributed_plan(
-    physical: &crate::planner::physical::PhysicalPlanNode,
-    sink: ConnectorWritePlanInput,
-) -> Result<DistributedPlan, String> {
-    let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let draft = with_connector_write_sink(draft, sink)?;
-    crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
-}
-
-/// Build a terminal writer from the compiler-owned write contract. This is
-/// the SQLX-2 path: table metadata and provider-specific options are resolved
-/// by the application from `contract.target.binding` only after the
-/// distributed plan is sealed.
-pub(crate) fn build_sql_write_distributed_plan(
-    physical: &crate::planner::physical::PhysicalPlanNode,
-    sink: SqlWritePlanInput,
-) -> Result<DistributedPlan, String> {
-    let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let draft = with_sql_write_sink(draft, sink)?;
-    crate::planner::distributed::seal::seal_draft(draft).map_err(|error| error.to_string())
-}
-
-/// Attach a compiler-owned write contract to an unsealed physical plan.  This
-/// is deliberately the same generic connector terminal used after native
-/// writer placement: SQL does not construct, inspect, or serialize a
-/// provider-specific sink here.
-pub(in crate::planner::distributed) fn with_sql_write_sink(
-    plan: DistributedPlanDraft,
-    sink: SqlWritePlanInput,
-) -> Result<DistributedPlanDraft, String> {
-    with_connector_write_sink(
-        plan,
-        ConnectorWritePlanInput::from_sql_write_plan_input(sink),
-    )
-}
-
-pub(crate) fn build_sql_change_stream_distributed_plan(
-    physical: &crate::planner::physical::PhysicalPlanNode,
-    dag: ChangeStreamWriteDagSpec,
-) -> Result<PlannedSqlChangeStreamDistributedPlan, String> {
-    let draft = crate::planner::distributed::build::build_distributed_plan_draft(physical)?;
-    let planned = with_sql_change_stream_write(draft, dag)?;
-    let distributed_plan = crate::planner::distributed::seal::seal_draft(planned.distributed_plan)
-        .map_err(|error| error.to_string())?;
-    Ok(PlannedSqlChangeStreamDistributedPlan {
-        distributed_plan,
-        topology: planned.topology,
-    })
-}
-
-pub(in crate::planner::distributed) fn with_connector_write_sink(
-    mut plan: DistributedPlanDraft,
-    sink: ConnectorWritePlanInput,
-) -> Result<DistributedPlanDraft, String> {
-    let root_fragment_id = plan
-        .root_fragment_id
-        .ok_or_else(|| "connector write sink requires a draft root fragment id".to_string())?;
-    let root = plan
-        .fragments
-        .iter_mut()
-        .find(|fragment| fragment.fragment_id == root_fragment_id)
-        .ok_or_else(|| {
-            format!("connector write sink cannot find root fragment id={root_fragment_id}")
-        })?;
-    if !matches!(root.sink, DataSink::Result) {
-        return Err(format!(
-            "connector write sink expected root fragment id={} to use result sink",
-            root.fragment_id
-        ));
-    }
-    let output_contract =
-        crate::planner::distributed::output::finalize_connector_write_output(root, &sink)
-            .map_err(|error| error.to_string())?;
-    root.sink = DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
-        handle: None,
-        input: sink.input,
-        output_contract: Some(output_contract),
-    });
-    Ok(plan)
-}
-
-pub(in crate::planner::distributed) fn with_sql_change_stream_write(
-    mut plan: DistributedPlanDraft,
-    dag: ChangeStreamWriteDagSpec,
-) -> Result<PlannedSqlChangeStreamDistributedPlanDraft, String> {
-    dag.validate()?;
-    if dag.routes.is_empty() {
-        return Err("row-mutation router requires at least one route".to_string());
-    }
-
-    let root_fragment_id = plan
-        .root_fragment_id
-        .ok_or_else(|| "row-mutation write requires a draft root fragment id".to_string())?;
-    let root_index = plan
-        .fragments
-        .iter()
-        .position(|fragment| fragment.fragment_id == root_fragment_id)
-        .ok_or_else(|| {
-            format!("row-mutation write cannot find root fragment id={root_fragment_id}")
-        })?;
-    if !matches!(plan.fragments[root_index].sink, DataSink::Result) {
-        return Err(format!(
-            "row-mutation write expected root fragment id={} to use result sink",
-            root_fragment_id
-        ));
-    }
-
-    let source_fragment = plan.fragments[root_index].clone();
-    validate_output_ordinal(
-        &source_fragment.output_columns,
-        dag.effect_output_ordinal,
-        "effect",
-    )?;
-
-    let mut next_fragment_id = next_fragment_id(&plan);
-    let mut next_node_id = next_node_id(&plan);
-    let mut next_tuple_id = next_tuple_id(&plan);
-    let mut routes = Vec::with_capacity(dag.routes.len());
-    let mut writer_routes = Vec::with_capacity(dag.routes.len());
-    let mut writer_fragments = Vec::with_capacity(dag.routes.len());
-    let mut writer_edges = Vec::with_capacity(dag.routes.len());
-
-    for route in dag.routes {
-        let stream_output_ordinals = route_output_ordinals(&route);
-        validate_output_ordinals(
-            &source_fragment.output_columns,
-            &stream_output_ordinals,
-            "route input",
-        )?;
-        validate_output_ordinals(
-            &source_fragment.output_columns,
-            &route.output_partition_ordinals,
-            "route partition",
-        )?;
-
-        let sink = route.sink;
-
-        let writer_columns =
-            output_columns_by_ordinals(&source_fragment.output_columns, &stream_output_ordinals)?;
-        let output_slot_ids = output_slot_ids_for_ordinals(
-            &source_fragment.output_columns,
-            &stream_output_ordinals,
-            "route input",
-        )?;
-        if !matches!(sink.input, ConnectorWriteInputBinding::RootOutputByOrdinal) {
-            return Err("SQL change-stream writer requires root output input binding".to_string());
-        }
-        if writer_columns.len() != sink.contract.input_columns.len() {
-            return Err(format!(
-                "SQL row-mutation route output column count {} does not match write input column count {}",
-                writer_columns.len(),
-                sink.contract.input_columns.len()
-            ));
-        }
-
-        let writer_fragment_id = next_fragment_id;
-        next_fragment_id += 1;
-        let exchange_node_id = next_node_id;
-        next_node_id += 1;
-        let exchange_tuple_id = next_tuple_id;
-        next_tuple_id += 1;
-        let output_partition = data_partition_for_ordinals(
-            &source_fragment.output_columns,
-            &route.output_partition_ordinals,
-            "route partition",
-        )?;
-        let stream_kind = stream_kind_for_data_partition(&output_partition);
-
-        let sink_template = ConnectorWritePlanInput::from_sql_write_plan_input(sink.clone());
-        let mut writer_fragment = PlanFragment {
-            fragment_id: writer_fragment_id,
-            root: DistributedNode {
-                node_id: exchange_node_id,
-                fragment_id: writer_fragment_id,
-                tuple_ids: vec![exchange_tuple_id],
-                nullable_tuple_ids: Vec::new(),
-                limit: -1,
-                runtime_filter_binding_ids: Vec::new(),
-                children: Vec::new(),
-                stats: source_fragment.root.stats.clone(),
-                payload: DistributedNodeKind::Exchange(ExchangeReceiver {
-                    partition: output_partition.clone(),
-                    source_fragment_id: root_fragment_id,
-                    output_columns: writer_columns.clone(),
-                    output_qualifier: None,
-                    flavor: ExchangeFlavor::Distribution,
-                }),
-            },
-            data_partition: DataPartition::unpartitioned(),
-            output_partition: DataPartition::unpartitioned(),
-            sink: DataSink::Noop,
-            output_exprs: None,
-            output_columns: writer_columns,
-            cte_id: None,
-            cte_exchange_nodes: Vec::new(),
-        };
-        let output_contract = crate::planner::distributed::output::finalize_connector_write_output(
-            &writer_fragment,
-            &sink_template,
-        )
-        .map_err(|error| error.to_string())?;
-        writer_fragment.sink = DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
-            handle: None,
-            input: sink_template.input,
-            output_contract: Some(output_contract),
-        });
-        writer_fragments.push(writer_fragment);
-
-        writer_edges.push(FragmentEdge {
-            source_fragment_id: root_fragment_id,
-            target_fragment_id: writer_fragment_id,
-            target_exchange_node_id: exchange_node_id,
-            output_partition,
-            stream_kind,
-            edge_kind: FragmentEdgeKind::ChangeStreamRouter {
-                router_group_id: 0,
-                route_id: route.route_id,
-            },
-            output_slot_ids,
-        });
-
-        routes.push(ChangeStreamRoute {
-            route_id: route.route_id,
-            write_target_ordinal: route.write_target_ordinal,
-            accepted_effects: route.accepted_effects.clone(),
-            input_ordinals: route.input_ordinals,
-            target_fragment_id: writer_fragment_id,
-            target_exchange_node_id: exchange_node_id,
-            output_partition_ordinals: route.output_partition_ordinals,
-        });
-        writer_routes.push(SqlChangeStreamWriterRoute {
-            route_id: route.route_id,
-            write_target_ordinal: route.write_target_ordinal,
-            accepted_effects: route.accepted_effects,
-            writer_fragment_id,
-            sink,
-        });
-    }
-
-    plan.fragments[root_index].sink = DataSink::ChangeStreamRouter(ChangeStreamRouterSink {
-        group_id: 0,
-        effect_output_ordinal: dag.effect_output_ordinal,
-        routes,
-    });
-    plan.fragments.extend(writer_fragments);
-    plan.edges.extend(writer_edges);
-
-    Ok(PlannedSqlChangeStreamDistributedPlanDraft {
-        distributed_plan: plan,
-        topology: SqlChangeStreamWriteTopology { writer_routes },
-    })
-}
-
-#[cfg(any(test, feature = "test-support"))]
-pub(crate) fn finalize_sql_change_stream_test_plan(
-    builder: crate::planner::distributed::test_support::DistributedPlanDraftBuilder,
-    dag: ChangeStreamWriteDagSpec,
-) -> Result<DistributedPlan, String> {
-    let planned = with_sql_change_stream_write(builder.into_draft(), dag)?;
-    crate::planner::distributed::seal::seal_draft(planned.distributed_plan)
-        .map_err(|error| error.to_string())
-}
-
 // ===========================================================================
 // NCP-6: table writer / table finish dataflow
 // ===========================================================================
 //
-// The builders below are the dataflow successors of `with_connector_write_sink`
-// and `with_sql_change_stream_write`. Instead of terminating a fragment in a
-// connector sink, they wrap the writer's child plan in a `TableWriter` node
-// that emits the frozen write-result relation, gather every writer fragment
-// into ONE `TableFinish` fragment on the plan root, and emit the query result
-// through the ordinary `DataSink::Result`. The terminal-sink builders above stay
-// alive until the frontend and backend have switched over.
+// The builders below wrap the writer's child plan in a `TableWriter` node that
+// emits the frozen write-result relation, gather every writer fragment into ONE
+// `TableFinish` fragment on the plan root, and emit the query result through the
+// ordinary `DataSink::Result`.
 
 /// Build a distributed plan whose writer is a dataflow `TableWriter` feeding a
 /// single Root `TableFinish` fragment.
-///
-/// Dataflow successor of [`build_connector_write_distributed_plan`].
-#[allow(
-    dead_code,
-    reason = "NCP-6 T02 lands the planner builder; the FE/BE cutover wires this entrypoint."
-)]
 pub(crate) fn build_table_writer_finish_distributed_plan(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: ConnectorWritePlanInput,
@@ -344,12 +68,6 @@ pub(crate) fn build_table_writer_finish_distributed_plan(
 }
 
 /// Build a dataflow writer/finish plan from the compiler-owned write contract.
-///
-/// Dataflow successor of [`build_sql_write_distributed_plan`].
-#[allow(
-    dead_code,
-    reason = "NCP-6 T02 lands the planner builder; the FE/BE cutover wires this entrypoint."
-)]
 pub(crate) fn build_sql_table_writer_finish_distributed_plan(
     physical: &crate::planner::physical::PhysicalPlanNode,
     sink: SqlWritePlanInput,
@@ -367,10 +85,6 @@ pub(crate) fn build_sql_table_writer_finish_distributed_plan(
 /// fragment, and all of them gather into one Root `TableFinish` fragment.
 ///
 /// Dataflow successor of [`build_sql_change_stream_distributed_plan`].
-#[allow(
-    dead_code,
-    reason = "NCP-6 T02 lands the planner builder; the FE/BE cutover wires this entrypoint."
-)]
 pub(crate) fn build_sql_change_stream_table_writer_finish_distributed_plan(
     physical: &crate::planner::physical::PhysicalPlanNode,
     dag: ChangeStreamWriteDagSpec,
@@ -386,10 +100,7 @@ pub(crate) fn build_sql_change_stream_table_writer_finish_distributed_plan(
 }
 
 /// Attach the compiler-owned write contract as a dataflow `TableWriter`.
-#[allow(
-    dead_code,
-    reason = "NCP-6 T02 lands the planner builder; the FE/BE cutover wires this entrypoint."
-)]
+#[cfg(any(test, feature = "test-support"))]
 pub(in crate::planner::distributed) fn with_sql_table_writer_finish(
     plan: DistributedPlanDraft,
     sink: SqlWritePlanInput,
@@ -1014,65 +725,7 @@ mod tests {
 
     use novarocks_spi::connector::write_stack::{root_output_schema, writer_output_schema};
 
-    use super::{
-        with_sql_change_stream_table_writer_finish, with_sql_change_stream_write,
-        with_sql_table_writer_finish, with_sql_write_sink,
-    };
-
-    #[test]
-    fn sqlx2_write_sink_uses_only_the_sql_contract() {
-        let plan = single_fragment_plan_for_test();
-        let planned = with_sql_write_sink(
-            plan.into_draft(),
-            test_support::simple_sql_write_plan_input(
-                ConnectorWriteInputBinding::RootOutputByOrdinal,
-            ),
-        )
-        .expect("attach SQL write sink");
-        let planned =
-            crate::planner::distributed::seal::seal_draft(planned).expect("SQL write draft seals");
-        let root = planned
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == planned.root_fragment_id())
-            .expect("root fragment");
-        assert!(matches!(root.sink, DataSink::ConnectorWrite(_)));
-    }
-
-    #[test]
-    fn sqlx2_write_sink_replaces_root_result_sink() {
-        let plan = single_fragment_plan_for_test();
-        let sink = test_support::simple_sql_write_plan_input(
-            ConnectorWriteInputBinding::RootOutputByOrdinal,
-        );
-
-        let planned = with_sql_write_sink(plan.into_draft(), sink).expect("plan write sink");
-        let planned = crate::planner::distributed::seal::seal_draft(planned)
-            .expect("decorated write draft seals");
-
-        let root = planned
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == planned.root_fragment_id())
-            .expect("root fragment");
-        assert!(matches!(root.sink, DataSink::ConnectorWrite(_)));
-    }
-
-    #[test]
-    fn sqlx2_write_sink_rejects_out_of_range_output_ordinal() {
-        let plan = single_fragment_plan_for_test();
-        let sink = test_support::simple_sql_write_plan_input(
-            ConnectorWriteInputBinding::OutputOrdinals(vec![7]),
-        );
-
-        let err = with_sql_write_sink(plan.into_draft(), sink).expect_err("out-of-range ordinal");
-
-        assert!(
-            err.contains("sink input references output ordinal 7")
-                && err.contains("output columns exist"),
-            "unexpected error: {err}"
-        );
-    }
+    use super::{with_sql_change_stream_table_writer_finish, with_sql_table_writer_finish};
 
     fn test_route(
         route_byte: u8,
@@ -1100,118 +753,6 @@ mod tests {
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
         }
-    }
-
-    #[test]
-    fn row_mutation_expander_adds_opaque_routes_and_preserves_replace_fanout() {
-        let plan = single_fragment_plan_for_test_with_columns(vec![
-            ("__row_mutation_effect", DataType::Int8),
-            ("delete_id", DataType::Int32),
-            ("replacement", DataType::Int32),
-        ]);
-        let dag = ChangeStreamWriteDagSpec::for_test(
-            0,
-            vec![
-                test_route(
-                    7,
-                    0,
-                    vec![
-                        novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
-                        novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
-                    ],
-                    1,
-                    vec![1],
-                ),
-                test_route(
-                    8,
-                    1,
-                    vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace],
-                    2,
-                    Vec::new(),
-                ),
-            ],
-        );
-
-        let planned =
-            with_sql_change_stream_write(plan.into_draft(), dag).expect("plan row mutation");
-        let topology = planned.topology;
-        let distributed_plan =
-            crate::planner::distributed::seal::seal_draft(planned.distributed_plan)
-                .expect("decorated row-mutation draft seals");
-
-        let root = distributed_plan
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == distributed_plan.root_fragment_id())
-            .expect("root fragment");
-        let DataSink::ChangeStreamRouter(router) = &root.sink else {
-            panic!("expected row-mutation router sink");
-        };
-        assert_eq!(router.effect_output_ordinal, 0);
-        assert_eq!(router.routes.len(), 2);
-        assert_eq!(
-            router.routes[0].accepted_effects,
-            vec![
-                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
-                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
-            ]
-        );
-        assert_eq!(
-            router.routes[1].accepted_effects,
-            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Replace]
-        );
-        assert_eq!(topology.writer_routes.len(), 2);
-        assert_eq!(
-            topology.writer_routes[0].route_id,
-            router.routes[0].route_id
-        );
-    }
-
-    #[test]
-    fn row_mutation_expander_rejects_effect_ordinal_out_of_range() {
-        let plan = single_fragment_plan_for_test();
-        let dag = ChangeStreamWriteDagSpec::for_test(
-            7,
-            vec![test_route(
-                7,
-                0,
-                vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
-                0,
-                Vec::new(),
-            )],
-        );
-
-        let err = with_sql_change_stream_write(plan.into_draft(), dag)
-            .expect_err("invalid effect ordinal");
-        assert!(err.contains("effect output ordinal 7"), "{err}");
-    }
-
-    #[test]
-    fn row_mutation_expander_rejects_route_output_slot_id_overflow() {
-        let mut plan = single_fragment_plan_for_test();
-        let overflow_column_id = ColumnId::new_for_test(i32::MAX as u32 + 1);
-        plan.fragments_mut()[0].output_columns[0].column_id = overflow_column_id;
-        let DistributedNodeKind::Values(values) = &mut plan.fragments_mut()[0].root.payload else {
-            panic!("expected values root");
-        };
-        values.columns[0].column_id = overflow_column_id;
-        let dag = ChangeStreamWriteDagSpec::for_test(
-            0,
-            vec![test_route(
-                7,
-                0,
-                vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete],
-                0,
-                Vec::new(),
-            )],
-        );
-
-        let err = with_sql_change_stream_write(plan.into_draft(), dag)
-            .expect_err("route output slot id overflow");
-        assert!(
-            err.contains("column id c2147483648 cannot be encoded as stream output slot id"),
-            "unexpected error: {err}"
-        );
     }
 
     fn single_fragment_plan_for_test() -> DistributedPlanDraftBuilder {
@@ -1401,14 +942,6 @@ mod tests {
             edge.output_partition.kind,
             crate::planner::distributed::PartitionKind::Unpartitioned
         ));
-
-        assert!(
-            planned
-                .fragments()
-                .iter()
-                .all(|fragment| !matches!(fragment.sink, DataSink::ConnectorWrite(_))),
-            "the dataflow write shape must carry no connector terminal sink"
-        );
     }
 
     #[test]
@@ -1545,13 +1078,6 @@ mod tests {
             assert!(matches!(edge.edge_kind, FragmentEdgeKind::Stream));
             assert_eq!(edge.stream_kind, FragmentStreamKind::Gather);
         }
-        assert!(
-            planned
-                .fragments()
-                .iter()
-                .all(|fragment| !matches!(fragment.sink, DataSink::ConnectorWrite(_))),
-            "the dataflow write shape must carry no connector terminal sink"
-        );
     }
 
     #[test]

@@ -58,7 +58,6 @@ pub struct TopologyContract {
     planner_root_fragment_id: FragmentId,
     result_fragment_id: Option<FragmentId>,
     execution_anchor_fragment_id: FragmentId,
-    terminal_write_fragment_ids: Vec<FragmentId>,
     producer_fragment_ids: Vec<FragmentId>,
     topological_fragment_order: Vec<FragmentId>,
 }
@@ -83,10 +82,6 @@ impl TopologyContract {
 
     /// Terminal fragments (fragments that are the source of no edge) whose sink
     /// is a terminal write, in fragment declaration order.
-    pub fn terminal_write_fragment_ids(&self) -> &[FragmentId] {
-        &self.terminal_write_fragment_ids
-    }
-
     /// Fragments that are the source of at least one edge, in ascending id
     /// order.
     pub fn producer_fragment_ids(&self) -> &[FragmentId] {
@@ -220,19 +215,7 @@ pub(in crate::planner::distributed) fn build_topology_contract(
         .collect();
 
     // Step 3: the execution anchor, determined by planner semantics.
-    let execution_anchor_fragment_id =
-        select_execution_anchor(&fragments_by_id, &terminal_fragment_ids)?;
-
-    // Terminal writes: terminal fragments whose sink is a terminal write.
-    let terminal_write_fragment_ids: Vec<FragmentId> = terminal_fragment_ids
-        .iter()
-        .copied()
-        .filter(|id| {
-            fragments_by_id
-                .get(id)
-                .is_some_and(|fragment| is_terminal_write(&fragment.sink))
-        })
-        .collect();
+    let execution_anchor_fragment_id = select_execution_anchor(&terminal_fragment_ids)?;
 
     // The result fragment is the root iff its sink is a result sink.
     let result_fragment_id = fragments_by_id
@@ -244,20 +227,9 @@ pub(in crate::planner::distributed) fn build_topology_contract(
         planner_root_fragment_id: root_fragment_id,
         result_fragment_id,
         execution_anchor_fragment_id,
-        terminal_write_fragment_ids,
         producer_fragment_ids,
         topological_fragment_order,
     })
-}
-
-/// Whether a sink is a *terminal write* for anchor selection.
-///
-/// This reproduces the coordinator's mapping (`fragment_output_kind` +
-/// `FragmentOutputKind::is_terminal_write`) directly from [`DataSink`] so the
-/// planner never imports codegen: an Iceberg write is a terminal write; result,
-/// noop, and change-stream router sinks are not.
-fn is_terminal_write(sink: &DataSink) -> bool {
-    matches!(sink, DataSink::ConnectorWrite(_))
 }
 
 /// Return the fragment ids in topological order (leaves first, root last).
@@ -343,31 +315,17 @@ fn verify_edge_direction(
 /// scheduler's `select_execution_root_fragment` (retired in CGO-9B/Task 4):
 /// - exactly one terminal fragment -> that fragment;
 /// - zero terminal fragments -> [`TopologyError::NoExecutionAnchor`];
-/// - many terminals, all terminal writes -> the minimum fragment id;
 /// - otherwise -> [`TopologyError::AmbiguousExecutionAnchor`].
 ///
 /// The scheduler derives `force_single_instance` from the anchor's output kind
 /// at placement time; that stays a runtime concern and is intentionally absent
 /// here.
 fn select_execution_anchor(
-    fragments_by_id: &BTreeMap<FragmentId, &PlanFragment>,
     terminal_fragment_ids: &[FragmentId],
 ) -> Result<FragmentId, TopologyError> {
-    let all_terminal_writes = || {
-        terminal_fragment_ids.iter().all(|id| {
-            fragments_by_id
-                .get(id)
-                .is_some_and(|fragment| is_terminal_write(&fragment.sink))
-        })
-    };
     match terminal_fragment_ids.len() {
         1 => Ok(terminal_fragment_ids[0]),
         0 => Err(TopologyError::NoExecutionAnchor),
-        _ if all_terminal_writes() => Ok(terminal_fragment_ids
-            .iter()
-            .copied()
-            .min()
-            .expect("terminal fragments checked non-empty")),
         _ => Err(TopologyError::AmbiguousExecutionAnchor {
             terminal_fragment_ids: terminal_fragment_ids.to_vec(),
         }),
@@ -386,8 +344,7 @@ mod tests {
         ChangeStreamWriteDagSpec, ChangeStreamWriteRouteSpec,
     };
     use crate::planner::distributed::write::contract::ConnectorWriteInputBinding;
-    use crate::planner::distributed::write::plan::finalize_sql_change_stream_test_plan;
-    use crate::planner::distributed::write::sink::ConnectorWriteFragmentSink;
+    use crate::planner::distributed::write::plan::finalize_sql_change_stream_table_writer_finish_test_plan;
     use crate::planner::distributed::{
         DataPartition, DataSink, DistributedNode, DistributedNodeKind, DistributedPlan,
         ExchangeFlavor, ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentId,
@@ -446,14 +403,6 @@ mod tests {
         }
     }
 
-    fn iceberg_write_sink() -> DataSink {
-        DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
-            handle: None,
-            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
-            output_contract: None,
-        })
-    }
-
     /// A minimal fragment carrying only the fields the topology derivation
     /// reads: its id and sink. A unique node id keeps global-node-id checks
     /// (in other passes) happy if these are ever routed through them.
@@ -495,28 +444,6 @@ mod tests {
         )
         .seal()
         .expect("single result plan seals")
-    }
-
-    fn single_write_plan() -> DistributedPlan {
-        let columns = vec![output_col(1, "id")];
-        DistributedPlanDraftBuilder::new(
-            vec![PlanFragment {
-                fragment_id: 0,
-                root: values_node(0, 10, columns.clone()),
-                data_partition: DataPartition::unpartitioned(),
-                output_partition: DataPartition::unpartitioned(),
-                sink: iceberg_write_sink(),
-                output_exprs: None,
-                output_columns: columns,
-                cte_id: None,
-                cte_exchange_nodes: Vec::new(),
-            }],
-            Some(0),
-            Vec::new(),
-            Default::default(),
-        )
-        .seal()
-        .expect("single write plan seals")
     }
 
     fn stream_plan() -> DistributedPlan {
@@ -697,7 +624,8 @@ mod tests {
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
             ),
         }]);
-        finalize_sql_change_stream_test_plan(builder, dag).expect("change-stream router plan seals")
+        finalize_sql_change_stream_table_writer_finish_test_plan(builder, dag)
+            .expect("change-stream router plan seals")
     }
 
     // ----- Positive seal-path contracts -------------------------------------
@@ -710,22 +638,6 @@ mod tests {
         assert_eq!(topology.planner_root_fragment_id(), 0);
         assert_eq!(topology.result_fragment_id(), Some(0));
         assert_eq!(topology.execution_anchor_fragment_id(), 0);
-        assert!(topology.terminal_write_fragment_ids().is_empty());
-        assert!(topology.producer_fragment_ids().is_empty());
-        assert_eq!(topology.topological_fragment_order(), &[0]);
-    }
-
-    #[test]
-    fn single_write_plan_contract() {
-        let plan = single_write_plan();
-        let topology = plan.topology();
-
-        assert_eq!(topology.planner_root_fragment_id(), 0);
-        // A pure single-write plan has no result fragment; its lone terminal
-        // Iceberg-write fragment is both the anchor and the terminal write.
-        assert_eq!(topology.result_fragment_id(), None);
-        assert_eq!(topology.execution_anchor_fragment_id(), 0);
-        assert_eq!(topology.terminal_write_fragment_ids(), &[0]);
         assert!(topology.producer_fragment_ids().is_empty());
         assert_eq!(topology.topological_fragment_order(), &[0]);
     }
@@ -739,7 +651,6 @@ mod tests {
         assert_eq!(topology.result_fragment_id(), Some(0));
         // The single terminal (the result root) is the anchor.
         assert_eq!(topology.execution_anchor_fragment_id(), 0);
-        assert!(topology.terminal_write_fragment_ids().is_empty());
         assert_eq!(topology.producer_fragment_ids(), &[1]);
         // Producer fragment 1 is a leaf, result root 0 is last.
         assert_eq!(topology.topological_fragment_order(), &[1, 0]);
@@ -754,7 +665,6 @@ mod tests {
         assert_eq!(topology.execution_anchor_fragment_id(), 0);
         assert_eq!(topology.producer_fragment_ids(), &[1]);
         assert_eq!(topology.topological_fragment_order(), &[1, 0]);
-        assert!(topology.terminal_write_fragment_ids().is_empty());
     }
 
     #[test]
@@ -762,14 +672,14 @@ mod tests {
         let plan = change_stream_router_plan();
         let topology = plan.topology();
 
-        // The router source (fragment 0) has no result sink, so no result
-        // fragment; the single terminal writer fragment is the anchor.
-        assert_eq!(topology.planner_root_fragment_id(), 0);
-        assert_eq!(topology.result_fragment_id(), None);
-        assert_eq!(topology.producer_fragment_ids(), &[0]);
-        assert_eq!(topology.topological_fragment_order(), &[0, 1]);
-        assert_eq!(topology.execution_anchor_fragment_id(), 1);
-        assert_eq!(topology.terminal_write_fragment_ids(), &[1]);
+        // The router source keeps its router sink and streams into one writer
+        // fragment; both feed the Root finish fragment, which is the only
+        // terminal and therefore both the result fragment and the anchor.
+        let root = topology.planner_root_fragment_id();
+        assert_eq!(topology.result_fragment_id(), Some(root));
+        assert_eq!(topology.execution_anchor_fragment_id(), root);
+        assert_eq!(topology.producer_fragment_ids(), &[0, 1]);
+        assert_eq!(topology.topological_fragment_order(), &[0, 1, root]);
     }
 
     #[test]
@@ -785,29 +695,6 @@ mod tests {
     // ----- Direct-call algorithm coverage -----------------------------------
 
     #[test]
-    fn multi_write_dag_anchor_is_the_minimum_terminal_id() {
-        // One producer feeding two terminal Iceberg writers (ids 3 and 2): all
-        // terminals are terminal writes, so the anchor is the minimum id.
-        let fragments = vec![
-            fragment(1, DataSink::Noop),
-            fragment(3, iceberg_write_sink()),
-            fragment(2, iceberg_write_sink()),
-        ];
-        let edges = vec![edge(1, 3), edge(1, 2)];
-
-        let contract = build_topology_contract(&fragments, 2, &edges)
-            .expect("all-terminal-write DAG derives a contract");
-
-        assert_eq!(contract.execution_anchor_fragment_id(), 2);
-        // No result fragment (the root is an Iceberg write, not a result).
-        assert_eq!(contract.result_fragment_id(), None);
-        assert_eq!(contract.producer_fragment_ids(), &[1]);
-        // Terminal writes are listed in fragment declaration order: 3 then 2.
-        assert_eq!(contract.terminal_write_fragment_ids(), &[3, 2]);
-        assert_eq!(contract.topological_fragment_order(), &[1, 3, 2]);
-    }
-
-    #[test]
     fn cycle_between_two_fragments_is_rejected() {
         let fragments = vec![fragment(0, DataSink::Result), fragment(1, DataSink::Noop)];
         let edges = vec![edge(0, 1), edge(1, 0)];
@@ -820,12 +707,12 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_anchor_with_multiple_non_write_terminals_is_rejected() {
-        // Two disconnected terminals, neither a terminal write.
+    fn ambiguous_anchor_with_multiple_terminals_is_rejected() {
+        // Two disconnected terminals.
         let fragments = vec![fragment(0, DataSink::Result), fragment(1, DataSink::Noop)];
 
         let error = build_topology_contract(&fragments, 0, &[])
-            .expect_err("multiple non-write terminals are ambiguous");
+            .expect_err("multiple terminals are ambiguous");
 
         assert_eq!(
             error,
@@ -834,26 +721,6 @@ mod tests {
             }
         );
         assert_eq!(error.to_string(), "multiple root fragments: [0, 1]");
-    }
-
-    #[test]
-    fn illegal_result_write_terminal_mix_is_rejected() {
-        // A result terminal coexisting with a terminal write is not all-write,
-        // so the anchor is not determined.
-        let fragments = vec![
-            fragment(0, DataSink::Result),
-            fragment(1, iceberg_write_sink()),
-        ];
-
-        let error = build_topology_contract(&fragments, 0, &[])
-            .expect_err("a result/write terminal mix is illegal");
-
-        assert_eq!(
-            error,
-            TopologyError::AmbiguousExecutionAnchor {
-                terminal_fragment_ids: vec![0, 1],
-            }
-        );
     }
 
     #[test]
@@ -902,11 +769,7 @@ mod tests {
     fn no_execution_anchor_when_no_terminal_exists() {
         // Exercised directly: an empty terminal set is only reachable behind a
         // cycle in a finite graph, which `topological_order` rejects first.
-        let fragments = [fragment(0, DataSink::Result)];
-        let fragments_by_id = fragments.iter().map(|f| (f.fragment_id, f)).collect();
-
-        let error = select_execution_anchor(&fragments_by_id, &[])
-            .expect_err("no terminal fragment means no anchor");
+        let error = select_execution_anchor(&[]).expect_err("no terminal fragment means no anchor");
 
         assert_eq!(error, TopologyError::NoExecutionAnchor);
         assert_eq!(

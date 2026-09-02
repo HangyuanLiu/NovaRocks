@@ -98,10 +98,6 @@ pub struct PreparedDelete {
 }
 
 pub enum DeleteWriteReport {
-    Aborted {
-        reason: String,
-        has_staged_files: bool,
-    },
     NoOp,
     CommitRequired(Arc<dyn DeleteCommit>),
 }
@@ -327,23 +323,12 @@ fn delete_write_report_from_result(
     result: crate::query_execution::outcome::QueryExecutionResult,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<DeleteWriteReport, String> {
-    if let Some(abort) = result.write_abort {
-        let has_staged_files = abort
-            .completed_writer_outputs
-            .iter()
-            .any(|writer| !writer.connector_staged_report_frames.is_empty());
-        return Ok(DeleteWriteReport::Aborted {
-            reason: abort.reason,
-            has_staged_files,
-        });
-    }
     let Some(completion) = result.write_session else {
         return Ok(DeleteWriteReport::NoOp);
     };
     // A DELETE whose predicate matched nothing produced no commit fragment.
     // Committing that would publish an empty snapshot, so the session is
-    // released instead and the statement reports a no-op -- the same terminal
-    // the staged-report path reached through its own empty-output check.
+    // released instead and the statement reports a no-op.
     if completion.is_empty() {
         completion
             .session()
@@ -489,9 +474,6 @@ mod tests {
     ) -> crate::query_execution::outcome::QueryExecutionResult {
         crate::query_execution::outcome::QueryExecutionResult {
             query_result: crate::runtime::query_result::QueryResult::empty(),
-            write_commit: None,
-            write_abort: None,
-            connector_completion: None,
             write_session: Some(
                 crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
                     Arc::clone(session),

@@ -326,18 +326,6 @@ pub fn analyze_mv_first_refresh_connector_write(
     })
 }
 
-pub fn compile_mv_first_refresh_connector_write(
-    analyzed: SqlMvFirstRefreshAnalyzed,
-    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::planning::dml::compile_connector_write_distributed_plan(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
-        analyzed.sink,
-        &analyzed.settings,
-    )
-}
-
-/// The NCP-6 dataflow form of [`compile_mv_first_refresh_connector_write`].
 pub fn compile_mv_first_refresh_connector_write_dataflow(
     analyzed: SqlMvFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
@@ -451,18 +439,6 @@ pub fn analyze_join_first_refresh_connector_write(
     })
 }
 
-pub fn compile_join_first_refresh_connector_write(
-    analyzed: SqlMvJoinFirstRefreshAnalyzed,
-    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::planning::dml::compile_connector_write_distributed_plan(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
-        analyzed.sink,
-        &analyzed.settings,
-    )
-}
-
-/// The NCP-6 dataflow form of [`compile_join_first_refresh_connector_write`].
 pub fn compile_join_first_refresh_connector_write_dataflow(
     analyzed: SqlMvJoinFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
@@ -2688,8 +2664,9 @@ mod tests {
         let _: fn(
             SqlMvJoinFirstRefreshAnalyzed,
             &crate::planning::dml::DmlStatisticsSnapshot,
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
         ) -> Result<crate::plan_read::DistributedPlan, String> =
-            compile_join_first_refresh_connector_write;
+            compile_join_first_refresh_connector_write_dataflow;
     }
 
     #[test]

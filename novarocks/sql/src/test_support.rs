@@ -40,10 +40,9 @@ use crate::planner::distributed::write::contract::{
     ConnectorWriteInputBinding, test_support::simple_sql_write_plan_input,
 };
 use crate::planner::distributed::write::plan::{
-    finalize_sql_change_stream_table_writer_finish_test_plan, finalize_sql_change_stream_test_plan,
+    finalize_sql_change_stream_table_writer_finish_test_plan,
     finalize_sql_table_writer_finish_test_plan,
 };
-use crate::planner::distributed::write::sink::ConnectorWriteFragmentSink;
 use crate::planner::distributed::{
     DataPartition, DataSink, DistributedNode, DistributedNodeKind, ExchangeFlavor,
     ExchangeReceiver, FragmentEdge, FragmentEdgeKind, FragmentStreamKind, PartitionKind,
@@ -175,7 +174,6 @@ pub enum NativePlanEncodingFixture {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativePreparationFixture {
     ResultOutput,
-    TerminalWrite,
     MissingResultOutput,
 }
 
@@ -309,7 +307,6 @@ pub fn native_preparation_plan(
 ) -> Result<DistributedPlan, String> {
     match fixture {
         NativePreparationFixture::ResultOutput => native_preparation_result_plan(),
-        NativePreparationFixture::TerminalWrite => native_preparation_terminal_write_plan(),
         NativePreparationFixture::MissingResultOutput => {
             let mut plan = native_preparation_result_plan()?;
             plan.remove_fragment_output_for_test(7);
@@ -564,25 +561,6 @@ fn native_preparation_result_plan() -> Result<DistributedPlan, String> {
         data_partition: DataPartition::unpartitioned(),
         output_partition: DataPartition::unpartitioned(),
         sink: DataSink::Result,
-        output_exprs: None,
-        output_columns: columns,
-        cte_id: None,
-        cte_exchange_nodes: Vec::new(),
-    }])
-}
-
-fn native_preparation_terminal_write_plan() -> Result<DistributedPlan, String> {
-    let columns = vec![output_column(1, "id", DataType::Int64)];
-    seal_fixture_plan(vec![PlanFragment {
-        fragment_id: 9,
-        root: values_node(9, 90, columns.clone()),
-        data_partition: DataPartition::unpartitioned(),
-        output_partition: DataPartition::unpartitioned(),
-        sink: DataSink::ConnectorWrite(ConnectorWriteFragmentSink {
-            handle: None,
-            input: ConnectorWriteInputBinding::RootOutputByOrdinal,
-            output_contract: None,
-        }),
         output_exprs: None,
         output_columns: columns,
         cte_id: None,
@@ -1629,7 +1607,7 @@ fn native_router_stream_plan() -> Result<DistributedPlan, String> {
             sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
         }],
     };
-    finalize_sql_change_stream_test_plan(draft, dag)
+    finalize_sql_change_stream_table_writer_finish_test_plan(draft, dag)
         .map_err(|error| format!("native router fixture must seal: {error}"))
 }
 
@@ -2676,18 +2654,21 @@ mod tests {
             NativeBuildFixture::TopNSplitStream,
             NativeBuildFixture::CteMulticastStream,
             NativeBuildFixture::CteMulticastOrdering,
-            NativeBuildFixture::RouterStream,
         ] {
             let plan = native_build_plan(fixture).expect("build fixture must seal");
             assert_eq!(plan.fragments().len(), 2);
         }
+        // The router fixture is the dataflow write shape: producer, one route
+        // writer, and the Root finish fragment they both stream into.
+        let router = native_build_plan(NativeBuildFixture::RouterStream)
+            .expect("router build fixture must seal");
+        assert_eq!(router.fragments().len(), 3);
     }
 
     #[test]
     fn preparation_fixtures_keep_construction_and_negative_mutation_inside_sql() {
         for fixture in [
             NativePreparationFixture::ResultOutput,
-            NativePreparationFixture::TerminalWrite,
             NativePreparationFixture::MissingResultOutput,
         ] {
             native_preparation_plan(fixture).expect("closed preparation fixture");

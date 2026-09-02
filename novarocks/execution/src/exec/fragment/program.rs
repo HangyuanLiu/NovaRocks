@@ -157,7 +157,6 @@ pub enum FragmentSinkKind {
     DataStream,
     MultiCastDataStream,
     SplitDataStream,
-    ConnectorWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,7 +209,6 @@ impl FragmentSinkSpec {
                     Required(DestinationGroups(count)),
                 )
             }
-            FragmentSinkProgram::ConnectorWrite(_) => (FragmentSinkKind::ConnectorWrite, None),
         };
         Ok(Self {
             program,

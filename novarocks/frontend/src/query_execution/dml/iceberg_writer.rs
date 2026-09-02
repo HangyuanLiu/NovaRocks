@@ -41,10 +41,9 @@ use novarocks_parser::ast::{Query, Statement};
 use novarocks_spi::connector::{
     ConnectorPreReadyWritePlanningRequest, ConnectorTableHandle, ConnectorWriteActivationIntent,
     ConnectorWriteActivationRequest, ConnectorWriteActivationSource,
-    ConnectorWriteAdmissionPurpose, ConnectorWriteCohortId, ConnectorWriteFieldRequest,
-    ConnectorWriteInputRequest, ConnectorWriteIntent, ConnectorWriteLease,
-    ConnectorWriteOperationId, ConnectorWritePreparation, ConnectorWritePreparationOutcome,
-    ConnectorWritePreparationRequest,
+    ConnectorWriteAdmissionPurpose, ConnectorWriteFieldRequest, ConnectorWriteInputRequest,
+    ConnectorWriteIntent, ConnectorWriteLease, ConnectorWriteOperationId,
+    ConnectorWritePreparation, ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest,
 };
 #[cfg(test)]
 use novarocks_sql::literal::bytes_to_latin1_string;
@@ -306,56 +305,6 @@ fn prepare_iceberg_distributed_write(
         native_assembly: Mutex::new(None),
         attempt_reservation: Mutex::new(Some(attempt_reservation)),
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "Retained beside the terminal-sink write path until it is deleted as one cut."
-)]
-fn register_insert_connector_write(
-    preparation: ConnectorWritePreparation,
-    operation_id: ConnectorWriteOperationId,
-    context: novarocks_spi::connector::ConnectorRequestContext,
-    exact_lease: &ConnectorWriteLease,
-) -> Result<PreparedInsertConnectorWriteBinding, String> {
-    let activation = ConnectorWriteActivationRequest {
-        operation_id,
-        source: ConnectorWriteActivationSource::Prepared(preparation),
-        intent: ConnectorWriteActivationIntent::Ordinary,
-        context: context.clone(),
-    };
-    let pre_ready_planning_request = ConnectorPreReadyWritePlanningRequest::new(activation.clone());
-    let activated = exact_lease
-        .activate_write(activation)
-        .map_err(|error| format!("activate exact Iceberg write generation: {error}"))?;
-    let cohort = activated
-        .cohort(ConnectorWriteCohortId::primary(operation_id))
-        .ok_or_else(|| "exact Iceberg write activation omitted its primary cohort".to_string())?;
-    let template =
-        crate::query_execution::contract::ConnectorWritePlanningTemplate::from_activated_cohort(
-            cohort,
-            context,
-            exact_lease.clone(),
-        )
-        .map_err(|error| format!("seal exact Iceberg write planning template: {error}"))?;
-    Ok(PreparedInsertConnectorWriteBinding {
-        template,
-        pre_ready_planning_request,
-    })
-}
-
-/// Exact activation facts retained with the first-admission INSERT semantic
-/// binding. The provider proof is intentionally requested only if a later
-/// pre-ready topology failure reaches the replan gate: lack of a proof must
-/// not reject the ordinary first round.
-#[allow(
-    dead_code,
-    reason = "Retained beside the terminal-sink write path until it is deleted as one cut."
-)]
-struct PreparedInsertConnectorWriteBinding {
-    template: crate::query_execution::contract::ConnectorWritePlanningTemplate,
-    pre_ready_planning_request: ConnectorPreReadyWritePlanningRequest,
 }
 
 /// Build the begin request for one distributed write.
