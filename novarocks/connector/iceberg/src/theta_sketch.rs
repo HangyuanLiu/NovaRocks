@@ -41,6 +41,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 const DEFAULT_LG_K: u8 = 12;
 
+// Design: ADR-0134 (docs/adr/ADR-0134-registry-datasketches-substrate.md)
 /// Provider-local lifecycle adapter around the standard DataSketches Theta
 /// mutable and compact states.
 pub struct ThetaSketchHandle {
