@@ -107,8 +107,8 @@ pub fn eval_ds_hll_count_distinct_state(
             None => DEFAULT_TARGET_TYPE,
         };
 
-        let mut handle = HllHandle::new(lg_k, target_type)?;
-        handle.update_hash(hash)?;
+        let mut handle = HllHandle::new_unreserved(lg_k, target_type)?;
+        handle.update_hash_unreserved(hash)?;
         builder.append_value(handle.serialize()?);
     }
 

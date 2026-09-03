@@ -94,6 +94,7 @@ GROUP BY grp
 ORDER BY grp;
 
 -- query 5
+-- Persisted singleton states must merge to the same non-null NDV as query 2.
 SELECT
     grp,
     ds_hll_estimate(ds_vb) AS est_vb

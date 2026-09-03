@@ -11,6 +11,7 @@ provenance:
   - "PR: pending — backfill the number once the registry cutover merges"
 code-anchors:
   - "novarocks/connector/iceberg/src/theta_sketch.rs (ThetaSketchHandle)"
+  - "novarocks/execution/src/exec/hll.rs (HllHandle allocation admission)"
 ---
 
 ## 问题
@@ -49,6 +50,8 @@ HLL/Theta 的构造、更新、compact 序列化、反序列化、estimate 和 u
 
 格式所有权明确分层：上游 DataSketches 是 sketch body、状态机、codec 与集合运算的唯一 owner；NovaRocks 只拥有产品载体和 admission。Theta partial carrier 固定为 `V2 | lg_k | opaque ordered v3 compact body`，先执行总长度与头部检查，再由上游标准 decoder 解释 opaque body，最后验证 ordered 与 retained-entry 上界。NovaRocks 不解析 body 字段、不复制上游 codec，也不以兼容 shim 接受第二种权威表示。
 
+HLL 内存 admission 与该精确版本的分配形状一起冻结，但不取得 body 语义所有权。preflight 只解析 RC1 固定头部中影响分配的 mode、target、`lg_k`、`lg_arr`、coupon/aux count，结合当前 union 的有效 `lg_k`、mode、capacity 与 generation，给出 current、绝对 peak 和 additional headroom；标准 decoder 仍负责 estimator 与 body 的语义验证。调用方先按 additional headroom 取得 reservation guard，操作在任何 DataSketches 分配或修改前重验 token、当前状态和 payload 头，返回精确新 current 后由调用方在 guard 仍存活时完成永久 charge 对账。库内不得自行取得或提前释放 reservation，也不得用全局 `lg_k=21` 最大值替代实时配置与状态推导。
+
 永久守卫检查实际 Cargo 图与 lockfile，而不是源码形状：动态发现 workspace，运行 locked Cargo metadata，关联精确版本、crates.io source 与 checksum，并拒绝旧版本、双版本、Git/path/vendor/patch 和 checksum 漂移。上游发布包、跨语言 TCK、consumer 测试和图守卫四者共同构成升级门；任何一项缺失都不能宣称兼容迁移完成。
 
 ## 接受的妥协（诚实记录）
@@ -68,3 +71,4 @@ HLL/Theta 的构造、更新、compact 序列化、反序列化、estimate 和 u
 - 当前版本出现 CVE、供应链撤包、长期无人维护或无法获得必要安全修复；
 - 相同 workload、参数与构建 profile 下出现可复现的结构性 benchmark 退化，而非单次时延噪声；
 - DataSketches 引入新的格式 major version、seed/hash domain 变化或集合语义变化，使现有 Java/C++/Rust 向量不再代表目标互操作契约。
+- DataSketches 改变 HLL list/set/dense、HLL4 aux map、decode 或 union transition 的分配形状；升级前必须重审 allocation header parser、状态推导和全局 allocator 峰值测试。
