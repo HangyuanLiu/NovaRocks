@@ -170,7 +170,8 @@ impl StatsAssembler {
         file_io: &FileIO,
     ) -> Result<Option<StatisticsFile>, StatisticsAssemblyFailure> {
         // 1. Aggregate the new file sketches per field id.
-        let per_column = aggregate_per_column(new_file_sketches);
+        let per_column = aggregate_per_column(new_file_sketches)
+            .map_err(StatisticsAssemblyFailure::SketchAssembly)?;
         if per_column.is_empty() {
             // Nothing to write — caller can either keep the previous entry or
             // skip statistics for this snapshot.
@@ -187,7 +188,8 @@ impl StatsAssembler {
             per_column,
             parent_sketches,
             parent_snapshot_is_proven_empty(table.metadata(), prev_snapshot_id),
-        );
+        )
+        .map_err(StatisticsAssemblyFailure::SketchAssembly)?;
         if merged.is_empty() {
             // The parent has rows that are not covered by statistics for any
             // field written by this append. Do not create a partial Puffin.
@@ -227,7 +229,8 @@ impl StatsAssembler {
         current_sequence_number: i64,
         file_io: &FileIO,
     ) -> Result<Option<StatisticsFile>, StatisticsAssemblyFailure> {
-        let per_column = aggregate_per_column(new_file_sketches);
+        let per_column = aggregate_per_column(new_file_sketches)
+            .map_err(StatisticsAssemblyFailure::SketchAssembly)?;
         if per_column.is_empty() {
             return Ok(None);
         }
@@ -250,7 +253,9 @@ impl StatsAssembler {
 
 /// Combine many per-file sketch sets into a per-column aggregate by taking the
 /// union over each field id's individual sketches.
-fn aggregate_per_column(new_file_sketches: Vec<FileSketchSet>) -> HashMap<i32, ThetaSketchHandle> {
+fn aggregate_per_column(
+    new_file_sketches: Vec<FileSketchSet>,
+) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
     let mut by_field: HashMap<i32, Vec<ThetaSketchHandle>> = HashMap::new();
     for set in new_file_sketches {
         for (field_id, sketch) in set.sketches {
@@ -261,9 +266,9 @@ fn aggregate_per_column(new_file_sketches: Vec<FileSketchSet>) -> HashMap<i32, T
     let mut out = HashMap::new();
     for (field_id, sketches) in by_field {
         let refs: Vec<&ThetaSketchHandle> = sketches.iter().collect();
-        out.insert(field_id, ThetaSketchHandle::union(&refs));
+        out.insert(field_id, ThetaSketchHandle::union(&refs)?);
     }
-    out
+    Ok(out)
 }
 
 /// The direct parent's statistics state. An empty `Present` map is distinct
@@ -288,15 +293,15 @@ fn merge_with_parent(
     new_per_column: HashMap<i32, ThetaSketchHandle>,
     parent: ParentSketches,
     parent_is_proven_empty: bool,
-) -> HashMap<i32, ThetaSketchHandle> {
-    match parent {
+) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
+    Ok(match parent {
         ParentSketches::NoParent => new_per_column,
         ParentSketches::Present(_) | ParentSketches::NoStatisticsFile if parent_is_proven_empty => {
             new_per_column
         }
-        ParentSketches::Present(previous) => merge_with_previous(new_per_column, previous),
+        ParentSketches::Present(previous) => merge_with_previous(new_per_column, previous)?,
         ParentSketches::NoStatisticsFile => HashMap::new(),
-    }
+    })
 }
 
 /// Merge only fields covered by both the previous snapshot's aggregate and
@@ -305,18 +310,18 @@ fn merge_with_parent(
 fn merge_with_previous(
     new_per_column: HashMap<i32, ThetaSketchHandle>,
     previous: HashMap<i32, ThetaSketchHandle>,
-) -> HashMap<i32, ThetaSketchHandle> {
-    new_per_column
-        .into_iter()
-        .filter_map(|(field_id, new_sketch)| {
-            previous.get(&field_id).map(|previous_sketch| {
-                (
-                    field_id,
-                    ThetaSketchHandle::union(&[&new_sketch, previous_sketch]),
-                )
-            })
-        })
-        .collect()
+) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
+    let mut merged = HashMap::new();
+    for (field_id, new_sketch) in new_per_column {
+        let Some(previous_sketch) = previous.get(&field_id) else {
+            continue;
+        };
+        merged.insert(
+            field_id,
+            ThetaSketchHandle::union(&[&new_sketch, previous_sketch])?,
+        );
+    }
+    Ok(merged)
 }
 
 /// Read the previous snapshot's Puffin and decode each Theta blob.
@@ -684,9 +689,9 @@ mod tests {
     }
 
     fn make_sketch_with_values(start: i64, count: i64) -> ThetaSketchHandle {
-        let mut sketch = ThetaSketchHandle::new(12);
+        let mut sketch = ThetaSketchHandle::new(12).expect("theta sketch");
         for v in start..(start + count) {
-            sketch.update(v);
+            sketch.update(v).expect("theta update");
         }
         sketch
     }
@@ -706,7 +711,8 @@ mod tests {
                 file_path: "b.parquet".to_string(),
                 sketches: b,
             },
-        ]);
+        ])
+        .expect("aggregate sketches");
         let est = aggregate.get(&1).expect("field 1 present").estimate();
         // Union of [0,999] and [500,1499] = [0,1499] ≈ 1500 distinct.
         assert!(
@@ -723,7 +729,8 @@ mod tests {
         let aggregate = aggregate_per_column(vec![FileSketchSet {
             file_path: "a.parquet".to_string(),
             sketches: a,
-        }]);
+        }])
+        .expect("aggregate sketches");
         assert_eq!(aggregate.len(), 2);
         assert!(aggregate.contains_key(&1));
         assert!(aggregate.contains_key(&2));
@@ -736,7 +743,8 @@ mod tests {
             (2, make_sketch_with_values(100, 100)),
         ]);
 
-        let merged = merge_with_parent(new_map, ParentSketches::NoParent, false);
+        let merged =
+            merge_with_parent(new_map, ParentSketches::NoParent, false).expect("merge sketches");
 
         assert_eq!(merged.len(), 2);
         assert!(merged.contains_key(&1));
@@ -752,7 +760,7 @@ mod tests {
         let parent =
             ParentSketches::Present(HashMap::from([(1, make_sketch_with_values(500, 100))]));
 
-        let merged = merge_with_parent(new_map, parent, true);
+        let merged = merge_with_parent(new_map, parent, true).expect("merge sketches");
 
         assert_eq!(merged.len(), 2);
         assert!(merged.contains_key(&1));
@@ -765,7 +773,8 @@ mod tests {
         new_map.insert(1, make_sketch_with_values(0, 5000));
         let mut prev_map = HashMap::new();
         prev_map.insert(1, make_sketch_with_values(3000, 5000));
-        let merged = merge_with_parent(new_map, ParentSketches::Present(prev_map), false);
+        let merged = merge_with_parent(new_map, ParentSketches::Present(prev_map), false)
+            .expect("merge sketches");
         let est = merged.get(&1).expect("field 1 present").estimate();
         // Union of [0,4999] and [3000,7999] = [0,7999] ≈ 8000 distinct.
         assert!(
@@ -785,7 +794,7 @@ mod tests {
             (3, make_sketch_with_values(1_000, 100)),
         ]));
 
-        let merged = merge_with_parent(new_map, parent, false);
+        let merged = merge_with_parent(new_map, parent, false).expect("merge sketches");
 
         assert_eq!(merged.len(), 1);
         assert!(merged.contains_key(&1));
@@ -797,7 +806,8 @@ mod tests {
     fn merge_with_parent_without_parent_statistics_skips_nonempty_parent() {
         let new_map = HashMap::from([(1, make_sketch_with_values(0, 100))]);
 
-        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, false);
+        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, false)
+            .expect("merge sketches");
 
         assert!(merged.is_empty());
     }
@@ -806,7 +816,8 @@ mod tests {
     fn merge_with_parent_without_parent_statistics_keeps_new_fields_when_empty() {
         let new_map = HashMap::from([(1, make_sketch_with_values(0, 100))]);
 
-        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, true);
+        let merged = merge_with_parent(new_map, ParentSketches::NoStatisticsFile, true)
+            .expect("merge sketches");
 
         assert_eq!(merged.len(), 1);
         assert!(merged.contains_key(&1));
@@ -832,9 +843,9 @@ mod tests {
         let path_str = format!("file://{}", path.display());
         let file_io = crate::fs_io::build_file_io_for_location(&path_str, local_test_binding());
 
-        let mut sketch = ThetaSketchHandle::new(12);
+        let mut sketch = ThetaSketchHandle::new(12).expect("theta sketch");
         for i in 0..500_i64 {
-            sketch.update(i);
+            sketch.update(i).expect("theta update");
         }
         let mut sketches = HashMap::new();
         sketches.insert(3_i32, sketch);

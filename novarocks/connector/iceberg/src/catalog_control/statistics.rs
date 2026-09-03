@@ -55,9 +55,11 @@ use crate::theta_sketch::ThetaSketchHandle;
 
 const STATISTICS_OPERATION_KIND: &str = "statistics-publish";
 const VISIBLE_ROW_ARTIFACT_VERSION: u8 = 1;
-const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
-const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 14;
+const THETA_PARTIAL_WIRE_VERSION: u8 = 2;
+const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 2;
 const MAX_THETA_RETAINED_HASHES: usize = 1 << 12;
+const MAX_THETA_PARTIAL_WIRE_BYTES: usize =
+    THETA_PARTIAL_WIRE_HEADER_BYTES + 24 + MAX_THETA_RETAINED_HASHES * 8;
 
 impl StatisticsReader for IcebergMetadata {
     fn descriptor(&self) -> &novarocks_spi::connector::ConnectorInstanceDescriptor {
@@ -861,25 +863,31 @@ fn decode_visible_row_artifact(
 }
 
 fn decode_theta_partial(bytes: &[u8]) -> Result<ThetaSketchHandle, ConnectorError> {
-    if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES || bytes[0] != THETA_PARTIAL_WIRE_VERSION {
-        return Err(corrupt("statistics Theta state is invalid"));
+    if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES {
+        return Err(corrupt("statistics Theta state is truncated"));
+    }
+    if bytes.len() > MAX_THETA_PARTIAL_WIRE_BYTES {
+        return Err(corrupt("statistics Theta state exceeds the size limit"));
+    }
+    if bytes[0] != THETA_PARTIAL_WIRE_VERSION {
+        return Err(corrupt("statistics Theta state has an unsupported version"));
     }
     let lg_k = bytes[1];
     if !(5..=12).contains(&lg_k) {
         return Err(corrupt("statistics Theta state has an invalid lg_k"));
     }
-    let theta = u64::from_be_bytes(bytes[2..10].try_into().expect("fixed field width"));
-    let count = u32::from_be_bytes(bytes[10..14].try_into().expect("fixed field width")) as usize;
-    if count > MAX_THETA_RETAINED_HASHES
-        || bytes.len() != THETA_PARTIAL_WIRE_HEADER_BYTES + count * 8
-    {
-        return Err(corrupt("statistics Theta state has an invalid length"));
+    let sketch =
+        ThetaSketchHandle::deserialize_with_lg_k(&bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..], lg_k)
+            .map_err(corrupt)?;
+    if !sketch.is_ordered() {
+        return Err(corrupt("statistics Theta compact body must be ordered"));
     }
-    let hashes = bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..]
-        .chunks_exact(8)
-        .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("exact chunks")))
-        .collect::<Vec<_>>();
-    ThetaSketchHandle::from_compact_parts(lg_k, theta, hashes).map_err(corrupt)
+    if sketch.num_retained() > MAX_THETA_RETAINED_HASHES {
+        return Err(corrupt(
+            "statistics Theta state exceeds the retained-hash limit",
+        ));
+    }
+    Ok(sketch)
 }
 
 fn take<'a>(bytes: &'a [u8], cursor: &mut usize, count: usize) -> Result<&'a [u8], ConnectorError> {
@@ -1080,13 +1088,50 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_canonical_theta_state() {
+    fn theta_carrier_v2_keeps_the_standard_body_opaque_and_bounded() {
+        let mut standard = ThetaSketchHandle::new(12).expect("theta sketch");
+        standard.update(9_u64).expect("theta update");
         let mut bytes = vec![THETA_PARTIAL_WIRE_VERSION, 12];
-        bytes.extend_from_slice(&u64::MAX.to_be_bytes());
-        bytes.extend_from_slice(&2_u32.to_be_bytes());
-        bytes.extend_from_slice(&9_u64.to_be_bytes());
-        bytes.extend_from_slice(&9_u64.to_be_bytes());
+        bytes.extend_from_slice(&standard.serialize());
+        assert_eq!(
+            decode_theta_partial(&bytes).expect("carrier").estimate(),
+            1.0
+        );
+
+        bytes[0] = 1;
         assert!(decode_theta_partial(&bytes).is_err());
+        bytes[0] = THETA_PARTIAL_WIRE_VERSION;
+        bytes[1] = 13;
+        assert!(decode_theta_partial(&bytes).is_err());
+        assert!(decode_theta_partial(&vec![0; MAX_THETA_PARTIAL_WIRE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn theta_carrier_accepts_shared_tck_ordered_v3_body() {
+        let body = include_bytes!(
+            "../../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
+        );
+        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
+        wire.extend_from_slice(body);
+
+        let sketch = decode_theta_partial(&wire).expect("decode shared TCK carrier");
+        assert_eq!(sketch.serialize(), body);
+        assert_eq!(sketch.estimate(), 1000.0);
+    }
+
+    #[test]
+    fn theta_carrier_rejects_shared_tck_unordered_body() {
+        let body = include_bytes!(
+            "../../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_n1000_unordered_v3.sk"
+        );
+        let mut wire = vec![THETA_PARTIAL_WIRE_VERSION, 12];
+        wire.extend_from_slice(body);
+
+        let error = match decode_theta_partial(&wire) {
+            Ok(_) => panic!("unordered compact body must fail"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("must be ordered"));
     }
 
     fn manifest_file(

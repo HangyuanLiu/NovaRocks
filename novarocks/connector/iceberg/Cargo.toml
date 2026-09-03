@@ -35,7 +35,7 @@ async-trait = "0.1"
 bytes = "1"
 chrono = "0.4"
 crc32fast = "1"
-datasketches = "0.2.0"
+datasketches = { workspace = true, features = ["theta"] }
 futures = "0.3"
 ordered-float = "4"
 parquet = { version = "58.2.0", features = ["arrow", "variant_experimental"] }

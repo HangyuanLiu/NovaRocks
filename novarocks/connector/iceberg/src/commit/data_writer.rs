@@ -384,7 +384,7 @@ pub async fn write_record_batches(
         let combined_sketches = if batch_sketches.is_empty() {
             None
         } else {
-            Some(merge_theta_sketches(batch_sketches))
+            Some(merge_theta_sketches(batch_sketches)?)
         };
         return data_files
             .into_iter()
@@ -396,7 +396,10 @@ pub async fn write_record_batches(
                     )?,
                     metadata: Arc::clone(&ctx.metadata),
                     partition_spec_id: ctx.partition_spec_id(),
-                    theta_sketches: combined_sketches.as_ref().map(clone_theta_sketches),
+                    theta_sketches: combined_sketches
+                        .as_ref()
+                        .map(clone_theta_sketches)
+                        .transpose()?,
                 })
             })
             .collect();
@@ -453,7 +456,10 @@ pub async fn write_record_batches(
                     )?,
                     metadata: Arc::clone(&ctx.metadata),
                     partition_spec_id: ctx.partition_spec_id(),
-                    theta_sketches: theta_sketches.as_ref().map(clone_theta_sketches),
+                    theta_sketches: theta_sketches
+                        .as_ref()
+                        .map(clone_theta_sketches)
+                        .transpose()?,
                 });
             }
         }
@@ -521,12 +527,15 @@ pub fn staged_data_file_to_writer_report(
         is_overwrite: None,
         is_rewrite: None,
     };
-    let sketch_set = staged.theta_sketches.as_ref().map(|sketches| {
-        novarocks_connector_iceberg::stats_assembler::FileSketchSet {
-            file_path: df.file_path().to_string(),
-            sketches: clone_theta_sketches(sketches),
-        }
-    });
+    let sketch_set = match staged.theta_sketches.as_ref() {
+        Some(sketches) => Some(
+            novarocks_connector_iceberg::stats_assembler::FileSketchSet {
+                file_path: df.file_path().to_string(),
+                sketches: clone_theta_sketches(sketches)?,
+            },
+        ),
+        None => None,
+    };
     Ok((report, sketch_set))
 }
 
@@ -598,12 +607,12 @@ fn maybe_collect_sketches(
     if !opts.collect_theta_sketches {
         return Ok(None);
     }
-    Ok(compute_theta_sketches_for_batch(batch))
+    compute_theta_sketches_for_batch(batch)
 }
 
 fn merge_theta_sketches(
     sketches: Vec<HashMap<i32, ThetaSketchHandle>>,
-) -> HashMap<i32, ThetaSketchHandle> {
+) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
     let mut by_field = HashMap::<i32, Vec<ThetaSketchHandle>>::new();
     for batch_sketches in sketches {
         for (field_id, sketch) in batch_sketches {
@@ -614,17 +623,19 @@ fn merge_theta_sketches(
         .into_iter()
         .map(|(field_id, field_sketches)| {
             let refs = field_sketches.iter().collect::<Vec<_>>();
-            (field_id, ThetaSketchHandle::union(&refs))
+            ThetaSketchHandle::union(&refs).map(|sketch| (field_id, sketch))
         })
         .collect()
 }
 
 fn clone_theta_sketches(
     sketches: &HashMap<i32, ThetaSketchHandle>,
-) -> HashMap<i32, ThetaSketchHandle> {
+) -> Result<HashMap<i32, ThetaSketchHandle>, String> {
     sketches
         .iter()
-        .map(|(field_id, sketch)| (*field_id, ThetaSketchHandle::union(&[sketch])))
+        .map(|(field_id, sketch)| {
+            ThetaSketchHandle::union(&[sketch]).map(|cloned| (*field_id, cloned))
+        })
         .collect()
 }
 

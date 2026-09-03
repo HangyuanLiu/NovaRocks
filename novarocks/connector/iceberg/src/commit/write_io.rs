@@ -129,11 +129,7 @@ pub fn write_parquet_file(
         .map_err(|error| format!("close parquet writer failed: {error}"))?;
     let metadata =
         fs::metadata(&path_buf).map_err(|error| format!("stat parquet file failed: {error}"))?;
-    Ok(build_parquet_write_result(
-        metadata.len(),
-        &parquet_metadata,
-        Some(batch),
-    ))
+    build_parquet_write_result(metadata.len(), &parquet_metadata, Some(batch))
 }
 
 fn normalize_path(path: &str) -> Result<String, String> {
@@ -166,7 +162,7 @@ fn write_parquet_to_bytes(
             .map_err(|error| format!("close parquet writer failed: {error}"))?;
     }
     let write_result =
-        build_parquet_write_result(buffer.len() as u64, &parquet_metadata, Some(batch));
+        build_parquet_write_result(buffer.len() as u64, &parquet_metadata, Some(batch))?;
     Ok((buffer, write_result))
 }
 
@@ -174,13 +170,16 @@ fn build_parquet_write_result(
     file_size: u64,
     metadata: &ParquetMetaData,
     batch: Option<&RecordBatch>,
-) -> ParquetWriteResult {
-    ParquetWriteResult {
+) -> Result<ParquetWriteResult, String> {
+    Ok(ParquetWriteResult {
         file_size,
         split_offsets: collect_split_offsets(metadata),
         column_stats: collect_iceberg_column_stats(metadata),
-        theta_sketches: batch.and_then(compute_theta_sketches_for_batch),
-    }
+        theta_sketches: batch
+            .map(compute_theta_sketches_for_batch)
+            .transpose()?
+            .flatten(),
+    })
 }
 
 fn collect_split_offsets(metadata: &ParquetMetaData) -> Option<Vec<i64>> {

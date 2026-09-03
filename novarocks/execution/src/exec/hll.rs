@@ -29,9 +29,7 @@ pub enum HllTargetType {
 impl HllTargetType {
     fn into_native(self) -> HllType {
         match self {
-            // The upstream Rust DataSketches Array4 path trips a debug-only assertion during
-            // dense unions. Keep the legacy HLL_4 surface, but execute it with HLL_6 payloads.
-            Self::Hll4 => HllType::Hll6,
+            Self::Hll4 => HllType::Hll4,
             Self::Hll6 => HllType::Hll6,
             Self::Hll8 => HllType::Hll8,
         }
@@ -67,14 +65,16 @@ impl HllHandle {
         }
         Ok(Self {
             target_type,
-            sketch_union: HllUnion::new(log_k),
+            sketch_union: HllUnion::new(log_k)
+                .map_err(|err| format!("ds_hll: failed to create HLL union: {err}"))?,
         })
     }
 
     pub fn from_payload(payload: &[u8]) -> Result<Self, String> {
         let sketch = deserialize_hll(payload, "ds_hll")?;
         let target_type = HllTargetType::from_native(sketch.target_type());
-        let mut sketch_union = HllUnion::new(sketch.lg_config_k());
+        let mut sketch_union = HllUnion::new(sketch.lg_config_k())
+            .map_err(|err| format!("ds_hll: failed to create HLL union: {err}"))?;
         sketch_union.update(&sketch);
         Ok(Self {
             target_type,
@@ -96,7 +96,7 @@ impl HllHandle {
     pub fn serialize(&self) -> Result<Vec<u8>, String> {
         Ok(self
             .sketch_union
-            .get_result(self.target_type.into_native())
+            .to_sketch(self.target_type.into_native())
             .serialize())
     }
 
@@ -109,6 +109,7 @@ impl HllHandle {
 mod tests {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
+    use datasketches::hll::{HllSketch, HllType};
 
     use super::{HllHandle, HllTargetType, hll_estimate};
 
@@ -154,24 +155,49 @@ mod tests {
 
     #[test]
     fn native_hll4_roundtrip_merges_without_cpp() {
+        let mut sparse = HllHandle::new(10, HllTargetType::Hll4).expect("sparse handle");
+        for value in 0_u64..7 {
+            sparse.update_hash(value).expect("update sparse");
+        }
+        let sparse_sketch =
+            HllSketch::deserialize(&sparse.serialize().expect("serialize sparse HLL4"))
+                .expect("deserialize sparse HLL4");
+
         let mut left = HllHandle::new(10, HllTargetType::Hll4).expect("left handle");
-        for value in 0_u64..64 {
+        for value in 0_u64..4_096 {
             left.update_hash(value).expect("update left");
         }
         let left_payload = left.serialize().expect("serialize left");
+        let left_sketch = HllSketch::deserialize(&left_payload).expect("deserialize left");
+        assert_eq!(left_sketch.target_type(), HllType::Hll4);
+        assert!(left_sketch.estimated_size() > sparse_sketch.estimated_size());
 
         let mut right = HllHandle::new(10, HllTargetType::Hll4).expect("right handle");
-        for value in 64_u64..128 {
+        for value in 4_096_u64..8_192 {
             right.update_hash(value).expect("update right");
         }
         let right_payload = right.serialize().expect("serialize right");
+        let right_sketch = HllSketch::deserialize(&right_payload).expect("deserialize right");
+        assert_eq!(right_sketch.target_type(), HllType::Hll4);
 
         let mut merged = HllHandle::from_payload(&left_payload).expect("merged handle");
         merged.merge_payload(&right_payload).expect("merge right");
+        let merged_payload = merged.serialize().expect("serialize merged");
+        let merged_sketch = HllSketch::deserialize(&merged_payload).expect("deserialize merged");
+        assert_eq!(merged_sketch.target_type(), HllType::Hll4);
 
-        let estimate = merged.estimate().expect("estimate merged");
+        let roundtrip = HllHandle::from_payload(&merged_payload).expect("roundtrip handle");
+        let roundtrip_payload = roundtrip.serialize().expect("serialize roundtrip");
+        assert_eq!(
+            HllSketch::deserialize(&roundtrip_payload)
+                .expect("deserialize roundtrip")
+                .target_type(),
+            HllType::Hll4
+        );
+
+        let estimate = roundtrip.estimate().expect("estimate merged");
         assert!(
-            (110..=150).contains(&estimate),
+            (7_000..=9_500).contains(&estimate),
             "merged estimate out of expected range: {estimate}"
         );
     }

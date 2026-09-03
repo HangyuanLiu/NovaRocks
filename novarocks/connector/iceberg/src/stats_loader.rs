@@ -182,9 +182,9 @@ mod tests {
     }
 
     fn build_sketch(values: i64) -> ThetaSketchHandle {
-        let mut s = ThetaSketchHandle::new(12);
+        let mut s = ThetaSketchHandle::new(12).expect("theta sketch");
         for i in 0..values {
-            s.update(i);
+            s.update(i).expect("theta update");
         }
         s
     }

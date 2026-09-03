@@ -614,7 +614,7 @@ fn statistics_theta_partials_union_without_exposing_a_sql_aggregate() {
     let left = ThetaSketchPartial::try_from_i64_values(12, [1, 2]).expect("left partial");
     let right = ThetaSketchPartial::try_from_i64_values(12, [2, 3]).expect("right partial");
     let merged = ThetaSketchPartial::try_union([left, right]).expect("two-phase union");
-    assert_eq!(merged.finalize().estimate(), 3.0);
+    assert_eq!(merged.finalize().expect("finalize union").estimate(), 3.0);
 }
 
 #[test]

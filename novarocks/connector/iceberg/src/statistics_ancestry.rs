@@ -194,9 +194,9 @@ mod tests {
     }
 
     fn sketch_of(distinct: i64) -> ThetaSketchHandle {
-        let mut sketch = ThetaSketchHandle::new(12);
+        let mut sketch = ThetaSketchHandle::new(12).expect("theta sketch");
         for value in 0..distinct {
-            sketch.update(value);
+            sketch.update(value).expect("theta update");
         }
         sketch
     }

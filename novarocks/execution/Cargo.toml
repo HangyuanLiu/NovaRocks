@@ -19,7 +19,7 @@ bytes = "1"
 chrono = "0.4"
 chrono-tz = "0.10"
 crc32c = "0.6"
-datasketches = "0.2.0"
+datasketches = { workspace = true, features = ["hll", "theta"] }
 hashbrown = { version = "0.14", features = ["raw"] }
 hex = "0.4"
 libm = "0.2"

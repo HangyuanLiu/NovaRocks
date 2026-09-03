@@ -1201,12 +1201,6 @@ dependencies = [
 
 [[package]]
 name = "datasketches"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
-
-[[package]]
-name = "datasketches"
 version = "0.5.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b"
@@ -3233,7 +3227,7 @@ dependencies = [
  "bytes",
  "chrono",
  "crc32fast",
- "datasketches 0.2.0",
+ "datasketches",
  "futures",
  "iceberg",
  "iceberg-catalog-hms",
@@ -3279,7 +3273,7 @@ dependencies = [
 name = "novarocks-datasketches-tck"
 version = "0.1.0"
 dependencies = [
- "datasketches 0.5.0-rc.1",
+ "datasketches",
  "sha2",
 ]
 
@@ -3296,7 +3290,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "crc32c",
- "datasketches 0.2.0",
+ "datasketches",
  "futures",
  "hashbrown 0.14.5",
  "hex",
@@ -3344,7 +3338,7 @@ dependencies = [
  "axum",
  "bytes",
  "chrono",
- "datasketches 0.2.0",
+ "datasketches",
  "futures",
  "hex",
  "libc",
