@@ -1122,9 +1122,9 @@ dependencies = [
 
 [[package]]
 name = "datasketches"
-version = "0.2.0"
+version = "0.5.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c286de4e81ea2590afc24d754e0f83810c566f50a1388fa75ebd57928c0d9745"
+checksum = "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b"
 
 [[package]]
 name = "der"
@@ -2827,11 +2827,13 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
+ "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-secret",
  "novarocks-spi",
  "novarocks-types",
  "novarocks-version",
@@ -2851,6 +2853,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-binding"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "novarocks-proto-codec",
+ "novarocks-spi",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
@@ -2862,9 +2873,11 @@ dependencies = [
  "chrono",
  "crc32fast",
  "datasketches",
+ "futures",
  "iceberg",
  "iceberg-catalog-hms",
  "iceberg-catalog-rest",
+ "novarocks-connector-binding",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -2892,6 +2905,8 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "bytes",
+ "futures",
+ "novarocks-connector-binding",
  "novarocks-spi",
  "reqwest",
  "serde",
@@ -2962,6 +2977,7 @@ dependencies = [
  "hex",
  "libc",
  "mysql_common",
+ "novarocks-connector-binding",
  "novarocks-execution",
  "novarocks-failpoint",
  "novarocks-fs",
@@ -3077,8 +3093,10 @@ dependencies = [
  "anyhow",
  "atty",
  "chrono",
+ "futures",
  "libc",
  "novarocks-backend",
+ "novarocks-connector-binding",
  "novarocks-connector-iceberg",
  "novarocks-connector-starrocks",
  "novarocks-execution",
@@ -3106,6 +3124,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "novarocks-secret",
  "serde",
  "sha2",
  "url",

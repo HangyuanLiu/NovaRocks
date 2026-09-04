@@ -25,6 +25,32 @@ source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 
+stage_capture="$tmpdir/cargo-gates"
+(
+  SKIP_CARGO_TEST="true"
+  run_fail_fast_stage() {
+    printf '%s|%s|' "$1" "$2" >>"$stage_capture"
+    shift 2
+    printf '%s\n' "$*" >>"$stage_capture"
+  }
+  ci_record_stage() { :; }
+  ci_render_summary() { :; }
+  run_cargo_gates
+)
+
+if ! grep -Fx \
+  "DataSketches resolved source|datasketches-source.log|python3 tools/ci/check-datasketches-source.py" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the DataSketches resolved-source stage" >&2
+  exit 1
+fi
+if ! grep -Fx \
+  "DataSketches source mutations|datasketches-source-test.log|tools/ci/tests/datasketches-source-test.sh" \
+  "$stage_capture" >/dev/null; then
+  echo "local full CI must run the DataSketches source mutation stage" >&2
+  exit 1
+fi
+
 baseline="$tmpdir/known-failures.toml"
 run_dir="$tmpdir/run"
 mkdir -p "$run_dir/sql"

@@ -412,6 +412,10 @@ run_fail_fast_stage() {
 run_cargo_gates() {
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
     tools/ci/check-generated-artifacts.sh
+  run_fail_fast_stage "DataSketches resolved source" "datasketches-source.log" \
+    python3 tools/ci/check-datasketches-source.py
+  run_fail_fast_stage "DataSketches source mutations" "datasketches-source-test.log" \
+    tools/ci/tests/datasketches-source-test.sh
   run_fail_fast_stage "native wire dependency boundary" "native-wire-dependency-boundary.log" \
     tools/ci/check-native-wire-dependency-boundary.py
   run_fail_fast_stage "native wire dependency boundary mutations" "native-wire-dependency-boundary-test.log" \

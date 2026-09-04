@@ -23,6 +23,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -33,7 +34,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use datasketches::theta::ThetaSketch;
+use datasketches::theta::{CompactThetaSketch, ThetaSketch, ThetaSketchBuilder};
 use novarocks_spi::connector::{
     MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, StatisticsMetric, StatisticsMetricRequest,
 };
@@ -42,8 +43,13 @@ use sha2::{Digest, Sha256};
 pub const MAX_STATISTICS_THETA_RETAINED_HASHES: usize = 1 << 12;
 const MIN_STATISTICS_THETA_LG_K: u8 = 5;
 const MAX_STATISTICS_THETA_LG_K: u8 = 12;
-const THETA_PARTIAL_WIRE_VERSION: u8 = 1;
-const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 1 + 1 + 8 + 4;
+const THETA_PARTIAL_WIRE_VERSION: u8 = 2;
+const THETA_PARTIAL_WIRE_HEADER_BYTES: usize = 2;
+const THETA_COMPACT_MAX_PREAMBLE_BYTES: usize = 24;
+const MAX_STATISTICS_THETA_COMPACT_BODY_BYTES: usize =
+    THETA_COMPACT_MAX_PREAMBLE_BYTES + MAX_STATISTICS_THETA_RETAINED_HASHES * size_of::<u64>();
+const MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES: usize =
+    THETA_PARTIAL_WIRE_HEADER_BYTES + MAX_STATISTICS_THETA_COMPACT_BODY_BYTES;
 const STATISTICS_FRAGMENT_PAYLOAD_VERSION: u8 = 2;
 const STATISTICS_SCALAR_PARTIAL_MAX_WIRE_BYTES: usize = 8 + 8 + 8 + (1 + 16) * 2;
 
@@ -91,9 +97,9 @@ enum StatisticsScalarBound {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThetaSketchPartial {
+    // The V2 Nova carrier owns only lg_k and bounds. DataSketches owns this ordered v3 body.
     lg_k: u8,
-    theta: u64,
-    retained_hashes: Vec<u64>,
+    compact_body: Vec<u8>,
 }
 
 /// A bounded partial which can be transferred in one terminal fragment report.
@@ -180,8 +186,11 @@ impl StatisticsBatchCollector {
                 .collect(),
             theta: theta_columns
                 .into_iter()
-                .map(|column| (column, StatisticsThetaAccumulator::new(theta_lg_k)))
-                .collect(),
+                .map(|column| {
+                    StatisticsThetaAccumulator::try_new(theta_lg_k)
+                        .map(|accumulator| (column, accumulator))
+                })
+                .collect::<Result<_, _>>()?,
         })
     }
 
@@ -394,11 +403,17 @@ impl StatisticsScalarAccumulator {
 }
 
 impl StatisticsThetaAccumulator {
-    fn new(lg_k: u8) -> Self {
+    fn try_new(lg_k: u8) -> Result<Self, StatisticsFragmentError> {
         debug_assert!((MIN_STATISTICS_THETA_LG_K..=MAX_STATISTICS_THETA_LG_K).contains(&lg_k));
-        Self {
-            sketch: ThetaSketch::builder().lg_k(lg_k).build(),
-        }
+        let sketch = ThetaSketchBuilder::default()
+            .lg_k(lg_k)
+            .build()
+            .map_err(|err| {
+                StatisticsFragmentError::contract(format!(
+                    "failed to create statistics Theta sketch: {err}"
+                ))
+            })?;
+        Ok(Self { sketch })
     }
 
     fn push(&mut self, array: &ArrayRef) -> Result<(), StatisticsFragmentError> {
@@ -441,7 +456,12 @@ fn statistics_theta_lg_k(
     }
     for column in theta_columns {
         fixed_bytes = fixed_bytes
-            .checked_add(2 + column.len() + 4 + THETA_PARTIAL_WIRE_HEADER_BYTES)
+            .checked_add(
+                2 + column.len()
+                    + 4
+                    + THETA_PARTIAL_WIRE_HEADER_BYTES
+                    + THETA_COMPACT_MAX_PREAMBLE_BYTES,
+            )
             .ok_or_else(|| {
                 StatisticsFragmentError::exhausted(
                     "statistics fragment report size accounting overflow",
@@ -490,39 +510,62 @@ impl ThetaSketchPartial {
     fn try_from_sketch(mut sketch: ThetaSketch) -> Result<Self, StatisticsFragmentError> {
         sketch.trim();
         let lg_k = sketch.lg_k();
-        let mut retained_hashes = sketch.iter().collect::<Vec<_>>();
-        retained_hashes.sort_unstable();
-        if retained_hashes.len() > MAX_STATISTICS_THETA_RETAINED_HASHES {
+        let compact = sketch.compact(true);
+        if compact.num_retained() > MAX_STATISTICS_THETA_RETAINED_HASHES {
             return Err(StatisticsFragmentError::exhausted(
                 "statistics Theta partial exceeds the retained-hash limit",
             ));
         }
-        Ok(Self {
-            lg_k,
-            theta: sketch.theta64(),
-            retained_hashes,
-        })
+        let compact_body = compact.serialize();
+        Self::try_new(lg_k, compact_body)
     }
 
-    fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(
-            THETA_PARTIAL_WIRE_HEADER_BYTES
-                + self.retained_hashes.len() * std::mem::size_of::<u64>(),
-        );
+    fn try_new(lg_k: u8, compact_body: Vec<u8>) -> Result<Self, StatisticsFragmentError> {
+        if !(MIN_STATISTICS_THETA_LG_K..=MAX_STATISTICS_THETA_LG_K).contains(&lg_k) {
+            return Err(StatisticsFragmentError::contract(
+                "statistics Theta wire state has an invalid lg_k",
+            ));
+        }
+        let wire_len = THETA_PARTIAL_WIRE_HEADER_BYTES
+            .checked_add(compact_body.len())
+            .ok_or_else(|| {
+                StatisticsFragmentError::exhausted("statistics Theta wire state length overflow")
+            })?;
+        if wire_len > MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES {
+            return Err(StatisticsFragmentError::exhausted(
+                "statistics Theta wire state exceeds the compact-body limit",
+            ));
+        }
+        Ok(Self { lg_k, compact_body })
+    }
+
+    fn to_wire_bytes(&self) -> Result<Vec<u8>, StatisticsFragmentError> {
+        let wire_len = THETA_PARTIAL_WIRE_HEADER_BYTES
+            .checked_add(self.compact_body.len())
+            .ok_or_else(|| {
+                StatisticsFragmentError::exhausted("statistics Theta wire state length overflow")
+            })?;
+        if wire_len > MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES {
+            return Err(StatisticsFragmentError::exhausted(
+                "statistics Theta wire state exceeds the compact-body limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(wire_len);
         bytes.push(THETA_PARTIAL_WIRE_VERSION);
         bytes.push(self.lg_k);
-        bytes.extend_from_slice(&self.theta.to_be_bytes());
-        bytes.extend_from_slice(&(self.retained_hashes.len() as u32).to_be_bytes());
-        for hash in &self.retained_hashes {
-            bytes.extend_from_slice(&hash.to_be_bytes());
-        }
-        bytes
+        bytes.extend_from_slice(&self.compact_body);
+        Ok(bytes)
     }
 
     fn try_from_wire_bytes(bytes: &[u8]) -> Result<Self, StatisticsFragmentError> {
         if bytes.len() < THETA_PARTIAL_WIRE_HEADER_BYTES {
             return Err(StatisticsFragmentError::contract(
                 "statistics Theta wire state is truncated",
+            ));
+        }
+        if bytes.len() > MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES {
+            return Err(StatisticsFragmentError::exhausted(
+                "statistics Theta wire state exceeds the compact-body limit",
             ));
         }
         if bytes[0] != THETA_PARTIAL_WIRE_VERSION {
@@ -536,48 +579,23 @@ impl ThetaSketchPartial {
                 "statistics Theta wire state has an invalid lg_k",
             ));
         }
-        let theta = u64::from_be_bytes(bytes[2..10].try_into().expect("slice width checked"));
-        let count =
-            u32::from_be_bytes(bytes[10..14].try_into().expect("slice width checked")) as usize;
-        if count > MAX_STATISTICS_THETA_RETAINED_HASHES {
+        let compact_body = bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..].to_vec();
+        let compact = CompactThetaSketch::deserialize(&compact_body).map_err(|err| {
+            StatisticsFragmentError::contract(format!(
+                "statistics Theta compact body is invalid: {err}"
+            ))
+        })?;
+        if !compact.is_ordered() {
+            return Err(StatisticsFragmentError::contract(
+                "statistics Theta compact body must be ordered",
+            ));
+        }
+        if compact.num_retained() > MAX_STATISTICS_THETA_RETAINED_HASHES {
             return Err(StatisticsFragmentError::exhausted(
                 "statistics Theta wire state exceeds the retained-hash limit",
             ));
         }
-        let expected = THETA_PARTIAL_WIRE_HEADER_BYTES
-            .checked_add(
-                count
-                    .checked_mul(std::mem::size_of::<u64>())
-                    .ok_or_else(|| {
-                        StatisticsFragmentError::exhausted(
-                            "statistics Theta wire state length overflow",
-                        )
-                    })?,
-            )
-            .ok_or_else(|| {
-                StatisticsFragmentError::exhausted("statistics Theta wire state length overflow")
-            })?;
-        if bytes.len() != expected {
-            return Err(StatisticsFragmentError::contract(
-                "statistics Theta wire state has an invalid length",
-            ));
-        }
-        let retained_hashes = bytes[THETA_PARTIAL_WIRE_HEADER_BYTES..]
-            .chunks_exact(std::mem::size_of::<u64>())
-            .map(|chunk| u64::from_be_bytes(chunk.try_into().expect("exact chunks")))
-            .collect::<Vec<_>>();
-        if retained_hashes.windows(2).any(|pair| pair[0] >= pair[1])
-            || retained_hashes.iter().any(|hash| *hash >= theta)
-        {
-            return Err(StatisticsFragmentError::contract(
-                "statistics Theta wire state is not canonical",
-            ));
-        }
-        Ok(Self {
-            lg_k,
-            theta,
-            retained_hashes,
-        })
+        Self::try_new(lg_k, compact_body)
     }
 }
 
@@ -952,7 +970,7 @@ fn encode_theta_partials(
     bytes.extend_from_slice(&count.to_be_bytes());
     for (column, partial) in partials {
         encode_fragment_column(bytes, column)?;
-        let theta = partial.to_wire_bytes();
+        let theta = partial.to_wire_bytes()?;
         let theta_len = u32::try_from(theta.len()).map_err(|_| {
             StatisticsFragmentError::exhausted("statistics fragment Theta state is too large")
         })?;
@@ -1029,9 +1047,36 @@ mod tests {
     use arrow::array::{Decimal128Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use datasketches::theta::{CompactThetaSketch, ThetaSketchBuilder};
     use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
 
-    use super::{StatisticsBatchCollector, StatisticsFragmentPartial};
+    use super::{
+        MAX_STATISTICS_THETA_COMPACT_BODY_BYTES, MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES,
+        MAX_STATISTICS_THETA_RETAINED_HASHES, StatisticsBatchCollector, StatisticsFragmentPartial,
+        THETA_COMPACT_MAX_PREAMBLE_BYTES, THETA_PARTIAL_WIRE_HEADER_BYTES,
+        THETA_PARTIAL_WIRE_VERSION, ThetaSketchPartial,
+    };
+
+    fn standard_theta_body(lg_k: u8, count: usize, seed: Option<u64>) -> Vec<u8> {
+        let mut builder = ThetaSketchBuilder::default().lg_k(lg_k);
+        if let Some(seed) = seed {
+            builder = builder.seed(seed);
+        }
+        let mut sketch = builder.build().expect("Theta sketch");
+        for value in 0..count {
+            sketch.update(value as i64);
+        }
+        sketch.trim();
+        sketch.compact(true).serialize()
+    }
+
+    fn theta_wire(version: u8, lg_k: u8, body: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::with_capacity(THETA_PARTIAL_WIRE_HEADER_BYTES + body.len());
+        wire.push(version);
+        wire.push(lg_k);
+        wire.extend_from_slice(body);
+        wire
+    }
 
     #[test]
     fn bound_support_predicate_agrees_with_the_measured_bounds() {
@@ -1125,11 +1170,14 @@ mod tests {
         let payload = collector.finish_fragment_payload().expect("payload");
         let partial =
             StatisticsFragmentPartial::try_from_payload(&payload).expect("decode payload");
+        let compact = CompactThetaSketch::deserialize(&partial.theta["d"].compact_body)
+            .expect("standard compact body");
         assert_eq!(
-            partial.theta["d"].retained_hashes.len(),
+            compact.num_retained(),
             2,
             "Theta NDV must deduplicate equal Decimal128 values"
         );
+        assert!(compact.is_ordered());
         assert_eq!(payload, partial.to_payload().expect("re-encode payload"));
     }
 
@@ -1174,5 +1222,136 @@ mod tests {
         let error = StatisticsFragmentPartial::try_from_payload(&[2, 0, 0, 0, 0, 0, 7])
             .expect_err("trailing payload must fail");
         assert!(error.to_string().contains("trailing"));
+    }
+
+    #[test]
+    fn theta_carrier_uses_standard_ordered_compact_body_with_bounded_sizes() {
+        for lg_k in 5_u8..=12 {
+            let mut sketch = ThetaSketchBuilder::default()
+                .lg_k(lg_k)
+                .build()
+                .expect("Theta sketch");
+            for value in 0..(4 * (1_usize << lg_k)) {
+                sketch.update(value as i64);
+            }
+            let partial = ThetaSketchPartial::try_from_sketch(sketch).expect("Theta partial");
+            let compact = CompactThetaSketch::deserialize(&partial.compact_body)
+                .expect("standard compact body");
+            assert!(compact.is_ordered());
+            assert!(compact.num_retained() <= 1_usize << lg_k);
+
+            let wire = partial.to_wire_bytes().expect("Theta carrier");
+            let per_lg_k_bound = THETA_PARTIAL_WIRE_HEADER_BYTES
+                + THETA_COMPACT_MAX_PREAMBLE_BYTES
+                + (1_usize << lg_k) * std::mem::size_of::<u64>();
+            assert!(wire.len() <= per_lg_k_bound);
+            assert_eq!(
+                ThetaSketchPartial::try_from_wire_bytes(&wire)
+                    .expect("decode Theta carrier")
+                    .to_wire_bytes()
+                    .expect("re-encode Theta carrier"),
+                wire
+            );
+        }
+    }
+
+    #[test]
+    fn theta_carrier_accepts_shared_tck_ordered_v3_body_byte_exact() {
+        let body = include_bytes!(
+            "../../../../tests/datasketches-tck/fixtures/theta/rust_quickselect_n1000_ordered_v3.sk"
+        );
+        let wire = theta_wire(THETA_PARTIAL_WIRE_VERSION, 12, body);
+
+        assert_eq!(
+            ThetaSketchPartial::try_from_wire_bytes(&wire)
+                .expect("decode shared TCK carrier")
+                .to_wire_bytes()
+                .expect("re-encode shared TCK carrier"),
+            wire
+        );
+    }
+
+    #[test]
+    fn theta_carrier_rejects_shared_tck_unordered_body() {
+        let body = include_bytes!(
+            "../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_n1000_unordered_v3.sk"
+        );
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(
+            THETA_PARTIAL_WIRE_VERSION,
+            12,
+            body,
+        ))
+        .expect_err("unordered compact body must fail");
+
+        assert!(error.to_string().contains("must be ordered"));
+    }
+
+    #[test]
+    fn theta_carrier_rejects_truncation_version_lg_k_and_corrupt_body() {
+        let body = standard_theta_body(12, 64, None);
+
+        for truncated in [Vec::new(), vec![THETA_PARTIAL_WIRE_VERSION]] {
+            let error = ThetaSketchPartial::try_from_wire_bytes(&truncated)
+                .expect_err("truncated carrier must fail");
+            assert!(error.to_string().contains("truncated"));
+        }
+
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(1, 12, &body))
+            .expect_err("old carrier version must fail");
+        assert!(error.to_string().contains("unsupported version"));
+
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(
+            THETA_PARTIAL_WIRE_VERSION,
+            4,
+            &body,
+        ))
+        .expect_err("invalid lg_k must fail");
+        assert!(error.to_string().contains("invalid lg_k"));
+
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(
+            THETA_PARTIAL_WIRE_VERSION,
+            12,
+            &[0; 8],
+        ))
+        .expect_err("corrupt standard body must fail");
+        assert!(error.to_string().contains("compact body is invalid"));
+    }
+
+    #[test]
+    fn theta_carrier_rejects_seed_mismatch_and_oversized_body() {
+        let custom_seed_body = standard_theta_body(12, 64, Some(123_456_789));
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(
+            THETA_PARTIAL_WIRE_VERSION,
+            12,
+            &custom_seed_body,
+        ))
+        .expect_err("seed mismatch must fail");
+        assert!(error.to_string().contains("seed"));
+
+        let oversized_body = vec![0; MAX_STATISTICS_THETA_COMPACT_BODY_BYTES + 1];
+        let oversized_wire = theta_wire(0, 4, &oversized_body);
+        assert_eq!(
+            oversized_wire.len(),
+            MAX_STATISTICS_THETA_PARTIAL_WIRE_BYTES + 1
+        );
+        let error = ThetaSketchPartial::try_from_wire_bytes(&oversized_wire)
+            .expect_err("oversized body must fail before standard decode");
+        assert!(error.to_string().contains("compact-body limit"));
+    }
+
+    #[test]
+    fn theta_carrier_checks_retained_count_after_standard_decode() {
+        let body = standard_theta_body(13, MAX_STATISTICS_THETA_RETAINED_HASHES + 1, None);
+        assert!(body.len() <= MAX_STATISTICS_THETA_COMPACT_BODY_BYTES);
+        let compact = CompactThetaSketch::deserialize(&body).expect("standard compact body");
+        assert!(compact.num_retained() > MAX_STATISTICS_THETA_RETAINED_HASHES);
+
+        let error = ThetaSketchPartial::try_from_wire_bytes(&theta_wire(
+            THETA_PARTIAL_WIRE_VERSION,
+            12,
+            &body,
+        ))
+        .expect_err("retained count above carrier budget must fail");
+        assert!(error.to_string().contains("retained-hash limit"));
     }
 }

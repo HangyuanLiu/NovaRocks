@@ -83,7 +83,7 @@ unsafe fn init_state_with_config<'a>(
         return Ok(state);
     }
     let boxed = Box::new(DsHllState {
-        handle: HllHandle::new(log_k, target_type)?,
+        handle: HllHandle::new_unreserved(log_k, target_type)?,
     });
     let raw = Box::into_raw(boxed);
     unsafe {
@@ -100,7 +100,7 @@ unsafe fn init_state_from_payload<'a>(
         return Ok(state);
     }
     let boxed = Box::new(DsHllState {
-        handle: HllHandle::from_payload(payload)?,
+        handle: HllHandle::from_payload_unreserved(payload)?,
     });
     let raw = Box::into_raw(boxed);
     unsafe {
@@ -219,7 +219,7 @@ fn update_from_struct(
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { init_state_with_config(ptr, lg_k, target_type) }?;
-        state.handle.update_hash(hash)?;
+        state.handle.update_hash_unreserved(hash)?;
     }
     Ok(())
 }
@@ -238,7 +238,7 @@ fn update_from_raw_array(
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
         let state = unsafe { init_state_with_config(ptr, log_k, target_type) }?;
-        state.handle.update_hash(hash)?;
+        state.handle.update_hash_unreserved(hash)?;
     }
     Ok(())
 }
@@ -255,7 +255,7 @@ fn merge_payload_array(
         };
         let ptr = unsafe { (base as *mut u8).add(offset) };
         if let Some(state) = unsafe { get_state_mut(ptr) } {
-            state.handle.merge_payload(&payload)?;
+            state.handle.merge_payload_unreserved(&payload)?;
         } else {
             let _ = unsafe { init_state_from_payload(ptr, &payload) }?;
         }
@@ -442,7 +442,7 @@ impl AggregateFunction for DsHllAgg {
             DataType::Binary => {
                 let mut builder = BinaryBuilder::new();
                 let empty_payload =
-                    HllHandle::new(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?;
+                    HllHandle::new_unreserved(DEFAULT_LOG_K, DEFAULT_TARGET_TYPE)?.serialize()?;
                 for &base in group_states {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     let state = unsafe { get_state(ptr) };
