@@ -909,7 +909,16 @@ fn fixture_command(
         .env("NOVAROCKS_WORKSPACE_ROOT", workspace_root)
         .env("NOVA_ENV_CONFIG_FILE", config_file)
         .env("NOVA_ENV_SHARED_DOCKER", "false")
-        .env("NOVA_ENV_COMPOSE_PROJECT", compose_project);
+        .env("NOVA_ENV_COMPOSE_PROJECT", compose_project)
+        // The fixture creates this exact non-shared project and no other.
+        // `down.sh --docker --purge` requires both pieces of this proof before
+        // it will remove the project's MinIO volume.
+        .env("NOVA_ENV_ALLOW_VOLUME_DELETE", "true")
+        .env("NOVA_ENV_EXPECTED_COMPOSE_PROJECT", compose_project)
+        .env(
+            "NOVA_ENV_EXPECTED_MINIO_VOLUME",
+            format!("{compose_project}_minio-data"),
+        );
     command
 }
 
@@ -973,6 +982,18 @@ mod tests {
         assert_eq!(
             environments.get("NOVA_ENV_CONFIG_FILE"),
             Some(&Some(config.to_string_lossy().into_owned()))
+        );
+        assert_eq!(
+            environments.get("NOVA_ENV_ALLOW_VOLUME_DELETE"),
+            Some(&Some("true".to_string()))
+        );
+        assert_eq!(
+            environments.get("NOVA_ENV_EXPECTED_COMPOSE_PROJECT"),
+            Some(&Some("nr-cca1-vended-rest-1-2-3".to_string()))
+        );
+        assert_eq!(
+            environments.get("NOVA_ENV_EXPECTED_MINIO_VOLUME"),
+            Some(&Some("nr-cca1-vended-rest-1-2-3_minio-data".to_string()))
         );
     }
 

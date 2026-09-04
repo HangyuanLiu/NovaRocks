@@ -324,6 +324,13 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let context = self.terminal_context(context)?;
+        self.commit_accumulated_with_context(context)
+    }
+
+    fn commit_accumulated_with_context(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let (row_count, fragments) = {
             let mut accumulated = self.lock_accumulated()?;
             (
@@ -362,6 +369,35 @@ impl ConnectorWriteSession {
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         self.accumulate(prepared)?;
         self.finish_accumulated(context)
+    }
+
+    /// Seal a write whose statement-level owner still has one terminal action
+    /// to perform with the same query-attempt storage capability.
+    ///
+    /// A staged CTAS first seals its writer reports and only then publishes
+    /// the catalog-side staged-create action. The seal itself has no external
+    /// catalog effect, so releasing the capability here would leave the
+    /// following manifest and metadata I/O with the already-revoked planning
+    /// route. Transfer one cloned terminal context to that owner instead.
+    pub(crate) fn finish_for_following_terminal_action(
+        &self,
+        prepared: DecodedPreparedWriteSet,
+        context: ConnectorRequestContext,
+    ) -> Result<
+        (
+            ExternalMutationOutcome<ConnectorWriteReceipt>,
+            ConnectorRequestContext,
+        ),
+        ConnectorError,
+    > {
+        self.accumulate(prepared)?;
+        self.claim_terminal(TerminalDecision::Committed)?;
+        let terminal_context = self.terminal_context(context)?;
+        let outcome = self.commit_accumulated_with_context(terminal_context.clone());
+        // The returned context owns the terminal capability from here. On an
+        // error it drops below, so the session never leaves an orphaned hold.
+        self.release_terminal_storage_resolver();
+        outcome.map(|outcome| (outcome, terminal_context))
     }
 
     #[expect(
@@ -595,6 +631,30 @@ impl CommittedWriteSession {
     }
 }
 
+/// A sealed write whose statement owner must perform one following terminal
+/// action using the same attempt-scoped storage capability.
+///
+/// This is frontend-local and carries only a request context. CTAS is its
+/// sole consumer: its staged writer receipt becomes catalog metadata during
+/// the subsequent publication step.
+pub(crate) struct FollowupTerminalWriteSession {
+    outcome: ExternalMutationOutcome<ConnectorWriteReceipt>,
+    affected_rows: Option<u64>,
+    context: ConnectorRequestContext,
+}
+
+impl FollowupTerminalWriteSession {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ExternalMutationOutcome<ConnectorWriteReceipt>,
+        Option<u64>,
+        ConnectorRequestContext,
+    ) {
+        (self.outcome, self.affected_rows, self.context)
+    }
+}
+
 /// Perform the one external commit for a write whose data plane closed and
 /// whose execution succeeded, then gate its affected-row count on the result.
 pub(crate) fn finish_write_session(
@@ -609,6 +669,24 @@ pub(crate) fn finish_write_session(
     Ok(CommittedWriteSession {
         outcome,
         affected_rows,
+    })
+}
+
+/// Seal a write while transferring its terminal storage capability to the
+/// immediately following statement-owned action.
+pub(crate) fn finish_write_session_for_following_terminal_action(
+    completion: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    context: ConnectorRequestContext,
+) -> Result<FollowupTerminalWriteSession, ConnectorError> {
+    let row_count = completion.row_count();
+    let (session, prepared) = completion.into_parts();
+    let (outcome, context) = session.finish_for_following_terminal_action(prepared, context)?;
+    let affected_rows =
+        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(row_count);
+    Ok(FollowupTerminalWriteSession {
+        outcome,
+        affected_rows,
+        context,
     })
 }
 
@@ -1534,6 +1612,39 @@ pub(crate) mod tests {
             Some(Ok(TABLE_PREFIX.to_string()))
         );
         // The decision is made, so the credentials are not pinned any longer.
+        assert_eq!(accounting.holds(), 0);
+        assert!(accounting.leases_cleared());
+    }
+
+    /// A staged CTAS has two terminal actions: sealing the writer receipt, then
+    /// publishing the catalog-side create. The latter still writes manifests
+    /// and metadata, so sealing must transfer (not release) the capability.
+    #[test]
+    fn a_following_terminal_action_keeps_vended_storage_until_its_context_drops() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+        let accounting = finalize_attempt_retaining_terminal_storage(&fixture.session);
+
+        let committed = finish_write_session_for_following_terminal_action(
+            completion(&fixture.session, 7),
+            request_context(),
+        )
+        .expect("seal write");
+        let (outcome, affected_rows, terminal_context) = committed.into_parts();
+
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(affected_rows, Some(7));
+        assert_eq!(
+            probe_vended_storage(&terminal_context),
+            Ok(TABLE_PREFIX.to_string())
+        );
+        assert_eq!(accounting.holds(), 1);
+        assert!(!accounting.leases_cleared());
+
+        drop(terminal_context);
+
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());
     }

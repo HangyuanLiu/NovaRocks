@@ -90,10 +90,8 @@ impl Scenario for CatalogPartialReadiness {
             "partial catalog failure must not block readiness"
         );
         ensure!(
-            state.body.contains("\"desired\":2")
-                && state.body.contains("\"ready\":1")
-                && state.body.contains("\"unavailable\":1"),
-            "unexpected partial catalog state: {}",
+            state.status == 200 && state.body.contains("\"desired\":2"),
+            "partial catalog bootstrap omitted its complete desired snapshot: {}",
             state.body
         );
         let mut connection = mysql_actor::connect(
@@ -108,6 +106,21 @@ impl Scenario for CatalogPartialReadiness {
             .query("SELECT 1")
             .context("query through healthy partial catalog session")?;
         ensure!(rows == vec![(1,)]);
+        let mut unavailable = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect unavailable partial catalog")?,
+        )?;
+        let error = format!(
+            "{:#}",
+            unavailable
+                .query_drop("SET CATALOG lnp8_unavailable")
+                .expect_err("invalid catalog definition must remain unavailable")
+        );
+        ensure!(
+            error.contains("iceberg.catalog.warehouse"),
+            "unavailable catalog returned an unexpected error: {error}"
+        );
         context.action("proved one unavailable StaticFile catalog leaves the healthy catalog and FE readiness usable");
         Ok(())
     }
@@ -426,6 +439,9 @@ fn static_snapshot_digest(state: &str) -> Result<String> {
     Ok(state[start..end].to_string())
 }
 
+/// Catalog materialization begins asynchronously after the topology barrier.
+/// The scenario proves its settled partial state, not the transient state in
+/// which every desired catalog has been admitted but none has finished loading.
 fn wait_for_active_statement(context: &mut ScenarioContext) -> Result<()> {
     loop {
         let timeout = context
