@@ -47,6 +47,10 @@ impl HllAllocationUpperBounds {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AdmissionMode {
     List,
+    /// `lg_k = 5` gives LIST and the union's dense HLL8 array the same 32-byte heap shape.
+    /// Public RC1 APIs cannot distinguish them without allocating a clone, so admission models
+    /// the sparse LIST transition, which is the allocation-producing alternative.
+    ListOrHll,
     Set,
     Hll,
 }
@@ -351,7 +355,7 @@ fn simulate_coupon_destination(profile: HandleProfile, additions: usize) -> usiz
     let mut heap = profile.heap_bytes;
     let mut peak_live_heap = heap;
     let final_count = count.saturating_add(additions);
-    if mode == AdmissionMode::List && final_count >= 8 {
+    if matches!(mode, AdmissionMode::List | AdmissionMode::ListOrHll) && final_count >= 8 {
         let new_heap = if profile.lg_k < 8 { k } else { 32 * 4 };
         peak_live_heap = peak_live_heap.max(heap + new_heap);
         heap = new_heap;
@@ -396,7 +400,17 @@ fn union_workspace_bytes(handle: HandleProfile, payload: PayloadProfile) -> usiz
                 AdmissionMode::Hll if payload.lg_k < handle.lg_k => result_heap + handle.heap_bytes,
                 AdmissionMode::Hll => 0,
                 AdmissionMode::List | AdmissionMode::Set => result_heap,
+                AdmissionMode::ListOrHll if payload.lg_k < handle.lg_k => {
+                    // At lg_k=5 the 32-byte heap may be either LIST or HLL8. A lower-precision
+                    // dense source makes the HLL alternative allocate the replacement array while
+                    // cloning the old gadget; the LIST alternative only allocates the result.
+                    result_heap + handle.heap_bytes
+                }
+                AdmissionMode::ListOrHll => result_heap,
             }
+        }
+        AdmissionMode::ListOrHll => {
+            unreachable!("serialized payload headers always identify one exact HLL mode")
         }
     }
 }
@@ -642,24 +656,39 @@ impl HllHandle {
         let current_bytes = self.current_allocation_upper_bound();
         let heap_bytes = self.sketch_union.estimated_size() - std::mem::size_of::<HllUnion>();
         let lg_k = self.sketch_union.lg_config_k();
-        let estimate = self.sketch_union.estimate();
         let k = 1usize << lg_k;
-        let mode = if heap_bytes == LIST_HEAP_BYTES && (heap_bytes != k || estimate < 8.0) {
-            AdmissionMode::List
+        let empty = self.sketch_union.is_empty();
+        // In the exact RC1 substrate, LIST/SET Container::estimate() is structurally floored by
+        // the exact container length (`len.max(interpolated_estimate)`). Its ceiling is therefore
+        // an allocation-free coupon-count upper bound, including externally accepted LIST(8) and
+        // near-full SET images cloned into an empty union. Dense states ignore this value except
+        // for the conservative lg_k=5 LIST alternative below.
+        let sparse_coupon_count_upper = self.sketch_union.estimate().ceil().max(0.0) as usize;
+        let (mode, coupon_count_upper) = if heap_bytes == LIST_HEAP_BYTES {
+            if lg_k == 5 && !empty {
+                // LIST and dense HLL8 both retain 32 bytes at lg_k=5. Treat the state as LIST for
+                // allocation purposes; a real dense update allocates less than this alternative.
+                (AdmissionMode::ListOrHll, sparse_coupon_count_upper.max(8))
+            } else {
+                (
+                    AdmissionMode::List,
+                    if empty { 0 } else { sparse_coupon_count_upper },
+                )
+            }
         } else if heap_bytes == k {
-            AdmissionMode::Hll
+            (AdmissionMode::Hll, 0)
         } else {
-            AdmissionMode::Set
+            (AdmissionMode::Set, sparse_coupon_count_upper)
         };
         HandleProfile {
             generation: self.generation,
             lg_k,
             lg_max_k: self.sketch_union.lg_max_k(),
             mode,
-            coupon_count_upper: estimate.ceil().max(0.0) as usize,
+            coupon_count_upper,
             heap_bytes,
             current_bytes,
-            empty: self.sketch_union.is_empty(),
+            empty,
         }
     }
 }

@@ -17,10 +17,11 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
-use datasketches::hll::{HllSketch, HllType};
+use datasketches::hll::{Coupon, HllSketch, HllType};
 use novarocks_execution::exec::hll::{HllAllocationUpperBounds, HllHandle, HllTargetType};
 
 struct TrackingAllocator;
@@ -200,6 +201,86 @@ fn payload(target: HllType, lg_k: u8, count: usize, seed: u64) -> Vec<u8> {
     sketch.serialize()
 }
 
+fn payload_from_hashes(target: HllType, lg_k: u8, hashes: &[u64]) -> Vec<u8> {
+    let mut sketch = HllSketch::new(lg_k, target).expect("create input sketch");
+    for hash in hashes {
+        sketch.update(*hash);
+    }
+    sketch.serialize()
+}
+
+fn unique_hashes(count: usize, seed: u64) -> Vec<u64> {
+    let mut coupons = HashSet::with_capacity(count);
+    let mut hashes = Vec::with_capacity(count);
+    let mut index = 0;
+    while hashes.len() < count {
+        let hash = mixed_value(index, seed);
+        if coupons.insert(Coupon::from_value(hash)) {
+            hashes.push(hash);
+        }
+        index += 1;
+    }
+    hashes
+}
+
+fn noncompact_list_payload() -> Vec<u8> {
+    let mut input = payload(HllType::Hll8, 10, 3, 0x1100);
+    input[5] &= !8;
+    input.resize(8 + 8 * 4, 0);
+    input
+}
+
+fn noncompact_set_payload() -> Vec<u8> {
+    let mut input = payload(HllType::Hll8, 10, 16, 0x2200);
+    let capacity = 1usize << input[4];
+    input[5] &= !8;
+    input.resize(12 + capacity * 4, 0);
+    input
+}
+
+fn noncompact_hll4_payload(compact: &[u8]) -> Vec<u8> {
+    let lg_k = compact[3];
+    let aux_count = u32::from_le_bytes(compact[36..40].try_into().expect("aux count")) as usize;
+    assert!(aux_count > 0, "fixture must exercise HLL4 AuxMap");
+    let mut capacity = 1usize
+        << [
+            0_u8, 2, 2, 2, 2, 2, 2, 3, 3, 3, 4, 4, 5, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+        ][lg_k as usize];
+    while 4 * aux_count > 3 * capacity {
+        capacity *= 2;
+    }
+    let packed_end = 40 + (1usize << (lg_k - 1));
+    let mut input = compact[..packed_end].to_vec();
+    input.extend_from_slice(&compact[packed_end..]);
+    input.resize(packed_end + capacity * 4, 0);
+    input[4] = capacity.trailing_zeros() as u8;
+    input[5] &= !8;
+    input
+}
+
+fn full_external_list_payload(hashes: &[u64]) -> Vec<u8> {
+    assert_eq!(hashes.len(), 8);
+    let set = payload_from_hashes(HllType::Hll8, 10, hashes);
+    assert_eq!(set[7] & 3, 1, "eight coupons must produce SET locally");
+    let mut list = set[..8].to_vec();
+    list[0] = 2;
+    list[4] = 3;
+    list[5] = 8;
+    list[6] = 8;
+    list[7] = 8;
+    list.extend_from_slice(&set[12..]);
+    list
+}
+
+fn near_full_external_set_payload(hashes: &[u64]) -> Vec<u8> {
+    assert_eq!(hashes.len(), 31);
+    let mut set = payload_from_hashes(HllType::Hll8, 10, hashes);
+    assert_eq!(set[7] & 3, 1, "31 coupons must remain SET locally");
+    assert_eq!(set[4], 6, "local SET must have grown to capacity 64");
+    set[4] = 5;
+    set
+}
+
 fn hll4_aux_payload() -> Vec<u8> {
     let mut sketch = HllSketch::new(12, HllType::Hll4).expect("create HLL4 sketch");
     let initial_size = sketch.estimated_size();
@@ -210,6 +291,33 @@ fn hll4_aux_payload() -> Vec<u8> {
         }
     }
     panic!("deterministic HLL4 workload did not reach AuxMap");
+}
+
+fn synthetic_hll4_aux_payload(aux_count: usize) -> Vec<u8> {
+    assert!((1..=25).contains(&aux_count));
+    let lg_k = 12_u8;
+    let mut input = payload(HllType::Hll4, lg_k, 512, 0xc000);
+    assert_eq!(input[7] & 3, 2, "base fixture must be dense");
+    assert_eq!(
+        u32::from_le_bytes(input[36..40].try_into().expect("base aux count")),
+        0,
+        "base fixture must not already contain auxiliary entries"
+    );
+    let packed_end = 40 + (1usize << (lg_k - 1));
+    input.truncate(packed_end);
+    let aux_value = input[6].checked_add(15).expect("valid auxiliary value");
+    for slot in 0..aux_count {
+        let byte = &mut input[40 + slot / 2];
+        if slot & 1 == 0 {
+            *byte = (*byte & 0xf0) | 0x0f;
+        } else {
+            *byte = (*byte & 0x0f) | 0xf0;
+        }
+        let coupon = (u32::from(aux_value) << 26) | slot as u32;
+        input.extend_from_slice(&coupon.to_le_bytes());
+    }
+    input[36..40].copy_from_slice(&(aux_count as u32).to_le_bytes());
+    input
 }
 
 fn populated_handle(target: HllType, lg_k: u8, count: usize, seed: u64) -> HllHandle {
@@ -353,6 +461,15 @@ fn preflight_bounds_cover_modes_targets_aux_and_transitions() {
         populated_handle(HllType::Hll4, 12, 4_096, 0x55aa_aa55),
         &aux,
     );
+    for aux_count in [1, 24, 25] {
+        let aux_boundary = synthetic_hll4_aux_payload(aux_count);
+        assert_from_payload_bound(&format!("HLL4-aux-{aux_count}"), &aux_boundary);
+        assert_merge_bound(
+            &format!("HLL4-aux-{aux_count}"),
+            populated_handle(HllType::Hll4, 12, 4_096, 0x65aa_aa55 + aux_count as u64),
+            &aux_boundary,
+        );
+    }
 
     // lg_k below 8 skips SET and promotes LIST directly to the union's HLL8 array.
     for direct_lg_k in [4, 5, 7] {
@@ -399,6 +516,176 @@ fn update_preflight_is_live_configuration_sensitive() {
         dense_update.operation_peak_bytes
     );
     assert!(dense_update.current_bytes > small_initial.current_bytes);
+}
+
+#[test]
+fn update_preflight_covers_every_lg_k_representation_transition() {
+    let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
+    for lg_k in 4_u8..=21 {
+        let k = 1usize << lg_k;
+        let mut transition_counts = vec![8];
+        if lg_k >= 8 {
+            let mut capacity = 32;
+            loop {
+                transition_counts.push(3 * capacity / 4 + 1);
+                if capacity == k / 8 {
+                    break;
+                }
+                capacity *= 2;
+            }
+        }
+        let final_transition = *transition_counts.last().expect("transition count");
+        let hashes = unique_hashes(
+            final_transition + 1,
+            0x9000_0000_u64.wrapping_add(u64::from(lg_k)),
+        );
+        let mut handle =
+            HllHandle::new_unreserved(lg_k, HllTargetType::Hll8).expect("create handle");
+        for (index, hash) in hashes.into_iter().enumerate() {
+            let count = index + 1;
+            if transition_counts.contains(&count) || count == final_transition + 1 {
+                reserved_update(&mut handle, hash);
+            } else {
+                handle
+                    .update_hash_unreserved(hash)
+                    .expect("populate exact coupon boundary");
+            }
+        }
+        assert_eq!(
+            handle.current_allocation_upper_bound(),
+            std::mem::size_of::<HllHandle>() + k,
+            "lg_k={lg_k}: final representation must retain exactly the dense HLL8 heap"
+        );
+    }
+}
+
+#[test]
+fn lg_k_five_ambiguous_heap_covers_dense_downsample_clone() {
+    let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
+    let dense_lg_five = payload(HllType::Hll8, 5, 8, 0);
+    assert_eq!(dense_lg_five[7] & 3, 2, "fixture must be dense");
+    let mut handle =
+        HllHandle::new_unreserved(5, HllTargetType::Hll8).expect("create lg_k=5 handle");
+    handle
+        .merge_payload_unreserved(&dense_lg_five)
+        .expect("initial dense merge");
+    handle
+        .merge_payload_unreserved(&dense_lg_five)
+        .expect("composite merge");
+    let serialized = handle.serialize().expect("serialize composite handle");
+    let ambiguous_estimate = HllSketch::deserialize(&serialized)
+        .expect("deserialize composite handle")
+        .estimate();
+    assert!(
+        ambiguous_estimate < 8.0,
+        "fixture must reproduce the dense/list estimate ambiguity, got {ambiguous_estimate}"
+    );
+
+    let lower_dense = payload(HllType::Hll8, 4, 8, 1);
+    assert_eq!(lower_dense[7] & 3, 2, "source fixture must be dense");
+    let preflight = handle
+        .merge_payload_allocation_preflight(&lower_dense)
+        .expect("downsample preflight");
+    let expected_peak = handle.current_allocation_upper_bound()
+        + std::mem::size_of::<HllSketch>()
+        + (1 << 4)
+        + (1 << 4)
+        + (1 << 5);
+    assert!(
+        preflight.bounds().operation_peak_bytes >= expected_peak,
+        "ambiguous lg_k=5 profile must cover the dense branch's old-gadget clone"
+    );
+    let bounds = preflight.bounds();
+    let (result, measured) = measure_allocations(|| {
+        with_reservation(|guard| {
+            handle.merge_payload_under_reservation(&lower_dense, &preflight, guard)
+        })
+    });
+    result.expect("downsample merge");
+    assert_peak_bound("lg_k=5 dense downsample", bounds, &measured);
+}
+
+#[test]
+fn external_sparse_capacity_bounds_cover_clone_and_repeated_growth() {
+    let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
+    let hashes = unique_hashes(49, 0xb000_0000);
+
+    let full_list = full_external_list_payload(&hashes[..8]);
+    let mut list_handle =
+        HllHandle::from_payload_unreserved(&full_list).expect("clone full external LIST");
+    reserved_update(&mut list_handle, hashes[8]);
+
+    let near_full_set = near_full_external_set_payload(&hashes[..31]);
+    let mut set_handle =
+        HllHandle::from_payload_unreserved(&near_full_set).expect("clone near-full external SET");
+    let additions = payload_from_hashes(HllType::Hll8, 10, &hashes[31..49]);
+    let preflight = set_handle
+        .merge_payload_allocation_preflight(&additions)
+        .expect("near-full SET merge preflight");
+    let bounds = preflight.bounds();
+    let (result, measured) = measure_allocations(|| {
+        with_reservation(|guard| {
+            set_handle.merge_payload_under_reservation(&additions, &preflight, guard)
+        })
+    });
+    result.expect("merge into near-full external SET");
+    assert_peak_bound("near-full external SET repeated growth", bounds, &measured);
+    assert_eq!(
+        set_handle.current_allocation_upper_bound(),
+        std::mem::size_of::<HllHandle>() + 128 * std::mem::size_of::<u32>(),
+        "31 + 18 unique coupons must grow capacity 32 -> 64 -> 128"
+    );
+}
+
+#[test]
+fn allocation_header_enforces_minimum_lengths_and_low_k_set_shape() {
+    let _lock = TEST_LOCK.lock().expect("lock allocation tracker");
+    let compact_hll4 = hll4_aux_payload();
+    let valid_images = [
+        ("compact-list", payload(HllType::Hll8, 10, 3, 0x3300)),
+        ("updatable-list", noncompact_list_payload()),
+        ("compact-set", payload(HllType::Hll8, 10, 16, 0x4400)),
+        ("updatable-set", noncompact_set_payload()),
+        ("compact-hll4", compact_hll4.clone()),
+        ("updatable-hll4", noncompact_hll4_payload(&compact_hll4)),
+        ("hll6", payload(HllType::Hll6, 10, 4_096, 0x5500)),
+        ("hll8", payload(HllType::Hll8, 10, 4_096, 0x6600)),
+    ];
+    for (label, input) in valid_images {
+        HllHandle::from_payload_allocation_preflight(&input)
+            .unwrap_or_else(|error| panic!("{label}: valid canonical image rejected: {error}"));
+
+        let mut trailing = input.clone();
+        trailing.push(0xa5);
+        assert!(
+            HllHandle::from_payload_allocation_preflight(&trailing).is_ok(),
+            "{label}: trailing backing capacity does not change allocation shape"
+        );
+
+        let mut truncated = input.clone();
+        truncated.pop();
+        assert!(
+            HllHandle::from_payload_allocation_preflight(&truncated).is_err(),
+            "{label}: truncated body must be rejected by allocation admission"
+        );
+
+        let mut unknown_flag = input.clone();
+        unknown_flag[5] |= 0x80;
+        assert!(
+            HllHandle::from_payload_allocation_preflight(&unknown_flag).is_ok(),
+            "{label}: reserved flags follow the RC1 decoder's tolerant semantics"
+        );
+    }
+
+    let set = payload(HllType::Hll8, 8, 16, 0xaa00);
+    for low_lg_k in 4_u8..8 {
+        let mut invalid = set.clone();
+        invalid[3] = low_lg_k;
+        assert!(
+            HllHandle::from_payload_allocation_preflight(&invalid).is_err(),
+            "lg_k={low_lg_k}: SET must be rejected because no valid lg_arr exists"
+        );
+    }
 }
 
 #[test]
