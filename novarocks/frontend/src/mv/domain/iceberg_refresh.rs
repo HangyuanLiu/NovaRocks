@@ -107,8 +107,10 @@ use crate::mv::domain::schema_validation::{
 use crate::mv::domain::schema_validation::{
     validate_join_schema_contract, validate_schema_contract,
 };
-use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
-use crate::mv::domain::storage_observation::MvTargetCreationObservation;
+use crate::mv::domain::storage_observation::{
+    MvLakePublication, MvSchemaValidationObservation, MvTargetCreationObservation,
+    observe_lake_package,
+};
 use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_parser::{Span, ast};
@@ -3948,6 +3950,43 @@ fn build_refresh_state_baseline(
     })
 }
 
+/// Reconcile a durable Accelerator projection only when the current lake head
+/// carries a complete published-MV package. This is the narrow recovery path
+/// for a frontend crash after publication reached the lake but before the
+/// normal projector persisted the new waterline. A missing package, an
+/// unpublished package, or a different current head remains an ordinary
+/// snapshot-fencing failure rather than being treated as NovaRocks-owned.
+fn reconcile_published_lake_projection(
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    binding: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<StoredMvDefinition>, String> {
+    let Some(package) = observe_lake_package(
+        source.storage_observation(),
+        binding.lease(),
+        binding.metadata(),
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("observe published MV lake package for recovery failed: {error}"))?
+    else {
+        return Ok(None);
+    };
+    if !matches!(package.publication, MvLakePublication::Published(_))
+        || package
+            .current_target_snapshot
+            .map(|snapshot| snapshot.snapshot_id)
+            != binding.current_snapshot_id()
+    {
+        return Ok(None);
+    }
+    source
+        .readiness()
+        .project_observed(uuid::Uuid::now_v7(), &package)
+        .map_err(|error| format!("reconcile published MV lake projection failed: {error}"))?;
+    load_iceberg_mv_definition_by_target(source.readiness().as_ref(), target).map(Some)
+}
+
 pub fn plan_iceberg_mv_refresh_with_connector_context(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -3965,30 +4004,44 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
 
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
-    // Preparation only observes the currently admitted catalog and MV facts.
+    // Preparation normally only observes the currently admitted catalog and
+    // MV facts. A snapshot fence may reconcile an already-published lake
+    // package into the durable projection, but it never replays a refresh.
     // Historical v1/v2 recovery stays in the legacy execution adapter; a
     // current frontend-owned attempt must never perform recovery before its
     // durable v3 intent exists.
-    let mv_definition =
+    let mut mv_definition =
         load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &iceberg_target)
             .map_err(RefreshError::user)?;
+    let target_binding = load_iceberg_mv_target_binding(
+        source.connector_control(),
+        source.storage_observation(),
+        &iceberg_target,
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
+    if let Err(snapshot_error) =
+        validate_target_snapshot(&iceberg_target, &mv_definition, &target_binding)
+    {
+        let Some(reconciled) = reconcile_published_lake_projection(
+            source,
+            &iceberg_target,
+            &target_binding,
+            connector_context,
+        )
+        .map_err(RefreshError::user)?
+        else {
+            return Err(RefreshError::user(snapshot_error));
+        };
+        mv_definition = reconciled;
+        validate_target_snapshot(&iceberg_target, &mv_definition, &target_binding)
+            .map_err(RefreshError::user)?;
+    }
     let target_ref = TableIdentity {
         catalog: iceberg_target.catalog.clone(),
         namespace: iceberg_target.namespace.clone(),
         table: iceberg_target.table.clone(),
     };
-    validate_target_snapshot(
-        &iceberg_target,
-        &mv_definition,
-        &load_iceberg_mv_target_binding(
-            source.connector_control(),
-            source.storage_observation(),
-            &iceberg_target,
-            connector_context,
-        )
-        .map_err(RefreshError::user)?,
-    )
-    .map_err(RefreshError::user)?;
 
     let base_refs =
         parse_iceberg_table_refs(&mv_definition.base_table_refs).map_err(RefreshError::user)?;

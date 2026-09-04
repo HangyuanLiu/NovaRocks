@@ -288,6 +288,62 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
             }
         }
     }
+    audit_retained_lake_mv_base_identities(ctx, &context)?;
+    Ok(())
+}
+
+/// Validate the physical base identities of every retained lake MV as well as
+/// packages found by catalog enumeration above.  Enumeration is authoritative
+/// for discovering missing projections, but a retained Accelerator projection
+/// must not remain ready merely because its target was absent from an
+/// otherwise successful discovery sweep.  In particular, this prevents a
+/// same-name replacement base table from reviving the old projection.
+fn audit_retained_lake_mv_base_identities(
+    ctx: &LakeRebuildContext<'_>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<(), String> {
+    for projection in ctx.readiness.list_ready_projections().map_err(|error| {
+        format!("list retained MV projections for startup audit failed: {error}")
+    })? {
+        let definition = &projection.definition;
+        if definition.storage_engine != MvStorageEngine::Iceberg.as_sql_str() {
+            continue;
+        }
+        let (Some(catalog), Some(namespace), Some(table)) = (
+            definition.target_catalog.as_deref(),
+            definition.target_namespace.as_deref(),
+            definition.target_table.as_deref(),
+        ) else {
+            continue;
+        };
+        let target =
+            crate::mv::activity::CanonicalMvTarget::from_parts(Some(catalog), namespace, table);
+        let audit = (|| -> Result<(), String> {
+            let exact_lease =
+                crate::connector::acquire_metadata_planning_lease(ctx.connector_control, catalog)?;
+            let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+                &exact_lease,
+                connector_context.clone(),
+                namespace,
+                table,
+                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+            )?;
+            let Some(package) = crate::mv::domain::storage_observation::observe_lake_package(
+                ctx.mv_storage_observation,
+                &exact_lease,
+                &metadata,
+                connector_context.clone(),
+            )
+            .map_err(|error| format!("observe retained MV lake package failed: {error}"))?
+            else {
+                return Ok(());
+            };
+            verify_published_base_identities(ctx, &package, connector_context)
+        })();
+        if let Err(error) = audit {
+            ctx.readiness.quarantine(target, error);
+        }
+    }
     Ok(())
 }
 

@@ -34,6 +34,9 @@
 //!   effect column the session later reads; and
 //! * `preview_managed_partition_spec` answers which partitioning a managed
 //!   replacement would establish, without proposing it.
+//! * `certify_pre_ready_write_planning` proves that activation and planning
+//!   remain generation-local until `ControlReady`, so Frontend may safely
+//!   replan after a participant is replaced before that barrier.
 //!
 //! It owns no operation table, no activation, and no commit authority.
 
@@ -43,6 +46,7 @@ use std::time::Instant;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedPartitionSpecPreview, ConnectorManagedPartitionSpecPreviewRequest,
+    ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorRowMutationPreparationOutcome,
     ConnectorRowMutationPreparationRequest, ConnectorWriteControl,
     ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ProviderBindingEpoch,
@@ -93,6 +97,18 @@ impl ConnectorWriteControl for IcebergWriteControl {
         request: ConnectorRowMutationPreparationRequest,
     ) -> Result<ConnectorRowMutationPreparationOutcome, ConnectorError> {
         super::row_mutation_preparation::prepare_row_mutation(request, &self.key)
+    }
+
+    fn certify_pre_ready_write_planning(
+        &self,
+        request: ConnectorPreReadyWritePlanningRequest,
+    ) -> Result<ConnectorPreReadyWritePlanningProof, ConnectorError> {
+        // Iceberg creates writers, staged objects, and catalog effects only
+        // after ControlReady. The pre-ready path is confined to the exact
+        // generation's admission facts, so its proof is safe to bind to this
+        // activation request without granting commit authority to a BE.
+        validate_context(&request.activation().context)?;
+        ConnectorPreReadyWritePlanningProof::try_issue(self.key.clone(), &request)
     }
 
     fn preview_managed_partition_spec(
@@ -155,4 +171,127 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 
 fn corrupt(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use arrow::datatypes::{DataType, Field};
+    use bytes::Bytes;
+    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorInstanceId, ConnectorPreReadyWritePlanningRequest,
+        ConnectorProviderId, ConnectorTableHandle, ConnectorWriteActivationIntent,
+        ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
+        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+        ConnectorWriteIntent, ConnectorWriteOperationId, ConnectorWritePreparation,
+        ConnectorWriteTargetRef,
+    };
+
+    use crate::access_binding::IcebergReadBinding;
+    use crate::catalog_control::IcebergCatalogControlState;
+    use crate::resources::IcebergMetadataResources;
+
+    use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            1024 * 1024,
+            4 * 1024 * 1024,
+        )
+        .expect("request context")
+    }
+
+    fn control() -> (tokio::runtime::Runtime, IcebergWriteControl) {
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[(
+                "iceberg.catalog.warehouse".to_string(),
+                warehouse.path().display().to_string(),
+            )],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(executor.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(executor.handle().clone())),
+        );
+        let resources = IcebergMetadataResources::new(binding, executor.handle().clone());
+        let runtime = Arc::new(
+            IcebergMetadataContext::try_new(
+                IcebergCatalogControlState::new(configuration),
+                resources,
+            )
+            .expect("control runtime"),
+        );
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+            instance_id: ConnectorInstanceId::parse("ice").expect("instance"),
+        };
+        let control = IcebergWriteControl::new(
+            descriptor,
+            ProviderBindingEpoch::from_bytes([7; 16]),
+            runtime,
+        );
+        (executor, control)
+    }
+
+    fn pre_ready_request(
+        owner: &ConnectorProviderBindingKey,
+    ) -> ConnectorPreReadyWritePlanningRequest {
+        let preparation = ConnectorWritePreparation::try_new(
+            owner.clone(),
+            ConnectorTableHandle::try_new(
+                owner.instance_id.clone(),
+                Bytes::from_static(b"admitted-table"),
+            )
+            .expect("table handle"),
+            ConnectorWriteTargetRef::main(),
+            ConnectorWriteIntent::Append,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base"),
+            ConnectorWriteInputShape::Data {
+                fields: vec![ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("value", DataType::Int64, true),
+                )],
+            },
+            Bytes::from_static(b"preparation"),
+        )
+        .expect("preparation");
+        ConnectorPreReadyWritePlanningRequest::new(ConnectorWriteActivationRequest {
+            operation_id: ConnectorWriteOperationId::new(),
+            source: ConnectorWriteActivationSource::Prepared(preparation),
+            intent: ConnectorWriteActivationIntent::Ordinary,
+            context: request_context(),
+        })
+    }
+
+    #[test]
+    fn pre_ready_planning_proof_binds_the_exact_iceberg_activation() {
+        let (_executor, control) = control();
+        let owner = control.binding_key().clone();
+        let request = pre_ready_request(&owner);
+
+        let proof = control
+            .certify_pre_ready_write_planning(request.clone())
+            .expect("Iceberg proves its effect-free pre-ready planning path");
+        proof
+            .validates(&owner, &request)
+            .expect("proof binds the exact owner and activation request");
+    }
 }

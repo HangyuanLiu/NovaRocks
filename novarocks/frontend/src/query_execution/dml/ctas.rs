@@ -901,9 +901,12 @@ trait CtasWriteTarget: Send + Sync {
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>;
 
+    /// Bind the sealed writer receipt and transfer the attempt's terminal
+    /// storage capability to staged-create publication.
     fn bind_write(
         &self,
         write: ConnectorStagedWriteProof,
+        terminal_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), novarocks_spi::connector::ConnectorError>;
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError>;
@@ -976,8 +979,14 @@ impl CtasWriteTarget for CoreStandardCtasTargetSession {
     fn bind_write(
         &self,
         write: ConnectorStagedWriteProof,
+        terminal_context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), novarocks_spi::connector::ConnectorError> {
-        self.lease.bind_write(self.handle.clone(), write)
+        self.lease.bind_write(self.handle.clone(), write)?;
+        *self
+            .context
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = terminal_context;
+        Ok(())
     }
 
     fn mark_write_unknown(&self) -> Result<(), novarocks_spi::connector::ConnectorError> {
@@ -1331,8 +1340,10 @@ fn seal_ctas_write(
     let Some(completion) = completion else {
         return staged_write_failed(target, "CTAS write produced no sealed write set");
     };
-    let committed =
-        match crate::query_execution::write_session::finish_write_session(completion, context) {
+    let committed = match crate::query_execution::write_session::finish_write_session_for_following_terminal_action(
+        completion,
+        context,
+    ) {
             Ok(committed) => committed,
             Err(error) => {
                 return staged_write_failed(
@@ -1340,11 +1351,12 @@ fn seal_ctas_write(
                     format!("CTAS write set could not be sealed: {error}"),
                 );
             }
-        };
+    };
+    let (outcome, affected_rows, terminal_context) = committed.into_parts();
     // Rows become reportable exactly here, and only on an outcome known to
     // have succeeded.
-    let Some(row_count) = committed.affected_rows() else {
-        let message = match committed.into_outcome() {
+    let Some(row_count) = affected_rows else {
+        let message = match outcome {
             ExternalMutationOutcome::KnownUncommitted { failure } => {
                 format!("CTAS write was not sealed: {}", failure.message())
             }
@@ -1358,7 +1370,7 @@ fn seal_ctas_write(
         };
         return staged_write_failed(target, message);
     };
-    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = committed.into_outcome() else {
+    let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
         return staged_write_failed(target, "CTAS write reported rows without a receipt");
     };
     let proof = match ConnectorStagedWriteProof::try_new(receipt, row_count) {
@@ -1370,7 +1382,7 @@ fn seal_ctas_write(
             );
         }
     };
-    if let Err(error) = target.bind_write(proof.clone()) {
+    if let Err(error) = target.bind_write(proof.clone(), terminal_context) {
         return staged_write_failed(
             target,
             format!("CTAS target refused its sealed write: {error}"),
@@ -2106,7 +2118,11 @@ mod tests {
             unreachable!("these tests drive the write terminal, not admission")
         }
 
-        fn bind_write(&self, write: ConnectorStagedWriteProof) -> Result<(), ConnectorError> {
+        fn bind_write(
+            &self,
+            write: ConnectorStagedWriteProof,
+            _terminal_context: novarocks_spi::connector::ConnectorRequestContext,
+        ) -> Result<(), ConnectorError> {
             self.bound
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
