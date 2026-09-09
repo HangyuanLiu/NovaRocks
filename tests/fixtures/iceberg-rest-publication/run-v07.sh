@@ -23,12 +23,28 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/../../.." && pwd)"
 image_name="${UEA7_FIXTURE_IMAGE:-novarocks/iceberg-rest-publication-fixture:test}"
 artifact_dir="${UEA7_ARTIFACT_DIR:-}"
+storage_mode="local-hadoop"
 name_suffix="$(printf '%s-%s' "${USER:-user}" "$$" | tr -cd '[:alnum:]-')"
 container_name="novarocks-uea7-publication-$name_suffix"
 work_dir="$(mktemp -d "${TMPDIR:-/tmp}/novarocks-uea7-v07.XXXXXX")"
+shared_bucket=""
+shared_bucket_created=0
+minio_container=""
+minio_host=""
+
+cleanup_shared_bucket() {
+  if [[ "$shared_bucket_created" == "1" ]]; then
+    docker exec \
+      --env "MC_HOST_uea7=$minio_host" \
+      "$minio_container" \
+      mc rb --force "uea7/$shared_bucket" >/dev/null 2>&1 || true
+    shared_bucket_created=0
+  fi
+}
 
 cleanup() {
   docker rm -f "$container_name" >/dev/null 2>&1 || true
+  cleanup_shared_bucket
   rm -rf -- "$work_dir"
 }
 trap cleanup EXIT INT TERM
@@ -54,20 +70,59 @@ if [[ "${UEA7_SKIP_BUILD:-0}" != "1" ]]; then
   docker build --pull=false -t "$image_name" "$script_dir"
 fi
 
-docker run --detach --pull=never \
-  --name "$container_name" \
-  --publish 127.0.0.1::8181 \
-  --publish 127.0.0.1::8182 \
-  --env CATALOG_CATALOG__IMPL=org.apache.iceberg.rest.fixture.HookedJdbcCatalog \
-  --env CATALOG_URI=jdbc:sqlite:/tmp/uea7-publication-catalog.db \
-  --env CATALOG_WAREHOUSE=file:///tmp/uea7-publication-warehouse \
-  --env CATALOG_IO__IMPL=org.apache.iceberg.hadoop.HadoopFileIO \
-  --env CATALOG_JDBC_USER=user \
-  --env CATALOG_JDBC_PASSWORD=password \
-  --env CATALOG_JDBC_STRICT__MODE=true \
-  --env UEA7_FAULT_CONTROL_PORT=8182 \
-  --env UEA7_FAULT_MAX_HOLD_SECONDS=60 \
-  "$image_name" >/dev/null
+docker_arguments=(
+  --detach
+  --pull=never
+  --name "$container_name"
+  --publish 127.0.0.1::8181
+  --publish 127.0.0.1::8182
+  --env CATALOG_CATALOG__IMPL=org.apache.iceberg.rest.fixture.HookedJdbcCatalog
+  --env CATALOG_URI=jdbc:sqlite:/tmp/uea7-publication-catalog.db
+  --env CATALOG_WAREHOUSE=file:///tmp/uea7-publication-warehouse
+  --env CATALOG_IO__IMPL=org.apache.iceberg.rest.fixture.TracingFileIO
+  --env CATALOG_JDBC_USER=user
+  --env CATALOG_JDBC_PASSWORD=password
+  --env CATALOG_JDBC_STRICT__MODE=true
+  --env UEA7_FAULT_CONTROL_PORT=8182
+  --env UEA7_FAULT_MAX_HOLD_SECONDS=60
+)
+
+if [[ "${UEA7_USE_SHARED_MINIO:-0}" == "1" ]]; then
+  for required_variable in NOVA_ENV_COMPOSE_PROJECT MINIO_ROOT_USER MINIO_ROOT_PASSWORD; do
+    [[ -n "${!required_variable:-}" ]] \
+      || fail "UEA7_USE_SHARED_MINIO=1 requires $required_variable"
+  done
+  storage_mode="shared-minio"
+  shared_network="${NOVA_ENV_COMPOSE_PROJECT}_iceberg_net"
+  minio_container="${UEA7_MINIO_CONTAINER:-${NOVA_ENV_COMPOSE_PROJECT}-minio-1}"
+  docker network inspect "$shared_network" >/dev/null 2>&1 \
+    || fail "shared MinIO network does not exist: $shared_network"
+  [[ "$(docker inspect "$minio_container" --format '{{.State.Running}}' 2>/dev/null)" == "true" ]] \
+    || fail "shared MinIO container is not running: $minio_container"
+  bucket_suffix="$(printf '%s' "$name_suffix" | tr '[:upper:]' '[:lower:]' | cut -c1-38)"
+  shared_bucket="novarocks-uea7-$bucket_suffix"
+  [[ "$shared_bucket" =~ ^novarocks-uea7-[a-z0-9-]+$ ]] \
+    || fail "generated unsafe shared MinIO bucket: $shared_bucket"
+  minio_host="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@localhost:9000"
+  docker exec \
+    --env "MC_HOST_uea7=$minio_host" \
+    "$minio_container" \
+    mc mb "uea7/$shared_bucket" >/dev/null \
+    || fail "create isolated shared MinIO bucket $shared_bucket"
+  shared_bucket_created=1
+  docker_arguments+=(
+    --network "$shared_network"
+    --env UEA7_DELEGATE_FILE_IO=s3
+    --env AWS_ACCESS_KEY_ID="$MINIO_ROOT_USER"
+    --env AWS_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD"
+    --env AWS_REGION=us-east-1
+    --env CATALOG_S3_ENDPOINT=http://minio:9000
+    --env CATALOG_S3_PATH__STYLE__ACCESS=true
+    --env CATALOG_WAREHOUSE="s3://$shared_bucket/warehouse"
+  )
+fi
+
+docker run "${docker_arguments[@]}" "$image_name" >/dev/null
 
 rest_port="$(docker port "$container_name" 8181/tcp | awk -F: 'NR == 1 {print $NF}')"
 control_port="$(docker port "$container_name" 8182/tcp | awk -F: 'NR == 1 {print $NF}')"
@@ -286,13 +341,17 @@ release_hold "$client_exit_arm"
 assert_current_schema client_exit 1
 
 curl --silent --show-error --fail "$control_uri/trace" >"$work_dir/trace.ndjson"
-python3 - "$work_dir/trace.ndjson" "$new_first_arm" "$old_first_arm" "$client_exit_arm" <<'PY'
+curl --silent --show-error --fail "$control_uri/metrics" >"$work_dir/metrics.json"
+python3 - "$work_dir/trace.ndjson" "$work_dir/metrics.json" \
+  "$new_first_arm" "$old_first_arm" "$client_exit_arm" <<'PY'
 import json
 import sys
 
-path, new_first_arm, old_first_arm, client_exit_arm = sys.argv[1:]
+path, metrics_path, new_first_arm, old_first_arm, client_exit_arm = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     events = [json.loads(line) for line in handle if line.strip()]
+with open(metrics_path, encoding="utf-8") as handle:
+    metrics = json.load(handle)
 
 def arm_events(arm_id):
     return [event for event in events if event["arm_id"] == arm_id]
@@ -395,9 +454,24 @@ if second_old_delegate:
         "its original schema requirement"
     )
 
+expected_mutations = {
+    "commit_attempts": 7,
+    "commit_successes": 6,
+    "commit_conflicts": 1,
+    "commit_failures": 0,
+}
+for name, expected in expected_mutations.items():
+    if metrics.get(name) != expected:
+        raise SystemExit(
+            f"unexpected mutation counter {name}={metrics.get(name)!r}, expected {expected}"
+        )
+for name in ("input_files", "input_streams", "input_bytes", "output_files", "output_streams", "output_bytes"):
+    if not isinstance(metrics.get(name), int) or metrics[name] <= 0:
+        raise SystemExit(f"object-I/O counter {name} is not positive: {metrics.get(name)!r}")
+
 print(
     "V07 trace validated: requirements-passed hold, both commit orders, "
-    "original-base retry rejection, and client-exit survival"
+    "original-base retry rejection, client-exit survival, and exact I/O counters"
 )
 PY
 
@@ -417,7 +491,7 @@ if [[ -n "$artifact_dir" ]]; then
   git_head="$(git -C "$repo_root" rev-parse HEAD)"
   python3 - "$artifact_dir/manifest.json" \
     "$git_head" "$image_name" "$image_id" "$base_image_id" "$container_id" \
-    "$script_dir" <<'PY'
+    "$script_dir" "$storage_mode" "$shared_bucket" <<'PY'
 import hashlib
 import json
 import sys
@@ -432,6 +506,8 @@ from pathlib import Path
     base_image_id,
     container_id,
     fixture_source,
+    storage_mode,
+    shared_bucket,
 ) = sys.argv[1:]
 source_root = Path(fixture_source)
 source_digest = hashlib.sha256()
@@ -454,6 +530,8 @@ with open(path, "w", encoding="utf-8") as handle:
             "base_image": "apache/iceberg-rest-fixture:1.10.1",
             "base_image_id": base_image_id,
             "container_id": container_id,
+            "storage_mode": storage_mode,
+            "shared_minio_bucket": shared_bucket,
             "scenarios": ["new-first", "old-first", "client-exit"],
         },
         handle,
@@ -467,6 +545,21 @@ fi
 docker rm -f "$container_name" >/dev/null
 if docker inspect "$container_name" >/dev/null 2>&1; then
   fail "fixture container still exists after cleanup"
+fi
+cleanup_shared_bucket
+if [[ -n "$shared_bucket" ]]; then
+  remaining_buckets="$(
+    docker exec --env "MC_HOST_uea7=$minio_host" "$minio_container" \
+      mc ls --json uea7
+  )" || fail "list shared MinIO buckets after fixture cleanup"
+  bucket_presence="$(
+    printf '%s\n' "$remaining_buckets" \
+      | python3 -c 'import json, sys; target = sys.argv[1]; print("present" if any(json.loads(line).get("key", "").rstrip("/") == target for line in sys.stdin if line.strip()) else "absent")' \
+        "$shared_bucket"
+  )" || fail "decode shared MinIO bucket listing after fixture cleanup"
+  if [[ "$bucket_presence" == "present" ]]; then
+    fail "shared MinIO bucket still exists after cleanup: $shared_bucket"
+  fi
 fi
 trap - EXIT INT TERM
 rm -rf -- "$work_dir"

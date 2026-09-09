@@ -440,6 +440,10 @@ pub enum PublicationCatalogFault {
     /// cross-engine companion, then forward the original request. This freezes
     /// the NovaRocks attempt before the companion advances the Iceberg table.
     BeforeDispatchHoldForConcurrentShell,
+    /// Hold before the matching request is forwarded to the REST server, so
+    /// the server cannot have started requirement validation. The concurrent
+    /// actor then advances the table before the original request is released.
+    BeforeRequirementCheckHoldForConcurrentShell,
     AfterCommitBeforeResponse,
     /// Hold the downstream-successful response until the runner has killed
     /// the frontend while the issuing statement is still in flight.
@@ -457,6 +461,9 @@ impl PublicationCatalogFault {
             Self::BeforeDispatchHoldForConcurrentShell => {
                 "before-dispatch-hold-for-concurrent-shell"
             }
+            Self::BeforeRequirementCheckHoldForConcurrentShell => {
+                "before-requirement-check-hold-for-concurrent-shell"
+            }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
             Self::IncompleteDiscovery => "incomplete-discovery",
@@ -469,7 +476,11 @@ impl PublicationCatalogFault {
     }
 
     pub const fn requires_concurrent_shell(self) -> bool {
-        matches!(self, Self::BeforeDispatchHoldForConcurrentShell)
+        matches!(
+            self,
+            Self::BeforeDispatchHoldForConcurrentShell
+                | Self::BeforeRequirementCheckHoldForConcurrentShell
+        )
     }
 }
 

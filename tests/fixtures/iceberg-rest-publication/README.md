@@ -40,9 +40,23 @@ uniquely named container, publishes random loopback ports, uses an isolated
 SQLite catalog and local warehouse, and removes the container on every exit.
 It never addresses the shared `nr-iceberg-rest` project.
 
+For plan-level V07 evidence, source the generated environment and set
+`UEA7_USE_SHARED_MINIO=1`. The fixture then joins only the shared Docker
+network, creates a unique bucket through the running MinIO container, delegates
+the tracing wrapper to the real `S3FileIO`, and removes that exact bucket on
+exit. It still owns a private SQLite catalog, endpoint, namespace, and
+container; it never sends catalog requests to the shared REST service.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+UEA7_USE_SHARED_MINIO=1 \
+  tests/fixtures/iceberg-rest-publication/run-v07.sh
+```
+
 Set `UEA7_ARTIFACT_DIR` to a new or empty absolute directory to retain the
-bounded NDJSON trace, request/response bodies, container log, and a manifest
-binding the evidence to the Git HEAD and exact image identities.
+bounded NDJSON trace, exact mutation/object-I/O counters, request/response
+bodies, container log, and a manifest binding the evidence to the Git HEAD and
+exact image identities.
 
 ## Evidence
 
@@ -62,3 +76,11 @@ conflict; the REST handler then refreshes and rejects the unchanged original
 the frozen competing request is rejected by that same requirement. A third
 case terminates the waiting HTTP client and proves that the server-owned held
 request can still be released and committed.
+
+The configured test-only `TracingFileIO` delegates to the image's real
+`HadoopFileIO` in local smoke mode and `S3FileIO` in shared-MinIO evidence mode.
+It counts actual input/output stream opens and bytes as they occur. The
+`/metrics` endpoint also counts every delegated table mutation by outcome. The
+script requires the exact seven mutations from its three table creates and four
+schema commit attempts, including one real JDBC conflict, and requires positive
+object-read and object-write counters.

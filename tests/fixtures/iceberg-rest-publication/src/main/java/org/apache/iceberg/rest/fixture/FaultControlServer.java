@@ -46,6 +46,19 @@ final class FaultControlServer {
   private static final AtomicBoolean STARTED = new AtomicBoolean(false);
   private static final AtomicLong ARM_SEQUENCE = new AtomicLong(1);
   private static final AtomicLong COMMIT_SEQUENCE = new AtomicLong(1);
+  private static final AtomicLong COMMIT_ATTEMPTS = new AtomicLong();
+  private static final AtomicLong COMMIT_SUCCESSES = new AtomicLong();
+  private static final AtomicLong COMMIT_CONFLICTS = new AtomicLong();
+  private static final AtomicLong COMMIT_FAILURES = new AtomicLong();
+  private static final AtomicLong INPUT_FILES = new AtomicLong();
+  private static final AtomicLong INPUT_FILE_LENGTH_CALLS = new AtomicLong();
+  private static final AtomicLong INPUT_FILE_EXISTS_CALLS = new AtomicLong();
+  private static final AtomicLong INPUT_STREAMS = new AtomicLong();
+  private static final AtomicLong INPUT_BYTES = new AtomicLong();
+  private static final AtomicLong OUTPUT_FILES = new AtomicLong();
+  private static final AtomicLong OUTPUT_STREAMS = new AtomicLong();
+  private static final AtomicLong OUTPUT_BYTES = new AtomicLong();
+  private static final AtomicLong DELETE_SUCCESSES = new AtomicLong();
   private static final Deque<TraceEvent> TRACE = new ArrayDeque<>();
   private static ActiveHold activeHold;
   private static long maxHoldSeconds;
@@ -68,6 +81,7 @@ final class FaultControlServer {
       server.createContext("/status", FaultControlServer::status);
       server.createContext("/release", FaultControlServer::release);
       server.createContext("/trace", FaultControlServer::trace);
+      server.createContext("/metrics", FaultControlServer::metrics);
       server.setExecutor(
           Executors.newFixedThreadPool(
               2,
@@ -86,6 +100,7 @@ final class FaultControlServer {
 
   static CommitAttempt beforePersistentCommit(
       String table, TableMetadata base, TableMetadata updated) {
+    COMMIT_ATTEMPTS.incrementAndGet();
     String commitId = "commit-" + COMMIT_SEQUENCE.getAndIncrement();
     String baseIdentity = metadataIdentity(base);
     String updatedIdentity = metadataIdentity(updated);
@@ -173,6 +188,7 @@ final class FaultControlServer {
   }
 
   static void commitSucceeded(String table, CommitAttempt attempt) {
+    COMMIT_SUCCESSES.incrementAndGet();
     record(
         "delegate-commit-success",
         table,
@@ -186,6 +202,7 @@ final class FaultControlServer {
 
   static void commitFailed(String table, CommitAttempt attempt, RuntimeException failure) {
     boolean conflict = failure instanceof CommitFailedException;
+    (conflict ? COMMIT_CONFLICTS : COMMIT_FAILURES).incrementAndGet();
     record(
         conflict ? "delegate-commit-conflict" : "delegate-commit-failed",
         table,
@@ -199,6 +216,46 @@ final class FaultControlServer {
 
   static void refreshed(String table, TableMetadata metadata) {
     record("refresh", table, "", "", metadataIdentity(metadata), "", "");
+  }
+
+  static void inputFileCreated() {
+    INPUT_FILES.incrementAndGet();
+  }
+
+  static void inputFileLengthRead() {
+    INPUT_FILE_LENGTH_CALLS.incrementAndGet();
+  }
+
+  static void inputFileExistenceChecked() {
+    INPUT_FILE_EXISTS_CALLS.incrementAndGet();
+  }
+
+  static void inputStreamOpened() {
+    INPUT_STREAMS.incrementAndGet();
+  }
+
+  static void inputBytesRead(long count) {
+    if (count > 0) {
+      INPUT_BYTES.addAndGet(count);
+    }
+  }
+
+  static void outputFileCreated() {
+    OUTPUT_FILES.incrementAndGet();
+  }
+
+  static void outputStreamOpened() {
+    OUTPUT_STREAMS.incrementAndGet();
+  }
+
+  static void outputBytesWritten(long count) {
+    if (count > 0) {
+      OUTPUT_BYTES.addAndGet(count);
+    }
+  }
+
+  static void fileDeleted() {
+    DELETE_SUCCESSES.incrementAndGet();
   }
 
   private static void finishHold(ActiveHold hold, HoldPhase phase) {
@@ -314,6 +371,44 @@ final class FaultControlServer {
       body.append(event.toJson()).append('\n');
     }
     send(exchange, 200, body.toString(), "application/x-ndjson; charset=utf-8");
+  }
+
+  private static void metrics(HttpExchange exchange) throws IOException {
+    if (!"GET".equals(exchange.getRequestMethod())) {
+      send(exchange, 405, "{\"error\":\"method not allowed\"}\n");
+      return;
+    }
+    send(
+        exchange,
+        200,
+        "{"
+            + "\"commit_attempts\":"
+            + COMMIT_ATTEMPTS.get()
+            + ",\"commit_successes\":"
+            + COMMIT_SUCCESSES.get()
+            + ",\"commit_conflicts\":"
+            + COMMIT_CONFLICTS.get()
+            + ",\"commit_failures\":"
+            + COMMIT_FAILURES.get()
+            + ",\"input_files\":"
+            + INPUT_FILES.get()
+            + ",\"input_file_length_calls\":"
+            + INPUT_FILE_LENGTH_CALLS.get()
+            + ",\"input_file_exists_calls\":"
+            + INPUT_FILE_EXISTS_CALLS.get()
+            + ",\"input_streams\":"
+            + INPUT_STREAMS.get()
+            + ",\"input_bytes\":"
+            + INPUT_BYTES.get()
+            + ",\"output_files\":"
+            + OUTPUT_FILES.get()
+            + ",\"output_streams\":"
+            + OUTPUT_STREAMS.get()
+            + ",\"output_bytes\":"
+            + OUTPUT_BYTES.get()
+            + ",\"delete_successes\":"
+            + DELETE_SUCCESSES.get()
+            + "}\n");
   }
 
   private static void record(

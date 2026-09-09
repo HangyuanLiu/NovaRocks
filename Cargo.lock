@@ -4371,6 +4371,7 @@ dependencies = [
  "novarocks-types",
  "novarocks-version",
  "prost 0.13.5",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
