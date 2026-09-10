@@ -426,10 +426,10 @@ impl SpjgDescriptor {
                     // matching on that set is sound. `None` keeps the full
                     // column list (the planner did not record a pruned set).
                     None => {
-                        let pruned: Option<&Vec<String>> = scan.required_columns.as_ref();
+                        let pruned = scan.required_columns.as_ref();
                         scan.columns
                             .iter()
-                            .filter(|c| pruned.is_none_or(|req| req.contains(&c.name)))
+                            .filter(|c| pruned.is_none_or(|req| req.contains(&c.column_id)))
                             .map(|c| SpjgOutput {
                                 name: c.name.clone(),
                                 column_id: c.column_id,
@@ -860,6 +860,7 @@ pub(crate) fn substitute_scalar(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => ScalarNode::FunctionCall {
             name,
@@ -868,6 +869,7 @@ pub(crate) fn substitute_scalar(
                 .map(|arg| substitute_scalar(arena, arg, defs))
                 .collect(),
             distinct,
+            binding,
             volatility,
         },
         ScalarNode::AggregateCall {
@@ -960,6 +962,7 @@ pub(crate) fn substitute_scalar(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -973,6 +976,7 @@ pub(crate) fn substitute_scalar(
                 .map(|arg| substitute_scalar(arena, arg, defs))
                 .collect(),
             distinct,
+            binding,
             function_order_by: function_order_by
                 .iter()
                 .map(|key| substitute_sort_key(arena, key, defs))

@@ -629,6 +629,12 @@ fn plan_query_for_ctas_source(
     let table_bindings = analyzer_provider.query_table_bindings();
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
@@ -644,12 +650,7 @@ fn plan_query_for_ctas_source(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(|error| match error {
@@ -666,7 +667,7 @@ fn plan_query_for_ctas_source(
         )
         .map_err(internal_failure)?;
     let source = novarocks_sql::planning::dml::compile_ctas_source(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
     )
     .map_err(internal_failure)?;
     Ok(PlannedCtasSourceQuery {
@@ -1452,7 +1453,7 @@ impl CtasEngine for DmlExecutionKernel {
             .reserve_initial_attempt()
             .map_err(|error| internal_failure(error.to_string()))?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(connector_failure)?;
+            .map_err(|error| connector_failure(error.into()))?;
         let planning = self
             .connector_control()
             .acquire_current(&instance_id)

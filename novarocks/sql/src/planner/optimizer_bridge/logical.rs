@@ -275,6 +275,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             let op = Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: node.function_name.clone(),
                 args: intern_exprs(scalars, &node.args),
+                binding: node.binding.clone(),
                 output_columns: node.output_columns.clone(),
                 alias: node.alias.clone(),
                 is_left_join: node.is_left_join,
@@ -502,6 +503,7 @@ pub(crate) fn to_logical_plan(expr: OptExpr, arena: &ScalarArena) -> LogicalPlan
             LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: op.function_name,
                 args: materialize_exprs(arena, &op.args),
+                binding: op.binding,
                 output_columns: op.output_columns,
                 alias: op.alias,
                 is_left_join: op.is_left_join,
@@ -828,7 +830,15 @@ mod tests {
             synthetic_column: "__nr_var_payload_0".to_string(),
             canonical_path: "$.user.id".to_string(),
             requested_type: DataType::Int64,
+            requested_type_literal: "bigint".to_string(),
             strict: true,
+            binding: crate::analysis::test_function_binding(
+                "variant_get",
+                &[],
+                DataType::Int64,
+                true,
+                novarocks_functions::FunctionVolatility::Immutable,
+            ),
         };
 
         let scan = LogicalPlanNode::new(

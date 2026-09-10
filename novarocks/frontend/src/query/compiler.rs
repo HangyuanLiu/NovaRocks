@@ -335,8 +335,17 @@ impl FrontendQueryCompiler {
                         .map_err(FrontendQueryCompilerError::from_compile)?;
                     let statistics =
                         query_statistics_snapshot(&self.query, &materializer, connector_context)?;
-                    SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-                        .map_err(FrontendQueryCompilerError::from_compile)?
+                    SqlCompiler::optimize(SqlOptimizeRequest::new(
+                        analyzed,
+                        &statistics,
+                        SqlCompileControl::new(
+                            context.execution().deadline(),
+                            sql_cancellation_observation(
+                                context.execution().cancellation().clone(),
+                            ),
+                        ),
+                    ))
+                    .map_err(FrontendQueryCompilerError::from_compile)?
                 };
                 Ok(PreparedQueryOperation::explain_lines(
                     output
@@ -465,7 +474,16 @@ impl FrontendQueryCompiler {
             "sql_optimize",
             "not-applicable",
             None,
-            || SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics)),
+            || {
+                SqlCompiler::optimize(SqlOptimizeRequest::new(
+                    analyzed,
+                    &statistics,
+                    SqlCompileControl::new(
+                        execution.deadline(),
+                        sql_cancellation_observation(execution.cancellation().clone()),
+                    ),
+                ))
+            },
         )
         .map_err(FrontendQueryCompilerError::from_compile)?
         .into_distributed_query()

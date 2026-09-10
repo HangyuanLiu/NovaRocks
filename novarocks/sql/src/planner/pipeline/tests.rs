@@ -189,6 +189,7 @@ fn broadcast_hash_join_without_optimizer_rf_annotations() -> OptimizedOperatorNo
                 null_safe: false,
             }],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
         }),
         children: vec![

@@ -754,10 +754,19 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq_condition],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
             }),
             children: vec![left_group, right_group],
         });
+        for group in [left_group, right_group, root] {
+            set_group_logical_rows_for_test(
+                &mut memo,
+                group,
+                0.0,
+                crate::optimizer::statistics::Confidence::Fallback,
+            );
+        }
         (memo, root)
     }
 
@@ -894,6 +903,7 @@ mod tests {
                 join_type: crate::analysis::JoinKind::Inner,
                 eq_conditions: vec![eq_condition],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
             }),
             children: vec![left, right],
@@ -932,6 +942,7 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq_condition],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
             }),
             children: vec![child_group],
@@ -1247,6 +1258,7 @@ mod tests {
             winner.alt_kind,
             super::super::derive::PropertyAlternativeKind::BroadcastJoin
                 | super::super::derive::PropertyAlternativeKind::ShuffleJoin
+                | super::super::derive::PropertyAlternativeKind::SingletonJoin
         ));
         assert_eq!(winner.child_props.len(), 2);
         assert_eq!(winner.child_outputs.len(), 2);
@@ -1264,6 +1276,10 @@ mod tests {
                     winner.child_props[1].distribution,
                     DistributionSpec::HashPartitioned { .. }
                 ));
+            }
+            super::super::derive::PropertyAlternativeKind::SingletonJoin => {
+                assert_eq!(winner.child_props[0], PhysicalPropertySet::gather());
+                assert_eq!(winner.child_props[1], PhysicalPropertySet::gather());
             }
             super::super::derive::PropertyAlternativeKind::Default => {
                 panic!("unknown hash join should choose a concrete property alternative")
@@ -1412,6 +1428,9 @@ mod tests {
             }
             super::super::derive::PropertyAlternativeKind::ShuffleJoin => {
                 assert_eq!(join.distribution, JoinDistribution::Shuffle);
+            }
+            super::super::derive::PropertyAlternativeKind::SingletonJoin => {
+                assert_eq!(join.distribution, JoinDistribution::Singleton);
             }
             super::super::derive::PropertyAlternativeKind::Default => {
                 assert!(!matches!(join.distribution, JoinDistribution::Unknown));
@@ -1597,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn search_allows_broadcast_when_expression_key_has_no_shuffle_fallback() {
+    fn search_uses_singleton_when_expression_key_broadcast_is_infeasible() {
         let (memo, root) = make_expression_key_large_estimated_build_join_memo_for_test();
         let mut ctx = SearchContext::new_for_test(empty_stats_input());
         let required = PhysicalPropertySet::gather();
@@ -1605,13 +1624,13 @@ mod tests {
         let cost = ctx.optimize_group(&memo, root, &required).expect("search");
         assert!(
             cost.is_finite(),
-            "expression-key joins must keep a feasible broadcast fallback"
+            "expression-key joins must keep a feasible singleton fallback"
         );
         let winner = ctx.winners.get(&(root, required.clone())).expect("winner");
 
         assert_eq!(
             winner.alt_kind,
-            crate::optimizer::derive::PropertyAlternativeKind::BroadcastJoin
+            crate::optimizer::derive::PropertyAlternativeKind::SingletonJoin
         );
     }
 
@@ -1858,6 +1877,7 @@ mod cascaded_derivation_tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
         });
         let g_sj = memo.new_group(MExpr {
@@ -1870,6 +1890,7 @@ mod cascaded_derivation_tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![eq_cond(&mut memo, col(10), col(10))],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
         });
         let g_bj = memo.new_group(MExpr {
@@ -1880,7 +1901,8 @@ mod cascaded_derivation_tests {
 
         let window_expr = crate::planner::payload::WindowExpr {
             name: "max".into(),
-            args: vec![],
+            args: vec![col(10)],
+            binding: crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![col(10)],

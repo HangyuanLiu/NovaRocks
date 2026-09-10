@@ -21,7 +21,6 @@ use super::scalar::{
     materialize_sort_keys, materialize_window_exprs,
 };
 use crate::analysis::{ExprKind, TypedExpr};
-use crate::column_id::ColumnId;
 use crate::common::{JoinKind, OutputColumn};
 use crate::optimizer::operator::{Operator, PhysicalDistributionOp};
 use crate::optimizer::optimized_tree::{JoinExecutionDistribution, OptimizedOperatorNode};
@@ -62,7 +61,7 @@ impl BridgeCtx<'_> {
             .collect::<Result<Vec<_>, _>>()?;
         let kind = self.convert_kind(node)?;
 
-        let output_columns = physical_node_output_columns(node);
+        let output_columns = physical_node_output_columns(node)?;
 
         Ok(PhysicalPlanNode {
             kind,
@@ -133,6 +132,17 @@ impl BridgeCtx<'_> {
                 )))
             }
             Operator::PhysicalHashJoin(op) => {
+                let expected_build_side =
+                    crate::optimizer::operator::exact_hash_join_build_side(op.join_type)
+                        .ok_or_else(|| {
+                            "PhysicalHashJoin cannot carry a cross join kind".to_string()
+                        })?;
+                if op.build_side != expected_build_side {
+                    return Err(format!(
+                        "PhysicalHashJoin build side {:?} differs from planner decision {:?}",
+                        op.build_side, expected_build_side
+                    ));
+                }
                 let execution_mode = join_execution_mode(node.execution_props.join_distribution);
                 Ok(PhysicalPlanKind::HashJoin(Box::new(PhysicalHashJoinNode {
                     join_type: op.join_type,
@@ -148,17 +158,18 @@ impl BridgeCtx<'_> {
                     other_condition: op
                         .other_condition
                         .map(|expr| materialize(self.scalars, expr)),
+                    build_side: map_hash_join_build_side(op.build_side),
                     distribution: map_join_distribution(op.distribution.clone()),
                     execution_mode,
                     build_runtime_filters: vec![],
-                    output_columns: physical_join_output_columns(op.join_type, node),
+                    output_columns: physical_join_output_columns(op.join_type, node)?,
                 })))
             }
             Operator::PhysicalNestLoopJoin(op) => {
                 Ok(PhysicalPlanKind::NestLoopJoin(PhysicalNestLoopJoinNode {
                     join_type: op.join_type,
                     condition: op.condition.map(|expr| materialize(self.scalars, expr)),
-                    output_columns: physical_join_output_columns(op.join_type, node),
+                    output_columns: physical_join_output_columns(op.join_type, node)?,
                 }))
             }
             Operator::PhysicalValues(op) => Ok(PhysicalPlanKind::Values(PlanValuesNode {
@@ -257,6 +268,7 @@ impl BridgeCtx<'_> {
                 Ok(PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
                     function_name: op.function_name.clone(),
                     args: materialize_exprs(self.scalars, &op.args),
+                    binding: op.binding.clone(),
                     output_columns: op.output_columns.clone(),
                     alias: op.alias.clone(),
                     is_left_join: op.is_left_join,
@@ -285,11 +297,11 @@ impl BridgeCtx<'_> {
                     "Bridge 2a invalid PhysicalDistribution shape: expected 1 children, got 0"
                         .to_string()
                 })?;
-                let partition_exprs = redistribute_partition_exprs(self.scalars, &mode, child);
+                let partition_exprs = redistribute_partition_exprs(&mode, child)?;
                 Ok(PhysicalPlanKind::Redistribute(RedistributeNode {
                     mode,
                     partition_exprs,
-                    output_columns: physical_distribution_output_columns(node),
+                    output_columns: physical_distribution_output_columns(node)?,
                 }))
             }
             op if op.is_logical() => Err(format!(
@@ -300,9 +312,9 @@ impl BridgeCtx<'_> {
     }
 }
 
-fn physical_node_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
+fn physical_node_output_columns(node: &OptimizedOperatorNode) -> Result<Vec<OutputColumn>, String> {
     match &node.op {
-        Operator::PhysicalScan(scan) => scan_materialized_output_columns(scan),
+        Operator::PhysicalScan(scan) => exact_scan_output_columns(scan, &node.output_columns),
         Operator::PhysicalDistribution(_) => physical_distribution_output_columns(node),
         Operator::PhysicalHashJoin(join) => physical_join_output_columns(join.join_type, node),
         Operator::PhysicalNestLoopJoin(join) => physical_join_output_columns(join.join_type, node),
@@ -311,7 +323,7 @@ fn physical_node_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColum
         | Operator::PhysicalLimit(_)
         | Operator::PhysicalTopN(_)
         | Operator::PhysicalAssertOneRow(_) => physical_passthrough_output_columns(node),
-        _ => node.output_columns.clone(),
+        _ => Ok(node.output_columns.clone()),
     }
 }
 
@@ -321,9 +333,13 @@ fn physical_node_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColum
 ///
 /// Aggregate completeness comes from `AggregateOutputLayout`, not from the
 /// aggregate's planner-visible output projection.
-fn physical_node_materialized_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
+fn physical_node_materialized_output_columns(
+    node: &OptimizedOperatorNode,
+) -> Result<Vec<OutputColumn>, String> {
     match &node.op {
-        Operator::PhysicalHashAggregate(aggregate) => aggregate.output_layout.full_output_columns(),
+        Operator::PhysicalHashAggregate(aggregate) => {
+            Ok(aggregate.output_layout.full_output_columns())
+        }
         _ => physical_node_output_columns(node),
     }
 }
@@ -331,58 +347,73 @@ fn physical_node_materialized_output_columns(node: &OptimizedOperatorNode) -> Ve
 /// Materializes the child producer contract onto the distribution boundary.
 /// The enclosing `PhysicalPlanNode::output_columns` is the source layout;
 /// `RedistributeNode::output_columns` remains the requested exchange order.
-fn physical_distribution_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
-    node.children
-        .first()
-        .map(physical_node_materialized_output_columns)
-        .unwrap_or_else(|| node.output_columns.clone())
+fn physical_distribution_output_columns(
+    node: &OptimizedOperatorNode,
+) -> Result<Vec<OutputColumn>, String> {
+    let child = node.children.first().ok_or_else(|| {
+        "Bridge 2a PhysicalDistribution has no child output occurrence map".to_string()
+    })?;
+    physical_node_materialized_output_columns(child)
 }
 
-fn physical_passthrough_output_columns(node: &OptimizedOperatorNode) -> Vec<OutputColumn> {
-    node.children
+fn physical_passthrough_output_columns(
+    node: &OptimizedOperatorNode,
+) -> Result<Vec<OutputColumn>, String> {
+    let child = node
+        .children
         .first()
-        .map(physical_node_materialized_output_columns)
-        .unwrap_or_else(|| node.output_columns.clone())
+        .ok_or_else(|| format!("Bridge 2a {:?} has no child output occurrence map", node.op))?;
+    physical_node_materialized_output_columns(child)
 }
 
 fn physical_join_output_columns(
     join_type: JoinKind,
     node: &OptimizedOperatorNode,
-) -> Vec<OutputColumn> {
-    if node.children.len() != 2 {
-        return node.output_columns.clone();
-    }
-
-    let left = physical_node_materialized_output_columns(&node.children[0]);
-    let right = physical_node_materialized_output_columns(&node.children[1]);
+) -> Result<Vec<OutputColumn>, String> {
+    let [left, right] = node.children.as_slice() else {
+        return Err(format!(
+            "Bridge 2a join has no exact two-input output occurrence map: got {} children",
+            node.children.len()
+        ));
+    };
+    let left = physical_node_materialized_output_columns(left)?;
+    let right = physical_node_materialized_output_columns(right)?;
     let derived = join_output_columns_from_children(join_type, left, right);
-    project_requested_output_columns(&node.output_columns, &derived).unwrap_or(derived)
+    project_requested_output_columns(&node.output_columns, &derived, "join")
 }
 
 fn project_requested_output_columns(
     requested: &[OutputColumn],
     available: &[OutputColumn],
-) -> Option<Vec<OutputColumn>> {
-    if requested.is_empty() || available.is_empty() {
-        return None;
-    }
-    let available_ids: std::collections::HashSet<_> =
-        available.iter().map(|column| column.column_id).collect();
-    let mut seen = std::collections::HashSet::new();
+    context: &str,
+) -> Result<Vec<OutputColumn>, String> {
+    let mut consumed = vec![false; available.len()];
     let mut projected = Vec::with_capacity(requested.len());
-    for column in requested {
-        if !available_ids.contains(&column.column_id) {
-            return None;
+    for (ordinal, column) in requested.iter().enumerate() {
+        let Some((available_ordinal, available_column)) =
+            available.iter().enumerate().find(|(index, candidate)| {
+                !consumed[*index] && candidate.column_id == column.column_id
+            })
+        else {
+            return Err(format!(
+                "Bridge 2a {context} output occurrence {ordinal} for ColumnId({}) has no exact producer occurrence",
+                column.column_id.0
+            ));
+        };
+        if column.name != available_column.name
+            || column.data_type != available_column.data_type
+            || column.nullable != available_column.nullable
+            || column.is_internal != available_column.is_internal
+        {
+            return Err(format!(
+                "Bridge 2a {context} output occurrence {ordinal} for ColumnId({}) differs from producer occurrence {available_ordinal}",
+                column.column_id.0
+            ));
         }
-        if seen.insert(column.column_id) {
-            let available_column = available
-                .iter()
-                .find(|available| available.column_id == column.column_id)
-                .expect("available column id was prevalidated");
-            projected.push(available_column.clone());
-        }
+        consumed[available_ordinal] = true;
+        projected.push(available_column.clone());
     }
-    Some(projected)
+    Ok(projected)
 }
 
 fn join_output_columns_from_children(
@@ -390,7 +421,7 @@ fn join_output_columns_from_children(
     left: Vec<OutputColumn>,
     right: Vec<OutputColumn>,
 ) -> Vec<OutputColumn> {
-    let mut output = match join_type {
+    match join_type {
         JoinKind::LeftSemi | JoinKind::LeftAnti | JoinKind::NullAwareLeftAnti => left,
         JoinKind::RightSemi | JoinKind::RightAnti => right,
         JoinKind::LeftOuter => {
@@ -413,10 +444,7 @@ fn join_output_columns_from_children(
             output.extend(right);
             output
         }
-    };
-    let mut seen = std::collections::HashSet::new();
-    output.retain(|column| seen.insert(column.column_id));
-    output
+    }
 }
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
@@ -426,39 +454,30 @@ fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> 
     columns
 }
 
-fn scan_materialized_output_columns(
+fn exact_scan_output_columns(
     scan: &crate::optimizer::operator::ScanOp,
-) -> Vec<OutputColumn> {
-    let Some(required_columns) = scan.required_columns.as_ref() else {
-        return scan.columns.clone();
-    };
-    let required: std::collections::HashSet<String> = required_columns
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    let variant_ids: std::collections::HashSet<ColumnId> = scan
-        .variant_columns
-        .iter()
-        .map(|column| column.synthetic_column_id)
-        .collect();
-    let output_columns: Vec<_> = scan
-        .columns
-        .iter()
-        .filter(|column| {
-            required.contains(&column.name.to_ascii_lowercase())
-                || variant_ids.contains(&column.column_id)
-                || !scan
-                    .table
-                    .columns
-                    .iter()
-                    .any(|table_column| table_column.name.eq_ignore_ascii_case(&column.name))
-        })
-        .cloned()
-        .collect();
-    if output_columns.is_empty() {
-        scan.columns.iter().take(1).cloned().collect()
-    } else {
-        output_columns
+    output_columns: &[OutputColumn],
+) -> Result<Vec<OutputColumn>, String> {
+    let output = project_requested_output_columns(output_columns, &scan.columns, "scan")?;
+    match &scan.required_columns {
+        None if output.len() != scan.columns.len() => Err(format!(
+            "Bridge 2a unpruned scan declares {} output occurrences for {} source occurrences",
+            output.len(),
+            scan.columns.len()
+        )),
+        None => Ok(output),
+        Some(required) => {
+            let actual = output
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>();
+            if actual != *required {
+                return Err(format!(
+                    "Bridge 2a scan output occurrence map does not match its required-column producer contract: expected {required:?}, got {actual:?}"
+                ));
+            }
+            Ok(output)
+        }
     }
 }
 
@@ -575,6 +594,7 @@ fn join_execution_mode(
         JoinExecutionDistribution::Broadcast => JoinExecutionMode::Broadcast,
         JoinExecutionDistribution::Partitioned => JoinExecutionMode::Partitioned,
         JoinExecutionDistribution::Colocate => JoinExecutionMode::Colocate,
+        JoinExecutionDistribution::Singleton => JoinExecutionMode::Singleton,
     })
 }
 
@@ -606,6 +626,20 @@ fn map_join_distribution(
         O::Shuffle => JoinDistribution::Shuffle,
         O::Broadcast => JoinDistribution::Broadcast,
         O::Colocate => JoinDistribution::Colocate,
+        O::Singleton => JoinDistribution::Singleton,
+    }
+}
+
+fn map_hash_join_build_side(
+    build_side: crate::optimizer::operator::HashJoinBuildSide,
+) -> crate::planner::physical::PhysicalHashJoinBuildSide {
+    match build_side {
+        crate::optimizer::operator::HashJoinBuildSide::Left => {
+            crate::planner::physical::PhysicalHashJoinBuildSide::Left
+        }
+        crate::optimizer::operator::HashJoinBuildSide::Right => {
+            crate::planner::physical::PhysicalHashJoinBuildSide::Right
+        }
     }
 }
 
@@ -641,30 +675,33 @@ fn redistribute_mode(op: &PhysicalDistributionOp) -> Result<RedistributeMode, St
 }
 
 fn redistribute_partition_exprs(
-    _scalars: &ScalarArena,
     mode: &RedistributeMode,
     child: &OptimizedOperatorNode,
-) -> Vec<TypedExpr> {
+) -> Result<Vec<TypedExpr>, String> {
     let RedistributeMode::Hash { cols, .. } = mode else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let Operator::PhysicalHashAggregate(aggregate) = &child.op else {
-        return Vec::new();
-    };
-
+    let child_outputs = physical_node_materialized_output_columns(child)?;
     let mut exprs = Vec::with_capacity(cols.len());
-    for col_id in cols {
-        let Some(column) = aggregate
-            .output_layout
-            .group_key_columns
+    for (ordinal, col_id) in cols.iter().enumerate() {
+        let mut matches = child_outputs
             .iter()
-            .find(|column| column.column_id == *col_id)
-        else {
-            return Vec::new();
+            .filter(|column| column.column_id == *col_id);
+        let Some(column) = matches.next() else {
+            return Err(format!(
+                "Bridge 2a hash distribution key occurrence {ordinal} ColumnId({}) is absent from the exact child output map",
+                col_id.0
+            ));
         };
+        if matches.next().is_some() {
+            return Err(format!(
+                "Bridge 2a hash distribution key occurrence {ordinal} ColumnId({}) is ambiguous in the exact child output map",
+                col_id.0
+            ));
+        }
         exprs.push(output_column_ref(column));
     }
-    exprs
+    Ok(exprs)
 }
 
 fn output_column_ref(column: &OutputColumn) -> TypedExpr {
@@ -929,17 +966,39 @@ mod tests {
             stats_ref: None,
             columns: columns.clone(),
             predicates: vec![],
-            required_columns: Some(vec!["s".to_string()]),
+            required_columns: Some(vec![ColumnId::new_for_test(2)]),
             variant_columns: vec![],
             mv_rewritten_from: None,
         }));
-        node.output_columns = columns;
+        node.output_columns = vec![output_column(2, "s")];
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
         let physical = materialize_physical_plan(&node).expect("bridge should convert");
 
         assert!(matches!(physical.kind, PhysicalPlanKind::Scan(_)));
         assert_output_columns_eq(&physical.output_columns, &[output_column(2, "s")]);
+    }
+
+    #[test]
+    fn physical_scan_rejects_missing_required_output_occurrence() {
+        let columns = vec![output_column(1, "k"), output_column(2, "s")];
+        let mut node = base_node(Operator::PhysicalScan(ScanOp {
+            database: "db".to_string(),
+            table: table_def(&columns),
+            alias: None,
+            stats_ref: None,
+            columns,
+            predicates: vec![],
+            required_columns: Some(vec![ColumnId::new_for_test(99)]),
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        }));
+        node.output_columns = vec![];
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let error = super::super::to_physical_plan(&node)
+            .expect_err("missing scan pruning output must fail closed");
+        assert!(error.contains("required-column producer contract"));
     }
 
     #[test]
@@ -968,7 +1027,11 @@ mod tests {
             stats_ref: None,
             columns: scan_columns.clone(),
             predicates: vec![],
-            required_columns: Some(vec!["payload".to_string()]),
+            required_columns: Some(vec![
+                payload.column_id,
+                synthetic.column_id,
+                extended.column_id,
+            ]),
             variant_columns: vec![ScanVariantColumn {
                 source_column_id: payload.column_id,
                 source_column: payload.name.clone(),
@@ -976,7 +1039,15 @@ mod tests {
                 synthetic_column: synthetic.name.clone(),
                 canonical_path: "$.k".to_string(),
                 requested_type: arrow::datatypes::DataType::Utf8,
+                requested_type_literal: "string".to_string(),
                 strict: true,
+                binding: crate::analysis::test_function_binding(
+                    "variant_get",
+                    &[],
+                    arrow::datatypes::DataType::Utf8,
+                    true,
+                    novarocks_functions::FunctionVolatility::Immutable,
+                ),
             }],
             mv_rewritten_from: None,
         }));
@@ -1042,7 +1113,8 @@ mod tests {
                 source: HashSource::ShuffleJoin,
             }
         );
-        assert!(redistribute.partition_exprs.is_empty());
+        assert_eq!(redistribute.partition_exprs.len(), 1);
+        assert_column_ref(&redistribute.partition_exprs[0], 7, "child_k");
         assert_output_columns_eq(&redistribute.output_columns, &[output_column(7, "child_k")]);
         assert_eq!(physical.children.len(), 1);
         assert!(matches!(
@@ -1061,11 +1133,11 @@ mod tests {
             stats_ref: None,
             columns: columns.clone(),
             predicates: vec![],
-            required_columns: Some(vec!["s".to_string()]),
+            required_columns: Some(vec![ColumnId::new_for_test(2)]),
             variant_columns: vec![],
             mv_rewritten_from: None,
         }));
-        child.output_columns = columns.clone();
+        child.output_columns = vec![output_column(2, "s")];
 
         let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
             spec: DistributionSpec::Gather,
@@ -1079,6 +1151,25 @@ mod tests {
             panic!("expected Redistribute");
         };
         assert_output_columns_eq(&redistribute.output_columns, &[output_column(2, "s")]);
+    }
+
+    #[test]
+    fn physical_hash_distribution_rejects_missing_child_key() {
+        let mut node = base_node(Operator::PhysicalDistribution(PhysicalDistributionOp {
+            spec: DistributionSpec::HashPartitioned {
+                cols: vec![ColumnId::new_for_test(99)],
+                source: OptimizerHashSource::ShuffleJoin,
+            },
+        }));
+        let mut child = raw_values_node();
+        child.output_columns = vec![output_column(7, "child_k")];
+        node.output_columns = child.output_columns.clone();
+        node.children.push(child);
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let error = materialize_physical_plan(&node)
+            .expect_err("missing hash distribution key must fail in the bridge");
+        assert!(error.contains("ColumnId(99) is absent from the exact child output map"));
     }
 
     #[test]
@@ -1345,6 +1436,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
         }));
         node.children.push(raw_values_node());
@@ -1356,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_hash_join_outputs_are_derived_from_children() {
+    fn physical_hash_join_rejects_stale_output_occurrence_map() {
         let left_a = output_column(1, "left_a");
         let left_b = output_column(2, "left_b");
         let right_c = output_column(3, "right_c");
@@ -1368,6 +1460,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
         }));
         node.output_columns = vec![output_column(10, "stale_parent_state")];
@@ -1375,14 +1468,9 @@ mod tests {
         node.children.push(right);
         let node = attach_arena(node, Arc::new(ScalarArena::new()));
 
-        let physical = materialize_physical_plan(&node).expect("bridge should convert");
-        let PhysicalPlanKind::HashJoin(join) = &physical.kind else {
-            panic!("expected HashJoin");
-        };
-
-        let expected = &[left_a, left_b, right_c];
-        assert_output_columns_eq(&join.output_columns, expected);
-        assert_output_columns_eq(&physical.output_columns, expected);
+        let error = materialize_physical_plan(&node)
+            .expect_err("bridge must reject a stale join output occurrence map");
+        assert!(error.contains("ColumnId(10) has no exact producer occurrence"));
     }
 
     #[test]
@@ -1398,9 +1486,22 @@ mod tests {
                 join_type,
                 eq_conditions: vec![],
                 other_condition: None,
+                build_side: crate::optimizer::operator::exact_hash_join_build_side(join_type)
+                    .expect("bridge fixture uses a legal hash join kind"),
                 distribution: JoinDistribution::Broadcast,
             }));
-            node.output_columns = vec![left_column.clone(), right_column.clone()];
+            let mut expected_left = left_column.clone();
+            let mut expected_right = right_column.clone();
+            match join_type {
+                JoinKind::LeftOuter => expected_right.nullable = true,
+                JoinKind::RightOuter => expected_left.nullable = true,
+                JoinKind::FullOuter => {
+                    expected_left.nullable = true;
+                    expected_right.nullable = true;
+                }
+                _ => {}
+            }
+            node.output_columns = vec![expected_left, expected_right];
             node.children = vec![left, right];
             let node = attach_arena(node, Arc::new(ScalarArena::new()));
             materialize_physical_plan(&node).expect("bridge should convert")
@@ -1425,6 +1526,33 @@ mod tests {
             full_outer.output_columns[1].column_id,
             right_column.column_id
         );
+    }
+
+    #[test]
+    fn physical_self_join_preserves_repeated_output_occurrences() {
+        let shared = output_column(41, "shared_key");
+        let mut left = raw_values_node();
+        left.output_columns = vec![shared.clone()];
+        let mut right = raw_values_node();
+        right.output_columns = vec![shared.clone()];
+        let mut node = base_node(Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+            join_type: JoinKind::Inner,
+            eq_conditions: vec![],
+            other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
+            distribution: JoinDistribution::Broadcast,
+        }));
+        node.output_columns = vec![shared.clone(), shared.clone()];
+        node.children = vec![left, right];
+        let node = attach_arena(node, Arc::new(ScalarArena::new()));
+
+        let physical = super::super::to_physical_plan(&node)
+            .expect("exact duplicate occurrences must survive the public bridge");
+        assert_output_columns_eq(&physical.output_columns, &[shared.clone(), shared.clone()]);
+        let PhysicalPlanKind::HashJoin(join) = physical.kind else {
+            panic!("expected HashJoin");
+        };
+        assert_output_columns_eq(&join.output_columns, &[shared.clone(), shared]);
     }
 
     #[test]

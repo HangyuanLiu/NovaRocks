@@ -301,11 +301,15 @@ pub(crate) fn rewrite(
                 pc.nullable,
             );
             let name = final_fn_name(&orig_spec.name);
-            let resolved = function_catalog
-                .resolve_aggregate_trusted(&name, std::slice::from_ref(&pc.data_type))
-                .map_err(|error| {
-                    format!("failed to resolve aggregate pushdown `{name}`: {error}")
-                })?;
+            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+                function_catalog,
+                arena,
+                &name,
+                &[arg_id],
+                &orig_spec.order_by,
+                true,
+            )
+            .map_err(|error| format!("failed to resolve aggregate pushdown `{name}`: {error}"))?;
             Ok(ScalarAggregateSpec {
                 output_column_id: orig_spec.output_column_id,
                 name,

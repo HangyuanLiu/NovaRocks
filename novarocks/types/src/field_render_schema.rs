@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{DataType, Field};
+use arrow_schema::{DataType, Field};
 
 use crate::PrimitiveType;
 use crate::arrow_primitive::arrow_field_to_primitive;

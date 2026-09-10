@@ -65,10 +65,17 @@ pub(crate) struct PhysicalHashJoinNode {
     pub join_type: JoinKind,
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<TypedExpr>,
+    pub build_side: PhysicalHashJoinBuildSide,
     pub distribution: JoinDistribution,
     pub execution_mode: Option<JoinExecutionMode>,
     pub build_runtime_filters: Vec<RuntimeFilterBuildIntent>,
     pub output_columns: Vec<OutputColumn>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PhysicalHashJoinBuildSide {
+    Left,
+    Right,
 }
 
 #[allow(dead_code)]
@@ -251,7 +258,10 @@ pub(crate) fn hash_aggregate_outputs_intermediate(mode: AggMode) -> bool {
 /// Only the call's positional `args` participate (matching the wire the encoder
 /// historically emitted); `order_by` inputs are intentionally excluded.
 pub(crate) fn aggregate_intermediate_type(call: &AggregateCall) -> Result<DataType, String> {
-    Ok(call.resolved.intermediate_type.clone())
+    Ok(crate::functions::aggregate_selection(&call.resolved)
+        .intermediate_type
+        .data_type
+        .clone())
 }
 
 /// The canonical aggregate function name for a `call`, delegating the DISTINCT

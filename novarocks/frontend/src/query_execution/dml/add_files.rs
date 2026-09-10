@@ -282,7 +282,7 @@ impl AddFilesEngine for DmlExecutionKernel {
         )
         .map_err(plan_string_failure)?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
-            .map_err(plan_connector_failure)?;
+            .map_err(|error| plan_connector_failure(error.into()))?;
         let session = DataMutationSession::plan(
             self.connector_control().as_ref(),
             &instance_id,

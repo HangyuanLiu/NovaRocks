@@ -22,59 +22,193 @@ use novarocks_sql::plan_read::ColumnId;
 use novarocks_sql::plan_read::PlanScanNode;
 use novarocks_sql::planning::query_execution::scan_preparation_facts;
 
+fn resolve_physical_column_occurrences(
+    node_id: i32,
+    scan: &PlanScanNode,
+) -> Result<Vec<ResolvedScanColumn>, String> {
+    use std::collections::BTreeSet;
+
+    let source_columns = scan
+        .table
+        .columns
+        .iter()
+        .map(|column| (column, ResolvedScanColumnKind::PhysicalTableColumn))
+        .chain(
+            scan.table
+                .iceberg_row_lineage_metadata_columns
+                .iter()
+                .map(|column| (column, ResolvedScanColumnKind::IcebergMetadataColumn)),
+        )
+        .collect::<Vec<_>>();
+    let planner_columns = scan
+        .columns
+        .iter()
+        .filter(|column| !is_variant_synthetic_column(scan, column.column_id))
+        .collect::<Vec<_>>();
+    let mut planner_ids = BTreeSet::new();
+    let mut provider_names = BTreeSet::new();
+    for (provider_ordinal, (source, _)) in source_columns.iter().enumerate() {
+        if !provider_names.insert(source.name.to_ascii_lowercase()) {
+            return Err(format!(
+                "scan binding node_id={node_id} repeats provider column '{}' at provider ordinal {provider_ordinal}",
+                source.name
+            ));
+        }
+    }
+    let mut bound_provider_ordinals = BTreeSet::new();
+    planner_columns
+        .into_iter()
+        .map(|planner| {
+            if !planner_ids.insert(planner.column_id) {
+                return Err(format!(
+                    "scan binding node_id={node_id} repeats planner column id {}",
+                    planner.column_id
+                ));
+            }
+            let matches = source_columns
+                .iter()
+                .enumerate()
+                .filter(|(_, (source, _))| source.name.eq_ignore_ascii_case(&planner.name))
+                .collect::<Vec<_>>();
+            let [(provider_ordinal, (source, kind))] = matches.as_slice() else {
+                return Err(format!(
+                    "scan binding node_id={node_id} cannot resolve planner physical column '{}' to exactly one provider ordinal in table '{}'",
+                    planner.name, scan.table.name
+                ));
+            };
+            if !bound_provider_ordinals.insert(*provider_ordinal) {
+                return Err(format!(
+                    "scan binding node_id={node_id} maps more than one planner occurrence to provider ordinal {provider_ordinal}"
+                ));
+            }
+            if planner.data_type != source.data_type {
+                return Err(format!(
+                    "scan binding node_id={node_id} column '{}' at provider ordinal {provider_ordinal} has type mismatch: planner={:?}, provider={:?}",
+                    planner.name, planner.data_type, source.data_type
+                ));
+            }
+            if planner.nullable != source.nullable {
+                return Err(format!(
+                    "scan binding node_id={node_id} column '{}' at provider ordinal {provider_ordinal} has nullability mismatch: planner={}, provider={}",
+                    planner.name, planner.nullable, source.nullable
+                ));
+            }
+            Ok(ResolvedScanColumn {
+                planner: planner.clone(),
+                source: (*source).clone(),
+                kind: *kind,
+            })
+        })
+        .collect()
+}
+
+fn resolve_provider_source_by_name<'a>(
+    node_id: i32,
+    scan: &'a PlanScanNode,
+    name: &str,
+) -> Result<&'a novarocks_types::schema::ColumnDef, String> {
+    let matches = scan
+        .table
+        .columns
+        .iter()
+        .chain(&scan.table.iceberg_row_lineage_metadata_columns)
+        .filter(|source| source.name.eq_ignore_ascii_case(name))
+        .collect::<Vec<_>>();
+    let [source] = matches.as_slice() else {
+        return Err(format!(
+            "scan binding node_id={node_id} provider column '{name}' does not resolve to exactly one provider ordinal in table '{}'",
+            scan.table.name
+        ));
+    };
+    Ok(*source)
+}
+
+fn refresh_scan_projected_column_ids(
+    node_id: i32,
+    scan: &PlanScanNode,
+    physical: &[ResolvedScanColumn],
+) -> Result<Option<Vec<ColumnId>>, String> {
+    let facts = scan_preparation_facts(scan);
+    let Some(projected_names) = facts.refresh_projected_names() else {
+        return Ok(None);
+    };
+    projected_names
+        .iter()
+        .map(|name| {
+            let matches = physical
+                .iter()
+                .filter(|column| column.source.name.eq_ignore_ascii_case(name))
+                .collect::<Vec<_>>();
+            let [column] = matches.as_slice() else {
+                return Err(format!(
+                    "scan binding node_id={node_id} refresh projection column '{name}' does not resolve to exactly one provider ordinal in table '{}'",
+                    scan.table.name
+                ));
+            };
+            Ok(column.planner.column_id)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+pub(super) fn merge_required_column_ids_with_projected(
+    node_id: i32,
+    existing: Option<&[ColumnId]>,
+    projected: &[ColumnId],
+) -> Result<Vec<ColumnId>, String> {
+    use std::collections::BTreeSet;
+
+    let mut out = projected.to_vec();
+    let mut seen = projected.iter().copied().collect::<BTreeSet<_>>();
+    let mut existing_seen = BTreeSet::new();
+    for column_id in existing.into_iter().flatten().copied() {
+        if !existing_seen.insert(column_id) {
+            return Err(format!(
+                "scan binding node_id={node_id} repeats required planner column id {column_id}"
+            ));
+        }
+        if seen.insert(column_id) {
+            out.push(column_id);
+        }
+    }
+    Ok(out)
+}
+
+fn effective_projection_ids(
+    node_id: i32,
+    scan: &PlanScanNode,
+    physical: &[ResolvedScanColumn],
+) -> Result<Option<Vec<ColumnId>>, String> {
+    match refresh_scan_projected_column_ids(node_id, scan, physical)? {
+        Some(projected) => Ok(Some(merge_required_column_ids_with_projected(
+            node_id,
+            scan.required_columns.as_deref(),
+            &projected,
+        )?)),
+        None => Ok(None),
+    }
+}
+
 pub(super) fn resolve_physical_columns(
     node_id: i32,
     scan: &PlanScanNode,
 ) -> Result<Vec<ResolvedScanColumn>, String> {
-    if let Some(projected_names) = refresh_scan_projected_names(scan) {
-        return projected_names
-            .into_iter()
-            .map(|name| {
-                let planner = scan
-                    .columns
-                    .iter()
-                    .find(|column| column.name.eq_ignore_ascii_case(&name))
-                    .ok_or_else(|| {
-                        format!(
-                            "scan binding node_id={node_id} cannot resolve projected planner column '{name}' in table '{}'",
-                            scan.table.name
-                        )
-                    })?;
-                let (source, kind) = resolved_source_column(scan, &name).ok_or_else(|| {
-                    format!(
-                        "scan binding node_id={node_id} cannot resolve projected physical column '{name}' in table '{}'",
-                        scan.table.name
-                    )
-                })?;
-                Ok(ResolvedScanColumn {
-                    planner: planner.clone(),
-                    source: source.clone(),
-                    kind,
-                })
+    let physical = resolve_physical_column_occurrences(node_id, scan)?;
+    let Some(projected_ids) = effective_projection_ids(node_id, scan, &physical)? else {
+        return Ok(physical);
+    };
+    let by_id = physical
+        .into_iter()
+        .map(|column| (column.planner.column_id, column))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    projected_ids
+        .into_iter()
+        .map(|column_id| {
+            by_id.get(&column_id).cloned().ok_or_else(|| {
+                format!(
+                    "scan binding node_id={node_id} projected planner column id {column_id} has no exact provider ordinal"
+                )
             })
-            .collect();
-    }
-
-    let keep_only_resolved = false;
-    scan.columns
-        .iter()
-        .filter(|planner| !is_variant_synthetic_column(scan, planner.column_id))
-        .filter_map(|planner| {
-            let Some((source, kind)) = resolved_source_column(scan, &planner.name) else {
-                return if keep_only_resolved {
-                    None
-                } else {
-                    Some(Err(format!(
-                        "scan binding node_id={node_id} cannot resolve planner physical column '{}' in table '{}'",
-                        planner.name, scan.table.name
-                    )))
-                };
-            };
-            Some(Ok(ResolvedScanColumn {
-                planner: planner.clone(),
-                source: source.clone(),
-                kind,
-            }))
         })
         .collect()
 }
@@ -120,64 +254,40 @@ pub(super) fn resolve_read_physical_columns(
         .collect())
 }
 
-/// The names one scan effectively projects, or `None` when nothing narrows it.
-fn effective_projection_names(scan: &PlanScanNode) -> Option<Vec<String>> {
-    match refresh_scan_projected_names(scan) {
-        Some(projected) => Some(merge_required_columns_with_projected(
-            scan.required_columns.clone(),
-            &projected,
-        )),
-        None => scan.required_columns.clone(),
-    }
-}
-
-fn refresh_scan_projected_names(scan: &PlanScanNode) -> Option<Vec<String>> {
-    scan_preparation_facts(scan)
-        .refresh_projected_names()
-        .map(ToOwned::to_owned)
-}
-
 pub(super) fn resolve_effective_required_reads(
     node_id: i32,
     scan: &PlanScanNode,
     equality_required: &[String],
 ) -> Result<Vec<ResolvedReadColumn>, String> {
-    let required_names = match refresh_scan_projected_names(scan) {
-        Some(projected) => {
-            merge_required_columns_with_projected(scan.required_columns.clone(), &projected)
-        }
-        None => scan.required_columns.clone().unwrap_or_else(|| {
-            scan.columns
+    let physical = resolve_physical_column_occurrences(node_id, scan)?;
+    let required_ids = match effective_projection_ids(node_id, scan, &physical)? {
+        Some(ids) => ids,
+        None => match scan.required_columns.as_deref() {
+            Some(ids) => merge_required_column_ids_with_projected(node_id, Some(ids), &[])?,
+            None => physical
                 .iter()
-                .filter(|column| resolved_source_column(scan, &column.name).is_some())
-                .map(|column| column.name.clone())
-                .collect()
-        }),
-    }
-    .into_iter()
-    .filter(|name| !is_variant_synthetic_name(scan, name))
-    .collect::<Vec<_>>();
-    let mut reads = required_names
+                .map(|column| column.planner.column_id)
+                .collect(),
+        },
+    };
+    let physical_by_id = physical
+        .iter()
+        .map(|column| (column.planner.column_id, column))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut reads = required_ids
         .into_iter()
-        .map(|name| {
-            let (source, _) = resolved_source_column(scan, &name).ok_or_else(|| {
-                format!(
-                    "scan binding node_id={node_id} cannot resolve required physical column '{name}' in table '{}'",
-                    scan.table.name
-                )
-            })?;
-            let planner = scan
-                .columns
-                .iter()
-                .find(|column| column.name.eq_ignore_ascii_case(&name))
+        .filter(|column_id| !is_variant_synthetic_column(scan, *column_id))
+        .map(|column_id| {
+            let column = physical_by_id
+                .get(&column_id)
                 .ok_or_else(|| {
                     format!(
-                        "scan binding node_id={node_id} required physical column '{name}' has no planner ColumnId"
+                        "scan binding node_id={node_id} required planner column id {column_id} has no exact provider ordinal"
                     )
                 })?;
             Ok(ResolvedReadColumn {
-                planner_column_id: Some(planner.column_id),
-                source: source.clone(),
+                planner_column_id: Some(column.planner.column_id),
+                source: column.source.clone(),
                 reason: ResolvedReadReason::PlannerRequiredOrOutput,
             })
         })
@@ -190,119 +300,34 @@ pub(super) fn resolve_effective_required_reads(
         {
             continue;
         }
-        let (source, _) = resolved_source_column(scan, name).ok_or_else(|| {
-            format!(
-                "scan binding node_id={node_id} cannot resolve equality-delete physical column '{name}' in table '{}'",
-                scan.table.name
-            )
-        })?;
-        if let Some(planner) = scan
-            .columns
+        let source = resolve_provider_source_by_name(node_id, scan, name)?;
+        let matches = physical
             .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(name))
-        {
-            reads.push(ResolvedReadColumn {
-                planner_column_id: Some(planner.column_id),
+            .filter(|column| column.source.name.eq_ignore_ascii_case(&source.name))
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [column] => reads.push(ResolvedReadColumn {
+                planner_column_id: Some(column.planner.column_id),
                 source: source.clone(),
                 reason: ResolvedReadReason::PlannerRequiredOrOutput,
-            });
-        } else {
-            reads.push(ResolvedReadColumn {
+            }),
+            [] => reads.push(ResolvedReadColumn {
                 planner_column_id: None,
                 source: source.clone(),
                 reason: ResolvedReadReason::EqualityDeleteKey,
-            });
+            }),
+            _ => {
+                return Err(format!(
+                    "scan binding node_id={node_id} equality-delete column '{name}' maps to more than one planner occurrence"
+                ));
+            }
         }
     }
     Ok(reads)
-}
-
-pub(super) fn merge_required_columns_with_projected(
-    existing: Option<Vec<String>>,
-    projected_names: &[String],
-) -> Vec<String> {
-    use std::collections::BTreeSet;
-
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for name in projected_names
-        .iter()
-        .cloned()
-        .chain(existing.unwrap_or_default())
-    {
-        if seen.insert(name.to_lowercase()) {
-            out.push(name);
-        }
-    }
-    out
-}
-
-fn push_unique_projected_name(names: &mut Vec<String>, name: &str) {
-    if !names
-        .iter()
-        .any(|existing| existing.eq_ignore_ascii_case(name))
-    {
-        names.push(name.to_string());
-    }
-}
-
-fn resolved_source_column<'a>(
-    scan: &'a PlanScanNode,
-    name: &str,
-) -> Option<(
-    &'a novarocks_types::schema::ColumnDef,
-    ResolvedScanColumnKind,
-)> {
-    if let Some(column) = scan
-        .table
-        .columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(name))
-    {
-        return Some((column, ResolvedScanColumnKind::PhysicalTableColumn));
-    }
-    scan.table
-        .iceberg_row_lineage_metadata_columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(name))
-        .map(|column| (column, ResolvedScanColumnKind::IcebergMetadataColumn))
-}
-
-/// The connector-schema column names one scan effectively reads.
-#[allow(
-    dead_code,
-    reason = "The eager projection-ordinal path that consumed this is gone; the typed stack resolves every output column through the connector's own column bindings."
-)]
-pub(super) fn effective_scan_column_names(scan: &PlanScanNode) -> Vec<String> {
-    if let Some(projected) = refresh_scan_projected_names(scan) {
-        return merge_required_columns_with_projected(scan.required_columns.clone(), &projected);
-    }
-    let mut names = scan.required_columns.clone().unwrap_or_else(|| {
-        scan.table
-            .columns
-            .iter()
-            .map(|column| column.name.clone())
-            .collect()
-    });
-    names.retain(|name| !is_variant_synthetic_name(scan, name));
-    for variant in &scan.variant_columns {
-        push_unique_projected_name(&mut names, &variant.source_column);
-    }
-    names
 }
 
 fn is_variant_synthetic_column(scan: &PlanScanNode, column_id: ColumnId) -> bool {
     scan.variant_columns
         .iter()
         .any(|variant| variant.synthetic_column_id == column_id)
-}
-
-fn is_variant_synthetic_name(scan: &PlanScanNode, name: &str) -> bool {
-    scan.variant_columns.iter().any(|variant| {
-        variant.synthetic_column.eq_ignore_ascii_case(name)
-            || scan.columns.iter().any(|column| {
-                column.column_id == variant.synthetic_column_id
-                    && column.name.eq_ignore_ascii_case(name)
-            })
-    })
 }

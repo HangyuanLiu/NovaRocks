@@ -173,15 +173,23 @@ mod tests {
     }
 
     fn variant_get(name: &str, source_column: &OutputColumn, path: &str, ty: &str) -> TypedExpr {
+        let args = vec![
+            column_ref(source_column),
+            string_literal(path),
+            string_literal(ty),
+        ];
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    name,
+                    &args,
+                    DataType::Int64,
+                    true,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
-                args: vec![
-                    column_ref(source_column),
-                    string_literal(path),
-                    string_literal(ty),
-                ],
+                args,
                 distinct: false,
             },
             data_type: DataType::Int64,
@@ -190,8 +198,16 @@ mod tests {
     }
 
     fn variant_get_with_args(name: &str, args: Vec<TypedExpr>) -> TypedExpr {
+        let binding = crate::analysis::test_function_binding(
+            name,
+            &args,
+            DataType::Int64,
+            true,
+            crate::functions::FunctionVolatility::Immutable,
+        );
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding,
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: name.to_string(),
                 args,
@@ -297,6 +313,12 @@ mod tests {
         assert_eq!(descriptor.synthetic_column, "__nr_var_v_0");
         assert_eq!(descriptor.canonical_path, "$.a");
         assert_eq!(descriptor.requested_type, DataType::Int64);
+        assert_eq!(descriptor.requested_type_literal, "bigint");
+        assert_eq!(
+            descriptor.binding.kind,
+            novarocks_functions::FunctionKind::Scalar
+        );
+        assert_eq!(descriptor.binding.logical_argument_count, 3);
         assert!(descriptor.strict);
         assert_ne!(descriptor.synthetic_column_id, source_column.column_id);
 
@@ -617,8 +639,17 @@ mod tests {
             DataType::Utf8,
             false,
         );
+        let binding = crate::optimizer::scalar::test_function_binding(
+            &scalars,
+            "variant_get",
+            &[unset_col_id, path_id, ty_id],
+            DataType::Int64,
+            true,
+            crate::functions::FunctionVolatility::Immutable,
+        );
         let call_id = scalars.intern(
             ScalarNode::FunctionCall {
+                binding,
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: "variant_get".to_string(),
                 args: vec![unset_col_id, path_id, ty_id],

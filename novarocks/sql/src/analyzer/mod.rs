@@ -20,7 +20,7 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
-mod functions;
+pub(crate) mod functions;
 mod helpers;
 mod literal_coercion;
 #[cfg(test)]
@@ -807,6 +807,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => {
                 let is_agg =
@@ -828,6 +829,7 @@ impl<'a> AnalyzerContext<'a> {
                             })
                             .collect(),
                         distinct,
+                        binding,
                         volatility,
                     },
                 }
@@ -1007,6 +1009,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => TypedExpr {
                 data_type: expr.data_type,
@@ -1020,6 +1023,7 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     distinct,
+                    binding,
                     volatility,
                 },
             },
@@ -2125,6 +2129,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => ExprKind::FunctionCall {
                 name,
@@ -2133,6 +2138,7 @@ impl<'a> AnalyzerContext<'a> {
                     .map(|arg| self.rebind_order_by_agg_args(arg, from_scope, inside_agg))
                     .collect(),
                 distinct,
+                binding,
                 volatility,
             },
             ExprKind::Cast {
@@ -2501,6 +2507,7 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
@@ -2519,6 +2526,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 volatility: *volatility,
             },
         },
@@ -2699,6 +2707,7 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -2722,6 +2731,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 function_order_by: function_order_by
                     .iter()
                     .map(|ob| {

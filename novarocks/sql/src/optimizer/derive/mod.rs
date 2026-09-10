@@ -68,6 +68,7 @@ pub(crate) enum PropertyAlternativeKind {
     Default,
     BroadcastJoin,
     ShuffleJoin,
+    SingletonJoin,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]

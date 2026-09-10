@@ -22,16 +22,16 @@
 //! durable desired state; BE compares the validated value exactly and never
 //! recomputes it from provider configuration.
 
-use std::{fmt::Write, sync::Arc};
+use std::sync::Arc;
 
 use uuid::Uuid;
 
+pub use novarocks_connector_contract::{CATALOG_VERSION_BYTES, CatalogHandle, CatalogVersion};
+
 use super::{
     CatalogCredentialBinding, CatalogCredentialPurpose, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorProviderId, canonicalize_catalog_credential_bindings,
+    ConnectorProviderId, canonicalize_catalog_credential_bindings,
 };
-
-pub const CATALOG_VERSION_BYTES: usize = 32;
 pub const MAX_CATALOGS_PER_QUERY: usize = 256;
 pub const MAX_CATALOG_SET_BYTES: usize = 1024 * 1024;
 /// A periodic prune is a cluster reachability snapshot, rather than one
@@ -41,53 +41,6 @@ pub const MAX_PRUNE_CATALOG_SET_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CATALOG_PROPERTIES: usize = 128;
 pub const MAX_CATALOG_PROPERTY_KEY_BYTES: usize = 256;
 pub const MAX_CATALOG_PROPERTY_VALUE_BYTES: usize = 4 * 1024;
-
-/// Stable content identity for one catalog configuration.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CatalogVersion([u8; CATALOG_VERSION_BYTES]);
-
-impl CatalogVersion {
-    pub const fn from_bytes(bytes: [u8; CATALOG_VERSION_BYTES]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn as_bytes(&self) -> &[u8; CATALOG_VERSION_BYTES] {
-        &self.0
-    }
-
-    /// A bounded rendering suitable for diagnostics, never a metric label.
-    pub fn short_hex(self) -> String {
-        let mut result = String::with_capacity(16);
-        for byte in &self.0[..8] {
-            write!(&mut result, "{byte:02x}").expect("writing to String cannot fail");
-        }
-        result
-    }
-}
-
-/// The exact catalog content a read or write execution artifact uses.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CatalogHandle {
-    catalog_name: ConnectorInstanceId,
-    version: CatalogVersion,
-}
-
-impl CatalogHandle {
-    pub const fn new(catalog_name: ConnectorInstanceId, version: CatalogVersion) -> Self {
-        Self {
-            catalog_name,
-            version,
-        }
-    }
-
-    pub const fn catalog_name(&self) -> &ConnectorInstanceId {
-        &self.catalog_name
-    }
-
-    pub const fn version(&self) -> CatalogVersion {
-        self.version
-    }
-}
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CatalogProperty {
@@ -257,7 +210,8 @@ fn invalid(subject: &str) -> ConnectorError {
 mod tests {
     use super::*;
     use crate::connector::{
-        CatalogCredentialMode, CredentialConsumerRole, StaticCredentialReference,
+        CatalogCredentialMode, ConnectorInstanceId, CredentialConsumerRole,
+        StaticCredentialReference,
     };
 
     fn handle(version: u8) -> CatalogHandle {

@@ -19,6 +19,7 @@
 //! Server-owned static manifest for the Native compatibility contract.
 
 use anyhow::Context;
+use novarocks_physical_plan::PLAN_CONTRACT_REVISION;
 use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_version::{
     NativeCarrierDeclaration, NativeCompatibilityMaterial,
@@ -80,6 +81,7 @@ pub fn resolve_native_compatibility_material(
         declarations,
         function_catalog_digest,
         execution_implementation_manifest_digest,
+        PLAN_CONTRACT_REVISION,
     )
     .with_context(|| "derive native compatibility material")
 }
@@ -142,7 +144,31 @@ mod tests {
             native_carrier_declarations(manifest.contracts()).unwrap()
         );
         assert_eq!(material.id().to_string().len(), 64);
+        assert_eq!(
+            material.plan_contract_revision(),
+            novarocks_physical_plan::PLAN_CONTRACT_REVISION
+        );
         assert_ne!(material.id(), implementation_only_change.id());
+
+        let next_plan_revision = novarocks_physical_plan::PLAN_CONTRACT_REVISION
+            .checked_add(1)
+            .expect("test requires a next plan contract revision");
+        let plan_only_change = novarocks_version::derive_repository_native_compatibility_material(
+            native_carrier_declarations(manifest.contracts()).unwrap(),
+            [0x31; 32],
+            [0x41; 32],
+            next_plan_revision,
+        )
+        .expect("plan-only compatibility material");
+        assert_ne!(material.id(), plan_only_change.id());
+        assert_ne!(
+            material.plan_contract_digest(),
+            plan_only_change.plan_contract_digest()
+        );
+        assert_eq!(
+            material.descriptor_digest(),
+            plan_only_change.descriptor_digest()
+        );
     }
 
     #[test]

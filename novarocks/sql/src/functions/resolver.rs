@@ -63,29 +63,38 @@ pub(crate) fn resolve_scalar_function_signature(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<ResolvedScalarFunction, ResolveError> {
+    resolve_scalar_function_signature_with_overload(name, arg_types).map(|(_, resolved)| resolved)
+}
+
+pub(crate) fn resolve_scalar_function_signature_with_overload(
+    name: &str,
+    arg_types: &[DataType],
+) -> Result<(usize, ResolvedScalarFunction), ResolveError> {
     let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
 
     // Pass 1: strict — every spec anchor-matches the concrete argument.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if strict_matches(sig, arg_types) {
-            return resolved_signature(sig, arg_types, &Bindings::default());
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
         }
     }
 
     // Pass 2: polymorphic-strict — `Any(name)` binds with equality.
     // Same name occurring twice must bind to the same concrete type.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         let mut bindings = Bindings::default();
         if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Strict) {
-            return resolved_signature(sig, arg_types, &bindings);
+            return resolved_signature(sig, arg_types, &bindings).map(|resolved| (index, resolved));
         }
     }
 
     // Pass 3: limited concrete casts for signatures that explicitly require
     // the resulting parameter targets to be enforced by the caller.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if concrete_cast_matches(sig, arg_types) {
-            return resolved_signature(sig, arg_types, &Bindings::default());
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
         }
     }
 
@@ -95,19 +104,53 @@ pub(crate) fn resolve_scalar_function_signature(
     // polymorphic signatures like `array_append(List<T>, T) -> List<T>`
     // are deliberately excluded so a mismatched element type fails the
     // resolver instead of silently widening through the type variable.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if !sig.widening {
             continue;
         }
         let mut bindings = Bindings::default();
         if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Widening) {
-            return resolved_signature(sig, arg_types, &bindings);
+            return resolved_signature(sig, arg_types, &bindings).map(|resolved| (index, resolved));
         }
     }
 
     Err(ResolveError::NoMatchingSignature {
         candidates: candidates.len(),
         binding_enforced: binding_enforced_for_arity(candidates, arg_types.len()),
+    })
+}
+
+/// Validate one catalog-selected overload without running overload selection.
+/// This is the BE-side path for a frozen binding identity.
+pub(crate) fn resolve_scalar_function_signature_at_overload(
+    name: &str,
+    overload_index: usize,
+    arg_types: &[DataType],
+) -> Result<ResolvedScalarFunction, ResolveError> {
+    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+    let signature = candidates
+        .get(overload_index)
+        .ok_or_else(|| ResolveError::BadSignature("selected overload index is unknown".into()))?;
+
+    if strict_matches(signature, arg_types) {
+        return resolved_signature(signature, arg_types, &Bindings::default());
+    }
+    let mut bindings = Bindings::default();
+    if polymorphic_matches(signature, arg_types, &mut bindings, BindMode::Strict) {
+        return resolved_signature(signature, arg_types, &bindings);
+    }
+    if concrete_cast_matches(signature, arg_types) {
+        return resolved_signature(signature, arg_types, &Bindings::default());
+    }
+    if signature.widening {
+        let mut bindings = Bindings::default();
+        if polymorphic_matches(signature, arg_types, &mut bindings, BindMode::Widening) {
+            return resolved_signature(signature, arg_types, &bindings);
+        }
+    }
+    Err(ResolveError::NoMatchingSignature {
+        candidates: 1,
+        binding_enforced: signature.argument_binding.is_enforced(),
     })
 }
 
@@ -280,6 +323,46 @@ mod tests {
         // args should give NoMatchingSignature, not Ok.
         let r = resolve_scalar_function("upper", &[DataType::Utf8, DataType::Utf8]);
         assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
+    }
+
+    #[test]
+    fn time_slice_declares_exact_rewritten_arities_and_preserves_value_type() {
+        assert_eq!(
+            resolve_scalar_function(
+                "time_slice",
+                &[DataType::Utf8, DataType::Int64, DataType::Utf8]
+            ),
+            Ok(DataType::Utf8)
+        );
+        assert_eq!(
+            resolve_scalar_function(
+                "time_slice",
+                &[
+                    DataType::Date32,
+                    DataType::Int64,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]
+            ),
+            Ok(DataType::Date32)
+        );
+        assert!(matches!(
+            resolve_scalar_function("time_slice", &[DataType::Utf8, DataType::Int64]),
+            Err(ResolveError::NoMatchingSignature { .. })
+        ));
+        assert!(matches!(
+            resolve_scalar_function(
+                "time_slice",
+                &[
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]
+            ),
+            Err(ResolveError::NoMatchingSignature { .. })
+        ));
     }
 
     #[test]

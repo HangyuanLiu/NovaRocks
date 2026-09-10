@@ -693,11 +693,13 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => ExprKind::FunctionCall {
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            binding: binding.clone(),
             volatility: *volatility,
         },
         ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
@@ -777,6 +779,7 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -787,6 +790,7 @@ pub(super) fn rewrite_expr_children(
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            binding: binding.clone(),
             function_order_by: function_order_by
                 .iter()
                 .map(|item| SortItem {
@@ -912,17 +916,20 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                binding: left_binding,
                 volatility: left_volatility,
             },
             ExprKind::FunctionCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                binding: right_binding,
                 volatility: right_volatility,
             },
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_binding == right_binding
                 && left_volatility == right_volatility
                 && typed_expr_slices_semantically_eq(left_args, right_args)
         }
@@ -1077,6 +1084,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                binding: left_binding,
                 function_order_by: left_function_order_by,
                 aggregate_binding: left_aggregate_binding,
                 partition_by: left_partition_by,
@@ -1088,6 +1096,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                binding: right_binding,
                 function_order_by: right_function_order_by,
                 aggregate_binding: right_aggregate_binding,
                 partition_by: right_partition_by,
@@ -1098,6 +1107,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_binding == right_binding
                 && left_aggregate_binding == right_aggregate_binding
                 && left_ignore_nulls == right_ignore_nulls
                 && format!("{left_frame:?}") == format!("{right_frame:?}")

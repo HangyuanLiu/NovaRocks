@@ -250,11 +250,16 @@ impl<'a> super::AnalyzerContext<'a> {
                         current_scope.apply_using_layout(&using_names, prefer_right);
                         if let Some(quals) = coalesce_quals {
                             for (col, l_q, r_q) in &quals {
-                                current_scope.register_full_outer_using_coalesce(
-                                    std::slice::from_ref(col),
-                                    l_q,
-                                    r_q,
-                                );
+                                current_scope
+                                    .register_full_outer_using_coalesce(
+                                        self.function_catalog,
+                                        std::slice::from_ref(col),
+                                        l_q,
+                                        r_q,
+                                    )
+                                    .map_err(|message| {
+                                        AnalyzeError::type_mismatch(message, join.span)
+                                    })?;
                             }
                         } else if matches!(join_kind, JoinKind::RightOuter) {
                             // RIGHT JOIN USING after a previous FULL OUTER
@@ -675,9 +680,42 @@ impl<'a> super::AnalyzerContext<'a> {
             args.push(typed);
         }
 
+        let function_arguments = args
+            .iter()
+            .map(crate::analysis::function_argument)
+            .collect::<Vec<_>>();
+        let binding = self
+            .function_catalog
+            .resolve_table_binding("unnest", &function_arguments)
+            .map_err(|error| {
+                AnalyzeError::invalid_argument(format!("failed to bind UNNEST: {error}"), span)
+            })?;
+        let novarocks_functions::FunctionResultType::Relation(result_columns) =
+            &binding.selected.result_type
+        else {
+            return Err(AnalyzeError::invalid_argument(
+                "UNNEST binding must produce a relation",
+                span,
+            ));
+        };
+        if result_columns.len() != output_columns.len()
+            || result_columns
+                .iter()
+                .zip(&output_columns)
+                .any(|(bound, output)| {
+                    bound.data_type != output.data_type || bound.nullable != output.nullable
+                })
+        {
+            return Err(AnalyzeError::invalid_argument(
+                "UNNEST binding result differs from analyzed output columns",
+                span,
+            ));
+        }
+
         Ok((
             Relation::Unnest(UnnestRelation {
                 args,
+                binding: binding.into(),
                 output_columns,
                 alias: alias_name,
             }),
@@ -947,7 +985,7 @@ impl<'a> super::AnalyzerContext<'a> {
         // we cannot recover row identity across snapshots.
         let resolved_table = self
             .catalog
-            .resolve_table_for_analysis(None, &namespace, &table_name)
+            .resolve_table_for_analysis(Some(&catalog), &namespace, &table_name)
             .map_err(|error| AnalyzeError::unknown_table(error, function.arguments[0].span()))?;
         let table_def = resolved_table.planner;
         if resolved_table.catalog.hidden_columns.is_empty() {

@@ -51,10 +51,10 @@ pub(super) fn encode_scan_node<'a, F: NativeScanFacts<'a>>(
         Some(binding) => encode_bound_scan_output_columns(src, binding)?,
         None => encode_output_columns(&src.columns)?,
     };
-    let required_columns = binding.map_or_else(
-        || src.required_columns.clone().unwrap_or_default(),
-        |binding| encode_bound_required_columns(src, binding),
-    );
+    let required_columns = match binding {
+        Some(binding) => encode_bound_required_columns(src, binding),
+        None => encode_unbound_required_columns(src)?,
+    };
     // Typed pushdown removes only the conjuncts the connector could represent
     // exactly. A conjunct with no typed representation stays a Core residual,
     // and one the connector declined travels in the carrier's unenforced
@@ -142,7 +142,7 @@ fn encode_bound_required_columns<'a>(
         let required_by_planner = src.required_columns.as_ref().is_none_or(|columns| {
             columns
                 .iter()
-                .any(|name| name.eq_ignore_ascii_case(&variant.synthetic_column))
+                .any(|column_id| *column_id == variant.synthetic_column_id)
         });
         if required_by_planner
             && !required
@@ -153,6 +153,31 @@ fn encode_bound_required_columns<'a>(
         }
     }
     required
+}
+
+fn encode_unbound_required_columns(src: &SqlPlanScanNodeRead) -> Result<Vec<String>, String> {
+    let Some(required_columns) = &src.required_columns else {
+        return Ok(Vec::new());
+    };
+    let names_by_id = src
+        .columns
+        .iter()
+        .map(|column| (column.column_id, column.name.as_str()))
+        .collect::<HashMap<_, _>>();
+    required_columns
+        .iter()
+        .map(|column_id| {
+            names_by_id
+                .get(column_id)
+                .map(|name| (*name).to_string())
+                .ok_or_else(|| {
+                    format!(
+                        "scan required column id {} is absent from the unbound output schema",
+                        column_id.0
+                    )
+                })
+        })
+        .collect()
 }
 
 fn encode_bound_scan_output_column(

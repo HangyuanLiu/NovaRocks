@@ -45,7 +45,12 @@ pub struct ScanVariantColumn {
     pub synthetic_column: String,
     pub canonical_path: String,
     pub requested_type: DataType,
+    /// Exact analyzer-accepted type literal passed to the scalar function.
+    pub requested_type_literal: String,
     pub strict: bool,
+    /// Exact scalar binding selected for the derived path expression.
+    /// Lowering must preserve this identity and must not resolve by name.
+    pub binding: crate::binding::SqlFunctionBinding,
 }
 
 #[cfg(test)]

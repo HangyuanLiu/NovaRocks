@@ -584,10 +584,11 @@ impl AnalyzerScope {
 
     pub(super) fn register_full_outer_using_coalesce(
         &mut self,
+        function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
         using_cols: &[String],
         left_qual: &str,
         right_qual: &str,
-    ) {
+    ) -> Result<(), String> {
         use crate::analysis::{ExprKind, TypedExpr};
         for col in using_cols {
             let col_lower = col.to_lowercase();
@@ -634,11 +635,26 @@ impl AnalyzerScope {
                 data_type: dt.clone(),
                 nullable: true,
             };
+            let args = vec![left_ref, right_ref];
+            let arguments = args
+                .iter()
+                .map(|arg| novarocks_functions::FunctionArgument::Value {
+                    value_type: novarocks_functions::FunctionValueType::new(
+                        arg.data_type.clone(),
+                        arg.nullable,
+                    ),
+                    constant: None,
+                })
+                .collect::<Vec<_>>();
+            let binding = function_catalog
+                .resolve_scalar_binding("coalesce", &arguments)
+                .map_err(|error| error.to_string())?;
             let coalesce = TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility("coalesce"),
                     name: "coalesce".to_string(),
-                    args: vec![left_ref, right_ref],
+                    binding: binding.into(),
+                    args,
                     distinct: false,
                 },
                 data_type: dt,
@@ -646,6 +662,7 @@ impl AnalyzerScope {
             };
             self.computed_columns.insert(col_lower, coalesce);
         }
+        Ok(())
     }
 
     /// Apply USING-clause column deduplication and reordering.

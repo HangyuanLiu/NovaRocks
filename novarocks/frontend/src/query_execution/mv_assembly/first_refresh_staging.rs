@@ -189,6 +189,12 @@ fn bind_first_refresh_write_dataflow(
                     ),
                 );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
                 SqlMvFirstRefreshAnalyzeContext {
@@ -199,12 +205,7 @@ fn bind_first_refresh_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                     sink,
                 },
             )?;
@@ -216,6 +217,7 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_mv_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                compile_control,
                 write_session
                     .statistics_requirements(write_target_ordinal)
                     .map_err(|error| error.to_string())?,
@@ -286,6 +288,12 @@ fn bind_first_refresh_write_dataflow(
                 frozen_base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
@@ -298,12 +306,7 @@ fn bind_first_refresh_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                     sink,
                 })?;
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -314,6 +317,7 @@ fn bind_first_refresh_write_dataflow(
             let distributed_plan = compile_join_first_refresh_connector_write_dataflow(
                 analyzed,
                 &statistics,
+                compile_control,
                 write_session
                     .statistics_requirements(write_target_ordinal)
                     .map_err(|error| error.to_string())?,

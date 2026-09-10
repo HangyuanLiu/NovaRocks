@@ -122,6 +122,7 @@ fn apply_opt(
     if a.correlation_column_ids.is_empty() {
         let provably_le_one_row = inner_is_provably_le_one_row(&right);
         let project_items = build_output_project_items(
+            ctx.function_catalog(),
             arena,
             &left,
             &right,
@@ -155,6 +156,7 @@ fn apply_opt(
     if !a.need_check_max_rows {
         let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
         let project_items = build_output_project_items(
+            ctx.function_catalog(),
             arena,
             &left,
             &right,
@@ -239,14 +241,25 @@ fn apply_opt(
         inner_scalar_type.clone(),
         inner_scalar_nullable,
     );
-    let count_resolved = ctx
-        .function_catalog()
-        .resolve_aggregate_trusted("count", &[DataType::Int64])
-        .map_err(|error| format!("failed to resolve optimizer count aggregate: {error}"))?;
-    let any_value_resolved = ctx
-        .function_catalog()
-        .resolve_aggregate_trusted("any_value", std::slice::from_ref(&inner_scalar_type))
-        .map_err(|error| format!("failed to resolve optimizer any_value aggregate: {error}"))?;
+    let count_argument = scalar_utils::int_literal(arena, 1);
+    let count_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+        ctx.function_catalog(),
+        arena,
+        "count",
+        &[count_argument],
+        &[],
+        true,
+    )
+    .map_err(|error| format!("failed to resolve optimizer count aggregate: {error}"))?;
+    let any_value_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+        ctx.function_catalog(),
+        arena,
+        "any_value",
+        &[inner_scalar_ref],
+        &[],
+        true,
+    )
+    .map_err(|error| format!("failed to resolve optimizer any_value aggregate: {error}"))?;
     if let Some(inner_column) =
         scalar_utils::find_output_column(&agg_input_columns, a.inner_output_column_id)
     {
@@ -341,10 +354,11 @@ fn apply_opt(
         false,
     );
     let assert_expr = scalar_utils::assert_true(
+        ctx.function_catalog(),
         arena,
         assert_cond,
         "correlate scalar subquery result must 1 row",
-    );
+    )?;
     items.push(ScalarProjectItem {
         expr: assert_expr,
         output_name: "__subquery_assertion".to_string(),
@@ -377,6 +391,7 @@ fn inner_is_provably_le_one_row(plan: &OptExpr) -> bool {
 }
 
 fn build_output_project_items(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     left: &OptExpr,
     right: &OptExpr,
@@ -399,7 +414,7 @@ fn build_output_project_items(
         if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {
             // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
             // match; normalize to 0 (SQL COUNT semantics).
-            scalar_utils::ifnull_zero(arena, inner_col_ref, inner_out_type)
+            scalar_utils::ifnull_zero(function_catalog, arena, inner_col_ref, inner_out_type)?
         } else {
             inner_col_ref
         };

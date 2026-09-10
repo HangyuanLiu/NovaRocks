@@ -255,10 +255,10 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set after pipeline");
-        let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
-        assert!(req_set.contains("a"), "a must be kept");
-        assert!(req_set.contains("b"), "b must be kept");
-        assert!(req_set.contains("c"), "c must be kept");
+        let req_set: std::collections::HashSet<ColumnId> = req.iter().copied().collect();
+        assert!(req_set.contains(&id_a), "a must be kept");
+        assert!(req_set.contains(&id_b), "b must be kept");
+        assert!(req_set.contains(&id_c), "c must be kept");
     }
 
     // -----------------------------------------------------------------------
@@ -295,7 +295,7 @@ mod tests {
             .as_ref()
             .expect("required_columns must be set");
         assert_eq!(req.len(), 1, "only 'a' should survive pruning");
-        assert_eq!(req[0], "a");
+        assert_eq!(req[0], id_a);
     }
 
     // -----------------------------------------------------------------------
@@ -350,13 +350,13 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
-        assert!(req_set.contains("a"), "a must be kept (projected)");
+        let req_set: std::collections::HashSet<ColumnId> = req.iter().copied().collect();
+        assert!(req_set.contains(&id_a), "a must be kept (projected)");
         assert!(
-            req_set.contains("b"),
+            req_set.contains(&id_b),
             "b must be kept (predicate reference)"
         );
-        assert!(!req_set.contains("c"), "c must be pruned");
+        assert!(!req_set.contains(&id_c), "c must be pruned");
     }
 
     // -----------------------------------------------------------------------
@@ -443,14 +443,14 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        let req_set: std::collections::HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
-        assert!(req_set.contains("b"), "b must be kept (group_by)");
+        let req_set: std::collections::HashSet<ColumnId> = req.iter().copied().collect();
+        assert!(req_set.contains(&id_b), "b must be kept (group_by)");
         assert!(
-            !req_set.contains("c"),
+            !req_set.contains(&id_c),
             "c must be pruned (unselected aggregate arg)"
         );
         assert!(
-            !req_set.contains("a"),
+            !req_set.contains(&id_a),
             "a must be pruned (not referenced by selected group key)"
         );
     }

@@ -430,6 +430,12 @@ fn compile_dml_change_stream_write(
         );
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -443,12 +449,7 @@ fn compile_dml_change_stream_write(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
@@ -464,6 +465,7 @@ fn compile_dml_change_stream_write(
             optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
                 analyzed,
                 &statistics,
+                compile_control,
             ),
             kind,
             routes,
@@ -3010,6 +3012,12 @@ fn execute_exact_cow_match_query(
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::Query,
@@ -3023,12 +3031,7 @@ fn execute_exact_cow_match_query(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
@@ -3041,7 +3044,7 @@ fn execute_exact_cow_match_query(
             connector_context,
         )?;
     let distributed = novarocks_sql::planning::dml::compile_query_distributed_plan(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,

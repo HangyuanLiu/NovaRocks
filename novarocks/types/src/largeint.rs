@@ -14,15 +14,11 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder};
-use arrow::datatypes::DataType;
+use arrow_array::builder::FixedSizeBinaryBuilder;
+use arrow_array::{ArrayRef, FixedSizeBinaryArray};
 use std::sync::Arc;
 
-pub const LARGEINT_BYTE_WIDTH: i32 = 16;
-
-pub fn is_largeint_data_type(dt: &DataType) -> bool {
-    matches!(dt, DataType::FixedSizeBinary(w) if *w == LARGEINT_BYTE_WIDTH)
-}
+pub use novarocks_type_contract::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
 
 pub fn i128_to_be_bytes(value: i128) -> [u8; 16] {
     value.to_be_bytes()

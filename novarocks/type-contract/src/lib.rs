@@ -1,0 +1,43 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Pure semantic type contracts shared by compilers, physical plans and workers.
+//!
+//! This crate owns immutable type identities and deterministic type rules. It
+//! deliberately excludes Arrow arrays, casts, rendering, serialization and
+//! runtime kernels so contract consumers do not acquire those capabilities.
+
+mod arithmetic;
+mod comparison;
+mod function;
+mod largeint;
+mod partition;
+
+pub use arithmetic::{
+    ArithmeticOperator, arithmetic_result_type, arithmetic_result_type_with_op,
+    canonical_agg_decimal_type, decimal_arithmetic_result_type,
+};
+pub use comparison::OrderedComparisonAlgorithm;
+pub use function::{
+    AggregateStateFormatId, FunctionArgumentEvaluation, FunctionArgumentType,
+    FunctionFailureBehavior, FunctionId, FunctionIdentityError, FunctionKind, FunctionOverloadId,
+    FunctionValueType, FunctionVolatility,
+};
+pub use largeint::{LARGEINT_BYTE_WIDTH, is_largeint_data_type};
+pub use partition::{
+    BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
+    PartitionHashAlgorithm, PartitionSpaceId, PartitionSpaceIdentityError,
+};

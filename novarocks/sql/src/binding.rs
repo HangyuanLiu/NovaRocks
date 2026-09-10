@@ -15,19 +15,61 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query-local opaque identities for SQL table facts.
+//! SQL-owned immutable binding handles.
 //!
-//! These values deliberately have no serialization implementation. A table
-//! binding is meaningful only in the application-owned store that allocated
-//! its scope, so forwarding it across a request/process boundary is invalid.
+//! These values deliberately have no serialization implementation. Table
+//! bindings are meaningful only in the application-owned store that allocated
+//! their scope. Function bindings share one immutable selection across SQL IR
+//! layers and are copied into the final physical-plan contract only at its
+//! lowering boundary.
 
 use std::{
     num::{NonZeroU32, NonZeroU64},
+    ops::Deref,
+    sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
 };
 
+/// Shared, immutable function selection carried through SQL-owned IR layers.
+///
+/// Function bindings include complete identity, type and semantic metadata.
+/// Sharing keeps expression nodes compact while preserving one exact binding
+/// from analysis through optimization and physical lowering.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SqlFunctionBinding(Arc<novarocks_functions::ResolvedFunctionBinding>);
+
+impl SqlFunctionBinding {
+    pub(crate) fn new(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
+        Self(Arc::new(binding))
+    }
+
+    pub fn resolved(&self) -> &novarocks_functions::ResolvedFunctionBinding {
+        self.0.as_ref()
+    }
+}
+
+impl AsRef<novarocks_functions::ResolvedFunctionBinding> for SqlFunctionBinding {
+    fn as_ref(&self) -> &novarocks_functions::ResolvedFunctionBinding {
+        self.resolved()
+    }
+}
+
+impl Deref for SqlFunctionBinding {
+    type Target = novarocks_functions::ResolvedFunctionBinding;
+
+    fn deref(&self) -> &Self::Target {
+        self.resolved()
+    }
+}
+
+impl From<novarocks_functions::ResolvedFunctionBinding> for SqlFunctionBinding {
+    fn from(binding: novarocks_functions::ResolvedFunctionBinding) -> Self {
+        Self::new(binding)
+    }
+}
+
 /// Process-local identity of one application binding store.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SqlTableBindingScopeId(NonZeroU64);
 
 impl SqlTableBindingScopeId {
@@ -41,7 +83,7 @@ impl SqlTableBindingScopeId {
 }
 
 /// One table fact allocated by a query-local binding store.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SqlTableBindingId {
     scope: SqlTableBindingScopeId,
     ordinal: NonZeroU32,
@@ -143,7 +185,17 @@ impl SqlTableBindingAllocator {
 mod tests {
     use std::num::NonZeroU64;
 
+    use arrow::datatypes::DataType;
+
     use super::SqlTableBindingAllocator;
+
+    #[test]
+    fn function_binding_clones_share_one_immutable_selection() {
+        let binding = crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false);
+        let clone = binding.clone();
+
+        assert!(std::ptr::eq(binding.resolved(), clone.resolved()));
+    }
 
     #[test]
     fn sqlx2_binding_token_is_scoped_and_nonzero() {

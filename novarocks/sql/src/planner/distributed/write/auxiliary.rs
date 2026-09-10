@@ -27,7 +27,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use arrow::datatypes::{DataType, Schema};
-use novarocks_functions::ResolvedAggregateSignature;
 use novarocks_spi::connector::StatisticsRequiredAggregation;
 use novarocks_spi::connector::write_stack::{
     ROOT_WRITE_RESULT_BODY_INDEX, ROOT_WRITE_RESULT_INPUT_FIELDS_INDEX,
@@ -38,6 +37,7 @@ use novarocks_spi::connector::write_stack::{
 
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr, UnpivotConstant};
 use crate::compiler::SqlFunctionCatalog;
+use novarocks_functions::ResolvedFunctionBinding;
 
 const MAX_UNPIVOT_OUTPUT_ROWS: usize = 4_096;
 const MAX_UNPIVOT_OUTPUT_BYTES: usize =
@@ -47,7 +47,7 @@ const MAX_UNPIVOT_OUTPUT_BYTES: usize =
 pub struct WriterPartialAggregateCall {
     pub(crate) input_slot_id: u32,
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedAggregateSignature,
+    pub(crate) resolved: ResolvedFunctionBinding,
     pub(crate) intermediate_slot_id: u32,
 }
 
@@ -58,7 +58,7 @@ impl WriterPartialAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedAggregateSignature {
+    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
         &self.resolved
     }
     pub const fn intermediate_slot_id(&self) -> u32 {
@@ -80,7 +80,7 @@ impl WriterPartialAggregatePlan {
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
     pub(crate) function_name: String,
-    pub(crate) resolved: ResolvedAggregateSignature,
+    pub(crate) resolved: ResolvedFunctionBinding,
     pub(crate) intermediate_input_slot_id: u32,
     pub(crate) final_output_slot_id: u32,
 }
@@ -89,7 +89,7 @@ impl WriterFinalAggregateCall {
     pub fn function_name(&self) -> &str {
         &self.function_name
     }
-    pub const fn resolved(&self) -> &ResolvedAggregateSignature {
+    pub const fn resolved(&self) -> &ResolvedFunctionBinding {
         &self.resolved
     }
     pub const fn intermediate_input_slot_id(&self) -> u32 {
@@ -295,11 +295,11 @@ pub fn plan_writer_statistics(
     let mut partial_by_target = BTreeMap::new();
     let mut final_calls = Vec::new();
     let mut mappings = Vec::new();
-    let mut shared_channels = HashMap::<(ResolvedAggregateSignature, usize), (u32, u32)>::new();
+    let mut shared_channels = HashMap::<(ResolvedFunctionBinding, usize), (u32, u32)>::new();
 
     for target in targets {
         let mut partial_calls = Vec::with_capacity(target.requirements.len());
-        let mut occurrence_by_signature = HashMap::<ResolvedAggregateSignature, usize>::new();
+        let mut occurrence_by_signature = HashMap::<ResolvedFunctionBinding, usize>::new();
         for requirement in target.requirements {
             let input = target
                 .input_schema
@@ -322,23 +322,36 @@ pub fn plan_writer_statistics(
                     target.target.get()
                 ));
             }
-            let resolved = functions
-                .resolve_aggregate_trusted(
+            let input_expr = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: crate::column_id::ColumnId(target_input_slot_id(
+                        requirement.input().ordinal(),
+                    )?),
+                    qualifier: None,
+                    column: requirement.input().name().to_string(),
+                },
+                data_type: requirement.input().data_type().clone(),
+                nullable: requirement.input().nullable(),
+            };
+            let resolved = crate::functions::resolve_sql_aggregate_binding(
+                functions,
+                requirement.function_name(),
+                std::slice::from_ref(&input_expr),
+                &[],
+                true,
+            )
+            .map_err(|error| {
+                format!(
+                    "resolve trusted write aggregate `{}` for {:?}: {error}",
                     requirement.function_name(),
-                    std::slice::from_ref(requirement.input().data_type()),
+                    requirement.input().data_type()
                 )
-                .map_err(|error| {
-                    format!(
-                        "resolve trusted write aggregate `{}` for {:?}: {error}",
-                        requirement.function_name(),
-                        requirement.input().data_type()
-                    )
-                })?;
-            if resolved.output_type != DataType::Binary {
+            })?;
+            if crate::functions::aggregate_result_type(&resolved).data_type != DataType::Binary {
                 return Err(format!(
                     "write aggregate `{}` output {:?} cannot feed the binary Root value slot",
                     requirement.function_name(),
-                    resolved.output_type
+                    crate::functions::aggregate_result_type(&resolved).data_type
                 ));
             }
             let occurrence = occurrence_by_signature.entry(resolved.clone()).or_default();
@@ -358,7 +371,10 @@ pub fn plan_writer_statistics(
                     WriterAuxiliaryChannel::try_new(
                         intermediate_slot_id,
                         format!("auxiliary_channel_{ordinal}"),
-                        resolved.intermediate_type.clone(),
+                        crate::functions::aggregate_selection(&resolved)
+                            .intermediate_type
+                            .data_type
+                            .clone(),
                     )
                     .map_err(|error| error.to_string())?,
                 );
@@ -496,7 +512,11 @@ fn validate_plan(
         let Some(data_type) = channels.get(&call.intermediate_input_slot_id) else {
             return Err("write final aggregate reads an unknown auxiliary slot".to_string());
         };
-        if **data_type != call.resolved.intermediate_type {
+        if **data_type
+            != crate::functions::aggregate_selection(&call.resolved)
+                .intermediate_type
+                .data_type
+        {
             return Err(
                 "write aggregate intermediate type differs from its typed tail".to_string(),
             );
@@ -546,8 +566,7 @@ mod tests {
     use super::*;
     use crate::compiler::build_builtin_engine_function_catalog;
     use novarocks_functions::{
-        AggregateOverloadMetadata, EngineFunctionCatalog, EngineFunctionCatalogBuilder,
-        FunctionDefinition, FunctionVisibility, FunctionVolatility,
+        AggregateOverloadMetadata, EngineFunctionCatalog, FunctionVisibility,
     };
     use novarocks_spi::connector::{
         StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
@@ -562,16 +581,11 @@ mod tests {
             "test.binary_stat.state.v1",
         )
         .expect("overload");
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        crate::functions::test_exact_aggregate_catalog(
             "binary_stat",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [overload],
         )
-        .expect("definition");
-        let mut builder = EngineFunctionCatalogBuilder::new();
-        builder.register(definition).expect("register");
-        builder.seal().expect("catalog")
     }
 
     fn requirement(field_id: i32) -> StatisticsRequiredAggregation {

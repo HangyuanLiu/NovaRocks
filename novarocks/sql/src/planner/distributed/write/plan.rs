@@ -757,10 +757,7 @@ fn stream_kind_for_data_partition(partition: &DataPartition) -> FragmentStreamKi
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
-    use novarocks_functions::{
-        AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
-        FunctionVisibility, FunctionVolatility,
-    };
+    use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
     use novarocks_spi::connector::{
         StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
     };
@@ -960,10 +957,9 @@ mod tests {
     }
 
     fn change_stream_auxiliary_plan() -> super::super::WriterAuxiliaryPlan {
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_change_stream_blob",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [AggregateOverloadMetadata::try_new(
                 "test/change-stream-blob/i64/v1",
                 [DataType::Int64],
@@ -972,11 +968,7 @@ mod tests {
                 "test/change-stream-blob-state/v1",
             )
             .expect("aggregate overload")],
-        )
-        .expect("aggregate definition");
-        let mut functions = EngineFunctionCatalogBuilder::new();
-        functions.register(definition).expect("register aggregate");
-        let functions = functions.seal().expect("function catalog");
+        );
         let requirements = [0, 1].map(|target| {
             vec![
                 StatisticsRequiredAggregation::try_new(

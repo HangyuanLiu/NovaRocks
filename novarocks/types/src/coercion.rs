@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Fields};
+use arrow_schema::{DataType, Field, Fields};
 
 use crate::predicate::{is_integer, is_largeint};
 
@@ -500,7 +500,7 @@ fn is_string_type(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Fields};
+    use arrow_schema::{DataType, Field, Fields};
     use std::sync::Arc;
 
     #[test]

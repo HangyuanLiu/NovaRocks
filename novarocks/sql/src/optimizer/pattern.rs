@@ -222,6 +222,12 @@ mod tests {
                 Operator::LogicalTableFunction(TableFunctionOp {
                     function_name: "unnest".to_string(),
                     args: vec![],
+                    binding: crate::optimizer::scalar::test_table_binding(
+                        &ScalarArena::new(),
+                        "unnest",
+                        &[],
+                        &[],
+                    ),
                     output_columns: vec![],
                     alias: None,
                     is_left_join: false,

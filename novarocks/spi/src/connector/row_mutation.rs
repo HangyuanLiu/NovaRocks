@@ -27,6 +27,8 @@ use arrow::row::{RowConverter, SortField};
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
+pub use novarocks_connector_contract::{ConnectorRowMutationEffect, ConnectorWriteRouteId};
+
 use super::{
     ConnectorError, ConnectorErrorKind, ConnectorPinnedFileSet, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorSealedWriteCohortSet, ConnectorTableHandle,
@@ -63,30 +65,6 @@ impl ConnectorRowMutationIntent {
             Self::Update => effect == ConnectorRowMutationEffect::Replace,
             Self::Merge { effects } => effects.contains(&effect),
         }
-    }
-}
-
-/// SQL-visible semantics only. A value is never a deletion-vector, rewrite,
-/// or table-format route discriminator.
-#[repr(i8)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ConnectorRowMutationEffect {
-    Delete = 1,
-    Replace = 2,
-    Insert = 3,
-}
-
-/// Fixed-width opaque provider route key. Native plans reject every other
-/// representation before a provider is reached.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorWriteRouteId([u8; 32]);
-
-impl ConnectorWriteRouteId {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-    pub const fn to_bytes(self) -> [u8; 32] {
-        self.0
     }
 }
 

@@ -1621,55 +1621,67 @@ pub fn build_statistics_connector_plan(
                 requirement.input().name()
             ));
         }
-        let resolved = functions
-            .resolve_aggregate_trusted(
+        let args = vec![crate::analysis::TypedExpr {
+            kind: crate::analysis::ExprKind::ColumnRef {
+                column_id: input.column_id,
+                qualifier: None,
+                column: input.name.clone(),
+            },
+            data_type: input.data_type.clone(),
+            nullable: input.nullable,
+        }];
+        let resolved = crate::functions::resolve_sql_aggregate_binding(
+            functions,
+            requirement.function_name(),
+            &args,
+            &[],
+            true,
+        )
+        .map_err(|error| {
+            format!(
+                "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
                 requirement.function_name(),
-                std::slice::from_ref(requirement.input().data_type()),
+                requirement.input().data_type()
             )
-            .map_err(|error| {
-                format!(
-                    "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
-                    requirement.function_name(),
-                    requirement.input().data_type()
-                )
-            })?;
+        })?;
         let output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
-            resolved.output_type.clone(),
+            crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             true,
         );
         let output_name = format!("analyze_body_{index}");
         final_columns.push(crate::analysis::OutputColumn {
             column_id: output_id,
             name: output_name.clone(),
-            data_type: resolved.output_type.clone(),
+            data_type: crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             nullable: true,
             is_internal: true,
         });
         partial_columns.push(crate::analysis::OutputColumn {
             column_id: output_id,
             name: output_name,
-            data_type: resolved.intermediate_type.clone(),
+            data_type: crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .data_type
+                .clone(),
             nullable: true,
             is_internal: true,
         });
         calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
-            args: vec![crate::analysis::TypedExpr {
-                kind: crate::analysis::ExprKind::ColumnRef {
-                    column_id: input.column_id,
-                    qualifier: None,
-                    column: input.name.clone(),
-                },
-                data_type: input.data_type.clone(),
-                nullable: input.nullable,
-            }],
+            args,
             distinct: false,
-            result_type: resolved.output_type.clone(),
+            result_type: crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             order_by: Vec::new(),
             output_column_id: output_id,
-            resolved,
+            resolved: resolved.into(),
         });
     }
 
@@ -1855,18 +1867,14 @@ mod tests {
     fn analyze_statistics_uses_ordinary_two_phase_aggregate_unpivot_and_result_sink() {
         use crate::planner::distributed::{DistributedNode, DistributedNodeKind};
         use crate::planner::physical::AggMode;
-        use novarocks_functions::{
-            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
-            FunctionVisibility, FunctionVolatility,
-        };
+        use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
         use novarocks_spi::connector::{
             StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
         };
 
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_blob_aggregate",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [AggregateOverloadMetadata::try_new(
                 "test/blob-aggregate/i64/v1",
                 [arrow::datatypes::DataType::Int64],
@@ -1875,11 +1883,7 @@ mod tests {
                 "test/blob-state/v1",
             )
             .expect("aggregate overload")],
-        )
-        .expect("aggregate definition");
-        let mut functions = EngineFunctionCatalogBuilder::new();
-        functions.register(definition).expect("register aggregate");
-        let functions = functions.seal().expect("function catalog");
+        );
         let requirement = StatisticsRequiredAggregation::try_new(
             StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
                 .expect("scan column"),
@@ -2359,18 +2363,14 @@ mod tests {
 
     #[test]
     fn change_stream_statistics_production_helper_plans_nonempty_requirements() {
-        use novarocks_functions::{
-            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
-            FunctionVisibility, FunctionVolatility,
-        };
+        use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
         use novarocks_spi::connector::{
             StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
         };
 
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_change_stream_blob",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [AggregateOverloadMetadata::try_new(
                 "test/change-stream-blob/i64/v1",
                 [arrow::datatypes::DataType::Int64],
@@ -2379,11 +2379,7 @@ mod tests {
                 "test/change-stream-blob-state/v1",
             )
             .expect("aggregate overload")],
-        )
-        .expect("aggregate definition");
-        let mut functions = EngineFunctionCatalogBuilder::new();
-        functions.register(definition).expect("register aggregate");
-        let functions = functions.seal().expect("function catalog");
+        );
         let requirement = |target: u32| {
             StatisticsRequiredAggregation::try_new(
                 StatisticsScanColumn::try_new(

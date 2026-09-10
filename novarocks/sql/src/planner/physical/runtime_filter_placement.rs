@@ -313,6 +313,7 @@ fn resolve_join_distribution(join: &PhysicalHashJoinNode) -> JoinDistribution {
         Some(JoinExecutionMode::Broadcast) => JoinDistribution::Broadcast,
         Some(JoinExecutionMode::Partitioned) => JoinDistribution::Shuffle,
         Some(JoinExecutionMode::Colocate) => JoinDistribution::Colocate,
+        Some(JoinExecutionMode::Singleton) => JoinDistribution::Singleton,
         None => join.distribution.clone(),
     }
 }
@@ -322,6 +323,7 @@ fn execution_mode_for(distribution: &JoinDistribution) -> JoinExecutionMode {
         JoinDistribution::Broadcast => JoinExecutionMode::Broadcast,
         JoinDistribution::Shuffle => JoinExecutionMode::Partitioned,
         JoinDistribution::Colocate => JoinExecutionMode::Colocate,
+        JoinDistribution::Singleton => JoinExecutionMode::Singleton,
         JoinDistribution::Unknown => unreachable!("Unknown distribution returns early"),
     }
 }
@@ -493,6 +495,7 @@ impl From<&JoinDistribution> for CrossExchangeMode {
         match d {
             JoinDistribution::Broadcast => CrossExchangeMode::Unconditional,
             JoinDistribution::Shuffle | JoinDistribution::Colocate => CrossExchangeMode::KeyAligned,
+            JoinDistribution::Singleton => CrossExchangeMode::Disabled,
             JoinDistribution::Unknown => CrossExchangeMode::Disabled,
         }
     }
@@ -1565,10 +1568,18 @@ mod tests {
                 ..out_col(3, "right_key")
             },
         ];
+        let coalesce_args = vec![col_ref(1, "left_key"), col_ref(3, "right_key")];
         let coalesced_key = typed_expr(ExprKind::FunctionCall {
+            binding: crate::analysis::test_function_binding(
+                "coalesce",
+                &coalesce_args,
+                DataType::Int64,
+                true,
+                crate::functions::FunctionVolatility::Immutable,
+            ),
             volatility: crate::functions::builtin_function_volatility("coalesce"),
             name: "coalesce".to_string(),
-            args: vec![col_ref(1, "left_key"), col_ref(3, "right_key")],
+            args: coalesce_args,
             distinct: false,
         });
         let build = leaf(vec![out_col(2, "build_key")]);
@@ -2002,50 +2013,70 @@ mod tests {
 
     #[test]
     fn column_id_vec_recurses_and_skips_unset() {
+        let then_args = vec![col_ref(4, "case_then")];
+        let then_expr = typed_expr(ExprKind::FunctionCall {
+            binding: crate::analysis::test_function_binding(
+                "then_fn",
+                &then_args,
+                DataType::Int64,
+                true,
+                crate::functions::FunctionVolatility::Immutable,
+            ),
+            volatility: crate::functions::builtin_function_volatility("then_fn"),
+            name: "then_fn".to_string(),
+            args: then_args,
+            distinct: false,
+        });
+        let args = vec![
+            unset_col_ref("unset"),
+            typed_expr(ExprKind::AggregateCall {
+                name: "sum".to_string(),
+                args: vec![col_ref(7, "agg_arg")],
+                distinct: false,
+                order_by: vec![sort_item(col_ref(3, "agg_order"))],
+                resolved: crate::functions::test_resolved_aggregate(
+                    "sum",
+                    &[DataType::Int64],
+                    false,
+                ),
+            }),
+            typed_expr(ExprKind::Case {
+                operand: Some(Box::new(col_ref(6, "case_operand"))),
+                when_then: vec![(col_ref(5, "case_when"), then_expr)],
+                else_expr: Some(Box::new(col_ref(2, "case_else"))),
+            }),
+            typed_expr(ExprKind::WindowCall {
+                name: "row_number".to_string(),
+                args: vec![col_ref(9, "window_arg")],
+                distinct: false,
+                binding: crate::analysis::test_window_binding(
+                    "row_number",
+                    &[col_ref(9, "window_arg")],
+                    DataType::Int64,
+                    false,
+                ),
+                function_order_by: vec![],
+                aggregate_binding: None,
+                partition_by: vec![col_ref(8, "window_partition")],
+                order_by: vec![sort_item(col_ref(1, "window_order"))],
+                window_frame: None,
+                ignore_nulls: false,
+            }),
+            typed_expr(ExprKind::Lambda {
+                params: vec!["x".to_string()],
+                body: Box::new(col_ref(10, "lambda_body")),
+            }),
+        ];
         let expr = typed_expr(ExprKind::FunctionCall {
+            binding: crate::analysis::test_function_binding(
+                "outer_fn",
+                &args,
+                DataType::Int64,
+                true,
+                crate::functions::FunctionVolatility::Immutable,
+            ),
             name: "outer_fn".to_string(),
-            args: vec![
-                unset_col_ref("unset"),
-                typed_expr(ExprKind::AggregateCall {
-                    name: "sum".to_string(),
-                    args: vec![col_ref(7, "agg_arg")],
-                    distinct: false,
-                    order_by: vec![sort_item(col_ref(3, "agg_order"))],
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
-                    ),
-                }),
-                typed_expr(ExprKind::Case {
-                    operand: Some(Box::new(col_ref(6, "case_operand"))),
-                    when_then: vec![(
-                        col_ref(5, "case_when"),
-                        typed_expr(ExprKind::FunctionCall {
-                            volatility: crate::functions::builtin_function_volatility("then_fn"),
-                            name: "then_fn".to_string(),
-                            args: vec![col_ref(4, "case_then")],
-                            distinct: false,
-                        }),
-                    )],
-                    else_expr: Some(Box::new(col_ref(2, "case_else"))),
-                }),
-                typed_expr(ExprKind::WindowCall {
-                    name: "row_number".to_string(),
-                    args: vec![col_ref(9, "window_arg")],
-                    distinct: false,
-                    function_order_by: vec![],
-                    aggregate_binding: None,
-                    partition_by: vec![col_ref(8, "window_partition")],
-                    order_by: vec![sort_item(col_ref(1, "window_order"))],
-                    window_frame: None,
-                    ignore_nulls: false,
-                }),
-                typed_expr(ExprKind::Lambda {
-                    params: vec!["x".to_string()],
-                    body: Box::new(col_ref(10, "lambda_body")),
-                }),
-            ],
+            args,
             distinct: false,
             volatility: crate::functions::FunctionVolatility::Immutable,
         });
@@ -2181,6 +2212,12 @@ mod tests {
                 join_type,
                 eq_conditions,
                 other_condition: None,
+                build_side: match join_type {
+                    JoinKind::RightSemi | JoinKind::RightAnti => {
+                        crate::planner::physical::PhysicalHashJoinBuildSide::Left
+                    }
+                    _ => crate::planner::physical::PhysicalHashJoinBuildSide::Right,
+                },
                 distribution,
                 execution_mode,
                 build_runtime_filters: vec![],

@@ -357,6 +357,12 @@ fn bind_incremental_write_dataflow(
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
@@ -369,12 +375,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                 },
             )?;
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -385,6 +386,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                compile_control,
                 sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal
@@ -439,6 +441,12 @@ fn bind_incremental_write_dataflow(
                 base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
@@ -453,12 +461,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                 },
             )?;
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -469,6 +472,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                compile_control,
                 sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal

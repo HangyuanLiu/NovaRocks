@@ -185,6 +185,7 @@ fn remap_scalar(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => {
             let args = remap_scalar_vec(arena, args, bindings)?;
@@ -193,6 +194,7 @@ fn remap_scalar(
                     name,
                     args,
                     distinct,
+                    binding,
                     volatility,
                 },
                 data_type,
@@ -340,6 +342,7 @@ fn remap_scalar(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -356,6 +359,7 @@ fn remap_scalar(
                     name,
                     args,
                     distinct,
+                    binding,
                     function_order_by,
                     aggregate_binding,
                     partition_by,

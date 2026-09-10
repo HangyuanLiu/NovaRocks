@@ -36,35 +36,13 @@ use crate::connector::read_stack::{
     SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    CatalogHandle, ConnectorAttemptContext, ConnectorError, ConnectorInstanceDescriptor,
-    ConnectorPinnedFileSet, ConnectorPlanningContext, ConnectorRequestContext,
+    ConnectorAttemptContext, ConnectorError, ConnectorPinnedFileSet, ConnectorPlanningContext,
+    ConnectorRequestContext,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorReadBinding {
-    descriptor: ConnectorInstanceDescriptor,
-    catalog_handle: CatalogHandle,
-}
-
-impl ConnectorReadBinding {
-    pub const fn new(
-        descriptor: ConnectorInstanceDescriptor,
-        catalog_handle: CatalogHandle,
-    ) -> Self {
-        Self {
-            descriptor,
-            catalog_handle,
-        }
-    }
-
-    pub const fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-        &self.descriptor
-    }
-
-    pub const fn catalog_handle(&self) -> &CatalogHandle {
-        &self.catalog_handle
-    }
-}
+pub use novarocks_connector_contract::{
+    ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource,
+};
 
 #[derive(Clone)]
 struct OpaquePayload(Arc<dyn Any + Send + Sync>);
@@ -206,14 +184,14 @@ impl PartialOrd for ConnectorReadColumnHandle {
 impl Ord for ConnectorReadColumnHandle {
     fn cmp(&self, other: &Self) -> Ordering {
         (
-            self.binding.descriptor.provider_id.as_str(),
-            self.binding.descriptor.instance_id.as_str(),
-            self.binding.catalog_handle.version().as_bytes(),
+            self.binding.descriptor().provider_id.as_str(),
+            self.binding.descriptor().instance_id.as_str(),
+            self.binding.catalog_handle().version().as_bytes(),
         )
             .cmp(&(
-                other.binding.descriptor.provider_id.as_str(),
-                other.binding.descriptor.instance_id.as_str(),
-                other.binding.catalog_handle.version().as_bytes(),
+                other.binding.descriptor().provider_id.as_str(),
+                other.binding.descriptor().instance_id.as_str(),
+                other.binding.catalog_handle().version().as_bytes(),
             ))
             .then_with(|| {
                 self.comparison
@@ -406,25 +384,6 @@ pub enum ConnectorReadRelationVersion {
     Current,
     SnapshotId(i64),
     Reference,
-}
-
-/// The neutral category of a frozen read relation. The central IDL remains
-/// the closed source of truth for its wire representation; this enum retains
-/// only the business category after a codec has decoded the carrier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorReadRelationKind {
-    Table,
-    TableFunction,
-    ChangeWindow,
-    SystemTable,
-    TableExecute,
-    MergeTable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorReadWorkSource {
-    RuntimeSplits,
-    WholeRelation,
 }
 
 #[derive(Clone, Debug)]

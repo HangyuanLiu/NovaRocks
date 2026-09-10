@@ -579,6 +579,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "date_trunc",
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Date], TypeSpec::Date),
     );
+    add(
+        m,
+        "date_trunc",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Datetime),
+    );
 
     // Datetime extractors -> Int32.
     for name in [
@@ -693,12 +698,31 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(vec![TypeSpec::Date], TypeSpec::Date),
     );
 
-    // time_slice / date_slice preserve first arg type.
+    // time_slice / date_slice preserve the first argument type. The interval
+    // rewrite produces exactly `(value, count, unit[, boundary])`; the unit
+    // and optional boundary are independent strings rather than repetitions
+    // of the value type.
     for name in ["time_slice", "date_slice"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64, TypeSpec::Utf8],
+                TypeSpec::Any("T"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::Any("T"),
+                    TypeSpec::Int64,
+                    TypeSpec::Utf8,
+                    TypeSpec::Utf8,
+                ],
+                TypeSpec::Any("T"),
+            ),
         );
     }
 }
@@ -888,7 +912,6 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "array_slice",
         "array_remove",
         "array_filter",
-        "array_map",
         "array_top_n",
     ] {
         add(
@@ -993,15 +1016,10 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // map_filter / distinct_map_keys / map_apply / transform_keys /
-    // transform_values: preserve first-arg map type.
-    for name in [
-        "map_filter",
-        "distinct_map_keys",
-        "map_apply",
-        "transform_keys",
-        "transform_values",
-    ] {
+    // Map-preserving value functions. Lambda-bearing transforms are bound by
+    // the dynamic exact resolver because their lambda contract is part of the
+    // selected argument shape.
+    for name in ["map_filter", "distinct_map_keys"] {
         add(
             m,
             name,
@@ -1067,6 +1085,11 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         m,
         "ntile",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
+    );
+    add(
+        m,
+        "session_number",
+        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Int64),
     );
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));

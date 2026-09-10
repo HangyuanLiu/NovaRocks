@@ -840,6 +840,13 @@ mod tests {
             arena,
             TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    binding: crate::analysis::test_function_binding(
+                        "rand",
+                        &[],
+                        DataType::Float64,
+                        false,
+                        crate::functions::FunctionVolatility::Volatile,
+                    ),
                     volatility: crate::functions::FunctionVolatility::Volatile,
                     name: "rand".to_string(),
                     args: vec![],

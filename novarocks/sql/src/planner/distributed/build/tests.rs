@@ -350,7 +350,7 @@ fn build_distributed_plan_preserves_filter_over_scan_without_mutating_scan() {
             alias: Some("t".to_string()),
             columns: scan_columns.clone(),
             predicates: vec![bool_lit(true)],
-            required_columns: Some(vec!["k".to_string(), "predicate_only".to_string()]),
+            required_columns: Some(vec![scan_columns[0].column_id, scan_columns[1].column_id]),
             variant_columns: vec![],
             mv_rewritten_from: None,
         }),
@@ -390,7 +390,7 @@ fn build_distributed_plan_preserves_filter_over_scan_without_mutating_scan() {
     assert_bool_lit(&scan.predicates[0], true);
     assert_eq!(
         scan.required_columns.as_ref(),
-        Some(&vec!["k".to_string(), "predicate_only".to_string()])
+        Some(&vec![ColumnId::new_for_test(1), ColumnId::new_for_test(2)])
     );
 }
 
@@ -546,6 +546,7 @@ fn build_distributed_plan_hash_join_combines_child_tuples() {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
             execution_mode: None,
             build_runtime_filters: vec![],
@@ -659,6 +660,7 @@ fn build_distributed_plan_seals_partitioned_join_progress_certificate() {
                 null_safe: false,
             }],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
             execution_mode: Some(JoinExecutionMode::Partitioned),
             build_runtime_filters: vec![RuntimeFilterBuildIntent {
@@ -806,6 +808,7 @@ fn rfd_5a_join_population_is_deterministic_and_node_carried_only_by_binding_id()
                 null_safe: true,
             }],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
             execution_mode: Some(JoinExecutionMode::Broadcast),
             build_runtime_filters: vec![RuntimeFilterBuildIntent {
@@ -933,6 +936,7 @@ fn rfd_5a_graph_disambiguates_duplicate_build_expressions_by_binding_order() {
                 },
             ],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
             execution_mode: Some(JoinExecutionMode::Broadcast),
             build_runtime_filters: vec![
@@ -1186,6 +1190,7 @@ fn build_distributed_plan_keeps_runtime_filter_probe_on_filter() {
                 null_safe: false,
             }],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
             execution_mode: Some(JoinExecutionMode::Partitioned),
             build_runtime_filters: vec![RuntimeFilterBuildIntent {
@@ -1709,6 +1714,15 @@ fn build_distributed_plan_table_function_replicates_dummy_allocations() {
         kind: PhysicalPlanKind::TableFunction(PlanTableFunctionNode {
             function_name: "unnest".to_string(),
             args: vec![],
+            binding: crate::optimizer::scalar::test_table_binding(
+                &crate::optimizer::scalar::ScalarArena::new(),
+                "unnest",
+                &[],
+                &[novarocks_functions::FunctionValueType::new(
+                    DataType::Int64,
+                    false,
+                )],
+            ),
             output_columns: output_columns.clone(),
             alias: None,
             is_left_join: false,
@@ -1984,6 +1998,7 @@ fn fragment_cut_seam_preserves_exchange_topology_before_rf_binding() {
                 null_safe: false,
             }],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
             execution_mode: Some(JoinExecutionMode::Partitioned),
             build_runtime_filters: vec![RuntimeFilterBuildIntent {
@@ -2173,7 +2188,11 @@ fn build_distributed_plan_stream_edge_drops_scan_columns_pruned_from_required() 
     ];
     let mut scan = scan_node_with_columns(source_columns.clone());
     if let PhysicalPlanKind::Scan(scan) = &mut scan.kind {
-        scan.required_columns = Some(vec!["c0".to_string(), "c1".to_string(), "c3".to_string()]);
+        scan.required_columns = Some(vec![
+            source_columns[0].column_id,
+            source_columns[1].column_id,
+            source_columns[3].column_id,
+        ]);
     }
     let materialized_scan_columns = vec![
         source_columns[0].clone(),
@@ -2222,7 +2241,7 @@ fn build_distributed_plan_stream_edge_drops_join_columns_pruned_from_child_sourc
     let right_columns = vec![output_col(4, "r_c0", DataType::Int64, false)];
     let mut left = scan_node_with_columns(left_columns.clone());
     if let PhysicalPlanKind::Scan(scan) = &mut left.kind {
-        scan.required_columns = Some(vec!["l_c0".to_string(), "l_c1".to_string()]);
+        scan.required_columns = Some(vec![left_columns[0].column_id, left_columns[1].column_id]);
     }
     let right = scan_node_with_columns(right_columns.clone());
     let join_output_columns = vec![
@@ -2235,6 +2254,7 @@ fn build_distributed_plan_stream_edge_drops_join_columns_pruned_from_child_sourc
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: vec![],
@@ -2298,9 +2318,9 @@ fn build_distributed_plan_stream_edge_drops_redistribute_child_columns_pruned_fr
     let mut right = scan_node_with_columns(right_columns.clone());
     if let PhysicalPlanKind::Scan(scan) = &mut right.kind {
         scan.required_columns = Some(vec![
-            "r_c0".to_string(),
-            "r_c1".to_string(),
-            "r_c3".to_string(),
+            right_columns[0].column_id,
+            right_columns[1].column_id,
+            right_columns[3].column_id,
         ]);
     }
     let right_redistribute = PhysicalPlanNode {
@@ -2328,6 +2348,7 @@ fn build_distributed_plan_stream_edge_drops_redistribute_child_columns_pruned_fr
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: vec![],
@@ -3075,6 +3096,7 @@ fn build_distributed_plan_collects_multiple_cte_exchange_nodes_in_root_tree() {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
             execution_mode: None,
             build_runtime_filters: vec![],
@@ -3994,6 +4016,7 @@ fn distributed_hash_join_node_with_exchanges(
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
             execution_mode: Some(JoinExecutionMode::Partitioned),
             build_runtime_filters: vec![],
@@ -4048,6 +4071,7 @@ fn window_expr(
         name: "row_number".to_string(),
         args: vec![],
         distinct: false,
+        binding: crate::analysis::test_window_binding("row_number", &[], DataType::Int64, false),
         function_order_by: vec![],
         aggregate_binding: None,
         partition_by,

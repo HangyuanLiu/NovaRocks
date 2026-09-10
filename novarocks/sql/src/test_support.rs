@@ -868,6 +868,7 @@ fn native_reconciled_hash_join_plan() -> Result<DistributedPlan, String> {
             join_type: JoinKind::Inner,
             eq_conditions: Vec::new(),
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
             execution_mode: None,
             build_runtime_filters: Vec::new(),
@@ -1122,7 +1123,7 @@ fn native_pruned_connector_scan_stream_edge_plan() -> Result<DistributedPlan, St
                 alias: None,
                 columns: all_columns,
                 predicates: Vec::new(),
-                required_columns: Some(vec!["s2".to_string(), "array1".to_string()]),
+                required_columns: Some(vec![ColumnId(2), ColumnId(3)]),
                 variant_columns: Vec::new(),
                 mv_rewritten_from: None,
             }),
@@ -1685,6 +1686,7 @@ fn native_cte_multicast_ordering_plan() -> Result<DistributedPlan, String> {
                 join_type: JoinKind::Inner,
                 eq_conditions: Vec::new(),
                 other_condition: None,
+                build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
                 execution_mode: None,
                 build_runtime_filters: Vec::new(),
@@ -1898,6 +1900,19 @@ fn native_ordinary_iceberg_required_payload_scan_plan() -> Result<DistributedPla
 }
 
 fn native_unsupported_predicate_scan_plan() -> Result<DistributedPlan, String> {
+    let predicate_args = vec![TypedExpr {
+        kind: ExprKind::BinaryOp {
+            left: Box::new(column_expr(1, "id", DataType::Int32)),
+            op: BinOp::Eq,
+            right: Box::new(TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Int(12)),
+                data_type: DataType::Int32,
+                nullable: false,
+            }),
+        },
+        data_type: DataType::Boolean,
+        nullable: false,
+    }];
     let root = DistributedNode {
         node_id: 10,
         fragment_id: 0,
@@ -1921,20 +1936,15 @@ fn native_unsupported_predicate_scan_plan() -> Result<DistributedPlan, String> {
             columns: vec![output_column(1, "id", DataType::Int32)],
             predicates: vec![TypedExpr {
                 kind: ExprKind::FunctionCall {
+                    binding: crate::analysis::test_function_binding(
+                        "abs",
+                        &predicate_args,
+                        DataType::Boolean,
+                        false,
+                        FunctionVolatility::Immutable,
+                    ),
                     name: "abs".to_string(),
-                    args: vec![TypedExpr {
-                        kind: ExprKind::BinaryOp {
-                            left: Box::new(column_expr(1, "id", DataType::Int32)),
-                            op: BinOp::Eq,
-                            right: Box::new(TypedExpr {
-                                kind: ExprKind::Literal(LiteralValue::Int(12)),
-                                data_type: DataType::Int32,
-                                nullable: false,
-                            }),
-                        },
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                    }],
+                    args: predicate_args,
                     distinct: false,
                     volatility: FunctionVolatility::Immutable,
                 },
@@ -2009,7 +2019,15 @@ fn native_variant_projection_scan_plan() -> Result<DistributedPlan, String> {
             synthetic_column: "__nr_var_v_0".to_string(),
             canonical_path: "$.a.b".to_string(),
             requested_type: DataType::Int64,
+            requested_type_literal: "bigint".to_string(),
             strict: true,
+            binding: crate::analysis::test_function_binding(
+                "variant_get",
+                &[],
+                DataType::Int64,
+                false,
+                novarocks_functions::FunctionVolatility::Immutable,
+            ),
         }],
     )
 }
@@ -2285,6 +2303,41 @@ fn native_scan_fixture_plan_with_lineage(
     predicates: Vec<TypedExpr>,
     iceberg_row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
 ) -> Result<DistributedPlan, String> {
+    let required_columns = required_columns
+        .map(|required| {
+            required
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, name)| {
+                    let mut matches = output_columns
+                        .iter()
+                        .filter(|column| column.name.eq_ignore_ascii_case(&name));
+                    if let Some(column) = matches.next() {
+                        if matches.next().is_some() {
+                            return Err(format!(
+                                "test scan required-column occurrence {ordinal} `{name}` is ambiguous"
+                            ));
+                        }
+                        return Ok(column.column_id);
+                    }
+                    let source_matches = table_columns
+                        .iter()
+                        .chain(&iceberg_row_lineage_metadata_columns)
+                        .enumerate()
+                        .filter(|(_, column)| column.name.eq_ignore_ascii_case(&name))
+                        .collect::<Vec<_>>();
+                    let [(source_ordinal, _)] = source_matches.as_slice() else {
+                        return Err(format!(
+                            "test scan required-column occurrence {ordinal} `{name}` has no unique source schema ordinal"
+                        ));
+                    };
+                    let source_id = u32::try_from(*source_ordinal + 1)
+                        .map_err(|_| "test scan source ordinal exceeds ColumnId".to_string())?;
+                    Ok(ColumnId(source_id))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .transpose()?;
     let table = TableDef {
         name: "orders".to_string(),
         columns: table_columns,
@@ -2395,6 +2448,7 @@ pub fn native_expression_variants() -> Vec<TypedExpr> {
         asc: false,
         nulls_first: true,
     };
+    let function_args = vec![column.clone()];
 
     vec![
         column_expr(1, "c1", DataType::Int64),
@@ -2426,8 +2480,15 @@ pub fn native_expression_variants() -> Vec<TypedExpr> {
         },
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "abs",
+                    &function_args,
+                    DataType::Int64,
+                    true,
+                    FunctionVolatility::Immutable,
+                ),
                 name: "abs".to_string(),
-                args: vec![column.clone()],
+                args: function_args,
                 distinct: false,
                 volatility: FunctionVolatility::Immutable,
             },
@@ -2522,6 +2583,7 @@ pub fn native_expression_variants() -> Vec<TypedExpr> {
                 name: "rank".to_string(),
                 args: vec![],
                 distinct: false,
+                binding: crate::analysis::test_window_binding("rank", &[], DataType::Int64, false),
                 function_order_by: vec![],
                 aggregate_binding: None,
                 partition_by: vec![column],
@@ -2547,10 +2609,18 @@ pub fn native_lambda_expression() -> TypedExpr {
 
 /// An immutable scalar call representative of the function-call wire arm.
 pub fn native_immutable_function_expression() -> TypedExpr {
+    let args = vec![column_expr(1, "c1", DataType::Int64)];
     TypedExpr {
         kind: ExprKind::FunctionCall {
+            binding: crate::analysis::test_function_binding(
+                "abs",
+                &args,
+                DataType::Int64,
+                true,
+                FunctionVolatility::Immutable,
+            ),
             name: "abs".to_string(),
-            args: vec![column_expr(1, "c1", DataType::Int64)],
+            args,
             distinct: false,
             volatility: FunctionVolatility::Immutable,
         },
@@ -2591,6 +2661,7 @@ pub fn native_window_expression() -> TypedExpr {
             name: "rank".to_string(),
             args: vec![],
             distinct: false,
+            binding: crate::analysis::test_window_binding("rank", &[], DataType::Int64, false),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![column.clone()],

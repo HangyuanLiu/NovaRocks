@@ -45,6 +45,44 @@ pub(crate) enum JoinDistribution {
     Shuffle,
     Broadcast,
     Colocate,
+    Singleton,
+}
+
+/// Exact physical input chosen as the hash-table build side.
+///
+/// This is a planner decision, not a convention that final lowering may
+/// reconstruct from a join name or from child order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HashJoinBuildSide {
+    Left,
+    Right,
+}
+
+impl HashJoinBuildSide {
+    pub(crate) const fn input_ordinal(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+        }
+    }
+
+    pub(crate) const fn probe_ordinal(self) -> usize {
+        1 - self.input_ordinal()
+    }
+}
+
+pub(crate) const fn exact_hash_join_build_side(join_type: JoinKind) -> Option<HashJoinBuildSide> {
+    match join_type {
+        JoinKind::Cross => None,
+        JoinKind::RightSemi | JoinKind::RightAnti => Some(HashJoinBuildSide::Left),
+        JoinKind::Inner
+        | JoinKind::LeftOuter
+        | JoinKind::RightOuter
+        | JoinKind::FullOuter
+        | JoinKind::LeftSemi
+        | JoinKind::LeftAnti
+        | JoinKind::NullAwareLeftAnti => Some(HashJoinBuildSide::Right),
+    }
 }
 
 #[allow(dead_code)]
@@ -107,7 +145,7 @@ pub(crate) struct ScalarAggregateSpec {
     pub args: Vec<ScalarId>,
     pub distinct: bool,
     pub order_by: Vec<SortKey>,
-    pub resolved: novarocks_functions::ResolvedAggregateSignature,
+    pub resolved: crate::binding::SqlFunctionBinding,
 }
 
 #[derive(Clone, Debug)]
@@ -221,8 +259,9 @@ pub(crate) struct ScalarWindowSpec {
     pub name: String,
     pub args: Vec<ScalarId>,
     pub distinct: bool,
+    pub binding: crate::binding::SqlFunctionBinding,
     pub function_order_by: Vec<SortKey>,
-    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+    pub aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
     pub partition_by: Vec<ScalarId>,
     pub order_by: Vec<SortKey>,
     pub window_frame: Option<WindowFrame>,
@@ -237,7 +276,10 @@ pub(crate) struct ScanOp {
     pub stats_ref: Option<StatsRef>,
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<ScalarId>,
-    pub required_columns: Option<Vec<String>>,
+    /// Exact ordered output occurrences materialized by this scan. Synthetic
+    /// VARIANT outputs remain explicit here and are separated from provider
+    /// fields only when the provider read contract is built.
+    pub required_columns: Option<Vec<ColumnId>>,
     /// Synthetic typed columns materialized from variant paths during scan.
     /// Populated by `VariantPathPushdownRule` and propagated to
     /// `ScanOp` by `ScanToPhysical`.
@@ -425,6 +467,7 @@ pub(crate) struct GenerateSeriesOp {
 pub(crate) struct TableFunctionOp {
     pub function_name: String,
     pub args: Vec<ScalarId>,
+    pub binding: crate::binding::SqlFunctionBinding,
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
@@ -574,6 +617,7 @@ pub(crate) struct PhysicalHashJoinOp {
     pub join_type: JoinKind,
     pub eq_conditions: Vec<PhysicalHashJoinEqCondition>,
     pub other_condition: Option<ScalarId>,
+    pub build_side: HashJoinBuildSide,
     pub distribution: JoinDistribution,
 }
 
@@ -719,6 +763,31 @@ mod aggregate_stage_tests {
     use crate::optimizer::scalar::ScalarArena;
 
     use crate::planner::optimizer_bridge::scalar::intern_typed;
+
+    #[test]
+    fn hash_join_build_side_is_a_closed_planner_decision() {
+        for kind in [JoinKind::RightSemi, JoinKind::RightAnti] {
+            assert_eq!(
+                exact_hash_join_build_side(kind),
+                Some(HashJoinBuildSide::Left)
+            );
+        }
+        for kind in [
+            JoinKind::Inner,
+            JoinKind::LeftOuter,
+            JoinKind::RightOuter,
+            JoinKind::FullOuter,
+            JoinKind::LeftSemi,
+            JoinKind::LeftAnti,
+            JoinKind::NullAwareLeftAnti,
+        ] {
+            assert_eq!(
+                exact_hash_join_build_side(kind),
+                Some(HashJoinBuildSide::Right)
+            );
+        }
+        assert_eq!(exact_hash_join_build_side(JoinKind::Cross), None);
+    }
 
     fn output_column(id: u32, name: &str) -> OutputColumn {
         OutputColumn {

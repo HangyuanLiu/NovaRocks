@@ -21,7 +21,7 @@
 //! It deliberately contains Arrow/runtime facts only; physical DDL and
 //! durable contracts remain with their respective owners.
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 
 /// Runtime aggregate operation used by aggregate state kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

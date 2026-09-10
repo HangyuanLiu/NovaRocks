@@ -142,12 +142,17 @@ fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
     };
 
     // The catalog and function-capability bindings have left scope. Phase two
-    // can receive only the move-only analyzed handle and immutable statistics.
+    // receives the move-only analyzed handle, immutable statistics, and only
+    // the invocation-scoped control selected by its caller.
     let statistics = DmlStatisticsSnapshot::empty();
-    let plan = SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-        .expect("public optimize request consumes frozen statistics")
-        .into_distributed_plan()
-        .expect("query intent produces a sealed distributed plan");
+    let plan = SqlCompiler::optimize(SqlOptimizeRequest::new(
+        analyzed,
+        &statistics,
+        SqlCompileControl::unbounded(),
+    ))
+    .expect("public optimize request consumes frozen statistics")
+    .into_distributed_plan()
+    .expect("query intent produces a sealed distributed plan");
     assert!(!plan.fragments().is_empty());
 
     let _: Option<SqlTableBindingId> = None;

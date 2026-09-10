@@ -230,6 +230,7 @@ pub(crate) struct GenerateSeriesRelation {
 #[derive(Clone, Debug)]
 pub(crate) struct UnnestRelation {
     pub args: Vec<TypedExpr>,
+    pub binding: crate::binding::SqlFunctionBinding,
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
 }
@@ -339,6 +340,229 @@ pub struct TypedExpr {
     pub nullable: bool,
 }
 
+pub(crate) fn function_argument(expr: &TypedExpr) -> novarocks_functions::FunctionArgument {
+    use novarocks_functions::{FunctionArgument, FunctionLiteral, FunctionValueType};
+
+    match &expr.kind {
+        ExprKind::LambdaFunction { params, body } => FunctionArgument::Lambda {
+            parameter_types: params
+                .iter()
+                .map(|param| FunctionValueType::new(param.data_type.clone(), param.nullable))
+                .collect(),
+            result_type: FunctionValueType::new(body.data_type.clone(), body.nullable),
+        },
+        ExprKind::Literal(value) => {
+            let constant = match value {
+                LiteralValue::Null => Some(FunctionLiteral::Null),
+                LiteralValue::Bool(value) => Some(FunctionLiteral::Boolean(*value)),
+                LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
+                LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
+                LiteralValue::Float(value) => Some(FunctionLiteral::Float64Bits(value.to_bits())),
+                LiteralValue::Decimal(value) => match &expr.data_type {
+                    DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
+                        decimal128_literal_unscaled(value, *scale).unwrap_or_else(|message| {
+                            panic!(
+                                "analyzed Decimal128 literal must have an exact value: {message}"
+                            )
+                        }),
+                    )),
+                    _ => None,
+                },
+                LiteralValue::String(value) => {
+                    Some(FunctionLiteral::Utf8(value.clone().into_boxed_str()))
+                }
+                LiteralValue::Binary(value) => {
+                    Some(FunctionLiteral::Binary(value.clone().into_boxed_slice()))
+                }
+            };
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
+                constant,
+            }
+        }
+        _ => FunctionArgument::Value {
+            value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
+            constant: None,
+        },
+    }
+}
+
+pub(crate) fn decimal128_literal_unscaled(value: &str, scale: i8) -> Result<i128, String> {
+    let scale = usize::try_from(scale)
+        .map_err(|_| format!("negative Decimal128 literal scale is unsupported: {scale}"))?;
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |rest| (true, rest));
+    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("invalid Decimal128 literal `{value}`"));
+    }
+    let (retained_fraction, discarded_fraction) = if fraction.len() > scale {
+        fraction.split_at(scale)
+    } else {
+        (fraction, "")
+    };
+    if discarded_fraction.bytes().any(|byte| byte != b'0') {
+        return Err(format!(
+            "Decimal128 literal `{value}` cannot be represented exactly at scale {scale}"
+        ));
+    }
+    let digits = format!(
+        "{}{}{}",
+        if integer.is_empty() { "0" } else { integer },
+        retained_fraction,
+        "0".repeat(scale.saturating_sub(retained_fraction.len()))
+    );
+    let magnitude = digits
+        .parse::<u128>()
+        .map_err(|_| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))?;
+    let magnitude = i128::try_from(magnitude)
+        .map_err(|_| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))?;
+    if negative {
+        magnitude
+            .checked_neg()
+            .ok_or_else(|| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))
+    } else {
+        Ok(magnitude)
+    }
+}
+
+fn converse_window_bound(bound: &WindowBound) -> WindowBound {
+    match bound {
+        WindowBound::UnboundedPreceding => WindowBound::UnboundedFollowing,
+        WindowBound::UnboundedFollowing => WindowBound::UnboundedPreceding,
+        WindowBound::Preceding(value) => WindowBound::Following(*value),
+        WindowBound::Following(value) => WindowBound::Preceding(*value),
+        WindowBound::CurrentRow => WindowBound::CurrentRow,
+    }
+}
+
+/// Freezes the execution shape before window function binding. This keeps a
+/// FIRST_VALUE/LAST_VALUE swap and its exact function identity atomic.
+pub(crate) fn normalize_window_for_execution(
+    name: &str,
+    order_by: Vec<SortItem>,
+    window_frame: Option<WindowFrame>,
+) -> (String, Vec<SortItem>, Option<WindowFrame>) {
+    let Some(frame) = window_frame else {
+        return (name.to_string(), order_by, None);
+    };
+    let needs_reverse = matches!(frame.end, WindowBound::UnboundedFollowing)
+        && !matches!(frame.start, WindowBound::UnboundedPreceding);
+    if !needs_reverse {
+        return (name.to_string(), order_by, Some(frame));
+    }
+    let order_by = order_by
+        .into_iter()
+        .map(|item| SortItem {
+            expr: item.expr,
+            asc: !item.asc,
+            nulls_first: !item.nulls_first,
+        })
+        .collect();
+    let window_frame = Some(WindowFrame {
+        frame_type: frame.frame_type,
+        start: converse_window_bound(&frame.end),
+        end: converse_window_bound(&frame.start),
+    });
+    let name = match name.to_ascii_lowercase().as_str() {
+        "first_value" => "last_value".to_string(),
+        "last_value" => "first_value".to_string(),
+        _ => name.to_string(),
+    };
+    (name, order_by, window_frame)
+}
+
+pub(crate) fn resolve_function_binding(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    args: &[TypedExpr],
+) -> Result<crate::binding::SqlFunctionBinding, String> {
+    let arguments = args.iter().map(function_argument).collect::<Vec<_>>();
+    catalog
+        .resolve_scalar_binding(name, &arguments)
+        .map(crate::binding::SqlFunctionBinding::new)
+        .map_err(|error| error.to_string())
+}
+
+/// Builds an explicit, fully typed function contract for structural IR tests
+/// that do not run the analyzer. Production code must always resolve through
+/// the injected catalog before constructing a function call.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_function_binding(
+    name: &str,
+    args: &[TypedExpr],
+    result_type: DataType,
+    result_nullable: bool,
+    volatility: novarocks_functions::FunctionVolatility,
+) -> crate::binding::SqlFunctionBinding {
+    use novarocks_functions::{
+        FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionKind,
+        FunctionOverloadId, FunctionResultType, FunctionSemantics, FunctionValueType,
+        ResolvedFunctionBinding,
+    };
+
+    crate::binding::SqlFunctionBinding::new(ResolvedFunctionBinding {
+        function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
+            .expect("test function identity"),
+        kind: FunctionKind::Scalar,
+        semantics: FunctionSemantics {
+            volatility,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+        },
+        logical_argument_count: args.len(),
+        selected: novarocks_functions::FunctionBindingSelection {
+            overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
+                .expect("test function overload identity"),
+            argument_types: args
+                .iter()
+                .map(function_argument)
+                .map(|argument| argument.argument_type())
+                .collect(),
+            result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                result_type,
+                result_nullable,
+            )),
+            aggregate: None,
+        },
+    })
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_window_binding(
+    name: &str,
+    args: &[TypedExpr],
+    result_type: DataType,
+    result_nullable: bool,
+) -> crate::binding::SqlFunctionBinding {
+    use novarocks_functions::{FunctionId, FunctionKind, FunctionOverloadId};
+
+    let mut binding = test_function_binding(
+        name,
+        args,
+        result_type,
+        result_nullable,
+        novarocks_functions::FunctionVolatility::Immutable,
+    )
+    .as_ref()
+    .clone();
+    binding.function_id = FunctionId::try_new(format!("test.window/{name}/v1"))
+        .expect("test window function identity");
+    binding.kind = FunctionKind::Window;
+    binding.selected.overload =
+        FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
+            .expect("test window function overload identity");
+    crate::binding::SqlFunctionBinding::new(binding)
+}
+
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     /// Resolved column reference.
@@ -364,6 +588,10 @@ pub enum ExprKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        /// Exact argument and result types selected during analysis.
+        /// Downstream stages must preserve this binding and must not resolve
+        /// the call again from its display name.
+        binding: crate::binding::SqlFunctionBinding,
         /// Semantics resolved by the request's immutable function catalog.
         /// The optimizer bridge preserves this value instead of reclassifying
         /// by name from ambient process state.
@@ -384,7 +612,7 @@ pub enum ExprKind {
         args: Vec<TypedExpr>,
         distinct: bool,
         order_by: Vec<SortItem>,
-        resolved: novarocks_functions::ResolvedAggregateSignature,
+        resolved: crate::binding::SqlFunctionBinding,
     },
     /// CAST expression.
     Cast {
@@ -431,13 +659,14 @@ pub enum ExprKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        binding: crate::binding::SqlFunctionBinding,
         /// ORDER BY owned by the aggregate call itself, for example
         /// `array_agg(value ORDER BY key)`. This is distinct from the ORDER BY
         /// in the OVER specification below.
         function_order_by: Vec<SortItem>,
         /// Exact ordinary aggregate overload selected during analysis. Window-only
         /// functions carry `None`; aggregate functions used with OVER carry `Some`.
-        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+        aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
         partition_by: Vec<TypedExpr>,
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,

@@ -233,7 +233,9 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                             aggregate_binding: expr
                                 .aggregate_binding
                                 .as_ref()
-                                .map(encode_resolved_aggregate_signature)
+                                .map(|binding| {
+                                    encode_resolved_function_aggregate_binding(binding.resolved())
+                                })
                                 .transpose()?,
                             partition_by: encode_exprs(&expr.partition_by)?,
                             order_by: encode_sort_items(&expr.order_by)?,
@@ -325,6 +327,9 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                         .aggregates
                         .iter()
                         .map(|call| {
+                            let resolved_signature = encode_resolved_function_aggregate_binding(
+                                call.resolved.resolved(),
+                            )?;
                             Ok(plan::PlanAggregateCall {
                                 name: call.name.clone(),
                                 args: encode_exprs(&call.args)?,
@@ -334,12 +339,10 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                                 // The wire field is the final SQL result type;
                                 // phase carriers are sealed independently in
                                 // output_layout.aggregate_columns.
-                                result_type: Some(encode_type(&call.resolved.output_type)?),
+                                result_type: resolved_signature.output_type.clone(),
                                 order_by: encode_sort_items(&call.order_by)?,
                                 output_column_id: call.output_column_id.0,
-                                resolved_signature: Some(encode_resolved_aggregate_signature(
-                                    &call.resolved,
-                                )?),
+                                resolved_signature: Some(resolved_signature),
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
@@ -548,6 +551,40 @@ pub(super) fn encode_resolved_aggregate_signature(
         intermediate_type: Some(encode_type(&binding.intermediate_type)?),
         output_type: Some(encode_type(&binding.output_type)?),
         state_format_identity: binding.state_format.as_str().to_string(),
+    })
+}
+
+pub(super) fn encode_resolved_function_aggregate_binding(
+    binding: &novarocks_functions::ResolvedFunctionBinding,
+) -> Result<plan::ResolvedAggregateSignature, String> {
+    let novarocks_functions::FunctionResultType::Scalar(output) = &binding.selected.result_type
+    else {
+        return Err("aggregate function selected a relation result".to_string());
+    };
+    let aggregate = binding
+        .selected
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| "aggregate function selected no intermediate state".to_string())?;
+    let argument_types = binding
+        .selected
+        .argument_types
+        .iter()
+        .map(|argument| match argument {
+            novarocks_functions::FunctionArgumentType::Value(value) => {
+                encode_type(&value.data_type)
+            }
+            novarocks_functions::FunctionArgumentType::Lambda { .. } => {
+                Err("aggregate update channel cannot be a lambda".to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(plan::ResolvedAggregateSignature {
+        overload_identity: binding.selected.overload.as_str().to_string(),
+        argument_types,
+        intermediate_type: Some(encode_type(&aggregate.intermediate_type.data_type)?),
+        output_type: Some(encode_type(&output.data_type)?),
+        state_format_identity: aggregate.state_format.as_str().to_string(),
     })
 }
 

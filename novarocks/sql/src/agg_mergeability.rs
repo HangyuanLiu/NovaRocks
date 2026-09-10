@@ -177,7 +177,9 @@ mod tests {
             } else {
                 &[DataType::Int64]
             };
-            let resolved = catalog.resolve_aggregate_user(name, args);
+            let resolved = crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
+                &catalog, name, args,
+            );
             assert!(
                 resolved.is_ok(),
                 "{name} must resolve exactly; got {resolved:?}"

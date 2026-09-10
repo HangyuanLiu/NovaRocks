@@ -75,7 +75,17 @@ fn format_node(plan: &LogicalPlanNode, level: ExplainLevel, indent: usize, out: 
                     ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
                 )
             {
-                out.push(format!("{pad}     columns: {}", cols.join(", ")));
+                let names = cols
+                    .iter()
+                    .map(|required| {
+                        node.columns
+                            .iter()
+                            .find(|column| column.column_id == *required)
+                            .map(|column| column.name.clone())
+                            .unwrap_or_else(|| format!("ColumnId({})", required.0))
+                    })
+                    .collect::<Vec<_>>();
+                out.push(format!("{pad}     columns: {}", names.join(", ")));
             }
             if matches!(
                 level,
@@ -982,6 +992,12 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    binding: crate::analysis::test_window_binding(
+                        "row_number",
+                        &[],
+                        DataType::Int64,
+                        false,
+                    ),
                     function_order_by: vec![],
                     aggregate_binding: None,
                     partition_by: vec![column_expr(1, None, "k")],

@@ -431,7 +431,7 @@ fn rewrite_group_ordinal(
         .ok_or_else(|| invalid("distributed rewrite group is not part of the frozen plan"))?;
     let ordinal = u32::try_from(position)
         .map_err(|_| invalid("distributed rewrite group ordinal space exhausted"))?;
-    WriteTargetOrdinal::try_new(ordinal)
+    Ok(WriteTargetOrdinal::try_new(ordinal)?)
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
