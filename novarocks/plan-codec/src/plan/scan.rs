@@ -139,11 +139,10 @@ fn encode_bound_required_columns<'a>(
         .map(|read| read.name.clone())
         .collect::<Vec<_>>();
     for variant in &src.variant_columns {
-        let required_by_planner = src.required_columns.as_ref().is_none_or(|columns| {
-            columns
-                .iter()
-                .any(|column_id| *column_id == variant.synthetic_column_id)
-        });
+        let required_by_planner = src
+            .required_columns
+            .as_ref()
+            .is_none_or(|columns| columns.contains(&variant.synthetic_column_id));
         if required_by_planner
             && !required
                 .iter()

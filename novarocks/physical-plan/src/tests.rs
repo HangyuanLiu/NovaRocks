@@ -209,8 +209,21 @@ fn metadata_relation(binding: &ConnectorReadBinding, column: ProviderColumnRefer
 }
 
 fn finish_scan_relation(relation: Relation) -> Result<Fragment, ValidationErrors> {
+    finish_scan_relation_at(
+        relation,
+        FragmentId::new(91),
+        ProviderReadOccurrenceId::new(0),
+    )
+}
+
+fn finish_scan_relation_at(
+    relation: Relation,
+    fragment_id: FragmentId,
+    occurrence: ProviderReadOccurrenceId,
+) -> Result<Fragment, ValidationErrors> {
     let column = relation.schema()[0].column.clone();
-    let mut builder = FragmentBuilder::new(FragmentId::new(91));
+    let output_properties = relation.provided_properties().clone();
+    let mut builder = FragmentBuilder::new(fragment_id);
     let scan = builder.reserve_node_id().unwrap();
     let value = builder
         .add_value(
@@ -226,12 +239,13 @@ fn finish_scan_relation(relation: Relation) -> Result<Fragment, ValidationErrors
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
-            output_properties: singleton(),
+            output_properties,
             output: OutputPort {
                 node: scan,
                 columns: Box::from([value]),
             },
             kind: NodeKind::Scan {
+                occurrence,
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
@@ -241,6 +255,59 @@ fn finish_scan_relation(relation: Relation) -> Result<Fragment, ValidationErrors
         })
         .unwrap();
     builder.finish_definition(scan, FragmentSink::Noop, dop())
+}
+
+#[test]
+fn scan_occurrence_is_unique_without_splitting_provider_relation_identity() {
+    let binding = connector_binding();
+    let column = ProviderColumnReference {
+        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 33),
+    };
+    let relation = metadata_relation(&binding, column);
+    let first = finish_scan_relation_at(
+        relation.clone(),
+        FragmentId::new(201),
+        ProviderReadOccurrenceId::new(11),
+    )
+    .unwrap();
+    let second = finish_scan_relation_at(
+        relation.clone(),
+        FragmentId::new(202),
+        ProviderReadOccurrenceId::new(12),
+    )
+    .unwrap();
+    assert_eq!(
+        match &first.nodes()[&first.root()].kind {
+            NodeKind::Scan { relation, .. } => relation.read(),
+            _ => unreachable!(),
+        },
+        match &second.nodes()[&second.root()].kind {
+            NodeKind::Scan { relation, .. } => relation.read(),
+            _ => unreachable!(),
+        }
+    );
+    let mut valid = PlanBuilder::new(version());
+    valid.add_fragment(first).unwrap();
+    valid.add_fragment(second).unwrap();
+    valid.finish().expect("distinct scan occurrences are valid");
+
+    let duplicate_first = finish_scan_relation_at(
+        relation.clone(),
+        FragmentId::new(203),
+        ProviderReadOccurrenceId::new(13),
+    )
+    .unwrap();
+    let duplicate_second = finish_scan_relation_at(
+        relation,
+        FragmentId::new(204),
+        ProviderReadOccurrenceId::new(13),
+    )
+    .unwrap();
+    let mut duplicate = PlanBuilder::new(version());
+    duplicate.add_fragment(duplicate_first).unwrap();
+    duplicate.add_fragment(duplicate_second).unwrap();
+    let error = duplicate.finish().unwrap_err().to_string();
+    assert!(error.contains("provider read occurrence 13 is already owned"));
 }
 
 fn finish_scan_predicate_contract(
@@ -293,6 +360,7 @@ fn finish_scan_predicate_contract(
                 columns: Box::from([value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
@@ -774,6 +842,7 @@ fn metadata_relation_and_progressive_artifact_sink_are_closed_contracts() {
                 columns: Box::from([value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
@@ -1335,6 +1404,7 @@ fn fragment_validation_requires_its_exact_artifact_cut() {
                 columns: Box::from([value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, value)]),
@@ -1715,6 +1785,7 @@ fn sealed_artifact_accepts_exact_source_provenance_across_an_exchange() {
                 columns: Box::from([source_value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, source_value)]),

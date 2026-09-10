@@ -49,6 +49,7 @@ fn provenance_cut_fixture() -> (PhysicalPlan, FragmentId) {
                 columns: Box::from([source_value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: Box::from([(column, source_value)]),

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::WriterAuxiliaryPlan;
+use super::auxiliary::WriterAuxiliaryPlan;
 use super::change_stream::{
     ChangeStreamRoute, ChangeStreamRouterSink, ChangeStreamWriteDagSpec,
     SqlChangeStreamWriteTopology, SqlChangeStreamWriterRoute, route_output_ordinals,
@@ -377,6 +377,7 @@ pub(in crate::planner::distributed) fn with_sql_change_stream_table_writer_finis
             write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             writer_fragment_id,
+            #[cfg(test)]
             sink,
         });
     }
@@ -804,6 +805,9 @@ mod tests {
                 ),
                 input_ordinal,
             )],
+            partition_input_positions: (!partition_ordinals.is_empty())
+                .then_some(vec![0])
+                .unwrap_or_default(),
             output_partition_ordinals: partition_ordinals,
             sink: test_support::simple_sql_write_plan_input(
                 ConnectorWriteInputBinding::RootOutputByOrdinal,
@@ -956,7 +960,7 @@ mod tests {
         assert_eq!(writer_count, 2);
     }
 
-    fn change_stream_auxiliary_plan() -> super::super::WriterAuxiliaryPlan {
+    fn change_stream_auxiliary_plan() -> super::super::auxiliary::WriterAuxiliaryPlan {
         let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_change_stream_blob",
             FunctionVisibility::Hidden,

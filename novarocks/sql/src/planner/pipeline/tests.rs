@@ -139,6 +139,7 @@ fn row_mutation_dag(
                 novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([9; 32]),
                 input_ordinal,
             )],
+            partition_input_positions: Vec::new(),
             output_partition_ordinals: Vec::new(),
             sink: crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
                 crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
@@ -405,6 +406,26 @@ fn keyed_change_stream_assert_is_planned_before_expand_and_distributed_normally(
             .collect::<Vec<_>>()
     );
     assert_eq!(planned.topology.writer_routes.len(), 1);
+    let writer_route = &planned.topology.writer_routes[0];
+    assert_eq!(
+        writer_route.route_id,
+        novarocks_spi::connector::ConnectorWriteRouteId::from_bytes([7; 32])
+    );
+    assert_eq!(writer_route.write_target_ordinal.get(), 0);
+    assert_eq!(
+        writer_route.accepted_effects,
+        vec![novarocks_spi::connector::ConnectorRowMutationEffect::Delete]
+    );
+    assert!(
+        distributed
+            .fragments()
+            .iter()
+            .any(|fragment| fragment.fragment_id == writer_route.writer_fragment_id)
+    );
+    assert!(matches!(
+        writer_route.sink.input,
+        crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal
+    ));
     // Producer, one route writer, and the Root finish fragment.
     assert_eq!(distributed.fragments().len(), 3);
 }

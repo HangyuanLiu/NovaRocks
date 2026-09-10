@@ -28,8 +28,8 @@ use std::fmt;
 
 use novarocks_physical_plan::{
     ArtifactInputRequirement, ArtifactRefId, NullOrdering, PlanBuilder, PlanVersionId,
-    PredicateGuaranteeKind, ProviderColumnReference, ProviderReadReference, SealedArtifactRef,
-    SortDirection, ValueType,
+    PredicateGuaranteeKind, ProviderColumnReference, ProviderReadOccurrenceId,
+    ProviderReadReference, SealedArtifactRef, SortDirection, ValueType,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorFunctionName, ConnectorReadBinding, ConnectorReadRelationKind,
@@ -535,6 +535,7 @@ impl fmt::Debug for ProviderReadPredicateNeed {
 #[derive(Clone, PartialEq)]
 pub struct ProviderReadNeed {
     id: CompileNeedId,
+    occurrence: ProviderReadOccurrenceId,
     binding: SqlTableBindingId,
     relation: ProviderReadRelationNeed,
     columns: Box<[ProviderReadColumnNeed]>,
@@ -547,6 +548,7 @@ impl ProviderReadNeed {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn try_new(
         id: CompileNeedId,
+        occurrence: ProviderReadOccurrenceId,
         binding: SqlTableBindingId,
         relation: ProviderReadRelationNeed,
         columns: impl Into<Box<[ProviderReadColumnNeed]>>,
@@ -585,6 +587,7 @@ impl ProviderReadNeed {
         }
         Ok(Self {
             id,
+            occurrence,
             binding,
             relation,
             columns,
@@ -596,6 +599,10 @@ impl ProviderReadNeed {
 
     pub const fn id(&self) -> CompileNeedId {
         self.id
+    }
+
+    pub const fn occurrence(&self) -> ProviderReadOccurrenceId {
+        self.occurrence
     }
 
     pub const fn binding(&self) -> SqlTableBindingId {
@@ -631,6 +638,7 @@ impl ProviderReadNeed {
     ) -> Self {
         Self::try_new(
             CompileNeedId::new(0),
+            ProviderReadOccurrenceId::new(0),
             binding,
             relation,
             columns,
@@ -697,6 +705,7 @@ impl fmt::Debug for ProviderReadNeed {
         formatter
             .debug_struct("ProviderReadNeed")
             .field("id", &self.id)
+            .field("occurrence", &self.occurrence)
             .field("binding", &self.binding)
             .field("relation", &self.relation)
             .field("projection_columns", &self.columns.len())
@@ -978,12 +987,14 @@ fn catalog_lookup_target_matches_table(
 pub struct StatisticsFact {
     id: CompileNeedId,
     binding: SqlTableBindingId,
+    metrics: Box<[StatisticsMetric]>,
     evidence: DmlStatisticsEvidence,
 }
 
 impl StatisticsFact {
     pub fn try_new(
         need: &StatisticsNeed,
+        metrics: impl Into<Box<[StatisticsMetric]>>,
         evidence: DmlStatisticsEvidence,
     ) -> Result<Self, CompletionProtocolError> {
         let actual = statistics_binding(&evidence);
@@ -994,9 +1005,16 @@ impl StatisticsFact {
                 actual,
             });
         }
+        let metrics = metrics.into();
+        validate_statistics_metric_coverage(need.id, &need.metrics, &metrics)?;
+        if let DmlStatisticsEvidence::Available { evidence, .. } = &evidence {
+            let evidence_metrics = evidence.metrics().keys().cloned().collect::<Vec<_>>();
+            validate_statistics_metric_coverage(need.id, &need.metrics, &evidence_metrics)?;
+        }
         Ok(Self {
             id: need.id,
             binding: need.binding,
+            metrics,
             evidence,
         })
     }
@@ -1007,6 +1025,10 @@ impl StatisticsFact {
 
     pub const fn binding(&self) -> SqlTableBindingId {
         self.binding
+    }
+
+    pub fn metrics(&self) -> &[StatisticsMetric] {
+        &self.metrics
     }
 
     pub const fn evidence(&self) -> &DmlStatisticsEvidence {
@@ -1340,6 +1362,7 @@ impl fmt::Debug for ProviderReadStaticContract {
 #[derive(Clone, PartialEq)]
 pub struct ProviderReadFact {
     id: CompileNeedId,
+    occurrence: ProviderReadOccurrenceId,
     binding: SqlTableBindingId,
     contract: ProviderReadStaticContract,
 }
@@ -1349,6 +1372,7 @@ impl fmt::Debug for ProviderReadFact {
         formatter
             .debug_struct("ProviderReadFact")
             .field("id", &self.id)
+            .field("occurrence", &self.occurrence)
             .field("binding", &self.binding)
             .field("outcome", &"complete_frozen_contract")
             .finish()
@@ -1363,6 +1387,7 @@ impl ProviderReadFact {
         validate_provider_contract(need, &contract)?;
         Ok(Self {
             id: need.id,
+            occurrence: need.occurrence,
             binding: need.binding,
             contract,
         })
@@ -1374,6 +1399,10 @@ impl ProviderReadFact {
 
     pub const fn binding(&self) -> SqlTableBindingId {
         self.binding
+    }
+
+    pub const fn occurrence(&self) -> ProviderReadOccurrenceId {
+        self.occurrence
     }
 
     pub const fn contract(&self) -> &ProviderReadStaticContract {
@@ -1777,8 +1806,25 @@ pub enum CompletionProtocolError {
         expected: SqlTableBindingId,
         actual: SqlTableBindingId,
     },
+    StatisticsMetricMissing {
+        id: CompileNeedId,
+        metric: StatisticsMetric,
+    },
+    StatisticsMetricDuplicate {
+        id: CompileNeedId,
+        metric: StatisticsMetric,
+    },
+    StatisticsMetricExtra {
+        id: CompileNeedId,
+        metric: StatisticsMetric,
+    },
     ProviderBindingMismatch {
         id: CompileNeedId,
+    },
+    ProviderOccurrenceMismatch {
+        id: CompileNeedId,
+        expected: ProviderReadOccurrenceId,
+        actual: ProviderReadOccurrenceId,
     },
     ProviderRequestMismatch {
         id: CompileNeedId,
@@ -1946,10 +1992,36 @@ impl fmt::Display for CompletionProtocolError {
                 actual,
                 expected
             ),
+            Self::StatisticsMetricMissing { id, metric } => write!(
+                formatter,
+                "statistics fact {} is missing requested metric {metric:?}",
+                id.get()
+            ),
+            Self::StatisticsMetricDuplicate { id, metric } => write!(
+                formatter,
+                "statistics fact {} repeats metric {metric:?}",
+                id.get()
+            ),
+            Self::StatisticsMetricExtra { id, metric } => write!(
+                formatter,
+                "statistics fact {} contains unrequested metric {metric:?}",
+                id.get()
+            ),
             Self::ProviderBindingMismatch { id } => write!(
                 formatter,
                 "provider read fact {} has a different SQL binding",
                 id.get()
+            ),
+            Self::ProviderOccurrenceMismatch {
+                id,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "provider read fact {} has occurrence {}, expected {}",
+                id.get(),
+                actual.get(),
+                expected.get()
             ),
             Self::ProviderRequestMismatch { id } => write!(
                 formatter,
@@ -2305,16 +2377,22 @@ fn validate_fact_semantics(
         (SqlNeedBatch::Statistics(needs), SqlFactBatch::Statistics(facts)) => {
             let expected = needs
                 .iter()
-                .map(|need| (need.id, need.binding))
+                .map(|need| (need.id, need))
                 .collect::<BTreeMap<_, _>>();
             for fact in facts.iter() {
-                let binding = expected[&fact.id];
+                let need = expected[&fact.id];
+                let binding = need.binding;
                 if fact.binding != binding || statistics_binding(&fact.evidence) != binding {
                     return Err(CompletionProtocolError::StatisticsBindingMismatch {
                         id: fact.id,
                         expected: binding,
                         actual: fact.binding,
                     });
+                }
+                validate_statistics_metric_coverage(fact.id, &need.metrics, &fact.metrics)?;
+                if let DmlStatisticsEvidence::Available { evidence, .. } = &fact.evidence {
+                    let evidence_metrics = evidence.metrics().keys().cloned().collect::<Vec<_>>();
+                    validate_statistics_metric_coverage(fact.id, &need.metrics, &evidence_metrics)?;
                 }
             }
         }
@@ -2371,6 +2449,13 @@ fn validate_fact_semantics(
                 let need = expected[&fact.id];
                 if fact.binding != need.binding {
                     return Err(CompletionProtocolError::ProviderBindingMismatch { id: fact.id });
+                }
+                if fact.occurrence != need.occurrence {
+                    return Err(CompletionProtocolError::ProviderOccurrenceMismatch {
+                        id: fact.id,
+                        expected: need.occurrence,
+                        actual: fact.occurrence,
+                    });
                 }
                 validate_provider_contract(need, &fact.contract)?;
             }
@@ -2861,6 +2946,10 @@ fn statistics_fact_bytes(fact: &StatisticsFact) -> Result<u64, CompletionProtoco
         StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
     };
 
+    let coverage_bytes = checked_sum([
+        checked_mul(fact.metrics.len(), std::mem::size_of::<StatisticsMetric>()),
+        checked_sum(fact.metrics.iter().map(statistics_metric_bytes)),
+    ])?;
     let dynamic = match &fact.evidence {
         DmlStatisticsEvidence::Missing { label, reason, .. } => checked_sum([
             checked_size(label.capacity()),
@@ -2924,7 +3013,11 @@ fn statistics_fact_bytes(fact: &StatisticsFact) -> Result<u64, CompletionProtoco
             ])?
         }
     };
-    checked_add(std::mem::size_of::<StatisticsFact>() as u64, dynamic)
+    checked_sum([
+        Ok(std::mem::size_of::<StatisticsFact>() as u64),
+        Ok(coverage_bytes),
+        Ok(dynamic),
+    ])
 }
 
 fn materialized_view_facts_bytes(
@@ -3240,6 +3333,36 @@ fn statistics_binding(evidence: &DmlStatisticsEvidence) -> SqlTableBindingId {
     }
 }
 
+fn validate_statistics_metric_coverage(
+    id: CompileNeedId,
+    expected: &[StatisticsMetric],
+    actual: &[StatisticsMetric],
+) -> Result<(), CompletionProtocolError> {
+    let mut actual_set = BTreeSet::new();
+    for metric in actual {
+        if !actual_set.insert(metric) {
+            return Err(CompletionProtocolError::StatisticsMetricDuplicate {
+                id,
+                metric: metric.clone(),
+            });
+        }
+    }
+    let expected_set = expected.iter().collect::<BTreeSet<_>>();
+    if let Some(metric) = expected_set.difference(&actual_set).next() {
+        return Err(CompletionProtocolError::StatisticsMetricMissing {
+            id,
+            metric: (*metric).clone(),
+        });
+    }
+    if let Some(metric) = actual_set.difference(&expected_set).next() {
+        return Err(CompletionProtocolError::StatisticsMetricExtra {
+            id,
+            metric: (*metric).clone(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_relation_identity(identity: &TableIdentity) -> Result<(), CompletionProtocolError> {
     if identity.catalog.trim().is_empty()
         || identity.namespace.trim().is_empty()
@@ -3308,8 +3431,10 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     use arrow::datatypes::DataType;
+    use bytes::Bytes;
     use novarocks_physical_plan::{
         ArtifactFormat, ArtifactFormatId, ArtifactKind, ArtifactSourceBinding, CoverageRange,
         CoverageSet, Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId,
@@ -3323,6 +3448,8 @@ mod tests {
         CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
         ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
         ConnectorInstanceId, ConnectorProviderId, ConnectorReadRelationPayload,
+        StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
+        StatisticsMetricState, StatisticsMissing, StatisticsMissingKind, StatisticsRowCoverage,
     };
 
     use super::*;
@@ -3534,6 +3661,7 @@ mod tests {
         let connector_type = provider_connector_type_for_engine(&ty).unwrap();
         ProviderReadNeed::try_new(
             CompileNeedId::new(id),
+            ProviderReadOccurrenceId::new(id),
             SqlTableBindingId::new_for_test(41),
             ProviderReadRelationNeed::Data {
                 relation: TableIdentity::new("iceberg", "db", "orders"),
@@ -3832,6 +3960,7 @@ mod tests {
                 .unwrap();
         let statistics_fact = StatisticsFact::try_new(
             &statistics_need,
+            statistics_need.metrics().to_vec(),
             DmlStatisticsEvidence::Missing {
                 binding,
                 label: "orders".into(),
@@ -3851,6 +3980,156 @@ mod tests {
             Err(SqlCompileProgressError::Protocol(
                 CompletionProtocolError::FactBatchKindMismatch { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn statistics_fact_requires_exact_metric_coverage_independent_of_order() {
+        let binding = SqlTableBindingId::new_for_test(7);
+        let null_count = StatisticsMetric::NullCount {
+            column: Arc::from("order_key"),
+        };
+        let need = StatisticsNeed::try_new(
+            CompileNeedId::new(9),
+            binding,
+            [StatisticsMetric::RowCount, null_count.clone()],
+        )
+        .unwrap();
+        let missing = || DmlStatisticsEvidence::Missing {
+            binding,
+            label: "orders".into(),
+            reason: "not collected".into(),
+        };
+
+        let fact = StatisticsFact::try_new(
+            &need,
+            [null_count.clone(), StatisticsMetric::RowCount],
+            missing(),
+        )
+        .expect("metric coverage is set-based");
+        assert_eq!(
+            fact.metrics(),
+            &[null_count.clone(), StatisticsMetric::RowCount]
+        );
+
+        assert!(matches!(
+            StatisticsFact::try_new(&need, [StatisticsMetric::RowCount], missing()),
+            Err(CompletionProtocolError::StatisticsMetricMissing { metric, .. })
+                if metric == null_count
+        ));
+        let maximum = StatisticsMetric::Maximum {
+            column: Arc::from("order_key"),
+        };
+        assert!(matches!(
+            StatisticsFact::try_new(
+                &need,
+                [StatisticsMetric::RowCount, null_count.clone(), maximum.clone()],
+                missing(),
+            ),
+            Err(CompletionProtocolError::StatisticsMetricExtra { metric, .. })
+                if metric == maximum
+        ));
+        assert!(matches!(
+            StatisticsFact::try_new(
+                &need,
+                [
+                    StatisticsMetric::RowCount,
+                    null_count.clone(),
+                    StatisticsMetric::RowCount,
+                ],
+                missing(),
+            ),
+            Err(CompletionProtocolError::StatisticsMetricDuplicate { metric, .. })
+                if metric == StatisticsMetric::RowCount
+        ));
+        assert!(matches!(
+            StatisticsFact::try_new(
+                &need,
+                [StatisticsMetric::RowCount, null_count],
+                DmlStatisticsEvidence::Missing {
+                    binding: SqlTableBindingId::new_for_test(8),
+                    label: "orders".into(),
+                    reason: "not collected".into(),
+                },
+            ),
+            Err(CompletionProtocolError::StatisticsBindingMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn statistics_fact_rejects_available_evidence_metric_drift() {
+        let binding = SqlTableBindingId::new_for_test(7);
+        let null_count = StatisticsMetric::NullCount {
+            column: Arc::from("order_key"),
+        };
+        let need = StatisticsNeed::try_new(
+            CompileNeedId::new(9),
+            binding,
+            [StatisticsMetric::RowCount, null_count.clone()],
+        )
+        .unwrap();
+        let evidence = StatisticsEvidence::try_new(
+            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap(),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"evidence-v1")).unwrap(),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::from([(
+                StatisticsMetric::RowCount,
+                StatisticsMetricState::Missing(StatisticsMissing {
+                    kind: StatisticsMissingKind::NotCollected,
+                    message: Arc::from("not collected"),
+                }),
+            )]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            StatisticsFact::try_new(
+                &need,
+                [StatisticsMetric::RowCount, null_count.clone()],
+                DmlStatisticsEvidence::Available {
+                    binding,
+                    label: "orders".into(),
+                    columns: Vec::new(),
+                    evidence,
+                },
+            ),
+            Err(CompletionProtocolError::StatisticsMetricMissing { metric, .. })
+                if metric == null_count
+        ));
+
+        let maximum = StatisticsMetric::Maximum {
+            column: Arc::from("order_key"),
+        };
+        let missing_state = || {
+            StatisticsMetricState::Missing(StatisticsMissing {
+                kind: StatisticsMissingKind::NotCollected,
+                message: Arc::from("not collected"),
+            })
+        };
+        let evidence = StatisticsEvidence::try_new(
+            StatisticsDataVersion::try_new(Bytes::from_static(b"data-v1")).unwrap(),
+            StatisticsEvidenceRevision::try_new(Bytes::from_static(b"evidence-v2")).unwrap(),
+            StatisticsRowCoverage::AllVisibleRows,
+            BTreeMap::from([
+                (StatisticsMetric::RowCount, missing_state()),
+                (null_count.clone(), missing_state()),
+                (maximum.clone(), missing_state()),
+            ]),
+        )
+        .unwrap();
+        assert!(matches!(
+            StatisticsFact::try_new(
+                &need,
+                [StatisticsMetric::RowCount, null_count],
+                DmlStatisticsEvidence::Available {
+                    binding,
+                    label: "orders".into(),
+                    columns: Vec::new(),
+                    evidence,
+                },
+            ),
+            Err(CompletionProtocolError::StatisticsMetricExtra { metric, .. })
+                if metric == maximum
         ));
     }
 
@@ -4005,6 +4284,28 @@ mod tests {
     }
 
     #[test]
+    fn provider_fact_occurrence_must_match_the_exact_need() {
+        let need = provider_need(1, DataType::Int64, &[], None);
+        let mut fact =
+            ProviderReadFact::negotiated(&need, provider_contract(&need, b"provider-private"))
+                .unwrap();
+        fact.occurrence = ProviderReadOccurrenceId::new(99);
+
+        assert!(matches!(
+            validate_fact_semantics(
+                &SqlNeedBatch::ProviderReads(Box::from([need])),
+                &SqlFactBatch::ProviderReads(Box::from([fact])),
+            ),
+            Err(CompletionProtocolError::ProviderOccurrenceMismatch {
+                expected,
+                actual,
+                ..
+            }) if expected == ProviderReadOccurrenceId::new(1)
+                && actual == ProviderReadOccurrenceId::new(99)
+        ));
+    }
+
+    #[test]
     fn provider_need_builds_one_exact_combined_filter_from_occurrences() {
         let need = provider_need(1, DataType::Int64, &[7, 9], None);
         assert!(need.filter().summary().is_none());
@@ -4016,6 +4317,7 @@ mod tests {
 
         let out_of_projection = ProviderReadNeed::try_new(
             CompileNeedId::new(2),
+            ProviderReadOccurrenceId::new(2),
             SqlTableBindingId::new_for_test(41),
             ProviderReadRelationNeed::Data {
                 relation: TableIdentity::new("iceberg", "db", "orders"),
@@ -4123,6 +4425,7 @@ mod tests {
             );
             ProviderReadNeed::try_new(
                 CompileNeedId::new(1),
+                ProviderReadOccurrenceId::new(1),
                 SqlTableBindingId::new_for_test(41),
                 ProviderReadRelationNeed::Data {
                     relation: TableIdentity::new("iceberg", "db", "orders"),
@@ -4216,7 +4519,7 @@ mod tests {
 
         let contract_debug = format!("{:?}", fact.contract());
         assert!(!contract_debug.contains(std::str::from_utf8(SENTINEL).unwrap()));
-        assert!(contract_debug.contains("provider_payload_bytes") == false);
+        assert!(!contract_debug.contains("provider_payload_bytes"));
 
         let sentinel = std::str::from_utf8(SENTINEL).unwrap();
         let column_need = provider_need_named(2, sentinel, DataType::Int64, &[], None);

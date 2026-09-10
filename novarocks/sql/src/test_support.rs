@@ -279,6 +279,9 @@ fn native_change_stream_table_writer_plan() -> Result<DistributedPlan, String> {
                 ConnectorWriteFieldToken::from_bytes([route_byte.wrapping_add(2); 32]),
                 input_ordinal,
             )],
+            partition_input_positions: (!output_partition_ordinals.is_empty())
+                .then_some(vec![0])
+                .unwrap_or_default(),
             output_partition_ordinals,
             sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
         }
@@ -1776,6 +1779,7 @@ fn native_router_stream_plan() -> Result<DistributedPlan, String> {
                 ConnectorWriteFieldToken::from_bytes([9; 32]),
                 1,
             )],
+            partition_input_positions: vec![0],
             output_partition_ordinals: vec![1],
             sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
         }],

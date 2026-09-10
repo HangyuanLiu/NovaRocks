@@ -28,8 +28,8 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    ValueType,
+    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
+    ProviderReadOccurrenceId, ScanReadBudget, ValueType,
 };
 use novarocks_spi::connector::StatisticsMetric;
 
@@ -282,39 +282,81 @@ pub(crate) struct SqlProviderReadCompletionState {
     common: FinalPlanCommon,
     physical: PhysicalPlanNode,
     needs: Box<[ProviderReadNeed]>,
-    occurrences: BTreeMap<CompileNeedId, ProviderScanOccurrence>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ProviderScanOccurrence {
-    binding: SqlTableBindingId,
-    ordinal: u32,
 }
 
 /// Exact provider results paired with the scan occurrences that requested
 /// them. The lowering visitor consumes every entry once. A binding alone is
 /// insufficient because a self join has two independently negotiated reads.
 pub(crate) struct FinalizedProviderReadSet {
-    entries: BTreeMap<ProviderScanOccurrence, FinalizedProviderRead>,
+    entries: BTreeMap<ProviderReadOccurrenceId, FinalizedProviderRead>,
 }
 
 pub(crate) struct FinalizedProviderRead {
+    pub(crate) binding: SqlTableBindingId,
     pub(crate) contract: ProviderReadStaticContract,
     pub(crate) read_budget: ScanReadBudget,
 }
 
 impl FinalizedProviderReadSet {
+    pub(crate) fn try_from_facts(
+        facts: impl IntoIterator<Item = (ProviderReadFact, ScanReadBudget)>,
+    ) -> Result<Self, SqlCompileError> {
+        let mut entries = BTreeMap::new();
+        for (fact, read_budget) in facts {
+            validate_scan_read_budget(read_budget)?;
+            let occurrence = fact.occurrence();
+            let binding = fact.binding();
+            if entries
+                .insert(
+                    occurrence,
+                    FinalizedProviderRead {
+                        binding,
+                        contract: fact.into_contract(),
+                        read_budget,
+                    },
+                )
+                .is_some()
+            {
+                return Err(SqlCompileError::Compilation(format!(
+                    "finalized provider reads repeat scan occurrence {}",
+                    occurrence.get()
+                )));
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn single_occurrence(&self) -> Result<ProviderReadOccurrenceId, SqlCompileError> {
+        let mut occurrences = self.entries.keys().copied();
+        let occurrence = occurrences.next().ok_or_else(|| {
+            SqlCompileError::Compilation(
+                "single-scan final plan requires one finalized provider read".to_string(),
+            )
+        })?;
+        if occurrences.next().is_some() {
+            return Err(SqlCompileError::Compilation(
+                "single-scan final plan received more than one finalized provider read".to_string(),
+            ));
+        }
+        Ok(occurrence)
+    }
+
     #[cfg(test)]
     pub(crate) fn single_for_test(
         binding: SqlTableBindingId,
-        ordinal: u32,
+        occurrence: ProviderReadOccurrenceId,
         contract: ProviderReadStaticContract,
         read_budget: ScanReadBudget,
     ) -> Self {
         Self {
             entries: BTreeMap::from([(
-                ProviderScanOccurrence { binding, ordinal },
+                occurrence,
                 FinalizedProviderRead {
+                    binding,
                     contract,
                     read_budget,
                 },
@@ -325,15 +367,22 @@ impl FinalizedProviderReadSet {
     pub(crate) fn take(
         &mut self,
         binding: SqlTableBindingId,
-        ordinal: u32,
+        occurrence: ProviderReadOccurrenceId,
     ) -> Result<FinalizedProviderRead, SqlCompileError> {
-        self.entries
-            .remove(&ProviderScanOccurrence { binding, ordinal })
-            .ok_or_else(|| {
+        let read = self.entries.remove(&occurrence).ok_or_else(|| {
                 SqlCompileError::Compilation(format!(
-                    "physical scan occurrence {ordinal} for binding {binding:?} has no finalized provider read"
+                    "physical scan occurrence {} for binding {binding:?} has no finalized provider read",
+                    occurrence.get()
                 ))
-            })
+            })?;
+        if read.binding != binding {
+            return Err(SqlCompileError::Compilation(format!(
+                "physical scan occurrence {} expects binding {binding:?} but its finalized provider read carries {:?}",
+                occurrence.get(),
+                read.binding
+            )));
+        }
+        Ok(read)
     }
 
     pub(crate) fn ensure_consumed(self) -> Result<(), SqlCompileError> {
@@ -707,15 +756,18 @@ fn optimize_to_physical(
 
 fn provider_or_ready_step(
     common: FinalPlanCommon,
-    physical: PhysicalPlanNode,
+    mut physical: PhysicalPlanNode,
     next_need_ordinal: u32,
 ) -> Result<CompilerStep, SqlCompileError> {
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        &common.session.optimizer_settings,
+    );
     let offer_predicates = common
         .session
         .optimizer_settings
         .connector_static_predicate_pushdown_enabled();
-    let (needs, occurrences) =
-        collect_provider_needs(&physical, next_need_ordinal, offer_predicates)?;
+    let (physical, needs) = collect_provider_needs(physical, next_need_ordinal, offer_predicates)?;
     if !needs.is_empty() {
         return Ok(CompilerStep::need(
             SqlNeedBatch::ProviderReads(needs.clone()),
@@ -723,7 +775,6 @@ fn provider_or_ready_step(
                 common,
                 physical,
                 needs,
-                occurrences,
             }),
         ));
     }
@@ -741,90 +792,115 @@ fn provider_or_ready_step(
     ))
 }
 
-type CollectedProviderNeeds = (
-    Box<[ProviderReadNeed]>,
-    BTreeMap<CompileNeedId, ProviderScanOccurrence>,
-);
-
 fn collect_provider_needs(
-    plan: &PhysicalPlanNode,
+    plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,
-) -> Result<CollectedProviderNeeds, SqlCompileError> {
+) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
+    #[derive(Default)]
+    struct ProviderReadOccurrenceAllocator {
+        next: u32,
+    }
+
+    impl ProviderReadOccurrenceAllocator {
+        fn mint(&mut self) -> Result<ProviderReadOccurrenceId, SqlCompileError> {
+            let occurrence = ProviderReadOccurrenceId::new(self.next);
+            self.next = self.next.checked_add(1).ok_or_else(|| {
+                SqlCompileError::Compilation("physical scan occurrence overflow".to_string())
+            })?;
+            Ok(occurrence)
+        }
+    }
+
     fn walk(
-        plan: &PhysicalPlanNode,
+        plan: PhysicalPlanNode,
         next_need_ordinal: &mut u32,
-        next_scan_ordinal: &mut u32,
+        occurrence_allocator: &mut ProviderReadOccurrenceAllocator,
         needs: &mut Vec<ProviderReadNeed>,
-        occurrences: &mut BTreeMap<CompileNeedId, ProviderScanOccurrence>,
         offer_predicates: bool,
-    ) -> Result<(), SqlCompileError> {
-        for child in &plan.children {
-            walk(
-                child,
-                next_need_ordinal,
-                next_scan_ordinal,
-                needs,
-                occurrences,
-                offer_predicates,
-            )?;
-        }
-        let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &plan.kind else {
-            return Ok(());
-        };
-        let ScanSource::Sql(source) = &scan.table.source;
-        let id = CompileNeedId::new(*next_need_ordinal);
-        *next_need_ordinal = next_need_ordinal.checked_add(1).ok_or_else(|| {
-            SqlCompileError::Compilation("provider completion need identity overflow".to_string())
-        })?;
-        let occurrence = ProviderScanOccurrence {
-            binding: source.binding,
-            ordinal: *next_scan_ordinal,
-        };
-        *next_scan_ordinal = next_scan_ordinal.checked_add(1).ok_or_else(|| {
-            SqlCompileError::Compilation("physical scan occurrence overflow".to_string())
-        })?;
-        let relation = provider_relation_need_from_sql_scan(
-            id,
-            novarocks_types::naming::TableIdentity::new(
-                &source.table.catalog,
-                &source.table.namespace,
-                &source.table.table,
-            ),
-            &source.kind,
-        )
-        .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-        let (columns, predicate_columns) = provider_columns(plan, scan)?;
-        let predicates = if offer_predicates {
-            lower_provider_predicates(scan, &predicate_columns)
-        } else {
-            Box::default()
-        };
-        let need =
-            ProviderReadNeed::try_new(id, source.binding, relation, columns, predicates, None)
+    ) -> Result<PhysicalPlanNode, SqlCompileError> {
+        let PhysicalPlanNode {
+            kind,
+            children,
+            output_columns,
+            stats,
+            probe_runtime_filters,
+        } = plan;
+        let children = children
+            .into_iter()
+            .map(|child| {
+                walk(
+                    child,
+                    next_need_ordinal,
+                    occurrence_allocator,
+                    needs,
+                    offer_predicates,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let kind = match kind {
+            crate::planner::physical::PhysicalPlanKind::Scan(scan) => {
+                let ScanSource::Sql(source) = &scan.table.source;
+                let id = CompileNeedId::new(*next_need_ordinal);
+                *next_need_ordinal = next_need_ordinal.checked_add(1).ok_or_else(|| {
+                    SqlCompileError::Compilation(
+                        "provider completion need identity overflow".to_string(),
+                    )
+                })?;
+                let occurrence = occurrence_allocator.mint()?;
+                let relation = provider_relation_need_from_sql_scan(
+                    id,
+                    novarocks_types::naming::TableIdentity::new(
+                        &source.table.catalog,
+                        &source.table.namespace,
+                        &source.table.table,
+                    ),
+                    &source.kind,
+                )
                 .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-        if occurrences.insert(id, occurrence).is_some() {
-            return Err(SqlCompileError::Compilation(format!(
-                "provider completion repeats need {}",
-                id.get()
-            )));
-        }
-        needs.push(need);
-        Ok(())
+                let (columns, predicate_columns) = provider_columns(&output_columns, &scan)?;
+                let predicates = if offer_predicates {
+                    lower_provider_predicates(&scan, &predicate_columns)
+                } else {
+                    Box::default()
+                };
+                let need = ProviderReadNeed::try_new(
+                    id,
+                    occurrence,
+                    source.binding,
+                    relation,
+                    columns,
+                    predicates,
+                    None,
+                )
+                .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
+                needs.push(need);
+                crate::planner::physical::PhysicalPlanKind::Scan(
+                    scan.finalize_provider_read_occurrence(occurrence)
+                        .map_err(SqlCompileError::Compilation)?,
+                )
+            }
+            kind => kind,
+        };
+        Ok(PhysicalPlanNode {
+            kind,
+            children,
+            output_columns,
+            stats,
+            probe_runtime_filters,
+        })
     }
 
     let mut needs = Vec::new();
-    let mut occurrences = BTreeMap::new();
-    let mut next_scan_ordinal = 0;
-    walk(
+    let mut occurrence_allocator = ProviderReadOccurrenceAllocator::default();
+    let plan = walk(
         plan,
         &mut next_need_ordinal,
-        &mut next_scan_ordinal,
+        &mut occurrence_allocator,
         &mut needs,
-        &mut occurrences,
         offer_predicates,
     )?;
-    Ok((needs.into_boxed_slice(), occurrences))
+    Ok((plan, needs.into_boxed_slice()))
 }
 
 type ProviderColumnProjection = (
@@ -833,7 +909,7 @@ type ProviderColumnProjection = (
 );
 
 fn provider_columns(
-    plan: &PhysicalPlanNode,
+    output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
 ) -> Result<ProviderColumnProjection, SqlCompileError> {
     let synthetic = scan
@@ -861,7 +937,7 @@ fn provider_columns(
     }
     let mut columns = Vec::new();
     let mut predicate_columns = BTreeMap::new();
-    for output in &plan.output_columns {
+    for output in output_columns {
         if synthetic.contains(&output.column_id) {
             continue;
         }
@@ -946,39 +1022,22 @@ pub(super) fn resume_provider_read(
     let expected = state
         .needs
         .iter()
-        .map(|need| (need.id(), need.binding()))
+        .map(|need| (need.id(), (need.binding(), need.occurrence())))
         .collect::<BTreeMap<_, _>>();
-    let mut entries = BTreeMap::new();
-    for fact in facts {
-        if expected.get(&fact.id()).copied() != Some(fact.binding()) {
+    for fact in &facts {
+        if expected.get(&fact.id()).copied() != Some((fact.binding(), fact.occurrence())) {
             return Err(SqlCompileError::Compilation(format!(
-                "provider completion fact {} does not match the requested binding",
+                "provider completion fact {} does not match the requested binding and occurrence",
                 fact.id().get()
-            )));
-        }
-        let occurrence = state.occurrences.get(&fact.id()).copied().ok_or_else(|| {
-            SqlCompileError::Compilation(format!(
-                "provider completion fact {} has no scan occurrence",
-                fact.id().get()
-            ))
-        })?;
-        if entries
-            .insert(
-                occurrence,
-                FinalizedProviderRead {
-                    contract: fact.into_contract(),
-                    read_budget: state.common.scan_read_budget,
-                },
-            )
-            .is_some()
-        {
-            return Err(SqlCompileError::Compilation(format!(
-                "provider completion repeats scan occurrence {}",
-                occurrence.ordinal
             )));
         }
     }
-    let reads = FinalizedProviderReadSet { entries };
+    let reads = FinalizedProviderReadSet::try_from_facts(
+        facts
+            .into_vec()
+            .into_iter()
+            .map(|fact| (fact, state.common.scan_read_budget)),
+    )?;
     let builder =
         crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
             &state.physical,
@@ -1003,7 +1062,8 @@ mod tests {
 
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
-        ExactInputVersion, PredicateGuaranteeKind, ProviderColumnReference, ProviderReadReference,
+        ExactInputVersion, NodeKind, PredicateGuaranteeKind, ProviderColumnReference,
+        ProviderReadReference,
     };
     use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
     use novarocks_spi::connector::{
@@ -1044,8 +1104,10 @@ mod tests {
         mv_enabled: bool,
         control: SqlCompileControl,
     ) -> SqlFinalPlanCompileRequest {
-        let mut optimizer_settings = SessionOptimizerSettings::default();
-        optimizer_settings.enable_materialized_view_rewrite = Some(mv_enabled);
+        let optimizer_settings = SessionOptimizerSettings {
+            enable_materialized_view_rewrite: Some(mv_enabled),
+            ..SessionOptimizerSettings::default()
+        };
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([17; 16]).expect("plan version"),
             SqlStatementInput::sql(sql),
@@ -1259,6 +1321,7 @@ mod tests {
             .map(|need| {
                 StatisticsFact::try_new(
                     need,
+                    need.metrics().to_vec(),
                     DmlStatisticsEvidence::Missing {
                         binding: need.binding(),
                         label: "iceberg.db.orders".to_string(),
@@ -1461,9 +1524,9 @@ mod tests {
     }
 
     #[test]
-    fn repeated_relation_negotiates_and_consumes_two_scan_occurrences() {
+    fn self_join_preserves_two_occurrences_for_one_provider_reference() {
         let seed = request(
-            "select order_key from orders union all select order_key from orders",
+            "select lhs.order_key from orders lhs join orders rhs on lhs.order_key = rhs.order_key",
             SqlCompileIntent::Query,
         )
         .try_into_completion()
@@ -1477,10 +1540,90 @@ mod tests {
         };
         assert_eq!(provider_needs.len(), 2);
         assert_eq!(provider_needs[0].binding(), provider_needs[1].binding());
+        assert_ne!(
+            provider_needs[0].occurrence(),
+            provider_needs[1].occurrence(),
+            "self-join reads need distinct query-local occurrence identities"
+        );
+        let replayed_occurrences = match provider.needs() {
+            SqlNeedBatch::ProviderReads(needs) => needs
+                .iter()
+                .map(ProviderReadNeed::occurrence)
+                .collect::<Vec<_>>(),
+            other => panic!("expected provider needs on replay, got {other:?}"),
+        };
+        assert_eq!(
+            replayed_occurrences,
+            provider_needs
+                .iter()
+                .map(ProviderReadNeed::occurrence)
+                .collect::<Vec<_>>(),
+            "replaying the same continuation must preserve occurrence identities"
+        );
+
+        let completed = answer_provider(provider)
+            .into_complete()
+            .expect("repeated relation completes");
+        let scans = completed
+            .plan()
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .filter_map(|node| match &node.kind {
+                NodeKind::Scan {
+                    occurrence,
+                    relation,
+                    ..
+                } => Some((*occurrence, relation.read().clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 2);
+        assert_ne!(scans[0].0, scans[1].0);
+        assert_eq!(
+            scans[0].1, scans[1].1,
+            "occurrence identity must not split a reusable provider relation identity"
+        );
+    }
+
+    #[test]
+    fn finalized_provider_reads_reject_one_occurrence_across_distinct_bindings() {
+        let seed = request("select order_key from orders", SqlCompileIntent::Query)
+            .try_into_completion()
+            .expect("completion seed");
+        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let statistics = incomplete(answer_catalog(catalog));
+        let provider = incomplete(answer_statistics(statistics));
+        let original = match provider.needs() {
+            SqlNeedBatch::ProviderReads(needs) => needs[0].clone(),
+            other => panic!("expected provider needs, got {other:?}"),
+        };
+        let conflicting = ProviderReadNeed::try_new(
+            CompileNeedId::new(99),
+            original.occurrence(),
+            SqlTableBindingId::new_for_test(99),
+            original.relation().clone(),
+            original.columns().to_vec(),
+            original.predicates().to_vec(),
+            original.limit(),
+        )
+        .expect("conflicting test need");
+        let original_fact =
+            ProviderReadFact::negotiated(&original, provider_contract(&original)).unwrap();
+        let conflicting_fact =
+            ProviderReadFact::negotiated(&conflicting, provider_contract(&conflicting)).unwrap();
+        let budget = ScanReadBudget {
+            max_batch_rows: MAX_SCAN_BATCH_ROWS,
+            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+        };
 
         assert!(matches!(
-            answer_provider(provider),
-            SqlCompileProgress::Complete(_)
+            FinalizedProviderReadSet::try_from_facts([
+                (original_fact, budget),
+                (conflicting_fact, budget),
+            ]),
+            Err(SqlCompileError::Compilation(message))
+                if message.contains("repeat scan occurrence")
         ));
     }
 }

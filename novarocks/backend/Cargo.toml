@@ -48,4 +48,6 @@ tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-physical-plan.workspace = true
+novarocks-plan-codec.workspace = true
 novarocks-sql.workspace = true

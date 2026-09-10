@@ -292,16 +292,19 @@ fn build_distributed_plan_scan_project_shapes_one_fragment() {
     let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
     let project_columns = vec![output_col(2, "k_alias", DataType::Int64, false)];
     let scan = PhysicalPlanNode {
-        kind: PhysicalPlanKind::Scan(PlanScanNode {
-            database: "db".to_string(),
-            table: table_def(),
-            alias: Some("t".to_string()),
-            columns: scan_columns.clone(),
-            predicates: vec![],
-            required_columns: None,
-            variant_columns: vec![],
-            mv_rewritten_from: None,
-        }),
+        kind: PhysicalPlanKind::Scan(
+            PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }
+            .into(),
+        ),
         children: vec![],
         output_columns: scan_columns.clone(),
         stats: stats(),
@@ -344,16 +347,19 @@ fn build_distributed_plan_preserves_filter_over_scan_without_mutating_scan() {
         output_col(2, "predicate_only", DataType::Int64, false),
     ];
     let scan = PhysicalPlanNode {
-        kind: PhysicalPlanKind::Scan(PlanScanNode {
-            database: "db".to_string(),
-            table: table_def_with_columns(&scan_columns),
-            alias: Some("t".to_string()),
-            columns: scan_columns.clone(),
-            predicates: vec![bool_lit(true)],
-            required_columns: Some(vec![scan_columns[0].column_id, scan_columns[1].column_id]),
-            variant_columns: vec![],
-            mv_rewritten_from: None,
-        }),
+        kind: PhysicalPlanKind::Scan(
+            PlanScanNode {
+                database: "db".to_string(),
+                table: table_def_with_columns(&scan_columns),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![bool_lit(true)],
+                required_columns: Some(vec![scan_columns[0].column_id, scan_columns[1].column_id]),
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }
+            .into(),
+        ),
         children: vec![],
         output_columns: scan_columns.clone(),
         stats: stats_with_row_count(100.0),
@@ -399,16 +405,19 @@ fn build_distributed_plan_preserves_filter_over_project() {
     let scan_columns = vec![output_col(1, "k", DataType::Int64, false)];
     let project_columns = vec![output_col(2, "k_alias", DataType::Int64, false)];
     let scan = PhysicalPlanNode {
-        kind: PhysicalPlanKind::Scan(PlanScanNode {
-            database: "db".to_string(),
-            table: table_def(),
-            alias: Some("t".to_string()),
-            columns: scan_columns.clone(),
-            predicates: vec![],
-            required_columns: None,
-            variant_columns: vec![],
-            mv_rewritten_from: None,
-        }),
+        kind: PhysicalPlanKind::Scan(
+            PlanScanNode {
+                database: "db".to_string(),
+                table: table_def(),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }
+            .into(),
+        ),
         children: vec![],
         output_columns: scan_columns.clone(),
         stats: stats_with_row_count(100.0),
@@ -3890,16 +3899,19 @@ fn find_distributed_node(
 
 fn scan_node_with_columns(scan_columns: Vec<OutputColumn>) -> PhysicalPlanNode {
     PhysicalPlanNode {
-        kind: PhysicalPlanKind::Scan(PlanScanNode {
-            database: "db".to_string(),
-            table: table_def_with_columns(&scan_columns),
-            alias: Some("t".to_string()),
-            columns: scan_columns.clone(),
-            predicates: vec![],
-            required_columns: None,
-            variant_columns: vec![],
-            mv_rewritten_from: None,
-        }),
+        kind: PhysicalPlanKind::Scan(
+            PlanScanNode {
+                database: "db".to_string(),
+                table: table_def_with_columns(&scan_columns),
+                alias: Some("t".to_string()),
+                columns: scan_columns.clone(),
+                predicates: vec![],
+                required_columns: None,
+                variant_columns: vec![],
+                mv_rewritten_from: None,
+            }
+            .into(),
+        ),
         children: vec![],
         output_columns: scan_columns,
         stats: stats(),

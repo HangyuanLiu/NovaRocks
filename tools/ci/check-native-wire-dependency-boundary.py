@@ -35,6 +35,7 @@ MODELS = "novarocks-proto-models"
 PROTO = "novarocks-proto-codec"
 TASK_CODEC = "novarocks-task-codec"
 EXECUTION_CONTRACT = "novarocks-execution-contract"
+PLAN_CODEC = "novarocks-plan-codec"
 SPI = "novarocks-spi"
 TYPES = "novarocks-types"
 FRONTEND = "novarocks-frontend"
@@ -73,6 +74,16 @@ FORBIDDEN_CODEC_CLOSURE = {
 FORBIDDEN_EXECUTION_CONTRACT_CLOSURE = WIRE_PACKAGES | {
     "novarocks-backend",
     "novarocks-execution",
+    "novarocks-frontend",
+    "novarocks-server",
+    "novarocks-sql",
+}
+
+# The plan encoder may depend on the immutable physical contract and wire
+# vocabulary, but it must not reach back into SQL or either application role.
+# Otherwise encoding can silently become another planning/completion owner.
+FORBIDDEN_PLAN_CODEC_CLOSURE = {
+    "novarocks-backend",
     "novarocks-frontend",
     "novarocks-server",
     "novarocks-sql",
@@ -284,6 +295,13 @@ def verify_codec_closures(metadata):
                 f"{package_name} normal dependency closure contains forbidden packages: "
                 + ", ".join(forbidden)
             )
+
+    forbidden = sorted(normal_closure(metadata, PLAN_CODEC) & FORBIDDEN_PLAN_CODEC_CLOSURE)
+    if forbidden:
+        fail(
+            f"{PLAN_CODEC} normal dependency closure contains forbidden planning or application packages: "
+            + ", ".join(forbidden)
+        )
 
 
 def verify_lower_layer_closures(metadata):

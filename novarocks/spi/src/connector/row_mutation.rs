@@ -158,7 +158,7 @@ impl ConnectorMutationEffectField {
 
 /// A provider-signed match layout. Identity, before/after values and the
 /// duplicate-detection tuple are token-bound, not inferred from column names.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ConnectorMutationMatchContract {
     owner: ConnectorProviderBindingKey,
     table: ConnectorTableHandle,
@@ -169,6 +169,44 @@ pub struct ConnectorMutationMatchContract {
     uniqueness_tokens: Vec<ConnectorWriteFieldToken>,
     effect_field: ConnectorMutationEffectField,
     digest: [u8; 32],
+}
+
+/// The provider-signed semantic role of one field in a materialized mutation
+/// selection. Tokens, rather than field names, identify these roles across
+/// planning boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorMutationSelectionFieldRole {
+    Identity,
+    BeforeImage,
+    AfterImage,
+    Effect,
+}
+
+/// One exact tokenized field in the provider-signed selection layout.
+#[derive(Clone, Copy, Debug)]
+pub struct ConnectorMutationSelectionFieldRef<'a> {
+    token: ConnectorWriteFieldToken,
+    role: ConnectorMutationSelectionFieldRole,
+    ordinal: u32,
+    field: &'a Field,
+}
+
+impl<'a> ConnectorMutationSelectionFieldRef<'a> {
+    pub const fn token(&self) -> ConnectorWriteFieldToken {
+        self.token
+    }
+
+    pub const fn role(&self) -> ConnectorMutationSelectionFieldRole {
+        self.role
+    }
+
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn field(&self) -> &'a Field {
+        self.field
+    }
 }
 
 impl ConnectorMutationMatchContract {
@@ -194,30 +232,43 @@ impl ConnectorMutationMatchContract {
         }
         base_version.validate()?;
         let mut tokens = HashSet::new();
-        let mut source_ordinals = HashSet::new();
+        let mut selection_ordinals = HashSet::new();
         for value in &identity_fields {
-            if !tokens.insert(value.token) || !source_ordinals.insert(value.source_ordinal) {
+            if !tokens.insert(value.token) || !selection_ordinals.insert(value.source_ordinal) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
                     "row-mutation identity has duplicate token or source ordinal",
                 ));
             }
         }
-        let mut target_ordinals = HashSet::new();
         for value in before_fields.iter().chain(&after_fields) {
-            if !tokens.insert(value.token) || !target_ordinals.insert(value.target_ordinal) {
+            if !tokens.insert(value.token) || !selection_ordinals.insert(value.target_ordinal) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::InvalidRequest,
-                    "row-mutation target field has duplicate token or ordinal",
+                    "row-mutation target field has duplicate token or selection ordinal",
                 ));
             }
         }
         if !tokens.insert(effect_field.token)
-            || !target_ordinals.insert(effect_field.target_ordinal)
+            || !selection_ordinals.insert(effect_field.target_ordinal)
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "row-mutation effect field conflicts with the match layout",
+            ));
+        }
+        if selection_ordinals.len() != tokens.len()
+            || !(0..u32::try_from(selection_ordinals.len()).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "row-mutation match layout exceeds u32 selection ordinals",
+                )
+            })?)
+                .all(|ordinal| selection_ordinals.contains(&ordinal))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation match layout selection ordinals must be dense from zero",
             ));
         }
         let mut unique = HashSet::new();
@@ -296,6 +347,99 @@ impl ConnectorMutationMatchContract {
     pub fn effect_field(&self) -> &ConnectorMutationEffectField {
         &self.effect_field
     }
+    pub fn selection_field(
+        &self,
+        token: ConnectorWriteFieldToken,
+    ) -> Option<ConnectorMutationSelectionFieldRef<'_>> {
+        self.identity_fields
+            .iter()
+            .find(|field| field.token() == token)
+            .map(|field| ConnectorMutationSelectionFieldRef {
+                token,
+                role: ConnectorMutationSelectionFieldRole::Identity,
+                ordinal: field.source_ordinal(),
+                field: field.field(),
+            })
+            .or_else(|| {
+                self.before_fields
+                    .iter()
+                    .find(|field| field.token() == token)
+                    .map(|field| ConnectorMutationSelectionFieldRef {
+                        token,
+                        role: ConnectorMutationSelectionFieldRole::BeforeImage,
+                        ordinal: field.target_ordinal(),
+                        field: field.field(),
+                    })
+            })
+            .or_else(|| {
+                self.after_fields
+                    .iter()
+                    .find(|field| field.token() == token)
+                    .map(|field| ConnectorMutationSelectionFieldRef {
+                        token,
+                        role: ConnectorMutationSelectionFieldRole::AfterImage,
+                        ordinal: field.target_ordinal(),
+                        field: field.field(),
+                    })
+            })
+            .or_else(|| {
+                (self.effect_field.token() == token).then(|| ConnectorMutationSelectionFieldRef {
+                    token,
+                    role: ConnectorMutationSelectionFieldRole::Effect,
+                    ordinal: self.effect_field.target_ordinal(),
+                    field: self.effect_field.field(),
+                })
+            })
+    }
+
+    /// Validate the complete Arrow selection against this exact tokenized
+    /// layout. Extra fields and ordinal gaps are refused because either would
+    /// make a token-to-value binding ambiguous after transport.
+    pub fn validate_selection(
+        &self,
+        selection: &ConnectorRowMutationSelection,
+    ) -> Result<(), ConnectorError> {
+        self.validate()?;
+        selection.validate()?;
+        let schema = selection.schema();
+        let expected_len =
+            self.identity_fields.len() + self.before_fields.len() + self.after_fields.len() + 1;
+        if schema.fields().len() != expected_len {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation selection width differs from its signed match contract",
+            ));
+        }
+        for signed in self
+            .identity_fields
+            .iter()
+            .map(|field| (field.source_ordinal(), field.field()))
+            .chain(
+                self.before_fields
+                    .iter()
+                    .chain(&self.after_fields)
+                    .map(|field| (field.target_ordinal(), field.field())),
+            )
+            .chain(std::iter::once((
+                self.effect_field.target_ordinal(),
+                self.effect_field.field(),
+            )))
+        {
+            let actual = schema.fields().get(signed.0 as usize).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "row-mutation selection omits a signed match field ordinal",
+                )
+            })?;
+            if actual.as_ref() != signed.1 {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "row-mutation selection field does not match its signed type and nullability",
+                ));
+            }
+        }
+        Ok(())
+    }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
     }
@@ -365,17 +509,14 @@ impl ConnectorRowMutationRoute {
             .map(|field| field.token())
             .collect();
         let mut tokens = HashSet::new();
-        let mut ordinals = HashSet::new();
         if input_ordinals.len() != known.len()
-            || input_ordinals.iter().any(|input| {
-                !known.contains(&input.token)
-                    || !tokens.insert(input.token)
-                    || !ordinals.insert(input.input_ordinal)
-            })
+            || input_ordinals
+                .iter()
+                .any(|input| !known.contains(&input.token) || !tokens.insert(input.token))
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "row-mutation route input bindings are incomplete, foreign, or duplicate",
+                "row-mutation route input bindings are incomplete, foreign, or repeat a token",
             ));
         }
         let mut partitions = HashSet::new();
@@ -644,14 +785,15 @@ impl ConnectorRowMutationPreparation {
     pub const fn base_version_ordinal(&self) -> Option<i64> {
         self.base_version_ordinal
     }
-    /// The version ordinal rows written by this mutation will carry, the
-    /// forward-looking counterpart of [`Self::base_version_ordinal`].
+    /// An optional provider-admitted version ordinal for strategies that stamp
+    /// a known value into every emitted row.
     ///
     /// A writer that must stamp each written row with the version it belongs to
     /// needs this before the commit exists, so the provider states it at
     /// admission. Core stamps and forwards the value; it never orders two of
-    /// them or derives read authority from one. `None` means the provider does
-    /// not version written rows.
+    /// them or derives read authority from one. `None` also covers strategies
+    /// whose version is inherited from the actual physical artifact at commit
+    /// time; callers must not synthesize a next ordinal for those strategies.
     pub const fn written_version_ordinal(&self) -> Option<i64> {
         self.written_version_ordinal
     }
@@ -1468,37 +1610,8 @@ fn validate_selection_against_preparation(
     selection: &ConnectorRowMutationSelection,
     preparation: &ConnectorRowMutationPreparation,
 ) -> Result<(), ConnectorError> {
-    let schema = selection.schema();
     let contract = preparation.match_contract();
-    for (ordinal, field) in contract
-        .identity_fields()
-        .iter()
-        .map(|field| (field.source_ordinal(), field.field()))
-        .chain(
-            contract
-                .before_fields()
-                .iter()
-                .chain(contract.after_fields())
-                .map(|field| (field.target_ordinal(), field.field())),
-        )
-        .chain(std::iter::once((
-            contract.effect_field().target_ordinal(),
-            contract.effect_field().field(),
-        )))
-    {
-        let actual = schema.fields().get(ordinal as usize).ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation selection omits a signed match field ordinal",
-            )
-        })?;
-        if actual.as_ref() != field {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "row-mutation selection field does not match its signed type and nullability",
-            ));
-        }
-    }
+    contract.validate_selection(selection)?;
     for ordinal in 0..selection.row_count() {
         let effect = selection_effect(
             selection,
@@ -1515,7 +1628,7 @@ fn validate_selection_against_preparation(
     Ok(())
 }
 
-fn selection_effect(
+pub(super) fn selection_effect(
     selection: &ConnectorRowMutationSelection,
     ordinal: ConnectorRowMutationSelectionOrdinal,
     effect_ordinal: u32,
@@ -1884,8 +1997,7 @@ fn validate_recipe_against_route(
                             ..
                         } if row_identity_fields.iter().any(|binding| binding.token() == *token)
                     );
-                    if preparation.written_version_ordinal().is_none()
-                        || !binding_tokens.contains(token)
+                    if !binding_tokens.contains(token)
                         || expected_matches.contains(token)
                         || !is_row_identity
                         || field.data_type() != &DataType::Int64
@@ -1896,12 +2008,6 @@ fn validate_recipe_against_route(
                             "rewrite written-version token must be signed non-null Int64",
                         ));
                     }
-                }
-                None if preparation.written_version_ordinal().is_some() => {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        "rewrite recipe omits the signed written-version token",
-                    ));
                 }
                 None => {}
             }
@@ -3244,7 +3350,7 @@ mod tests {
             ConnectorMutationEffectField::try_new(
                 effect_token,
                 Field::new("effect", DataType::Int8, false),
-                0,
+                1,
             )
             .expect("effect field"),
         )
@@ -3355,6 +3461,59 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(descending.routes()[0].route_id() < descending.routes()[1].route_id());
+    }
+
+    #[test]
+    fn route_allows_distinct_tokens_to_share_one_producer_ordinal() {
+        let preparation = preparation_with_version_ordinals(None, None);
+        let first = ConnectorWriteFieldToken::from_bytes([31; 32]);
+        let second = ConnectorWriteFieldToken::from_bytes([32; 32]);
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![
+                super::super::ConnectorWriteFieldBinding::new(
+                    first,
+                    Field::new("primary", DataType::Int64, false),
+                ),
+                super::super::ConnectorWriteFieldBinding::new(
+                    second,
+                    Field::new("alias", DataType::Int64, false),
+                ),
+            ],
+        };
+        let writer = ConnectorWritePreparation::try_new(
+            preparation.owner().clone(),
+            preparation.table().clone(),
+            preparation.target_ref().clone(),
+            ConnectorWriteIntent::RowDelta,
+            preparation.base_version().clone(),
+            input.clone(),
+            Bytes::new(),
+        )
+        .expect("writer");
+        let cohort = ConnectorWriteCohortId::derive(
+            preparation.operation_id(),
+            b"repeated-route-occurrence",
+            [33; 32],
+        )
+        .expect("cohort");
+
+        let route = ConnectorRowMutationRoute::try_new(
+            ConnectorWriteRouteId::from_bytes([34; 32]),
+            cohort,
+            vec![ConnectorRowMutationEffect::Delete],
+            input,
+            vec![
+                ConnectorMutationRouteInput::new(first, 0),
+                ConnectorMutationRouteInput::new(second, 0),
+            ],
+            vec![second],
+            writer,
+        )
+        .expect("distinct route tokens may share one producer occurrence");
+
+        assert_eq!(route.input_ordinals()[0].input_ordinal(), 0);
+        assert_eq!(route.input_ordinals()[1].input_ordinal(), 0);
+        assert_eq!(route.partition_fields(), &[second]);
     }
 
     #[test]

@@ -28,29 +28,47 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use arrow::datatypes::DataType;
+#[cfg(test)]
+use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_physical_plan::{
     AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregatePhase,
     AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction, BoundTableFunction,
-    BucketOrdinalDomainProof, BuildError, DataRelation, Distribution, Edge, EdgeDestination,
-    EdgeKind, EdgePartitioning, EdgeSource, ExprId, ExprKind as ContractExprKind, FragmentBuilder,
-    FragmentId, FragmentSink, FunctionArgumentType, GroupingOutput, HashDefinition,
-    HashPartitionScheme, JoinDistribution as ContractJoinDistribution, JoinKey,
-    JoinKind as ContractJoinKind, JoinSide as ContractJoinSide,
-    LiteralValue as ContractLiteralValue, MetadataRelation, MetadataRelationKind,
-    NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering, OrderingKey, OutputPort,
-    PartitionCountDomain, PartitionCountParameter, PhysicalNode, PhysicalProperties,
-    PipelineDopDomain, PlanBuilder, PlanVersionId, PredicateGuarantee, PredicateGuaranteeKind,
-    ProviderReadReference, Relation, RelationField, ResultField, ResultPort, RowCountAssertion,
-    RowCountAssertionSpec, RowMultiplicity, SealedArtifactRef, SetOperationKind, SortDirection,
-    SortExpr, SortMode, TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId,
-    UnaryOperator, UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping,
-    ValidationErrors, ValueId, ValueOrigin, ValueType, WindowBound as ContractWindowBound,
-    WindowExpression, WindowFrame as ContractWindowFrame, WindowFrameExclusion, WindowFrameUnits,
-    WindowSpec, derive_filter_output_properties, derive_project_output_properties,
+    BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
+    ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
+    EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
+    ExprKind as ContractExprKind, Fragment, FragmentBuilder, FragmentId, FragmentSink,
+    FunctionArgumentType, GroupingOutput, HashDefinition, HashPartitionScheme,
+    JoinDistribution as ContractJoinDistribution, JoinKey, JoinKind as ContractJoinKind,
+    JoinSide as ContractJoinSide, LiteralValue as ContractLiteralValue, MetadataRelation,
+    MetadataRelationKind, NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering, OrderingKey,
+    OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalNode, PhysicalProperties,
+    PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId, PredicateGuarantee,
+    PredicateGuaranteeKind, ProviderReadReference, ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation,
+    RelationField, ResultField, ResultPort, RowCountAssertion, RowCountAssertionSpec,
+    RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability, RuntimeFilterCompletion,
+    RuntimeFilterConsumer, RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget,
+    RuntimeFilterContributionKind, RuntimeFilterCoverage, RuntimeFilterCoverageNode,
+    RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitness,
+    RuntimeFilterEqualityWitnessId, RuntimeFilterId, RuntimeFilterKind, RuntimeFilterLifecycle,
+    RuntimeFilterLineageStep, RuntimeFilterNullSemantics, RuntimeFilterOrderKey,
+    RuntimeFilterPolicy, RuntimeFilterProducer, RuntimeFilterProducerProgress,
+    RuntimeFilterProducerTarget, RuntimeFilterReduction, RuntimeFilterWitnessId, SealedArtifactRef,
+    SetOperationKind, SortDirection, SortExpr, SortMode, TableFunctionOutput,
+    TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
+    UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValidationErrors,
+    ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
+    WindowBound as ContractWindowBound, WindowExpression, WindowFrame as ContractWindowFrame,
+    WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
+    WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
+    WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
+    derive_filter_output_properties, derive_project_output_properties,
     expressions_are_replica_deterministic,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
-use novarocks_type_contract::{PartitionCountParameterId, PartitionSpaceId};
+use novarocks_spi::connector::write_stack::{RootWriteResultSchema, WriteTargetOrdinal};
+use novarocks_type_contract::{
+    OrderedComparisonAlgorithm, PartitionCountParameterId, PartitionSpaceId,
+};
 use sha2::{Digest, Sha256};
 
 use crate::analysis::cte::CteId;
@@ -60,6 +78,11 @@ use crate::compiler::{
     FinalizedProviderRead, FinalizedProviderReadSet, ProviderBucketPartitionScheme,
     ProviderHashPartitionScheme, ProviderReadDistribution, ProviderReadProperties,
     ProviderReadRelationNeed,
+};
+use crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan;
+use crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec;
+use crate::planner::distributed::write::contract::{
+    ConnectorWriteInputBinding, FinalizedWriteTargetSet, SqlWritePlanInput,
 };
 use crate::planner::physical::{
     AggMode, JoinDistribution as SqlJoinDistribution, JoinExecutionMode, PhysicalHashJoinBuildSide,
@@ -92,6 +115,80 @@ pub(crate) fn lower_final_physical_plan_with_provider_reads(
     lower_final_physical_plan_inner(plan, version, dop_domain, Some(reads))
 }
 
+/// Lower one admitted SQL write directly into the final physical-plan
+/// contract. The provider handle is consumed by exact target ordinal here;
+/// neither the logical tree nor the legacy distributed-plan carrier can own or
+/// reconstruct it.
+pub(crate) struct FinalWriteLowering<'a> {
+    pub(crate) reads: Option<FinalizedProviderReadSet>,
+    pub(crate) write: SqlWritePlanInput,
+    pub(crate) write_target_ordinal: WriteTargetOrdinal,
+    pub(crate) auxiliary: &'a WriterAuxiliaryPlan,
+    pub(crate) targets: FinalizedWriteTargetSet,
+}
+
+pub(crate) fn lower_final_physical_write_plan(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    input: FinalWriteLowering<'_>,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    let FinalWriteLowering {
+        reads,
+        write,
+        write_target_ordinal,
+        auxiliary,
+        mut targets,
+    } = input;
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    let source = visitor.lower_node(plan)?;
+    let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
+    let writer = visitor.lower_table_writer(
+        source,
+        write,
+        write_target_ordinal,
+        auxiliary,
+        &sequences,
+        targets.take(write_target_ordinal).map_err(invalid_write)?,
+    )?;
+    targets.ensure_consumed().map_err(invalid_write)?;
+    visitor.lower_single_writer_finish(writer, write_target_ordinal, auxiliary, &sequences)
+}
+
+pub(crate) struct FinalChangeStreamWriteLowering<'a> {
+    pub(crate) reads: Option<FinalizedProviderReadSet>,
+    pub(crate) dag: ChangeStreamWriteDagSpec,
+    pub(crate) auxiliary: &'a WriterAuxiliaryPlan,
+    pub(crate) targets: FinalizedWriteTargetSet,
+}
+
+pub(crate) fn lower_final_change_stream_write_plan(
+    plan: &PhysicalPlanNode,
+    version: PlanVersionId,
+    dop_domain: PipelineDopDomain,
+    input: FinalChangeStreamWriteLowering<'_>,
+) -> Result<PlanBuilder, ContractLoweringError> {
+    let FinalChangeStreamWriteLowering {
+        reads,
+        dag,
+        auxiliary,
+        mut targets,
+    } = input;
+    dag.validate().map_err(invalid_write)?;
+    if !matches!(plan.kind, PhysicalPlanKind::ChangeEventExpand(_)) {
+        return Err(invalid_write(
+            "change-stream router source is not ChangeEventExpand".into(),
+        ));
+    }
+    let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    let source = visitor.lower_node(plan)?;
+    let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
+    let (writers, ordinals) =
+        visitor.lower_change_stream_writers(source, dag, auxiliary, &sequences, &mut targets)?;
+    targets.ensure_consumed().map_err(invalid_write)?;
+    visitor.lower_writer_finish(writers, ordinals, auxiliary, &sequences)
+}
+
 fn lower_final_physical_plan_inner(
     plan: &PhysicalPlanNode,
     version: PlanVersionId,
@@ -101,7 +198,7 @@ fn lower_final_physical_plan_inner(
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
     let root = visitor.lower_node(plan)?;
 
-    let result_fields = result_fields(&plan.output_columns, &root.output, &root.display_names)?;
+    let result_fields = result_fields(plan, &root.output, &root.display_names)?;
     let result_output = OutputPort {
         node: root.node,
         columns: root.output.clone(),
@@ -132,8 +229,13 @@ struct ContractLoweringVisitor {
     provider_partition_definitions: BTreeMap<PartitionSpaceId, ProviderPartitionDefinition>,
     dop_domain: PipelineDopDomain,
     provider_reads: Option<FinalizedProviderReadSet>,
-    next_scan_ordinal: u32,
     cte_producers: BTreeMap<CteId, CteProducer>,
+    annotated_nodes: BTreeSet<(FragmentId, NodeId)>,
+    annotated_values: BTreeSet<(FragmentId, ValueId)>,
+    runtime_filter_builds: BTreeMap<i32, PendingRuntimeFilterBuild>,
+    runtime_filter_probes: BTreeMap<i32, Vec<PendingRuntimeFilterProbe>>,
+    runtime_filter_attachments: BTreeSet<(FragmentId, RuntimeFilterId)>,
+    edges: BTreeMap<EdgeId, Edge>,
 }
 
 struct CteProducer {
@@ -142,6 +244,822 @@ struct CteProducer {
     outputs: BTreeMap<ColumnId, (ValueId, ValueType)>,
     row_multiplicity: RowMultiplicity,
     edges: Vec<novarocks_physical_plan::EdgeId>,
+}
+
+#[derive(Clone)]
+enum PendingRuntimeFilterBuild {
+    Join {
+        fragment: FragmentId,
+        node: NodeId,
+        key_ordinal: u32,
+        build_side: ContractJoinSide,
+        execution_mode: crate::planner::physical::JoinExecutionMode,
+        build_value: ValueId,
+        probe_value: ValueId,
+        null_semantics: RuntimeFilterNullSemantics,
+    },
+    AggregateTopN {
+        fragment: FragmentId,
+        node: NodeId,
+        group_key_ordinal: u32,
+        input_value: ValueId,
+        limit: u32,
+        direction: SortDirection,
+        null_ordering: NullOrdering,
+    },
+}
+
+#[derive(Clone, Copy)]
+struct PendingRuntimeFilterProbe {
+    fragment: FragmentId,
+    node: NodeId,
+    value: ValueId,
+    scan_source: bool,
+}
+
+fn runtime_filter_id(id: i32) -> Result<RuntimeFilterId, ContractLoweringError> {
+    u32::try_from(id).map(RuntimeFilterId::new).map_err(|_| {
+        ContractLoweringError::InvalidRuntimeFilter {
+            id,
+            detail: "identity is negative".to_string(),
+        }
+    })
+}
+
+fn all_of_runtime_filter_witness(witness: RuntimeFilterWitnessId) -> RuntimeFilterCoverage {
+    RuntimeFilterCoverage {
+        nodes: Box::from([
+            RuntimeFilterCoverageNode::Witness(witness),
+            RuntimeFilterCoverageNode::AllOf {
+                children: Box::from([0]),
+            },
+        ]),
+        root: 1,
+    }
+}
+
+fn leaf_runtime_filter_witness(witness: RuntimeFilterWitnessId) -> RuntimeFilterCoverage {
+    RuntimeFilterCoverage {
+        nodes: Box::from([RuntimeFilterCoverageNode::Witness(witness)]),
+        root: 0,
+    }
+}
+
+fn any_of_runtime_filter_witness(witness: RuntimeFilterWitnessId) -> RuntimeFilterCoverage {
+    RuntimeFilterCoverage {
+        nodes: Box::from([
+            RuntimeFilterCoverageNode::Witness(witness),
+            RuntimeFilterCoverageNode::AnyOf {
+                children: Box::from([0]),
+            },
+        ]),
+        root: 1,
+    }
+}
+
+fn join_runtime_filter_coverage(
+    witness: RuntimeFilterWitnessId,
+    execution_mode: crate::planner::physical::JoinExecutionMode,
+) -> RuntimeFilterCoverage {
+    match execution_mode {
+        crate::planner::physical::JoinExecutionMode::Broadcast => {
+            any_of_runtime_filter_witness(witness)
+        }
+        crate::planner::physical::JoinExecutionMode::Partitioned => {
+            all_of_runtime_filter_witness(witness)
+        }
+        crate::planner::physical::JoinExecutionMode::Colocate
+        | crate::planner::physical::JoinExecutionMode::Singleton => {
+            leaf_runtime_filter_witness(witness)
+        }
+    }
+}
+
+fn fragment_inbound_edges(fragment: &Fragment) -> BTreeSet<EdgeId> {
+    fragment
+        .nodes()
+        .values()
+        .filter_map(|node| match node.kind {
+            NodeKind::ExchangeSource { edge, .. } => Some(edge),
+            _ => None,
+        })
+        .collect()
+}
+
+fn subtree_inbound_edges(fragment: &Fragment, root: NodeId) -> BTreeSet<EdgeId> {
+    let mut edges = BTreeSet::new();
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(node_id) = pending.pop() {
+        if !visited.insert(node_id) {
+            continue;
+        }
+        let Some(node) = fragment.nodes().get(&node_id) else {
+            continue;
+        };
+        if let NodeKind::ExchangeSource { edge, .. } = node.kind {
+            edges.insert(edge);
+        }
+        pending.extend(node.inputs.iter().copied());
+    }
+    edges
+}
+
+fn direct_expression_value(fragment: &Fragment, expression: ExprId) -> Option<ValueId> {
+    match fragment.expressions().get(expression)?.kind {
+        ContractExprKind::Value(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn runtime_filter_scan_lineage(
+    fragments: &BTreeMap<FragmentId, Fragment>,
+    edges: &BTreeMap<EdgeId, Edge>,
+    start: (FragmentId, NodeId, ValueId),
+    target: (FragmentId, NodeId, ValueId),
+) -> Option<Box<[RuntimeFilterLineageStep]>> {
+    fn walk(
+        fragments: &BTreeMap<FragmentId, Fragment>,
+        edges: &BTreeMap<EdgeId, Edge>,
+        position: (FragmentId, NodeId, ValueId),
+        target: (FragmentId, NodeId, ValueId),
+        visited: &mut BTreeSet<(FragmentId, NodeId, ValueId)>,
+    ) -> Option<Vec<RuntimeFilterLineageStep>> {
+        if position == target {
+            return Some(Vec::new());
+        }
+        if !visited.insert(position) {
+            return None;
+        }
+        let fragment = fragments.get(&position.0)?;
+        let node = fragment.nodes().get(&position.1)?;
+        let candidates = match &node.kind {
+            NodeKind::Filter { .. } if node.inputs.len() == 1 => vec![(
+                RuntimeFilterLineageStep::FilterPassThrough {
+                    fragment: position.0,
+                    node: position.1,
+                    input_ordinal: 0,
+                },
+                (position.0, node.inputs[0], position.2),
+            )],
+            NodeKind::Sort {
+                mode: SortMode::Global | SortMode::Analytic { .. },
+                ..
+            } if node.inputs.len() == 1 => vec![(
+                RuntimeFilterLineageStep::SortPassThrough {
+                    fragment: position.0,
+                    node: position.1,
+                    input_ordinal: 0,
+                },
+                (position.0, node.inputs[0], position.2),
+            )],
+            NodeKind::Project { expressions } if node.inputs.len() == 1 => node
+                .output
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| **output == position.2)
+                .filter_map(|(ordinal, _)| {
+                    let (expression, output) = expressions.get(ordinal)?;
+                    if *output != position.2 {
+                        return None;
+                    }
+                    let source = direct_expression_value(fragment, *expression)?;
+                    Some((
+                        RuntimeFilterLineageStep::ProjectIdentity {
+                            fragment: position.0,
+                            node: position.1,
+                            output_ordinal: u32::try_from(ordinal).ok()?,
+                        },
+                        (position.0, node.inputs[0], source),
+                    ))
+                })
+                .collect(),
+            NodeKind::HashJoin { kind, keys, .. }
+                if *kind == novarocks_physical_plan::JoinKind::Inner && node.inputs.len() == 2 =>
+            {
+                keys.iter()
+                    .enumerate()
+                    .filter(|(_, key)| !key.null_safe)
+                    .flat_map(|(ordinal, key)| {
+                        let left = direct_expression_value(fragment, key.left);
+                        let right = direct_expression_value(fragment, key.right);
+                        [
+                            (ContractJoinSide::Left, left),
+                            (ContractJoinSide::Right, right),
+                        ]
+                        .into_iter()
+                        .filter(move |(_, value)| *value == Some(position.2))
+                        .flat_map(move |(source_side, _)| {
+                            [
+                                (ContractJoinSide::Left, left),
+                                (ContractJoinSide::Right, right),
+                            ]
+                            .into_iter()
+                            .filter_map(
+                                move |(target_side, target_value)| {
+                                    Some((
+                                        RuntimeFilterLineageStep::JoinEquality {
+                                            fragment: position.0,
+                                            node: position.1,
+                                            key_ordinal: u32::try_from(ordinal).ok()?,
+                                            source_side,
+                                            target_side,
+                                        },
+                                        (
+                                            position.0,
+                                            node.inputs[usize::try_from(
+                                                target_side.input_ordinal(),
+                                            )
+                                            .ok()?],
+                                            target_value?,
+                                        ),
+                                    ))
+                                },
+                            )
+                        })
+                    })
+                    .collect()
+            }
+            NodeKind::Aggregate { group_by, .. } if node.inputs.len() == 1 => group_by
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, output))| *output == position.2)
+                .filter_map(|(ordinal, (expression, _))| {
+                    Some((
+                        RuntimeFilterLineageStep::AggregateGroupKey {
+                            fragment: position.0,
+                            node: position.1,
+                            group_key_ordinal: u32::try_from(ordinal).ok()?,
+                        },
+                        (
+                            position.0,
+                            node.inputs[0],
+                            direct_expression_value(fragment, *expression)?,
+                        ),
+                    ))
+                })
+                .collect(),
+            NodeKind::SetOp {
+                kind: SetOperationKind::UnionAll,
+                input_mappings,
+            } => node
+                .output
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, output)| **output == position.2)
+                .flat_map(|(output_ordinal, _)| {
+                    node.inputs
+                        .iter()
+                        .zip(input_mappings)
+                        .enumerate()
+                        .filter_map(move |(input_ordinal, (input, mapping))| {
+                            Some((
+                                RuntimeFilterLineageStep::UnionAllBranch {
+                                    fragment: position.0,
+                                    node: position.1,
+                                    input_ordinal: u32::try_from(input_ordinal).ok()?,
+                                    output_ordinal: u32::try_from(output_ordinal).ok()?,
+                                },
+                                (position.0, *input, *mapping.get(output_ordinal)?),
+                            ))
+                        })
+                })
+                .collect(),
+            NodeKind::ExchangeSource { edge, imports } => imports
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, destination))| *destination == position.2)
+                .filter_map(|(ordinal, (source, _))| {
+                    let edge_contract = edges.get(edge)?;
+                    let source_fragment = fragments.get(&edge_contract.source.fragment)?;
+                    Some((
+                        RuntimeFilterLineageStep::ExchangeMapping {
+                            edge: *edge,
+                            mapping_ordinal: u32::try_from(ordinal).ok()?,
+                        },
+                        (source_fragment.id(), source_fragment.root(), *source),
+                    ))
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (step, next) in candidates {
+            let mut candidate_visited = visited.clone();
+            if let Some(mut suffix) = walk(fragments, edges, next, target, &mut candidate_visited) {
+                suffix.insert(0, step);
+                return Some(suffix);
+            }
+        }
+        None
+    }
+
+    walk(fragments, edges, start, target, &mut BTreeSet::new()).map(Vec::into_boxed_slice)
+}
+
+fn materialize_runtime_filter(
+    legacy_id: i32,
+    build: &PendingRuntimeFilterBuild,
+    probes: &[PendingRuntimeFilterProbe],
+    fragments: &BTreeMap<FragmentId, Fragment>,
+    edges: &BTreeMap<EdgeId, Edge>,
+) -> Result<RuntimeFilter, ContractLoweringError> {
+    let id = runtime_filter_id(legacy_id)?;
+    let witness = RuntimeFilterWitnessId::new(id.get());
+    let policy = RuntimeFilterPolicy {
+        max_contribution_bytes: 1024,
+        max_artifact_bytes: 4096,
+        deadline_ms: 30_000,
+        max_retries: 3,
+    };
+    let invalid = |detail: String| ContractLoweringError::InvalidRuntimeFilter {
+        id: legacy_id,
+        detail,
+    };
+
+    match build {
+        PendingRuntimeFilterBuild::Join {
+            fragment,
+            node,
+            key_ordinal,
+            build_side,
+            execution_mode,
+            build_value,
+            probe_value,
+            null_semantics,
+        } => {
+            let producer_fragment = fragments
+                .get(fragment)
+                .ok_or_else(|| invalid("producer fragment is absent".to_string()))?;
+            let join = producer_fragment
+                .nodes()
+                .get(node)
+                .ok_or_else(|| invalid("producer join is absent".to_string()))?;
+            let build_root = join.inputs[usize::try_from(build_side.input_ordinal()).unwrap()];
+            let probe_root =
+                join.inputs[usize::try_from(build_side.opposite().input_ordinal()).unwrap()];
+            let build_edges = subtree_inbound_edges(producer_fragment, build_root);
+            let non_build_edges = fragment_inbound_edges(producer_fragment)
+                .difference(&build_edges)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            let equality = RuntimeFilterEqualityWitnessId::new(id.get());
+            let coverage = join_runtime_filter_coverage(witness, *execution_mode);
+            let mut consumers = Vec::new();
+            let mut seen_scans = BTreeSet::new();
+            let mut needs_join_consumer = false;
+            for probe in probes {
+                if !probe.scan_source {
+                    needs_join_consumer = true;
+                    continue;
+                }
+                if !seen_scans.insert((probe.fragment, probe.node, probe.value)) {
+                    continue;
+                }
+                let lineage = runtime_filter_scan_lineage(
+                    fragments,
+                    edges,
+                    (*fragment, probe_root, *probe_value),
+                    (probe.fragment, probe.node, probe.value),
+                )
+                .ok_or_else(|| invalid("scan probe lacks an exact ValueId lineage".to_string()))?;
+                consumers.push(RuntimeFilterConsumer {
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: probe.fragment,
+                        node: probe.node,
+                        values: Box::from([probe.value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource,
+                    capabilities: Box::from([
+                        RuntimeFilterArtifactCapability::Membership,
+                        RuntimeFilterArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                    target: RuntimeFilterConsumerTarget::ScanField { equality, lineage },
+                });
+            }
+            if needs_join_consumer || consumers.is_empty() {
+                consumers.push(RuntimeFilterConsumer {
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: *fragment,
+                        node: *node,
+                        values: Box::from([*probe_value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                        input_ordinal: build_side.opposite().input_ordinal(),
+                    },
+                    capabilities: Box::from([
+                        RuntimeFilterArtifactCapability::Membership,
+                        RuntimeFilterArtifactCapability::EmptyDomain,
+                    ]),
+                    activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                    target: RuntimeFilterConsumerTarget::JoinProbeKey { equality },
+                });
+            }
+            let ty = producer_fragment
+                .values()
+                .get(build_value)
+                .ok_or_else(|| invalid("producer ValueId is absent".to_string()))?
+                .ty
+                .clone();
+            Ok(RuntimeFilter {
+                id,
+                kind: RuntimeFilterKind::InList,
+                domain: RuntimeFilterDomain::Membership {
+                    ty,
+                    null_semantics: *null_semantics,
+                },
+                lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+                reduction: RuntimeFilterReduction::SetUnion,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                equality_witnesses: Box::from([RuntimeFilterEqualityWitness {
+                    id: equality,
+                    fragment: *fragment,
+                    join: *node,
+                    key_ordinal: *key_ordinal,
+                    domain_side: *build_side,
+                }]),
+                producers: Box::from([RuntimeFilterProducer {
+                    witness,
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: *fragment,
+                        node: *node,
+                        values: Box::from([*build_value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                        input_ordinal: build_side.input_ordinal(),
+                    },
+                    contribution_kinds: Box::from([
+                        RuntimeFilterContributionKind::ValueDomainDelta,
+                        RuntimeFilterContributionKind::ProducerClosed,
+                    ]),
+                    completion: RuntimeFilterCompletion::ProducerClosed,
+                    progress: RuntimeFilterProducerProgress {
+                        build_edges: build_edges.into_iter().collect(),
+                        non_build_edges: non_build_edges.into_iter().collect(),
+                    },
+                    target: RuntimeFilterProducerTarget::JoinBuildKey { equality },
+                }]),
+                consumers: consumers.into_boxed_slice(),
+                policy,
+            })
+        }
+        PendingRuntimeFilterBuild::AggregateTopN {
+            fragment,
+            node,
+            group_key_ordinal,
+            input_value,
+            limit,
+            direction,
+            null_ordering,
+        } => {
+            let coverage = leaf_runtime_filter_witness(witness);
+            let producer_fragment = fragments
+                .get(fragment)
+                .ok_or_else(|| invalid("producer fragment is absent".to_string()))?;
+            let aggregate = producer_fragment
+                .nodes()
+                .get(node)
+                .ok_or_else(|| invalid("producer aggregate is absent".to_string()))?;
+            let NodeKind::Aggregate { group_by, .. } = &aggregate.kind else {
+                return Err(invalid("producer node is not an aggregate".to_string()));
+            };
+            let group_output = group_by
+                .get(usize::try_from(*group_key_ordinal).unwrap_or(usize::MAX))
+                .map(|(_, output)| *output)
+                .ok_or_else(|| invalid("producer aggregate group key is absent".to_string()))?;
+            let matching_topn = producer_fragment
+                .nodes()
+                .values()
+                .filter_map(|candidate| {
+                    let NodeKind::TopN {
+                        order_by,
+                        limit: frozen_limit,
+                        offset,
+                        phase,
+                    } = &candidate.kind
+                    else {
+                        return None;
+                    };
+                    (candidate.inputs.as_ref() == [*node]
+                        && matches!(phase, ContractTopNPhase::Partial { .. })
+                        && order_by.len() == 1
+                        && direct_expression_value(producer_fragment, order_by[0].expr)
+                            == Some(group_output)
+                        && *frozen_limit == u64::from(*limit)
+                        && *offset == 0
+                        && order_by[0].direction == *direction
+                        && order_by[0].null_ordering == *null_ordering)
+                        .then_some((candidate.id, *phase))
+                })
+                .collect::<Vec<_>>();
+            let [(topn, phase)] = matching_topn.as_slice() else {
+                return Err(invalid(
+                    "Aggregate TopN producer lacks one exact partial TopN parent".to_string(),
+                ));
+            };
+            let input_root = *aggregate
+                .inputs
+                .first()
+                .ok_or_else(|| invalid("producer aggregate has no input".to_string()))?;
+            let input_edges = subtree_inbound_edges(producer_fragment, input_root);
+            let mut consumers = Vec::new();
+            let mut seen = BTreeSet::new();
+            for probe in probes {
+                if !probe.scan_source || !seen.insert((probe.fragment, probe.node, probe.value)) {
+                    if !probe.scan_source {
+                        return Err(invalid(
+                            "Aggregate TopN consumer is not an exact scan source".to_string(),
+                        ));
+                    }
+                    continue;
+                }
+                let lineage = runtime_filter_scan_lineage(
+                    fragments,
+                    edges,
+                    (*fragment, input_root, *input_value),
+                    (probe.fragment, probe.node, probe.value),
+                )
+                .ok_or_else(|| {
+                    invalid("Aggregate TopN probe lacks exact ValueId lineage".to_string())
+                })?;
+                consumers.push(RuntimeFilterConsumer {
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: probe.fragment,
+                        node: probe.node,
+                        values: Box::from([probe.value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource,
+                    capabilities: Box::from([RuntimeFilterArtifactCapability::OrderedRange]),
+                    activation: RuntimeFilterConsumerActivation::NonBlockingLive {
+                        late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
+                    },
+                    target: RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                        producer: witness,
+                        lineage,
+                    },
+                });
+            }
+            let ty = producer_fragment
+                .values()
+                .get(input_value)
+                .ok_or_else(|| invalid("Aggregate TopN producer ValueId is absent".to_string()))?
+                .ty
+                .clone();
+            Ok(RuntimeFilter {
+                id,
+                kind: RuntimeFilterKind::MinMax,
+                domain: RuntimeFilterDomain::Ordered {
+                    key: RuntimeFilterOrderKey {
+                        ty,
+                        direction: *direction,
+                        null_ordering: *null_ordering,
+                    },
+                    inclusive: true,
+                    comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
+                },
+                lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+                reduction: RuntimeFilterReduction::TightenOrderedBound,
+                availability_coverage: coverage.clone(),
+                terminal_coverage: coverage,
+                equality_witnesses: Box::default(),
+                producers: Box::from([RuntimeFilterProducer {
+                    witness,
+                    endpoint: RuntimeFilterEndpoint {
+                        fragment: *fragment,
+                        node: *node,
+                        values: Box::from([*input_value]),
+                    },
+                    apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                        input_ordinal: 0,
+                    },
+                    contribution_kinds: Box::from([
+                        RuntimeFilterContributionKind::OrderedBoundUpdate,
+                        RuntimeFilterContributionKind::ProducerClosed,
+                    ]),
+                    completion: RuntimeFilterCompletion::ProducerClosed,
+                    progress: RuntimeFilterProducerProgress {
+                        build_edges: input_edges.into_iter().collect(),
+                        non_build_edges: Box::default(),
+                    },
+                    target: RuntimeFilterProducerTarget::AggregateTopNKey {
+                        group_key_ordinal: *group_key_ordinal,
+                        topn: *topn,
+                        phase: *phase,
+                        order_key_ordinal: 0,
+                        limit: u64::from(*limit),
+                        offset: 0,
+                        direction: *direction,
+                        null_ordering: *null_ordering,
+                    },
+                }]),
+                consumers: consumers.into_boxed_slice(),
+                policy,
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RuntimeFilterWaitNode {
+    Physical(FragmentId, NodeId),
+    Filter(RuntimeFilterId),
+}
+
+fn resolve_runtime_filter_activations(
+    filters: &mut [RuntimeFilter],
+    fragments: &BTreeMap<FragmentId, Fragment>,
+    edges: &BTreeMap<EdgeId, Edge>,
+) {
+    let mut dependencies =
+        BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
+    for fragment in fragments.values() {
+        for node in fragment.nodes().values() {
+            let current = RuntimeFilterWaitNode::Physical(fragment.id(), node.id);
+            let current_dependencies = dependencies.entry(current).or_default();
+            current_dependencies.extend(
+                node.inputs
+                    .iter()
+                    .map(|input| RuntimeFilterWaitNode::Physical(fragment.id(), *input)),
+            );
+            if let NodeKind::ExchangeSource { edge, .. } = node.kind
+                && let Some(edge) = edges.get(&edge)
+                && let Some(source) = fragments.get(&edge.source.fragment)
+            {
+                current_dependencies
+                    .insert(RuntimeFilterWaitNode::Physical(source.id(), source.root()));
+            }
+        }
+    }
+    for filter in filters.iter() {
+        let filter_node = RuntimeFilterWaitNode::Filter(filter.id);
+        dependencies.entry(filter_node).or_default();
+        for producer in &filter.producers {
+            let Some(fragment) = fragments.get(&producer.endpoint.fragment) else {
+                continue;
+            };
+            let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
+                continue;
+            };
+            let producer_root = match (&producer.target, &node.kind) {
+                (
+                    RuntimeFilterProducerTarget::JoinBuildKey { .. },
+                    NodeKind::HashJoin { build_side, .. },
+                ) => usize::try_from(build_side.input_ordinal())
+                    .ok()
+                    .and_then(|ordinal| node.inputs.get(ordinal))
+                    .copied(),
+                (
+                    RuntimeFilterProducerTarget::AggregateTopNKey { .. },
+                    NodeKind::Aggregate { .. },
+                ) => node.inputs.first().copied(),
+                _ => None,
+            };
+            if let Some(producer_root) = producer_root {
+                dependencies.entry(filter_node).or_default().insert(
+                    RuntimeFilterWaitNode::Physical(fragment.id(), producer_root),
+                );
+            }
+        }
+        for consumer in &filter.consumers {
+            if consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot {
+                dependencies
+                    .entry(RuntimeFilterWaitNode::Physical(
+                        consumer.endpoint.fragment,
+                        consumer.endpoint.node,
+                    ))
+                    .or_default()
+                    .insert(filter_node);
+            }
+        }
+    }
+    let downstream = edges.values().fold(
+        BTreeMap::<FragmentId, BTreeSet<FragmentId>>::new(),
+        |mut index, edge| {
+            index
+                .entry(edge.source.fragment)
+                .or_default()
+                .insert(edge.destination.fragment);
+            index
+        },
+    );
+    for source in fragments.values() {
+        let FragmentSink::Multicast { edges: branches } = source.sink() else {
+            continue;
+        };
+        if branches.len() < 2 {
+            continue;
+        }
+        let mut reachable = BTreeSet::new();
+        let mut pending = branches
+            .iter()
+            .filter_map(|edge| edges.get(edge).map(|edge| edge.destination.fragment))
+            .collect::<Vec<_>>();
+        while let Some(fragment) = pending.pop() {
+            if !reachable.insert(fragment) {
+                continue;
+            }
+            pending.extend(downstream.get(&fragment).into_iter().flatten().copied());
+        }
+        for consumer in filters
+            .iter()
+            .flat_map(|filter| &filter.consumers)
+            .filter(|consumer| {
+                consumer.activation == RuntimeFilterConsumerActivation::BlockingSnapshot
+                    && reachable.contains(&consumer.endpoint.fragment)
+            })
+        {
+            dependencies
+                .entry(RuntimeFilterWaitNode::Physical(source.id(), source.root()))
+                .or_default()
+                .insert(RuntimeFilterWaitNode::Physical(
+                    consumer.endpoint.fragment,
+                    consumer.endpoint.node,
+                ));
+        }
+    }
+
+    let mut reverse = BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
+    for (node, node_dependencies) in &dependencies {
+        reverse.entry(*node).or_default();
+        for dependency in node_dependencies {
+            reverse.entry(*dependency).or_default().insert(*node);
+        }
+    }
+    let nodes = reverse.keys().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut finish_order = Vec::with_capacity(nodes.len());
+    for start in nodes {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((node, exiting)) = stack.pop() {
+            if exiting {
+                finish_order.push(node);
+                continue;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            stack.push((node, true));
+            if let Some(next) = dependencies.get(&node) {
+                stack.extend(next.iter().rev().map(|dependency| (*dependency, false)));
+            }
+        }
+    }
+    let mut component_by_node = BTreeMap::new();
+    let mut next_component = 0_u32;
+    while let Some(start) = finish_order.pop() {
+        if component_by_node.contains_key(&start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        while let Some(node) = stack.pop() {
+            if component_by_node.contains_key(&node) {
+                continue;
+            }
+            component_by_node.insert(node, next_component);
+            if let Some(next) = reverse.get(&node) {
+                stack.extend(next.iter().rev().copied());
+            }
+        }
+        next_component = next_component.saturating_add(1);
+    }
+
+    for filter in filters {
+        let filter_component = component_by_node
+            .get(&RuntimeFilterWaitNode::Filter(filter.id))
+            .copied();
+        for consumer in &mut filter.consumers {
+            if consumer.activation != RuntimeFilterConsumerActivation::BlockingSnapshot {
+                continue;
+            }
+            let consumer_component = component_by_node
+                .get(&RuntimeFilterWaitNode::Physical(
+                    consumer.endpoint.fragment,
+                    consumer.endpoint.node,
+                ))
+                .copied();
+            if filter_component.is_some() && filter_component == consumer_component {
+                let late_apply = match consumer.target {
+                    RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
+                        novarocks_physical_plan::LateApplyGranularity::Batch
+                    }
+                    RuntimeFilterConsumerTarget::ScanField { .. } => {
+                        novarocks_physical_plan::LateApplyGranularity::RowGroup
+                    }
+                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => continue,
+                };
+                consumer.activation =
+                    RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                        late_apply,
+                    };
+            }
+        }
+    }
 }
 
 impl ContractLoweringVisitor {
@@ -167,8 +1085,13 @@ impl ContractLoweringVisitor {
             provider_partition_definitions: BTreeMap::new(),
             dop_domain,
             provider_reads,
-            next_scan_ordinal: 0,
             cte_producers: BTreeMap::new(),
+            annotated_nodes: BTreeSet::new(),
+            annotated_values: BTreeSet::new(),
+            runtime_filter_builds: BTreeMap::new(),
+            runtime_filter_probes: BTreeMap::new(),
+            runtime_filter_attachments: BTreeSet::new(),
+            edges: BTreeMap::new(),
         }
     }
 
@@ -176,6 +1099,20 @@ impl ContractLoweringVisitor {
         self.fragments
             .get_mut(&self.current_fragment)
             .expect("the current fragment is allocated before lowering")
+    }
+
+    fn attach_runtime_filter(
+        &mut self,
+        fragment: FragmentId,
+        filter: RuntimeFilterId,
+    ) -> Result<(), ContractLoweringError> {
+        if self.runtime_filter_attachments.insert((fragment, filter)) {
+            self.fragments
+                .get_mut(&fragment)
+                .expect("runtime-filter endpoint fragment has been allocated")
+                .attach_runtime_filter(filter)?;
+        }
+        Ok(())
     }
 
     fn register_provider_artifacts(
@@ -375,17 +1312,15 @@ impl ContractLoweringVisitor {
         result_port: ResultPort,
     ) -> Result<PlanBuilder, ContractLoweringError> {
         self.plan_builder.set_result_port(result_port)?;
-        for (fragment_id, builder) in self.fragments {
+        let mut finished_fragments = BTreeMap::new();
+        for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
             let (root, sink) = self.completions.remove(&fragment_id).ok_or(
                 ContractLoweringError::IncompleteFragment {
                     fragment: fragment_id,
                 },
             )?;
-            self.plan_builder.add_fragment(builder.finish_definition(
-                root,
-                sink,
-                self.dop_domain,
-            )?)?;
+            let fragment = builder.finish_definition(root, sink, self.dop_domain)?;
+            finished_fragments.insert(fragment_id, fragment);
         }
         if let Some((&fragment, _)) = self.completions.first_key_value() {
             return Err(ContractLoweringError::UnknownFragmentCompletion { fragment });
@@ -397,20 +1332,49 @@ impl ContractLoweringVisitor {
                     detail: error.to_string(),
                 })?;
         }
+        for filter in self.materialize_runtime_filters(&finished_fragments)? {
+            self.plan_builder.add_runtime_filter(filter)?;
+        }
+        for fragment in finished_fragments.into_values() {
+            self.plan_builder.add_fragment(fragment)?;
+        }
         Ok(self.plan_builder)
+    }
+
+    fn materialize_runtime_filters(
+        &self,
+        fragments: &BTreeMap<FragmentId, Fragment>,
+    ) -> Result<Vec<RuntimeFilter>, ContractLoweringError> {
+        for id in self.runtime_filter_probes.keys() {
+            if !self.runtime_filter_builds.contains_key(id) {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: *id,
+                    detail: "probe has no static producer".to_string(),
+                });
+            }
+        }
+        let mut filters = self
+            .runtime_filter_builds
+            .iter()
+            .map(|(legacy_id, build)| {
+                let probes = self.runtime_filter_probes.get(legacy_id).ok_or_else(|| {
+                    ContractLoweringError::InvalidRuntimeFilter {
+                        id: *legacy_id,
+                        detail: "producer has no static consumer witness".to_string(),
+                    }
+                })?;
+                materialize_runtime_filter(*legacy_id, build, probes, fragments, &self.edges)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        resolve_runtime_filter_activations(&mut filters, fragments, &self.edges);
+        Ok(filters)
     }
 
     fn lower_node(
         &mut self,
         plan: &PhysicalPlanNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
-        if !plan.probe_runtime_filters.is_empty() {
-            return Err(ContractLoweringError::UnsupportedRuntimeFilters {
-                node: physical_kind_name(&plan.kind),
-                count: plan.probe_runtime_filters.len(),
-            });
-        }
-        match &plan.kind {
+        let lowered = match &plan.kind {
             PhysicalPlanKind::Scan(scan) => self.lower_scan(plan, scan),
             PhysicalPlanKind::Values(values) => self.lower_values(plan, values),
             PhysicalPlanKind::Filter(filter) => self.lower_filter(plan, &filter.predicate),
@@ -438,9 +1402,115 @@ impl ContractLoweringVisitor {
                 detail: "CTEProduce is only valid as the first child of its CTEAnchor".into(),
             }),
             PhysicalPlanKind::CTEConsume(consume) => self.lower_cte_consume(plan, consume),
-            other => Err(ContractLoweringError::UnsupportedNode {
-                kind: physical_kind_name(other),
-            }),
+            PhysicalPlanKind::ChangeEventExpand(expand) => {
+                self.lower_change_event_expand(plan, expand)
+            }
+        }?;
+        self.record_runtime_filter_probes(plan, &lowered)?;
+        self.annotate_node(plan, &lowered);
+        Ok(lowered)
+    }
+
+    fn record_runtime_filter_probes(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        lowered: &LoweredNode,
+    ) -> Result<(), ContractLoweringError> {
+        for intent in &plan.probe_runtime_filters {
+            let column = identity_column_ref(&intent.probe_expr).ok_or_else(|| {
+                ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "probe expression is not one exact physical value".to_string(),
+                }
+            })?;
+            let value = lowered.columns.get(&column).copied().ok_or_else(|| {
+                ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: format!("probe ColumnId {} has no lowered ValueId", column.0),
+                }
+            })?;
+            self.attach_runtime_filter(lowered.fragment, runtime_filter_id(intent.filter_id)?)?;
+            self.runtime_filter_probes
+                .entry(intent.filter_id)
+                .or_default()
+                .push(PendingRuntimeFilterProbe {
+                    fragment: lowered.fragment,
+                    node: lowered.node,
+                    value,
+                    scan_source: matches!(plan.kind, PhysicalPlanKind::Scan(_)),
+                });
+        }
+        Ok(())
+    }
+
+    fn annotate_node(&mut self, plan: &PhysicalPlanNode, lowered: &LoweredNode) {
+        if !self
+            .annotated_nodes
+            .insert((lowered.fragment, lowered.node))
+        {
+            return;
+        }
+        let subject =
+            novarocks_physical_plan::AnnotationSubject::Node(lowered.fragment, lowered.node);
+        let value = match &plan.stats.cost_estimate {
+            Some(cost) => format!(
+                "rows={}, cpu={}, memory={}, network={}",
+                plan.stats.output_row_count, cost.cpu_cost, cost.memory_cost, cost.network_cost
+            ),
+            None => format!("rows={}", plan.stats.output_row_count),
+        };
+        self.plan_builder.add_annotation(PlanAnnotation {
+            subject,
+            key: "optimizer.statistics".into(),
+            value: value.into_boxed_str(),
+        });
+        if let Some(decision) = &plan.stats.broadcast_decision {
+            self.plan_builder.add_annotation(PlanAnnotation {
+                subject,
+                key: "optimizer.broadcast".into(),
+                value: format!(
+                    "verdict={}, forced={}, build_bytes={}, hash_table_bytes={}, backends={}, fanout_bytes={}, per_node_budget_bytes={}, risk_multiplier={}",
+                    if decision.feasible { "feasible" } else { "infeasible" },
+                    decision.forced,
+                    decision.build_bytes,
+                    decision.hash_table_bytes,
+                    decision.effective_backend_count,
+                    decision.risk_adj_fanout_bytes,
+                    decision.per_node_budget_bytes,
+                    decision.risk_multiplier
+                )
+                .into_boxed_str(),
+            });
+        }
+        if let PhysicalPlanKind::Scan(scan) = &plan.kind {
+            let relation = match &scan.alias {
+                Some(alias) => format!("{}.{} (alias={alias})", scan.database, scan.table.name),
+                None => format!("{}.{}", scan.database, scan.table.name),
+            };
+            self.plan_builder.add_annotation(PlanAnnotation {
+                subject,
+                key: "sql.relation".into(),
+                value: relation.into_boxed_str(),
+            });
+            if let Some(materialized_view) = &scan.mv_rewritten_from {
+                self.plan_builder.add_annotation(PlanAnnotation {
+                    subject,
+                    key: "sql.mv_rewritten_from".into(),
+                    value: materialized_view.clone().into_boxed_str(),
+                });
+            }
+        }
+        for (value, display_name) in lowered.output.iter().zip(&lowered.display_names) {
+            if self.annotated_values.insert((lowered.fragment, *value)) {
+                self.plan_builder.add_annotation(PlanAnnotation {
+                    subject: novarocks_physical_plan::AnnotationSubject::Value(
+                        lowered.fragment,
+                        *value,
+                    ),
+                    key: "sql.display_name".into(),
+                    value: display_name.clone().into_boxed_str(),
+                });
+            }
         }
     }
 
@@ -452,6 +1522,125 @@ impl ContractLoweringVisitor {
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("fragment"))?;
         self.fragments.insert(id, FragmentBuilder::new(id));
         Ok(id)
+    }
+
+    fn lower_change_event_expand(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        expand: &crate::planner::physical::DistributedChangeEventExpandNode,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        expect_children(plan, 1)?;
+        require_output_shape(
+            "ChangeEventExpand",
+            &plan.output_columns,
+            &expand.output_columns,
+        )?;
+        let child = self.lower_node(&plan.children[0])?;
+        require_single_copy_input("ChangeEventExpand", &child.properties)?;
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut output = Vec::with_capacity(plan.output_columns.len());
+        let mut columns = BTreeMap::new();
+        for (ordinal, column) in plan.output_columns.iter().enumerate() {
+            let value = self.fragment_mut().add_value(
+                value_type(column),
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: checked_ordinal("ChangeEventExpand output", ordinal)?,
+                },
+            )?;
+            if columns.insert(column.column_id, value).is_some() {
+                return Err(ContractLoweringError::DuplicateColumnDefinition {
+                    node: "ChangeEventExpand",
+                    column: column.column_id,
+                });
+            }
+            output.push(value);
+        }
+        let effect_ordinal = plan
+            .output_columns
+            .iter()
+            .position(|column| column.column_id == expand.effect_column_id)
+            .ok_or_else(|| invalid_write("change-event effect column is absent".into()))?;
+        let effect_output = output[effect_ordinal];
+        let events = expand
+            .events
+            .iter()
+            .map(|event| {
+                let predicate = event
+                    .predicate
+                    .as_ref()
+                    .map(|predicate| self.lower_expression(node, predicate, &child.columns))
+                    .transpose()?;
+                let mut assigned = BTreeSet::new();
+                let assignments = event
+                    .assignments
+                    .iter()
+                    .map(|assignment| {
+                        if assignment.output_column_id == expand.effect_column_id
+                            || !assigned.insert(assignment.output_column_id)
+                        {
+                            return Err(invalid_write(
+                                "change-event assignment repeats or targets the effect output"
+                                    .into(),
+                            ));
+                        }
+                        let value = columns
+                            .get(&assignment.output_column_id)
+                            .copied()
+                            .ok_or_else(|| {
+                                invalid_write(
+                                    "change-event assignment targets an unknown output".into(),
+                                )
+                            })?;
+                        let expression = assignment
+                            .expr
+                            .as_ref()
+                            .map(|expression| {
+                                self.lower_expression(node, expression, &child.columns)
+                            })
+                            .transpose()?;
+                        Ok((value, expression))
+                    })
+                    .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+                Ok(ChangeEventSpec {
+                    predicate,
+                    effect: event.effect,
+                    assignments: assignments.into_boxed_slice(),
+                })
+            })
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+        let properties = PhysicalProperties {
+            distribution: Distribution::Unconstrained,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        self.fragment_mut().insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([child.node]),
+            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
+            output_properties: properties.clone(),
+            output: OutputPort {
+                node,
+                columns: output.clone().into_boxed_slice(),
+            },
+            kind: NodeKind::ChangeEventExpand {
+                events: events.into_boxed_slice(),
+                effect_output,
+            },
+        })?;
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns,
+            properties,
+            display_names: plan
+                .output_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
     }
 
     fn lower_cte_anchor(
@@ -685,7 +1874,7 @@ impl ContractLoweringVisitor {
                 imports: receive_mapping.clone().into_boxed_slice(),
             },
         })?;
-        self.plan_builder.add_edge(Edge {
+        let edge_contract = Edge {
             id: edge,
             kind: EdgeKind::CteMulticast,
             source: EdgeSource {
@@ -703,7 +1892,9 @@ impl ContractLoweringVisitor {
                 destination: Distribution::Unconstrained,
                 destination_multiplicity: producer_multiplicity,
             },
-        })?;
+        };
+        self.plan_builder.add_edge(edge_contract.clone())?;
+        self.edges.insert(edge, edge_contract);
         self.cte_producers
             .get_mut(&consume.cte_id)
             .expect("the CTE producer stays active through body lowering")
@@ -776,15 +1967,18 @@ impl ContractLoweringVisitor {
     fn lower_scan(
         &mut self,
         plan: &PhysicalPlanNode,
-        scan: &crate::planner::payload::PlanScanNode,
+        scan: &crate::planner::physical::PhysicalScanNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 0)?;
         let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
-        let scan_ordinal = self.next_scan_ordinal;
-        self.next_scan_ordinal = self.next_scan_ordinal.checked_add(1).ok_or(
-            ContractLoweringError::IdentitySpaceExhausted("physical scan occurrence"),
-        )?;
+        let scan_occurrence =
+            scan.provider_read_occurrence()
+                .ok_or(ContractLoweringError::MissingPlannerFact {
+                    node: "Scan",
+                    fact: "provider read occurrence",
+                })?;
         let FinalizedProviderRead {
+            binding,
             contract,
             read_budget,
         } = self
@@ -794,14 +1988,15 @@ impl ContractLoweringVisitor {
                 node: "Scan",
                 fact: "finalized provider read side table",
             })?
-            .take(source.binding, scan_ordinal)
+            .take(source.binding, scan_occurrence)
             .map_err(|error| ContractLoweringError::ProviderRead {
                 detail: error.to_string(),
             })?;
-        if contract.sql_binding != source.binding {
+        if binding != source.binding || contract.sql_binding != source.binding {
             return Err(ContractLoweringError::ProviderRead {
                 detail: format!(
-                    "scan occurrence {scan_ordinal} provider contract carries a different SQL binding"
+                    "scan occurrence {} provider contract carries a different SQL binding",
+                    scan_occurrence.get()
                 ),
             });
         }
@@ -1104,6 +2299,7 @@ impl ContractLoweringVisitor {
                 columns: output.clone().into_boxed_slice(),
             },
             kind: NodeKind::Scan {
+                occurrence: scan_occurrence,
                 relation: Box::new(relation),
                 read_budget,
                 provider_outputs: provider_outputs.into_boxed_slice(),
@@ -1142,6 +2338,938 @@ impl ContractLoweringVisitor {
             ContractLoweringError::IdentitySpaceExhausted("aggregate call"),
         )?;
         Ok(call)
+    }
+
+    fn allocate_writer_aggregate_sequences(
+        &mut self,
+        auxiliary: &WriterAuxiliaryPlan,
+    ) -> Result<BTreeMap<u32, AggregateSequenceId>, ContractLoweringError> {
+        auxiliary
+            .final_plan()
+            .calls()
+            .iter()
+            .map(|call| {
+                Ok((
+                    call.intermediate_input_slot_id(),
+                    self.allocate_aggregate_sequence()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn lower_table_writer(
+        &mut self,
+        source: LoweredNode,
+        write: SqlWritePlanInput,
+        ordinal: WriteTargetOrdinal,
+        auxiliary: &WriterAuxiliaryPlan,
+        sequences: &BTreeMap<u32, AggregateSequenceId>,
+        handle: novarocks_spi::connector::ConnectorEncodedPayload,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        if source.fragment != self.current_fragment {
+            return Err(ContractLoweringError::UnexpectedFragment {
+                node: "TableWriter",
+                expected: self.current_fragment,
+                actual: source.fragment,
+            });
+        }
+        require_single_copy_input("TableWriter", &source.properties)?;
+        if source.properties.distribution == Distribution::Broadcast {
+            return Err(invalid_write(
+                "table writer cannot consume a replicated input distribution".to_string(),
+            ));
+        }
+        let projected = self.lower_writer_projection(source, &write)?;
+        if projected.output.len() != write.contract.target.fields.len()
+            || projected.output.len() != write.contract.input_columns.len()
+        {
+            return Err(invalid_write(format!(
+                "write target/input/projected arity differs: target={}, input={}, projected={}",
+                write.contract.target.fields.len(),
+                write.contract.input_columns.len(),
+                projected.output.len()
+            )));
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let relation = self.writer_relation_schema(
+            node,
+            auxiliary.schema().contract_version(),
+            auxiliary.schema().arrow_schema().fields(),
+            &auxiliary.schema().slot_ids(),
+        )?;
+        let LoweredWriterRelation {
+            schema: output_schema,
+            output,
+            values_by_slot: output_slots,
+        } = relation;
+        if output_schema.revision != WRITER_MULTIPLEX_SCHEMA_REVISION {
+            return Err(invalid_write(
+                "writer multiplex schema revision differs".into(),
+            ));
+        }
+
+        let target_fields = write
+            .contract
+            .target
+            .fields
+            .iter()
+            .zip(&write.contract.input_columns)
+            .zip(projected.output.iter())
+            .enumerate()
+            .map(|(field_ordinal, ((target, input), value))| {
+                if target.column.data_type != input.data_type
+                    || target.column.nullable != input.nullable
+                {
+                    return Err(invalid_write(format!(
+                        "write target field {field_ordinal} type differs from its input contract"
+                    )));
+                }
+                Ok(WriterTargetField {
+                    token: target.token,
+                    input: *value,
+                    ty: ValueType::new(input.data_type.clone(), input.nullable),
+                    hidden: target.is_hidden,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let partial = auxiliary.partial_for(ordinal).map_err(invalid_write)?;
+        let partial_aggregates = partial
+            .calls()
+            .iter()
+            .map(|call| {
+                let input_index = usize::try_from(call.input_slot_id().saturating_sub(1))
+                    .map_err(|_| invalid_write("writer input slot is outside host range".into()))?;
+                if call.input_slot_id() == 0 {
+                    return Err(invalid_write("writer input slot is zero".into()));
+                }
+                let input = projected.output.get(input_index).copied().ok_or_else(|| {
+                    invalid_write(format!(
+                        "writer aggregate input slot {} is outside the exact input",
+                        call.input_slot_id()
+                    ))
+                })?;
+                let output = output_slots
+                    .get(&call.intermediate_slot_id())
+                    .copied()
+                    .ok_or_else(|| {
+                        invalid_write("writer aggregate output slot is unknown".into())
+                    })?;
+                let sequence = sequences
+                    .get(&call.intermediate_slot_id())
+                    .copied()
+                    .ok_or_else(|| invalid_write("writer aggregate sequence is missing".into()))?;
+                Ok(WriterAggregateCall {
+                    input,
+                    binding: lower_writer_aggregate_binding(
+                        call.resolved(),
+                        AggregatePhase::Partial { sequence },
+                    )?,
+                    output,
+                })
+            })
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+
+        let required = PhysicalProperties {
+            distribution: projected.properties.distribution.clone(),
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        let properties = PhysicalProperties {
+            distribution: Distribution::Unconstrained,
+            row_multiplicity: RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        self.fragment_mut().insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([projected.node]),
+            required_inputs: Box::from([required.clone()]),
+            output_properties: properties.clone(),
+            output: OutputPort {
+                node,
+                columns: output.clone(),
+            },
+            kind: NodeKind::TableWriter {
+                target: WriterTarget {
+                    handle,
+                    write_target_ordinal: ordinal,
+                    input: projected.output,
+                    required_distribution: required.distribution,
+                    target_fields: target_fields.into_boxed_slice(),
+                    output_schema,
+                    partial_aggregates: partial_aggregates.into_boxed_slice(),
+                },
+            },
+        })?;
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output,
+            columns: BTreeMap::new(),
+            properties,
+            display_names: auxiliary
+                .schema()
+                .arrow_schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+
+    fn lower_writer_projection(
+        &mut self,
+        source: LoweredNode,
+        write: &SqlWritePlanInput,
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        let width = write.contract.input_columns.len();
+        if write.root_output_exprs.is_none()
+            && matches!(write.input, ConnectorWriteInputBinding::RootOutputByOrdinal)
+            && source.output.len() == width
+        {
+            return Ok(source);
+        }
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(width);
+        let mut output = Vec::with_capacity(width);
+        if let Some(root_expressions) = &write.root_output_exprs {
+            if root_expressions.len() != width {
+                return Err(ContractLoweringError::ArityMismatch {
+                    context: "TableWriter root projection",
+                    expected: width,
+                    actual: root_expressions.len(),
+                });
+            }
+            for (ordinal, (expression, column)) in root_expressions
+                .iter()
+                .zip(&write.contract.input_columns)
+                .enumerate()
+            {
+                let expected = ValueType::new(column.data_type.clone(), column.nullable);
+                let actual = expression_type(expression);
+                if actual != expected {
+                    return Err(ContractLoweringError::ExpressionTypeMismatch {
+                        context: format!("TableWriter root projection {ordinal}"),
+                        expected,
+                        actual,
+                    });
+                }
+                let expression_id = self.lower_expression(node, expression, &source.columns)?;
+                let value = match identity_column_ref(expression) {
+                    Some(column_id) => source
+                        .columns
+                        .get(&column_id)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
+                    None => self.fragment_mut().add_value(
+                        expression_type(expression),
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression_id,
+                        },
+                    )?,
+                };
+                expressions.push((expression_id, value));
+                output.push(value);
+            }
+        } else {
+            let ordinals: Vec<usize> = match &write.input {
+                ConnectorWriteInputBinding::RootOutputByOrdinal => {
+                    (0..source.output.len()).collect()
+                }
+                ConnectorWriteInputBinding::OutputOrdinals(ordinals) => ordinals.clone(),
+            };
+            if ordinals.len() != width {
+                return Err(ContractLoweringError::ArityMismatch {
+                    context: "TableWriter ordinal projection",
+                    expected: width,
+                    actual: ordinals.len(),
+                });
+            }
+            for (field_ordinal, source_ordinal) in ordinals.into_iter().enumerate() {
+                let value = source.output.get(source_ordinal).copied().ok_or_else(|| {
+                    invalid_write(format!(
+                        "writer input source ordinal {source_ordinal} is outside {} outputs",
+                        source.output.len()
+                    ))
+                })?;
+                let ty = ValueType::new(
+                    write.contract.input_columns[field_ordinal]
+                        .data_type
+                        .clone(),
+                    write.contract.input_columns[field_ordinal].nullable,
+                );
+                let expression =
+                    self.fragment_mut()
+                        .add_expression(node, ty, ContractExprKind::Value(value))?;
+                expressions.push((expression, value));
+                output.push(value);
+            }
+        }
+        let properties = derive_project_output_properties(
+            &source.properties,
+            &output,
+            expressions_are_replica_deterministic(
+                self.fragment_mut().expressions(),
+                expressions.iter().map(|(expression, _)| *expression),
+                true,
+            ),
+        );
+        self.fragment_mut().insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([source.node]),
+            required_inputs: Box::from([passthrough_requirement(&source.properties)]),
+            output_properties: properties.clone(),
+            output: OutputPort {
+                node,
+                columns: output.clone().into_boxed_slice(),
+            },
+            kind: NodeKind::Project {
+                expressions: expressions.into_boxed_slice(),
+            },
+        })?;
+        Ok(LoweredNode {
+            fragment: source.fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns: BTreeMap::new(),
+            properties,
+            display_names: write
+                .contract
+                .input_columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+    }
+
+    fn writer_relation_schema(
+        &mut self,
+        owner: NodeId,
+        revision: u32,
+        fields: &arrow::datatypes::Fields,
+        slot_ids: &[u32],
+    ) -> Result<LoweredWriterRelation, ContractLoweringError> {
+        if fields.len() != slot_ids.len() {
+            return Err(invalid_write(
+                "writer schema field/slot arity differs".into(),
+            ));
+        }
+        let mut output = Vec::with_capacity(fields.len());
+        let mut by_slot = BTreeMap::new();
+        let mut relation_fields = Vec::with_capacity(fields.len());
+        for (index, (field, slot)) in fields.iter().zip(slot_ids).enumerate() {
+            let role = match index {
+                0 => WriterRelationFieldRole::Kind,
+                1 => WriterRelationFieldRole::TargetOrdinal,
+                2 => WriterRelationFieldRole::RowCount,
+                3 => WriterRelationFieldRole::CommitFragment,
+                _ => WriterRelationFieldRole::Auxiliary,
+            };
+            let kind = match role {
+                WriterRelationFieldRole::Kind => WriterDerivedKind::RelationKind,
+                WriterRelationFieldRole::TargetOrdinal => WriterDerivedKind::WriteTargetOrdinal,
+                WriterRelationFieldRole::RowCount => WriterDerivedKind::AffectedRows,
+                WriterRelationFieldRole::CommitFragment => WriterDerivedKind::CommitFragment,
+                WriterRelationFieldRole::Auxiliary => WriterDerivedKind::RelationAuxiliary,
+            };
+            let ty = ValueType::new(field.data_type().clone(), field.is_nullable());
+            let value = self.fragment_mut().add_value(
+                ty.clone(),
+                ValueOrigin::WriterDerived {
+                    writer_node: owner,
+                    kind,
+                },
+            )?;
+            if by_slot.insert(*slot, value).is_some() {
+                return Err(invalid_write("writer schema repeats a slot".into()));
+            }
+            output.push(value);
+            relation_fields.push(WriterRelationField {
+                value,
+                name: field.name().clone().into_boxed_str(),
+                ty,
+                role,
+            });
+        }
+        Ok(LoweredWriterRelation {
+            schema: WriterRelationSchema {
+                revision,
+                fields: relation_fields.into_boxed_slice(),
+            },
+            output: output.into_boxed_slice(),
+            values_by_slot: by_slot,
+        })
+    }
+
+    fn lower_change_stream_writers(
+        &mut self,
+        source: LoweredNode,
+        dag: ChangeStreamWriteDagSpec,
+        auxiliary: &WriterAuxiliaryPlan,
+        sequences: &BTreeMap<u32, AggregateSequenceId>,
+        targets: &mut FinalizedWriteTargetSet,
+    ) -> Result<(Vec<LoweredNode>, Box<[WriteTargetOrdinal]>), ContractLoweringError> {
+        let effect = source
+            .output
+            .get(dag.effect_output_ordinal)
+            .copied()
+            .ok_or_else(|| invalid_write("change-stream effect ordinal is out of range".into()))?;
+        let source_fragment = source.fragment;
+        let mut router_routes = Vec::with_capacity(dag.routes.len());
+        let mut writers = Vec::with_capacity(dag.routes.len());
+        let mut ordinals = Vec::with_capacity(dag.routes.len());
+        for mut route in dag.routes {
+            let edge = self.plan_builder.reserve_edge_id()?;
+            let writer_fragment = self.allocate_fragment()?;
+            let mut projection = Vec::with_capacity(route.input_ordinals.len());
+            let mut route_mapping = Vec::with_capacity(route.input_ordinals.len());
+            let mut typed_sources = Vec::with_capacity(route.input_ordinals.len());
+            for (route_input_ordinal, input) in route.input_ordinals.iter().enumerate() {
+                let source_ordinal = usize::try_from(input.input_ordinal()).map_err(|_| {
+                    invalid_write("change-stream input ordinal is outside host range".into())
+                })?;
+                let source_value = source.output.get(source_ordinal).copied().ok_or_else(|| {
+                    invalid_write(format!(
+                        "change-stream route input ordinal {source_ordinal} is out of range"
+                    ))
+                })?;
+                let input_column = route
+                    .sink
+                    .contract
+                    .input_columns
+                    .get(route_input_ordinal)
+                    .ok_or_else(|| {
+                        invalid_write("change-stream route input/schema arity differs".into())
+                    })?;
+                projection.push(source_value);
+                route_mapping.push((input.token(), source_value));
+                typed_sources.push((
+                    source_value,
+                    ValueType::new(input_column.data_type.clone(), input_column.nullable),
+                ));
+            }
+            if route
+                .sink
+                .contract
+                .target
+                .fields
+                .iter()
+                .map(|field| field.token)
+                .ne(route.input_ordinals.iter().map(|input| input.token()))
+            {
+                return Err(invalid_write(
+                    "change-stream route token order differs from its writer target".into(),
+                ));
+            }
+            let partition_sources = route
+                .partition_input_positions
+                .iter()
+                .map(|position| {
+                    projection.get(*position).copied().ok_or_else(|| {
+                        invalid_write(
+                            "change-stream partition input position is outside the route input"
+                                .into(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            self.current_fragment = writer_fragment;
+            let receiver = self.fragment_mut().reserve_node_id()?;
+            let mut imports = Vec::with_capacity(projection.len());
+            let mut imported = Vec::with_capacity(projection.len());
+            let mut source_to_import = BTreeMap::new();
+            for (source_value, ty) in typed_sources {
+                let destination = match source_to_import.get(&source_value) {
+                    Some((destination, existing_type)) if existing_type == &ty => *destination,
+                    Some(_) => {
+                        return Err(invalid_write(
+                            "one change-stream source value is bound with conflicting target types"
+                                .into(),
+                        ));
+                    }
+                    None => {
+                        let destination = self.fragment_mut().add_value(
+                            ty.clone(),
+                            ValueOrigin::ExchangeImport { edge, source_value },
+                        )?;
+                        source_to_import.insert(source_value, (destination, ty));
+                        destination
+                    }
+                };
+                imports.push((source_value, destination));
+                imported.push(destination);
+            }
+            let (source_distribution, destination_distribution) = if partition_sources.is_empty() {
+                (Distribution::Singleton, Distribution::Singleton)
+            } else {
+                let scheme = self.allocate_hash_scheme()?;
+                let destination_keys = route
+                    .partition_input_positions
+                    .iter()
+                    .map(|position| {
+                        imported.get(*position).copied().ok_or_else(|| {
+                            invalid_write(
+                                "change-stream partition import position is outside the route input"
+                                    .into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    Distribution::Hash {
+                        keys: partition_sources.clone().into_boxed_slice(),
+                        scheme: scheme.clone(),
+                    },
+                    Distribution::Hash {
+                        keys: destination_keys.into_boxed_slice(),
+                        scheme,
+                    },
+                )
+            };
+            let receiver_properties = PhysicalProperties {
+                distribution: destination_distribution.clone(),
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            };
+            self.fragment_mut().insert_node(PhysicalNode {
+                id: receiver,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: receiver_properties.clone(),
+                output: OutputPort {
+                    node: receiver,
+                    columns: imported.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::ExchangeSource {
+                    edge,
+                    imports: imports.clone().into_boxed_slice(),
+                },
+            })?;
+            self.plan_builder.add_edge(Edge {
+                id: edge,
+                kind: EdgeKind::ChangeStreamRouter,
+                source: EdgeSource {
+                    fragment: source_fragment,
+                    projection: projection.clone().into_boxed_slice(),
+                },
+                destination: EdgeDestination {
+                    fragment: writer_fragment,
+                    node: receiver,
+                    receive_mapping: imports.into_boxed_slice(),
+                },
+                partitioning: EdgePartitioning {
+                    source: source_distribution,
+                    source_multiplicity: RowMultiplicity::SingleCopy,
+                    destination: destination_distribution,
+                    destination_multiplicity: RowMultiplicity::SingleCopy,
+                },
+            })?;
+            router_routes.push(ContractChangeStreamRoute {
+                route_id: route.route_id,
+                write_target_ordinal: route.write_target_ordinal,
+                accepted_effects: route.accepted_effects.into_boxed_slice(),
+                input_mapping: route_mapping.into_boxed_slice(),
+                partition_by: partition_sources.into_boxed_slice(),
+                edge,
+            });
+            let ordinal = route.write_target_ordinal;
+            let writer_source = LoweredNode {
+                fragment: writer_fragment,
+                node: receiver,
+                output: imported.into_boxed_slice(),
+                columns: BTreeMap::new(),
+                properties: receiver_properties,
+                display_names: route
+                    .sink
+                    .contract
+                    .input_columns
+                    .iter()
+                    .map(|column| column.name.clone())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            };
+            if route.sink.root_output_exprs.is_some() {
+                return Err(invalid_write(
+                    "change-stream route cannot apply a second writer projection".into(),
+                ));
+            }
+            // The router edge has already projected the exact ordered target
+            // occurrences. The writer must consume its ExchangeSource directly;
+            // applying the producer-relative ordinal binding again would insert
+            // a second projection and sever the route-to-writer contract.
+            route.sink.input = ConnectorWriteInputBinding::RootOutputByOrdinal;
+            let handle = targets.take(ordinal).map_err(invalid_write)?;
+            let writer = self.lower_table_writer(
+                writer_source,
+                route.sink,
+                ordinal,
+                auxiliary,
+                sequences,
+                handle,
+            )?;
+            writers.push(writer);
+            ordinals.push(ordinal);
+        }
+        self.current_fragment = source_fragment;
+        self.complete_fragment(
+            source_fragment,
+            source.node,
+            FragmentSink::Router {
+                effect,
+                routes: router_routes.into_boxed_slice(),
+            },
+        )?;
+        Ok((writers, ordinals.into_boxed_slice()))
+    }
+
+    fn lower_single_writer_finish(
+        self,
+        writer: LoweredNode,
+        ordinal: WriteTargetOrdinal,
+        auxiliary: &WriterAuxiliaryPlan,
+        sequences: &BTreeMap<u32, AggregateSequenceId>,
+    ) -> Result<PlanBuilder, ContractLoweringError> {
+        self.lower_writer_finish(vec![writer], Box::from([ordinal]), auxiliary, sequences)
+    }
+
+    fn lower_writer_finish(
+        mut self,
+        writers: Vec<LoweredNode>,
+        ordinals: Box<[WriteTargetOrdinal]>,
+        auxiliary: &WriterAuxiliaryPlan,
+        sequences: &BTreeMap<u32, AggregateSequenceId>,
+    ) -> Result<PlanBuilder, ContractLoweringError> {
+        if writers.is_empty() || writers.len() != ordinals.len() {
+            return Err(invalid_write(
+                "writer finish has no exact writer set".into(),
+            ));
+        }
+        let finish_fragment = self.allocate_fragment()?;
+        self.current_fragment = finish_fragment;
+        let mut exchange_nodes = Vec::with_capacity(writers.len());
+        let mut exchange_outputs = Vec::with_capacity(writers.len());
+        for writer in writers {
+            let edge = self.plan_builder.reserve_edge_id()?;
+            self.complete_fragment(writer.fragment, writer.node, FragmentSink::Stream { edge })?;
+            let exchange = self.fragment_mut().reserve_node_id()?;
+            let mut imports = Vec::with_capacity(writer.output.len());
+            let mut imported = Vec::with_capacity(writer.output.len());
+            for (source, field) in writer
+                .output
+                .iter()
+                .zip(auxiliary.schema().arrow_schema().fields())
+            {
+                let destination = self.fragment_mut().add_value(
+                    ValueType::new(field.data_type().clone(), field.is_nullable()),
+                    ValueOrigin::ExchangeImport {
+                        edge,
+                        source_value: *source,
+                    },
+                )?;
+                imports.push((*source, destination));
+                imported.push(destination);
+            }
+            self.fragment_mut().insert_node(PhysicalNode {
+                id: exchange,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: singleton_properties(),
+                output: OutputPort {
+                    node: exchange,
+                    columns: imported.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::ExchangeSource {
+                    edge,
+                    imports: imports.clone().into_boxed_slice(),
+                },
+            })?;
+            self.plan_builder.add_edge(Edge {
+                id: edge,
+                kind: EdgeKind::Stream,
+                source: EdgeSource {
+                    fragment: writer.fragment,
+                    projection: writer.output,
+                },
+                destination: EdgeDestination {
+                    fragment: finish_fragment,
+                    node: exchange,
+                    receive_mapping: imports.into_boxed_slice(),
+                },
+                partitioning: EdgePartitioning {
+                    source: Distribution::Singleton,
+                    source_multiplicity: RowMultiplicity::SingleCopy,
+                    destination: Distribution::Singleton,
+                    destination_multiplicity: RowMultiplicity::SingleCopy,
+                },
+            })?;
+            exchange_nodes.push(exchange);
+            exchange_outputs.push(imported.into_boxed_slice());
+        }
+        let (finish_input, imported) = if exchange_nodes.len() == 1 {
+            (
+                exchange_nodes[0],
+                exchange_outputs.pop().unwrap().into_vec(),
+            )
+        } else {
+            let union = self.fragment_mut().reserve_node_id()?;
+            let mut output = Vec::with_capacity(auxiliary.schema().arrow_schema().fields().len());
+            for (output_ordinal, field) in auxiliary
+                .schema()
+                .arrow_schema()
+                .fields()
+                .iter()
+                .enumerate()
+            {
+                output.push(self.fragment_mut().add_value(
+                    ValueType::new(field.data_type().clone(), field.is_nullable()),
+                    ValueOrigin::NodeOutput {
+                        node: union,
+                        output_ordinal: checked_ordinal("writer UnionAll output", output_ordinal)?,
+                    },
+                )?);
+            }
+            self.fragment_mut().insert_node(PhysicalNode {
+                id: union,
+                inputs: exchange_nodes.into_boxed_slice(),
+                required_inputs: (0..exchange_outputs.len())
+                    .map(|_| singleton_properties())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                output_properties: singleton_properties(),
+                output: OutputPort {
+                    node: union,
+                    columns: output.clone().into_boxed_slice(),
+                },
+                kind: NodeKind::SetOp {
+                    kind: SetOperationKind::UnionAll,
+                    input_mappings: exchange_outputs.into_boxed_slice(),
+                },
+            })?;
+            (union, output)
+        };
+
+        let finish = self.fragment_mut().reserve_node_id()?;
+        let root_schema = RootWriteResultSchema::new();
+        let relation = self.writer_relation_schema(
+            finish,
+            root_schema.contract_version(),
+            root_schema.arrow_schema().fields(),
+            &root_schema.slot_ids(),
+        )?;
+        let LoweredWriterRelation {
+            schema: output_schema,
+            output,
+            values_by_slot: output_slots,
+        } = relation;
+        if output_schema.revision != ROOT_WRITE_RESULT_SCHEMA_REVISION {
+            return Err(invalid_write(
+                "root write-result schema revision differs".into(),
+            ));
+        }
+        let input_schema = writer_import_schema(auxiliary, &imported)?;
+        let input_slots = auxiliary
+            .schema()
+            .slot_ids()
+            .into_iter()
+            .zip(imported.iter().copied())
+            .collect::<BTreeMap<_, _>>();
+        let mut final_values_by_slot = BTreeMap::new();
+        let final_aggregates = auxiliary
+            .final_plan()
+            .calls()
+            .iter()
+            .map(|call| {
+                let input = input_slots
+                    .get(&call.intermediate_input_slot_id())
+                    .copied()
+                    .ok_or_else(|| invalid_write("final aggregate input slot is unknown".into()))?;
+                let output = self.fragment_mut().add_value(
+                    writer_aggregate_result_type(call.resolved())?,
+                    ValueOrigin::WriterDerived {
+                        writer_node: finish,
+                        kind: WriterDerivedKind::RelationAuxiliary,
+                    },
+                )?;
+                if final_values_by_slot
+                    .insert(call.final_output_slot_id(), output)
+                    .is_some()
+                {
+                    return Err(invalid_write(
+                        "final aggregate output slot is duplicated".into(),
+                    ));
+                }
+                let sequence = sequences
+                    .get(&call.intermediate_input_slot_id())
+                    .copied()
+                    .ok_or_else(|| invalid_write("final aggregate sequence is missing".into()))?;
+                Ok(WriterAggregateCall {
+                    input,
+                    binding: lower_writer_aggregate_binding(
+                        call.resolved(),
+                        AggregatePhase::Final { sequence },
+                    )?,
+                    output,
+                })
+            })
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+        let grouped_unpivot = auxiliary
+            .final_plan()
+            .unpivot()
+            .map(
+                |unpivot| -> Result<WriterGroupedUnpivotSpec, ContractLoweringError> {
+                    let grouping_input = input_slots
+                        .get(&unpivot.grouping_input_slot_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            invalid_write("writer grouping input slot is unknown".into())
+                        })?;
+                    let grouping_output = self.fragment_mut().add_value(
+                        ValueType::new(DataType::Int32, false),
+                        ValueOrigin::WriterDerived {
+                            writer_node: finish,
+                            kind: WriterDerivedKind::GroupingKey,
+                        },
+                    )?;
+                    let passthrough_output = output_slots
+                        .get(&unpivot.passthrough_output_slot_id())
+                        .copied()
+                        .ok_or_else(|| {
+                            invalid_write("writer passthrough output slot is unknown".into())
+                        })?;
+                    let value_output = output_slots
+                        .get(&unpivot.value_output_slot_id())
+                        .copied()
+                        .ok_or_else(|| {
+                        invalid_write("writer value output slot is unknown".into())
+                    })?;
+                    let literal_outputs = unpivot
+                        .literal_output_slot_ids()
+                        .iter()
+                        .map(|slot| {
+                            output_slots.get(slot).copied().ok_or_else(|| {
+                                invalid_write("writer literal output slot is unknown".into())
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mappings = unpivot
+                        .mappings()
+                        .iter()
+                        .map(|mapping| {
+                            let input = final_values_by_slot
+                                .get(&mapping.input_value_slot_id())
+                                .copied()
+                                .ok_or_else(|| {
+                                    invalid_write("writer Unpivot input slot is unknown".into())
+                                })?;
+                            let constants = mapping
+                                .constants()
+                                .iter()
+                                .map(|constant| match constant {
+                                    crate::analysis::UnpivotConstant::Scalar(expression) => {
+                                        Ok(ContractUnpivotConstant::Scalar(self.lower_expression(
+                                            finish,
+                                            expression,
+                                            &BTreeMap::new(),
+                                        )?))
+                                    }
+                                    crate::analysis::UnpivotConstant::Int32List(values) => {
+                                        Ok(ContractUnpivotConstant::Int32List(
+                                            values.clone().into_boxed_slice(),
+                                        ))
+                                    }
+                                    crate::analysis::UnpivotConstant::Utf8Map(entries) => {
+                                        Ok(ContractUnpivotConstant::Utf8Map(
+                                            entries
+                                                .iter()
+                                                .map(|(key, value)| {
+                                                    (
+                                                        key.clone().into_boxed_str(),
+                                                        value.clone().into_boxed_str(),
+                                                    )
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .into_boxed_slice(),
+                                        ))
+                                    }
+                                })
+                                .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+                            Ok(WriterGroupedUnpivotMapping {
+                                write_target_ordinal: mapping.target(),
+                                input,
+                                constants: constants.into_boxed_slice(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, ContractLoweringError>>()?;
+                    let statistics_target_ordinals = unpivot
+                        .mappings()
+                        .iter()
+                        .map(|mapping| mapping.target())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    Ok(WriterGroupedUnpivotSpec {
+                        statistics_target_ordinals,
+                        grouping_input,
+                        grouping_output,
+                        passthrough_output,
+                        value_output,
+                        literal_outputs: literal_outputs.into_boxed_slice(),
+                        mappings: mappings.into_boxed_slice(),
+                        max_output_rows: u64::try_from(unpivot.max_output_rows()).map_err(
+                            |_| invalid_write("writer Unpivot row bound is outside u64".into()),
+                        )?,
+                        max_output_bytes: u64::try_from(unpivot.max_output_bytes()).map_err(
+                            |_| invalid_write("writer Unpivot byte bound is outside u64".into()),
+                        )?,
+                    })
+                },
+            )
+            .transpose()?;
+        self.fragment_mut().insert_node(PhysicalNode {
+            id: finish,
+            inputs: Box::from([finish_input]),
+            required_inputs: Box::from([singleton_properties()]),
+            output_properties: singleton_properties(),
+            output: OutputPort {
+                node: finish,
+                columns: output.clone(),
+            },
+            kind: NodeKind::TableFinish(WriterFinishSpec {
+                expected_target_ordinals: ordinals,
+                input_schema,
+                output_schema,
+                final_aggregates: final_aggregates.into_boxed_slice(),
+                grouped_unpivot,
+            }),
+        })?;
+        let fields = root_schema
+            .arrow_schema()
+            .fields()
+            .iter()
+            .zip(output.iter())
+            .map(|(field, value)| ResultField {
+                name: field.name().clone().into_boxed_str(),
+                alias: None,
+                value: *value,
+                ty: ValueType::new(field.data_type().clone(), field.is_nullable()),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.complete_fragment(finish_fragment, finish, FragmentSink::Result)?;
+        self.finish_draft(ResultPort {
+            fragment: finish_fragment,
+            output: OutputPort {
+                node: finish,
+                columns: output,
+            },
+            fields,
+        })
     }
 
     fn lower_redistribute(
@@ -1344,7 +3472,7 @@ impl ContractLoweringVisitor {
                 imports: receive_mapping.clone().into_boxed_slice(),
             },
         })?;
-        self.plan_builder.add_edge(Edge {
+        let edge_contract = Edge {
             id: edge,
             kind: EdgeKind::Stream,
             source: EdgeSource {
@@ -1362,7 +3490,9 @@ impl ContractLoweringVisitor {
                 destination: destination_distribution,
                 destination_multiplicity,
             },
-        })?;
+        };
+        self.plan_builder.add_edge(edge_contract.clone())?;
+        self.edges.insert(edge, edge_contract);
         self.complete_fragment(source.fragment, source.node, FragmentSink::Stream { edge })?;
         Ok(LoweredNode {
             fragment: destination,
@@ -1402,13 +3532,6 @@ impl ContractLoweringVisitor {
                 detail: "hash join has no equality keys",
             });
         }
-        if !join.build_runtime_filters.is_empty() {
-            return Err(ContractLoweringError::UnsupportedRuntimeFilters {
-                node: "HashJoin",
-                count: join.build_runtime_filters.len(),
-            });
-        }
-
         let kind = lower_join_kind(join.join_type);
         if kind == ContractJoinKind::Cross {
             return Err(ContractLoweringError::InvalidJoin {
@@ -1541,6 +3664,84 @@ impl ContractLoweringVisitor {
                 null_extended,
             },
         })?;
+        for intent in &join.build_runtime_filters {
+            if join.execution_mode != Some(intent.execution_mode) {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "producer execution mode differs from the frozen join mode".to_string(),
+                });
+            }
+            let key_ordinal = u32::try_from(intent.expr_order).map_err(|_| {
+                ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "join equality ordinal exceeds u32".to_string(),
+                }
+            })?;
+            let (build_value, probe_value) = match build_side {
+                ContractJoinSide::Left => (
+                    left_key_values.get(intent.expr_order).copied().flatten(),
+                    right_key_values.get(intent.expr_order).copied().flatten(),
+                ),
+                ContractJoinSide::Right => (
+                    right_key_values.get(intent.expr_order).copied().flatten(),
+                    left_key_values.get(intent.expr_order).copied().flatten(),
+                ),
+            };
+            let (Some(build_value), Some(probe_value)) = (build_value, probe_value) else {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "join runtime filter key is not one direct lowered ValueId".to_string(),
+                });
+            };
+            let (expected_build_expr, expected_probe_expr) = match build_side {
+                ContractJoinSide::Left => (
+                    &join.eq_conditions[intent.expr_order].left,
+                    &join.eq_conditions[intent.expr_order].right,
+                ),
+                ContractJoinSide::Right => (
+                    &join.eq_conditions[intent.expr_order].right,
+                    &join.eq_conditions[intent.expr_order].left,
+                ),
+            };
+            if identity_column_ref(&intent.build_expr) != identity_column_ref(expected_build_expr)
+                || identity_column_ref(&intent.probe_expr)
+                    != identity_column_ref(expected_probe_expr)
+            {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "producer intent differs from the exact frozen join key".to_string(),
+                });
+            }
+            let filter_id = runtime_filter_id(intent.filter_id)?;
+            self.attach_runtime_filter(self.current_fragment, filter_id)?;
+            let pending = PendingRuntimeFilterBuild::Join {
+                fragment: self.current_fragment,
+                node,
+                key_ordinal,
+                build_side,
+                execution_mode: intent.execution_mode,
+                build_value,
+                probe_value,
+                null_semantics: match intent.null_semantics {
+                    crate::planner::runtime_filter::contract::NullSemantics::NeverMatches => {
+                        RuntimeFilterNullSemantics::NeverMatches
+                    }
+                    crate::planner::runtime_filter::contract::NullSemantics::NullSafeEqual => {
+                        RuntimeFilterNullSemantics::NullSafeEqual
+                    }
+                },
+            };
+            if self
+                .runtime_filter_builds
+                .insert(intent.filter_id, pending)
+                .is_some()
+            {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "more than one producer owns the filter".to_string(),
+                });
+            }
+        }
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -2037,12 +4238,6 @@ impl ContractLoweringVisitor {
         aggregate: &crate::planner::physical::PhysicalHashAggregateNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        if !aggregate.topn_runtime_filter_builds.is_empty() {
-            return Err(ContractLoweringError::UnsupportedRuntimeFilters {
-                node: "HashAggregate",
-                count: aggregate.topn_runtime_filter_builds.len(),
-            });
-        }
         require_output_shape(
             "HashAggregate",
             &plan.output_columns,
@@ -2366,6 +4561,65 @@ impl ContractLoweringVisitor {
                 calls: calls.into_boxed_slice(),
             },
         })?;
+        for intent in &aggregate.topn_runtime_filter_builds {
+            let group_key_ordinal = u32::try_from(intent.group_key_ordinal).map_err(|_| {
+                ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "Aggregate TopN group-key ordinal exceeds u32".to_string(),
+                }
+            })?;
+            let input_value = group_input_values
+                .get(intent.group_key_ordinal)
+                .copied()
+                .flatten()
+                .ok_or_else(|| ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "Aggregate TopN key is not one direct lowered ValueId".to_string(),
+                })?;
+            let intent_input = identity_column_ref(&intent.group_key_expr)
+                .and_then(|column| child.columns.get(&column))
+                .copied();
+            if intent_input != Some(input_value) {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "Aggregate TopN intent differs from the exact frozen group key"
+                        .to_string(),
+                });
+            }
+            let filter_id = runtime_filter_id(intent.filter_id)?;
+            self.attach_runtime_filter(self.current_fragment, filter_id)?;
+            let pending = PendingRuntimeFilterBuild::AggregateTopN {
+                fragment: self.current_fragment,
+                node,
+                group_key_ordinal,
+                input_value,
+                limit: intent.limit.get(),
+                direction: match intent.direction {
+                    crate::planner::runtime_filter::contract::SortDirection::Ascending => {
+                        SortDirection::Ascending
+                    }
+                    crate::planner::runtime_filter::contract::SortDirection::Descending => {
+                        SortDirection::Descending
+                    }
+                },
+                null_ordering: match intent.null_order {
+                    crate::planner::runtime_filter::contract::NullOrder::First => {
+                        NullOrdering::First
+                    }
+                    crate::planner::runtime_filter::contract::NullOrder::Last => NullOrdering::Last,
+                },
+            };
+            if self
+                .runtime_filter_builds
+                .insert(intent.filter_id, pending)
+                .is_some()
+            {
+                return Err(ContractLoweringError::InvalidRuntimeFilter {
+                    id: intent.filter_id,
+                    detail: "more than one producer owns the filter".to_string(),
+                });
+            }
+        }
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -4325,6 +6579,12 @@ struct LoweredNode {
     display_names: Box<[String]>,
 }
 
+struct LoweredWriterRelation {
+    schema: WriterRelationSchema,
+    output: Box<[ValueId]>,
+    values_by_slot: BTreeMap<u32, ValueId>,
+}
+
 struct JoinOutputRequest<'a> {
     kind: ContractJoinKind,
     requested: &'a [OutputColumn],
@@ -4371,6 +6631,82 @@ enum ProviderPartitionDefinition {
     Bucket(ProviderBucketPartitionScheme),
 }
 
+fn writer_import_schema(
+    auxiliary: &WriterAuxiliaryPlan,
+    values: &[ValueId],
+) -> Result<WriterRelationSchema, ContractLoweringError> {
+    let fields = auxiliary.schema().arrow_schema();
+    if fields.fields().len() != values.len() {
+        return Err(invalid_write("writer import schema arity differs".into()));
+    }
+    Ok(WriterRelationSchema {
+        revision: auxiliary.schema().contract_version(),
+        fields: fields
+            .fields()
+            .iter()
+            .zip(values)
+            .enumerate()
+            .map(|(index, (field, value))| WriterRelationField {
+                value: *value,
+                name: field.name().clone().into_boxed_str(),
+                ty: ValueType::new(field.data_type().clone(), field.is_nullable()),
+                role: match index {
+                    0 => WriterRelationFieldRole::Kind,
+                    1 => WriterRelationFieldRole::TargetOrdinal,
+                    2 => WriterRelationFieldRole::RowCount,
+                    3 => WriterRelationFieldRole::CommitFragment,
+                    _ => WriterRelationFieldRole::Auxiliary,
+                },
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    })
+}
+
+fn lower_writer_aggregate_binding(
+    resolved: &novarocks_functions::ResolvedFunctionBinding,
+    phase: AggregatePhase,
+) -> Result<AggregateBinding, ContractLoweringError> {
+    if resolved.kind != novarocks_physical_plan::FunctionKind::Aggregate
+        || resolved.logical_argument_count != 1
+    {
+        return Err(invalid_write(
+            "writer aggregate binding is not an exact unary aggregate".into(),
+        ));
+    }
+    let novarocks_functions::FunctionResultType::Scalar(result) = &resolved.selected.result_type
+    else {
+        return Err(invalid_write("writer aggregate returns a relation".into()));
+    };
+    let aggregate = resolved
+        .selected
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| invalid_write("writer aggregate has no state contract".into()))?;
+    Ok(AggregateBinding {
+        function: bound_function_from_resolved(resolved, result),
+        phase,
+        logical_argument_count: 1,
+        intermediate_type: aggregate.intermediate_type.clone(),
+        state_format: aggregate.state_format.clone(),
+    })
+}
+
+fn writer_aggregate_result_type(
+    resolved: &novarocks_functions::ResolvedFunctionBinding,
+) -> Result<ValueType, ContractLoweringError> {
+    match &resolved.selected.result_type {
+        novarocks_functions::FunctionResultType::Scalar(result) => Ok(result.clone()),
+        novarocks_functions::FunctionResultType::Relation(_) => {
+            Err(invalid_write("writer aggregate returns a relation".into()))
+        }
+    }
+}
+
+fn invalid_write(detail: String) -> ContractLoweringError {
+    ContractLoweringError::InvalidWrite { detail }
+}
+
 fn provider_partition_identity_digest(
     label: &[u8],
     version: PlanVersionId,
@@ -4411,10 +6747,11 @@ fn partition_identity_digest(label: &[u8], version: PlanVersionId, parts: &[&[u8
 }
 
 fn result_fields(
-    columns: &[OutputColumn],
+    plan: &PhysicalPlanNode,
     values: &[ValueId],
     display_names: &[String],
 ) -> Result<Box<[ResultField]>, ContractLoweringError> {
+    let columns = &plan.output_columns;
     if columns.len() != values.len() {
         return Err(ContractLoweringError::ArityMismatch {
             context: "result port",
@@ -4429,17 +6766,65 @@ fn result_fields(
             actual: display_names.len(),
         });
     }
+    let identities = result_field_identities(plan);
     Ok(columns
         .iter()
         .zip(values.iter().zip(display_names))
-        .map(|(column, (value, display_name))| ResultField {
-            name: display_name.clone().into_boxed_str(),
-            alias: None,
-            value: *value,
-            ty: value_type(column),
+        .enumerate()
+        .map(|(ordinal, (column, (value, display_name)))| {
+            let identity = identities.as_ref().and_then(|items| items.get(ordinal));
+            let name = identity
+                .map(|identity| identity.name.as_str())
+                .unwrap_or(&column.name);
+            let alias = identity
+                .and_then(|identity| identity.alias.as_deref())
+                .or_else(|| (display_name != name).then_some(display_name.as_str()));
+            ResultField {
+                name: name.into(),
+                alias: alias.map(Into::into),
+                value: *value,
+                ty: value_type(column),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice())
+}
+
+struct ResultFieldIdentity {
+    name: String,
+    alias: Option<String>,
+}
+
+fn result_field_identities(plan: &PhysicalPlanNode) -> Option<Vec<ResultFieldIdentity>> {
+    if let PhysicalPlanKind::Project(project) = &plan.kind {
+        return Some(
+            project
+                .items
+                .iter()
+                .map(|item| {
+                    let name = crate::analysis::expr_display::typed_expr_display_name(&item.expr);
+                    let alias = (name != item.output_name).then(|| item.output_name.clone());
+                    ResultFieldIdentity { name, alias }
+                })
+                .collect(),
+        );
+    }
+    let passthrough_child = if plan.children.len() == 1 {
+        plan.children.first()
+    } else if matches!(&plan.kind, PhysicalPlanKind::CTEAnchor(_)) {
+        plan.children.get(1)
+    } else {
+        None
+    }?;
+    let preserves_occurrences = passthrough_child.output_columns.len() == plan.output_columns.len()
+        && passthrough_child
+            .output_columns
+            .iter()
+            .zip(&plan.output_columns)
+            .all(|(child, output)| child.column_id == output.column_id);
+    preserves_occurrences
+        .then(|| result_field_identities(passthrough_child))
+        .flatten()
 }
 
 fn singleton_properties() -> PhysicalProperties {
@@ -5666,6 +8051,9 @@ pub(crate) enum ContractLoweringError {
     InvalidCte {
         detail: String,
     },
+    InvalidWrite {
+        detail: String,
+    },
     DuplicateFragmentCompletion {
         fragment: FragmentId,
     },
@@ -5684,6 +8072,10 @@ pub(crate) enum ContractLoweringError {
     UnsupportedRuntimeFilters {
         node: &'static str,
         count: usize,
+    },
+    InvalidRuntimeFilter {
+        id: i32,
+        detail: String,
     },
     UnsupportedSortMode {
         detail: &'static str,
@@ -5808,6 +8200,7 @@ impl fmt::Display for ContractLoweringError {
                 write!(formatter, "invalid TableFunction: {detail}")
             }
             Self::InvalidCte { detail } => write!(formatter, "invalid CTE: {detail}"),
+            Self::InvalidWrite { detail } => write!(formatter, "invalid final write: {detail}"),
             Self::DuplicateFragmentCompletion { fragment } => write!(
                 formatter,
                 "fragment {} has more than one root/sink completion",
@@ -5837,6 +8230,9 @@ impl fmt::Display for ContractLoweringError {
                 formatter,
                 "final physical-plan lowering does not yet bind {count} runtime filter(s) on {node}"
             ),
+            Self::InvalidRuntimeFilter { id, detail } => {
+                write!(formatter, "runtime filter {id} is invalid: {detail}")
+            }
             Self::UnsupportedSortMode { detail } => {
                 write!(formatter, "unsupported final Sort mode: {detail}")
             }
@@ -5974,7 +8370,9 @@ mod tests {
         WindowExpr,
     };
     use crate::planner::physical::DistributedChangeEventExpandNode;
-    use crate::planner::physical::{PhysicalPlanStats, PhysicalTopNNode, PlannerConfidence};
+    use crate::planner::physical::{
+        PhysicalPlanStats, PhysicalTopNNode, PlannerConfidence, PlannerCostEstimate,
+    };
 
     fn version() -> PlanVersionId {
         PlanVersionId::try_new([41; 16]).unwrap()
@@ -6191,6 +8589,42 @@ mod tests {
         }
     }
 
+    fn attach_singleton_join_runtime_filter(
+        plan: &mut PhysicalPlanNode,
+        filter_id: i32,
+        null_safe: bool,
+        include_probe: bool,
+    ) {
+        let left_key = plan.children[0].output_columns[0].clone();
+        let right_key = plan.children[1].output_columns[0].clone();
+        if include_probe {
+            plan.children[0].probe_runtime_filters.push(
+                crate::planner::physical::runtime_filter::RuntimeFilterProbeIntent {
+                    filter_id,
+                    probe_expr: column_ref(&left_key),
+                },
+            );
+        }
+        let PhysicalPlanKind::HashJoin(join) = &mut plan.kind else {
+            unreachable!("hash_join fixture always constructs HashJoin")
+        };
+        join.eq_conditions[0].null_safe = null_safe;
+        join.build_runtime_filters.push(
+            crate::planner::physical::runtime_filter::RuntimeFilterBuildIntent {
+                filter_id,
+                build_expr: column_ref(&right_key),
+                probe_expr: column_ref(&left_key),
+                expr_order: 0,
+                execution_mode: JoinExecutionMode::Singleton,
+                null_semantics: if null_safe {
+                    crate::planner::runtime_filter::contract::NullSemantics::NullSafeEqual
+                } else {
+                    crate::planner::runtime_filter::contract::NullSemantics::NeverMatches
+                },
+            },
+        );
+    }
+
     fn cte_produce(
         cte_id: CteId,
         output_columns: Vec<OutputColumn>,
@@ -6244,6 +8678,376 @@ mod tests {
 
     fn finish_for_test(plan: &PhysicalPlanNode) -> Result<PhysicalPlan, ContractLoweringError> {
         Ok(lower_final_physical_plan(plan, version(), dop())?.finish()?)
+    }
+
+    fn write_handle() -> ConnectorEncodedPayload {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let instance = ConnectorInstanceId::parse("warehouse").unwrap();
+        ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                provider,
+                CatalogHandle::new(instance, CatalogVersion::from_bytes([9; 32])),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            vec![7].into(),
+        )
+    }
+
+    #[test]
+    fn ordinary_write_lowers_to_writer_stream_finish_and_result_port() {
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+
+        let input = column(1, "order_id", DataType::Int64, false);
+        let source = values(vec![input], vec![vec![literal_int(7)]]);
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
+        let targets = FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap();
+        let plan = lower_final_physical_write_plan(
+            &source,
+            version(),
+            dop(),
+            FinalWriteLowering {
+                reads: None,
+                write: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+                write_target_ordinal: ordinal,
+                auxiliary: &auxiliary,
+                targets,
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+
+        assert_eq!(plan.fragments().len(), 2);
+        assert_eq!(plan.edges().len(), 1);
+        assert!(matches!(
+            plan.edges().values().next().unwrap().kind,
+            EdgeKind::Stream
+        ));
+        assert_eq!(
+            plan.fragments()
+                .values()
+                .filter(|fragment| fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::TableWriter { .. })))
+                .count(),
+            1
+        );
+        assert_eq!(
+            plan.fragments()
+                .values()
+                .filter(|fragment| fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::TableFinish(_))))
+                .count(),
+            1
+        );
+        assert_eq!(plan.result_port().unwrap().fields.len(), 8);
+    }
+
+    #[test]
+    fn ordinary_write_preserves_repeated_source_output_occurrences() {
+        use crate::planner::distributed::write::contract::test_support::repeated_source_sql_write_plan_input;
+
+        let source = values(
+            vec![column(1, "order_id", DataType::Int64, false)],
+            vec![vec![literal_int(7)]],
+        );
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
+        let plan = lower_final_physical_write_plan(
+            &source,
+            version(),
+            dop(),
+            FinalWriteLowering {
+                reads: None,
+                write: repeated_source_sql_write_plan_input(),
+                write_target_ordinal: ordinal,
+                auxiliary: &auxiliary,
+                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let target = plan
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .find_map(|node| match &node.kind {
+                NodeKind::TableWriter { target } => Some(target),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(target.input.len(), 2);
+        assert_eq!(target.input[0], target.input[1]);
+        assert_eq!(target.target_fields[0].input, target.target_fields[1].input);
+    }
+
+    #[test]
+    fn ordinary_write_preserves_two_phase_auxiliary_statistics_contract() {
+        use crate::planner::distributed::write::auxiliary::{
+            WriterStatisticsTargetInput, plan_writer_statistics,
+        };
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+        use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
+        use novarocks_spi::connector::{
+            StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+        };
+
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let input_schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
+            "order_id",
+            DataType::Int64,
+            false,
+        )]);
+        let requirement = StatisticsRequiredAggregation::try_new(
+            StatisticsScanColumn::try_new(0, "order_id", DataType::Int64, false).unwrap(),
+            "$test_writer_stat",
+            StatisticsArtifactIdentity::try_new(vec![1], "test-writer-stat-v1").unwrap(),
+        )
+        .unwrap();
+        let functions = crate::functions::test_exact_aggregate_catalog(
+            "$test_writer_stat",
+            FunctionVisibility::Hidden,
+            [AggregateOverloadMetadata::try_new(
+                "test/writer-stat/i64/v1",
+                [DataType::Int64],
+                DataType::Binary,
+                DataType::Binary,
+                "test/writer-stat-state/v1",
+            )
+            .unwrap()],
+        );
+        let auxiliary = plan_writer_statistics(
+            &[WriterStatisticsTargetInput {
+                target: ordinal,
+                input_schema: &input_schema,
+                requirements: &[requirement],
+            }],
+            &functions,
+        )
+        .unwrap();
+        let input = column(1, "order_id", DataType::Int64, false);
+        let source = values(vec![input], vec![vec![literal_int(7)]]);
+        let plan = lower_final_physical_write_plan(
+            &source,
+            version(),
+            dop(),
+            FinalWriteLowering {
+                reads: None,
+                write: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+                write_target_ordinal: ordinal,
+                auxiliary: &auxiliary,
+                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let finish = plan
+            .fragments()
+            .values()
+            .flat_map(|fragment| fragment.nodes().values())
+            .find_map(|node| match &node.kind {
+                NodeKind::TableFinish(finish) => Some(finish),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(finish.final_aggregates.len(), 1);
+        assert!(finish.grouped_unpivot.is_some());
+    }
+
+    #[test]
+    fn change_stream_lowers_router_routes_to_exact_writers_and_one_finish() {
+        use crate::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
+        use crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input;
+        use crate::planner::physical::{
+            DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
+        };
+        use novarocks_spi::connector::{
+            ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+            ConnectorWriteRouteId,
+        };
+
+        let input = column(1, "order_id", DataType::Int64, false);
+        let data = column(2, "order_id", DataType::Int64, false);
+        let effect = column(3, "effect", DataType::Int8, false);
+        let expanded = PhysicalPlanNode {
+            kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
+                events: vec![DistributedChangeEventSpec {
+                    predicate: None,
+                    effect: ConnectorRowMutationEffect::Replace,
+                    assignments: vec![DistributedChangeEventOutputExpr {
+                        output_column_id: data.column_id,
+                        expr: Some(column_ref(&input)),
+                    }],
+                }],
+                output_columns: vec![data.clone(), effect.clone()],
+                effect_column_id: effect.column_id,
+            }),
+            children: vec![values(vec![input], vec![vec![literal_int(7)]])],
+            output_columns: vec![data, effect],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let ordinals = [
+            WriteTargetOrdinal::try_new(0).unwrap(),
+            WriteTargetOrdinal::try_new(1).unwrap(),
+        ];
+        let token = ConnectorWriteFieldToken::from_bytes([1; 32]);
+        let routes = ordinals
+            .iter()
+            .enumerate()
+            .map(|(index, ordinal)| ChangeStreamWriteRouteSpec {
+                route_id: ConnectorWriteRouteId::from_bytes([index as u8 + 1; 32]),
+                write_target_ordinal: *ordinal,
+                accepted_effects: vec![ConnectorRowMutationEffect::Replace],
+                input_ordinals: vec![ConnectorMutationRouteInput::new(token, 0)],
+                partition_input_positions: Vec::new(),
+                output_partition_ordinals: Vec::new(),
+                sink: simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal),
+            })
+            .collect();
+        let auxiliary = WriterAuxiliaryPlan::without_requirements(ordinals).unwrap();
+        let targets = FinalizedWriteTargetSet::try_new([
+            (ordinals[0], write_handle()),
+            (ordinals[1], write_handle()),
+        ])
+        .unwrap();
+        let plan = lower_final_change_stream_write_plan(
+            &expanded,
+            version(),
+            dop(),
+            FinalChangeStreamWriteLowering {
+                reads: None,
+                dag: ChangeStreamWriteDagSpec::for_test(1, routes),
+                auxiliary: &auxiliary,
+                targets,
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+
+        assert_eq!(plan.fragments().len(), 4);
+        assert_eq!(
+            plan.edges()
+                .values()
+                .filter(|edge| edge.kind == EdgeKind::ChangeStreamRouter)
+                .count(),
+            2
+        );
+        assert_eq!(
+            plan.fragments()
+                .values()
+                .filter(|fragment| fragment
+                    .nodes()
+                    .values()
+                    .any(|node| matches!(node.kind, NodeKind::TableWriter { .. })))
+                .count(),
+            2
+        );
+        assert_eq!(
+            plan.fragments()
+                .values()
+                .flat_map(|fragment| fragment.nodes().values())
+                .filter(|node| matches!(node.kind, NodeKind::TableFinish(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn change_stream_reuses_one_import_for_repeated_source_value_occurrences() {
+        use crate::planner::distributed::write::change_stream::ChangeStreamWriteRouteSpec;
+        use crate::planner::distributed::write::contract::test_support::repeated_source_sql_write_plan_input;
+        use crate::planner::physical::{
+            DistributedChangeEventOutputExpr, DistributedChangeEventSpec,
+        };
+        use novarocks_spi::connector::{
+            ConnectorMutationRouteInput, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
+            ConnectorWriteRouteId,
+        };
+
+        let input = column(1, "order_id", DataType::Int64, false);
+        let data = column(2, "order_id", DataType::Int64, false);
+        let effect = column(3, "effect", DataType::Int8, false);
+        let expanded = PhysicalPlanNode {
+            kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
+                events: vec![DistributedChangeEventSpec {
+                    predicate: None,
+                    effect: ConnectorRowMutationEffect::Replace,
+                    assignments: vec![DistributedChangeEventOutputExpr {
+                        output_column_id: data.column_id,
+                        expr: Some(column_ref(&input)),
+                    }],
+                }],
+                output_columns: vec![data.clone(), effect.clone()],
+                effect_column_id: effect.column_id,
+            }),
+            children: vec![values(vec![input], vec![vec![literal_int(7)]])],
+            output_columns: vec![data, effect],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
+        let route = ChangeStreamWriteRouteSpec {
+            route_id: ConnectorWriteRouteId::from_bytes([1; 32]),
+            write_target_ordinal: ordinal,
+            accepted_effects: vec![ConnectorRowMutationEffect::Replace],
+            input_ordinals: vec![
+                ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([1; 32]), 0),
+                ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([2; 32]), 0),
+            ],
+            partition_input_positions: vec![1],
+            output_partition_ordinals: vec![0],
+            sink: repeated_source_sql_write_plan_input(),
+        };
+        let auxiliary = WriterAuxiliaryPlan::without_requirements([ordinal]).unwrap();
+        let plan = lower_final_change_stream_write_plan(
+            &expanded,
+            version(),
+            dop(),
+            FinalChangeStreamWriteLowering {
+                reads: None,
+                dag: ChangeStreamWriteDagSpec::for_test(1, vec![route]),
+                auxiliary: &auxiliary,
+                targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
+            },
+        )
+        .unwrap()
+        .finish()
+        .unwrap();
+        let edge = plan
+            .edges()
+            .values()
+            .find(|edge| edge.kind == EdgeKind::ChangeStreamRouter)
+            .unwrap();
+        let target = plan
+            .fragments()
+            .get(&edge.destination.fragment)
+            .and_then(|fragment| fragment.nodes().get(&fragment.root()))
+            .and_then(|node| match &node.kind {
+                NodeKind::TableWriter { target } => Some(target),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(edge.source.projection[0], edge.source.projection[1]);
+        assert_eq!(
+            edge.destination.receive_mapping[0].1,
+            edge.destination.receive_mapping[1].1
+        );
+        assert_eq!(target.input[0], target.input[1]);
+        assert!(matches!(
+            edge.partitioning.source,
+            Distribution::Hash { .. }
+        ));
     }
 
     fn encoded_provider_payload(
@@ -6405,11 +9209,19 @@ mod tests {
         );
         assert_eq!(
             final_plan.result_port().unwrap().fields[0].name.as_ref(),
-            "left"
+            "number"
         );
         assert_eq!(
             final_plan.result_port().unwrap().fields[1].name.as_ref(),
-            "right"
+            "number"
+        );
+        assert_eq!(
+            final_plan.result_port().unwrap().fields[0].alias.as_deref(),
+            Some("left")
+        );
+        assert_eq!(
+            final_plan.result_port().unwrap().fields[1].alias.as_deref(),
+            Some("right")
         );
     }
 
@@ -6464,36 +9276,42 @@ mod tests {
             string_literal("string"),
         ];
         let plan = PhysicalPlanNode {
-            kind: PhysicalPlanKind::Scan(crate::planner::payload::PlanScanNode {
-                database: "db".to_string(),
-                table,
-                alias: None,
-                columns: vec![payload.clone(), synthetic.clone(), row_id.clone()],
-                predicates: Vec::new(),
-                required_columns: Some(vec![
-                    payload.column_id,
-                    synthetic.column_id,
-                    row_id.column_id,
-                ]),
-                variant_columns: vec![crate::common::ScanVariantColumn {
-                    source_column_id: payload.column_id,
-                    source_column: payload.name.clone(),
-                    synthetic_column_id: synthetic.column_id,
-                    synthetic_column: synthetic.name.clone(),
-                    canonical_path: "$.k".to_string(),
-                    requested_type: DataType::Utf8,
-                    requested_type_literal: "string".to_string(),
-                    strict: true,
-                    binding: crate::analysis::test_function_binding(
-                        "variant_get",
-                        &binding_args,
-                        DataType::Utf8,
-                        true,
-                        novarocks_functions::FunctionVolatility::Immutable,
-                    ),
-                }],
-                mv_rewritten_from: None,
-            }),
+            kind: PhysicalPlanKind::Scan(
+                crate::planner::physical::PhysicalScanNode::from(
+                    crate::planner::payload::PlanScanNode {
+                        database: "db".to_string(),
+                        table,
+                        alias: None,
+                        columns: vec![payload.clone(), synthetic.clone(), row_id.clone()],
+                        predicates: Vec::new(),
+                        required_columns: Some(vec![
+                            payload.column_id,
+                            synthetic.column_id,
+                            row_id.column_id,
+                        ]),
+                        variant_columns: vec![crate::common::ScanVariantColumn {
+                            source_column_id: payload.column_id,
+                            source_column: payload.name.clone(),
+                            synthetic_column_id: synthetic.column_id,
+                            synthetic_column: synthetic.name.clone(),
+                            canonical_path: "$.k".to_string(),
+                            requested_type: DataType::Utf8,
+                            requested_type_literal: "string".to_string(),
+                            strict: true,
+                            binding: crate::analysis::test_function_binding(
+                                "variant_get",
+                                &binding_args,
+                                DataType::Utf8,
+                                true,
+                                novarocks_functions::FunctionVolatility::Immutable,
+                            ),
+                        }],
+                        mv_rewritten_from: None,
+                    },
+                )
+                .finalize_provider_read_occurrence(ProviderReadOccurrenceId::new(0))
+                .expect("test scan occurrence"),
+            ),
             children: Vec::new(),
             output_columns: vec![payload.clone(), synthetic, row_id.clone()],
             stats: stats(),
@@ -6633,7 +9451,7 @@ mod tests {
             };
         let reads = FinalizedProviderReadSet::single_for_test(
             binding,
-            0,
+            ProviderReadOccurrenceId::new(0),
             contract,
             novarocks_physical_plan::ScanReadBudget {
                 max_batch_rows: 1024,
@@ -6689,7 +9507,7 @@ mod tests {
 
         let bucket_reads = FinalizedProviderReadSet::single_for_test(
             binding,
-            0,
+            ProviderReadOccurrenceId::new(0),
             bucket_contract,
             novarocks_physical_plan::ScanReadBudget {
                 max_batch_rows: 1024,
@@ -6821,6 +9639,38 @@ mod tests {
     }
 
     #[test]
+    fn completed_plan_freezes_costs_as_node_annotations() {
+        let output = column(1, "number", DataType::Int64, false);
+        let mut plan = values(vec![output], vec![vec![literal_int(7)]]);
+        plan.stats.output_row_count = 3.0;
+        plan.stats.cost_estimate = Some(PlannerCostEstimate {
+            cpu_cost: 1.0,
+            memory_cost: 2.0,
+            network_cost: 4.0,
+        });
+
+        let final_plan = finish_for_test(&plan).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let annotation = final_plan
+            .annotations()
+            .iter()
+            .find(|annotation| {
+                annotation.subject
+                    == novarocks_physical_plan::AnnotationSubject::Node(
+                        ROOT_FRAGMENT_ID,
+                        fragment.root(),
+                    )
+            })
+            .expect("root cost annotation");
+
+        assert_eq!(annotation.key.as_ref(), "optimizer.statistics");
+        assert_eq!(
+            annotation.value.as_ref(),
+            "rows=3, cpu=1, memory=2, network=4"
+        );
+    }
+
+    #[test]
     fn filter_preserves_repeated_input_occurrences_and_display_names() {
         let input = column(1, "number", DataType::Int64, false);
         let repeated_project = PhysicalPlanNode {
@@ -6868,11 +9718,19 @@ mod tests {
         assert_eq!(root.output.columns[0], root.output.columns[1]);
         assert_eq!(
             final_plan.result_port().unwrap().fields[0].name.as_ref(),
-            "first"
+            "number"
         );
         assert_eq!(
             final_plan.result_port().unwrap().fields[1].name.as_ref(),
-            "second"
+            "number"
+        );
+        assert_eq!(
+            final_plan.result_port().unwrap().fields[0].alias.as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            final_plan.result_port().unwrap().fields[1].alias.as_deref(),
+            Some("second")
         );
     }
 
@@ -7245,7 +10103,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_nodes_fail_closed_with_the_concrete_kind() {
+    fn malformed_change_event_expand_fails_closed() {
         let unsupported = PhysicalPlanNode {
             kind: PhysicalPlanKind::ChangeEventExpand(DistributedChangeEventExpandNode {
                 events: Vec::new(),
@@ -7258,15 +10116,7 @@ mod tests {
             probe_runtime_filters: Vec::new(),
         };
 
-        let error = lower_final_physical_plan(&unsupported, version(), dop())
-            .err()
-            .expect("unsupported node must fail");
-        assert!(matches!(
-            error,
-            ContractLoweringError::UnsupportedNode {
-                kind: "ChangeEventExpand"
-            }
-        ));
+        assert!(lower_final_physical_plan(&unsupported, version(), dop()).is_err());
     }
 
     #[test]
@@ -7451,6 +10301,166 @@ mod tests {
                 RowMultiplicity::SingleCopy
             );
         }
+    }
+
+    #[test]
+    fn singleton_right_outer_runtime_filter_finishes_with_exact_null_safe_witness() {
+        let left = column(1, "left_key", DataType::Int64, false);
+        let right = column(2, "right_key", DataType::Int64, false);
+        let mut nullable_left = left.clone();
+        nullable_left.nullable = true;
+        let mut hash_join = hash_join(
+            crate::common::JoinKind::RightOuter,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![left], vec![vec![literal_int(1)]]),
+            values(vec![right.clone()], vec![vec![literal_int(1)]]),
+            vec![nullable_left, right],
+        );
+        attach_singleton_join_runtime_filter(&mut hash_join, 7, true, true);
+
+        let final_plan = finish_for_test(&hash_join).expect("runtime filter must finish");
+        let filter = final_plan
+            .runtime_filters()
+            .get(&RuntimeFilterId::new(7))
+            .expect("runtime filter");
+        assert!(matches!(
+            filter.domain,
+            RuntimeFilterDomain::Membership {
+                null_semantics: RuntimeFilterNullSemantics::NullSafeEqual,
+                ..
+            }
+        ));
+        assert!(matches!(
+            filter.producers[0].target,
+            RuntimeFilterProducerTarget::JoinBuildKey { .. }
+        ));
+        assert!(matches!(
+            filter.consumers[0].target,
+            RuntimeFilterConsumerTarget::JoinProbeKey { .. }
+        ));
+        assert_eq!(
+            filter.consumers[0].activation,
+            RuntimeFilterConsumerActivation::BlockingSnapshot
+        );
+        assert_eq!(
+            filter.equality_witnesses[0].domain_side,
+            ContractJoinSide::Right
+        );
+    }
+
+    #[test]
+    fn runtime_filter_wait_cycle_downgrades_only_the_cyclic_consumer() {
+        let left = column(1, "left_key", DataType::Int64, false);
+        let nested_build = column(2, "nested_build", DataType::Int64, false);
+        let outer_probe = column(3, "outer_probe", DataType::Int64, false);
+        let inner = hash_join(
+            crate::common::JoinKind::Inner,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![left.clone()], vec![vec![literal_int(1)]]),
+            values(vec![nested_build.clone()], vec![vec![literal_int(2)]]),
+            vec![left.clone(), nested_build.clone()],
+        );
+        let outer = hash_join(
+            crate::common::JoinKind::Inner,
+            PhysicalHashJoinBuildSide::Left,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            inner,
+            values(vec![outer_probe.clone()], vec![vec![literal_int(3)]]),
+            vec![left, nested_build, outer_probe],
+        );
+        let plan = finish_for_test(&outer).expect("nested singleton joins must finish");
+        let fragment = plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let outer_node = fragment.nodes().get(&fragment.root()).unwrap();
+        let inner_node = fragment.nodes().get(&outer_node.inputs[0]).unwrap();
+        let filter_id = RuntimeFilterId::new(44);
+        let witness = RuntimeFilterWitnessId::new(44);
+        let equality = RuntimeFilterEqualityWitnessId::new(44);
+        let mut filters = vec![RuntimeFilter {
+            id: filter_id,
+            kind: RuntimeFilterKind::InList,
+            domain: RuntimeFilterDomain::Membership {
+                ty: novarocks_physical_plan::ValueType::new(DataType::Int64, false),
+                null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+            },
+            lifecycle: RuntimeFilterLifecycle::CompleteOnce,
+            reduction: RuntimeFilterReduction::SetUnion,
+            availability_coverage: leaf_runtime_filter_witness(witness),
+            terminal_coverage: leaf_runtime_filter_witness(witness),
+            equality_witnesses: Box::default(),
+            producers: Box::from([RuntimeFilterProducer {
+                witness,
+                endpoint: RuntimeFilterEndpoint {
+                    fragment: ROOT_FRAGMENT_ID,
+                    node: outer_node.id,
+                    values: Box::from([inner_node.output.columns[0]]),
+                },
+                apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                    input_ordinal: 0,
+                },
+                contribution_kinds: Box::default(),
+                completion: RuntimeFilterCompletion::ProducerClosed,
+                progress: RuntimeFilterProducerProgress {
+                    build_edges: Box::default(),
+                    non_build_edges: Box::default(),
+                },
+                target: RuntimeFilterProducerTarget::JoinBuildKey { equality },
+            }]),
+            consumers: Box::from([RuntimeFilterConsumer {
+                endpoint: RuntimeFilterEndpoint {
+                    fragment: ROOT_FRAGMENT_ID,
+                    node: inner_node.id,
+                    values: Box::from([inner_node.output.columns[0]]),
+                },
+                apply_point: novarocks_physical_plan::RuntimeFilterApplyPoint::NodeInput {
+                    input_ordinal: 0,
+                },
+                capabilities: Box::default(),
+                activation: RuntimeFilterConsumerActivation::BlockingSnapshot,
+                target: RuntimeFilterConsumerTarget::JoinProbeKey { equality },
+            }]),
+            policy: RuntimeFilterPolicy {
+                max_contribution_bytes: 1024,
+                max_artifact_bytes: 4096,
+                deadline_ms: 30_000,
+                max_retries: 3,
+            },
+        }];
+
+        resolve_runtime_filter_activations(&mut filters, plan.fragments(), plan.edges());
+
+        assert_eq!(
+            filters[0].consumers[0].activation,
+            RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_filter_producer_without_probe_witness_fails_before_publication() {
+        let left = column(1, "left_key", DataType::Int64, false);
+        let right = column(2, "right_key", DataType::Int64, false);
+        let mut hash_join = hash_join(
+            crate::common::JoinKind::Inner,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            values(vec![left.clone()], vec![vec![literal_int(1)]]),
+            values(vec![right.clone()], vec![vec![literal_int(1)]]),
+            vec![left, right],
+        );
+        attach_singleton_join_runtime_filter(&mut hash_join, 9, false, false);
+
+        assert!(matches!(
+            finish_for_test(&hash_join),
+            Err(ContractLoweringError::InvalidRuntimeFilter { id: 9, detail })
+                if detail == "producer has no static consumer witness"
+        ));
     }
 
     #[test]
@@ -7728,8 +10738,10 @@ mod tests {
             edge.destination.receive_mapping[1].1
         );
         let result = final_plan.result_port().unwrap();
-        assert_eq!(result.fields[0].name.as_ref(), "left");
-        assert_eq!(result.fields[1].name.as_ref(), "right");
+        assert_eq!(result.fields[0].name.as_ref(), "number");
+        assert_eq!(result.fields[1].name.as_ref(), "number");
+        assert_eq!(result.fields[0].alias.as_deref(), Some("left"));
+        assert_eq!(result.fields[1].alias.as_deref(), Some("right"));
         assert_eq!(result.fields[0].value, result.fields[1].value);
     }
 

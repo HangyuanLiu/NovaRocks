@@ -168,6 +168,12 @@ impl ConnectorWriteSession {
         self.plan.targets()
     }
 
+    pub(crate) const fn copy_on_write_routing(
+        &self,
+    ) -> Option<&novarocks_spi::connector::write_stack::ConnectorWriteCopyOnWriteRoutingPlan> {
+        self.plan.copy_on_write()
+    }
+
     /// How many times this session actually asked the connector to commit.
     ///
     /// The dual barrier's whole point is that some outcomes must leave this at

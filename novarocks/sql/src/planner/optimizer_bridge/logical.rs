@@ -943,7 +943,7 @@ mod tests {
         let PhysicalPlanKind::Scan(scan) = materialized.kind else {
             panic!("expected physical scan");
         };
-        let ScanSource::Sql(source) = scan.table.source;
+        let ScanSource::Sql(source) = &scan.table.source;
         assert!(matches!(source.kind, SqlScanKind::ConnectorRead));
     }
 

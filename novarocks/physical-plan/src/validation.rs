@@ -193,10 +193,6 @@ impl ValueMappingIndex {
             .is_some_and(|sources| sources.contains_key(&Some(source)))
     }
 
-    fn has_destination(&self, destination: ValueId) -> bool {
-        self.by_destination.contains_key(&destination)
-    }
-
     fn resolve(&self, destination: ValueId, allow_identical_duplicates: bool) -> Option<ValueId> {
         let sources = self.by_destination.get(&destination)?;
         if sources.len() != 1 {
@@ -244,7 +240,6 @@ struct SemanticTraceIndexes {
 struct RuntimeFilterLineageIndexes {
     parents: BTreeMap<FragmentId, BTreeMap<NodeId, Option<NodeId>>>,
     ports: BTreeMap<(FragmentId, NodeId), ValuePortIndex>,
-    projects: BTreeMap<(FragmentId, NodeId), ValueMappingIndex>,
     apply_ports: BTreeMap<(FragmentId, NodeId, RuntimeFilterApplyPortKey), Option<ValuePortIndex>>,
     scan_provider_ports: BTreeMap<(FragmentId, NodeId), ValuePortIndex>,
     build_frontiers: BTreeMap<(FragmentId, NodeId), RuntimeFilterFrontierIndex>,
@@ -357,30 +352,6 @@ impl RuntimeFilterLineageIndexes {
             .entry((fragment.id(), node.id))
             .or_insert_with(|| ValuePortIndex::new(&node.output.columns))
             .contains(&value)
-    }
-
-    fn project_source(
-        &mut self,
-        fragment: &Fragment,
-        node: &PhysicalNode,
-        expressions: &[(ExprId, ValueId)],
-        output: ValueId,
-    ) -> Option<Option<ValueId>> {
-        let index = self
-            .projects
-            .entry((fragment.id(), node.id))
-            .or_insert_with(|| {
-                let mut index = ValueMappingIndex::default();
-                for (expression, output) in expressions {
-                    index.insert(expression_value(fragment, *expression), *output);
-                }
-                index
-            });
-        if index.has_destination(output) {
-            Some(index.resolve(output, false))
-        } else {
-            None
-        }
     }
 }
 
@@ -1250,17 +1221,24 @@ fn extend_runtime_filter_build_dependencies(
     let Some(fragment) = plan.fragments().get(&producer.endpoint.fragment) else {
         return false;
     };
-    let Some(join) = fragment.nodes().get(&producer.endpoint.node) else {
+    let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
         return false;
     };
-    let NodeKind::HashJoin { build_side, .. } = &join.kind else {
-        return false;
+    let build_root = match (&producer.target, &node.kind) {
+        (
+            crate::RuntimeFilterProducerTarget::JoinBuildKey { .. },
+            NodeKind::HashJoin { build_side, .. },
+        ) => usize::try_from(build_side.input_ordinal())
+            .ok()
+            .and_then(|ordinal| node.inputs.get(ordinal))
+            .copied(),
+        (
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
+            NodeKind::Aggregate { .. },
+        ) => node.inputs.first().copied(),
+        _ => None,
     };
-    let Some(build_root) = usize::try_from(build_side.input_ordinal())
-        .ok()
-        .and_then(|ordinal| join.inputs.get(ordinal))
-        .copied()
-    else {
+    let Some(build_root) = build_root else {
         return false;
     };
 
@@ -1275,6 +1253,7 @@ fn extend_runtime_filter_build_dependencies(
     if let Entry::Vacant(entry) = expansion.cache.by_root.entry(root) {
         let mut closure = RuntimeFilterBuildDependencyClosure::default();
         let mut pending = vec![root];
+        let mut expanded_multicast_sources = BTreeSet::new();
         while let Some((fragment_id, node_id)) = pending.pop() {
             if !closure.sites.insert((fragment_id, node_id)) {
                 continue;
@@ -1286,6 +1265,32 @@ fn extend_runtime_filter_build_dependencies(
             let Some(fragment) = plan.fragments().get(&fragment_id) else {
                 return false;
             };
+            if expanded_multicast_sources.insert(fragment_id)
+                && let FragmentSink::Multicast { edges } = fragment.sink()
+                && edges.len() >= 2
+            {
+                for edge in edges {
+                    let Some(edge_contract) = plan.edges().get(edge) else {
+                        return false;
+                    };
+                    if !expansion
+                        .cache
+                        .source_sinks
+                        .as_ref()
+                        .is_some_and(|sinks| sinks.owns(edge_contract))
+                    {
+                        return false;
+                    }
+                    let Some(destination) =
+                        plan.fragments().get(&edge_contract.destination.fragment)
+                    else {
+                        return false;
+                    };
+                    closure.edges.insert(*edge);
+                    closure.fragments.insert(destination.id());
+                    pending.push((destination.id(), destination.root()));
+                }
+            }
             let Some(node) = fragment.nodes().get(&node_id) else {
                 return false;
             };
@@ -1385,9 +1390,11 @@ fn extend_runtime_filter_proof_hull(
                 .saturating_add(filter.consumers.iter().fold(0usize, |work, consumer| {
                     work.saturating_add(match &consumer.target {
                         crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => 0,
-                        crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. } => {
-                            lineage.len()
-                        }
+                        crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
+                        | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                            lineage,
+                            ..
+                        } => lineage.len(),
                     })
                 }));
             if !work_budget.charge(static_work) {
@@ -1429,16 +1436,19 @@ fn extend_runtime_filter_proof_hull(
                         active_queue.push(filter_id);
                     }
                 }
-                let crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
-                    &consumer.target
-                else {
-                    continue;
+                let lineage = match &consumer.target {
+                    crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
+                    | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                        lineage, ..
+                    } => lineage,
+                    crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => continue,
                 };
                 for step in lineage {
                     match step {
                         crate::RuntimeFilterLineageStep::FilterPassThrough { fragment, .. }
                         | crate::RuntimeFilterLineageStep::SortPassThrough { fragment, .. }
                         | crate::RuntimeFilterLineageStep::ProjectIdentity { fragment, .. }
+                        | crate::RuntimeFilterLineageStep::JoinEquality { fragment, .. }
                         | crate::RuntimeFilterLineageStep::AggregateGroupKey { fragment, .. }
                         | crate::RuntimeFilterLineageStep::UnionAllBranch { fragment, .. } => {
                             fragments.insert(*fragment);
@@ -1832,6 +1842,7 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
     run_validation_stage!(validate_artifact_inputs(plan, &mut errors));
     run_validation_stage!(validate_annotations(plan, &mut errors));
     run_validation_stage!(validate_cross_fragment_value_origins(plan, &mut errors));
+    run_validation_stage!(validate_provider_read_occurrences(plan, &mut errors));
     run_validation_stage!(validate_partition_identities(plan, &mut errors));
     run_validation_stage!(validate_aggregate_sequences(plan, &mut errors));
     run_validation_stage!(validate_topn_reductions(plan, &mut errors));
@@ -1888,6 +1899,34 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
         Ok(())
     } else {
         Err(ValidationErrors::from_collector(errors))
+    }
+}
+
+fn validate_provider_read_occurrences(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+    let mut occurrences = BTreeMap::new();
+    for fragment in plan.fragments().values() {
+        for node in fragment.nodes().values() {
+            let NodeKind::Scan { occurrence, .. } = &node.kind else {
+                continue;
+            };
+            if let Some((first_fragment, first_node)) =
+                occurrences.insert(*occurrence, (fragment.id(), node.id))
+            {
+                errors.push(ValidationError::new(
+                    format!(
+                        "fragments[{}].nodes[{}].occurrence",
+                        fragment.id().get(),
+                        node.id.get()
+                    ),
+                    format!(
+                        "provider read occurrence {} is already owned by fragment {} node {}",
+                        occurrence.get(),
+                        first_fragment.get(),
+                        first_node.get()
+                    ),
+                ));
+            }
+        }
     }
 }
 
@@ -3520,6 +3559,7 @@ fn validate_fragment_runtime_filter_cuts(
                     path,
                     errors,
                 );
+                validate_runtime_filter_join_coverage(fragment, filter, producer, path, errors);
                 validate_runtime_filter_producer_progress(
                     fragment,
                     producer,
@@ -3551,6 +3591,7 @@ fn validate_fragment_runtime_filter_cuts(
                 validate_runtime_filter_consumer_semantics(
                     fragment,
                     &witnesses,
+                    &filter.producers,
                     consumer,
                     &mut lineage_indexes,
                     path,
@@ -3564,6 +3605,55 @@ fn validate_fragment_runtime_filter_cuts(
                 "attached runtime filter has no endpoint in this fragment",
             ));
         }
+    }
+}
+
+fn validate_runtime_filter_join_coverage(
+    fragment: &Fragment,
+    filter: &crate::RuntimeFilter,
+    producer: &crate::RuntimeFilterProducer,
+    path: &str,
+    errors: &mut ValidationErrorCollector,
+) {
+    if !matches!(
+        producer.target,
+        crate::RuntimeFilterProducerTarget::JoinBuildKey { .. }
+    ) || producer.contribution_kinds.as_ref()
+        != [
+            crate::RuntimeFilterContributionKind::ValueDomainDelta,
+            crate::RuntimeFilterContributionKind::ProducerClosed,
+        ]
+    {
+        return;
+    }
+    let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
+        return;
+    };
+    let NodeKind::HashJoin { distribution, .. } = node.kind else {
+        return;
+    };
+    let matches_shape = |coverage: &crate::RuntimeFilterCoverage| match distribution {
+        crate::JoinDistribution::BroadcastBuild => matches!(
+            coverage.nodes.as_ref(),
+            [crate::RuntimeFilterCoverageNode::Witness(witness), crate::RuntimeFilterCoverageNode::AnyOf { children }]
+                if *witness == producer.witness && children.as_ref() == [0] && coverage.root == 1
+        ),
+        crate::JoinDistribution::Partitioned => matches!(
+            coverage.nodes.as_ref(),
+            [crate::RuntimeFilterCoverageNode::Witness(witness), crate::RuntimeFilterCoverageNode::AllOf { children }]
+                if *witness == producer.witness && children.as_ref() == [0] && coverage.root == 1
+        ),
+        crate::JoinDistribution::Colocated | crate::JoinDistribution::Singleton => matches!(
+            coverage.nodes.as_ref(),
+            [crate::RuntimeFilterCoverageNode::Witness(witness)]
+                if *witness == producer.witness && coverage.root == 0
+        ),
+    };
+    if !matches_shape(&filter.availability_coverage) || !matches_shape(&filter.terminal_coverage) {
+        errors.push(ValidationError::new(
+            path,
+            "runtime filter coverage shape differs from its exact join execution mode",
+        ));
     }
 }
 
@@ -3734,6 +3824,7 @@ fn validate_runtime_filter_proof_graph(
                     path,
                     errors,
                 );
+                validate_runtime_filter_join_coverage(fragment, filter, producer, path, errors);
                 validate_runtime_filter_producer_progress(
                     fragment,
                     producer,
@@ -3774,6 +3865,7 @@ fn validate_runtime_filter_proof_graph(
                 validate_runtime_filter_consumer_semantics(
                     fragment,
                     &witnesses,
+                    &filter.producers,
                     consumer,
                     &mut lineage_indexes,
                     path,
@@ -3783,6 +3875,7 @@ fn validate_runtime_filter_proof_graph(
             validate_runtime_filter_consumer_lineage(
                 &proof_plan,
                 &witnesses,
+                &filter.producers,
                 consumer,
                 path,
                 &mut lineage_indexes,
@@ -5847,6 +5940,7 @@ fn validate_node_semantics(
             provider_outputs,
             residuals,
             derived_values,
+            ..
         } => {
             validate_relation(fragment, relation, path, errors);
             if read_budget.max_batch_rows == 0
@@ -10374,6 +10468,7 @@ fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationErrorCol
                     &path,
                     errors,
                 );
+                validate_runtime_filter_join_coverage(fragment, filter, producer, &path, errors);
                 validate_runtime_filter_producer_progress(
                     fragment,
                     producer,
@@ -10414,6 +10509,7 @@ fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationErrorCol
                 validate_runtime_filter_consumer_semantics(
                     fragment,
                     &witnesses,
+                    &filter.producers,
                     consumer,
                     &mut lineage_indexes,
                     &path,
@@ -10423,6 +10519,7 @@ fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationErrorCol
             validate_runtime_filter_consumer_lineage(
                 plan,
                 &witnesses,
+                &filter.producers,
                 consumer,
                 &path,
                 &mut lineage_indexes,
@@ -10481,22 +10578,33 @@ fn validate_runtime_filter_wait_graph(
             let Some(fragment) = plan.fragments().get(&producer.endpoint.fragment) else {
                 continue;
             };
-            let Some(join) = fragment.nodes().get(&producer.endpoint.node) else {
+            let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
                 continue;
             };
-            let NodeKind::HashJoin { build_side, .. } = &join.kind else {
-                continue;
+            let producer_root = match (&producer.target, &node.kind) {
+                (
+                    crate::RuntimeFilterProducerTarget::JoinBuildKey { .. },
+                    NodeKind::HashJoin { build_side, .. },
+                ) => usize::try_from(build_side.input_ordinal())
+                    .ok()
+                    .and_then(|ordinal| node.inputs.get(ordinal))
+                    .copied(),
+                (
+                    crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
+                    NodeKind::Aggregate { .. },
+                ) => node.inputs.first().copied(),
+                _ => None,
             };
-            let Some(build_root) = usize::try_from(build_side.input_ordinal())
-                .ok()
-                .and_then(|ordinal| join.inputs.get(ordinal))
-            else {
+            let Some(producer_root) = producer_root else {
                 continue;
             };
             dependencies
                 .entry(filter_node)
                 .or_default()
-                .insert(RuntimeFilterWaitNode::Physical(fragment.id(), *build_root));
+                .insert(RuntimeFilterWaitNode::Physical(
+                    fragment.id(),
+                    producer_root,
+                ));
         }
         for consumer in &filter.consumers {
             if consumer.activation == crate::RuntimeFilterConsumerActivation::BlockingSnapshot {
@@ -10508,6 +10616,52 @@ fn validate_runtime_filter_wait_graph(
                     .or_default()
                     .insert(filter_node);
             }
+        }
+    }
+    let downstream = plan.edges().values().fold(
+        BTreeMap::<FragmentId, BTreeSet<FragmentId>>::new(),
+        |mut index, edge| {
+            index
+                .entry(edge.source.fragment)
+                .or_default()
+                .insert(edge.destination.fragment);
+            index
+        },
+    );
+    for source in plan.fragments().values() {
+        let FragmentSink::Multicast { edges: branches } = source.sink() else {
+            continue;
+        };
+        if branches.len() < 2 {
+            continue;
+        }
+        let mut reachable = BTreeSet::new();
+        let mut pending = branches
+            .iter()
+            .filter_map(|edge| plan.edges().get(edge).map(|edge| edge.destination.fragment))
+            .collect::<Vec<_>>();
+        while let Some(fragment) = pending.pop() {
+            if !reachable.insert(fragment) {
+                continue;
+            }
+            pending.extend(downstream.get(&fragment).into_iter().flatten().copied());
+        }
+        for consumer in plan
+            .runtime_filters()
+            .values()
+            .flat_map(|filter| &filter.consumers)
+            .filter(|consumer| {
+                consumer.activation == crate::RuntimeFilterConsumerActivation::BlockingSnapshot
+                    && reachable.contains(&consumer.endpoint.fragment)
+            })
+        {
+            dependencies
+                .entry(RuntimeFilterWaitNode::Physical(source.id(), source.root()))
+                .or_default()
+                .insert(RuntimeFilterWaitNode::Physical(
+                    consumer.endpoint.fragment,
+                    consumer.endpoint.node,
+                ));
         }
     }
 
@@ -10640,7 +10794,10 @@ fn validate_runtime_filter_shape(
     let lineage_steps = filter.consumers.iter().fold(0_usize, |total, consumer| {
         total.saturating_add(match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => 0,
-            crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. } => lineage.len(),
+            crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+                lineage.len()
+            }
         })
     });
     if lineage_steps > MAX_RUNTIME_FILTER_LINEAGE_STEPS {
@@ -10726,16 +10883,18 @@ fn validate_runtime_filter_shape(
     let producer_equalities = filter
         .producers
         .iter()
-        .map(|producer| match &producer.target {
-            crate::RuntimeFilterProducerTarget::JoinBuildKey { equality } => *equality,
+        .filter_map(|producer| match &producer.target {
+            crate::RuntimeFilterProducerTarget::JoinBuildKey { equality } => Some(*equality),
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     let consumer_equalities = filter
         .consumers
         .iter()
-        .map(|consumer| match &consumer.target {
+        .filter_map(|consumer| match &consumer.target {
             crate::RuntimeFilterConsumerTarget::JoinProbeKey { equality }
-            | crate::RuntimeFilterConsumerTarget::ScanField { equality, .. } => *equality,
+            | crate::RuntimeFilterConsumerTarget::ScanField { equality, .. } => Some(*equality),
+            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => None,
         })
         .collect::<BTreeSet<_>>();
     if !consumer_equalities.is_subset(&producer_equalities) {
@@ -10781,7 +10940,8 @@ fn validate_runtime_filter_shape(
         )
         | (
             crate::RuntimeFilterDomain::Ordered { .. },
-            crate::RuntimeFilterReduction::UnionOrderedHull,
+            crate::RuntimeFilterReduction::UnionOrderedHull
+            | crate::RuntimeFilterReduction::TightenOrderedBound,
         ) => {}
         _ => errors.push(ValidationError::new(
             path,
@@ -10845,7 +11005,10 @@ fn validate_runtime_filter_matrix(
     path: &str,
     errors: &mut ValidationErrorCollector,
 ) {
-    if coverage_comparison_safe && filter.availability_coverage != filter.terminal_coverage {
+    if coverage_comparison_safe
+        && filter.lifecycle == crate::RuntimeFilterLifecycle::CompleteOnce
+        && filter.availability_coverage != filter.terminal_coverage
+    {
         errors.push(ValidationError::new(
             path,
             "complete-once runtime filter has different availability and terminal coverage",
@@ -10858,13 +11021,13 @@ fn validate_runtime_filter_matrix(
                 crate::RuntimeFilterDomain::Membership { null_semantics, .. },
                 crate::RuntimeFilterReduction::SetUnion,
             ) => {
-                if !coverage_is_all_of_only(&filter.availability_coverage)
+                if filter.lifecycle != crate::RuntimeFilterLifecycle::CompleteOnce
                     || (coverage_comparison_safe
                         && filter.availability_coverage != filter.terminal_coverage)
                 {
                     errors.push(ValidationError::new(
                         path,
-                        "membership runtime filter requires complete-once identical AllOf coverage",
+                        "membership runtime filter requires complete-once identical coverage",
                     ));
                 }
                 let has_final_shard = filter.producers.iter().any(|producer| {
@@ -10910,7 +11073,8 @@ fn validate_runtime_filter_matrix(
                 crate::RuntimeFilterDomain::Ordered { .. },
                 crate::RuntimeFilterReduction::UnionOrderedHull,
             ) => {
-                if !coverage_is_all_of_only(&filter.availability_coverage)
+                if filter.lifecycle != crate::RuntimeFilterLifecycle::CompleteOnce
+                    || !coverage_is_all_of_only(&filter.availability_coverage)
                     || (coverage_comparison_safe
                         && filter.availability_coverage != filter.terminal_coverage)
                 {
@@ -10929,6 +11093,26 @@ fn validate_runtime_filter_matrix(
                         crate::RuntimeFilterArtifactCapability::OrderedRange,
                         crate::RuntimeFilterArtifactCapability::EmptyDomain,
                     ]),
+                    true,
+                )
+            }
+            (
+                crate::RuntimeFilterDomain::Ordered { .. },
+                crate::RuntimeFilterReduction::TightenOrderedBound,
+            ) => {
+                if filter.lifecycle != crate::RuntimeFilterLifecycle::MonotonicUpdates {
+                    errors.push(ValidationError::new(
+                        path,
+                        "ordered-bound runtime filter requires monotonic-update lifecycle",
+                    ));
+                }
+                (
+                    BTreeSet::from([
+                        crate::RuntimeFilterContributionKind::OrderedBoundUpdate,
+                        crate::RuntimeFilterContributionKind::ProducerClosed,
+                    ]),
+                    crate::RuntimeFilterCompletion::ProducerClosed,
+                    BTreeSet::from([crate::RuntimeFilterArtifactCapability::OrderedRange]),
                     true,
                 )
             }
@@ -10980,6 +11164,17 @@ fn validate_runtime_filter_matrix(
             errors.push(ValidationError::new(
                 path,
                 "runtime filter consumer capabilities differ from the channel matrix",
+            ));
+        }
+        if filter.lifecycle == crate::RuntimeFilterLifecycle::MonotonicUpdates
+            && !matches!(
+                consumer.activation,
+                crate::RuntimeFilterConsumerActivation::NonBlockingLive { .. }
+            )
+        {
+            errors.push(ValidationError::new(
+                path,
+                "monotonic runtime-filter consumer requires non-blocking live-update activation",
             ));
         }
     }
@@ -11164,24 +11359,25 @@ fn validate_runtime_filter_producer_progress(
     let Some(node) = fragment.nodes().get(&producer.endpoint.node) else {
         return;
     };
-    let NodeKind::HashJoin { build_side, .. } = &node.kind else {
-        errors.push(ValidationError::new(
-            path,
-            "runtime filter join-build progress does not belong to a hash-join build producer",
-        ));
-        return;
+    let producer_input = match (&producer.target, &node.kind) {
+        (
+            crate::RuntimeFilterProducerTarget::JoinBuildKey { .. },
+            NodeKind::HashJoin { build_side, .. },
+        ) if node.inputs.len() == 2 => {
+            node.inputs[usize::try_from(build_side.input_ordinal()).unwrap()]
+        }
+        (
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. },
+            NodeKind::Aggregate { .. },
+        ) if node.inputs.len() == 1 && non_build_edges.is_empty() => node.inputs[0],
+        _ => {
+            errors.push(ValidationError::new(
+                path,
+                "runtime filter producer progress does not belong to its declared producer input",
+            ));
+            return;
+        }
     };
-    if !matches!(
-        producer.target,
-        crate::RuntimeFilterProducerTarget::JoinBuildKey { .. }
-    ) || node.inputs.len() != 2
-    {
-        errors.push(ValidationError::new(
-            path,
-            "runtime filter join-build progress does not belong to a hash-join build producer",
-        ));
-        return;
-    }
     for (label, edges) in [("build", build_edges), ("non-build", non_build_edges)] {
         if edges.windows(2).any(|pair| pair[0] >= pair[1]) {
             errors.push(ValidationError::new(
@@ -11204,16 +11400,25 @@ fn validate_runtime_filter_producer_progress(
             "runtime filter build and non-build frontier edges overlap",
         ));
     }
-    let expected = indexes.build_frontier(
-        fragment,
-        node.inputs[usize::try_from(build_side.input_ordinal()).unwrap()],
-        inbound_edges,
-    );
-    if declared_build != expected.build || declared_non_build != expected.non_build {
-        errors.push(ValidationError::new(
-            path,
-            "runtime filter join-build frontier differs from the exact join input exchange cuts",
-        ));
+    let expected = indexes.build_frontier(fragment, producer_input, inbound_edges);
+    let expected_non_build = if matches!(
+        producer.target,
+        crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. }
+    ) {
+        BTreeSet::new()
+    } else {
+        expected.non_build.clone()
+    };
+    if declared_build != expected.build || declared_non_build != expected_non_build {
+        let detail = match producer.target {
+            crate::RuntimeFilterProducerTarget::JoinBuildKey { .. } => {
+                "runtime filter join-build frontier differs from the exact join input exchange cuts"
+            }
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => {
+                "runtime filter Aggregate TopN frontier differs from the exact aggregate input exchange cuts"
+            }
+        };
+        errors.push(ValidationError::new(path, detail));
     }
 }
 
@@ -11430,11 +11635,21 @@ fn validate_runtime_filter_producer_target(
     fragment: &Fragment,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
     producer: &crate::RuntimeFilterProducer,
-    _domain: &crate::RuntimeFilterDomain,
+    domain: &crate::RuntimeFilterDomain,
     reduction: crate::RuntimeFilterReduction,
     path: &str,
     errors: &mut ValidationErrorCollector,
 ) {
+    if matches!(
+        producer.target,
+        crate::RuntimeFilterProducerTarget::AggregateTopNKey { limit: 0, .. }
+    ) {
+        errors.push(ValidationError::new(
+            path,
+            "runtime filter Aggregate TopN producer has a zero limit",
+        ));
+        return;
+    }
     let valid = match producer.target {
         crate::RuntimeFilterProducerTarget::JoinBuildKey { equality }
             if matches!(
@@ -11454,25 +11669,105 @@ fn validate_runtime_filter_producer_target(
                         .is_some_and(|value| producer.endpoint.values.as_ref() == [value])
             })
         }
+        crate::RuntimeFilterProducerTarget::AggregateTopNKey {
+            group_key_ordinal,
+            topn,
+            phase,
+            order_key_ordinal,
+            limit,
+            offset,
+            direction,
+            null_ordering,
+        } if matches!(
+            reduction,
+            crate::RuntimeFilterReduction::TightenOrderedBound
+        ) && limit > 0 =>
+        {
+            let Some(aggregate) = fragment.nodes().get(&producer.endpoint.node) else {
+                return;
+            };
+            let NodeKind::Aggregate { group_by, .. } = &aggregate.kind else {
+                return errors.push(ValidationError::new(
+                    path,
+                    "runtime filter Aggregate TopN producer does not belong to an aggregate",
+                ));
+            };
+            let Some(topn_node) = fragment.nodes().get(&topn) else {
+                return errors.push(ValidationError::new(
+                    path,
+                    "runtime filter Aggregate TopN producer references an absent TopN node",
+                ));
+            };
+            let NodeKind::TopN {
+                order_by,
+                limit: actual_limit,
+                offset: actual_offset,
+                phase: actual_phase,
+            } = &topn_node.kind
+            else {
+                return errors.push(ValidationError::new(
+                    path,
+                    "runtime filter Aggregate TopN producer witness is not a TopN node",
+                ));
+            };
+            let group_key = group_by.get(usize::try_from(group_key_ordinal).unwrap_or(usize::MAX));
+            let order_key = order_by.get(usize::try_from(order_key_ordinal).unwrap_or(usize::MAX));
+            let ordered_domain_matches = matches!(
+                domain,
+                crate::RuntimeFilterDomain::Ordered { key, .. }
+                    if key.direction == direction && key.null_ordering == null_ordering
+            );
+            producer.apply_point == (crate::RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 })
+                && aggregate.inputs.len() == 1
+                && group_by.len() == 1
+                && topn_node.inputs.as_ref() == [aggregate.id]
+                && order_by.len() == 1
+                && phase == *actual_phase
+                && matches!(
+                    phase,
+                    crate::TopNPhase::Single | crate::TopNPhase::Partial { .. }
+                )
+                && limit == *actual_limit
+                && offset == *actual_offset
+                && offset == 0
+                && order_key.is_some_and(|item| {
+                    item.direction == direction
+                        && item.null_ordering == null_ordering
+                        && group_key.is_some_and(|(_, output)| {
+                            expression_value(fragment, item.expr) == Some(*output)
+                        })
+                })
+                && ordered_domain_matches
+                && group_key
+                    .and_then(|(expression, _)| expression_value(fragment, *expression))
+                    .is_some_and(|value| producer.endpoint.values.as_ref() == [value])
+        }
         _ => false,
     };
     if !valid {
-        errors.push(ValidationError::new(
-            path,
-            "runtime filter producer target does not match its equality witness and exact build key",
-        ));
+        let detail = match producer.target {
+            crate::RuntimeFilterProducerTarget::JoinBuildKey { .. } => {
+                "runtime filter producer target does not match its equality witness and exact build key"
+            }
+            crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } => {
+                "runtime filter Aggregate TopN producer target does not match its exact group key"
+            }
+        };
+        errors.push(ValidationError::new(path, detail));
     }
 }
 
 fn validate_runtime_filter_consumer_semantics(
     fragment: &Fragment,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
     consumer: &crate::RuntimeFilterConsumer,
     indexes: &mut RuntimeFilterLineageIndexes,
     path: &str,
     errors: &mut ValidationErrorCollector,
 ) {
-    if let crate::RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { late_apply } =
+    if let crate::RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { late_apply }
+    | crate::RuntimeFilterConsumerActivation::NonBlockingLive { late_apply } =
         consumer.activation
     {
         let supported = match consumer.target {
@@ -11483,6 +11778,13 @@ fn validate_runtime_filter_consumer_semantics(
             crate::RuntimeFilterConsumerTarget::ScanField { .. } => matches!(
                 late_apply,
                 crate::LateApplyGranularity::RowGroup
+                    | crate::LateApplyGranularity::Split
+                    | crate::LateApplyGranularity::File
+            ),
+            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
+                late_apply,
+                crate::LateApplyGranularity::Batch
+                    | crate::LateApplyGranularity::RowGroup
                     | crate::LateApplyGranularity::Split
                     | crate::LateApplyGranularity::File
             ),
@@ -11524,30 +11826,64 @@ fn validate_runtime_filter_consumer_semantics(
                             )
                     })
         }
+        crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, .. } => {
+            producers.iter().any(|candidate| {
+                candidate.witness == *producer
+                    && matches!(
+                        candidate.target,
+                        crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. }
+                    )
+            }) && consumer.apply_point == crate::RuntimeFilterApplyPoint::ScanSource
+                && fragment
+                    .nodes()
+                    .get(&consumer.endpoint.node)
+                    .is_some_and(|node| {
+                        consumer.endpoint.values.len() == 1
+                            && indexes.scan_provider_contains(
+                                fragment,
+                                node,
+                                consumer.endpoint.values[0],
+                            )
+                    })
+        }
     };
     if !valid {
-        errors.push(ValidationError::new(
-            path,
-            "runtime filter consumer target is not locally valid for its equality witness",
-        ));
+        let detail = match &consumer.target {
+            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+                "runtime filter Aggregate TopN consumer has no exact producer witness or scan field"
+            }
+            crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. }
+            | crate::RuntimeFilterConsumerTarget::ScanField { .. } => {
+                "runtime filter consumer target is not locally valid for its equality witness"
+            }
+        };
+        errors.push(ValidationError::new(path, detail));
     }
 }
 
 fn validate_runtime_filter_consumer_lineage(
     plan: &PhysicalPlan,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
     consumer: &crate::RuntimeFilterConsumer,
     path: &str,
     indexes: &mut RuntimeFilterLineageIndexes,
     errors: &mut ValidationErrorCollector,
 ) {
-    let crate::RuntimeFilterConsumerTarget::ScanField { equality, lineage } = &consumer.target
-    else {
-        return;
+    let (origin, lineage) = match &consumer.target {
+        crate::RuntimeFilterConsumerTarget::ScanField { equality, lineage } => (
+            RuntimeFilterLineageOrigin::Join(*equality),
+            lineage.as_ref(),
+        ),
+        crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, lineage } => (
+            RuntimeFilterLineageOrigin::AggregateTopN(*producer),
+            lineage.as_ref(),
+        ),
+        crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => return,
     };
     if lineage.len() > MAX_RUNTIME_FILTER_LINEAGE_STEPS
         || runtime_filter_scan_lineage_is_valid(
-            plan, witnesses, consumer, *equality, lineage, indexes,
+            plan, witnesses, producers, consumer, origin, lineage, indexes,
         )
         .is_none()
     {
@@ -11558,33 +11894,56 @@ fn validate_runtime_filter_consumer_lineage(
     }
 }
 
+#[derive(Clone, Copy)]
+enum RuntimeFilterLineageOrigin {
+    Join(crate::RuntimeFilterEqualityWitnessId),
+    AggregateTopN(crate::RuntimeFilterWitnessId),
+}
+
 fn runtime_filter_scan_lineage_is_valid(
     plan: &PhysicalPlan,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
+    producers: &[crate::RuntimeFilterProducer],
     consumer: &crate::RuntimeFilterConsumer,
-    equality: crate::RuntimeFilterEqualityWitnessId,
+    origin: RuntimeFilterLineageOrigin,
     lineage: &[crate::RuntimeFilterLineageStep],
     indexes: &mut RuntimeFilterLineageIndexes,
 ) -> Option<()> {
-    let witness = runtime_filter_equality_witness(witnesses, equality)?;
-    let witness_fragment = plan.fragments().get(&witness.fragment)?;
-    let join = witness_fragment.nodes().get(&witness.join)?;
-    let probe_side = witness.domain_side.opposite();
-    let probe_value = equality_key_value(witness_fragment, witness, probe_side)?;
-    let probe_input = join
-        .inputs
-        .get(usize::try_from(probe_side.input_ordinal()).ok()?)
-        .copied()?;
-    if !node_has_exact_parent(
-        &mut indexes.parents,
-        witness_fragment,
-        probe_input,
-        witness.join,
-    ) {
-        return None;
-    }
-
-    let mut position = (witness.fragment, probe_input, probe_value);
+    let mut position = match origin {
+        RuntimeFilterLineageOrigin::Join(equality) => {
+            let witness = runtime_filter_equality_witness(witnesses, equality)?;
+            let fragment = plan.fragments().get(&witness.fragment)?;
+            let join = fragment.nodes().get(&witness.join)?;
+            let probe_side = witness.domain_side.opposite();
+            let probe_value = equality_key_value(fragment, witness, probe_side)?;
+            let probe_input = join
+                .inputs
+                .get(usize::try_from(probe_side.input_ordinal()).ok()?)
+                .copied()?;
+            if !node_has_exact_parent(&mut indexes.parents, fragment, probe_input, witness.join) {
+                return None;
+            }
+            (witness.fragment, probe_input, probe_value)
+        }
+        RuntimeFilterLineageOrigin::AggregateTopN(producer_witness) => {
+            let producer = producers
+                .iter()
+                .find(|producer| producer.witness == producer_witness)?;
+            let crate::RuntimeFilterProducerTarget::AggregateTopNKey { .. } = producer.target
+            else {
+                return None;
+            };
+            let fragment = plan.fragments().get(&producer.endpoint.fragment)?;
+            let aggregate = fragment.nodes().get(&producer.endpoint.node)?;
+            let input = *aggregate.inputs.first()?;
+            if aggregate.inputs.len() != 1
+                || !node_has_exact_parent(&mut indexes.parents, fragment, input, aggregate.id)
+            {
+                return None;
+            }
+            (fragment.id(), input, *producer.endpoint.values.first()?)
+        }
+    };
     let mut visited = BTreeSet::from([position]);
     for step in lineage {
         let next = match *step {
@@ -11674,17 +12033,58 @@ fn runtime_filter_scan_lineage_is_valid(
                 }
                 let child = node.inputs[0];
                 let child_node = fragment.nodes().get(&child)?;
-                let source = match indexes.project_source(fragment, node, expressions, position.2) {
-                    Some(Some(value)) => value,
-                    None if indexes.port_contains(fragment, child_node, position.2) => position.2,
-                    _ => return None,
-                };
+                let (expression, output) = expressions
+                    .get(usize::try_from(output_ordinal).ok()?)
+                    .copied()?;
+                if output != position.2 {
+                    return None;
+                }
+                let source = expression_value(fragment, expression)?;
                 if !indexes.port_contains(fragment, child_node, source)
                     || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
                 {
                     return None;
                 }
                 (fragment.id(), child, source)
+            }
+            crate::RuntimeFilterLineageStep::JoinEquality {
+                fragment,
+                node,
+                key_ordinal,
+                source_side,
+                target_side,
+            } => {
+                if (fragment, node) != (position.0, position.1) {
+                    return None;
+                }
+                let fragment = plan.fragments().get(&fragment)?;
+                let node = fragment.nodes().get(&node)?;
+                let NodeKind::HashJoin { kind, keys, .. } = &node.kind else {
+                    return None;
+                };
+                let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
+                if *kind != crate::JoinKind::Inner || key.null_safe || node.inputs.len() != 2 {
+                    return None;
+                }
+                let key_value = |side: crate::JoinSide| match side {
+                    crate::JoinSide::Left => expression_value(fragment, key.left),
+                    crate::JoinSide::Right => expression_value(fragment, key.right),
+                };
+                if key_value(source_side) != Some(position.2)
+                    || !indexes.port_contains(fragment, node, position.2)
+                {
+                    return None;
+                }
+                let target_value = key_value(target_side)?;
+                let target_input =
+                    node.inputs[usize::try_from(target_side.input_ordinal()).ok()?];
+                let child_node = fragment.nodes().get(&target_input)?;
+                if !indexes.port_contains(fragment, child_node, target_value)
+                    || !node_has_exact_parent(&mut indexes.parents, fragment, target_input, node.id)
+                {
+                    return None;
+                }
+                (fragment.id(), target_input, target_value)
             }
             crate::RuntimeFilterLineageStep::AggregateGroupKey {
                 fragment,
@@ -12685,6 +13085,7 @@ mod validation_error_tests {
                 ty: ValueType::new(DataType::Int64, false),
                 null_semantics: crate::RuntimeFilterNullSemantics::NeverMatches,
             },
+            lifecycle: crate::RuntimeFilterLifecycle::CompleteOnce,
             reduction: crate::RuntimeFilterReduction::SetUnion,
             availability_coverage: crate::RuntimeFilterCoverage {
                 nodes: Box::default(),

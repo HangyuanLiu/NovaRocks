@@ -1390,6 +1390,10 @@ impl std::error::Error for SqlCompileError {}
 /// [`SqlCompiler::optimize`] after the application freezes statistics.
 pub struct SqlCompiler;
 
+pub use crate::explain::completed::{
+    ExplainRenderBudget, SqlCompletedExplainProfile, SqlExplainFragmentMetrics, SqlExplainNodeKey,
+    SqlExplainObservation, SqlExplainOperatorMetrics, SqlExplainUnavailableReason,
+};
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{FinalizedProviderRead, FinalizedProviderReadSet};
 use completion_driver::{

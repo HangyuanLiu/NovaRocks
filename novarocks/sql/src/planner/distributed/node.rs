@@ -151,7 +151,9 @@ pub(crate) fn distributed_kind_from_physical(
         join.build_runtime_filters.clear();
     }
     match kind {
-        PhysicalPlanKind::Scan(node) => Ok(DistributedNodeKind::Scan(node)),
+        PhysicalPlanKind::Scan(node) => {
+            Ok(DistributedNodeKind::Scan(node.into_planning_payload()?))
+        }
         PhysicalPlanKind::Filter(node) => Ok(DistributedNodeKind::Filter(node)),
         PhysicalPlanKind::Project(node) => Ok(DistributedNodeKind::Project(node)),
         PhysicalPlanKind::Unpivot(node) => Ok(DistributedNodeKind::Unpivot(node)),
@@ -184,7 +186,7 @@ pub(crate) fn distributed_kind_from_physical(
 
 pub fn distributed_kind_to_physical(kind: &DistributedNodeKind) -> PhysicalPlanKind {
     match kind {
-        DistributedNodeKind::Scan(node) => PhysicalPlanKind::Scan(node.clone()),
+        DistributedNodeKind::Scan(node) => PhysicalPlanKind::Scan(node.clone().into()),
         DistributedNodeKind::Filter(node) => PhysicalPlanKind::Filter(node.clone()),
         DistributedNodeKind::Project(node) => PhysicalPlanKind::Project(node.clone()),
         DistributedNodeKind::Unpivot(node) => PhysicalPlanKind::Unpivot(node.clone()),

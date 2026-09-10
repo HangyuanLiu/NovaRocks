@@ -153,6 +153,7 @@ fn finish_scan_with_budget(
                 columns: Box::from([value]),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget,
                 provider_outputs: Box::from([(column, value)]),
@@ -231,6 +232,7 @@ fn finish_plan_with_partition_distributions(
                     columns: Box::from([value]),
                 },
                 kind: NodeKind::Scan {
+                    occurrence: ProviderReadOccurrenceId::new(0),
                     relation: Box::new(relation),
                     read_budget: scan_budget(),
                     provider_outputs: Box::from([(column, value)]),

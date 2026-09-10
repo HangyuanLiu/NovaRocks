@@ -538,6 +538,7 @@ pub(super) fn encode_unpivot_constant(
     Ok(plan::UnpivotConstant { value: Some(value) })
 }
 
+#[cfg(test)]
 pub(super) fn encode_resolved_aggregate_signature(
     binding: &novarocks_functions::ResolvedAggregateSignature,
 ) -> Result<plan::ResolvedAggregateSignature, String> {

@@ -1315,8 +1315,12 @@ fn add_runtime_filter_usage(
             return;
         }
         usage.add_item_counts([consumer.endpoint.values.len(), consumer.capabilities.len()]);
-        if let crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &consumer.target {
-            usage.add_items(lineage.len());
+        match &consumer.target {
+            crate::RuntimeFilterConsumerTarget::ScanField { lineage, .. }
+            | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { lineage, .. } => {
+                usage.add_items(lineage.len());
+            }
+            crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {}
         }
     }
 }

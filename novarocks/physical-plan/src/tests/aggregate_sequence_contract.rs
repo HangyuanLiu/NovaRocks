@@ -128,6 +128,7 @@ fn add_provider_scan(
                 columns: values.clone().into_boxed_slice(),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: columns

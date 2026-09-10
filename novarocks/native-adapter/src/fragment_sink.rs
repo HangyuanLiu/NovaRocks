@@ -556,6 +556,7 @@ mod tests {
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
+    use novarocks_types::SlotId;
     use prost::Message;
 
     use super::{decode_fragment_sink_program, decode_row_mutation_effect};
@@ -791,6 +792,46 @@ mod tests {
         assert_eq!(
             protocol.detail(),
             "native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: 1"
+        );
+    }
+
+    #[test]
+    fn router_branch_preserves_distinct_occurrence_slots() {
+        let mut fragment = router_fragment(plan::ChangeStreamBranchRoute {
+            target_exchange_node_id: 7,
+            route_id: vec![1; 32],
+            accepted_effects: vec![plan::RowMutationEffect::Insert as i32],
+            input_ordinals: vec![1, 2],
+            output_partition: Some(plan::DataPartition {
+                kind: plan::PartitionKind::Unpartitioned as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        fragment.output_columns.extend([
+            common::OutputColumn {
+                column_id: 2,
+                name: "first occurrence".to_string(),
+                ..Default::default()
+            },
+            common::OutputColumn {
+                column_id: 3,
+                name: "second occurrence".to_string(),
+                ..Default::default()
+            },
+        ]);
+
+        let program = decode_fragment_sink_program(&fragment, &Layout::default())
+            .expect("distinct occurrence slots must survive router decode");
+        let novarocks_execution::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(split) =
+            program
+        else {
+            panic!("expected split data stream program")
+        };
+        assert_eq!(split.sinks().len(), 1);
+        assert_eq!(
+            split.sinks()[0].output_columns(),
+            &[SlotId::new(2), SlotId::new(3)]
         );
     }
 

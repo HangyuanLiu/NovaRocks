@@ -46,6 +46,7 @@ numeric_id!(RuntimeFilterWitnessId);
 numeric_id!(RuntimeFilterEqualityWitnessId);
 numeric_id!(ArtifactRefId);
 numeric_id!(TopNSequenceId);
+numeric_id!(ProviderReadOccurrenceId);
 
 /// Identity of one immutable physical-plan version.
 ///

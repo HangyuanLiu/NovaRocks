@@ -34,7 +34,8 @@ use std::collections::BTreeMap;
 
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorWriteCohortRoutingBody, ConnectorWriteCohortRoutingProof, ConnectorWriteRewriteSource,
+    ConnectorWriteRouteFacts,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorWriteAdmissionPurpose, ConnectorWriteInputShape,
@@ -88,6 +89,7 @@ pub struct IcebergWriteTargetPlan {
     handle: IcebergWriterHandle,
     input: ConnectorWriteInputShape,
     route: Option<ConnectorWriteRouteFacts>,
+    routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
 }
 
@@ -114,6 +116,9 @@ impl IcebergWriteTargetPlan {
     pub const fn rewrite_source(&self) -> Option<&ConnectorWriteRewriteSource> {
         self.rewrite_source.as_ref()
     }
+    pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
+        self.routing_proof.as_ref()
+    }
     pub fn into_parts(
         self,
     ) -> (
@@ -121,6 +126,7 @@ impl IcebergWriteTargetPlan {
         IcebergWriterHandle,
         ConnectorWriteInputShape,
         Option<ConnectorWriteRouteFacts>,
+        Option<ConnectorWriteCohortRoutingProof>,
         Option<ConnectorWriteRewriteSource>,
     ) {
         (
@@ -128,6 +134,7 @@ impl IcebergWriteTargetPlan {
             self.handle,
             self.input,
             self.route,
+            self.routing_proof,
             self.rewrite_source,
         )
     }
@@ -388,12 +395,34 @@ pub fn plan_branch_session(
     let writer_table = input.writer_table.as_ref().unwrap_or(&input.table);
     let mut plans = Vec::with_capacity(sealed.len());
     for (index, plan) in input.branches.iter().enumerate() {
+        let routing_proof = match input.copy_on_write.get(index) {
+            Some(recipe) => {
+                let route = plan.route().ok_or_else(|| {
+                    invalid("Iceberg copy-on-write branch omits its routing facts")
+                })?;
+                Some(ConnectorWriteCohortRoutingProof::try_new(
+                route.route_id(),
+                recipe.selection_digest(),
+                recipe.selection_ordinals().to_vec(),
+                match recipe.input() {
+                    crate::commit::write_stack::copy_on_write::IcebergCowBranchInput::Rewrite {
+                        ..
+                    } => ConnectorWriteCohortRoutingBody::Rewrite,
+                    crate::commit::write_stack::copy_on_write::IcebergCowBranchInput::Append => {
+                        ConnectorWriteCohortRoutingBody::Append
+                    }
+                },
+                )?)
+            }
+            None => None,
+        };
         plans.push(IcebergWriteTargetPlan {
             ordinal: sealed[index].ordinal(),
             branch: plan.branch(),
             handle: plan.writer_handle(writer_table)?,
             input: plan.input().clone(),
             route: plan.route().cloned(),
+            routing_proof,
             rewrite_source: input
                 .copy_on_write
                 .get(index)

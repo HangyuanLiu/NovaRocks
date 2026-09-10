@@ -644,6 +644,7 @@ mod tests {
                     ConnectorWriteFieldToken::from_bytes([9; 32]),
                     2,
                 )],
+                partition_input_positions: vec![0],
                 output_partition_ordinals: vec![2],
                 sink: test_support::simple_sql_write_plan_input(
                     ConnectorWriteInputBinding::RootOutputByOrdinal,

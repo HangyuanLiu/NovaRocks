@@ -261,6 +261,7 @@ fn null_safe_join_filter(
             ty: value_type,
             null_semantics,
         },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
         availability_coverage: coverage([witness], true),
         terminal_coverage: coverage([witness], true),
         equality_witnesses: Box::from([RuntimeFilterEqualityWitness {
@@ -317,6 +318,7 @@ fn null_safe_join_filter(
 fn scan_lineage_filter(
     through_filter: bool,
     through_project: bool,
+    through_inner_join: bool,
     second_provider_field: bool,
 ) -> (Fragment, RuntimeFilter, Option<ValueId>) {
     let fragment_id = FragmentId::new(101);
@@ -378,6 +380,7 @@ fn scan_lineage_filter(
                 columns: scan_values.clone().into_boxed_slice(),
             },
             kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
                 relation: Box::new(relation),
                 read_budget: scan_budget(),
                 provider_outputs: provider_outputs.into_boxed_slice(),
@@ -422,7 +425,7 @@ fn scan_lineage_filter(
         (scan, scan_values[0], Vec::new())
     };
 
-    let (probe_node, probe_value, lineage) = if through_project {
+    let (mut probe_node, probe_value, mut lineage) = if through_project {
         let project = builder.reserve_node_id().unwrap();
         let identity = builder
             .add_expression(
@@ -464,10 +467,14 @@ fn scan_lineage_filter(
                 output_properties: unconstrained(),
                 output: OutputPort {
                     node: project,
-                    columns: Box::from([projected, other]),
+                    columns: Box::from([projected, projected, other]),
                 },
                 kind: NodeKind::Project {
-                    expressions: Box::from([(identity, projected), (other_expression, other)]),
+                    expressions: Box::from([
+                        (identity, projected),
+                        (identity, projected),
+                        (other_expression, other),
+                    ]),
                 },
             })
             .unwrap();
@@ -479,10 +486,72 @@ fn scan_lineage_filter(
                 output_ordinal: 0,
             },
         );
-        (project, projected, lineage.into_boxed_slice())
+        (project, projected, lineage)
     } else {
-        (lineage_input, lineage_value, lineage.into_boxed_slice())
+        (lineage_input, lineage_value, lineage)
     };
+
+    if through_inner_join {
+        let (equivalent, equivalent_value) =
+            append_literal_with_distribution(&mut builder, false, Distribution::Broadcast);
+        let inner_join = builder.reserve_node_id().unwrap();
+        let left_key = builder
+            .add_expression(
+                inner_join,
+                ty(DataType::Int64, false),
+                ExprKind::Value(probe_value),
+            )
+            .unwrap();
+        let right_key = builder
+            .add_expression(
+                inner_join,
+                ty(DataType::Int64, false),
+                ExprKind::Value(equivalent_value),
+            )
+            .unwrap();
+        builder
+            .insert_node(PhysicalNode {
+                id: inner_join,
+                inputs: Box::from([probe_node, equivalent]),
+                required_inputs: Box::from([
+                    unconstrained(),
+                    PhysicalProperties {
+                        distribution: Distribution::Broadcast,
+                        row_multiplicity: RowMultiplicity::Replicated,
+                        ordering: Box::default(),
+                    },
+                ]),
+                output_properties: unconstrained(),
+                output: OutputPort {
+                    node: inner_join,
+                    columns: Box::from([probe_value, equivalent_value]),
+                },
+                kind: NodeKind::HashJoin {
+                    kind: JoinKind::Inner,
+                    keys: Box::from([JoinKey {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }]),
+                    build_side: JoinSide::Right,
+                    distribution: JoinDistribution::BroadcastBuild,
+                    residual: None,
+                    null_extended: Box::default(),
+                },
+            })
+            .unwrap();
+        lineage.insert(
+            0,
+            RuntimeFilterLineageStep::JoinEquality {
+                fragment: fragment_id,
+                node: inner_join,
+                key_ordinal: 0,
+                source_side: JoinSide::Left,
+                target_side: JoinSide::Left,
+            },
+        );
+        probe_node = inner_join;
+    }
 
     let (build, build_value) =
         append_literal_with_distribution(&mut builder, false, Distribution::Broadcast);
@@ -546,9 +615,10 @@ fn scan_lineage_filter(
             ty: ty(DataType::Int64, false),
             null_semantics: RuntimeFilterNullSemantics::NeverMatches,
         },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
         reduction: RuntimeFilterReduction::SetUnion,
-        availability_coverage: coverage([witness], true),
-        terminal_coverage: coverage([witness], true),
+        availability_coverage: coverage([witness], false),
+        terminal_coverage: coverage([witness], false),
         equality_witnesses: Box::from([RuntimeFilterEqualityWitness {
             id: equality,
             fragment: fragment_id,
@@ -589,7 +659,10 @@ fn scan_lineage_filter(
             activation: RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
                 late_apply: LateApplyGranularity::RowGroup,
             },
-            target: RuntimeFilterConsumerTarget::ScanField { equality, lineage },
+            target: RuntimeFilterConsumerTarget::ScanField {
+                equality,
+                lineage: lineage.into_boxed_slice(),
+            },
         }]),
         policy: RuntimeFilterPolicy {
             max_contribution_bytes: 1024,
@@ -624,19 +697,267 @@ fn local_runtime_filter_cuts(fragment: &Fragment, filter: &RuntimeFilter) -> Fra
     }
 }
 
+fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
+    let fragment_id = FragmentId::new(105);
+    let binding = connector_binding();
+    let column = ProviderColumnReference {
+        column_payload: encoded(&binding, ConnectorCodecCategory::ReadColumn, 51),
+    };
+    let mut relation = metadata_relation(&binding, column.clone());
+    match &mut relation {
+        Relation::Data(relation) => relation.provided_properties = singleton(),
+        Relation::Metadata(relation) => relation.provided_properties = singleton(),
+    }
+    let mut builder = FragmentBuilder::new(fragment_id);
+    let scan = builder.reserve_node_id().unwrap();
+    let scan_value = builder
+        .add_value(
+            ty(DataType::Int64, false),
+            ValueOrigin::ProviderField {
+                scan_node: scan,
+                field: column.clone(),
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: scan,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node: scan,
+                columns: Box::from([scan_value]),
+            },
+            kind: NodeKind::Scan {
+                occurrence: ProviderReadOccurrenceId::new(0),
+                relation: Box::new(relation),
+                read_budget: scan_budget(),
+                provider_outputs: Box::from([(column, scan_value)]),
+                residuals: Box::default(),
+                derived_values: Box::default(),
+            },
+        })
+        .unwrap();
+    let aggregate = builder.reserve_node_id().unwrap();
+    let group_key = builder
+        .add_expression(
+            aggregate,
+            ty(DataType::Int64, false),
+            ExprKind::Value(scan_value),
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: aggregate,
+            inputs: Box::from([scan]),
+            required_inputs: Box::from([singleton()]),
+            output_properties: singleton(),
+            output: OutputPort {
+                node: aggregate,
+                columns: Box::from([scan_value]),
+            },
+            kind: NodeKind::Aggregate {
+                group_by: Box::from([(group_key, scan_value)]),
+                calls: Box::default(),
+            },
+        })
+        .unwrap();
+    let topn = builder.reserve_node_id().unwrap();
+    let order_key = builder
+        .add_expression(
+            topn,
+            ty(DataType::Int64, false),
+            ExprKind::Value(scan_value),
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: topn,
+            inputs: Box::from([aggregate]),
+            required_inputs: Box::from([singleton()]),
+            output_properties: PhysicalProperties {
+                distribution: Distribution::Singleton,
+                row_multiplicity: RowMultiplicity::SingleCopy,
+                ordering: Box::from([OrderingKey {
+                    value: scan_value,
+                    direction: SortDirection::Ascending,
+                    null_ordering: NullOrdering::Last,
+                }]),
+            },
+            output: OutputPort {
+                node: topn,
+                columns: Box::from([scan_value]),
+            },
+            kind: NodeKind::TopN {
+                order_by: Box::from([SortExpr {
+                    expr: order_key,
+                    direction: SortDirection::Ascending,
+                    null_ordering: NullOrdering::Last,
+                }]),
+                limit: 5,
+                offset: 0,
+                phase: TopNPhase::Single,
+            },
+        })
+        .unwrap();
+    let filter_id = RuntimeFilterId::new(105);
+    builder.attach_runtime_filter(filter_id).unwrap();
+    let fragment = builder
+        .finish_definition(topn, FragmentSink::Noop, dop())
+        .unwrap();
+    let witness = RuntimeFilterWitnessId::new(105);
+    let filter = RuntimeFilter {
+        id: filter_id,
+        kind: RuntimeFilterKind::MinMax,
+        domain: RuntimeFilterDomain::Ordered {
+            key: RuntimeFilterOrderKey {
+                ty: ty(DataType::Int64, false),
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::Last,
+            },
+            inclusive: true,
+            comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
+        },
+        lifecycle: RuntimeFilterLifecycle::MonotonicUpdates,
+        reduction: RuntimeFilterReduction::TightenOrderedBound,
+        availability_coverage: coverage([witness], true),
+        terminal_coverage: coverage([witness], true),
+        equality_witnesses: Box::default(),
+        producers: Box::from([RuntimeFilterProducer {
+            witness,
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment_id,
+                node: aggregate,
+                values: Box::from([scan_value]),
+            },
+            apply_point: RuntimeFilterApplyPoint::NodeInput { input_ordinal: 0 },
+            contribution_kinds: Box::from([
+                RuntimeFilterContributionKind::OrderedBoundUpdate,
+                RuntimeFilterContributionKind::ProducerClosed,
+            ]),
+            completion: RuntimeFilterCompletion::ProducerClosed,
+            progress: RuntimeFilterProducerProgress {
+                build_edges: Box::default(),
+                non_build_edges: Box::default(),
+            },
+            target: RuntimeFilterProducerTarget::AggregateTopNKey {
+                group_key_ordinal: 0,
+                topn,
+                phase: TopNPhase::Single,
+                order_key_ordinal: 0,
+                limit: 5,
+                offset: 0,
+                direction: SortDirection::Ascending,
+                null_ordering: NullOrdering::Last,
+            },
+        }]),
+        consumers: Box::from([RuntimeFilterConsumer {
+            endpoint: RuntimeFilterEndpoint {
+                fragment: fragment_id,
+                node: scan,
+                values: Box::from([scan_value]),
+            },
+            apply_point: RuntimeFilterApplyPoint::ScanSource,
+            capabilities: Box::from([RuntimeFilterArtifactCapability::OrderedRange]),
+            activation: RuntimeFilterConsumerActivation::NonBlockingLive {
+                late_apply: LateApplyGranularity::Batch,
+            },
+            target: RuntimeFilterConsumerTarget::AggregateTopNScanField {
+                producer: witness,
+                lineage: Box::default(),
+            },
+        }]),
+        policy: RuntimeFilterPolicy {
+            max_contribution_bytes: 1024,
+            max_artifact_bytes: 1024,
+            deadline_ms: 100,
+            max_retries: 1,
+        },
+    };
+    (fragment, filter)
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_requires_a_positive_frozen_limit() {
+    let (fragment, filter) = aggregate_topn_filter();
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+
+    let mut invalid = filter;
+    let RuntimeFilterProducerTarget::AggregateTopNKey { limit, .. } =
+        &mut invalid.producers[0].target
+    else {
+        unreachable!();
+    };
+    *limit = 0;
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        invalid,
+        "runtime filter Aggregate TopN producer has a zero limit",
+    );
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_recomputes_the_exact_topn_witness() {
+    let (fragment, mut filter) = aggregate_topn_filter();
+    let RuntimeFilterProducerTarget::AggregateTopNKey { direction, .. } =
+        &mut filter.producers[0].target
+    else {
+        unreachable!();
+    };
+    *direction = SortDirection::Descending;
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "runtime filter Aggregate TopN producer target does not match its exact group key",
+    );
+}
+
+#[test]
+fn aggregate_topn_runtime_filter_consumer_requires_its_exact_producer_witness() {
+    let (fragment, mut filter) = aggregate_topn_filter();
+    let RuntimeFilterConsumerTarget::AggregateTopNScanField { producer, .. } =
+        &mut filter.consumers[0].target
+    else {
+        unreachable!();
+    };
+    *producer = RuntimeFilterWitnessId::new(10_105);
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "runtime filter Aggregate TopN consumer has no exact producer witness",
+    );
+}
+
+#[test]
+fn aggregate_topn_monotonic_updates_require_live_activation() {
+    let (fragment, mut filter) = aggregate_topn_filter();
+    filter.consumers[0].activation =
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Batch,
+        };
+
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "monotonic runtime-filter consumer requires non-blocking live-update activation",
+    );
+}
+
 #[test]
 fn runtime_filter_scan_field_accepts_direct_and_identity_project_lineage() {
     for (through_filter, through_project) in
         [(false, false), (false, true), (true, false), (true, true)]
     {
-        let (fragment, filter, _) = scan_lineage_filter(through_filter, through_project, false);
+        let (fragment, filter, _) =
+            scan_lineage_filter(through_filter, through_project, false, false);
         assert_runtime_filter_plan_accepted(fragment, filter);
     }
 }
 
 #[test]
 fn runtime_filter_scan_field_rejects_filter_lineage_drift() {
-    let (fragment, mut filter, _) = scan_lineage_filter(true, false, false);
+    let (fragment, mut filter, _) = scan_lineage_filter(true, false, false, false);
     let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
     else {
         unreachable!();
@@ -654,8 +975,48 @@ fn runtime_filter_scan_field_rejects_filter_lineage_drift() {
 }
 
 #[test]
+fn runtime_filter_project_identity_uses_the_exact_output_occurrence() {
+    let (fragment, mut filter, _) = scan_lineage_filter(false, true, false, false);
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+
+    let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
+    else {
+        unreachable!();
+    };
+    let RuntimeFilterLineageStep::ProjectIdentity { output_ordinal, .. } = &mut lineage[0] else {
+        unreachable!();
+    };
+    *output_ordinal = 2;
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+    );
+}
+
+#[test]
+fn runtime_filter_join_equality_lineage_recomputes_inner_key_direction() {
+    let (fragment, mut filter, _) = scan_lineage_filter(false, false, true, false);
+    assert_runtime_filter_plan_accepted(fragment.clone(), filter.clone());
+
+    let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
+    else {
+        unreachable!();
+    };
+    let RuntimeFilterLineageStep::JoinEquality { target_side, .. } = &mut lineage[0] else {
+        unreachable!();
+    };
+    *target_side = JoinSide::Right;
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment,
+        filter,
+        "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+    );
+}
+
+#[test]
 fn runtime_filter_scan_field_rejects_a_same_typed_non_key_provider_field() {
-    let (fragment, mut filter, second) = scan_lineage_filter(false, false, true);
+    let (fragment, mut filter, second) = scan_lineage_filter(false, false, false, true);
     filter.consumers[0].endpoint.values = Box::from([second.unwrap()]);
 
     let cuts = local_runtime_filter_cuts(&fragment, &filter);
@@ -727,6 +1088,9 @@ fn runtime_filter_consumer_requires_a_producer_for_its_exact_equality_witness() 
     match &mut filter.consumers[0].target {
         RuntimeFilterConsumerTarget::JoinProbeKey { equality }
         | RuntimeFilterConsumerTarget::ScanField { equality, .. } => *equality = second.id,
+        RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+            panic!("null-safe join fixture must use a join equality target")
+        }
     }
 
     assert_local_runtime_filter_rejected_at_both_boundaries(
@@ -799,6 +1163,16 @@ fn runtime_filter_coverage_depth_is_bounded_without_recursive_values() {
 #[test]
 fn membership_filter_rejects_each_contribution_and_completion_matrix_drift() {
     let (fragment, filter, _) = null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
+
+    let mut wrong_coverage = filter.clone();
+    let witness = wrong_coverage.producers[0].witness;
+    wrong_coverage.availability_coverage = coverage([witness], false);
+    wrong_coverage.terminal_coverage = coverage([witness], false);
+    assert_local_runtime_filter_rejected_at_both_boundaries(
+        fragment.clone(),
+        wrong_coverage,
+        "fenced final-domain runtime filter requires null-safe AllOf coverage",
+    );
 
     let mut wrong_contributions = filter.clone();
     wrong_contributions.producers[0].contribution_kinds = Box::from([
@@ -909,6 +1283,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
             inclusive: true,
             comparator: OrderedComparisonAlgorithm::NativeScalarOrderV1,
         },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
         reduction: RuntimeFilterReduction::UnionOrderedHull,
         availability_coverage: coverage([witness], true),
         terminal_coverage: coverage([witness], true),
@@ -1308,9 +1683,10 @@ fn join_build_frontier_fixture() -> JoinBuildFrontierFixture {
             ty: ty(DataType::Int64, false),
             null_semantics: RuntimeFilterNullSemantics::NeverMatches,
         },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
         reduction: RuntimeFilterReduction::SetUnion,
-        availability_coverage: coverage([witness], true),
-        terminal_coverage: coverage([witness], true),
+        availability_coverage: coverage([witness], false),
+        terminal_coverage: coverage([witness], false),
         equality_witnesses: Box::from([RuntimeFilterEqualityWitness {
             id: equality,
             fragment: target_fragment,

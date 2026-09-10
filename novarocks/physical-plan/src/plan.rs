@@ -581,6 +581,12 @@ pub struct ChangeStreamRoute {
 #[derive(Clone, Debug, PartialEq)]
 pub enum NodeKind {
     Scan {
+        /// Query-local identity of this exact provider-read occurrence.
+        ///
+        /// Two scans may intentionally share one frozen provider relation and
+        /// input version. The occurrence keeps their runtime-private
+        /// capabilities distinct without changing provider relation identity.
+        occurrence: crate::ProviderReadOccurrenceId,
         relation: Box<Relation>,
         read_budget: ScanReadBudget,
         provider_outputs: Box<[(ProviderColumnReference, ValueId)]>,
@@ -1044,13 +1050,21 @@ pub enum RuntimeFilterDomain {
 pub enum RuntimeFilterContributionKind {
     ValueDomainDelta,
     FinalDomainShard,
+    OrderedBoundUpdate,
     FinalOrderedHullShard,
     ProducerClosed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterLifecycle {
+    CompleteOnce,
+    MonotonicUpdates,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeFilterReduction {
     SetUnion,
+    TightenOrderedBound,
     UnionOrderedHull,
 }
 
@@ -1079,7 +1093,11 @@ pub struct RuntimeFilterCoverage {
     pub root: u32,
 }
 
-/// Exact hash-join build progress that closes one producer witness.
+/// Exact static producer-input progress that closes one producer witness.
+///
+/// `build_edges` names the producer input frontier: the hash-join build input
+/// or the Aggregate TopN input. `non_build_edges` is the remainder of the
+/// producer fragment's inbound frontier and is empty for Aggregate TopN.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterProducerProgress {
     /// Complete inbound exchange set under the join build input.
@@ -1099,6 +1117,19 @@ pub enum RuntimeFilterApplyPoint {
 pub enum RuntimeFilterProducerTarget {
     JoinBuildKey {
         equality: crate::RuntimeFilterEqualityWitnessId,
+    },
+    AggregateTopNKey {
+        group_key_ordinal: u32,
+        /// Exact TopN whose monotonic bound is contributed by this
+        /// aggregate. The validator replays the parent/key/order proof rather
+        /// than trusting planner placement.
+        topn: NodeId,
+        phase: TopNPhase,
+        order_key_ordinal: u32,
+        limit: u64,
+        offset: u64,
+        direction: crate::SortDirection,
+        null_ordering: crate::NullOrdering,
     },
 }
 
@@ -1126,6 +1157,11 @@ pub enum RuntimeFilterConsumerActivation {
     StartUnfilteredThenApplyComplete {
         late_apply: LateApplyGranularity,
     },
+    /// Remain runnable while installing every monotonic update at the named
+    /// scheduling boundary. There is no complete snapshot admission barrier.
+    NonBlockingLive {
+        late_apply: LateApplyGranularity,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1135,6 +1171,10 @@ pub enum RuntimeFilterConsumerTarget {
     },
     ScanField {
         equality: crate::RuntimeFilterEqualityWitnessId,
+        lineage: Box<[RuntimeFilterLineageStep]>,
+    },
+    AggregateTopNScanField {
+        producer: crate::RuntimeFilterWitnessId,
         lineage: Box<[RuntimeFilterLineageStep]>,
     },
 }
@@ -1158,6 +1198,16 @@ pub enum RuntimeFilterLineageStep {
         fragment: FragmentId,
         node: NodeId,
         output_ordinal: u32,
+    },
+    /// Traverse one exact equality key of an inner hash join. `source_side`
+    /// identifies the key currently named by the join output and
+    /// `target_side` identifies the input/key followed by the reverse trace.
+    JoinEquality {
+        fragment: FragmentId,
+        node: NodeId,
+        key_ordinal: u32,
+        source_side: JoinSide,
+        target_side: JoinSide,
     },
     AggregateGroupKey {
         fragment: FragmentId,
@@ -1232,6 +1282,7 @@ pub struct RuntimeFilter {
     pub id: RuntimeFilterId,
     pub kind: RuntimeFilterKind,
     pub domain: RuntimeFilterDomain,
+    pub lifecycle: RuntimeFilterLifecycle,
     pub reduction: RuntimeFilterReduction,
     pub availability_coverage: RuntimeFilterCoverage,
     pub terminal_coverage: RuntimeFilterCoverage,

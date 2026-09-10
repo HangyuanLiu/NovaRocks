@@ -33,13 +33,13 @@ fn single_copy() -> PhysicalProperties {
     }
 }
 
-fn all_of(witnesses: &[RuntimeFilterWitnessId]) -> RuntimeFilterCoverage {
+fn any_of(witnesses: &[RuntimeFilterWitnessId]) -> RuntimeFilterCoverage {
     let mut nodes = witnesses
         .iter()
         .copied()
         .map(RuntimeFilterCoverageNode::Witness)
         .collect::<Vec<_>>();
-    nodes.push(RuntimeFilterCoverageNode::AllOf {
+    nodes.push(RuntimeFilterCoverageNode::AnyOf {
         children: (0..u32::try_from(witnesses.len()).unwrap())
             .collect::<Vec<_>>()
             .into_boxed_slice(),
@@ -106,6 +106,42 @@ fn append_exchange(
             inputs: Box::default(),
             required_inputs: Box::default(),
             output_properties: properties,
+            output: OutputPort {
+                node,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::ExchangeSource {
+                edge,
+                imports: Box::from([(source_value, value)]),
+            },
+        })
+        .unwrap();
+    (node, value)
+}
+
+fn append_cte_exchange(
+    builder: &mut FragmentBuilder,
+    edge: EdgeId,
+    producer_fragment: FragmentId,
+    source_value: ValueId,
+) -> (NodeId, ValueId) {
+    let node = builder.reserve_node_id().unwrap();
+    let value = builder
+        .add_value(
+            ty(DataType::Int64, false),
+            ValueOrigin::CteImport {
+                edge,
+                producer_fragment,
+                producer_value: source_value,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: single_copy(),
             output: OutputPort {
                 node,
                 columns: Box::from([value]),
@@ -233,7 +269,7 @@ fn filter(
         .iter()
         .map(|producer| producer.witness)
         .collect::<Vec<_>>();
-    let coverage = all_of(&witnesses);
+    let coverage = any_of(&witnesses);
     RuntimeFilter {
         id,
         kind: RuntimeFilterKind::InList,
@@ -241,6 +277,7 @@ fn filter(
             ty: ty(DataType::Int64, false),
             null_semantics: RuntimeFilterNullSemantics::NeverMatches,
         },
+        lifecycle: RuntimeFilterLifecycle::CompleteOnce,
         reduction: RuntimeFilterReduction::SetUnion,
         availability_coverage: coverage.clone(),
         terminal_coverage: coverage,
@@ -265,9 +302,19 @@ struct EdgeEndpoints {
 }
 
 fn add_edge(plan: &mut PlanBuilder, id: EdgeId, endpoints: EdgeEndpoints, broadcast_edge: bool) {
+    add_edge_with_kind(plan, id, endpoints, broadcast_edge, EdgeKind::Stream);
+}
+
+fn add_edge_with_kind(
+    plan: &mut PlanBuilder,
+    id: EdgeId,
+    endpoints: EdgeEndpoints,
+    broadcast_edge: bool,
+    kind: EdgeKind,
+) {
     plan.add_edge(Edge {
         id,
-        kind: EdgeKind::Stream,
+        kind,
         source: EdgeSource {
             fragment: endpoints.source_fragment,
             projection: Box::from([endpoints.source_value]),
@@ -297,6 +344,137 @@ fn add_edge(plan: &mut PlanBuilder, id: EdgeId, endpoints: EdgeEndpoints, broadc
         },
     })
     .unwrap();
+}
+
+#[test]
+fn blocking_runtime_filter_rejects_multicast_backpressure_cycle() {
+    let source_fragment_id = FragmentId::new(420);
+    let build_fragment_id = FragmentId::new(421);
+    let probe_fragment_id = FragmentId::new(422);
+    let build_branch = EdgeId::new(420);
+    let probe_branch = EdgeId::new(421);
+    let join_build_edge = EdgeId::new(422);
+    let filter_id = RuntimeFilterId::new(420);
+
+    let mut source_builder = FragmentBuilder::new(source_fragment_id);
+    let (source_root, source_value) = append_single_copy_literal(&mut source_builder);
+    let source_fragment = source_builder
+        .finish_definition(
+            source_root,
+            FragmentSink::Multicast {
+                edges: Box::from([build_branch, probe_branch]),
+            },
+            dop(),
+        )
+        .unwrap();
+
+    let mut build_builder = FragmentBuilder::new(build_fragment_id);
+    let (build_root, build_value) = append_cte_exchange(
+        &mut build_builder,
+        build_branch,
+        source_fragment_id,
+        source_value,
+    );
+    let build_fragment = build_builder
+        .finish_definition(
+            build_root,
+            FragmentSink::Stream {
+                edge: join_build_edge,
+            },
+            dop(),
+        )
+        .unwrap();
+
+    let mut probe_builder = FragmentBuilder::new(probe_fragment_id);
+    let probe = append_cte_exchange(
+        &mut probe_builder,
+        probe_branch,
+        source_fragment_id,
+        source_value,
+    );
+    let build = append_exchange(
+        &mut probe_builder,
+        join_build_edge,
+        build_value,
+        broadcast(),
+    );
+    let join = append_broadcast_join(&mut probe_builder, probe, build);
+    probe_builder.attach_runtime_filter(filter_id).unwrap();
+    let probe_fragment = probe_builder
+        .finish_definition(join, FragmentSink::Noop, dop())
+        .unwrap();
+
+    let mut filter = filter(
+        filter_id,
+        Box::from([equality(420, probe_fragment_id, join)]),
+        Box::from([producer(
+            420,
+            420,
+            probe_fragment_id,
+            join,
+            build.1,
+            Box::from([join_build_edge]),
+        )]),
+        Box::from([blocking_consumer(420, probe_fragment_id, join, probe.1)]),
+    );
+    filter.producers[0].progress.non_build_edges = Box::from([probe_branch]);
+
+    let finish = |filter: RuntimeFilter| {
+        let mut plan = PlanBuilder::new(version());
+        for fragment in [
+            source_fragment.clone(),
+            build_fragment.clone(),
+            probe_fragment.clone(),
+        ] {
+            plan.add_fragment(fragment).unwrap();
+        }
+        for (id, destination_fragment, destination_node, destination_value) in [
+            (build_branch, build_fragment_id, build_root, build_value),
+            (probe_branch, probe_fragment_id, probe.0, probe.1),
+        ] {
+            add_edge_with_kind(
+                &mut plan,
+                id,
+                EdgeEndpoints {
+                    source_fragment: source_fragment_id,
+                    source_value,
+                    destination_fragment,
+                    destination_node,
+                    destination_value,
+                },
+                false,
+                EdgeKind::CteMulticast,
+            );
+        }
+        add_edge(
+            &mut plan,
+            join_build_edge,
+            EdgeEndpoints {
+                source_fragment: build_fragment_id,
+                source_value: build_value,
+                destination_fragment: probe_fragment_id,
+                destination_node: build.0,
+                destination_value: build.1,
+            },
+            true,
+        );
+        plan.add_runtime_filter(filter).unwrap();
+        plan.finish()
+    };
+
+    let mut non_blocking = filter.clone();
+    non_blocking.consumers[0].activation =
+        RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+            late_apply: LateApplyGranularity::Batch,
+        };
+    let valid = finish(non_blocking).expect("late apply breaks the multicast wait cycle");
+    let cuts = fragment_cuts(&valid, probe_fragment_id).unwrap();
+    validate_fragment(&valid.fragments()[&probe_fragment_id], &cuts).unwrap();
+
+    let error = finish(filter).unwrap_err().to_string();
+    assert!(error.contains(
+        "blocking runtime-filter waits form a cycle with physical execution dependencies"
+    ));
 }
 
 #[test]

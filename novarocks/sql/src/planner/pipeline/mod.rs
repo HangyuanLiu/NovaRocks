@@ -146,7 +146,7 @@ pub(crate) fn build_sql_change_stream_dataflow_plan_with_auxiliary_settings(
     )
 }
 
-fn insert_pre_expand_keyed_assert(
+pub(crate) fn insert_pre_expand_keyed_assert(
     physical: &mut PhysicalPlanNode,
     keyed_assert: &PreExpandKeyedAssertSpec,
 ) -> Result<(), String> {

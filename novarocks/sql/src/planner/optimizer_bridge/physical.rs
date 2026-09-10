@@ -74,16 +74,19 @@ impl BridgeCtx<'_> {
 
     fn convert_kind(&self, node: &OptimizedOperatorNode) -> Result<PhysicalPlanKind, String> {
         match &node.op {
-            Operator::PhysicalScan(op) => Ok(PhysicalPlanKind::Scan(PlanScanNode {
-                database: op.database.clone(),
-                table: op.table.clone(),
-                alias: op.alias.clone(),
-                columns: op.columns.clone(),
-                predicates: materialize_exprs(self.scalars, &op.predicates),
-                required_columns: op.required_columns.clone(),
-                variant_columns: op.variant_columns.clone(),
-                mv_rewritten_from: op.mv_rewritten_from.clone(),
-            })),
+            Operator::PhysicalScan(op) => Ok(PhysicalPlanKind::Scan(
+                PlanScanNode {
+                    database: op.database.clone(),
+                    table: op.table.clone(),
+                    alias: op.alias.clone(),
+                    columns: op.columns.clone(),
+                    predicates: materialize_exprs(self.scalars, &op.predicates),
+                    required_columns: op.required_columns.clone(),
+                    variant_columns: op.variant_columns.clone(),
+                    mv_rewritten_from: op.mv_rewritten_from.clone(),
+                }
+                .into(),
+            )),
             Operator::PhysicalFilter(op) => Ok(PhysicalPlanKind::Filter(PlanFilterNode {
                 predicate: materialize(self.scalars, op.predicate),
             })),

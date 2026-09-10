@@ -18,6 +18,8 @@
 //! Planner-owned physical plan nodes.
 
 use arrow::datatypes::DataType;
+use novarocks_physical_plan::ProviderReadOccurrenceId;
+use std::ops::{Deref, DerefMut};
 
 use crate::analysis::{JoinKind, OutputColumn, SortItem, TypedExpr};
 use crate::column_id::ColumnId;
@@ -151,6 +153,88 @@ pub(crate) struct PhysicalPlanNode {
     pub probe_runtime_filters: Vec<RuntimeFilterProbeIntent>,
 }
 
+/// A scan after optimizer materialization and before final contract lowering.
+///
+/// Provider completion freezes the query-local read occurrence directly on
+/// this node. Later stages must read that identity from the scan rather than
+/// reconstructing an association from traversal order or relation identity.
+#[derive(Clone, Debug)]
+pub(crate) enum PhysicalScanNode {
+    Planning(PlanScanNode),
+    Finalized(FinalPhysicalScanNode),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FinalPhysicalScanNode {
+    payload: PlanScanNode,
+    provider_read_occurrence: ProviderReadOccurrenceId,
+}
+
+impl PhysicalScanNode {
+    pub(crate) fn provider_read_occurrence(&self) -> Option<ProviderReadOccurrenceId> {
+        match self {
+            Self::Planning(_) => None,
+            Self::Finalized(scan) => Some(scan.provider_read_occurrence),
+        }
+    }
+
+    pub(crate) fn finalize_provider_read_occurrence(
+        self,
+        occurrence: ProviderReadOccurrenceId,
+    ) -> Result<Self, String> {
+        let Self::Planning(payload) = self else {
+            let existing = self
+                .provider_read_occurrence()
+                .expect("finalized physical scan owns an occurrence");
+            return Err(format!(
+                "physical scan already owns provider read occurrence {} and cannot be reassigned to {}",
+                existing.get(),
+                occurrence.get()
+            ));
+        };
+        Ok(Self::Finalized(FinalPhysicalScanNode {
+            payload,
+            provider_read_occurrence: occurrence,
+        }))
+    }
+
+    pub(crate) fn into_planning_payload(self) -> Result<PlanScanNode, String> {
+        match self {
+            Self::Planning(payload) => Ok(payload),
+            Self::Finalized(scan) => Err(format!(
+                "finalized physical scan occurrence {} cannot be converted to a stage that has no occurrence identity",
+                scan.provider_read_occurrence.get()
+            )),
+        }
+    }
+}
+
+impl From<PlanScanNode> for PhysicalScanNode {
+    fn from(payload: PlanScanNode) -> Self {
+        Self::Planning(payload)
+    }
+}
+
+impl Deref for PhysicalScanNode {
+    type Target = PlanScanNode;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Planning(payload) => payload,
+            Self::Finalized(scan) => &scan.payload,
+        }
+    }
+}
+
+impl DerefMut for PhysicalScanNode {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Planning(payload) => payload,
+            Self::Finalized(scan) => &mut scan.payload,
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[expect(
     private_interfaces,
@@ -162,7 +246,7 @@ pub(crate) struct PhysicalPlanNode {
 )]
 #[derive(Clone, Debug)]
 pub enum PhysicalPlanKind {
-    Scan(PlanScanNode),
+    Scan(PhysicalScanNode),
     Filter(PlanFilterNode),
     Project(PlanProjectNode),
     Unpivot(PlanUnpivotNode),

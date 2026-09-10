@@ -17,6 +17,7 @@
 
 //! EXPLAIN plan formatter for logical plans and shared expression formatting.
 
+pub(crate) mod completed;
 pub(crate) mod distributed;
 
 use std::fmt::Write;

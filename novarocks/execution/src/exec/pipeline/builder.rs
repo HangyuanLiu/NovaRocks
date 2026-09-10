@@ -1635,7 +1635,7 @@ fn build_pipeline_for_node(
             let left_build = build_pipeline_for_node(left, ctx)?;
             let right_build = build_pipeline_for_node(right, ctx)?;
 
-            let probe_is_left = *join_type != JoinType::RightSemi;
+            let probe_is_left = hash_join_probe_is_left(*join_type);
             let (mut probe_build, mut build_build) = if probe_is_left {
                 (left_build, right_build)
             } else {
@@ -2066,6 +2066,10 @@ fn build_pipeline_for_node(
     }
 }
 
+const fn hash_join_probe_is_left(join_type: JoinType) -> bool {
+    !matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+}
+
 fn new_source_pipeline(
     ctx: &mut PipelineBuildContext,
     source: Box<dyn OperatorFactory>,
@@ -2123,7 +2127,7 @@ mod tests {
 
     use super::{
         build_native_pipeline_graph_for_exec_plan_with_dop,
-        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop,
+        build_native_pipeline_graph_for_exec_plan_with_root_sink_dop, hash_join_probe_is_left,
     };
     use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
     use crate::exec::expr::agg::test_builtin_execution_function_set;
@@ -2133,6 +2137,7 @@ mod tests {
     };
     use crate::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
     use crate::exec::node::exchange_source::ExchangeSourceNode;
+    use crate::exec::node::join::JoinType;
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
     use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings, ScanBindings};
     use crate::exec::pipeline::dependency::DependencyManager;
@@ -2143,6 +2148,14 @@ mod tests {
     fn chunk_schema_of(schema: &Arc<Schema>, slot_ids: &[SlotId]) -> ChunkSchemaRef {
         ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), slot_ids)
             .expect("chunk schema")
+    }
+
+    #[test]
+    fn right_semi_and_right_anti_pipeline_with_right_probe() {
+        assert!(!hash_join_probe_is_left(JoinType::RightSemi));
+        assert!(!hash_join_probe_is_left(JoinType::RightAnti));
+        assert!(hash_join_probe_is_left(JoinType::LeftSemi));
+        assert!(hash_join_probe_is_left(JoinType::LeftAnti));
     }
 
     fn resolved_aggregate(
