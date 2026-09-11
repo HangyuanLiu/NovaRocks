@@ -3967,6 +3967,7 @@ name = "novarocks-mysql-adapter"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "chrono",
  "libc",
  "mysql_common 0.32.4",

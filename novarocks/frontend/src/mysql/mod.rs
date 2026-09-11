@@ -20,35 +20,32 @@ pub use novarocks_mysql_adapter::{
 };
 
 use std::future::Future;
-use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use async_trait::async_trait;
-use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, ParamParser, QueryResultWriter,
-    StatementMetaWriter,
-};
-use tokio::io::AsyncWrite;
-use tokio::net::TcpStream;
-use tracing::{info, warn};
+#[cfg(test)]
+use opensrv_mysql::{AsyncMysqlShim, ErrorKind};
+use tracing::info;
 
 use novarocks_version as version;
 
 use novarocks_query_application::cancellation::QueryCancellationReason;
-use novarocks_query_application::client_connection::{
-    ClientConnectionTerminationReason, ClientConnectionToken,
-};
-use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_query_application::session::{
-    QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
-};
+use novarocks_query_application::client_connection::ClientConnectionTerminationReason;
+#[cfg(test)]
+use novarocks_query_application::client_connection::ClientConnectionToken;
+use novarocks_query_application::session::QuerySessionFactory;
+#[cfg(test)]
+use novarocks_query_application::session::{QuerySession, QuerySessionOpenRequest};
+#[cfg(test)]
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
+#[cfg(test)]
 const ROOT_USER: &str = novarocks_mysql_adapter::DEFAULT_MYSQL_USER;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -114,8 +111,9 @@ where
         drain,
         finalize,
         move |stream, peer_addr| {
-            serve_frontend_mysql_connection(
+            novarocks_mysql_adapter::serve_query_application_mysql_connection(
                 session_user.clone(),
+                version::short_version().to_string(),
                 Arc::clone(&session_factory),
                 Arc::clone(&connections),
                 stream,
@@ -144,306 +142,6 @@ fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
         bind_addr.port(),
         std::process::id()
     );
-}
-
-async fn serve_frontend_mysql_connection(
-    user: String,
-    session_factory: Arc<dyn QuerySessionFactory>,
-    connections: Arc<MysqlClientConnectionRegistry>,
-    stream: TcpStream,
-    peer_addr: SocketAddr,
-) {
-    let mut registration = match connections.register() {
-        Ok(registration) => registration,
-        Err(error) => {
-            warn!(
-                "reject standalone mysql connection because the connection registry is exhausted: peer={}, error={:?}",
-                peer_addr, error
-            );
-            return;
-        }
-    };
-    let connection = registration.token();
-    let session: Arc<OnceLock<Arc<dyn QuerySession>>> = Arc::new(OnceLock::new());
-    let session_for_disconnect = Arc::clone(&session);
-    let disconnect_watcher =
-        novarocks_mysql_adapter::spawn_disconnect_watcher(&stream, move || {
-            if let Some(session) = session_for_disconnect.get() {
-                session.cancel_current(QueryCancellationReason::ClientDisconnected);
-            }
-        });
-    let shim = FrontendMysqlShim::new(
-        user,
-        connection,
-        session_factory,
-        Arc::clone(&session),
-        disconnect_watcher,
-    );
-    let (reader, writer) = stream.into_split();
-    let result = {
-        let intermediary = AsyncMysqlIntermediary::run_with_options(
-            shim,
-            reader,
-            writer,
-            &novarocks_mysql_adapter::MYSQL_INTERMEDIARY_OPTIONS,
-        );
-        tokio::pin!(intermediary);
-        tokio::select! {
-            termination = registration.termination_receiver() => {
-                match termination {
-                    Ok(reason) => {
-                        if let Some(session) = session.get() {
-                            session.cancel_current(query_cancellation_reason_for_connection_termination(&reason));
-                        }
-                        info!(
-                            "terminate standalone mysql connection: peer={}, connection_id={}, reason={:?}",
-                            peer_addr,
-                            connection.connection_id(),
-                            reason
-                        );
-                    }
-                    Err(error) => {
-                        warn!(
-                            "standalone mysql connection termination signal closed unexpectedly: peer={}, connection_id={}, error={}",
-                            peer_addr,
-                            connection.connection_id(),
-                            error
-                        );
-                    }
-                }
-                None
-            }
-            result = &mut intermediary => Some(result),
-        }
-    };
-    if let Some(Err(err)) = result {
-        warn!(
-            "standalone mysql connection failed: peer={}, connection_id={}, err={}",
-            peer_addr,
-            connection.connection_id(),
-            err
-        );
-    }
-}
-
-fn query_cancellation_reason_for_connection_termination(
-    reason: &ClientConnectionTerminationReason,
-) -> QueryCancellationReason {
-    match reason {
-        ClientConnectionTerminationReason::ExplicitKillConnection {
-            requester_connection_id,
-        } => QueryCancellationReason::ExplicitKillConnection {
-            requester_connection_id: *requester_connection_id,
-        },
-        ClientConnectionTerminationReason::ServerShutdown => {
-            QueryCancellationReason::ServerShutdown
-        }
-    }
-}
-
-struct FrontendMysqlShim {
-    user: String,
-    connection: ClientConnectionToken,
-    session_factory: Arc<dyn QuerySessionFactory>,
-    session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-    _disconnect_watcher: novarocks_mysql_adapter::ClientDisconnectWatcher,
-}
-
-impl FrontendMysqlShim {
-    fn new(
-        user: String,
-        connection: ClientConnectionToken,
-        session_factory: Arc<dyn QuerySessionFactory>,
-        session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-        disconnect_watcher: novarocks_mysql_adapter::ClientDisconnectWatcher,
-    ) -> Self {
-        Self {
-            user,
-            connection,
-            session_factory,
-            session,
-            _disconnect_watcher: disconnect_watcher,
-        }
-    }
-
-    fn session(&self) -> Result<&Arc<dyn QuerySession>, QueryServiceError> {
-        self.session.get().ok_or_else(|| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::PermissionDenied,
-                "session is not authenticated",
-            )
-        })
-    }
-}
-
-impl Drop for FrontendMysqlShim {
-    fn drop(&mut self) {
-        if let Some(session) = self.session.get() {
-            session.close();
-        }
-    }
-}
-
-#[async_trait]
-impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
-    type Error = io::Error;
-
-    fn version(&self) -> String {
-        format!("{}-standalone-mysql", version::short_version())
-    }
-
-    fn connect_id(&self) -> u32 {
-        self.connection.connection_id()
-    }
-
-    async fn authenticate(
-        &self,
-        auth_plugin: &str,
-        username: &[u8],
-        salt: &[u8],
-        auth_data: &[u8],
-    ) -> bool {
-        if !novarocks_mysql_adapter::authenticate_empty_password(
-            &self.user,
-            auth_plugin,
-            username,
-            salt,
-            auth_data,
-        ) {
-            return false;
-        }
-        let session = match self
-            .session_factory
-            .open_session(QuerySessionOpenRequest::new(
-                self.connection,
-                self.user.clone(),
-            )) {
-            Ok(session) => session,
-            Err(error) => {
-                warn!(
-                    "failed to open frontend query session for connection_id={}: {}",
-                    self.connection.connection_id(),
-                    error
-                );
-                return false;
-            }
-        };
-        self.session.set(session).is_ok()
-    }
-
-    async fn on_prepare<'a>(
-        &'a mut self,
-        _query: &'a str,
-        info: StatementMetaWriter<'a, W>,
-    ) -> io::Result<()> {
-        info.error(
-            ErrorKind::ER_NOT_SUPPORTED_YET,
-            b"prepared statements are not supported in standalone server v1",
-        )
-        .await
-    }
-
-    async fn on_execute<'a>(
-        &'a mut self,
-        _id: u32,
-        _params: ParamParser<'a>,
-        results: QueryResultWriter<'a, W>,
-    ) -> io::Result<()> {
-        results
-            .error(
-                ErrorKind::ER_NOT_SUPPORTED_YET,
-                b"prepared statements are not supported in standalone server v1",
-            )
-            .await
-    }
-
-    async fn on_close<'a>(&'a mut self, _stmt: u32) {}
-
-    async fn on_init<'a>(
-        &'a mut self,
-        schema: &'a str,
-        writer: InitWriter<'a, W>,
-    ) -> io::Result<()> {
-        let session = match self.session() {
-            Ok(session) => session,
-            Err(error) => {
-                return writer
-                    .error(
-                        novarocks_mysql_adapter::mysql_error_kind(&error),
-                        error.message().as_bytes(),
-                    )
-                    .await;
-            }
-        };
-        match session
-            .init_database(&novarocks_mysql_adapter::normalize_init_database_schema(
-                schema,
-            ))
-            .await
-        {
-            Ok(()) => writer.ok().await,
-            Err(error) => {
-                writer
-                    .error(
-                        novarocks_mysql_adapter::mysql_error_kind(&error),
-                        error.message().as_bytes(),
-                    )
-                    .await
-            }
-        }
-    }
-
-    async fn on_query<'a>(
-        &'a mut self,
-        query: &'a str,
-        results: QueryResultWriter<'a, W>,
-    ) -> io::Result<()> {
-        let session = match self.session() {
-            Ok(session) => session,
-            Err(error) => {
-                return results
-                    .error(
-                        novarocks_mysql_adapter::mysql_error_kind(&error),
-                        error.message().as_bytes(),
-                    )
-                    .await;
-            }
-        };
-        let (statement, terminal) = match session.execute_batch(query).await {
-            Ok(statement) => statement.into_parts(),
-            Err(error) => {
-                return results
-                    .error(
-                        novarocks_mysql_adapter::mysql_error_kind(&error),
-                        error.message().as_bytes(),
-                    )
-                    .await;
-            }
-        };
-        let outcome = match statement {
-            StatementResult::Query(result) => {
-                novarocks_mysql_adapter::write_query_result(result, results).await
-            }
-            StatementResult::GovernedQuery(result) => {
-                novarocks_mysql_adapter::write_governed_query_result(result, results).await
-            }
-            StatementResult::StreamingQuery(result) => {
-                novarocks_mysql_adapter::write_streaming_query_result(result, results).await
-            }
-            StatementResult::GovernedCompletion(result) => {
-                novarocks_mysql_adapter::write_governed_terminal_ok(result.into_protocol(), results)
-                    .await
-            }
-            StatementResult::GovernedError(result) => {
-                let (error, protocol) = result.into_parts();
-                novarocks_mysql_adapter::write_governed_terminal_error(error, protocol, results)
-                    .await
-            }
-            StatementResult::Ok => novarocks_mysql_adapter::write_terminal_ok(results).await,
-        };
-        terminal.complete();
-        outcome
-    }
 }
 
 #[cfg(test)]
@@ -598,8 +296,8 @@ mod protocol_api_tests {
 
     /// A shim whose session factory must never be reached. Every assertion below
     /// is a rejection, and rejection happens strictly before a session is opened.
-    fn rejecting_shim() -> FrontendMysqlShim {
-        FrontendMysqlShim::new(
+    fn rejecting_shim() -> novarocks_mysql_adapter::QueryApplicationMysqlShim {
+        novarocks_mysql_adapter::QueryApplicationMysqlShim::new(
             ROOT_USER.to_string(),
             ClientConnectionToken::new(1, 1).expect("valid connection token"),
             Arc::new(CancellationProbeFactory {
@@ -607,11 +305,12 @@ mod protocol_api_tests {
             }),
             Arc::new(OnceLock::new()),
             novarocks_mysql_adapter::ClientDisconnectWatcher::inactive(),
+            "test".to_string(),
         )
     }
 
     async fn authenticate(
-        shim: &FrontendMysqlShim,
+        shim: &novarocks_mysql_adapter::QueryApplicationMysqlShim,
         auth_plugin: &str,
         username: &[u8],
         auth_data: &[u8],

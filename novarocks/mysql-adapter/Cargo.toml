@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
 arrow.workspace = true
 chrono.workspace = true
 libc.workspace = true

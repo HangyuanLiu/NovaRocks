@@ -24,6 +24,7 @@ mod error_mapping;
 mod governed_result_writer;
 mod listener;
 mod listener_settings;
+mod query_application_shim;
 mod result_encoding;
 mod result_value;
 mod result_writer;
@@ -46,6 +47,9 @@ pub use listener::{
 };
 pub use listener_settings::{
     DEFAULT_MYSQL_USER, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
+};
+pub use query_application_shim::{
+    QueryApplicationMysqlShim, serve_query_application_mysql_connection,
 };
 pub use result_encoding::mysql_column_for_result_field;
 pub use result_value::MysqlResultValue;
