@@ -561,6 +561,7 @@ impl FrontendQueryService {
         truncate_engine: Arc<dyn TruncateEngine>,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
+        serving_lifecycle: FrontendServingLifecycle,
     ) -> Self {
         Self {
             session_catalog_resolver,
@@ -592,20 +593,8 @@ impl FrontendQueryService {
             truncate_engine,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
-            // A deployable FE must install its shared lifecycle before
-            // opening MySQL. Keep an omitted install fail-closed rather than
-            // silently creating a second ready admission authority.
-            serving_lifecycle: FrontendServingLifecycle::new(),
+            serving_lifecycle,
         }
-    }
-
-    /// Installs the process-wide serving owner composed by the FE server.
-    ///
-    /// The constructor is intentionally fail-closed; deployable composition
-    /// must install its shared lifecycle before opening the MySQL listener.
-    pub(crate) fn with_serving_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
-        self.serving_lifecycle = lifecycle;
-        self
     }
 }
 
