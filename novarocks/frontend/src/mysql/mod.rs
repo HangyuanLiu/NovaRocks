@@ -49,7 +49,7 @@ use self::encoding::{
     write_governed_query_result, write_query_result, write_streaming_query_result,
 };
 use self::error_mapping::error_kind_for_code;
-use self::session::{QuerySession, QuerySessionFactory, QuerySessionOpenRequest};
+use self::session::{QuerySession, QuerySessionFactory};
 use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
 };
@@ -57,6 +57,7 @@ use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
 };
+use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;

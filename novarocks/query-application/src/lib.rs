@@ -35,6 +35,9 @@ pub mod query_control;
 /// Query-session errors before protocol-specific encoding.
 pub mod session_error;
 
+/// Query-session admission requests independent of a wire protocol.
+pub mod session;
+
 /// Session generations, governed statement control, and protocol settlement.
 pub mod session_control;
 

@@ -968,6 +968,7 @@ mod tests {
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
         run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
     };
+    use crate::ResolvedMysqlListenerSettings;
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::native::transport::FrontendNativeTransport;
     use crate::runtime::statement_result::StatementResult;
@@ -979,7 +980,7 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
-    use crate::{QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+    use novarocks_query_application::session::QuerySessionOpenRequest;
     use novarocks_query_application::session_error::QueryServiceErrorKind;
 
     fn settle_governed_completion(result: StatementResult) {

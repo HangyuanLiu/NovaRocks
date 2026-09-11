@@ -28,35 +28,8 @@ use async_trait::async_trait;
 
 use crate::runtime::statement_result::StatementResult;
 use novarocks_query_application::cancellation::QueryCancellationReason;
-use novarocks_query_application::client_connection::ClientConnectionToken;
+use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_error::QueryServiceError;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QuerySessionOpenRequest {
-    connection: ClientConnectionToken,
-    principal: Arc<str>,
-}
-
-impl QuerySessionOpenRequest {
-    pub fn new(connection: ClientConnectionToken, principal: impl Into<Arc<str>>) -> Self {
-        Self {
-            connection,
-            principal: principal.into(),
-        }
-    }
-
-    pub const fn connection_id(&self) -> u32 {
-        self.connection.connection_id()
-    }
-
-    pub const fn connection_token(&self) -> ClientConnectionToken {
-        self.connection
-    }
-
-    pub fn principal(&self) -> &str {
-        &self.principal
-    }
-}
 
 #[async_trait]
 pub trait QuerySession: Send + Sync + 'static {
@@ -86,6 +59,7 @@ pub trait QuerySessionFactory: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_query_application::client_connection::ClientConnectionToken;
 
     #[test]
     fn open_request_keeps_connection_identity_private_but_readable() {
