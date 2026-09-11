@@ -39,8 +39,7 @@ use opensrv_mysql::{
     QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinSet;
+use tokio::net::TcpStream;
 use tracing::{info, warn};
 
 use novarocks_version as version;
@@ -133,7 +132,7 @@ where
 {
     let (bind_addr, session_user) = settings.into_parts();
     let ready_user = session_user.clone();
-    serve_until_drain_then_shutdown(
+    novarocks_mysql_adapter::serve_tcp_until_drain_then_shutdown(
         bind_addr,
         drain,
         finalize,
@@ -168,154 +167,6 @@ fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
         bind_addr.port(),
         std::process::id()
     );
-}
-
-async fn serve_until_shutdown<F, H, HFut, R>(
-    bind_addr: SocketAddr,
-    shutdown: F,
-    session_handler: H,
-    on_ready: R,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    H: FnMut(TcpStream, SocketAddr) -> HFut,
-    HFut: Future<Output = ()> + Send + 'static,
-    R: FnOnce(SocketAddr),
-{
-    serve_until_shutdown_with_drain_timeout(
-        bind_addr,
-        shutdown,
-        session_handler,
-        on_ready,
-        SESSION_DRAIN_TIMEOUT,
-    )
-    .await
-}
-
-async fn serve_until_shutdown_with_drain_timeout<F, H, HFut, R>(
-    bind_addr: SocketAddr,
-    shutdown: F,
-    mut session_handler: H,
-    on_ready: R,
-    drain_timeout: Duration,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    H: FnMut(TcpStream, SocketAddr) -> HFut,
-    HFut: Future<Output = ()> + Send + 'static,
-    R: FnOnce(SocketAddr),
-{
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|e| format!("bind standalone mysql server on {bind_addr} failed: {e}"))?;
-    let bound_addr = listener
-        .local_addr()
-        .map_err(|e| format!("read standalone mysql server address failed: {e}"))?;
-    on_ready(bound_addr);
-
-    let mut sessions = JoinSet::new();
-    tokio::pin!(shutdown);
-    let serve_result = loop {
-        tokio::select! {
-            biased;
-            _ = &mut shutdown => break Ok(()),
-            completed = sessions.join_next(), if !sessions.is_empty() => {
-                if let Some(result) = completed {
-                    log_session_join_error(result);
-                }
-            }
-            accepted = listener.accept() => {
-                match accepted {
-                    Ok((stream, peer_addr)) => {
-                        sessions.spawn(session_handler(stream, peer_addr));
-                    }
-                    Err(err) => {
-                        break Err(format!(
-                            "accept standalone mysql connection failed: {err}"
-                        ));
-                    }
-                }
-            }
-        }
-    };
-
-    drop(listener);
-    drain_session_tasks(&mut sessions, drain_timeout).await;
-    serve_result
-}
-
-async fn serve_until_drain_then_shutdown<F, G, H, HFut, R>(
-    bind_addr: SocketAddr,
-    drain: F,
-    finalize: G,
-    mut session_handler: H,
-    on_ready: R,
-    cleanup_timeout: Duration,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    G: Future<Output = ()> + Send,
-    H: FnMut(TcpStream, SocketAddr) -> HFut,
-    HFut: Future<Output = ()> + Send + 'static,
-    R: FnOnce(SocketAddr),
-{
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .map_err(|error| format!("bind standalone mysql server on {bind_addr} failed: {error}"))?;
-    let bound_addr = listener
-        .local_addr()
-        .map_err(|error| format!("read standalone mysql server address failed: {error}"))?;
-    on_ready(bound_addr);
-
-    let mut sessions = JoinSet::new();
-    tokio::pin!(drain);
-    let serve_result = loop {
-        tokio::select! {
-            biased;
-            _ = &mut drain => break Ok(()),
-            completed = sessions.join_next(), if !sessions.is_empty() => {
-                if let Some(result) = completed { log_session_join_error(result); }
-            }
-            accepted = listener.accept() => match accepted {
-                Ok((stream, peer_addr)) => {
-                    sessions.spawn(session_handler(stream, peer_addr));
-                }
-                Err(error) => break Err(format!("accept standalone mysql connection failed: {error}")),
-            },
-        }
-    };
-    drop(listener);
-    if serve_result.is_err() {
-        drain_session_tasks(&mut sessions, cleanup_timeout).await;
-        return serve_result;
-    }
-    finalize.await;
-    drain_session_tasks(&mut sessions, cleanup_timeout).await;
-    serve_result
-}
-
-fn log_session_join_error(result: Result<(), tokio::task::JoinError>) {
-    if let Err(err) = result
-        && !err.is_cancelled()
-    {
-        warn!("standalone mysql connection task failed: {err}");
-    }
-}
-
-async fn drain_session_tasks(sessions: &mut JoinSet<()>, drain_timeout: Duration) {
-    let drain = async {
-        while let Some(result) = sessions.join_next().await {
-            log_session_join_error(result);
-        }
-    };
-    if tokio::time::timeout(drain_timeout, drain).await.is_ok() {
-        return;
-    }
-
-    sessions.abort_all();
-    while let Some(result) = sessions.join_next().await {
-        log_session_join_error(result);
-    }
 }
 
 async fn serve_frontend_mysql_connection(
@@ -965,7 +816,7 @@ mod tests {
     use std::future::pending;
     use std::sync::Mutex;
 
-    use tokio::net::TcpStream;
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
 
     use super::*;
@@ -1015,7 +866,7 @@ mod tests {
         async fn shutdown_before_first_connection_stops_accepting() {
             let (ready_tx, ready_rx) = oneshot::channel();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();
-            let server = tokio::spawn(serve_until_shutdown(
+            let server = tokio::spawn(novarocks_mysql_adapter::serve_tcp_until_shutdown(
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                 async move {
                     let _ = shutdown_rx.await;
@@ -1050,7 +901,7 @@ mod tests {
             let started_tx = Arc::new(Mutex::new(Some(started_tx)));
             let (release_tx, release_rx) = oneshot::channel();
             let release_rx = Arc::new(Mutex::new(Some(release_rx)));
-            let server = tokio::spawn(serve_until_shutdown(
+            let server = tokio::spawn(novarocks_mysql_adapter::serve_tcp_until_shutdown(
                 SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                 async move {
                     let _ = shutdown_rx.await;
@@ -1108,32 +959,36 @@ mod tests {
             let started_tx = Arc::new(Mutex::new(Some(started_tx)));
             let (release_tx, release_rx) = oneshot::channel();
             let release_rx = Arc::new(Mutex::new(Some(release_rx)));
-            let server = tokio::spawn(serve_until_drain_then_shutdown(
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-                async move {
-                    let _ = drain_rx.await;
-                },
-                async move {
-                    let _ = finalize_rx.await;
-                },
-                move |_stream, _peer_addr| {
-                    let started_tx = Arc::clone(&started_tx);
-                    let release_rx = Arc::clone(&release_rx);
+            let server = tokio::spawn(
+                novarocks_mysql_adapter::serve_tcp_until_drain_then_shutdown(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                     async move {
-                        if let Some(started_tx) = started_tx.lock().expect("started lock").take() {
-                            let _ = started_tx.send(());
+                        let _ = drain_rx.await;
+                    },
+                    async move {
+                        let _ = finalize_rx.await;
+                    },
+                    move |_stream, _peer_addr| {
+                        let started_tx = Arc::clone(&started_tx);
+                        let release_rx = Arc::clone(&release_rx);
+                        async move {
+                            if let Some(started_tx) =
+                                started_tx.lock().expect("started lock").take()
+                            {
+                                let _ = started_tx.send(());
+                            }
+                            let release_rx = { release_rx.lock().expect("release lock").take() };
+                            if let Some(release_rx) = release_rx {
+                                let _ = release_rx.await;
+                            }
                         }
-                        let release_rx = { release_rx.lock().expect("release lock").take() };
-                        if let Some(release_rx) = release_rx {
-                            let _ = release_rx.await;
-                        }
-                    }
-                },
-                move |addr| {
-                    let _ = ready_tx.send(addr);
-                },
-                TEST_TIMEOUT,
-            ));
+                    },
+                    move |addr| {
+                        let _ = ready_tx.send(addr);
+                    },
+                    TEST_TIMEOUT,
+                ),
+            );
             let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
                 .await
                 .expect("server should bind within the test timeout")
@@ -1177,27 +1032,31 @@ mod tests {
             let started_tx = Arc::new(Mutex::new(Some(started_tx)));
             let session_dropped = Arc::new(AtomicBool::new(false));
             let session_dropped_in_task = Arc::clone(&session_dropped);
-            let server = tokio::spawn(serve_until_shutdown_with_drain_timeout(
-                SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-                async move {
-                    let _ = shutdown_rx.await;
-                },
-                move |_stream, _peer_addr| {
-                    let started_tx = Arc::clone(&started_tx);
-                    let session_dropped = Arc::clone(&session_dropped_in_task);
+            let server = tokio::spawn(
+                novarocks_mysql_adapter::serve_tcp_until_shutdown_with_drain_timeout(
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
                     async move {
-                        let _probe = DropProbe(session_dropped);
-                        if let Some(started_tx) = started_tx.lock().expect("started lock").take() {
-                            let _ = started_tx.send(());
+                        let _ = shutdown_rx.await;
+                    },
+                    move |_stream, _peer_addr| {
+                        let started_tx = Arc::clone(&started_tx);
+                        let session_dropped = Arc::clone(&session_dropped_in_task);
+                        async move {
+                            let _probe = DropProbe(session_dropped);
+                            if let Some(started_tx) =
+                                started_tx.lock().expect("started lock").take()
+                            {
+                                let _ = started_tx.send(());
+                            }
+                            pending::<()>().await;
                         }
-                        pending::<()>().await;
-                    }
-                },
-                move |addr| {
-                    let _ = ready_tx.send(addr);
-                },
-                Duration::from_millis(20),
-            ));
+                    },
+                    move |addr| {
+                        let _ = ready_tx.send(addr);
+                    },
+                    Duration::from_millis(20),
+                ),
+            );
             let addr = tokio::time::timeout(TEST_TIMEOUT, ready_rx)
                 .await
                 .expect("server should bind within the test timeout")
@@ -1230,7 +1089,7 @@ mod tests {
             let ready_emitted = Arc::new(AtomicBool::new(false));
             let ready_emitted_in_callback = Arc::clone(&ready_emitted);
 
-            let err = serve_until_shutdown(
+            let err = novarocks_mysql_adapter::serve_tcp_until_shutdown(
                 addr,
                 pending::<()>(),
                 |_stream, _peer_addr| async move {},
@@ -1239,7 +1098,7 @@ mod tests {
             .await
             .expect_err("occupied address should fail to bind");
 
-            assert!(err.contains("bind standalone mysql server"), "{err}");
+            assert!(err.contains("bind MySQL listener"), "{err}");
             assert!(!ready_emitted.load(Ordering::SeqCst));
         }
     }

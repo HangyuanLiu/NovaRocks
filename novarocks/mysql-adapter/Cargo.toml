@@ -10,4 +10,5 @@ workspace = true
 [dependencies]
 novarocks-query-application.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tracing.workspace = true

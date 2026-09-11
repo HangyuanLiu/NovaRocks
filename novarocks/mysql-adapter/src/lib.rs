@@ -19,6 +19,7 @@
 
 mod connection_registry;
 mod error_mapping;
+mod listener;
 mod listener_settings;
 
 use novarocks_query_application::session_error::QueryServiceErrorKind;
@@ -26,6 +27,10 @@ use opensrv_mysql::{ErrorKind, IntermediaryOptions};
 
 pub use connection_registry::MysqlClientConnectionRegistry;
 pub use error_mapping::error_kind_for_domain_code;
+pub use listener::{
+    serve_tcp_until_drain_then_shutdown, serve_tcp_until_shutdown,
+    serve_tcp_until_shutdown_with_drain_timeout,
+};
 pub use listener_settings::{
     DEFAULT_MYSQL_USER, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };

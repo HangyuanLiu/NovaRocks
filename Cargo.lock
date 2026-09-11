@@ -3971,6 +3971,7 @@ dependencies = [
  "novarocks-query-application",
  "opensrv-mysql",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
