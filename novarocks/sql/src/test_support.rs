@@ -478,6 +478,7 @@ pub fn native_self_join_scan_plan() -> Result<DistributedPlan, String> {
             join_type: JoinKind::Inner,
             eq_conditions: Vec::new(),
             other_condition: None,
+            build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
             execution_mode: None,
             build_runtime_filters: Vec::new(),

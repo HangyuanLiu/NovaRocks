@@ -3651,8 +3651,6 @@ fn node_header<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
-
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,
@@ -3698,9 +3696,7 @@ mod tests {
                     ..SessionOptimizerSettings::default()
                 },
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("backend count"),
-            },
+            SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             SqlCompileControl::unbounded(),

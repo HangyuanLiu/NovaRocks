@@ -1407,7 +1407,7 @@ impl ContractLoweringVisitor {
             }
         }?;
         self.record_runtime_filter_probes(plan, &lowered)?;
-        self.annotate_node(plan, &lowered);
+        self.annotate_node(plan, &lowered)?;
         Ok(lowered)
     }
 
@@ -1443,12 +1443,16 @@ impl ContractLoweringVisitor {
         Ok(())
     }
 
-    fn annotate_node(&mut self, plan: &PhysicalPlanNode, lowered: &LoweredNode) {
+    fn annotate_node(
+        &mut self,
+        plan: &PhysicalPlanNode,
+        lowered: &LoweredNode,
+    ) -> Result<(), ContractLoweringError> {
         if !self
             .annotated_nodes
             .insert((lowered.fragment, lowered.node))
         {
-            return;
+            return Ok(());
         }
         let subject =
             novarocks_physical_plan::AnnotationSubject::Node(lowered.fragment, lowered.node);
@@ -1496,7 +1500,7 @@ impl ContractLoweringVisitor {
                 self.plan_builder.add_annotation(PlanAnnotation {
                     subject,
                     key: "sql.mv_rewritten_from".into(),
-                    value: materialized_view.clone().into_boxed_str(),
+                    value: mv_rewrite_provenance_annotation(materialized_view)?,
                 });
             }
         }
@@ -1512,6 +1516,7 @@ impl ContractLoweringVisitor {
                 });
             }
         }
+        Ok(())
     }
 
     fn allocate_fragment(&mut self) -> Result<FragmentId, ContractLoweringError> {
@@ -6707,6 +6712,102 @@ fn invalid_write(detail: String) -> ContractLoweringError {
     ContractLoweringError::InvalidWrite { detail }
 }
 
+fn mv_rewrite_provenance_annotation(
+    selection: &crate::planner::payload::MvRewriteSelection,
+) -> Result<Box<str>, ContractLoweringError> {
+    let publication_id =
+        selection
+            .publication_id()
+            .ok_or(ContractLoweringError::MissingPlannerFact {
+                node: "Scan",
+                fact: "MV rewrite publication identity",
+            })?;
+    let definition_fingerprint =
+        selection
+            .definition_fingerprint()
+            .ok_or(ContractLoweringError::MissingPlannerFact {
+                node: "Scan",
+                fact: "MV rewrite definition fingerprint",
+            })?;
+    let publication_state_digest = mv_rewrite_publication_state_digest(selection)?;
+    Ok(format!(
+        "v1;publication_id={};definition_fingerprint={};publication_state_digest={}",
+        hex_bytes(&publication_id),
+        hex_bytes(&definition_fingerprint),
+        hex_bytes(&publication_state_digest)
+    )
+    .into_boxed_str())
+}
+
+fn mv_rewrite_publication_state_digest(
+    selection: &crate::planner::payload::MvRewriteSelection,
+) -> Result<[u8; 32], ContractLoweringError> {
+    let target =
+        selection
+            .publication_target()
+            .ok_or(ContractLoweringError::MissingPlannerFact {
+                node: "Scan",
+                fact: "MV rewrite publication target revision",
+            })?;
+    if selection.publication_inputs().is_empty() {
+        return Err(ContractLoweringError::MissingPlannerFact {
+            node: "Scan",
+            fact: "MV rewrite publication input revisions",
+        });
+    }
+
+    let mut digest = Sha256::new();
+    update_digest_part(
+        &mut digest,
+        b"novarocks.mv-rewrite-publication-provenance.v1",
+    );
+    update_digest_part(
+        &mut digest,
+        &(selection.publication_inputs().len() as u64).to_be_bytes(),
+    );
+    for input in selection.publication_inputs() {
+        update_mv_publication_relation_digest(&mut digest, b"input", input);
+    }
+    update_mv_publication_relation_digest(&mut digest, b"target", target);
+    Ok(digest.finalize().into())
+}
+
+fn update_mv_publication_relation_digest(
+    digest: &mut Sha256,
+    role: &[u8],
+    relation: &crate::compiler::SqlMvRewritePublicationRelation,
+) {
+    update_digest_part(digest, role);
+    update_digest_part(digest, relation.table_fqn().as_bytes());
+    update_mv_semantic_fact_digest(digest, relation.revision().object_identity());
+    update_mv_semantic_fact_digest(digest, relation.revision().data_version());
+}
+
+fn update_mv_semantic_fact_digest(
+    digest: &mut Sha256,
+    fact: &novarocks_spi::connector::ConnectorSemanticFact,
+) {
+    update_digest_part(digest, fact.provider().as_str().as_bytes());
+    update_digest_part(digest, fact.format().as_bytes());
+    update_digest_part(digest, &fact.version().to_be_bytes());
+    update_digest_part(digest, fact.value());
+}
+
+fn update_digest_part(digest: &mut Sha256, value: &[u8]) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value);
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn provider_partition_identity_digest(
     label: &[u8],
     version: PlanVersionId,
@@ -8384,6 +8485,76 @@ mod tests {
             max: 8,
             requires_power_of_two: true,
         }
+    }
+
+    #[test]
+    fn mv_rewrite_annotation_uses_exact_publication_identity() {
+        let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+            [7; 16],
+            [9; 32],
+            vec!["ice.db.orders".to_string()],
+        )
+        .unwrap();
+        let selection = crate::planner::payload::MvRewriteSelection::selected(
+            "display_name_is_not_identity".to_string(),
+            [7; 16],
+            [9; 32],
+            Vec::new(),
+            publication.publication_inputs().to_vec(),
+            publication.publication_target().clone(),
+        );
+
+        let annotation = mv_rewrite_provenance_annotation(&selection).unwrap();
+        assert!(annotation.starts_with(concat!(
+            "v1;publication_id=07070707070707070707070707070707;",
+            "definition_fingerprint=",
+            "0909090909090909090909090909090909090909090909090909090909090909;",
+            "publication_state_digest="
+        )));
+        let state_digest = annotation
+            .strip_prefix(concat!(
+                "v1;publication_id=07070707070707070707070707070707;",
+                "definition_fingerprint=",
+                "0909090909090909090909090909090909090909090909090909090909090909;",
+                "publication_state_digest="
+            ))
+            .unwrap();
+        assert_eq!(state_digest.len(), 64);
+        assert!(state_digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!annotation.contains("display_name_is_not_identity"));
+
+        let other_publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+            [7; 16],
+            [9; 32],
+            vec!["ice.db.other_orders".to_string()],
+        )
+        .unwrap();
+        let other_selection = crate::planner::payload::MvRewriteSelection::selected(
+            "display_name_is_not_identity".to_string(),
+            [7; 16],
+            [9; 32],
+            Vec::new(),
+            other_publication.publication_inputs().to_vec(),
+            other_publication.publication_target().clone(),
+        );
+        assert_ne!(
+            annotation,
+            mv_rewrite_provenance_annotation(&other_selection).unwrap()
+        );
+    }
+
+    #[test]
+    fn mv_rewrite_annotation_rejects_unverified_name_only_marker() {
+        let selection =
+            crate::planner::payload::MvRewriteSelection::unverified("name_only".to_string());
+
+        assert!(matches!(
+            mv_rewrite_provenance_annotation(&selection),
+            Err(ContractLoweringError::MissingPlannerFact {
+                node: "Scan",
+                fact: "MV rewrite publication identity",
+            })
+        ));
     }
 
     fn provider_hash_scheme(seed: u8) -> ProviderHashPartitionScheme {

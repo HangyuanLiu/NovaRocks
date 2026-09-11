@@ -1056,7 +1056,6 @@ pub(super) fn resume_provider_read(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -1117,9 +1116,7 @@ mod tests {
                 current_database: "db".to_string(),
                 optimizer_settings,
             },
-            SqlPlanningEnvironment::Distributed {
-                backend_count: NonZeroUsize::new(3).expect("backend count"),
-            },
+            SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
             control,

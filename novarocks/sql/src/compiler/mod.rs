@@ -2377,6 +2377,7 @@ mod tests {
             .expect("sealed distributed fixture"),
             statistics: SqlStatisticsPlan::empty(),
             mv_rewrite_diagnostics: Vec::new(),
+            explain_level: None,
         });
         let terminal = output
             .into_distributed_query()
@@ -2428,19 +2429,6 @@ mod tests {
             Some(SqlPlanCostUnknownReason::NonFinite)
         );
         assert_eq!(cost.network(), SqlPlanCostValue::Known(3.0));
-    }
-
-    #[test]
-    fn distributed_query_terminal_rejects_the_wrong_output_shape() {
-        let error = match SqlCompileOutput::immediate_explain(vec!["EXPLAIN".to_string()])
-            .into_distributed_query()
-        {
-            Ok(_) => panic!("explain output must not become a distributed query terminal"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
-        let _: fn(SqlCompileOutput) -> Result<SqlDistributedQueryTerminal, SqlCompileError> =
-            SqlCompileOutput::into_distributed_query;
     }
 
     #[test]
