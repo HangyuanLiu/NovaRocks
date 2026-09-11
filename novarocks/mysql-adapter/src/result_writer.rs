@@ -20,7 +20,9 @@
 use std::io;
 
 use arrow::record_batch::RecordBatch;
-use novarocks_query_application::api::{QueryExecutionError, QueryExecutionErrorKind, ResultField};
+use novarocks_query_application::api::{
+    QueryExecutionError, QueryExecutionErrorKind, ResultFailureView, ResultField,
+};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use opensrv_mysql::QueryResultWriter;
 use tokio::io::AsyncWrite;
@@ -60,6 +62,7 @@ fn invalid_data_error(error: String) -> io::Error {
 /// remains an application decision at the composition boundary.
 pub enum MysqlBatchWriteError {
     Cancelled(QueryExecutionError),
+    Native(QueryExecutionError),
     Encoding(io::Error),
     Io(io::Error),
 }
@@ -80,6 +83,35 @@ pub async fn write_cancellable_batch<W: AsyncWrite + Unpin>(
         tokio::pin!(write);
         tokio::select! {
             biased;
+            reason = cancellation.cancelled() => {
+                return Err(MysqlBatchWriteError::Cancelled(cancelled_delivery(reason)));
+            }
+            written = &mut write => written.map_err(MysqlBatchWriteError::Io)?,
+        }
+    }
+    Ok(())
+}
+
+/// Writes one streaming result batch while observing both logical delivery
+/// failure and query cancellation before each row reaches the MySQL socket.
+pub async fn write_streaming_batch<W: AsyncWrite + Unpin>(
+    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    batch: &RecordBatch,
+    fields: &[ResultField],
+    cancellation: QueryCancellationView,
+    mut failure: ResultFailureView,
+) -> Result<(), MysqlBatchWriteError> {
+    for row_idx in 0..batch.num_rows() {
+        let row = build_mysql_row(batch, fields, row_idx)
+            .map_err(invalid_data_error)
+            .map_err(MysqlBatchWriteError::Encoding)?;
+        let write = writer.write_row(row);
+        tokio::pin!(write);
+        tokio::select! {
+            biased;
+            error = failure.wait() => {
+                return Err(MysqlBatchWriteError::Native(error));
+            }
             reason = cancellation.cancelled() => {
                 return Err(MysqlBatchWriteError::Cancelled(cancelled_delivery(reason)));
             }

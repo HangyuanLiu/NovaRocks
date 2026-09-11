@@ -45,7 +45,9 @@ pub use listener_settings::{
 };
 pub use result_encoding::mysql_column_for_result_field;
 pub use result_value::MysqlResultValue;
-pub use result_writer::{MysqlBatchWriteError, write_cancellable_batch, write_record_batches};
+pub use result_writer::{
+    MysqlBatchWriteError, write_cancellable_batch, write_record_batches, write_streaming_batch,
+};
 pub use row_encoding::{array_value_to_mysql_value, build_mysql_row};
 pub use terminal::{
     mysql_error_kind, write_governed_terminal_error, write_governed_terminal_ok, write_terminal_ok,

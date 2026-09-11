@@ -44,9 +44,7 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::runtime::statement_result::GovernedImmediateStatementResult;
 #[cfg(test)]
 use novarocks_mysql_adapter::MysqlResultValue as StandaloneMysqlValue;
-use novarocks_mysql_adapter::{
-    build_mysql_row as mysql_adapter_build_mysql_row, mysql_column_for_result_field,
-};
+use novarocks_mysql_adapter::mysql_column_for_result_field;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
     decoded_result_batch_governance_charge,
@@ -822,28 +820,24 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
     batch: &RecordBatch,
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
-    mut failure: ResultFailureView,
+    failure: ResultFailureView,
 ) -> Result<(), ProtocolWriteFailure> {
-    for row_idx in 0..batch.num_rows() {
-        let values = mysql_adapter_build_mysql_row(batch, columns, row_idx)
-            .map_err(invalid_data_error)
-            .map_err(ProtocolWriteFailure::Encoding)?;
-        let write = writer.write_row(values);
-        tokio::pin!(write);
-        tokio::select! {
-            biased;
-            error = failure.wait() => {
-                return Err(ProtocolWriteFailure::Native(error));
+    novarocks_mysql_adapter::write_streaming_batch(writer, batch, columns, cancellation, failure)
+        .await
+        .map_err(|error| match error {
+            novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error) => {
+                ProtocolWriteFailure::Cancelled(error)
             }
-            reason = cancellation.cancelled() => {
-                return Err(ProtocolWriteFailure::Cancelled(
-                    cancelled_query_result_delivery(reason)
-                ));
+            novarocks_mysql_adapter::MysqlBatchWriteError::Native(error) => {
+                ProtocolWriteFailure::Native(error)
             }
-            written = &mut write => written.map_err(ProtocolWriteFailure::Io)?,
-        }
-    }
-    Ok(())
+            novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error) => {
+                ProtocolWriteFailure::Encoding(error)
+            }
+            novarocks_mysql_adapter::MysqlBatchWriteError::Io(error) => {
+                ProtocolWriteFailure::Io(error)
+            }
+        })
 }
 
 async fn write_governed_batch<W: AsyncWrite + Unpin>(
@@ -857,6 +851,9 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
         .map_err(|error| match error {
             novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error) => {
                 ProtocolWriteFailure::Cancelled(error)
+            }
+            novarocks_mysql_adapter::MysqlBatchWriteError::Native(error) => {
+                ProtocolWriteFailure::Native(error)
             }
             novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error) => {
                 ProtocolWriteFailure::Encoding(error)
