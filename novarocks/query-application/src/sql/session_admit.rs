@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned capability errors for typed session statements.
+//! Query-application capability errors for typed SQL session statements.
 
 use novarocks_parser::Span;
 use novarocks_user_error::{
@@ -43,7 +43,7 @@ const ADMIT_KILL_DENIED: ErrorCodeDescriptor = ErrorCodeDescriptor {
     status: ErrorCodeStatus::Active,
 };
 
-/// Session capability descriptors, exported for aggregate manifest and wire-mapping checks.
+/// Session capability descriptors exported for manifest and wire-mapping checks.
 pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_SESSION_GLOBAL_SCOPE_UNSUPPORTED,
     ADMIT_SESSION_TRANSACTION_UNSUPPORTED,
@@ -51,9 +51,9 @@ pub const SESSION_ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
     ADMIT_KILL_DENIED,
 ];
 
-/// Capability failures owned by the frontend session-statement application.
+/// Capability failures owned by Query Application SQL admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SessionAdmitError {
+pub enum SessionAdmitError {
     GlobalScopeUnsupported,
     TransactionUnsupported,
     KillDenied,
@@ -68,12 +68,7 @@ impl SessionAdmitError {
         }
     }
 
-    pub(crate) fn to_user_error(
-        self,
-        source: &str,
-        span: Span,
-        message: impl Into<String>,
-    ) -> UserError {
+    pub fn to_user_error(self, source: &str, span: Span, message: impl Into<String>) -> UserError {
         UserError::from_descriptor(
             self.descriptor(),
             message,

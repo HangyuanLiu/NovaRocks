@@ -85,6 +85,7 @@ use novarocks_query_application::session_error::{QueryServiceError, QueryService
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
 };
+use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
     SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
@@ -808,7 +809,7 @@ impl FrontendQuerySession {
             ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
             ast::SessionStatement::TransactionControl(statement) => Err(
                 QueryServiceError::from_user_error(
-                    crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                    SessionAdmitError::TransactionUnsupported.to_user_error(
                         source,
                         statement.span,
                         format!(
@@ -866,7 +867,7 @@ impl FrontendQuerySession {
         match lower_autocommit_setting(&assignment.value)? {
             AutocommitSetting::Enabled => Ok(()),
             AutocommitSetting::Disabled => Err(QueryServiceError::from_user_error(
-                crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
+                SessionAdmitError::TransactionUnsupported.to_user_error(
                     source,
                     assignment.span,
                     "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
@@ -917,12 +918,11 @@ impl FrontendQuerySession {
                     && is_known_session_setting(&name)
                 {
                     return Err(QueryServiceError::from_user_error(
-                        crate::session_error::SessionAdmitError::GlobalScopeUnsupported
-                            .to_user_error(
-                                source,
-                                assignment.span,
-                                format!("SET GLOBAL {name} is not supported"),
-                            ),
+                        SessionAdmitError::GlobalScopeUnsupported.to_user_error(
+                            source,
+                            assignment.span,
+                            format!("SET GLOBAL {name} is not supported"),
+                        ),
                     ));
                 }
                 let value = session_setting_value(&assignment.value)?;
@@ -931,12 +931,11 @@ impl FrontendQuerySession {
             ast::SetTarget::Catalog { .. } => {
                 if matches!(assignment.scope, ast::SetScope::Global) {
                     return Err(QueryServiceError::from_user_error(
-                        crate::session_error::SessionAdmitError::GlobalScopeUnsupported
-                            .to_user_error(
-                                source,
-                                assignment.span,
-                                "SET GLOBAL CATALOG is not supported",
-                            ),
+                        SessionAdmitError::GlobalScopeUnsupported.to_user_error(
+                            source,
+                            assignment.span,
+                            "SET GLOBAL CATALOG is not supported",
+                        ),
                     ));
                 }
                 let catalog = session_catalog_value(&assignment.value)?;
@@ -2130,13 +2129,11 @@ fn no_such_connection_error(connection_id: u32) -> QueryServiceError {
 }
 
 fn kill_denied_error(source: &str, statement: &ast::KillStatement) -> QueryServiceError {
-    QueryServiceError::from_user_error(
-        crate::session_error::SessionAdmitError::KillDenied.to_user_error(
-            source,
-            statement.span,
-            "permission denied to kill connection owned by another principal",
-        ),
-    )
+    QueryServiceError::from_user_error(SessionAdmitError::KillDenied.to_user_error(
+        source,
+        statement.span,
+        "permission denied to kill connection owned by another principal",
+    ))
 }
 
 fn resolve_catalog_name(

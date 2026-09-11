@@ -27,6 +27,9 @@ use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 /// a role adapter projects them into a particular wire contract.
 pub mod session;
 
+/// Typed session-admission errors and their stable user-error descriptors.
+pub mod session_admit;
+
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
 

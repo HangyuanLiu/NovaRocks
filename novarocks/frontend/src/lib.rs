@@ -39,7 +39,6 @@ pub mod query;
 pub mod query_execution;
 pub mod runtime_filter;
 mod server;
-pub(crate) mod session_error;
 pub mod state_family;
 pub mod state_store;
 pub mod statistics;
@@ -69,13 +68,13 @@ pub use novarocks_mysql_adapter::{
 };
 pub use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
 pub use novarocks_query_application::sql::session::SessionExecutionSettings;
+pub use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
     open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,
 };
-pub use session_error::SESSION_ERROR_CODE_DESCRIPTORS;
 pub use state_store::{
     RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
     StateStoreRunPolicy, run_side_effect_free,
