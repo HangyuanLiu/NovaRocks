@@ -56,7 +56,6 @@ pub use application::{
     FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
     FrontendTaskTransportBudget,
 };
-pub use common::admitted_query_context::LakePublicationRuntimePolicy;
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
@@ -66,6 +65,7 @@ pub use native::transport::FrontendNativeTransport;
 pub use novarocks_mysql_adapter::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
+pub use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 pub use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
 pub use novarocks_query_application::sql::session::SessionExecutionSettings;
 pub use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;

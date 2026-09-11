@@ -22,9 +22,7 @@ use std::time::{Duration, Instant};
 
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
-use crate::common::admitted_query_context::{
-    LakePublicationRuntimePolicy, RequestAdmission, RequestContext,
-};
+use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::common::engine_error::EngineError;
 use crate::dml::DmlService;
@@ -75,6 +73,7 @@ use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult,
 };
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,

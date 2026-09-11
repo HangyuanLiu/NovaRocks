@@ -58,7 +58,6 @@ use crate::catalog_application::{
 use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
-use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
 use crate::connector::ConnectorControlHost;
 use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
 use crate::dml::DmlService;
@@ -84,6 +83,7 @@ use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle,
 };
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::query_control::QueryApplicationControl;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);

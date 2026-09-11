@@ -54,6 +54,9 @@ pub mod observation;
 /// Move-only settlement of governed protocol output and streaming rows.
 pub mod protocol_delivery;
 
+/// Startup-frozen admission policy for lake-publication attempts.
+pub mod publication;
+
 /// Pure, topology-free preparation and its immutable execution handoff.
 pub mod preparation;
 

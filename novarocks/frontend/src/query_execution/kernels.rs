@@ -189,7 +189,7 @@ pub struct DmlExecutionKernel {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     lake_publication_runtime_policy:
-        Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
+        Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
 }
 
 /// Immutable SQL planning authorities shared by every DML statement.
@@ -249,7 +249,7 @@ impl DmlExecutionKernel {
 
     pub fn with_lake_publication_runtime_policy(
         mut self,
-        policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+        policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         self.lake_publication_runtime_policy = Some(policy);
         self
@@ -281,7 +281,7 @@ impl DmlExecutionKernel {
 
     pub(crate) fn lake_publication_runtime_policy(
         &self,
-    ) -> Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy> {
+    ) -> Option<novarocks_query_application::publication::LakePublicationRuntimePolicy> {
         self.lake_publication_runtime_policy
     }
 }

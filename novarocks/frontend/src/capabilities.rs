@@ -158,7 +158,7 @@ pub struct DmlEnginePorts {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     lake_publication_runtime_policy:
-        crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+        novarocks_query_application::publication::LakePublicationRuntimePolicy,
 }
 
 impl DmlEnginePorts {
@@ -172,7 +172,7 @@ impl DmlEnginePorts {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
-        lake_publication_runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+        lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
             functions,

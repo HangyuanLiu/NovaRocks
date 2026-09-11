@@ -76,7 +76,7 @@ pub struct FrontendTableMaintenanceService {
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
     lake_publication_runtime_policy:
-        Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
+        Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
     workload_lifecycle: Option<FrontendServingLifecycle>,
 }
 
@@ -121,7 +121,7 @@ impl FrontendTableMaintenanceService {
 
     pub fn with_lake_publication_runtime_policy(
         mut self,
-        policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+        policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         self.lake_publication_runtime_policy = Some(policy);
         self
