@@ -3959,6 +3959,9 @@ dependencies = [
 [[package]]
 name = "novarocks-mv-application"
 version = "0.1.0"
+dependencies = [
+ "novarocks-query-application",
+]
 
 [[package]]
 name = "novarocks-native-trust"
@@ -4293,6 +4296,7 @@ dependencies = [
 name = "novarocks-table-maintenance"
 version = "0.1.0"
 dependencies = [
+ "novarocks-query-application",
  "tokio",
  "uuid",
 ]

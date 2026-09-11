@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+novarocks-query-application.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true, features = ["v7"] }
 
