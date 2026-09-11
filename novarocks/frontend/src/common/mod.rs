@@ -17,4 +17,3 @@
 
 pub mod admitted_query_context;
 pub mod backend_topology;
-pub mod engine_error;

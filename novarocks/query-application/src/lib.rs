@@ -29,6 +29,9 @@ pub mod cancellation;
 /// Bounded process-local execution of CPU-bound query application work.
 pub mod cpu;
 
+/// Stable query and mutation error model, without wire-specific encoding.
+pub mod engine_error;
+
 /// Exact client-session identity and protocol-owned termination contracts.
 pub mod client_connection;
 

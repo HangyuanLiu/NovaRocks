@@ -19,10 +19,6 @@ use std::fmt;
 
 use novarocks_types::UniqueId;
 
-pub const REPORT_EXEC_STATUS_OK: i32 = 0;
-pub const REPORT_EXEC_STATUS_ERROR: i32 = 1;
-pub const REPORT_EXEC_STATUS_QUERY_GONE: i32 = 2;
-
 pub use novarocks_types::EngineErrorCode;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -84,10 +80,6 @@ impl EngineError {
 
     pub fn code(&self) -> EngineErrorCode {
         self.code
-    }
-
-    pub fn to_report_error_code(&self) -> &'static str {
-        self.code.as_str()
     }
 
     pub fn write_coordinator_gone(query_id: UniqueId) -> Self {
@@ -211,23 +203,6 @@ impl EngineError {
             message: self.to_user_message(),
         }
     }
-
-    pub fn to_mysql_error_kind(&self) -> opensrv_mysql::ErrorKind {
-        match self.code {
-            EngineErrorCode::UnsupportedDistributedDmlShape => {
-                opensrv_mysql::ErrorKind::ER_NOT_SUPPORTED_YET
-            }
-            EngineErrorCode::ProtocolDecodeError => opensrv_mysql::ErrorKind::ER_PARSE_ERROR,
-            _ => opensrv_mysql::ErrorKind::ER_UNKNOWN_ERROR,
-        }
-    }
-
-    pub fn to_report_status_code(&self) -> i32 {
-        match self.code {
-            EngineErrorCode::WriteCoordinatorGone => REPORT_EXEC_STATUS_QUERY_GONE,
-            _ => REPORT_EXEC_STATUS_ERROR,
-        }
-    }
 }
 
 impl fmt::Display for EngineError {
@@ -267,10 +242,9 @@ mod tests {
     }
 
     #[test]
-    fn write_coordinator_gone_maps_to_query_gone_report_status() {
+    fn write_coordinator_gone_preserves_query_identity() {
         let err = EngineError::write_coordinator_gone(UniqueId::new(11, 22));
         assert_eq!(err.code(), EngineErrorCode::WriteCoordinatorGone);
-        assert_eq!(err.to_report_status_code(), REPORT_EXEC_STATUS_QUERY_GONE);
         assert!(err.to_user_message().contains("11/22"));
     }
 
@@ -278,7 +252,6 @@ mod tests {
     fn protocol_decode_error_has_stable_code_and_message() {
         let err = EngineError::protocol_decode("failed to deserialize payload");
         assert_eq!(err.code().as_str(), "ProtocolDecodeError");
-        assert_eq!(err.to_report_error_code(), "ProtocolDecodeError");
         assert!(
             err.to_user_message()
                 .contains("failed to deserialize payload")

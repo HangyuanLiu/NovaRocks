@@ -17,8 +17,8 @@
 
 use std::fmt;
 
-use crate::common::engine_error::EngineErrorCode;
 use novarocks_parser::Span;
+use novarocks_query_application::engine_error::EngineErrorCode;
 use novarocks_spi::connector::{LakePublicationDisposition, LakePublicationTerminal};
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_user_error::{

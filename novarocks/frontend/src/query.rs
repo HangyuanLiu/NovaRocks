@@ -24,7 +24,6 @@ use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
-use crate::common::engine_error::EngineError;
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
@@ -69,6 +68,7 @@ use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
+use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult,

@@ -28,7 +28,6 @@ use serde::Serialize;
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::common::engine_error::EngineError;
 use crate::mv::domain::analysis::refresh_property::{
     RefreshFragmentProperty, TargetIdentity, derive_fragment_property, derive_imv_refresh_contract,
 };
@@ -113,6 +112,7 @@ use crate::mv::domain::storage_observation::{
 };
 use mv_schema::MvPartitionContract;
 use novarocks_parser::{Span, ast};
+use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
