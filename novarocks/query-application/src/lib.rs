@@ -35,6 +35,9 @@ pub mod client_connection;
 /// Session registry and cancellation implementation owned by the query application.
 pub mod query_control;
 
+/// Session-derived facts frozen before role-local request assembly.
+pub mod request_session;
+
 /// Query-session errors before protocol-specific encoding.
 pub mod session_error;
 

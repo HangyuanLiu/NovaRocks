@@ -1246,13 +1246,12 @@ fn test_request_context_with_role(
     current_database: &str,
     role: novarocks_types::ClusterRole,
 ) -> crate::common::admitted_query_context::RequestContext {
-    use crate::common::admitted_query_context::{
-        QueryExecutionContext, RequestContext, RequestSessionContext,
-    };
+    use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
     use novarocks_query_application::cancellation::QueryCancellationSource;
+    use novarocks_query_application::request_session::RequestSessionContext;
     use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();

@@ -22,6 +22,7 @@ use std::time::Instant;
 
 use crate::common::backend_topology::BackendTopologySnapshot;
 use novarocks_query_application::cancellation::QueryCancellationView;
+use novarocks_query_application::request_session::RequestSessionContext;
 pub use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
@@ -60,14 +61,6 @@ impl RequestAdmission {
             optimizer_settings,
         }
     }
-}
-
-/// Session-derived inputs frozen at the request boundary.
-#[derive(Clone, Debug)]
-pub struct RequestSessionContext {
-    current_catalog: Option<String>,
-    current_database: String,
-    optimizer_settings: SessionOptimizerSettings,
 }
 
 /// Statement-stable inputs retained while a distributed statement may need a
@@ -137,32 +130,6 @@ impl StatementAdmissionContext {
 
     pub fn cancellation(&self) -> &QueryCancellationView {
         &self.cancellation
-    }
-}
-
-impl RequestSessionContext {
-    pub fn new(
-        current_catalog: Option<String>,
-        current_database: String,
-        optimizer_settings: SessionOptimizerSettings,
-    ) -> Self {
-        Self {
-            current_catalog,
-            current_database,
-            optimizer_settings,
-        }
-    }
-
-    pub fn current_catalog(&self) -> Option<&str> {
-        self.current_catalog.as_deref()
-    }
-
-    pub fn current_database(&self) -> &str {
-        &self.current_database
-    }
-
-    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
-        &self.optimizer_settings
     }
 }
 
