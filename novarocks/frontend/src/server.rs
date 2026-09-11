@@ -24,13 +24,13 @@ use std::time::Duration;
 use tokio::runtime::Handle;
 
 use crate::capabilities as core_capabilities;
-use crate::common::query_cancellation::QueryCancellationReason;
 use crate::native::transport::FrontendNativeTransport;
 use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
 use crate::{MysqlClientConnectionRegistry, QuerySessionFactory, ResolvedMysqlListenerSettings};
+use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminationReason,
 };

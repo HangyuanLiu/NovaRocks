@@ -53,14 +53,14 @@ use self::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
     QuerySessionOpenRequest,
 };
-use crate::common::query_cancellation::QueryCancellationReason;
-use crate::query_execution::control::GovernedStatementVisibilitySealOutcome;
 use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
 };
+use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
 };
+use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::naming::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
