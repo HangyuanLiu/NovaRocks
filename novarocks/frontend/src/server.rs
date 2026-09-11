@@ -30,9 +30,9 @@ use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
-use crate::{
-    ClientConnectionControlPort, ClientConnectionTerminationReason, MysqlClientConnectionRegistry,
-    QuerySessionFactory, ResolvedMysqlListenerSettings,
+use crate::{MysqlClientConnectionRegistry, QuerySessionFactory, ResolvedMysqlListenerSettings};
+use novarocks_query_application::client_connection::{
+    ClientConnectionControlPort, ClientConnectionTerminationReason,
 };
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
@@ -958,6 +958,7 @@ mod tests {
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
+    use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
     use novarocks_workload_control::{WorkClass, WorkRequest};
@@ -1175,7 +1176,7 @@ mod tests {
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
-                crate::ClientConnectionToken::new(1, 1).expect("valid connection token"),
+                ClientConnectionToken::new(1, 1).expect("valid connection token"),
                 "cp2-cutover",
             ))
             .expect("open frontend query session");
@@ -1327,7 +1328,7 @@ mod tests {
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
-                crate::ClientConnectionToken::new(2, 1).expect("valid connection token"),
+                ClientConnectionToken::new(2, 1).expect("valid connection token"),
                 "statistics-binding",
             ))
             .expect("open frontend query session");

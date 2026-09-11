@@ -27,9 +27,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::client_connection::ClientConnectionToken;
 use novarocks_spi::connector::LakePublicationTerminal;
 use novarocks_user_error::UserError;
 

@@ -23,6 +23,9 @@
 
 pub mod api;
 
+/// Exact client-session identity and protocol-owned termination contracts.
+pub mod client_connection;
+
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.
 pub mod sql;

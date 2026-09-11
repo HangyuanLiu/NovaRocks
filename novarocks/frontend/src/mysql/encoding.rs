@@ -1332,13 +1332,13 @@ mod streaming_result_tests {
     };
 
     use super::*;
-    use crate::client_connection::ClientConnectionToken;
     use crate::common::query_cancellation::QueryCancellationReason;
     use crate::query_control::FrontendQueryControl;
     use crate::query_execution::control::{
         QueryControlPort, QueryControlService, QuerySessionLease, SessionIdentity,
     };
     use crate::runtime::statement_result::StreamingStatementResult;
+    use novarocks_query_application::client_connection::ClientConnectionToken;
 
     struct Fixture {
         producer: ResultStreamTestProducer,

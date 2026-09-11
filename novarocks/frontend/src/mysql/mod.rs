@@ -58,6 +58,9 @@ use crate::query_execution::control::GovernedStatementVisibilitySealOutcome;
 use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
 };
+use novarocks_query_application::client_connection::{
+    ClientConnectionTerminationReason, ClientConnectionToken,
+};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -159,8 +162,7 @@ where
         },
         async move {
             shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
-            shutdown_connections
-                .terminate_all(crate::ClientConnectionTerminationReason::ServerShutdown);
+            shutdown_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
         },
         SESSION_DRAIN_TIMEOUT,
     )
@@ -444,15 +446,15 @@ async fn serve_frontend_mysql_connection(
 }
 
 fn query_cancellation_reason_for_connection_termination(
-    reason: &crate::ClientConnectionTerminationReason,
+    reason: &ClientConnectionTerminationReason,
 ) -> QueryCancellationReason {
     match reason {
-        crate::ClientConnectionTerminationReason::ExplicitKillConnection {
+        ClientConnectionTerminationReason::ExplicitKillConnection {
             requester_connection_id,
         } => QueryCancellationReason::ExplicitKillConnection {
             requester_connection_id: *requester_connection_id,
         },
-        crate::ClientConnectionTerminationReason::ServerShutdown => {
+        ClientConnectionTerminationReason::ServerShutdown => {
             QueryCancellationReason::ServerShutdown
         }
     }
@@ -460,7 +462,7 @@ fn query_cancellation_reason_for_connection_termination(
 
 struct FrontendMysqlShim {
     user: String,
-    connection: crate::ClientConnectionToken,
+    connection: ClientConnectionToken,
     session_factory: Arc<dyn QuerySessionFactory>,
     session: Arc<OnceLock<Arc<dyn QuerySession>>>,
     _disconnect_watcher: ClientDisconnectWatcher,
@@ -469,7 +471,7 @@ struct FrontendMysqlShim {
 impl FrontendMysqlShim {
     fn new(
         user: String,
-        connection: crate::ClientConnectionToken,
+        connection: ClientConnectionToken,
         session_factory: Arc<dyn QuerySessionFactory>,
         session: Arc<OnceLock<Arc<dyn QuerySession>>>,
         disconnect_watcher: ClientDisconnectWatcher,
@@ -928,7 +930,7 @@ mod protocol_api_tests {
                 .termination_receiver()
                 .try_recv()
                 .expect("shutdown must reach the registered connection"),
-            crate::ClientConnectionTerminationReason::ServerShutdown
+            ClientConnectionTerminationReason::ServerShutdown
         );
     }
 
@@ -937,7 +939,7 @@ mod protocol_api_tests {
     fn rejecting_shim() -> FrontendMysqlShim {
         FrontendMysqlShim::new(
             ROOT_USER.to_string(),
-            crate::ClientConnectionToken::new(1, 1).expect("valid connection token"),
+            ClientConnectionToken::new(1, 1).expect("valid connection token"),
             Arc::new(CancellationProbeFactory {
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),

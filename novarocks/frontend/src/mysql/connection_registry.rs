@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
-use crate::client_connection::{
+use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason, ClientConnectionToken,
 };

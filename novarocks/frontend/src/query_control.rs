@@ -20,7 +20,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::ClientConnectionToken;
 use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::query_execution::control::{
     ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
@@ -28,6 +27,7 @@ use crate::query_execution::control::{
     QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionToken,
     StatementFinishOutcome, StatementRegistration, StatementToken,
 };
+use novarocks_query_application::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     CancellationReason, WorkCancellationRequestOutcome, WorkError, WorkSuccessSealOutcome,
 };

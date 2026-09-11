@@ -23,7 +23,6 @@ pub mod catalog_controller;
 mod catalog_projection_metrics;
 mod catalog_prune;
 pub use catalog_prune::CatalogPruneConfig;
-pub mod client_connection;
 pub mod common;
 pub mod connector;
 pub mod coordinator;
@@ -59,10 +58,6 @@ pub use application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
     FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
     FrontendTaskTransportBudget,
-};
-pub use client_connection::{
-    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
-    ClientConnectionTerminationReason, ClientConnectionToken, ClientConnectionTokenError,
 };
 pub use common::admitted_query_context::LakePublicationRuntimePolicy;
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;

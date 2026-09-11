@@ -336,11 +336,11 @@ mod tests {
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     use super::*;
-    use crate::client_connection::ClientConnectionToken;
     use crate::query_control::FrontendQueryControl;
     use crate::query_execution::control::{
         QueryControlPort, QueryControlService, QuerySessionLease, SessionIdentity,
     };
+    use novarocks_query_application::client_connection::ClientConnectionToken;
 
     fn immediate_fixture() -> (
         GovernedImmediateStatementResult,

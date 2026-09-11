@@ -20,10 +20,10 @@
 use std::sync::Arc;
 use tokio::time::Instant;
 
-use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
+use novarocks_query_application::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     BusinessPermit, CancellationReason, CancellationView, RootAdmissionHandle,
     WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,

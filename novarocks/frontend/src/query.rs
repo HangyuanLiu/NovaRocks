@@ -54,9 +54,8 @@ use crate::runtime::statement_result::{
     GovernedImmediateStatementResult,
 };
 use crate::{
-    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
-    ClientConnectionTerminationReason, QueryServiceError, QueryServiceErrorKind, QuerySession,
-    QuerySessionFactory, QuerySessionOpenRequest,
+    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
+    QuerySessionOpenRequest,
 };
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -70,6 +69,10 @@ use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
+};
+use novarocks_query_application::client_connection::{
+    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
+    ClientConnectionTerminationReason,
 };
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
@@ -2931,6 +2934,7 @@ mod tests {
     };
     use arrow::array::Int64Array;
     use novarocks_query_application::api::ResultField;
+    use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,
     };
@@ -3380,7 +3384,7 @@ mod tests {
     ) -> QuerySessionLease {
         control
             .register_session(SessionIdentity::new(
-                crate::ClientConnectionToken::new(connection_id, generation)
+                ClientConnectionToken::new(connection_id, generation)
                     .expect("valid test connection token"),
                 principal,
             ))
@@ -3389,12 +3393,7 @@ mod tests {
 
     struct FixedConnectionControl {
         outcome: ClientConnectionTerminateOutcome,
-        calls: Mutex<
-            Vec<(
-                crate::ClientConnectionToken,
-                ClientConnectionTerminationReason,
-            )>,
-        >,
+        calls: Mutex<Vec<(ClientConnectionToken, ClientConnectionTerminationReason)>>,
     }
 
     impl FixedConnectionControl {
@@ -3409,7 +3408,7 @@ mod tests {
     impl ClientConnectionControlPort for FixedConnectionControl {
         fn terminate(
             &self,
-            target: crate::ClientConnectionToken,
+            target: ClientConnectionToken,
             reason: ClientConnectionTerminationReason,
         ) -> ClientConnectionTerminateOutcome {
             self.calls
@@ -3469,8 +3468,7 @@ mod tests {
                         .expect("connection control calls lock")
                         .as_slice(),
                     &[(
-                        crate::ClientConnectionToken::new(7, 11)
-                            .expect("valid test connection token"),
+                        ClientConnectionToken::new(7, 11).expect("valid test connection token"),
                         ClientConnectionTerminationReason::ExplicitKillConnection {
                             requester_connection_id: 8,
                         },
