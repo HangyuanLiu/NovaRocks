@@ -368,7 +368,21 @@ impl QueryControlService {
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
-        let mut request = WorkRequest::new(WorkClass::Query);
+        self.begin_governed_statement(session, admission, WorkClass::Query, deadline, timeout_ms)
+    }
+
+    /// Admit one protocol-visible statement under its actual workload class.
+    /// The returned owner remains the sole holder of the statement generation,
+    /// business permit, cancellation authority, and final protocol outcome.
+    pub fn begin_governed_statement(
+        &self,
+        session: SessionToken,
+        admission: &RootAdmissionHandle,
+        class: WorkClass,
+        deadline: Option<Instant>,
+        timeout_ms: Option<u64>,
+    ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
+        let mut request = WorkRequest::new(class);
         request.deadline = deadline;
         let root = admission
             .try_begin_root(request)
