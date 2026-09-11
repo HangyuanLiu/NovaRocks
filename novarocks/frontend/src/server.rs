@@ -981,6 +981,15 @@ mod tests {
         let _ = protocol.complete();
     }
 
+    fn settle_governed_query(result: StatementResult) {
+        let StatementResult::GovernedQuery(result) = result else {
+            panic!("query result must retain its owner through terminal EOF");
+        };
+        let (_result, mut protocol) = result.into_parts();
+        let _ = protocol.seal_success_visibility();
+        let _ = protocol.complete();
+    }
+
     fn test_native_trust() -> Arc<NativeTrust> {
         Arc::new(NativeTrust::new(
             DeploymentId::parse("frontend-server-test").expect("deployment"),
@@ -1314,10 +1323,12 @@ mod tests {
                 "statistics-binding",
             ))
             .expect("open frontend query session");
-        session
+        let result = session
             .execute_batch("SHOW ANALYZE JOBS")
             .await
             .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
+        settle_governed_query(result);
+        session.complete_statement();
 
         session.close();
         drop(session);
