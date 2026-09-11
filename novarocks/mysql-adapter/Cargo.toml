@@ -8,6 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+libc.workspace = true
 mysql_common = "0.32"
 novarocks-query-application.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }

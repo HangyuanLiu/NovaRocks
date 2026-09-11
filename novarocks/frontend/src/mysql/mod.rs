@@ -25,8 +25,6 @@ pub use novarocks_mysql_adapter::{
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -61,18 +59,6 @@ use novarocks_types::naming::DEFAULT_DATABASE;
 
 const ROOT_USER: &str = novarocks_mysql_adapter::DEFAULT_MYSQL_USER;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-struct ClientDisconnectWatcher {
-    join_handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for ClientDisconnectWatcher {
-    fn drop(&mut self) {
-        if let Some(handle) = self.join_handle.take() {
-            handle.abort();
-        }
-    }
-}
 
 /// Runs the MySQL protocol listener with a ready frontend-owned session
 /// factory.
@@ -186,8 +172,14 @@ async fn serve_frontend_mysql_connection(
         }
     };
     let connection = registration.token();
-    let session = Arc::new(OnceLock::new());
-    let disconnect_watcher = spawn_frontend_disconnect_watcher(&stream, Arc::clone(&session));
+    let session: Arc<OnceLock<Arc<dyn QuerySession>>> = Arc::new(OnceLock::new());
+    let session_for_disconnect = Arc::clone(&session);
+    let disconnect_watcher =
+        novarocks_mysql_adapter::spawn_disconnect_watcher(&stream, move || {
+            if let Some(session) = session_for_disconnect.get() {
+                session.cancel_current(QueryCancellationReason::ClientDisconnected);
+            }
+        });
     let shim = FrontendMysqlShim::new(
         user,
         connection,
@@ -262,7 +254,7 @@ struct FrontendMysqlShim {
     connection: ClientConnectionToken,
     session_factory: Arc<dyn QuerySessionFactory>,
     session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-    _disconnect_watcher: ClientDisconnectWatcher,
+    _disconnect_watcher: novarocks_mysql_adapter::ClientDisconnectWatcher,
 }
 
 impl FrontendMysqlShim {
@@ -271,7 +263,7 @@ impl FrontendMysqlShim {
         connection: ClientConnectionToken,
         session_factory: Arc<dyn QuerySessionFactory>,
         session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-        disconnect_watcher: ClientDisconnectWatcher,
+        disconnect_watcher: novarocks_mysql_adapter::ClientDisconnectWatcher,
     ) -> Self {
         Self {
             user,
@@ -596,65 +588,6 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
     }
 }
 
-#[cfg(unix)]
-fn spawn_frontend_disconnect_watcher(
-    stream: &tokio::net::TcpStream,
-    session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-) -> ClientDisconnectWatcher {
-    let fd = unsafe { libc::dup(stream.as_raw_fd()) };
-    if fd < 0 {
-        return ClientDisconnectWatcher { join_handle: None };
-    }
-    let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-    if let Err(error) = std_stream.set_nonblocking(true) {
-        warn!("failed to configure frontend disconnect monitor: {}", error);
-        return ClientDisconnectWatcher { join_handle: None };
-    }
-    let watcher_stream = match tokio::net::TcpStream::from_std(std_stream) {
-        Ok(stream) => stream,
-        Err(error) => {
-            warn!("failed to create frontend disconnect monitor: {}", error);
-            return ClientDisconnectWatcher { join_handle: None };
-        }
-    };
-    let join_handle = tokio::spawn(async move {
-        let mut buf = [0u8; 1];
-        loop {
-            match watcher_stream.peek(&mut buf).await {
-                Ok(0) => {
-                    if let Some(session) = session.get() {
-                        session.cancel_current(QueryCancellationReason::ClientDisconnected);
-                    }
-                    break;
-                }
-                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-                    ) => {}
-                Err(_) => {
-                    if let Some(session) = session.get() {
-                        session.cancel_current(QueryCancellationReason::ClientDisconnected);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-    ClientDisconnectWatcher {
-        join_handle: Some(join_handle),
-    }
-}
-
-#[cfg(not(unix))]
-fn spawn_frontend_disconnect_watcher(
-    _stream: &tokio::net::TcpStream,
-    _session: Arc<OnceLock<Arc<dyn QuerySession>>>,
-) -> ClientDisconnectWatcher {
-    ClientDisconnectWatcher { join_handle: None }
-}
-
 #[cfg(test)]
 mod protocol_api_tests {
     use super::*;
@@ -737,7 +670,7 @@ mod protocol_api_tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
             }),
             Arc::new(OnceLock::new()),
-            ClientDisconnectWatcher { join_handle: None },
+            novarocks_mysql_adapter::ClientDisconnectWatcher::inactive(),
         )
     }
 

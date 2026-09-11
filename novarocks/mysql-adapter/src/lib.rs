@@ -19,6 +19,7 @@
 
 mod authentication;
 mod connection_registry;
+mod disconnect_watcher;
 mod error_mapping;
 mod listener;
 mod listener_settings;
@@ -28,6 +29,7 @@ use opensrv_mysql::{ErrorKind, IntermediaryOptions};
 
 pub use authentication::authenticate_empty_password;
 pub use connection_registry::MysqlClientConnectionRegistry;
+pub use disconnect_watcher::{ClientDisconnectWatcher, spawn_disconnect_watcher};
 pub use error_mapping::error_kind_for_domain_code;
 pub use listener::{
     serve_tcp_until_drain_then_shutdown, serve_tcp_until_shutdown,
