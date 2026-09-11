@@ -67,6 +67,7 @@ use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason,
 };
+use novarocks_query_application::cpu::QueryCpuExecutor;
 use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
@@ -526,6 +527,7 @@ pub struct FrontendQueryService {
     add_files_engine: Arc<dyn AddFilesEngine>,
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
+    query_cpu_executor: QueryCpuExecutor,
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
@@ -561,6 +563,7 @@ impl FrontendQueryService {
         add_files_engine: Arc<dyn AddFilesEngine>,
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
+        query_cpu_executor: QueryCpuExecutor,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_lifecycle: FrontendServingLifecycle,
@@ -593,6 +596,7 @@ impl FrontendQueryService {
             add_files_engine,
             ctas_engine,
             truncate_engine,
+            query_cpu_executor,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
             serving_lifecycle,
@@ -1121,13 +1125,16 @@ impl FrontendQuerySession {
             },
         );
         let compiler = self.service.query_compiler.clone();
-        let prepared = task::spawn_blocking(move || {
-            let _diagnostic_scope =
-                crate::preparation_diagnostics::enter_statement(statement_token);
-            compiler.prepare_statement(&parsed_statement, &context, Some(query_options))
-        })
-        .await
-        .map_err(|error| internal_error(error.to_string()))?;
+        let prepared = self
+            .service
+            .query_cpu_executor
+            .run(move || {
+                let _diagnostic_scope =
+                    crate::preparation_diagnostics::enter_statement(statement_token);
+                compiler.prepare_statement(&parsed_statement, &context, Some(query_options))
+            })
+            .await
+            .map_err(internal_error)?;
         match prepared {
             Ok(operation) => Ok(operation),
             Err(FrontendQueryCompilerError::Engine(error)) => Err(internal_error(error)),

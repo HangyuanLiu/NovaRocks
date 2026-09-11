@@ -49,6 +49,7 @@ use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
     LogicalExecutionSupervisorConfig,
 };
+use novarocks_query_application::cpu::QueryCpuExecutorConfig;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
@@ -464,6 +465,10 @@ pub fn compose_frontend_server_config(
     let runtime_config = &config.runtime;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
+    let query_cpu_workers = NonZeroUsize::new(runtime_config.actual_query_cpu_workers())
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_worker_threads must be nonzero"))?;
+    let query_cpu_queue = NonZeroUsize::new(runtime_config.query_cpu_queue_capacity)
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_queue_capacity must be nonzero"))?;
     let failure_backoff_ms = config
         .standalone_server
         .as_ref()
@@ -571,6 +576,10 @@ pub fn compose_frontend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("construct Connector blocking-I/O budget: {error}"))?,
     )
+    .with_query_cpu_executor_config(QueryCpuExecutorConfig::new(
+        query_cpu_workers,
+        query_cpu_queue,
+    ))
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");

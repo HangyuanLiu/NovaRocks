@@ -353,6 +353,7 @@ pub fn build_frontend_query_session_factory(
         dml_engines.add_files,
         dml_engines.ctas,
         dml_engines.truncate,
+        host.query_cpu_executor(),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
         (*host.serving_lifecycle()).clone(),

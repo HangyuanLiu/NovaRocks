@@ -626,6 +626,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_connector_blocking_io_config(&cfg.runtime)?;
+    validate_query_cpu_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
@@ -1271,6 +1272,13 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    /// Fixed FE CPU preparation workers. `0` derives the deployment's
+    /// configured execution parallelism.
+    #[serde(default = "default_query_cpu_worker_threads")]
+    pub query_cpu_worker_threads: usize,
+    /// Maximum queued FE CPU preparation jobs; zero is rejected at preflight.
+    #[serde(default = "default_query_cpu_queue_capacity")]
+    pub query_cpu_queue_capacity: usize,
     #[serde(default = "default_connector_blocking_io_max_inflight")]
     pub connector_blocking_io_max_inflight: usize,
     #[serde(default = "default_connector_split_blocking_io_max_inflight")]
@@ -1702,6 +1710,16 @@ fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> 
     Ok(())
 }
 
+fn validate_query_cpu_config(runtime: &RuntimeConfig) -> Result<()> {
+    if runtime.actual_query_cpu_workers() == 0 {
+        bail!("runtime.query_cpu_worker_threads must resolve to a nonzero value");
+    }
+    if runtime.query_cpu_queue_capacity == 0 {
+        bail!("runtime.query_cpu_queue_capacity must be nonzero");
+    }
+    Ok(())
+}
+
 fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
     novarocks_backend::BackendResultRetainedLimits::try_new(
         runtime.result_retained_bytes_per_root,
@@ -1948,6 +1966,14 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
+fn default_query_cpu_worker_threads() -> usize {
+    0
+}
+
+fn default_query_cpu_queue_capacity() -> usize {
+    64
+}
+
 fn default_connector_blocking_io_max_inflight() -> usize {
     16
 }
@@ -2108,6 +2134,8 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            query_cpu_worker_threads: default_query_cpu_worker_threads(),
+            query_cpu_queue_capacity: default_query_cpu_queue_capacity(),
             connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
             connector_split_blocking_io_max_inflight:
                 default_connector_split_blocking_io_max_inflight(),
@@ -2268,6 +2296,14 @@ impl RuntimeConfig {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
+        }
+    }
+
+    pub fn actual_query_cpu_workers(&self) -> usize {
+        if self.query_cpu_worker_threads > 0 {
+            self.query_cpu_worker_threads
+        } else {
+            self.actual_exec_threads()
         }
     }
 }

@@ -57,3 +57,11 @@ pub use schedule::*;
 pub use stand_down::*;
 pub use status::*;
 pub use supervisor::*;
+
+// The fixed-worker queue is a process-runtime primitive. Product runtimes
+// retain their own typed owners around it; they do not share admission or
+// lifecycle authority merely because they share this implementation.
+pub(crate) use result_decode::{
+    BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
+    ResultDecodeJob,
+};
