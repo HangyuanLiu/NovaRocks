@@ -307,6 +307,9 @@ pub enum MvApplicationErrorKind {
     Engine,
     Repository,
     Unavailable,
+    /// The exact pre-dispatch target binding changed before any provider
+    /// effect was emitted. A fresh preparation may be attempted.
+    BindingInvalidated,
     AlreadyActive,
     TargetGone,
     Corruption,

@@ -42,15 +42,25 @@ pub fn freeze_mv_rewrite_definition_index_with_ports(
         .list_ready_projections()
         .map_err(|error| format!("list mv definitions: {error}"))?;
 
-    MvRewriteDefinitionIndex::try_new(
-        definitions
-            .into_iter()
-            .map(|projection| {
-                let definition = projection.definition;
-                freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    )
+    let report = novarocks_mv_application::candidate::inspect_candidates(
+        definitions,
+        |projection| projection.definition.mv_id.to_string(),
+        |projection| {
+            freeze_mv_rewrite_definition(
+                connector_control,
+                storage_observation,
+                projection.definition,
+            )
+        },
+    );
+    for diagnostic in report.diagnostics() {
+        tracing::debug!(
+            candidate = diagnostic.identity(),
+            error = diagnostic.message(),
+            "skip unavailable MV rewrite candidate"
+        );
+    }
+    MvRewriteDefinitionIndex::try_new(report.into_accepted())
 }
 
 fn freeze_mv_rewrite_definition(

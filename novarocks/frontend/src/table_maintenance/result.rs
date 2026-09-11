@@ -41,7 +41,7 @@ pub fn action_result(
         } => build_query_result(
             vec![
                 column("rewritten_data_files_count", DataType::Int32, false),
-                column("added_data_files_count", DataType::Int32, false),
+                column("added_data_files_count", DataType::Int32, true),
                 column("rewritten_bytes_count", DataType::Int64, false),
                 column("failed_data_files_count", DataType::Int32, false),
                 column("removed_delete_files_count", DataType::Int32, false),
@@ -120,7 +120,7 @@ pub fn action_result(
         } => build_query_result(
             vec![
                 column("rewritten_delete_files_count", DataType::Int32, false),
-                column("added_delete_files_count", DataType::Int32, false),
+                column("added_delete_files_count", DataType::Int32, true),
                 column("rewritten_bytes_count", DataType::Int64, false),
                 column("added_bytes_count", DataType::Int64, false),
             ],
@@ -184,7 +184,8 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
         );
         values[9].push(
             outcome
-                .map(|value| value.added_data_files.to_string())
+                .and_then(|value| value.added_data_files)
+                .map(|value| value.to_string())
                 .unwrap_or_default(),
         );
         values[10].push(
@@ -192,7 +193,12 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
                 .map(|value| value.deleted_data_files.to_string())
                 .unwrap_or_default(),
         );
-        values[11].push(outcome.map(|_| "0".to_string()).unwrap_or_default());
+        values[11].push(
+            outcome
+                .and_then(|value| value.added_delete_files)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
     }
     let result = build_query_result(
         column_names
@@ -210,11 +216,21 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
 
 fn optimize_outcome_message(outcome: &OptimizeJobOutcome) -> String {
     format!(
-        "rewrote {} data files and {} delete files into {} data files ({} rows)",
+        "rewrote {} data files and {} delete files into {} data files and {} delete files ({} rows)",
         outcome.rewritten_data_files,
         outcome.deleted_data_files,
-        outcome.added_data_files,
-        outcome.output_record_count
+        outcome
+            .added_data_files
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        outcome
+            .added_delete_files
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        outcome
+            .output_record_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     )
 }
 

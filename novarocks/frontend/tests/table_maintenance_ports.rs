@@ -64,18 +64,19 @@ fn rewrite_data_files_outcome_carries_durable_optimize_truth() {
     let outcome = MaintenanceActionOutcome::RewriteDataFiles {
         target_snapshot_id: Some(900),
         rewritten_data_files_count: 4,
-        added_data_files_count: 2,
+        added_data_files_count: Some(2),
+        added_delete_files_count: Some(1),
         rewritten_bytes_count: 8192,
         failed_data_files_count: 0,
         removed_delete_files_count: 3,
-        output_record_count: 88,
+        output_record_count: Some(88),
     };
 
     assert!(matches!(
         outcome,
         MaintenanceActionOutcome::RewriteDataFiles {
             target_snapshot_id: Some(900),
-            output_record_count: 88,
+            output_record_count: Some(88),
             ..
         }
     ));

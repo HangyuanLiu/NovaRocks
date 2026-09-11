@@ -1196,6 +1196,7 @@ impl IcebergWriteSessionControl {
             .iter()
             .map(|entry| written_file_from_fragment(entry.fragment, commit_metadata))
             .collect::<Result<Vec<_>, _>>()?;
+        let output_facts = crate::write_codec::written_output_facts(&files).map_err(invalid)?;
 
         let table_ident =
             crate::iceberg::TableIdent::from_strs([facts.namespace(), facts.table_name()])
@@ -1314,14 +1315,16 @@ impl IcebergWriteSessionControl {
                             )),
                         ),
                     };
-                let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
-                    outcome.new_snapshot_id,
-                    resulting_row_count,
-                    handle
-                        .repartition()
-                        .map(|prepared| prepared.committed().clone()),
-                )
-                .map_err(invalid)?;
+                let receipt =
+                    crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                        outcome.new_snapshot_id,
+                        resulting_row_count,
+                        handle
+                            .repartition()
+                            .map(|prepared| prepared.committed().clone()),
+                        Some(output_facts),
+                    )
+                    .map_err(invalid)?;
                 Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
                     receipt,
@@ -1352,10 +1355,11 @@ impl IcebergWriteSessionControl {
                 evidence,
             }) => match outcome {
                 Some(committed) => {
-                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
                         committed.new_snapshot_id,
                         None,
                         None,
+                        Some(output_facts),
                     )
                     .map_err(invalid)?;
                     Ok(ExternalMutationOutcome::KnownCommitted {
@@ -1462,6 +1466,13 @@ impl IcebergWriteSessionControl {
             Err(error) => {
                 cleanup_session();
                 return Err(error);
+            }
+        };
+        let output_facts = match crate::write_codec::written_output_facts(&files) {
+            Ok(facts) => facts,
+            Err(error) => {
+                cleanup_session();
+                return Err(invalid(error));
             }
         };
         let staged_data_rows = files
@@ -1890,12 +1901,13 @@ impl IcebergWriteSessionControl {
                                 ),
                             }
                         };
-                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
                         data_outcome.new_snapshot_id,
                         resulting_row_count,
                         handle
                             .repartition()
                             .map(|prepared| prepared.committed().clone()),
+                        Some(output_facts),
                     )
                     .map_err(invalid)?;
                     emit_iceberg_write_phase_marker(

@@ -172,8 +172,8 @@ pub(super) fn execute(
     }) != refresh.observed_binding
     {
         return Err(MvApplicationError::new(
-            MvApplicationErrorKind::CommitUnknown,
-            "MV refresh connector generation changed after SQL preparation",
+            MvApplicationErrorKind::BindingInvalidated,
+            "MV refresh connector generation changed before provider dispatch",
         ));
     }
     match refresh.work {
@@ -290,7 +290,7 @@ fn execute_data(
     dependencies
         .readiness
         .project_observed(*attempt.publication_id.as_uuid(), &package)
-        .map_err(repository_error)?;
+        .map_err(known_committed_projection_error)?;
     Ok(MvStatementResult::Ok)
 }
 
@@ -567,7 +567,7 @@ fn execute_metadata_only(
     dependencies
         .readiness
         .project_observed(*attempt.publication_id.as_uuid(), &package)
-        .map_err(repository_error)?;
+        .map_err(known_committed_projection_error)?;
     Ok(MvStatementResult::Ok)
 }
 
@@ -784,6 +784,19 @@ fn repository_error(error: crate::mv::domain::repository::MvRepositoryError) -> 
         }
     };
     MvApplicationError::new(kind, error.to_string())
+}
+
+/// A provider publication has already crossed its external commit boundary.
+/// Accelerator projection is therefore finalization, never evidence that the
+/// provider outcome became unknown. Keep the known-committed fact visible to
+/// recovery even when the projector's own CAS/read path is unavailable.
+fn known_committed_projection_error(
+    error: crate::mv::domain::repository::MvRepositoryError,
+) -> MvApplicationError {
+    MvApplicationError::new(
+        MvApplicationErrorKind::KnownCommittedFinalizeFailed,
+        format!("MV publication is known committed but accelerator projection failed: {error}"),
+    )
 }
 
 #[cfg(test)]
@@ -1041,5 +1054,21 @@ mod tests {
 
         assert!(write_commit_authority(Some(completion)).is_ok());
         assert_eq!(fixture.session.finish_invocations(), 0);
+    }
+
+    #[test]
+    fn known_committed_publication_keeps_its_fact_when_projection_fails() {
+        let error = known_committed_projection_error(
+            crate::mv::domain::repository::MvRepositoryError::new(
+                crate::mv::domain::repository::MvRepositoryErrorKind::Unavailable,
+                "projector store unavailable",
+            ),
+        );
+
+        assert_eq!(
+            error.kind(),
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed
+        );
+        assert!(error.message().contains("known committed"));
     }
 }

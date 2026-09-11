@@ -50,7 +50,6 @@ pub(crate) use self::admission::{
 use self::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use self::model::OptimizeJobCreate;
 use self::result::{action_result, optimize_jobs_result};
 use self::runtime::{OptimizeProcessRuntime, OptimizeRuntimeErrorKind};
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
@@ -346,16 +345,20 @@ impl FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
-        let object_id = engine.capture_target_object_id(&target)?;
-        let base_snapshot_id = engine.current_snapshot_id(&target)?;
+        // Acquire the target conflict right before observing any provider
+        // identity or base version. Capturing first leaves a TOCTOU window in
+        // which another maintenance operation can replace the exact object
+        // that this job would later bind and dispatch against.
         let permit = self
             .activity
             .acquire(&target, MaintenanceActivityFamily::Optimize)
             .map_err(|_| "an optimize job is already active for this table".to_string())?;
+        let object_id = engine.capture_target_object_id(&target)?;
+        let base_snapshot_id = engine.current_snapshot_id(&target)?;
         let submitted = self.block_on(self.optimize_runtime.submit(
-            OptimizeJobCreate {
+            novarocks_table_maintenance::runtime::JobCreate {
                 target,
-                object_id,
+                object_id: object_id.as_bytes().to_vec(),
                 base_snapshot_id,
                 created_at_ms: now_unix_millis(),
             },
@@ -463,8 +466,8 @@ impl OptimizeJobExecutor for DirectOptimizeExecutor {
         _runtime: &Handle,
         engine: &dyn TableMaintenanceEngine,
         job: &model::OptimizeJob,
-    ) -> Result<MaintenanceActionOutcome, String> {
-        execute_distributed_rewrite(
+    ) -> Result<MaintenanceActionOutcome, self::runtime::OptimizeTerminalError> {
+        execute_distributed_rewrite_terminal(
             engine,
             &job.target,
             DistributedRewriteIntent::DataFiles { rewrite_all: true },
@@ -481,11 +484,25 @@ fn execute_distributed_rewrite(
     target: &MaintenanceTarget,
     intent: DistributedRewriteIntent,
 ) -> Result<MaintenanceActionOutcome, String> {
-    let session =
-        engine.plan_distributed_rewrite(target, ConnectorWriteOperationId::new(), intent)?;
+    execute_distributed_rewrite_terminal(engine, target, intent).map_err(|error| error.message)
+}
+
+/// Executes one rewrite and preserves the provider's terminal fact instead of
+/// flattening it into a generic worker failure. Only the current-process job
+/// runtime interprets these terminal classes; foreground SQL maps them to its
+/// ordinary error surface.
+fn execute_distributed_rewrite_terminal(
+    engine: &dyn TableMaintenanceEngine,
+    target: &MaintenanceTarget,
+    intent: DistributedRewriteIntent,
+) -> Result<MaintenanceActionOutcome, self::runtime::OptimizeTerminalError> {
+    let session = engine
+        .plan_distributed_rewrite(target, ConnectorWriteOperationId::new(), intent)
+        .map_err(self::runtime::OptimizeTerminalError::failed)?;
     let plan = session.plan();
     if session.is_noop() {
-        return rewrite_outcome(intent, None, plan.summary());
+        return rewrite_outcome(intent, None, plan.summary())
+            .map_err(self::runtime::OptimizeTerminalError::failed);
     }
 
     for cohort in plan.cohorts() {
@@ -502,38 +519,57 @@ fn execute_distributed_rewrite(
             });
         let completion = match completion {
             Ok(completion) => completion,
-            Err(error) => return abort_distributed_rewrite(engine, &session, error),
+            Err(error) => {
+                return abort_distributed_rewrite(engine, &session, error)
+                    .map_err(self::runtime::OptimizeTerminalError::failed);
+            }
         };
         // Each group runs as its own query, so the session collects their
         // prepared sets and commits the union once below.
         if let Err(error) = engine.accumulate_distributed_rewrite_group(&session, completion) {
-            return abort_distributed_rewrite(engine, &session, error);
+            return abort_distributed_rewrite(engine, &session, error)
+                .map_err(self::runtime::OptimizeTerminalError::failed);
         }
     }
 
-    match engine.commit_distributed_rewrite(&session)? {
+    match engine
+        .commit_distributed_rewrite(&session)
+        .map_err(self::runtime::OptimizeTerminalError::failed)?
+    {
         ExternalMutationOutcome::KnownCommitted {
             receipt,
             finalization,
             ..
         } => {
-            let receipt = engine.finalize_distributed_rewrite(&session, &receipt)?;
             if let ExternalMutationFinalization::Failed(error) = finalization {
-                return Err(format!(
-                    "distributed optimize committed but finalization failed: {error}"
-                ));
+                return Err(
+                    self::runtime::OptimizeTerminalError::known_committed_finalization_failed(
+                        format!("distributed optimize committed but finalization failed: {error}"),
+                    ),
+                );
             }
+            let receipt = engine
+                .finalize_distributed_rewrite(&session, &receipt)
+                .map_err(self::runtime::OptimizeTerminalError::failed)?;
             let summary = receipt.summary();
             rewrite_outcome(intent, Some(summary), plan.summary())
+                .map_err(self::runtime::OptimizeTerminalError::failed)
         }
-        ExternalMutationOutcome::KnownUncommitted { failure } => abort_distributed_rewrite(
-            engine,
-            &session,
-            format!("distributed rewrite commit was not applied: {failure}"),
+        ExternalMutationOutcome::KnownUncommitted { failure } => {
+            let error = format!("distributed rewrite commit was not applied: {failure}");
+            let error = match abort_distributed_rewrite(engine, &session, error) {
+                Err(error) => error,
+                Ok(_) => "distributed rewrite commit was not applied".to_string(),
+            };
+            Err(self::runtime::OptimizeTerminalError::known_uncommitted(
+                error,
+            ))
+        }
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(
+            self::runtime::OptimizeTerminalError::commit_unknown(format!(
+                "distributed rewrite commit outcome is unknown: {failure}; do not retry automatically"
+            )),
         ),
-        ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(format!(
-            "distributed rewrite commit outcome is unknown: {failure}; do not retry automatically"
-        )),
     }
 }
 
@@ -549,23 +585,49 @@ fn rewrite_outcome(
                 target_snapshot_id: receipt.target_version,
                 rewritten_data_files_count: i32::try_from(receipt.input_data_files)
                     .map_err(|_| "distributed rewrite input data file count exceeds i32")?,
-                added_data_files_count: i32::try_from(receipt.output_data_files)
-                    .map_err(|_| "distributed rewrite output data file count exceeds i32")?,
+                added_data_files_count: receipt
+                    .output_data_files
+                    .map(|count| {
+                        i32::try_from(count).map_err(|_| {
+                            "distributed rewrite output data file count exceeds i32".to_string()
+                        })
+                    })
+                    .transpose()?,
+                added_delete_files_count: receipt
+                    .output_delete_files
+                    .map(|count| {
+                        i32::try_from(count).map_err(|_| {
+                            "distributed rewrite output delete file count exceeds i32".to_string()
+                        })
+                    })
+                    .transpose()?,
                 rewritten_bytes_count: i64::try_from(plan.input_bytes)
                     .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
                 failed_data_files_count: 0,
                 removed_delete_files_count: i32::try_from(receipt.input_delete_files)
                     .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
-                output_record_count: i64::try_from(receipt.output_rows)
-                    .map_err(|_| "distributed rewrite output row count exceeds i64")?,
+                output_record_count: receipt
+                    .output_rows
+                    .map(|count| {
+                        i64::try_from(count).map_err(|_| {
+                            "distributed rewrite output row count exceeds i64".to_string()
+                        })
+                    })
+                    .transpose()?,
             })
         }
         DistributedRewriteIntent::PositionDeletes { .. } => {
             Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
                 rewritten_delete_files_count: i32::try_from(receipt.input_delete_files)
                     .map_err(|_| "distributed rewrite input delete file count exceeds i32")?,
-                added_delete_files_count: i32::try_from(receipt.output_delete_files)
-                    .map_err(|_| "distributed rewrite output delete file count exceeds i32")?,
+                added_delete_files_count: receipt
+                    .output_delete_files
+                    .map(|count| {
+                        i32::try_from(count).map_err(|_| {
+                            "distributed rewrite output delete file count exceeds i32".to_string()
+                        })
+                    })
+                    .transpose()?,
                 rewritten_bytes_count: i64::try_from(plan.input_bytes)
                     .map_err(|_| "distributed rewrite input byte count exceeds i64")?,
                 added_bytes_count: 0,
@@ -690,6 +752,10 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         }
     }
 
+    #[expect(
+        private_interfaces,
+        reason = "The typed SHOW OPTIMIZE parser carrier is intentionally confined to the table-maintenance boundary."
+    )]
     fn handle_typed_show_optimize(
         &self,
         statement: ParsedShowOptimize,
@@ -753,12 +819,36 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         self.submit_optimize(engine, target)
     }
 
+    async fn wait_for_automatic_optimize(
+        &self,
+        handle: crate::query_execution::maintenance::OptimizeJobHandle,
+    ) -> Result<crate::query_execution::maintenance::OptimizeJobState, String> {
+        self.optimize_runtime
+            .wait_for_completion(handle.job_id())
+            .await
+            .map(|job| job.state)
+            .map_err(|error| format!("wait for frontend optimize job failed: {error}"))
+    }
+
     fn execute_automatic_optimize_durably(
         &self,
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
-        self.submit_optimize(engine, target)
+        let submission = self.submit_optimize(engine, target)?;
+        let Some(handle) = submission.handle() else {
+            return Ok(submission);
+        };
+        let terminal = self.block_on(self.wait_for_automatic_optimize(handle))?;
+        if terminal == crate::query_execution::maintenance::OptimizeJobState::Finished {
+            Ok(submission)
+        } else {
+            Err(format!(
+                "optimize job {} completed with terminal state {}",
+                handle.job_id(),
+                terminal.as_str()
+            ))
+        }
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {

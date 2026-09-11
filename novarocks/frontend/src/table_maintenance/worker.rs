@@ -67,7 +67,7 @@ pub trait OptimizeJobExecutor: Send + Sync {
         runtime: &Handle,
         engine: &dyn TableMaintenanceEngine,
         job: &OptimizeJob,
-    ) -> Result<MaintenanceActionOutcome, String>;
+    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError>;
 }
 
 impl OptimizeWorker {
@@ -170,7 +170,14 @@ async fn run_worker(
                 continue;
             }
             FrontendServingState::Ready => {}
-            FrontendServingState::Draining | FrontendServingState::Stopping => return Ok(()),
+            FrontendServingState::Draining | FrontendServingState::Stopping => {
+                jobs.request_shutdown_cancellation()
+                    .await
+                    .map_err(|error| {
+                        format!("cancel optimize jobs after frontend drain began failed: {error}")
+                    })?;
+                return Ok(());
+            }
         }
         let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
             Ok(lease) => lease,
@@ -212,7 +219,7 @@ async fn execute_claimed_job(
     if cancellation.is_cancelled() {
         jobs.finish(
             job_id,
-            Err(OptimizeTerminalError::failed(
+            Err(OptimizeTerminalError::cancelled_before_dispatch(
                 "optimize job cancelled before target rebind",
             )),
             now_unix_millis(),
@@ -225,7 +232,7 @@ async fn execute_claimed_job(
     if cancellation.is_cancelled() {
         jobs.finish(
             job_id,
-            Err(OptimizeTerminalError::failed(
+            Err(OptimizeTerminalError::cancelled_before_dispatch(
                 "optimize job cancelled before target rebind",
             )),
             now_unix_millis(),
@@ -264,7 +271,7 @@ async fn execute_claimed_job(
     {
         jobs.finish(
             job_id,
-            Err(OptimizeTerminalError::failed(
+            Err(OptimizeTerminalError::cancelled_before_dispatch(
                 "optimize job cancelled before provider dispatch",
             )),
             now_unix_millis(),
@@ -276,7 +283,7 @@ async fn execute_claimed_job(
 
     stat2f_record_provider_dispatch(job_id)?;
     let worker_runtime = runtime.clone();
-    let execution = tokio::task::spawn_blocking(move || {
+    let execution = match tokio::task::spawn_blocking(move || {
         let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
             format!("maintenance-job:{job_id}"),
             format!("maintenance-job:{job_id}"),
@@ -284,10 +291,13 @@ async fn execute_claimed_job(
         executor.execute(&worker_runtime, engine.as_ref(), &job)
     })
     .await
-    .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
-    .and_then(|result| result)
-    .and_then(optimize_outcome)
-    .map_err(OptimizeTerminalError::failed);
+    {
+        Ok(Ok(outcome)) => optimize_outcome(outcome).map_err(OptimizeTerminalError::failed),
+        Ok(Err(terminal)) => Err(terminal),
+        Err(error) => Err(OptimizeTerminalError::failed(format!(
+            "optimize job {job_id} engine task failed: {error}"
+        ))),
+    };
     jobs.finish(job_id, execution, now_unix_millis())
         .await
         .map_err(|error| format!("record optimize terminal failed: {error}"))?;
@@ -399,6 +409,7 @@ pub(crate) fn optimize_outcome(
         target_snapshot_id,
         rewritten_data_files_count,
         added_data_files_count,
+        added_delete_files_count,
         removed_delete_files_count,
         output_record_count,
         ..
@@ -410,7 +421,8 @@ pub(crate) fn optimize_outcome(
         target_snapshot_id,
         rewritten_data_files: i64::from(rewritten_data_files_count),
         deleted_data_files: i64::from(removed_delete_files_count),
-        added_data_files: i64::from(added_data_files_count),
+        added_data_files: added_data_files_count.map(i64::from),
+        added_delete_files: added_delete_files_count.map(i64::from),
         output_record_count,
     })
 }
@@ -430,7 +442,7 @@ mod lifecycle_tests {
         MaintenanceTargetRebind, TableMaintenanceEngine,
     };
     use crate::table_maintenance::model::OptimizeJob;
-    use crate::table_maintenance::runtime::OptimizeProcessRuntime;
+    use crate::table_maintenance::runtime::{OptimizeProcessRuntime, OptimizeTerminalError};
     use crate::workload_lifecycle::FrontendServingLifecycle;
 
     struct NeverRunEngine;
@@ -483,8 +495,8 @@ mod lifecycle_tests {
             _runtime: &tokio::runtime::Handle,
             _engine: &dyn TableMaintenanceEngine,
             _job: &OptimizeJob,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            Err("never run".to_string())
+        ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+            Err(OptimizeTerminalError::failed("never run"))
         }
     }
 

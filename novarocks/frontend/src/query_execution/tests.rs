@@ -312,7 +312,7 @@ fn outcome_factory_rejects_intent_mismatch() {
 #[test]
 fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     let policy = StatisticsExecutionPolicy::try_new(
-        StatisticsExecutionMode::ProcessJobAttempt,
+        StatisticsExecutionMode::BackgroundCollectionAttempt,
         std::time::Duration::from_secs(30 * 60),
     )
     .expect("maximum durable policy");
@@ -323,7 +323,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::ProcessJobAttempt,
+            StatisticsExecutionMode::BackgroundCollectionAttempt,
             std::time::Duration::from_secs(30 * 60 + 1),
         )
         .is_ok(),
@@ -331,7 +331,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::ProcessJobAttempt,
+            StatisticsExecutionMode::BackgroundCollectionAttempt,
             std::time::Duration::ZERO,
         )
         .is_err()

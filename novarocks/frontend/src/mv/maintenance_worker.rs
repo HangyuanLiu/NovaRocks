@@ -161,19 +161,14 @@ impl FrontendMaintenanceWorker {
             .into_iter()
             .map(|projection| projection.definition)
             .collect::<Vec<_>>();
-        let pass = Mutex::new(FrontendMaintenancePassReport::default());
-        // Admission is synchronized inside `MaintenanceCoordinator`, but the
-        // durable operations run outside that lock.  The coordinator's active
-        // set therefore bounds real concurrent work across different MVs.
-        std::thread::scope(|scope| {
-            for definition in definitions {
-                let pass = &pass;
-                scope.spawn(move || self.run_definition(definition, now_ms, pass));
-            }
-        });
-        Ok(pass
-            .into_inner()
-            .expect("frontend MV maintenance pass lock poisoned"))
+        // One frontend event loop owns the pass.  The coordinator still owns
+        // admission policy, but no definition creates its own OS thread; each
+        // terminal transition completes before the next event is admitted.
+        let mut pass = FrontendMaintenancePassReport::default();
+        for definition in definitions {
+            self.run_definition(definition, now_ms, &mut pass);
+        }
+        Ok(pass)
     }
 
     /// A simple process-local runtime loop.  Shutdown is owned by the host:
@@ -216,14 +211,12 @@ impl FrontendMaintenanceWorker {
         &self,
         definition: StoredMvDefinition,
         now_ms: i64,
-        pass: &Mutex<FrontendMaintenancePassReport>,
+        pass: &mut FrontendMaintenancePassReport,
     ) {
         let target = match canonical_target(&definition) {
             Some(target) => target,
             None => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
+                pass.skipped
                     .push(FrontendMaintenanceSkip::MissingCanonicalTarget {
                         mv_id: definition.mv_id,
                     });
@@ -237,13 +230,10 @@ impl FrontendMaintenanceWorker {
         {
             Ok(facts) => facts,
             Err(error) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::FactsFailed {
-                        mv_id: definition.mv_id,
-                        kind: error.kind(),
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::FactsFailed {
+                    mv_id: definition.mv_id,
+                    kind: error.kind(),
+                });
                 return;
             }
         };
@@ -255,12 +245,9 @@ impl FrontendMaintenanceWorker {
         {
             Ok(lease) => lease,
             Err(_) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
@@ -270,33 +257,24 @@ impl FrontendMaintenanceWorker {
         ) {
             Ok(ticket) => ticket,
             Err(MvActivityGateError::Stopping) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
         let lease = match ticket.try_acquire() {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::GateBusy {
-                        mv_id: definition.mv_id,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::GateBusy {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
             Err(MvActivityGateError::Stopping) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
@@ -308,12 +286,9 @@ impl FrontendMaintenanceWorker {
             .cancellation()
             .is_some_and(|cancellation| cancellation.is_cancelled())
         {
-            pass.lock()
-                .expect("frontend MV maintenance pass lock poisoned")
-                .skipped
-                .push(FrontendMaintenanceSkip::Stopping {
-                    mv_id: definition.mv_id,
-                });
+            pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                mv_id: definition.mv_id,
+            });
             return;
         }
 
@@ -325,13 +300,10 @@ impl FrontendMaintenanceWorker {
         {
             Ok(attempt) => attempt,
             Err(admission) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Admission {
-                        mv_id: definition.mv_id,
-                        admission,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::Admission {
+                    mv_id: definition.mv_id,
+                    admission,
+                });
                 return;
             }
         };
@@ -354,14 +326,11 @@ impl FrontendMaintenanceWorker {
         // request for this MV target.
         let _lease = lease;
         let _workload_lease = workload_lease;
-        pass.lock()
-            .expect("frontend MV maintenance pass lock poisoned")
-            .attempts
-            .push(FrontendMaintenanceAttemptReport {
-                mv_id: definition.mv_id,
-                target,
-                execution,
-            });
+        pass.attempts.push(FrontendMaintenanceAttemptReport {
+            mv_id: definition.mv_id,
+            target,
+            execution,
+        });
     }
 }
 

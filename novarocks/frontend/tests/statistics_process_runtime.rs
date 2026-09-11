@@ -9,306 +9,194 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the Apache License is distributed on an
+// software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+//! Product-owner integration checks reached through frontend re-exports.
 
-use novarocks_frontend::FrontendServingLifecycle;
-use novarocks_frontend::statistics_jobs::application::StatisticsColumnIntent;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use novarocks_frontend::statistics_jobs::model::{
-    StatisticsJob, StatisticsJobCreate, StatisticsJobErrorKind, StatisticsJobState,
-    StatisticsJobTarget,
+    StatisticsColumns, StatisticsFailure, StatisticsJobConclusion, StatisticsJobCreate,
+    StatisticsJobPhase, StatisticsJobState, StatisticsPublicationFact, StatisticsTarget,
 };
-use novarocks_frontend::statistics_jobs::repository::{
-    MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS, MAX_RECENT_TERMINAL_STATISTICS_JOBS,
-    StatisticsJobRepository, StatisticsJobRepositoryErrorKind,
-};
+use novarocks_frontend::statistics_jobs::repository::StatisticsJobRepository;
 use novarocks_frontend::statistics_jobs::worker::{
-    StatisticsAnalyzeWorker, StatisticsAttemptError, StatisticsAttemptExecutor,
+    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsPublicationOutcome,
+    StatisticsWorker,
+};
+use novarocks_workload_control::{
+    ResourceConfig, WorkClass, WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
 };
 
 fn create(at_ms: i64) -> StatisticsJobCreate {
     StatisticsJobCreate {
-        target: StatisticsJobTarget {
-            catalog: "iceberg".into(),
-            namespace: "db".into(),
-            table: "t".into(),
+        target: StatisticsTarget {
+            catalog: Arc::from("iceberg"),
+            namespace: Arc::from("db"),
+            table: Arc::from("t"),
+            object_id: Arc::from(&b"table-object"[..]),
         },
-        connector_instance_id: "iceberg".into(),
-        object_id: b"table-object".to_vec(),
-        columns: StatisticsColumnIntent::AllColumns,
+        columns: StatisticsColumns::All,
         submitted_at_ms: at_ms,
     }
 }
 
-struct CommitUnknownExecutor {
-    publishes: AtomicUsize,
+fn root() -> WorkOwner {
+    let control = WorkloadControl::try_new(
+        WorkloadConfig::default(),
+        ResourceConfig {
+            total_bytes: 16 * 1024 * 1024,
+            control_bytes: 1024 * 1024,
+            per_scope_bytes: 8 * 1024 * 1024,
+        },
+    )
+    .expect("workload control");
+    control.mark_ready().expect("ready");
+    control
+        .try_begin_root(WorkRequest::new(WorkClass::Statistics))
+        .expect("root")
+        .owner
 }
 
-struct CancelAwareExecutor {
-    started: AtomicBool,
-    finishes: AtomicUsize,
+struct PublishExecutor {
+    publications: AtomicUsize,
+    outcome: StatisticsPublicationFact,
+    finalization_failure: bool,
 }
-
-struct SuccessfulExecutor {
-    finishes: AtomicUsize,
-}
-
-impl StatisticsAttemptExecutor for CancelAwareExecutor {
-    fn execute(
+impl StatisticsAttemptExecutor for PublishExecutor {
+    fn prepare(
         &self,
-        _job: &StatisticsJob,
-        cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        scope: &WorkScope,
     ) -> Result<(), StatisticsAttemptError> {
-        self.started.store(true, Ordering::Release);
-        while !cancellation.is_cancelled() {
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        Err(StatisticsAttemptError::permanent(
-            StatisticsJobErrorKind::Cancelled,
-            "cancelled before provider finish",
-        ))
+        scope.check().map_err(failed)
     }
-}
-
-impl StatisticsAttemptExecutor for CommitUnknownExecutor {
-    fn execute(
+    fn collect(
         &self,
-        _job: &StatisticsJob,
-        _cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        scope: &WorkScope,
     ) -> Result<(), StatisticsAttemptError> {
-        self.publishes.fetch_add(1, Ordering::SeqCst);
-        Err(StatisticsAttemptError::publication(
-            novarocks_frontend::statistics_jobs::application::StatisticsPublicationTerminal::CommitUnknown,
-            "connector outcome is unknown",
-        ))
+        scope.check().map_err(failed)
     }
-}
-
-impl StatisticsAttemptExecutor for SuccessfulExecutor {
-    fn execute(
+    fn publish(
         &self,
-        _job: &StatisticsJob,
-        _cancellation: novarocks_frontend::common::query_cancellation::QueryCancellationView,
-    ) -> Result<(), StatisticsAttemptError> {
-        self.finishes.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        scope: &WorkScope,
+    ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
+        scope.check().map_err(failed)?;
+        self.publications.fetch_add(1, Ordering::SeqCst);
+        Ok(StatisticsPublicationOutcome {
+            fact: self.outcome,
+            finalization_failure: self.finalization_failure.then(|| StatisticsFailure {
+                message: Arc::from("finalization projection failed"),
+            }),
+        })
     }
 }
-
-async fn wait_terminal(repository: &StatisticsJobRepository, job_id: uuid::Uuid) -> StatisticsJob {
-    for _ in 0..200 {
-        let job = repository.get(job_id).await.unwrap().unwrap();
-        if job.state.is_terminal() {
-            return job;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("statistics job did not reach a terminal state")
+fn failed(error: novarocks_workload_control::WorkError) -> StatisticsAttemptError {
+    StatisticsAttemptError::Failed(StatisticsFailure {
+        message: Arc::from(error.to_string()),
+    })
 }
 
 #[tokio::test]
-async fn process_runtime_uses_v7_identities_and_never_recovers_another_incarnation() {
-    let first = StatisticsJobRepository::new();
-    let job = first.create(create(1)).await.unwrap();
-    assert_eq!(job.job_id.get_version_num(), 7);
-    assert_eq!(job.operation_id.as_uuid().get_version_num(), 7);
-    assert!(first.get(job.job_id).await.unwrap().is_some());
-
-    let restarted = StatisticsJobRepository::new();
-    assert!(restarted.get(job.job_id).await.unwrap().is_none());
-    assert!(restarted.list().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn active_and_queued_jobs_are_bounded_without_evicting_live_work() {
+async fn frontend_adapter_exposes_distinct_process_local_identities() {
     let repository = StatisticsJobRepository::new();
-    for index in 0..MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
-        repository.create(create(index as i64 + 1)).await.unwrap();
-    }
-    let error = repository.create(create(10_000)).await.unwrap_err();
-    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::Capacity);
-    assert_eq!(
-        repository.list().await.unwrap().len(),
-        MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS
+    let submitted = repository.create(create(1), root()).await.expect("create");
+    let claimed = repository.claim_next(2).await.expect("claim").expect("job");
+    assert_eq!(submitted.id.as_uuid().get_version_num(), 7);
+    assert_eq!(submitted.publication_id.as_uuid().get_version_num(), 7);
+    assert_ne!(
+        submitted.id.as_uuid(),
+        claimed.logical_execution_id.unwrap().as_uuid()
+    );
+    assert_ne!(
+        claimed.logical_execution_id.unwrap().as_uuid(),
+        claimed.query_attempt_id.unwrap().as_uuid()
+    );
+    assert_ne!(
+        submitted.publication_id.as_uuid(),
+        claimed.query_attempt_id.unwrap().as_uuid()
+    );
+    assert!(
+        StatisticsJobRepository::new()
+            .get(submitted.id)
+            .await
+            .expect("get")
+            .is_none()
     );
 }
 
 #[tokio::test]
-async fn terminal_history_is_count_bounded_while_active_jobs_remain_visible() {
+async fn commit_unknown_is_terminal_and_not_redispatched() {
     let repository = StatisticsJobRepository::new();
-    let base = now_ms();
-    for index in 0..=MAX_RECENT_TERMINAL_STATISTICS_JOBS {
-        let job = repository
-            .create(create(base + index as i64))
-            .await
-            .unwrap();
-        let claimed = repository
-            .claim_next(base + index as i64)
-            .await
+    let executor = Arc::new(PublishExecutor {
+        publications: AtomicUsize::new(0),
+        outcome: StatisticsPublicationFact::CommitUnknown,
+        finalization_failure: false,
+    });
+    let worker = StatisticsWorker::new(repository.clone(), executor.clone());
+    let job = repository.create(create(1), root()).await.expect("create");
+    let terminal = worker.run_one(2).await.expect("run").expect("terminal");
+    assert_eq!(
+        terminal.state,
+        StatisticsJobState::Terminal(StatisticsJobConclusion::CommitUnknown)
+    );
+    assert_eq!(
+        terminal.publication,
+        StatisticsPublicationFact::CommitUnknown
+    );
+    assert_eq!(executor.publications.load(Ordering::SeqCst), 1);
+    assert!(worker.run_one(3).await.expect("idle").is_none());
+    assert_eq!(executor.publications.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        repository.get(job.id).await.expect("get").unwrap().state,
+        terminal.state
+    );
+}
+
+#[tokio::test]
+async fn known_commit_finalization_failure_retains_the_provider_fact() {
+    let repository = StatisticsJobRepository::new();
+    let executor = Arc::new(PublishExecutor {
+        publications: AtomicUsize::new(0),
+        outcome: StatisticsPublicationFact::KnownCommitted,
+        finalization_failure: true,
+    });
+    let worker = StatisticsWorker::new(repository.clone(), executor);
+    repository.create(create(1), root()).await.expect("create");
+    let terminal = worker.run_one(2).await.expect("run").expect("terminal");
+    assert_eq!(
+        terminal.state,
+        StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+    );
+    assert_eq!(
+        terminal.publication,
+        StatisticsPublicationFact::KnownCommitted
+    );
+    assert_eq!(
+        terminal
+            .publication_finalization_failure
             .unwrap()
-            .unwrap();
-        repository
-            .transition(
-                claimed.job_id,
-                StatisticsJobState::Preparing,
-                StatisticsJobState::Running,
-                base + index as i64,
-                None,
-            )
-            .await
-            .unwrap();
-        repository
-            .transition(
-                claimed.job_id,
-                StatisticsJobState::Running,
-                StatisticsJobState::Failed,
-                base + index as i64,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(job.job_id, claimed.job_id);
-    }
-    let jobs = repository.list().await.unwrap();
-    assert_eq!(jobs.len(), MAX_RECENT_TERMINAL_STATISTICS_JOBS);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_unknown_is_terminal_and_never_dispatches_another_mutation() {
-    let repository = StatisticsJobRepository::new();
-    let executor = Arc::new(CommitUnknownExecutor {
-        publishes: AtomicUsize::new(0),
-    });
-    let lifecycle = FrontendServingLifecycle::new();
-    lifecycle.mark_ready().expect("mark frontend ready");
-    let mut worker = StatisticsAnalyzeWorker::start(
-        &tokio::runtime::Handle::current(),
-        repository.clone(),
-        executor.clone(),
-        lifecycle,
-    )
-    .await
-    .unwrap();
-    let job = repository.create(create(now_ms())).await.unwrap();
-    let terminal = wait_terminal(&repository, job.job_id).await;
-    assert_eq!(terminal.state, StatisticsJobState::CommitUnknown);
-    assert_eq!(
-        terminal.error.unwrap().kind,
-        StatisticsJobErrorKind::CommitUnknown
+            .message
+            .as_ref(),
+        "finalization projection failed"
     );
-    assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(executor.publishes.load(Ordering::SeqCst), 1);
-    worker
-        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
-        .await
-        .unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn provider_finish_succeeds_once_and_late_cancel_cannot_rewrite_the_terminal() {
-    let repository = StatisticsJobRepository::new();
-    let executor = Arc::new(SuccessfulExecutor {
-        finishes: AtomicUsize::new(0),
-    });
-    let lifecycle = FrontendServingLifecycle::new();
-    lifecycle.mark_ready().expect("mark frontend ready");
-    let mut worker = StatisticsAnalyzeWorker::start(
-        &tokio::runtime::Handle::current(),
-        repository.clone(),
-        executor.clone(),
-        lifecycle,
-    )
-    .await
-    .unwrap();
-    let job = repository.create(create(now_ms())).await.unwrap();
-    let terminal = wait_terminal(&repository, job.job_id).await;
-    assert_eq!(terminal.state, StatisticsJobState::Succeeded);
-    assert_eq!(executor.finishes.load(Ordering::SeqCst), 1);
-
-    let error = repository
-        .request_cancel(job.job_id, now_ms())
-        .await
-        .expect_err("a terminal job is no longer a cancellable active attempt");
-    assert_eq!(error.kind(), StatisticsJobRepositoryErrorKind::NotFound);
-    assert_eq!(
-        repository.get(job.job_id).await.unwrap().unwrap().state,
-        StatisticsJobState::Succeeded
-    );
-    tokio::time::sleep(Duration::from_millis(30)).await;
-    assert_eq!(executor.finishes.load(Ordering::SeqCst), 1);
-    worker
-        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
-        .await
-        .unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn running_cancel_reaches_the_attempt_and_blocks_provider_finish() {
-    let repository = StatisticsJobRepository::new();
-    let executor = Arc::new(CancelAwareExecutor {
-        started: AtomicBool::new(false),
-        finishes: AtomicUsize::new(0),
-    });
-    let lifecycle = FrontendServingLifecycle::new();
-    lifecycle.mark_ready().expect("mark frontend ready");
-    let mut worker = StatisticsAnalyzeWorker::start(
-        &tokio::runtime::Handle::current(),
-        repository.clone(),
-        executor.clone(),
-        lifecycle,
-    )
-    .await
-    .unwrap();
-    let job = repository.create(create(now_ms())).await.unwrap();
-    for _ in 0..200 {
-        if executor.started.load(Ordering::Acquire) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert!(executor.started.load(Ordering::Acquire));
-    repository
-        .request_cancel(job.job_id, now_ms())
-        .await
-        .unwrap();
-    let terminal = wait_terminal(&repository, job.job_id).await;
-    assert_eq!(terminal.state, StatisticsJobState::Cancelled);
-    assert_eq!(executor.finishes.load(Ordering::SeqCst), 0);
-    worker
-        .shutdown_until(std::time::Instant::now() + Duration::from_secs(1))
-        .await
-        .unwrap();
+    assert!(terminal.convergence.is_complete());
 }
 
 #[tokio::test]
-async fn explicit_cancel_of_a_queued_job_is_terminal_and_process_local() {
+async fn submitted_is_a_phase_not_a_success_conclusion() {
     let repository = StatisticsJobRepository::new();
-    let job = repository.create(create(now_ms())).await.unwrap();
-    let cancelled = repository
-        .request_cancel(job.job_id, now_ms())
-        .await
-        .unwrap();
-    assert_eq!(cancelled.state, StatisticsJobState::Cancelled);
-    assert!(cancelled.cancel_requested);
+    let job = repository.create(create(1), root()).await.expect("create");
     assert_eq!(
-        cancelled.error.unwrap().kind,
-        StatisticsJobErrorKind::Cancelled
+        job.state,
+        StatisticsJobState::Active(StatisticsJobPhase::Submitted)
     );
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .try_into()
-        .unwrap()
+    assert!(!job.state.is_terminal());
 }

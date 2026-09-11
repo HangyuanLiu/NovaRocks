@@ -281,7 +281,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
             read_version_ordinal,
             required,
             crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                crate::query_execution::statistics::StatisticsExecutionMode::ProcessJobAttempt,
+                crate::query_execution::statistics::StatisticsExecutionMode::BackgroundCollectionAttempt,
                 self.ports.attempt_timeout,
             )
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,

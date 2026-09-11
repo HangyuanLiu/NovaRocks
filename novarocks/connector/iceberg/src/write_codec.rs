@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorWriteReceipt};
 
+use crate::commit::WrittenFile;
 use crate::commit::report::{
     IcebergColumnStats, IcebergPartitionReport, IcebergWriterReport, IcebergWrittenFileReport,
 };
@@ -392,13 +393,130 @@ pub fn decode_writer_reports(
 struct IcebergWriteReceiptV1 {
     version: u32,
     snapshot_id: i64,
+    /// Exact provider-private output facts collected from validated written
+    /// files. Older/non-write receipts deliberately omit this rather than
+    /// manufacturing zeroes.
+    #[serde(default)]
+    output_facts: Option<IcebergWrittenOutputFactsV1>,
+}
+
+/// Exact output facts for one Iceberg write publication. This is intentionally
+/// provider-private: generic applications consume only the typed projection
+/// performed by the Iceberg distributed-rewrite control.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IcebergWrittenOutputFacts {
+    pub data_files: u64,
+    pub position_delete_files: u64,
+    pub deletion_vectors: u64,
+    pub equality_delete_files: u64,
+    pub data_rows: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IcebergWrittenOutputFactsV1 {
+    data_files: u64,
+    position_delete_files: u64,
+    deletion_vectors: u64,
+    equality_delete_files: u64,
+    data_rows: u64,
+}
+
+impl From<IcebergWrittenOutputFacts> for IcebergWrittenOutputFactsV1 {
+    fn from(value: IcebergWrittenOutputFacts) -> Self {
+        Self {
+            data_files: value.data_files,
+            position_delete_files: value.position_delete_files,
+            deletion_vectors: value.deletion_vectors,
+            equality_delete_files: value.equality_delete_files,
+            data_rows: value.data_rows,
+        }
+    }
+}
+
+impl From<IcebergWrittenOutputFactsV1> for IcebergWrittenOutputFacts {
+    fn from(value: IcebergWrittenOutputFactsV1) -> Self {
+        Self {
+            data_files: value.data_files,
+            position_delete_files: value.position_delete_files,
+            deletion_vectors: value.deletion_vectors,
+            equality_delete_files: value.equality_delete_files,
+            data_rows: value.data_rows,
+        }
+    }
+}
+
+pub(crate) fn written_output_facts(
+    files: &[WrittenFile],
+) -> Result<IcebergWrittenOutputFacts, String> {
+    let mut facts = IcebergWrittenOutputFacts::default();
+    for file in files {
+        match file.content {
+            crate::iceberg::spec::DataContentType::Data => {
+                facts.data_files = facts
+                    .data_files
+                    .checked_add(1)
+                    .ok_or_else(|| "Iceberg output data file count overflow".to_string())?;
+                facts.data_rows = facts
+                    .data_rows
+                    .checked_add(file.record_count)
+                    .ok_or_else(|| "Iceberg output data row count overflow".to_string())?;
+            }
+            crate::iceberg::spec::DataContentType::PositionDeletes
+                if file.content_offset.is_some() =>
+            {
+                facts.deletion_vectors = facts
+                    .deletion_vectors
+                    .checked_add(1)
+                    .ok_or_else(|| "Iceberg output deletion-vector count overflow".to_string())?;
+            }
+            crate::iceberg::spec::DataContentType::PositionDeletes => {
+                facts.position_delete_files =
+                    facts.position_delete_files.checked_add(1).ok_or_else(|| {
+                        "Iceberg output position-delete file count overflow".to_string()
+                    })?;
+            }
+            crate::iceberg::spec::DataContentType::EqualityDeletes => {
+                facts.equality_delete_files =
+                    facts.equality_delete_files.checked_add(1).ok_or_else(|| {
+                        "Iceberg output equality-delete file count overflow".to_string()
+                    })?;
+            }
+        }
+    }
+    Ok(facts)
 }
 
 pub fn encode_write_receipt(snapshot_id: i64) -> Result<Bytes, String> {
+    encode_write_receipt_with_output_facts(snapshot_id, None)
+}
+
+fn encode_write_receipt_with_output_facts(
+    snapshot_id: i64,
+    output_facts: Option<IcebergWrittenOutputFacts>,
+) -> Result<Bytes, String> {
     canonical_json(&IcebergWriteReceiptV1 {
         version: ICEBERG_WRITE_PAYLOAD_VERSION,
         snapshot_id,
+        output_facts: output_facts.map(Into::into),
     })
+}
+
+/// Decode only the exact private facts owned by this provider. A receipt from
+/// an older or non-writing path remains valid but projects no output facts.
+pub(crate) fn decode_write_receipt_output_facts(
+    receipt: &ConnectorWriteReceipt,
+) -> Result<Option<IcebergWrittenOutputFacts>, String> {
+    let decoded: IcebergWriteReceiptV1 = decode_json(receipt.payload(), "write receipt")?;
+    if decoded.version != ICEBERG_WRITE_PAYLOAD_VERSION {
+        return Err(format!(
+            "unsupported Iceberg write receipt payload version {}; expected {}",
+            decoded.version, ICEBERG_WRITE_PAYLOAD_VERSION
+        ));
+    }
+    ensure_canonical_json(receipt.payload(), &decoded, "write receipt")?;
+    Ok(decoded.output_facts.map(Into::into))
 }
 
 pub fn connector_write_receipt_with_partitioning(
@@ -406,7 +524,21 @@ pub fn connector_write_receipt_with_partitioning(
     resulting_row_count: Option<u64>,
     committed_partitioning: Option<novarocks_spi::connector::ConnectorCommittedPartitioning>,
 ) -> Result<ConnectorWriteReceipt, String> {
-    let payload = encode_write_receipt(snapshot_id)?;
+    connector_write_receipt_with_partitioning_and_output_facts(
+        snapshot_id,
+        resulting_row_count,
+        committed_partitioning,
+        None,
+    )
+}
+
+pub(crate) fn connector_write_receipt_with_partitioning_and_output_facts(
+    snapshot_id: i64,
+    resulting_row_count: Option<u64>,
+    committed_partitioning: Option<novarocks_spi::connector::ConnectorCommittedPartitioning>,
+    output_facts: Option<IcebergWrittenOutputFacts>,
+) -> Result<ConnectorWriteReceipt, String> {
+    let payload = encode_write_receipt_with_output_facts(snapshot_id, output_facts)?;
     let committed_version = ConnectorCommittedVersion::try_new(payload.clone(), Some(snapshot_id))
         .map_err(|error| format!("build Iceberg connector committed version failed: {error}"))?;
     match committed_partitioning {
@@ -423,4 +555,44 @@ pub fn connector_write_receipt_with_partitioning(
         ),
     }
     .map_err(|error| format!("build Iceberg connector write receipt failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        IcebergWrittenOutputFacts, connector_write_receipt_with_partitioning,
+        connector_write_receipt_with_partitioning_and_output_facts,
+        decode_write_receipt_output_facts,
+    };
+
+    #[test]
+    fn write_receipt_preserves_exact_output_facts() {
+        let facts = IcebergWrittenOutputFacts {
+            data_files: 2,
+            position_delete_files: 3,
+            deletion_vectors: 5,
+            equality_delete_files: 7,
+            data_rows: 11,
+        };
+        let receipt = connector_write_receipt_with_partitioning_and_output_facts(
+            17,
+            Some(11),
+            None,
+            Some(facts),
+        )
+        .expect("receipt");
+        assert_eq!(
+            decode_write_receipt_output_facts(&receipt).expect("decode"),
+            Some(facts)
+        );
+    }
+
+    #[test]
+    fn receipt_without_validated_written_files_projects_unknown_not_zero() {
+        let receipt = connector_write_receipt_with_partitioning(17, None, None).expect("receipt");
+        assert_eq!(
+            decode_write_receipt_output_facts(&receipt).expect("decode"),
+            None
+        );
+    }
 }

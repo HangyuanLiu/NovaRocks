@@ -304,11 +304,17 @@ pub enum MaintenanceActionOutcome {
     RewriteDataFiles {
         target_snapshot_id: Option<i64>,
         rewritten_data_files_count: i32,
-        added_data_files_count: i32,
+        /// `None` is an externally committed rewrite whose provider receipt
+        /// does not prove an output file count. It is not a known zero.
+        added_data_files_count: Option<i32>,
+        /// Includes position deletes, deletion vectors, and equality deletes
+        /// in the provider's typed receipt projection. `None` is unknown.
+        added_delete_files_count: Option<i32>,
         rewritten_bytes_count: i64,
         failed_data_files_count: i32,
         removed_delete_files_count: i32,
-        output_record_count: i64,
+        /// `None` is an unknown publication fact, distinct from zero rows.
+        output_record_count: Option<i64>,
     },
     RewriteManifests {
         rewritten_manifests_count: i32,
@@ -327,20 +333,14 @@ pub enum MaintenanceActionOutcome {
     },
     RewritePositionDeleteFiles {
         rewritten_delete_files_count: i32,
-        added_delete_files_count: i32,
+        /// `None` is an unknown publication fact, distinct from zero files.
+        added_delete_files_count: Option<i32>,
         rewritten_bytes_count: i64,
         added_bytes_count: i64,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum OptimizeJobState {
-    Pending,
-    Running,
-    Finished,
-    Failed,
-    TargetReplaced,
-}
+pub use novarocks_table_maintenance::runtime::MaintenanceJobState as OptimizeJobState;
 
 /// Result of rebinding a durable maintenance target to its current table.
 ///
@@ -354,22 +354,29 @@ pub enum MaintenanceTargetRebind {
     Missing,
 }
 
-impl OptimizeJobState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "PENDING",
-            Self::Running => "RUNNING",
-            Self::Finished => "FINISHED",
-            Self::Failed => "FAILED",
-            Self::TargetReplaced => "TARGET_REPLACED",
-        }
-    }
-}
+/// A named, current-process handle for one exact maintenance job.
+///
+/// The handle is intentionally not a durable recovery record.  It is the
+/// only value a caller may wait on after a `Submitted` answer, preventing a
+/// second lookup by target from accidentally joining a replacement job.
+pub use novarocks_table_maintenance::runtime::JobHandle as OptimizeJobHandle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptimizeSubmission {
     Submitted { job_id: i64 },
     AlreadyActive,
+}
+
+impl OptimizeSubmission {
+    /// Returns the exact submitted job. `AlreadyActive` deliberately has no
+    /// handle: joining a different caller's job would silently transfer its
+    /// business responsibility and conflict gate.
+    pub const fn handle(self) -> Option<OptimizeJobHandle> {
+        match self {
+            Self::Submitted { job_id } => Some(OptimizeJobHandle::new(job_id)),
+            Self::AlreadyActive => None,
+        }
+    }
 }
 
 /// CLS-R2 boundary: the implementation moves to the frontend with the rest of
@@ -631,6 +638,15 @@ pub trait TableMaintenanceService: Send + Sync {
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String>;
+
+    /// Wait for the exact job named by a prior `Submitted` result. A completed
+    /// job is returned even if it completed before the caller subscribed.
+    async fn wait_for_automatic_optimize(
+        &self,
+        _handle: OptimizeJobHandle,
+    ) -> Result<OptimizeJobState, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
+    }
 
     /// Execute an automatic OPTIMIZE as one complete durable job lifecycle.
     /// Unlike submission, success means the job was claimed, executed and

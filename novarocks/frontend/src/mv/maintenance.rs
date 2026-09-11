@@ -761,7 +761,7 @@ mod tests {
                 .push(MaintenanceActionKind::RewritePositionDeletes);
             Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
                 rewritten_delete_files_count: 1,
-                added_delete_files_count: 1,
+                added_delete_files_count: Some(1),
                 rewritten_bytes_count: 1,
                 added_bytes_count: 1,
             })

@@ -72,7 +72,10 @@ fn artifact_properties_type() -> DataType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsExecutionMode {
     SynchronousWait,
-    ProcessJobAttempt,
+    /// A process-owned statistics job has reached its collection query
+    /// attempt. This is intentionally not the business job identity and not
+    /// the provider publication identity.
+    BackgroundCollectionAttempt,
 }
 
 impl StatisticsExecutionMode {

@@ -21,9 +21,10 @@
 //! fresh action belongs to this frontend process, and a child rewrite can only
 //! run through the exact permit its parent already owns.
 
-use std::collections::HashSet;
 use std::fmt;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::Arc;
+
+use novarocks_table_maintenance::activity::{TargetActivity, TargetActivityPermit, TargetBusy};
 
 use crate::maintenance::MaintenanceTarget;
 
@@ -65,7 +66,7 @@ impl From<&MaintenanceTarget> for ActivityKey {
 
 #[derive(Clone, Default)]
 pub struct TableMaintenanceActivity {
-    active: Arc<Mutex<HashSet<ActivityKey>>>,
+    active: TargetActivity<ActivityKey>,
 }
 
 impl fmt::Debug for TableMaintenanceActivity {
@@ -83,24 +84,19 @@ impl TableMaintenanceActivity {
         family: MaintenanceActivityFamily,
     ) -> Result<MaintenanceActivityPermit, MaintenanceActivityBusy> {
         let key = ActivityKey::from(target);
-        let mut active = self.active.lock().map_err(|_| MaintenanceActivityBusy {
-            family,
-            target: target.clone(),
-            detail: "the process-local activity gate is poisoned".to_string(),
-        })?;
-        if !active.insert(key.clone()) {
-            return Err(MaintenanceActivityBusy {
+        let lease = self
+            .active
+            .acquire(key)
+            .map_err(|error| MaintenanceActivityBusy {
                 family,
                 target: target.clone(),
-                detail: "another maintenance action is already active for this table in this frontend process"
-                    .to_string(),
-            });
-        }
+                detail: match error {
+                    TargetBusy::Busy => "another maintenance action is already active for this table in this frontend process".to_string(),
+                    TargetBusy::Poisoned => "the process-local activity gate is poisoned".to_string(),
+                },
+            })?;
         Ok(MaintenanceActivityPermit {
-            _lease: Arc::new(ActivityLease {
-                key,
-                owner: Arc::downgrade(&self.active),
-            }),
+            _lease: Arc::new(lease),
         })
     }
 }
@@ -130,30 +126,12 @@ impl std::error::Error for MaintenanceActivityBusy {}
 /// receives a clone of the parent proof rather than re-acquiring its target.
 #[derive(Clone)]
 pub struct MaintenanceActivityPermit {
-    _lease: Arc<ActivityLease>,
-}
-
-struct ActivityLease {
-    key: ActivityKey,
-    owner: Weak<Mutex<HashSet<ActivityKey>>>,
+    _lease: Arc<TargetActivityPermit<ActivityKey>>,
 }
 
 impl fmt::Debug for MaintenanceActivityPermit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_struct("MaintenanceActivityPermit").finish()
-    }
-}
-
-impl Drop for ActivityLease {
-    fn drop(&mut self) {
-        // This runs only after the final parent/child proof releases the
-        // shared lease. A poisoned mutex means shutdown is already
-        // inconsistent; never panic from Drop.
-        if let Some(owner) = self.owner.upgrade()
-            && let Ok(mut active) = owner.lock()
-        {
-            active.remove(&self.key);
-        }
     }
 }
 

@@ -9,16 +9,18 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the Apache License is distributed on an
+// software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-//! No-authority frontend re-export of the statistics job repository.
+//! Application-owned table-maintenance primitives.
+//!
+//! This crate owns no SQL session, provider client, executor, or workload
+//! policy. Products supply their exact target binding and execution adapter;
+//! this crate supplies the single target conflict gate and current-process job
+//! observation semantics shared by SQL and MV.
 
-pub use novarocks_statistics_application::{
-    MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS, MAX_RECENT_TERMINAL_STATISTICS_JOBS,
-    StatisticsJobRepository, StatisticsRepositoryError as StatisticsJobRepositoryError,
-    StatisticsRepositoryErrorKind as StatisticsJobRepositoryErrorKind,
-};
+pub mod activity;
+pub mod runtime;

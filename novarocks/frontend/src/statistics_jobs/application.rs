@@ -18,7 +18,9 @@
 //! Typed frontend application contract for unified statistics commands.
 //!
 //! This module deliberately contains no parser AST or raw-SQL interception.
-//! The frontend owns target resolution, current-process job state, and worker composition.
+//! The frontend owns SQL/connector adaptation and target resolution. The
+//! statistics application crate owns current-process job state and worker
+//! composition.
 
 use std::fmt;
 use std::sync::Arc;
@@ -129,9 +131,12 @@ pub trait StatisticsTableReaderSink: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Frontend-owned implementation of provider-native collection and
-/// publication. One consuming call owns the session from provider begin through
-/// ordinary distributed execution and the single external finish attempt.
+/// Legacy combined provider adapter contract.
+///
+/// It cannot be used to start a statistics job: the product worker requires a
+/// separately bound `WorkOwner` source and three-phase executor. T12 replaces
+/// this compatibility registration with the real query-application/provider
+/// adapter.
 pub trait StatisticsAttemptExecutor: Send + Sync {
     fn execute(
         &self,
