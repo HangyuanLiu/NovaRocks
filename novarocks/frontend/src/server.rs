@@ -961,6 +961,7 @@ mod tests {
     };
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::native::transport::FrontendNativeTransport;
+    use crate::runtime::statement_result::StatementResult;
     use crate::state_store::{
         StateStoreProviderRegistry,
         testing::{input as test_state_store_input, registry as test_state_store_registry},
@@ -970,6 +971,15 @@ mod tests {
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
     use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+
+    fn settle_governed_completion(result: StatementResult) {
+        let StatementResult::GovernedCompletion(result) = result else {
+            panic!("successful statement must retain its owner through terminal OK");
+        };
+        let mut protocol = result.into_protocol();
+        let _ = protocol.seal_success_visibility();
+        let _ = protocol.complete();
+    }
 
     fn test_native_trust() -> Arc<NativeTrust> {
         Arc::new(NativeTrust::new(
@@ -1155,10 +1165,12 @@ mod tests {
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
-        session
+        let result = session
             .execute_batch(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
+        settle_governed_completion(result);
+        session.complete_statement();
         let created = attachments
             .get(&instance_id)
             .await
@@ -1170,15 +1182,19 @@ mod tests {
             host.catalog_application_port().admit_catalog(&instance_id),
             CatalogAdmission::Ready(_)
         ));
-        session
+        let result = session
             .execute_batch("SET CATALOG warehouse")
             .await
             .expect("the committed attachment is admitted by this frontend session");
+        settle_governed_completion(result);
+        session.complete_statement();
 
-        session
+        let result = session
             .execute_batch("DROP CATALOG warehouse")
             .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
+        settle_governed_completion(result);
+        session.complete_statement();
         assert!(
             attachments
                 .get(&instance_id)
@@ -1191,14 +1207,17 @@ mod tests {
             host.catalog_application_port().admit_catalog(&instance_id),
             CatalogAdmission::Absent
         ));
-        assert_eq!(
-            session
-                .execute_batch("SET CATALOG warehouse")
-                .await
-                .expect_err("a dropped catalog stops being admitted")
-                .kind(),
-            QueryServiceErrorKind::BadDatabase
-        );
+        let result = session
+            .execute_batch("SET CATALOG warehouse")
+            .await
+            .expect("admission error is retained until the protocol terminal error");
+        let StatementResult::GovernedError(result) = result else {
+            panic!("a dropped catalog must produce a governed terminal error");
+        };
+        let (error, mut protocol) = result.into_parts();
+        assert_eq!(error.kind(), QueryServiceErrorKind::BadDatabase);
+        let _ = protocol.fail();
+        session.complete_statement();
 
         // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
