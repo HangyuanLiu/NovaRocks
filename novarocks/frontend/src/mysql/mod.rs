@@ -733,46 +733,40 @@ fn normalize_init_database_schema(schema: &str) -> String {
         .join(".")
 }
 
-fn map_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
-    match kind {
-        QueryServiceErrorKind::Parse => ErrorKind::ER_PARSE_ERROR,
-        QueryServiceErrorKind::BadDatabase => ErrorKind::ER_BAD_DB_ERROR,
-        QueryServiceErrorKind::Unsupported => ErrorKind::ER_NOT_SUPPORTED_YET,
-        QueryServiceErrorKind::PermissionDenied => ErrorKind::ER_SPECIFIC_ACCESS_DENIED_ERROR,
-        QueryServiceErrorKind::NoSuchSession => ErrorKind::ER_NO_SUCH_THREAD,
-        QueryServiceErrorKind::Interrupted => ErrorKind::ER_QUERY_INTERRUPTED,
-        QueryServiceErrorKind::Timeout => ErrorKind::ER_UNKNOWN_ERROR,
-        QueryServiceErrorKind::InvalidValue => ErrorKind::ER_WRONG_VALUE,
-        QueryServiceErrorKind::Unavailable => ErrorKind::ER_UNKNOWN_ERROR,
-        QueryServiceErrorKind::FrontendDraining => ErrorKind::ER_SERVER_SHUTDOWN,
-        QueryServiceErrorKind::Internal => ErrorKind::ER_UNKNOWN_ERROR,
-    }
-}
-
 fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
     error
         .user_error()
         .and_then(|user_error| error_kind_for_code(user_error.code()))
-        .unwrap_or_else(|| map_query_service_error(error.kind()))
+        .unwrap_or_else(|| {
+            novarocks_mysql_adapter::error_kind_for_query_service_error(error.kind())
+        })
 }
 
 #[cfg(test)]
 #[test]
 fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
     assert_eq!(
-        map_query_service_error(QueryServiceErrorKind::BadDatabase),
+        novarocks_mysql_adapter::error_kind_for_query_service_error(
+            QueryServiceErrorKind::BadDatabase
+        ),
         ErrorKind::ER_BAD_DB_ERROR
     );
     assert_eq!(
-        map_query_service_error(QueryServiceErrorKind::Interrupted),
+        novarocks_mysql_adapter::error_kind_for_query_service_error(
+            QueryServiceErrorKind::Interrupted
+        ),
         ErrorKind::ER_QUERY_INTERRUPTED
     );
     assert_eq!(
-        map_query_service_error(QueryServiceErrorKind::Unavailable),
+        novarocks_mysql_adapter::error_kind_for_query_service_error(
+            QueryServiceErrorKind::Unavailable
+        ),
         ErrorKind::ER_UNKNOWN_ERROR
     );
     assert_eq!(
-        map_query_service_error(QueryServiceErrorKind::FrontendDraining),
+        novarocks_mysql_adapter::error_kind_for_query_service_error(
+            QueryServiceErrorKind::FrontendDraining
+        ),
         ErrorKind::ER_SERVER_SHUTDOWN
     );
     assert_eq!(ErrorKind::ER_SERVER_SHUTDOWN.sqlstate(), b"08S01");

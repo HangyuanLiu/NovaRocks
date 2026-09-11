@@ -3872,6 +3872,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-mv-application",
+ "novarocks-mysql-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-plan-codec",
@@ -3961,6 +3962,14 @@ name = "novarocks-mv-application"
 version = "0.1.0"
 dependencies = [
  "novarocks-query-application",
+]
+
+[[package]]
+name = "novarocks-mysql-adapter"
+version = "0.1.0"
+dependencies = [
+ "novarocks-query-application",
+ "opensrv-mysql",
 ]
 
 [[package]]

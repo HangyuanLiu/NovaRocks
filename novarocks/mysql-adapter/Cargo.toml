@@ -1,0 +1,12 @@
+[package]
+name = "novarocks-mysql-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+novarocks-query-application.workspace = true
+opensrv-mysql = { version = "0.7", default-features = false }
