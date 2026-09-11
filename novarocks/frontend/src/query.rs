@@ -92,6 +92,7 @@ use tokio::task;
 use crate::dml::DmlService;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
 use crate::statistics::command::StatisticsCommandExecutor;
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
 use crate::workload_lifecycle::{
     FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
@@ -528,6 +529,7 @@ pub struct FrontendQueryService {
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
     query_cpu_executor: QueryCpuExecutor,
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
@@ -564,6 +566,7 @@ impl FrontendQueryService {
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
         query_cpu_executor: QueryCpuExecutor,
+        connector_blocking_io: ConnectorBlockingIoSupervisor,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
         serving_lifecycle: FrontendServingLifecycle,
@@ -597,6 +600,7 @@ impl FrontendQueryService {
             ctas_engine,
             truncate_engine,
             query_cpu_executor,
+            connector_blocking_io,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
             serving_lifecycle,
@@ -1958,17 +1962,13 @@ impl QuerySession for FrontendQuerySession {
             .map_err(poisoned_state)?
             .current_catalog
             .clone();
-        let session_catalog_resolver = self.service.session_catalog_resolver.clone();
-        let schema = schema.to_string();
-        let context = task::spawn_blocking(move || {
-            resolve_database_context(
-                &session_catalog_resolver,
-                current_catalog.as_deref(),
-                &schema,
-            )
-        })
-        .await
-        .map_err(|error| internal_error(error.to_string()))??;
+        let context = resolve_database_context(
+            &self.service.session_catalog_resolver,
+            current_catalog.as_deref(),
+            schema,
+            &self.service.connector_blocking_io,
+        )
+        .await?;
         let mut state = self.state.lock().map_err(poisoned_state)?;
         state.current_catalog = context.catalog;
         state.current_database = context.database;
@@ -2145,10 +2145,11 @@ fn resolve_catalog_name(
     Ok(Some(normalized))
 }
 
-fn resolve_database_context(
+async fn resolve_database_context(
     resolver: &SessionCatalogResolver,
     current_catalog: Option<&str>,
     schema: &str,
+    connector_blocking_io: &ConnectorBlockingIoSupervisor,
 ) -> Result<DatabaseContext, QueryServiceError> {
     let parts = schema
         .split('.')
@@ -2159,33 +2160,42 @@ fn resolve_database_context(
             let database = normalize_identifier(database)
                 .map_err(|error| internal_error(error.to_string()))?;
             match current_catalog {
-                Some(catalog)
+                Some(catalog) => {
+                    if external_namespace_exists(
+                        resolver,
+                        connector_blocking_io,
+                        catalog.to_string(),
+                        database.clone(),
+                    )
+                    .await?
+                    {
+                        Ok(DatabaseContext {
+                            catalog: Some(catalog.to_string()),
+                            database,
+                        })
+                    } else {
+                        Err(QueryServiceError::new(
+                            QueryServiceErrorKind::BadDatabase,
+                            format!("unknown database `{schema}`"),
+                        ))
+                    }
+                }
+                None => {
                     if resolver
-                        .iceberg_namespace_exists(catalog, &database)
-                        .map_err(|error| internal_error(error.to_string()))? =>
-                {
-                    Ok(DatabaseContext {
-                        catalog: Some(catalog.to_string()),
-                        database,
-                    })
+                        .database_exists(&database)
+                        .map_err(|error| internal_error(error.to_string()))?
+                    {
+                        Ok(DatabaseContext {
+                            catalog: None,
+                            database,
+                        })
+                    } else {
+                        Err(QueryServiceError::new(
+                            QueryServiceErrorKind::BadDatabase,
+                            format!("unknown database `{schema}`"),
+                        ))
+                    }
                 }
-                Some(_) => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::BadDatabase,
-                    format!("unknown database `{schema}`"),
-                )),
-                None if resolver
-                    .database_exists(&database)
-                    .map_err(|error| internal_error(error.to_string()))? =>
-                {
-                    Ok(DatabaseContext {
-                        catalog: None,
-                        database,
-                    })
-                }
-                None => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::BadDatabase,
-                    format!("unknown database `{schema}`"),
-                )),
             }
         }
         [catalog, database] => {
@@ -2193,29 +2203,42 @@ fn resolve_database_context(
             let database = normalize_identifier(database)
                 .map_err(|error| internal_error(error.to_string()))?;
             match catalog {
-                Some(catalog)
+                Some(catalog) => {
+                    if external_namespace_exists(
+                        resolver,
+                        connector_blocking_io,
+                        catalog.clone(),
+                        database.clone(),
+                    )
+                    .await?
+                    {
+                        Ok(DatabaseContext {
+                            catalog: Some(catalog),
+                            database,
+                        })
+                    } else {
+                        Err(QueryServiceError::new(
+                            QueryServiceErrorKind::BadDatabase,
+                            format!("unknown database `{schema}`"),
+                        ))
+                    }
+                }
+                None => {
                     if resolver
-                        .iceberg_namespace_exists(&catalog, &database)
-                        .map_err(|error| internal_error(error.to_string()))? =>
-                {
-                    Ok(DatabaseContext {
-                        catalog: Some(catalog),
-                        database,
-                    })
+                        .database_exists(&database)
+                        .map_err(|error| internal_error(error.to_string()))?
+                    {
+                        Ok(DatabaseContext {
+                            catalog: None,
+                            database,
+                        })
+                    } else {
+                        Err(QueryServiceError::new(
+                            QueryServiceErrorKind::BadDatabase,
+                            format!("unknown database `{schema}`"),
+                        ))
+                    }
                 }
-                None if resolver
-                    .database_exists(&database)
-                    .map_err(|error| internal_error(error.to_string()))? =>
-                {
-                    Ok(DatabaseContext {
-                        catalog: None,
-                        database,
-                    })
-                }
-                _ => Err(QueryServiceError::new(
-                    QueryServiceErrorKind::BadDatabase,
-                    format!("unknown database `{schema}`"),
-                )),
             }
         }
         _ => Err(QueryServiceError::new(
@@ -2223,6 +2246,21 @@ fn resolve_database_context(
             format!("unknown database `{schema}`; expected `<database>` or `<catalog>.<database>`"),
         )),
     }
+}
+
+async fn external_namespace_exists(
+    resolver: &SessionCatalogResolver,
+    connector_blocking_io: &ConnectorBlockingIoSupervisor,
+    catalog: String,
+    database: String,
+) -> Result<bool, QueryServiceError> {
+    let resolver = resolver.clone();
+    connector_blocking_io
+        .spawn_ordinary(move || resolver.iceberg_namespace_exists(&catalog, &database))
+        .finish()
+        .await
+        .map_err(|error| internal_error(error.to_string()))?
+        .map_err(internal_error)
 }
 
 #[derive(Clone)]

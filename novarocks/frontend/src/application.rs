@@ -41,6 +41,7 @@ use novarocks_workload_control::{
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use crate::task_execution::ConnectorBlockingIoBudget;
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
@@ -1564,6 +1565,13 @@ impl FrontendApplicationHost {
     /// Cloneable submission handle for the process-owned CPU preparation pool.
     pub(crate) fn query_cpu_executor(&self) -> QueryCpuExecutor {
         self.execution_runtime_owner.query_cpu_executor()
+    }
+
+    /// Cloneable handle for the one process-owned Connector blocking-I/O
+    /// supervisor. SQL session initialization uses its ordinary lane only for
+    /// external catalog metadata, never for local catalog lookups.
+    pub(crate) fn connector_blocking_io_supervisor(&self) -> ConnectorBlockingIoSupervisor {
+        self.data_runtime.connector_blocking_io().clone()
     }
 
     #[allow(
