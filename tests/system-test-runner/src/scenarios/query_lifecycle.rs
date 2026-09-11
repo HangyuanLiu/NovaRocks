@@ -140,12 +140,7 @@ impl Scenario for QueryTimeout {
         context.action("sent a blocking query expected to time out");
         await_resource_activity(context, &baseline)?;
         context.action("observed in-flight distributed query resources before timeout");
-        let (_, response) = read_packet(&mut stream).context("read timed query response")?;
-        ensure!(
-            response.first().copied() == Some(0xff),
-            "expected timed query to return a MySQL error packet, got payload={response:?}"
-        );
-        let error = mysql_error_text(&response)?;
+        let error = read_timeout_query_error(&mut stream)?;
         ensure!(
             error.contains("timed out") || error.contains("timeout"),
             "expected MySQL timeout error, got: {error}"
@@ -728,6 +723,41 @@ fn mysql_error_text(payload: &[u8]) -> Result<String> {
         3
     };
     Ok(String::from_utf8_lossy(&payload[message_offset..]).into_owned())
+}
+
+/// Reads the terminal failure of the one-column timeout query.
+///
+/// The MySQL writer may make the schema visible before the deadline expires.
+/// That is a legitimate partial result-set prefix: the terminal packet must
+/// still be ERR, and no row or success EOF may follow the metadata. A timeout
+/// observed before schema start remains an ERR-first response.
+fn read_timeout_query_error(stream: &mut TcpStream) -> Result<String> {
+    let (_, first) = read_packet(stream).context("read timed query first response")?;
+    if first.first().copied() == Some(0xff) {
+        return mysql_error_text(&first);
+    }
+
+    ensure!(
+        first == [1],
+        "expected timed query to begin with one-column metadata or ERR, got payload={first:?}"
+    );
+    let (_, column) = read_packet(stream).context("read timed query column metadata")?;
+    ensure!(
+        !is_mysql_result_terminator(&column) && column.first().copied() != Some(0xff),
+        "expected timed query column definition, got payload={column:?}"
+    );
+    let (_, metadata_end) = read_packet(stream).context("read timed query metadata terminator")?;
+    ensure!(
+        is_mysql_result_terminator(&metadata_end),
+        "expected timed query metadata terminator, got payload={metadata_end:?}"
+    );
+    let (_, terminal) = read_packet(stream).context("read timed query terminal error")?;
+    mysql_error_text(&terminal)
+}
+
+fn is_mysql_result_terminator(payload: &[u8]) -> bool {
+    matches!(payload.first().copied(), Some(0xfe) if payload.len() < 9)
+        || payload.first().copied() == Some(0)
 }
 
 fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
