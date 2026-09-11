@@ -37,11 +37,11 @@ use crate::{
 /// state, but do not own a second session representation.
 #[derive(Clone)]
 pub struct SessionSqlState {
-    pub current_catalog: Option<String>,
-    pub current_database: String,
-    pub execution_settings: SessionExecutionSettings,
-    pub optimizer_settings: SessionOptimizerSettings,
-    pub user_variables: BTreeMap<String, String>,
+    current_catalog: Option<String>,
+    current_database: String,
+    execution_settings: SessionExecutionSettings,
+    optimizer_settings: SessionOptimizerSettings,
+    user_variables: BTreeMap<String, String>,
 }
 
 impl Default for SessionSqlState {
@@ -57,6 +57,58 @@ impl Default for SessionSqlState {
 }
 
 impl SessionSqlState {
+    pub fn current_catalog(&self) -> Option<&str> {
+        self.current_catalog.as_deref()
+    }
+
+    pub fn current_database(&self) -> &str {
+        &self.current_database
+    }
+
+    pub fn execution_settings(&self) -> &SessionExecutionSettings {
+        &self.execution_settings
+    }
+
+    /// Stores a catalog the role owner has already resolved against its
+    /// external projection. If the default catalog is selected and the old
+    /// database does not exist there, reset to the portable default database.
+    pub fn apply_resolved_catalog(
+        &mut self,
+        catalog: Option<String>,
+        current_database_exists: bool,
+    ) {
+        self.current_catalog = catalog;
+        if self.current_catalog.is_none() && !current_database_exists {
+            self.current_database = DEFAULT_DATABASE.to_string();
+        }
+    }
+
+    /// Replaces the already-resolved database context selected by a role
+    /// adapter. Validation remains with that adapter's external catalog owner.
+    pub fn set_resolved_database_context(&mut self, catalog: Option<String>, database: String) {
+        self.current_catalog = catalog;
+        self.current_database = database;
+    }
+
+    /// Transfers the immutable inputs needed to construct one query attempt.
+    /// The role adapter may add role-local admission facts, but it cannot mutate
+    /// the session after this transfer.
+    pub fn into_query_attempt_inputs(
+        self,
+    ) -> (
+        Option<String>,
+        String,
+        SessionExecutionSettings,
+        SessionOptimizerSettings,
+    ) {
+        (
+            self.current_catalog,
+            self.current_database,
+            self.execution_settings,
+            self.optimizer_settings,
+        )
+    }
+
     /// Records one SQL expression as a connection-local user variable.
     pub fn set_user_variable(&mut self, name: &str, value: String) {
         self.user_variables.insert(name.to_ascii_lowercase(), value);
@@ -635,12 +687,12 @@ mod tests {
     #[test]
     fn default_sql_session_state_is_neutral_and_empty() {
         let state = SessionSqlState::default();
-        assert_eq!(state.current_catalog, None);
-        assert_eq!(state.current_database, DEFAULT_DATABASE);
+        assert_eq!(state.current_catalog(), None);
+        assert_eq!(state.current_database(), DEFAULT_DATABASE);
         assert!(state.user_variables.is_empty());
         assert_eq!(
-            state.execution_settings,
-            SessionExecutionSettings::default()
+            state.execution_settings(),
+            &SessionExecutionSettings::default()
         );
     }
 
@@ -688,9 +740,7 @@ mod tests {
     #[test]
     fn substitutes_user_variables_without_a_frontend_router() {
         let mut state = SessionSqlState::default();
-        state
-            .user_variables
-            .insert("@limit".to_string(), "7".to_string());
+        state.set_user_variable("@limit", "7".to_string());
         let statement = novarocks_parser::parse("SELECT @limit")
             .expect("parse query")
             .pop()
@@ -702,6 +752,20 @@ mod tests {
                 .expect("substitute session variable"),
         );
         assert_eq!(rendered, "SELECT 7");
+    }
+
+    #[test]
+    fn resolved_catalog_selection_preserves_or_resets_database_explicitly() {
+        let mut state = SessionSqlState::default();
+        state.set_resolved_database_context(Some("lake".to_string()), "analytics".to_string());
+
+        state.apply_resolved_catalog(Some("other_lake".to_string()), false);
+        assert_eq!(state.current_catalog(), Some("other_lake"));
+        assert_eq!(state.current_database(), "analytics");
+
+        state.apply_resolved_catalog(None, false);
+        assert_eq!(state.current_catalog(), None);
+        assert_eq!(state.current_database(), DEFAULT_DATABASE);
     }
 
     fn set_assignment(sql: &str) -> ast::SetAssignment {
@@ -732,20 +796,15 @@ mod tests {
             );
         }
 
-        assert!(state.optimizer_settings.enable_eliminate_agg);
+        let (_, _, _, optimizer_settings) = state.into_query_attempt_inputs();
+        assert!(optimizer_settings.enable_eliminate_agg);
         assert_eq!(
-            state.optimizer_settings.cbo_broadcast_node_mem_budget_bytes,
+            optimizer_settings.cbo_broadcast_node_mem_budget_bytes,
             Some(0.0)
         );
-        assert_eq!(state.optimizer_settings.rf_probe_min_selectivity, Some(0.0));
-        assert_eq!(
-            state.optimizer_settings.enable_common_subexpr_reuse,
-            Some(false)
-        );
-        assert_eq!(
-            state.optimizer_settings.max_reorder_node_use_exhaustive,
-            Some(2)
-        );
+        assert_eq!(optimizer_settings.rf_probe_min_selectivity, Some(0.0));
+        assert_eq!(optimizer_settings.enable_common_subexpr_reuse, Some(false));
+        assert_eq!(optimizer_settings.max_reorder_node_use_exhaustive, Some(2));
     }
 
     #[test]
@@ -757,7 +816,7 @@ mod tests {
                 .expect("catalog target must lower"),
             SessionSetAssignmentOutcome::SelectCatalog("external_catalog".to_string()),
         );
-        assert_eq!(state.current_catalog, None);
+        assert_eq!(state.current_catalog(), None);
     }
 
     #[test]

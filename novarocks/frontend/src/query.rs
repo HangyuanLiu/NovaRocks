@@ -92,7 +92,7 @@ use novarocks_query_application::sql::{
     SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
     parse_single_statement, strip_leading_line_comments,
 };
-use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
+use novarocks_types::naming::normalize_identifier;
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
 use novarocks_workload_control::{
@@ -891,16 +891,13 @@ impl FrontendQuerySession {
         catalog: &str,
     ) -> Result<(), QueryServiceError> {
         let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, catalog)?;
-        state.current_catalog = catalog;
-        if state.current_catalog.is_none()
-            && !self
+        let current_database_exists = catalog.is_some()
+            || self
                 .service
                 .session_catalog_resolver
-                .database_exists(&state.current_database)
-                .map_err(internal_error)?
-        {
-            state.current_database = DEFAULT_DATABASE.to_string();
-        }
+                .database_exists(state.current_database())
+                .map_err(internal_error)?;
+        state.apply_resolved_catalog(catalog, current_database_exists);
         Ok(())
     }
 
@@ -936,14 +933,15 @@ impl FrontendQuerySession {
         let topology =
             wait_for_initial_query_topology(&self.service.topology, &cancellation, deadline)
                 .await?;
-        let mut optimizer_settings = state.optimizer_settings;
+        let (current_catalog, current_database, execution_settings, mut optimizer_settings) =
+            state.into_query_attempt_inputs();
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
             optimizer_settings.optimizer_query_mem_limit_bytes =
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
         let context = RequestContext::admit(RequestAdmission::new(
-            state.current_catalog,
-            state.current_database,
+            current_catalog,
+            current_database,
             self.service.role,
             topology,
             deadline,
@@ -951,7 +949,7 @@ impl FrontendQuerySession {
             optimizer_settings,
         ));
         let query_options = with_query_hints(
-            query_options_from_session_settings(&state.execution_settings),
+            query_options_from_session_settings(&execution_settings),
             match &parsed_statement {
                 ParsedStatement::Query(query) => Some(query),
                 _ => None,
@@ -1256,7 +1254,7 @@ impl FrontendQuerySession {
         let parsed_statement = state
             .substitute_user_variables(parsed_statement)
             .map_err(|error| internal_error(error.to_string()))?;
-        let query_timeout_secs = state.execution_settings.query_timeout_secs();
+        let query_timeout_secs = state.execution_settings().query_timeout_secs();
         let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
                 .checked_add(Duration::from_secs(seconds))
@@ -1335,7 +1333,8 @@ impl FrontendQuerySession {
         } else {
             topology
         };
-        let mut optimizer_settings = state.optimizer_settings;
+        let (current_catalog, current_database, execution_settings, mut optimizer_settings) =
+            state.into_query_attempt_inputs();
         // A session `SET` wins; otherwise admission freezes the process budget so
         // SQL costing never consults a process-global configuration.
         if optimizer_settings.optimizer_query_mem_limit_bytes.is_none() {
@@ -1343,8 +1342,8 @@ impl FrontendQuerySession {
                 Some(self.service.optimizer_query_mem_limit_bytes as f64);
         }
         let context = RequestContext::admit(RequestAdmission::new(
-            state.current_catalog,
-            state.current_database,
+            current_catalog,
+            current_database,
             self.service.role,
             topology,
             deadline,
@@ -1362,7 +1361,7 @@ impl FrontendQuerySession {
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let query_options = with_query_hints(
-            query_options_from_session_settings(&state.execution_settings),
+            query_options_from_session_settings(&execution_settings),
             match &parsed_statement {
                 ParsedStatement::ExplainQuery(explain) => Some(&explain.query),
                 _ => None,
@@ -1625,8 +1624,8 @@ impl QuerySession for FrontendQuerySession {
             .state
             .lock()
             .map_err(poisoned_state)?
-            .current_catalog
-            .clone();
+            .current_catalog()
+            .map(ToOwned::to_owned);
         let context = resolve_database_context(
             &self.service.session_catalog_resolver,
             current_catalog.as_deref(),
@@ -1635,8 +1634,7 @@ impl QuerySession for FrontendQuerySession {
         )
         .await?;
         let mut state = self.state.lock().map_err(poisoned_state)?;
-        state.current_catalog = context.catalog;
-        state.current_database = context.database;
+        state.set_resolved_database_context(context.catalog, context.database);
         Ok(())
     }
 
@@ -2315,7 +2313,7 @@ async fn wait_for_eligible_query_topology_after(
 fn governed_query_deadline(
     state: &SessionSqlState,
 ) -> Result<(Option<Instant>, Option<u64>), QueryServiceError> {
-    let timeout_secs = state.execution_settings.query_timeout_secs();
+    let timeout_secs = state.execution_settings().query_timeout_secs();
     let deadline = match timeout_secs {
         Some(seconds) => Some(
             Instant::now()
