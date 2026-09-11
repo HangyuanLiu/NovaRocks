@@ -852,23 +852,19 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
 ) -> Result<(), ProtocolWriteFailure> {
-    for row_idx in 0..batch.num_rows() {
-        let values = mysql_adapter_build_mysql_row(batch, columns, row_idx)
-            .map_err(invalid_data_error)
-            .map_err(ProtocolWriteFailure::Encoding)?;
-        let write = writer.write_row(values);
-        tokio::pin!(write);
-        tokio::select! {
-            biased;
-            reason = cancellation.cancelled() => {
-                return Err(ProtocolWriteFailure::Cancelled(
-                    cancelled_query_result_delivery(reason)
-                ));
+    novarocks_mysql_adapter::write_cancellable_batch(writer, batch, columns, cancellation)
+        .await
+        .map_err(|error| match error {
+            novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error) => {
+                ProtocolWriteFailure::Cancelled(error)
             }
-            written = &mut write => written.map_err(ProtocolWriteFailure::Io)?,
-        }
-    }
-    Ok(())
+            novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error) => {
+                ProtocolWriteFailure::Encoding(error)
+            }
+            novarocks_mysql_adapter::MysqlBatchWriteError::Io(error) => {
+                ProtocolWriteFailure::Io(error)
+            }
+        })
 }
 
 fn result_schema_to_query_result_columns(schema: &ResultSchema) -> Vec<QueryResultColumn> {
