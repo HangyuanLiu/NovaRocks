@@ -35,8 +35,7 @@ use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementFinishOutcome,
-    StatementToken,
+    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -52,7 +51,10 @@ use crate::query_execution::maintenance::command::{
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::{PreparedQueryOperation, StatementResult};
 use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::statement_result::GovernedImmediateStatementResult;
+use crate::runtime::statement_result::{
+    GovernedCompletionStatementResult, GovernedErrorStatementResult,
+    GovernedImmediateStatementResult,
+};
 use crate::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason, QueryServiceError, QueryServiceErrorKind, QuerySession,
@@ -493,6 +495,16 @@ fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
     }
 }
 
+fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
+    match statement {
+        ParsedStatement::Dml(_) | ParsedStatement::ExplainQuery(_) => WorkClass::Query,
+        ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
+            unreachable!("session and plain query statements do not use the typed route")
+        }
+        _ => WorkClass::Management,
+    }
+}
+
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
@@ -707,10 +719,8 @@ impl FrontendQuerySession {
                     .iter()
                     .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
             {
-                drop(admission);
-                return self
-                    .execute_governed_set(trimmed.to_string(), &statement)
-                    .await;
+                self.execute_governed_set(trimmed.to_string(), &statement, &admission)
+                    .await
             }
             ParsedStatement::Session(statement) => {
                 self.execute_session_statement(trimmed, &statement, cancellation)
@@ -726,15 +736,16 @@ impl FrontendQuerySession {
                     .await;
             }
             statement => {
-                self.execute_typed_statement(trimmed.to_string(), statement, cancellation)
+                self.execute_typed_statement(trimmed.to_string(), statement, &admission)
                     .await
             }
         };
-        if matches!(&result, Ok(StatementResult::Query(_))) {
+        if result.is_ok() {
             let mut active_statements = self.active_statements.lock().map_err(poisoned_state)?;
-            // A QueryResult is consumed by the MySQL protocol after this
-            // method returns. Retain the admission through that write so an
-            // FE drain observes streaming work and can cancel it at deadline.
+            // The MySQL protocol consumes every successful statement result
+            // after this method returns. Retain lifecycle observation through
+            // that terminal write; governed statements receive drain
+            // cancellation through their query-control owner, not this lease.
             active_statements.push(admission);
         }
         result
@@ -1090,6 +1101,7 @@ impl FrontendQuerySession {
         &self,
         source: String,
         set: &ast::SetStatement,
+        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
         for assignment in &set.assignments {
             self.admit_session_set_assignment(&source, assignment)?;
@@ -1107,6 +1119,10 @@ impl FrontendQuerySession {
                 timeout_ms,
             )
             .map_err(governed_statement_begin_error)?;
+        let query_control = self.service.query_control.clone();
+        lifecycle_admission.bind_external_cancellation(move |reason| {
+            let _ = query_control.cancel_session_statement(token, reason);
+        });
 
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
@@ -1115,8 +1131,7 @@ impl FrontendQuerySession {
                     assignment,
                     &mut staged_state,
                 ) {
-                    let _ = statement.finish();
-                    return Err(error);
+                    return Ok(self.governed_typed_error(error, statement));
                 }
                 continue;
             };
@@ -1138,16 +1153,17 @@ impl FrontendQuerySession {
                     {
                         Ok(value) => value,
                         Err(error) => {
-                            let _ = statement.finish();
-                            return Err(error);
+                            return Ok(self.governed_typed_error(error, statement));
                         }
                     }
                 }
                 ast::SetValue::Words(_) => {
-                    let _ = statement.finish();
-                    return Err(QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "user variable assignment requires an expression",
+                    return Ok(self.governed_typed_error(
+                        QueryServiceError::new(
+                            QueryServiceErrorKind::InvalidValue,
+                            "user variable assignment requires an expression",
+                        ),
+                        statement,
                     ));
                 }
             };
@@ -1160,29 +1176,27 @@ impl FrontendQuerySession {
             crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Sealed => {
                 *live_state = staged_state;
                 drop(live_state);
-                match statement.finish() {
-                    GovernedStatementFinishOutcome::Completed => Ok(StatementResult::Ok),
-                    GovernedStatementFinishOutcome::Cancelled(reason) => {
-                        Err(governed_cancellation_error(reason))
-                    }
-                    GovernedStatementFinishOutcome::ProtocolFailed
-                    | GovernedStatementFinishOutcome::Stale => Err(internal_error(
-                        "governed SET query lost its sealed statement generation",
-                    )),
-                }
+                statement.complete_execution();
+                Ok(StatementResult::GovernedCompletion(
+                    GovernedCompletionStatementResult::new(
+                        self.service.workload_resources.clone(),
+                        statement,
+                    ),
+                ))
             }
             crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Cancelled(
                 reason,
             ) => {
                 drop(live_state);
-                let _ = statement.finish();
-                Err(governed_cancellation_error(reason))
+                Ok(self.governed_typed_error(governed_cancellation_error(reason), statement))
             }
             crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Stale => {
                 drop(live_state);
-                let _ = statement.finish();
-                Err(internal_error(
-                    "governed SET query lost its statement generation before state commit",
+                Ok(self.governed_typed_error(
+                    internal_error(
+                        "governed SET query lost its statement generation before state commit",
+                    ),
+                    statement,
                 ))
             }
         }
@@ -1310,7 +1324,10 @@ impl FrontendQuerySession {
                             statement,
                         ),
                     )),
-                    StatementResult::GovernedQuery(_) | StatementResult::StreamingQuery(_) => {
+                    StatementResult::GovernedQuery(_)
+                    | StatementResult::StreamingQuery(_)
+                    | StatementResult::GovernedCompletion(_)
+                    | StatementResult::GovernedError(_) => {
                         let _ = statement.finish();
                         Err(internal_error(
                             "plain query preparation returned an already-owned protocol result",
@@ -1355,7 +1372,7 @@ impl FrontendQuerySession {
         &self,
         sql: String,
         parsed_statement: ParsedStatement,
-        cancellation_source: QueryCancellationSource,
+        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
         reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
         let state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -1366,18 +1383,6 @@ impl FrontendQuerySession {
             .collect::<Vec<_>>();
         let parsed_statement = substitute_session_user_variables(parsed_statement, &assignments)
             .map_err(|error| internal_error(error.to_string()))?;
-        let token = self.token()?;
-        let mut active = self
-            .service
-            .query_control
-            .begin_statement_with_cancellation(token, cancellation_source)
-            .map_err(|error| {
-                QueryServiceError::new(
-                    QueryServiceErrorKind::Internal,
-                    format!("begin statement failed: {error:?}"),
-                )
-            })?;
-        let cancellation = active.cancellation().clone();
         let query_timeout_secs = state.execution_settings.query_timeout_secs();
         let session_deadline = match query_timeout_secs {
             Some(seconds) => Instant::now()
@@ -1403,13 +1408,33 @@ impl FrontendQuerySession {
         };
         let timeout_duration =
             deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        let timeout_ms = timeout_duration.map(timeout_message_millis);
+        let token = self.token()?;
+        let mut statement = self
+            .service
+            .query_control
+            .begin_governed_statement(
+                token,
+                &self.service.workload_root_admission,
+                typed_statement_work_class(&parsed_statement),
+                deadline.map(tokio::time::Instant::from_std),
+                timeout_ms,
+            )
+            .map_err(governed_statement_begin_error)?;
+        let query_control = self.service.query_control.clone();
+        lifecycle_admission.bind_external_cancellation(move |reason| {
+            let _ = query_control.cancel_session_statement(token, reason);
+        });
+        let cancellation = QueryCancellationView::governed(
+            statement.cancellation().clone(),
+            statement.timeout_ms(),
+        );
         let topology = match self.service.topology.snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                let _ = active.finish();
-                return Err(QueryServiceError::new(
-                    QueryServiceErrorKind::Internal,
-                    error.to_string(),
+                return Ok(self.governed_typed_error(
+                    QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string()),
+                    statement,
                 ));
             }
         };
@@ -1431,15 +1456,15 @@ impl FrontendQuerySession {
             {
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
-                    let _ = active.finish();
-                    return Err(QueryServiceError::new(
-                        QueryServiceErrorKind::Internal,
-                        error.to_string(),
+                    return Ok(self.governed_typed_error(
+                        QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string()),
+                        statement,
                     ));
                 }
                 Err(error) => {
-                    let _ = active.finish();
-                    return Err(internal_error(error.to_string()));
+                    return Ok(
+                        self.governed_typed_error(internal_error(error.to_string()), statement)
+                    );
                 }
             }
         } else {
@@ -1478,7 +1503,10 @@ impl FrontendQuerySession {
                 _ => None,
             },
         );
-        let diagnostic_statement = active.token();
+        let diagnostic_statement = statement.token();
+        let execution_owner = statement
+            .take_execution_owner()
+            .expect("governed typed statement transfers its execution owner exactly once");
         let mut worker = task::spawn_blocking(move || {
             let _diagnostic_scope =
                 crate::preparation_diagnostics::enter_statement(diagnostic_statement);
@@ -1563,8 +1591,8 @@ impl FrontendQuerySession {
                         .map_err(RoutedExecutionError::Engine)
                 }
             };
-            let completion = active.finish();
-            (result, completion)
+            execution_owner.complete();
+            result
         });
         let result = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
@@ -1576,9 +1604,12 @@ impl FrontendQuerySession {
                     // statement lease. Waiting here also fences Backend abort
                     // acknowledgement before this session admits its next SQL.
                     let _ = worker.await;
-                    return Err(QueryServiceError::new(
-                        QueryServiceErrorKind::Timeout,
-                        format!("query timed out after {timeout_ms} ms"),
+                    return Ok(self.governed_typed_error(
+                        QueryServiceError::new(
+                            QueryServiceErrorKind::Timeout,
+                            format!("query timed out after {timeout_ms} ms"),
+                        ),
+                        statement,
                     ));
                 }
             }
@@ -1606,28 +1637,67 @@ impl FrontendQuerySession {
                                     .await
                                     .map_err(|error| internal_error(error.to_string()))?;
                             }
-                            return Err(cancellation_error(reason));
+                            return Ok(self.governed_typed_error(
+                                cancellation_error(reason),
+                                statement,
+                            ));
                         }
                     }
                 }
             }
         };
-        let (result, completion) = result;
-        match completion {
-            StatementFinishOutcome::Cancelled(reason) => Err(cancellation_error(reason)),
-            StatementFinishOutcome::Stale if cancellation.is_cancelled() => Err(
+        if cancellation.is_cancelled() {
+            return Ok(self.governed_typed_error(
                 cancellation_error(cancellation.reason().expect("cancelled view has a reason")),
-            ),
-            StatementFinishOutcome::Completed | StatementFinishOutcome::Stale => {
-                result.map_err(|error| match error {
+                statement,
+            ));
+        }
+        match result {
+            Ok(StatementResult::Query(result)) => Ok(StatementResult::GovernedQuery(
+                GovernedImmediateStatementResult::new(
+                    result,
+                    self.service.workload_resources.clone(),
+                    statement,
+                ),
+            )),
+            Ok(StatementResult::Ok) => Ok(StatementResult::GovernedCompletion(
+                GovernedCompletionStatementResult::new(
+                    self.service.workload_resources.clone(),
+                    statement,
+                ),
+            )),
+            Ok(
+                StatementResult::GovernedQuery(_)
+                | StatementResult::StreamingQuery(_)
+                | StatementResult::GovernedCompletion(_)
+                | StatementResult::GovernedError(_),
+            ) => Ok(self.governed_typed_error(
+                internal_error("typed statement returned an already-owned protocol result"),
+                statement,
+            )),
+            Err(error) => Ok(self.governed_typed_error(
+                match error {
                     RoutedExecutionError::Engine(error) => internal_error(error),
                     RoutedExecutionError::User(error) => QueryServiceError::from_user_error(error),
                     RoutedExecutionError::Publication { message, terminal } => {
                         QueryServiceError::with_publication_terminal(message, terminal)
                     }
-                })
-            }
+                },
+                statement,
+            )),
         }
+    }
+
+    fn governed_typed_error(
+        &self,
+        error: QueryServiceError,
+        statement: crate::query_execution::control::GovernedQueryStatementOwner,
+    ) -> StatementResult {
+        StatementResult::GovernedError(GovernedErrorStatementResult::new(
+            error,
+            self.service.workload_resources.clone(),
+            statement,
+        ))
     }
 }
 
@@ -2861,6 +2931,21 @@ mod tests {
         assert!(proto.enable_parquet_reader_page_index);
         assert!(proto.enable_scan_datacache);
         assert!(proto.enable_populate_datacache);
+    }
+
+    #[test]
+    fn typed_statement_work_class_keeps_data_plane_work_distinct_from_management() {
+        let explain = parse_single_statement("EXPLAIN SELECT 1").expect("parse explain");
+        let dml = parse_single_statement("INSERT INTO target VALUES (1)").expect("parse DML");
+        let management =
+            parse_single_statement("CREATE DATABASE governed_management").expect("parse DDL");
+
+        assert_eq!(typed_statement_work_class(&explain), WorkClass::Query);
+        assert_eq!(typed_statement_work_class(&dml), WorkClass::Query);
+        assert_eq!(
+            typed_statement_work_class(&management),
+            WorkClass::Management
+        );
     }
 
     fn scalar_stream_fixture(

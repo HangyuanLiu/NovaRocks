@@ -16,6 +16,7 @@
 // under the License.
 
 use super::query_result::QueryResult;
+use crate::QueryServiceError;
 use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
@@ -38,6 +39,12 @@ pub enum StatementResult {
     /// value until schema, every batch, and success EOF have reached the
     /// client or the connection has failed.
     StreamingQuery(StreamingStatementResult),
+    /// Completion-only output whose statement owner remains live through the
+    /// terminal OK packet.
+    GovernedCompletion(GovernedCompletionStatementResult),
+    /// Error output whose statement owner remains live through the terminal
+    /// MySQL error packet.
+    GovernedError(GovernedErrorStatementResult),
     Ok,
 }
 
@@ -47,6 +54,8 @@ impl std::fmt::Debug for StatementResult {
             Self::Query(result) => formatter.debug_tuple("Query").field(result).finish(),
             Self::GovernedQuery(_) => formatter.write_str("GovernedQuery(..)"),
             Self::StreamingQuery(_) => formatter.write_str("StreamingQuery(..)"),
+            Self::GovernedCompletion(_) => formatter.write_str("GovernedCompletion(..)"),
+            Self::GovernedError(_) => formatter.write_str("GovernedError(..)"),
             Self::Ok => formatter.write_str("Ok"),
         }
     }
@@ -155,6 +164,53 @@ impl GovernedImmediateStatementResult {
 
     pub(crate) fn into_parts(self) -> (QueryResult, GovernedProtocolOwner) {
         (self.result, self.protocol)
+    }
+}
+
+/// Completion-only output that retains its statement generation and business
+/// permit until the MySQL adapter has written the terminal OK packet.
+#[must_use = "the governed completion must be settled by its protocol owner"]
+pub struct GovernedCompletionStatementResult {
+    protocol: GovernedProtocolOwner,
+}
+
+impl GovernedCompletionStatementResult {
+    pub(crate) fn new(
+        resources: LocalResourceAuthority,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            protocol: GovernedProtocolOwner::new(statement, resources),
+        }
+    }
+
+    pub(crate) fn into_protocol(self) -> GovernedProtocolOwner {
+        self.protocol
+    }
+}
+
+/// Error output that retains its statement generation and business permit
+/// until the MySQL adapter has written the terminal error packet.
+#[must_use = "the governed error must be settled by its protocol owner"]
+pub struct GovernedErrorStatementResult {
+    error: QueryServiceError,
+    protocol: GovernedProtocolOwner,
+}
+
+impl GovernedErrorStatementResult {
+    pub(crate) fn new(
+        error: QueryServiceError,
+        resources: LocalResourceAuthority,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            error,
+            protocol: GovernedProtocolOwner::new(statement, resources),
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (QueryServiceError, GovernedProtocolOwner) {
+        (self.error, self.protocol)
     }
 }
 
@@ -351,6 +407,86 @@ mod tests {
             protocol.seal_success_visibility(),
             GovernedStatementVisibilitySealOutcome::Sealed
         );
+        assert_eq!(
+            protocol.fail(),
+            GovernedStatementFinishOutcome::ProtocolFailed
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_completion_retains_business_until_terminal_ok() {
+        let control = QueryControlService::new(
+            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+        );
+        let session = control
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(303, 1).expect("connection token"),
+                "root",
+            ))
+            .expect("register session");
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload control");
+        workload.mark_ready().expect("workload ready");
+        let mut statement = control
+            .begin_governed_query_statement(session.token(), &workload.root_admission(), None, None)
+            .expect("governed statement");
+        statement.complete_execution();
+        let result = GovernedCompletionStatementResult::new(workload.resources(), statement);
+
+        assert_eq!(workload.snapshot().businesses, 1);
+        let mut protocol = result.into_protocol();
+        assert_eq!(
+            protocol.seal_success_visibility(),
+            GovernedStatementVisibilitySealOutcome::Sealed
+        );
+        assert_eq!(
+            protocol.complete(),
+            GovernedStatementFinishOutcome::Completed
+        );
+        assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_error_retains_business_until_terminal_error() {
+        let control = QueryControlService::new(
+            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+        );
+        let session = control
+            .register_session(SessionIdentity::new(
+                ClientConnectionToken::new(304, 1).expect("connection token"),
+                "root",
+            ))
+            .expect("register session");
+        let workload = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload control");
+        workload.mark_ready().expect("workload ready");
+        let mut statement = control
+            .begin_governed_query_statement(session.token(), &workload.root_admission(), None, None)
+            .expect("governed statement");
+        statement.complete_execution();
+        let result = GovernedErrorStatementResult::new(
+            QueryServiceError::new(crate::QueryServiceErrorKind::Internal, "failed command"),
+            workload.resources(),
+            statement,
+        );
+
+        assert_eq!(workload.snapshot().businesses, 1);
+        let (_, mut protocol) = result.into_parts();
         assert_eq!(
             protocol.fail(),
             GovernedStatementFinishOutcome::ProtocolFailed

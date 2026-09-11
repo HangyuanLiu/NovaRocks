@@ -54,7 +54,10 @@ use self::session::{
     QuerySessionOpenRequest,
 };
 use crate::common::query_cancellation::QueryCancellationReason;
-use crate::runtime::statement_result::StatementResult;
+use crate::query_execution::control::GovernedStatementVisibilitySealOutcome;
+use crate::runtime::statement_result::{
+    GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
+};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
 const DEFAULT_MYSQL_PORT: u16 = 9030;
@@ -624,6 +627,12 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(StatementResult::StreamingQuery(result)) => {
                 write_streaming_query_result(result, results).await
             }
+            Ok(StatementResult::GovernedCompletion(result)) => {
+                write_governed_completion_result(result, results).await
+            }
+            Ok(StatementResult::GovernedError(result)) => {
+                write_governed_error_result(result, results).await
+            }
             Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
             Err(error) => {
                 results
@@ -636,6 +645,71 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         // protocol outcome.
         session.complete_statement();
         outcome
+    }
+}
+
+async fn write_governed_completion_result<W: AsyncWrite + Unpin>(
+    result: GovernedCompletionStatementResult,
+    results: QueryResultWriter<'_, W>,
+) -> io::Result<()> {
+    let mut protocol = result.into_protocol();
+    match protocol.seal_success_visibility() {
+        GovernedStatementVisibilitySealOutcome::Sealed => {
+            match results.completed(OkResponse::default()).await {
+                Ok(()) => {
+                    let _ = protocol.complete();
+                    Ok(())
+                }
+                Err(error) => {
+                    let _ = protocol.client_disconnected();
+                    Err(error)
+                }
+            }
+        }
+        GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
+            let _ = protocol.settle_cancellation();
+            results
+                .error(
+                    ErrorKind::ER_QUERY_INTERRUPTED,
+                    b"query cancelled before terminal OK",
+                )
+                .await
+        }
+        GovernedStatementVisibilitySealOutcome::Stale => {
+            let _ = protocol.fail();
+            results
+                .error(
+                    ErrorKind::ER_UNKNOWN_ERROR,
+                    b"governed statement became stale before terminal OK",
+                )
+                .await
+        }
+    }
+}
+
+async fn write_governed_error_result<W: AsyncWrite + Unpin>(
+    result: GovernedErrorStatementResult,
+    results: QueryResultWriter<'_, W>,
+) -> io::Result<()> {
+    let (error, mut protocol) = result.into_parts();
+    if protocol.cancellation().is_cancelled() {
+        let _ = protocol.settle_cancellation();
+        return results
+            .error(ErrorKind::ER_QUERY_INTERRUPTED, b"query cancelled")
+            .await;
+    }
+    match results
+        .error(mysql_error_kind(&error), error.message().as_bytes())
+        .await
+    {
+        Ok(()) => {
+            let _ = protocol.fail();
+            Ok(())
+        }
+        Err(error) => {
+            let _ = protocol.client_disconnected();
+            Err(error)
+        }
     }
 }
 
