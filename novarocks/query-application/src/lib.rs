@@ -26,6 +26,9 @@ pub mod api;
 /// First-wins statement cancellation shared by query application consumers.
 pub mod cancellation;
 
+/// Bounded process-local execution of CPU-bound query application work.
+pub mod cpu;
+
 /// Exact client-session identity and protocol-owned termination contracts.
 pub mod client_connection;
 
