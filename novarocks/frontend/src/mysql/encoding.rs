@@ -470,45 +470,47 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
         }
     };
     let columns = result_schema_to_query_result_columns(schema_delivery.schema());
-    let mysql_columns = match columns
-        .iter()
-        .map(query_result_column_to_mysql_column)
-        .collect::<Result<Vec<_>, _>>()
-    {
+    let mysql_columns = match novarocks_mysql_adapter::mysql_columns_for_result_fields(&columns) {
         Ok(columns) => columns,
         Err(error) => {
-            let error = invalid_query_result_delivery(error);
+            let error = invalid_query_result_delivery(error.to_string());
             schema_delivery.fail(error.clone());
             let _ = result.fail();
             return Err(invalid_data_error(error.to_string()));
         }
     };
-
     let cancellation = result.cancellation();
-    let start = results.start(mysql_columns.as_slice());
-    tokio::pin!(start);
-    let mut writer = tokio::select! {
-        biased;
-        error = failure.wait() => {
+    let mut writer = match novarocks_mysql_adapter::start_streaming_result(
+        results,
+        mysql_columns.as_slice(),
+        cancellation,
+        failure.clone(),
+    )
+    .await
+    {
+        Ok(writer) => writer,
+        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Native(error)) => {
             schema_delivery.fail(error.clone());
             let _ = result.fail();
             return Err(invalid_data_error(error.to_string()));
         }
-        reason = cancellation.cancelled() => {
-            let error = cancelled_query_result_delivery(reason);
+        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error)) => {
             schema_delivery.fail(error.clone());
             let _ = result.settle_cancellation();
             return Err(interrupted_error(error.to_string()));
         }
-        opened = &mut start => match opened {
-            Ok(writer) => writer,
-            Err(error) => {
-                schema_delivery.fail(failed_query_result_delivery(
-                    format!("write MySQL result schema: {error}"),
-                ));
-                let _ = result.client_disconnected();
-                return Err(error);
-            }
+        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error)) => {
+            let error = invalid_query_result_delivery(error.to_string());
+            schema_delivery.fail(error.clone());
+            let _ = result.fail();
+            return Err(invalid_data_error(error.to_string()));
+        }
+        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Io(error)) => {
+            schema_delivery.fail(failed_query_result_delivery(format!(
+                "write MySQL result schema: {error}"
+            )));
+            let _ = result.client_disconnected();
+            return Err(error);
         }
     };
     schema_delivery.complete();

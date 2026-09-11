@@ -24,7 +24,7 @@ use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultFailureView, ResultField,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use opensrv_mysql::QueryResultWriter;
+use opensrv_mysql::{Column, QueryResultWriter};
 use tokio::io::AsyncWrite;
 
 use crate::{build_mysql_row, mysql_column_for_result_field};
@@ -38,11 +38,7 @@ pub async fn write_record_batches<W: AsyncWrite + Unpin>(
     batches: &[&RecordBatch],
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    let columns = fields
-        .iter()
-        .map(mysql_column_for_result_field)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid_data_error)?;
+    let columns = mysql_columns_for_result_fields(fields)?;
     let mut writer = results.start(columns.as_slice()).await?;
     for batch in batches {
         for row_idx in 0..batch.num_rows() {
@@ -52,6 +48,37 @@ pub async fn write_record_batches<W: AsyncWrite + Unpin>(
         }
     }
     writer.finish().await
+}
+
+/// Converts immutable Query Application fields to their MySQL schema form.
+/// The returned columns must outlive the RowWriter opened with them.
+pub fn mysql_columns_for_result_fields(fields: &[ResultField]) -> io::Result<Vec<Column>> {
+    fields
+        .iter()
+        .map(mysql_column_for_result_field)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid_data_error)
+}
+
+/// Opens a streaming MySQL result after converting its immutable Query
+/// Application schema, while observing logical failure and cancellation before
+/// the schema reaches the socket.
+pub async fn start_streaming_result<'a, W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'a, W>,
+    columns: &'a [Column],
+    cancellation: QueryCancellationView,
+    mut failure: ResultFailureView,
+) -> Result<opensrv_mysql::RowWriter<'a, W>, MysqlBatchWriteError> {
+    let start = results.start(columns);
+    tokio::pin!(start);
+    tokio::select! {
+        biased;
+        error = failure.wait() => Err(MysqlBatchWriteError::Native(error)),
+        reason = cancellation.cancelled() => {
+            Err(MysqlBatchWriteError::Cancelled(cancelled_delivery(reason)))
+        }
+        writer = &mut start => writer.map_err(MysqlBatchWriteError::Io),
+    }
 }
 
 fn invalid_data_error(error: String) -> io::Error {
