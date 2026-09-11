@@ -161,12 +161,7 @@ fn statistics_string_result(
     }
     let columns = names
         .iter()
-        .map(|name| QueryResultColumn {
-            name: (*name).to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        })
+        .map(|name| QueryResultColumn::new(*name, DataType::Utf8, true, None))
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(
         names
@@ -370,8 +365,8 @@ mod tests {
         else {
             panic!("SHOW TABLE STATS must return a query result");
         };
-        assert_eq!(show_stats.columns[0].name, "metric");
-        assert_eq!(show_stats.columns[1].name, "value");
+        assert_eq!(show_stats.columns[0].name(), "metric");
+        assert_eq!(show_stats.columns[1].name(), "value");
         let value = show_stats.chunks[0].batch.column(1);
         let value = value
             .as_any()

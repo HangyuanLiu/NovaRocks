@@ -348,7 +348,7 @@ fn session_view_ddl_show_and_rewrite_preserve_existing_behavior() {
             .try_handle_statement(&engine, "SHOW   VIEWS", ctx)
             .unwrap(),
     );
-    assert_eq!(show.columns[0].name, "Views_in_db");
+    assert_eq!(show.columns[0].name(), "Views_in_db");
     assert_eq!(query_rows(&show), vec!["v1", "v2"]);
 
     let mut query = parse_query("SELECT x.a FROM v1 AS x");
@@ -546,8 +546,8 @@ fn iceberg_show_create_escapes_comment_and_show_views_is_sorted() {
             .try_handle_statement(&engine, "SHOW   CREATE VIEW ice.db.v", context(None, "db"))
             .unwrap(),
     );
-    assert_eq!(show_create.columns[0].name, "View");
-    assert_eq!(show_create.columns[1].name, "Create View");
+    assert_eq!(show_create.columns[0].name(), "View");
+    assert_eq!(show_create.columns[1].name(), "Create View");
     assert_eq!(query_rows_at(&show_create, 0), vec!["v"]);
     assert_eq!(
         query_rows_at(&show_create, 1),

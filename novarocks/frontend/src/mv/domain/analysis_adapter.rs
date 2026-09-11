@@ -249,96 +249,21 @@ pub fn analyze_mv_select_with_provider(
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
     let columns = vec![
-        QueryResultColumn {
-            name: "Name".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "Database".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "StorageEngine".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshMode".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastRefreshTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastRefreshRows".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "BaseTables".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "SelectText".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "Dependencies".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshPaused".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "NextRefreshTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastSchedulerError".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "MaxStalenessMs".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshState".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RetryAfterTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
+        QueryResultColumn::new("Name", DataType::Utf8, false, None),
+        QueryResultColumn::new("Database", DataType::Utf8, false, None),
+        QueryResultColumn::new("StorageEngine", DataType::Utf8, false, None),
+        QueryResultColumn::new("RefreshMode", DataType::Utf8, false, None),
+        QueryResultColumn::new("LastRefreshTime", DataType::Utf8, true, None),
+        QueryResultColumn::new("LastRefreshRows", DataType::Utf8, true, None),
+        QueryResultColumn::new("BaseTables", DataType::Utf8, false, None),
+        QueryResultColumn::new("SelectText", DataType::Utf8, false, None),
+        QueryResultColumn::new("Dependencies", DataType::Utf8, false, None),
+        QueryResultColumn::new("RefreshPaused", DataType::Utf8, false, None),
+        QueryResultColumn::new("NextRefreshTime", DataType::Utf8, true, None),
+        QueryResultColumn::new("LastSchedulerError", DataType::Utf8, true, None),
+        QueryResultColumn::new("MaxStalenessMs", DataType::Utf8, true, None),
+        QueryResultColumn::new("RefreshState", DataType::Utf8, false, None),
+        QueryResultColumn::new("RetryAfterTime", DataType::Utf8, true, None),
     ];
 
     let schema = Arc::new(Schema::new(vec![

@@ -28,15 +28,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-use novarocks_types::schema::SqlType;
-
-#[derive(Clone, Debug)]
-pub struct QueryResultColumn {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub logical_type: Option<SqlType>,
-}
+pub use novarocks_query_application::api::ResultField as QueryResultColumn;
 
 #[derive(Clone, Debug)]
 pub struct QueryResult {
@@ -61,12 +53,7 @@ pub fn build_string_query_result(
     column_name: &str,
     rows: Vec<String>,
 ) -> Result<QueryResult, String> {
-    let column = QueryResultColumn {
-        name: column_name.to_string(),
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: None,
-    };
+    let column = QueryResultColumn::new(column_name, DataType::Utf8, false, None);
     let schema = Arc::new(Schema::new(vec![Field::new(
         column_name,
         DataType::Utf8,
@@ -153,10 +140,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.columns.len(), 1);
-        assert_eq!(result.columns[0].name, "Explain String");
-        assert_eq!(result.columns[0].data_type, DataType::Utf8);
-        assert!(!result.columns[0].nullable);
-        assert!(result.columns[0].logical_type.is_none());
+        assert_eq!(result.columns[0].name(), "Explain String");
+        assert_eq!(result.columns[0].data_type(), &DataType::Utf8);
+        assert!(!result.columns[0].nullable());
+        assert!(result.columns[0].logical_type().is_none());
         assert_eq!(result.row_count(), 2);
         let field = result.chunks[0].schema().field(0).clone();
         assert_eq!(field.name(), "Explain String");
@@ -174,27 +161,27 @@ mod tests {
         let empty = build_string_query_result("status", Vec::new()).unwrap();
         assert_eq!(empty.row_count(), 0);
         assert_eq!(empty.chunks.len(), 1);
-        assert_eq!(empty.columns[0].name, "status");
+        assert_eq!(empty.columns[0].name(), "status");
     }
 
     #[test]
     fn query_result_column_preserves_logical_decimal_type() {
-        let column = QueryResultColumn {
-            name: "amount".to_string(),
-            data_type: DataType::Decimal128(38, -2),
-            nullable: true,
-            logical_type: Some(SqlType::Decimal {
+        let column = QueryResultColumn::new(
+            "amount",
+            DataType::Decimal128(38, -2),
+            true,
+            Some(novarocks_types::schema::SqlType::Decimal {
                 precision: 38,
                 scale: -2,
             }),
-        };
+        );
 
-        assert_eq!(column.name, "amount");
-        assert_eq!(column.data_type, DataType::Decimal128(38, -2));
-        assert!(column.nullable);
+        assert_eq!(column.name(), "amount");
+        assert_eq!(column.data_type(), &DataType::Decimal128(38, -2));
+        assert!(column.nullable());
         assert_eq!(
-            column.logical_type,
-            Some(SqlType::Decimal {
+            column.logical_type(),
+            Some(&novarocks_types::schema::SqlType::Decimal {
                 precision: 38,
                 scale: -2,
             })

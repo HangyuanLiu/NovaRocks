@@ -440,12 +440,7 @@ fn execute_typed_dml_statement(
 }
 
 fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
-    let column = QueryResultColumn {
-        name: "status".to_string(),
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: None,
-    };
+    let column = QueryResultColumn::new("status", DataType::Utf8, false, None);
     let batch = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new(
             "status",
@@ -2721,12 +2716,12 @@ async fn consume_governed_scalar_stream(
         return Err(scalar_query_error(message));
     }
     let field = &schema.schema().fields()[0];
-    let column = QueryResultColumn {
-        name: field.name().to_string(),
-        data_type: field.data_type().clone(),
-        nullable: field.nullable(),
-        logical_type: field.logical_type().cloned(),
-    };
+    let column = QueryResultColumn::new(
+        field.name(),
+        field.data_type().clone(),
+        field.nullable(),
+        field.logical_type().cloned(),
+    );
     schema.complete();
 
     let mut value = None;

@@ -261,11 +261,13 @@ fn build_query_result(
 ) -> Result<QueryResult, String> {
     let query_columns = columns
         .iter()
-        .map(|column| QueryResultColumn {
-            name: column.sql_name().to_string(),
-            data_type: column.data_type(),
-            nullable: column.nullable(),
-            logical_type: None,
+        .map(|column| {
+            QueryResultColumn::new(
+                column.sql_name(),
+                column.data_type(),
+                column.nullable(),
+                None,
+            )
         })
         .collect::<Vec<_>>();
     let fields = columns

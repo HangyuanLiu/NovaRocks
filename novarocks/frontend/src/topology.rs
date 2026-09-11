@@ -1062,12 +1062,7 @@ impl BackendTopologyPort for ClusterBackendService {
         Ok(QueryResult {
             columns: names
                 .iter()
-                .map(|name| QueryResultColumn {
-                    name: (*name).to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                })
+                .map(|name| QueryResultColumn::new(*name, DataType::Utf8, false, None))
                 .collect(),
             chunks: vec![record_batch_to_chunk(batch)?],
         })
@@ -1708,7 +1703,7 @@ mod tests {
         let names = result
             .columns
             .iter()
-            .map(|column| column.name.clone())
+            .map(|column| column.name().to_string())
             .collect::<Vec<_>>();
         let index = |name: &str| {
             names
@@ -1883,7 +1878,7 @@ mod tests {
             .unwrap()
             .columns
             .into_iter()
-            .map(|column| column.name)
+            .map(|column| column.name().to_string())
             .collect::<Vec<_>>();
         assert!(columns.contains(&"LeaseValid".to_string()));
         assert!(columns.contains(&"IdentityVerified".to_string()));

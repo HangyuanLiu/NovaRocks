@@ -241,7 +241,7 @@ fn build_query_result(
 ) -> Result<QueryResult, String> {
     let fields = columns
         .iter()
-        .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
+        .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|error| format!("{context} failed: {error}"))?;
@@ -262,10 +262,5 @@ fn build_query_result(
 }
 
 fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn {
-    QueryResultColumn {
-        name: name.to_string(),
-        data_type,
-        nullable,
-        logical_type: None,
-    }
+    QueryResultColumn::new(name, data_type, nullable, None)
 }

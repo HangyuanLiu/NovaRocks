@@ -348,12 +348,7 @@ fn build_query_result(columns: Vec<(String, Vec<String>)>) -> Result<QueryResult
     Ok(QueryResult {
         columns: columns
             .into_iter()
-            .map(|(name, _)| QueryResultColumn {
-                name,
-                data_type: DataType::Utf8,
-                nullable: false,
-                logical_type: None,
-            })
+            .map(|(name, _)| QueryResultColumn::new(name, DataType::Utf8, false, None))
             .collect(),
         chunks: vec![chunk],
     })

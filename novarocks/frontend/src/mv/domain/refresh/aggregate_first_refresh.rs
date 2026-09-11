@@ -28,7 +28,7 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
-use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
+use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
 use novarocks_parser::{ast, printer};
@@ -384,7 +384,7 @@ fn normalize_and_materialize_aggregate_read(
         .result
         .columns
         .iter()
-        .map(|column| column.name.as_str())
+        .map(QueryResultColumn::name)
         .collect::<Vec<_>>();
     let metadata_permutation = exact_name_permutation(
         &metadata_names,
@@ -396,9 +396,13 @@ fn normalize_and_materialize_aggregate_read(
         .iter()
         .zip(target_names.iter())
         .map(|(source_index, target_name)| {
-            let mut column = old_columns[*source_index].clone();
-            column.name.clone_from(target_name);
-            column
+            let column = &old_columns[*source_index];
+            QueryResultColumn::new(
+                target_name.as_str(),
+                column.data_type().clone(),
+                column.nullable(),
+                column.logical_type().cloned(),
+            )
         })
         .collect();
 
@@ -850,18 +854,13 @@ mod tests {
         .expect("state-shaped result batch");
         QueryResult {
             columns: vec![
-                QueryResultColumn {
-                    name: "__agg_state_c".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
-                    logical_type: Some(SqlType::Binary),
-                },
-                QueryResultColumn {
-                    name: group_key.to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    logical_type: Some(SqlType::String),
-                },
+                QueryResultColumn::new(
+                    "__agg_state_c",
+                    DataType::Binary,
+                    false,
+                    Some(SqlType::Binary),
+                ),
+                QueryResultColumn::new(group_key, DataType::Utf8, true, Some(SqlType::String)),
             ],
             chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
         }
@@ -997,7 +996,12 @@ mod tests {
         for names in [["unexpected", "region"], ["region", "region"]] {
             let mut result = reordered_count_result();
             for (column, name) in result.columns.iter_mut().zip(names) {
-                column.name = name.to_string();
+                *column = QueryResultColumn::new(
+                    name,
+                    column.data_type().clone(),
+                    column.nullable(),
+                    column.logical_type().cloned(),
+                );
             }
 
             let error = prepare_with_result(result).expect_err("metadata names must be exact");

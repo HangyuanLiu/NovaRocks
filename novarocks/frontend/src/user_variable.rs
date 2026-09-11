@@ -49,7 +49,7 @@ pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<Str
             .columns
             .first()
             .ok_or_else(|| "user variable assignment missing column metadata".to_string())?;
-        return query_result_cell_to_user_variable_sql(column, &declared.data_type, 0);
+        return query_result_cell_to_user_variable_sql(column, declared.data_type(), 0);
     }
     Ok("null".to_string())
 }

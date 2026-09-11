@@ -508,12 +508,7 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
     Ok(QueryResult {
         columns: columns
             .into_iter()
-            .map(|name| QueryResultColumn {
-                name,
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: None,
-            })
+            .map(|name| QueryResultColumn::new(name, DataType::Utf8, true, None))
             .collect(),
         chunks: vec![chunk],
     })

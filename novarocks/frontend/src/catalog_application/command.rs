@@ -662,18 +662,8 @@ fn execute_show_create_table(
     Ok(StatementResult::Query(
         crate::runtime::query_result::QueryResult {
             columns: vec![
-                QueryResultColumn {
-                    name: "Table".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                },
-                QueryResultColumn {
-                    name: "Create Table".to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                },
+                QueryResultColumn::new("Table", DataType::Utf8, false, None),
+                QueryResultColumn::new("Create Table", DataType::Utf8, false, None),
             ],
             chunks: vec![crate::runtime::query_result::record_batch_to_chunk(batch)?],
         },

@@ -871,16 +871,7 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
 }
 
 fn result_schema_to_query_result_columns(schema: &ResultSchema) -> Vec<QueryResultColumn> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| QueryResultColumn {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.nullable(),
-            logical_type: field.logical_type().cloned(),
-        })
-        .collect()
+    schema.fields().to_vec()
 }
 
 fn mysql_result_schema_protocol_bytes_upper_bound(schema: &ResultSchema) -> Result<u64, String> {
@@ -894,7 +885,7 @@ fn mysql_query_result_schema_protocol_bytes_upper_bound(
     columns: &[QueryResultColumn],
 ) -> Result<u64, String> {
     mysql_schema_protocol_bytes_upper_bound(
-        columns.iter().map(|column| column.name.as_str()),
+        columns.iter().map(QueryResultColumn::name),
         columns.len(),
     )
 }
@@ -1004,19 +995,18 @@ fn mysql_text_cell_upper_bound(
         return Ok(1);
     }
     if declared
-        .logical_type
-        .as_ref()
+        .logical_type()
         .is_some_and(|logical| matches!(logical, novarocks_types::schema::SqlType::Decimal { .. }))
     {
         return mysql_lenenc_string_upper_bound(48);
     }
-    if matches!(declared.data_type, DataType::Date32)
+    if matches!(declared.data_type(), DataType::Date32)
         && matches!(column.data_type(), DataType::Timestamp(_, _))
     {
         return mysql_lenenc_string_upper_bound(10);
     }
     if matches!(
-        declared.data_type,
+        declared.data_type(),
         DataType::Time32(_) | DataType::Time64(_)
     ) && matches!(column.data_type(), DataType::Timestamp(_, _))
     {
@@ -1024,7 +1014,7 @@ fn mysql_text_cell_upper_bound(
     }
     if schema.renders_opaque_binary()
         || (matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
-            && is_opaque_aggregate_column(&declared.name))
+            && is_opaque_aggregate_column(declared.name()))
     {
         return Ok(1);
     }
@@ -1469,12 +1459,12 @@ mod streaming_result_tests {
             vec![Arc::new(Int64Array::from(vec![i64::MIN]))],
         )
         .unwrap();
-        let columns = vec![QueryResultColumn {
-            name: "value".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
-            logical_type: None,
-        }];
+        let columns = vec![QueryResultColumn::new(
+            "value",
+            DataType::Int64,
+            false,
+            None,
+        )];
 
         // i64 text has at most 20 digits, one length byte, and one four-byte
         // packet header. opensrv may retain one fallback copy after a partial
@@ -1576,12 +1566,12 @@ mod streaming_result_tests {
             vec![Arc::new(list)],
         )
         .unwrap();
-        let columns = vec![QueryResultColumn {
-            name: "items".to_string(),
-            data_type: field.data_type().clone(),
-            nullable: false,
-            logical_type: None,
-        }];
+        let columns = vec![QueryResultColumn::new(
+            "items",
+            field.data_type().clone(),
+            false,
+            None,
+        )];
         let upper = mysql_text_batch_protocol_bytes_upper_bound(&batch, &columns).unwrap();
         let values = build_mysql_row(&batch, &columns, 0).unwrap();
         let mut rendered = Vec::new();
@@ -1954,12 +1944,7 @@ mod streaming_result_tests {
 pub(super) fn query_result_column_to_mysql_column(
     column: &QueryResultColumn,
 ) -> Result<Column, String> {
-    mysql_column_for_result_field(&novarocks_query_application::api::ResultField::new(
-        column.name.clone(),
-        column.data_type.clone(),
-        column.nullable,
-        column.logical_type.clone(),
-    ))
+    mysql_column_for_result_field(column)
 }
 
 pub(super) fn build_mysql_row(
@@ -2003,19 +1988,17 @@ pub(super) fn array_value_to_mysql_value(
         return Ok(StandaloneMysqlValue::Null);
     }
 
-    if let Some(novarocks_types::schema::SqlType::Decimal { scale, .. }) =
-        declared.logical_type.as_ref()
-    {
+    if let Some(novarocks_types::schema::SqlType::Decimal { scale, .. }) = declared.logical_type() {
         return decimal_to_mysql_value(column, row_idx, *scale);
     }
 
-    if matches!(declared.data_type, DataType::Date32)
+    if matches!(declared.data_type(), DataType::Date32)
         && matches!(column.data_type(), DataType::Timestamp(_, _))
     {
         return timestamp_to_date_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
     }
     if matches!(
-        declared.data_type,
+        declared.data_type(),
         DataType::Time32(_) | DataType::Time64(_)
     ) && matches!(column.data_type(), DataType::Timestamp(_, _))
     {
@@ -2026,7 +2009,7 @@ pub(super) fn array_value_to_mysql_value(
         return Ok(StandaloneMysqlValue::Null);
     }
 
-    let name_lower = declared.name.to_lowercase();
+    let name_lower = declared.name().to_lowercase();
     if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
         && (name_lower.starts_with("bitmap_agg(")
             || name_lower.starts_with("bitmap_union(")
@@ -2345,12 +2328,7 @@ mod tests {
 
     #[test]
     fn declared_date_timestamp_value_serializes_without_time_component() {
-        let declared = QueryResultColumn {
-            name: "d".to_string(),
-            data_type: DataType::Date32,
-            nullable: false,
-            logical_type: None,
-        };
+        let declared = QueryResultColumn::new("d", DataType::Date32, false, None);
         let value = array_value_to_mysql_value(
             &(Arc::new(TimestampMicrosecondArray::from(vec![
                 1_580_601_600_000_000i64,
@@ -2410,12 +2388,12 @@ mod tests {
                 .expect("chunk schema"),
             ),
         );
-        let columns = vec![QueryResultColumn {
-            name: "payload".to_string(),
-            data_type: array.data_type().clone(),
-            nullable: true,
-            logical_type: None,
-        }];
+        let columns = vec![QueryResultColumn::new(
+            "payload",
+            array.data_type().clone(),
+            true,
+            None,
+        )];
 
         let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
 
@@ -2451,12 +2429,12 @@ mod tests {
                 .expect("chunk schema"),
             ),
         );
-        let columns = vec![QueryResultColumn {
-            name: "payload".to_string(),
-            data_type: array.data_type().clone(),
-            nullable: true,
-            logical_type: None,
-        }];
+        let columns = vec![QueryResultColumn::new(
+            "payload",
+            array.data_type().clone(),
+            true,
+            None,
+        )];
 
         let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
 

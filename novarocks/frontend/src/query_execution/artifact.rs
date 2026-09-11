@@ -2164,11 +2164,8 @@ impl ExpectedOutputSchema {
             columns: self
                 .output_columns
                 .into_iter()
-                .map(|column| QueryResultColumn {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                    logical_type: None,
+                .map(|column| {
+                    QueryResultColumn::new(column.name, column.data_type, column.nullable, None)
                 })
                 .collect(),
             chunks,
