@@ -1886,57 +1886,19 @@ impl QuerySession for FrontendQuerySession {
     }
 
     async fn execute_batch(&self, sql: &str) -> Result<StatementResult, QueryServiceError> {
-        // Match the standalone MySQL session contract: a batch returns its
-        // most recent result set even when subsequent DDL/session statements
-        // complete successfully. In particular, all-in-one routes through
-        // this frontend session before reaching the Stage/Start lifecycle.
-        let mut last_query_result = None;
-        let mut cursor = SqlBatchCursor::new(sql);
-        while cursor.has_remaining() {
-            // The lifecycle lease intentionally precedes fragment scanning and
-            // parsing. This makes the admission latch the linearization point
-            // even for malformed SQL and for later batch fragments.
-            let admission = self
-                .service
-                .serving_lifecycle
-                .try_admit(FrontendWorkloadKind::Statement)
-                .map_err(query_service_admission_error)?;
-            let Some(statement) = cursor.next_fragment()? else {
-                break;
-            };
-            // Empty/comment-only fragments release their just-acquired lease
-            // before any session mutation or execution starts.
-            if strip_leading_line_comments(statement.trim()).is_empty() {
-                continue;
-            }
-            match self.execute_statement(statement, admission).await? {
-                StatementResult::Query(result) => last_query_result = Some(result),
-                StatementResult::GovernedQuery(result) => {
-                    if cursor.has_nonempty_remaining()? {
-                        drop(result);
-                        return Err(QueryServiceError::new(
-                            QueryServiceErrorKind::Unsupported,
-                            "a governed SELECT must be the final nonempty statement in its SQL batch",
-                        ));
-                    }
-                    return Ok(StatementResult::GovernedQuery(result));
-                }
-                StatementResult::StreamingQuery(result) => {
-                    if cursor.has_nonempty_remaining()? {
-                        drop(result);
-                        return Err(QueryServiceError::new(
-                            QueryServiceErrorKind::Unsupported,
-                            "a streaming SELECT must be the final nonempty statement in its SQL batch",
-                        ));
-                    }
-                    return Ok(StatementResult::StreamingQuery(result));
-                }
-                StatementResult::Ok => {}
-            }
-        }
-        Ok(last_query_result
-            .map(StatementResult::Query)
-            .unwrap_or(StatementResult::Ok))
+        // Preserve the serving lifecycle's admission linearization before
+        // inspecting the COM_QUERY. The current handshake advertises neither
+        // multi-statement nor multi-result support, so inspection still
+        // completes before execution can mutate session or catalog state.
+        let admission = self
+            .service
+            .serving_lifecycle
+            .try_admit(FrontendWorkloadKind::Statement)
+            .map_err(query_service_admission_error)?;
+        let Some(statement) = unnegotiated_query_statement(sql)? else {
+            return Ok(StatementResult::Ok);
+        };
+        self.execute_statement(statement, admission).await
     }
 
     fn complete_statement(&self) {
@@ -2188,26 +2150,7 @@ impl<'a> SqlBatchCursor<'a> {
         self.offset < self.sql.len()
     }
 
-    fn has_nonempty_remaining(&self) -> Result<bool, QueryServiceError> {
-        let mut probe = self.clone();
-        while let Some(fragment) = probe.next_fragment()? {
-            let fragment = strip_leading_line_comments(fragment.trim());
-            if fragment.is_empty() {
-                continue;
-            }
-            if parse_optional_single_statement(fragment)
-                .map_err(|error| query_application_parse_error(error, fragment))?
-                .is_some()
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Returns one raw semicolon-delimited fragment. The cursor never scans a
-    /// later fragment, so draining between statements does not parse or admit
-    /// work that has not crossed the lifecycle gate yet.
+    /// Returns one raw semicolon-delimited fragment.
     fn next_fragment(&mut self) -> Result<Option<&'a str>, QueryServiceError> {
         if !self.has_remaining() {
             return Ok(None);
@@ -2274,6 +2217,35 @@ impl<'a> SqlBatchCursor<'a> {
         self.offset = self.sql.len();
         Ok(Some(&self.sql[start..]))
     }
+}
+
+/// Return the one SQL statement permitted by the current MySQL capability
+/// negotiation. The protocol adapter currently advertises neither multi
+/// statements nor multi results, so it must reject all batches before a
+/// statement can produce an externally visible effect.
+fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
+    let mut cursor = SqlBatchCursor::new(sql);
+    let mut statement = None;
+    while let Some(fragment) = cursor.next_fragment()? {
+        let trimmed = strip_leading_line_comments(fragment.trim());
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_statement = admin_raise_engine_error(trimmed)?.is_some()
+            || parse_optional_single_statement(trimmed)
+                .map_err(|error| query_application_parse_error(error, trimmed))?
+                .is_some();
+        if !is_statement {
+            continue;
+        }
+        if statement.replace(fragment).is_some() {
+            return Err(QueryServiceError::new(
+                QueryServiceErrorKind::Unsupported,
+                "multiple SQL statements require negotiated MySQL multi-statement support",
+            ));
+        }
+    }
+    Ok(statement)
 }
 
 fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
@@ -4035,38 +4007,27 @@ mod tests {
     }
 
     #[test]
-    fn streaming_tail_detection_ignores_comments_and_rejects_a_real_statement() {
-        let mut comments = SqlBatchCursor::new("SELECT 1; /* trailing comment */; -- done");
-        assert_eq!(comments.next_fragment().unwrap(), Some("SELECT 1"));
-        assert!(!comments.has_nonempty_remaining().unwrap());
-
-        let mut statement = SqlBatchCursor::new("SELECT 1; /* comment */; SET query_timeout = 1");
-        assert_eq!(statement.next_fragment().unwrap(), Some("SELECT 1"));
-        assert!(statement.has_nonempty_remaining().unwrap());
+    fn unnegotiated_query_accepts_one_statement_with_empty_and_comment_fragments() {
+        assert_eq!(
+            unnegotiated_query_statement("; /* leading comment */; SELECT ';'; -- done\n")
+                .expect("one statement is valid"),
+            Some(" SELECT ';'")
+        );
+        assert_eq!(
+            unnegotiated_query_statement("; -- comment only\n; /* still empty */")
+                .expect("comments are not statements"),
+            None
+        );
     }
 
     #[test]
-    fn streaming_batch_tail_check_ignores_empty_fragments_and_rejects_work() {
-        let mut final_query = SqlBatchCursor::new("SELECT 1; ; -- trailing comment\n");
+    fn unnegotiated_query_rejects_multiple_statements_before_execution() {
+        let error = unnegotiated_query_statement("SET query_timeout = 1; SELECT 1")
+            .expect_err("multi-statement COM_QUERY must fail closed");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
         assert_eq!(
-            final_query.next_fragment().expect("first fragment"),
-            Some("SELECT 1")
-        );
-        assert!(
-            !final_query
-                .has_nonempty_remaining()
-                .expect("comment-only tail")
-        );
-
-        let mut followed = SqlBatchCursor::new("SELECT 1; SET query_timeout = 1");
-        assert_eq!(
-            followed.next_fragment().expect("first fragment"),
-            Some("SELECT 1")
-        );
-        assert!(
-            followed
-                .has_nonempty_remaining()
-                .expect("valid trailing statement")
+            error.message(),
+            "multiple SQL statements require negotiated MySQL multi-statement support"
         );
     }
 
