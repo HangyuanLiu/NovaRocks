@@ -44,9 +44,6 @@ use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_frontend::catalog_attachment::{
     CatalogAttachment, CatalogAttachmentErrorKind, CatalogAttachmentRepository,
 };
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -62,6 +59,9 @@ use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
     GcOwnedRefObservationErrorKind,
+};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,

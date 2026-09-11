@@ -26,7 +26,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::definition::{
     MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
     StoredMvDefinition,
@@ -34,6 +33,7 @@ use crate::mv::domain::persistence::definition::{
 use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
 use crate::state_family::StateFamily;
+use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};

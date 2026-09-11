@@ -627,10 +627,10 @@ fn backoff_ms(config: &FrontendMvSchedulerConfig, attempt: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::persisted_query_definition::{
+    use bytes::Bytes;
+    use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
-    use bytes::Bytes;
 
     fn definition(policy: MvDesiredRefreshPolicy) -> StoredMvDefinition {
         let refresh_interval_ms =

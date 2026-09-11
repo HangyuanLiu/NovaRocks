@@ -21,9 +21,6 @@ use std::time::{Duration, Instant};
 
 use arrow::array::{Array, StringArray};
 use novarocks_frontend::FrontendViewService;
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
@@ -32,6 +29,9 @@ use novarocks_parser::{
     Span,
     ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
     printer::print_query,
+};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
 

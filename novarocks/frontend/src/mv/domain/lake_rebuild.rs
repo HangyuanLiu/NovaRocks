@@ -666,9 +666,9 @@ mod tests {
             descriptor_version: 3,
             package_id: "analytics.mv_orders".to_string(),
             query_definition:
-                crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                novarocks_query_application::persisted_query_definition::PersistedQueryDefinition::new(
                     "SELECT id FROM ice.sales.orders",
-                    crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                    novarocks_query_application::persisted_query_definition::PersistedQueryDialect::StarRocks,
                     "ice",
                     "sales",
                 )

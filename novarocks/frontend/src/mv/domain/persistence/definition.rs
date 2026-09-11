@@ -20,8 +20,8 @@ use std::collections::BTreeMap;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use serde::{Deserialize, Serialize};
 
-use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
+use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 pub(crate) const MV_ACCELERATOR_PROJECTION_SUBJECT: &str = "mv.accelerator_projection";
 

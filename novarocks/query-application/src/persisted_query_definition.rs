@@ -15,11 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The durable contract for a query definition that must survive a Frontend restart.
+//! Durable query-definition facts that survive a process restart.
 //!
-//! This deliberately contains the effective user query source, rather than an AST
-//! printer result.  Consumers may derive normalized or qualified compiler input from
-//! it for one request, but those derived values are not durable facts.
+//! The definition deliberately contains the effective user query source rather
+//! than an AST printer result. Consumers may derive normalized or qualified
+//! compiler input for one request, but those derived values are not durable
+//! facts.
 
 use novarocks_types::naming::normalize_identifier;
 use serde::{Deserialize, Serialize};

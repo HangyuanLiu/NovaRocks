@@ -994,9 +994,6 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 pub(crate) mod tests_support {
     use std::sync::Arc;
 
-    use crate::common::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
     use crate::mv::domain::persistence::definition::StoredMvDefinition;
     use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
     use mv_schema::{
@@ -1004,6 +1001,9 @@ pub(crate) mod tests_support {
         HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
         MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
         TargetContract, TargetVisibleColumn,
+    };
+    use novarocks_query_application::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
     };
     use novarocks_sql::planning::mv::{
         MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,

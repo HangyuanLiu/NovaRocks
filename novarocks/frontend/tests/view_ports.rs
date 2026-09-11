@@ -17,9 +17,6 @@
 
 use std::collections::HashMap;
 
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_frontend::view::{
     CreateExternalViewRequest, ResolvedExternalView, ViewColumnDefinition, ViewEngine,
     ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
@@ -27,6 +24,9 @@ use novarocks_frontend::view::{
 use novarocks_parser::{
     Span,
     ast::{Ident, ObjectName, TypeName},
+};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 
 fn native_bigint_type() -> TypeName {

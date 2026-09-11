@@ -19,9 +19,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -36,6 +33,9 @@ use novarocks_frontend::mv::domain::repository::{
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_frontend::state_store::StateStoreRunPolicy;
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 #[path = "common/mod.rs"]

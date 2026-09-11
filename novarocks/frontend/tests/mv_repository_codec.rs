@@ -18,9 +18,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
-use novarocks_frontend::common::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -36,6 +33,9 @@ use novarocks_frontend::mv::repository::codec::{
 use novarocks_frontend::mv::repository::key::{
     MvKeyKind, decode_key, dependency_by_downstream_key, dependency_by_upstream_key,
     projection_by_id_key, sequence_key, target_lookup_key,
+};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{Key, Value};

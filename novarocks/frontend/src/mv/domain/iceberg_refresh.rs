@@ -345,9 +345,9 @@ impl MvEngine for StandaloneMvEngine {
         let projection_seed = MvCreateProjectionSeed {
             definition: CreateMvDefinitionRequest {
                 query_definition:
-                    crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                    novarocks_query_application::persisted_query_definition::PersistedQueryDefinition::new(
                         request.statement.select_sql.clone(),
-                        crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                        novarocks_query_application::persisted_query_definition::PersistedQueryDialect::StarRocks,
                         request.context.current_catalog.unwrap_or("default_catalog"),
                         request.context.current_database,
                     )
@@ -3887,7 +3887,8 @@ fn log_planned_iceberg_mv_affected_partitions(
 #[derive(Serialize)]
 struct RefreshDefinitionFingerprint<'a> {
     mv_id: i64,
-    query_definition: &'a crate::common::persisted_query_definition::PersistedQueryDefinition,
+    query_definition:
+        &'a novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
     canonical_select_sql: String,
     canonical_base_refs: BTreeSet<String>,
     storage_engine: &'a str,

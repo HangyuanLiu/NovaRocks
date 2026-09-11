@@ -216,11 +216,11 @@ fn stored_definition_dependency_ref_for_iceberg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
     use crate::mv::domain::dependency::model::iceberg_mv_dependency_ref;
     use crate::mv::domain::dependency::scope as dependency_scope;
+    use novarocks_query_application::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
+    };
 
     fn stored_mv_definition(
         storage_engine: &str,

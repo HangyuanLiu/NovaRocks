@@ -20,7 +20,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -29,6 +28,9 @@ use novarocks_parser::{
     printer,
 };
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) mod command;

@@ -22,9 +22,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::schema::MvSchemaContract;
 use crate::mv::domain::persistence::semantic::{MvDesiredSemantics, MvRefreshDesiredConfiguration};
+use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 pub const MV_DESCRIPTOR_V3_VERSION: u16 = 3;
 pub const MV_DESCRIPTOR_PACKAGE_ID_PROP: &str = "novarocks.mv.descriptor.package-id";
@@ -302,7 +302,7 @@ mod tests {
                 "analytics.mv_orders".to_string(),
                 PersistedQueryDefinition::new(
                     "SELECT id FROM ice.sales.orders",
-                    crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                    novarocks_query_application::persisted_query_definition::PersistedQueryDialect::StarRocks,
                     "ice",
                     "sales",
                 )

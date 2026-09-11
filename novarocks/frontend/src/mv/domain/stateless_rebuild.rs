@@ -132,7 +132,8 @@ pub(crate) struct ImvStatelessRebuildRequest {
 /// versions and next-run bookkeeping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MvRebuildEquivalenceSnapshot {
-    query_definition: crate::common::persisted_query_definition::PersistedQueryDefinition,
+    query_definition:
+        novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
     base_table_refs: Vec<String>,
     primary_key_columns: Vec<String>,
     schema_contract: crate::mv::domain::persistence::schema::MvSchemaContract,

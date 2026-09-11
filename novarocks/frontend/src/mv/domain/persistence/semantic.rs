@@ -23,10 +23,10 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
 use crate::mv::domain::persistence::descriptor::DescriptorDependency;
 use crate::mv::domain::persistence::schema::MvSchemaContract;
+use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
