@@ -20,23 +20,32 @@
 use std::io;
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeListArray, LargeStringArray, ListArray, MapArray, StringArray, StructArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
+    MapArray, StringArray, StructArray,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+#[cfg(test)]
+use arrow::array::{
+    BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
+#[cfg(test)]
+use arrow::datatypes::TimeUnit;
 use arrow::record_batch::RecordBatch;
+#[cfg(test)]
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, U24_MAX};
 use tokio::io::AsyncWrite;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::runtime::statement_result::GovernedImmediateStatementResult;
+#[cfg(test)]
+use novarocks_mysql_adapter::MysqlResultValue as StandaloneMysqlValue;
 use novarocks_mysql_adapter::{
-    MysqlResultValue as StandaloneMysqlValue, mysql_column_for_result_field,
+    build_mysql_row as mysql_adapter_build_mysql_row, mysql_column_for_result_field,
 };
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
@@ -46,7 +55,9 @@ use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCa
 use novarocks_query_application::protocol_delivery::ImmediateResultBatch;
 use novarocks_query_application::protocol_delivery::StreamingStatementResult;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
-use novarocks_types::{FieldRenderSchema, format_mysql_container_value_with_schema};
+use novarocks_types::FieldRenderSchema;
+#[cfg(test)]
+use novarocks_types::format_mysql_container_value_with_schema;
 use novarocks_workload_control::{
     LocalResourceAuthority, Reservation, ResourceClass, WorkError, WorkScope,
 };
@@ -96,7 +107,7 @@ pub(super) async fn write_query_result<W: AsyncWrite + Unpin>(
     let mut writer = results.start(columns.as_slice()).await?;
     for chunk in &result.chunks {
         for row_idx in 0..chunk.len() {
-            let row = build_mysql_row(&chunk.batch, &result.columns, row_idx)
+            let row = mysql_adapter_build_mysql_row(&chunk.batch, &result.columns, row_idx)
                 .map_err(invalid_data_error)?;
             writer.write_row(row).await?;
         }
@@ -824,7 +835,7 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
     mut failure: ResultFailureView,
 ) -> Result<(), ProtocolWriteFailure> {
     for row_idx in 0..batch.num_rows() {
-        let values = build_mysql_row(batch, columns, row_idx)
+        let values = mysql_adapter_build_mysql_row(batch, columns, row_idx)
             .map_err(invalid_data_error)
             .map_err(ProtocolWriteFailure::Encoding)?;
         let write = writer.write_row(values);
@@ -852,7 +863,7 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
     cancellation: QueryCancellationView,
 ) -> Result<(), ProtocolWriteFailure> {
     for row_idx in 0..batch.num_rows() {
-        let values = build_mysql_row(batch, columns, row_idx)
+        let values = mysql_adapter_build_mysql_row(batch, columns, row_idx)
             .map_err(invalid_data_error)
             .map_err(ProtocolWriteFailure::Encoding)?;
         let write = writer.write_row(values);
@@ -1947,6 +1958,7 @@ pub(super) fn query_result_column_to_mysql_column(
     mysql_column_for_result_field(column)
 }
 
+#[cfg(test)]
 pub(super) fn build_mysql_row(
     batch: &RecordBatch,
     columns: &[QueryResultColumn],
@@ -1978,6 +1990,7 @@ pub(super) fn build_mysql_row(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn array_value_to_mysql_value(
     column: &ArrayRef,
     declared: &QueryResultColumn,
@@ -2079,6 +2092,7 @@ pub(super) fn array_value_to_mysql_value(
     }
 }
 
+#[cfg(test)]
 fn decimal128_to_mysql_value(
     column: &ArrayRef,
     row_idx: usize,
@@ -2090,6 +2104,7 @@ fn decimal128_to_mysql_value(
     ))
 }
 
+#[cfg(test)]
 fn format_decimal128_string(value: i128, scale: i8) -> Result<String, String> {
     if scale < 0 {
         return Err(format!("unsupported decimal scale: {scale}"));
@@ -2114,6 +2129,7 @@ fn format_decimal128_string(value: i128, scale: i8) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn decimal_to_mysql_value(
     column: &ArrayRef,
     row_idx: usize,
@@ -2156,6 +2172,7 @@ fn decimal_to_mysql_value(
     Ok(StandaloneMysqlValue::Bytes(formatted.into_bytes()))
 }
 
+#[cfg(test)]
 fn timestamp_unit(data_type: &DataType) -> Result<TimeUnit, String> {
     match data_type {
         DataType::Timestamp(unit, _) => Ok(*unit),
@@ -2170,6 +2187,7 @@ fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Resul
         .ok_or_else(|| format!("failed to downcast output column to {}", expected))
 }
 
+#[cfg(test)]
 fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
     if days == novarocks_execution::exec::expr::function::date::zero_date_sentinel_date32() {
         return Ok(StandaloneMysqlValue::Bytes(b"0000-00-00".to_vec()));
@@ -2181,6 +2199,7 @@ fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
     Ok(StandaloneMysqlValue::Date(date))
 }
 
+#[cfg(test)]
 fn timestamp_to_naive_datetime(
     column: &ArrayRef,
     unit: TimeUnit,
@@ -2197,6 +2216,7 @@ fn timestamp_to_naive_datetime(
     Ok(dt.naive_utc())
 }
 
+#[cfg(test)]
 fn timestamp_raw_micros(column: &ArrayRef, unit: TimeUnit, row_idx: usize) -> Result<i128, String> {
     let raw = match unit {
         TimeUnit::Second => {
@@ -2225,6 +2245,7 @@ fn timestamp_raw_micros(column: &ArrayRef, unit: TimeUnit, row_idx: usize) -> Re
     Ok(raw)
 }
 
+#[cfg(test)]
 fn timestamp_to_mysql_value(
     column: &ArrayRef,
     unit: TimeUnit,
@@ -2235,6 +2256,7 @@ fn timestamp_to_mysql_value(
     )?))
 }
 
+#[cfg(test)]
 fn timestamp_to_date_mysql_value(
     column: &ArrayRef,
     unit: TimeUnit,
@@ -2245,6 +2267,7 @@ fn timestamp_to_date_mysql_value(
     ))
 }
 
+#[cfg(test)]
 fn timestamp_to_time_mysql_value(
     column: &ArrayRef,
     unit: TimeUnit,
@@ -2253,6 +2276,7 @@ fn timestamp_to_time_mysql_value(
     time_micros_to_mysql_value(timestamp_raw_micros(column, unit, row_idx)?)
 }
 
+#[cfg(test)]
 fn time_to_mysql_value(
     column: &ArrayRef,
     unit: TimeUnit,
@@ -2285,6 +2309,7 @@ fn time_to_mysql_value(
     time_micros_to_mysql_value(micros)
 }
 
+#[cfg(test)]
 fn time_micros_to_mysql_value(micros: i128) -> Result<StandaloneMysqlValue, String> {
     let total_seconds = micros.div_euclid(1_000_000);
     let microseconds = micros.rem_euclid(1_000_000) as u32;
