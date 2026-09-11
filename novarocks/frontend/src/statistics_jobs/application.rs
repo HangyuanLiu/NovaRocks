@@ -100,16 +100,6 @@ pub trait StatisticsTargetResolver: Send + Sync {
     ) -> Result<StatisticsTargetCapture, StatisticsApplicationError>;
 }
 
-/// Frontend composition sink installed before engine open. Frontend composition calls it once
-/// after connector control is ready, so ANALYZE submission can resolve and
-/// persist a pin without giving the durable worker a resolver.
-pub trait StatisticsTargetResolverSink: Send + Sync {
-    fn bind_statistics_target_resolver(
-        &self,
-        resolver: Arc<dyn StatisticsTargetResolver>,
-    ) -> Result<(), String>;
-}
-
 /// Read-only frontend table-statistics surface. Unlike ANALYZE submission, it is
 /// intentionally short-lived and resolves its latest table
 /// metadata only for this one short-lived read.
@@ -119,16 +109,6 @@ pub trait StatisticsTableReader: Send + Sync {
         target: &StatisticsTableTarget,
         context: ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
-}
-
-/// Frontend composition sink installed alongside the target resolver. The
-/// frontend adapts this typed result for the SQL application port; it never
-/// receives a raw SQL string or an optimizer/provider handle.
-pub trait StatisticsTableReaderSink: Send + Sync {
-    fn bind_statistics_table_reader(
-        &self,
-        reader: Arc<dyn StatisticsTableReader>,
-    ) -> Result<(), String>;
 }
 
 /// Legacy combined provider adapter contract.
@@ -143,15 +123,6 @@ pub trait StatisticsAttemptExecutor: Send + Sync {
         request: &StatisticsAttemptRequest,
         cancellation: crate::common::query_cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsApplicationError>;
-}
-
-/// Composition sink used after the frontend has installed connector control and the
-/// native coordinator.
-pub trait StatisticsAttemptExecutorSink: Send + Sync {
-    fn bind_statistics_attempt_executor(
-        &self,
-        executor: Arc<dyn StatisticsAttemptExecutor>,
-    ) -> Result<(), String>;
 }
 
 pub struct ConnectorStatisticsTargetResolver {

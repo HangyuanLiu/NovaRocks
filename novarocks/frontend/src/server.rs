@@ -183,31 +183,6 @@ pub fn build_frontend_query_session_factory(
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
 
-    core_capabilities::bind_statistics_target_resolver(
-        statistics_application.as_ref(),
-        Arc::clone(&connector_control),
-    )
-    .map_err(FrontendApplicationError::server)?;
-    core_capabilities::bind_statistics_table_reader(
-        statistics_application.as_ref(),
-        Arc::clone(&connector_control),
-    )
-    .map_err(FrontendApplicationError::server)?;
-    core_capabilities::bind_statistics_attempt_executor(
-        statistics_application.as_ref(),
-        core_capabilities::StatisticsAttemptExecutorPorts::new(
-            role,
-            Arc::clone(&connector_control),
-            Arc::clone(&typed_connector_control),
-            topology.clone(),
-            query_execution.clone(),
-            Arc::clone(&function_catalog),
-            host.lake_publication_runtime_policy()
-                .max_attempt_duration(),
-        ),
-    )
-    .map_err(FrontendApplicationError::server)?;
-
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
         Arc::clone(&function_catalog),
         Arc::clone(&catalog_service),

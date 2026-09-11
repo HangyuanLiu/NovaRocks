@@ -49,11 +49,7 @@ use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
 use crate::statistics::command::StatisticsCommandExecutor;
-use crate::statistics_jobs::application::{
-    ConnectorStatisticsTableReader, ConnectorStatisticsTargetResolver, StatisticsApplicationPort,
-    StatisticsAttemptExecutor, StatisticsAttemptExecutorSink, StatisticsTableReaderSink,
-    StatisticsTargetResolverSink,
-};
+use crate::statistics_jobs::application::StatisticsApplicationPort;
 use crate::view::command::ViewCommandExecutor;
 
 use crate::query::compiler::FrontendQueryCompiler;
@@ -665,26 +661,6 @@ pub(crate) fn bind_mv_refresh_provider_activation(
     sink.bind_mv_refresh_provider_activation(mv_refresh_provider_activation(ports))
 }
 
-/// Bind the short-lived, generation-fenced statistics target resolver.
-pub fn bind_statistics_target_resolver(
-    sink: &dyn StatisticsTargetResolverSink,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-) -> Result<(), String> {
-    sink.bind_statistics_target_resolver(Arc::new(ConnectorStatisticsTargetResolver::new(
-        connector_control,
-    )))
-}
-
-/// Bind the short-lived, generation-fenced statistics reader.
-pub fn bind_statistics_table_reader(
-    sink: &dyn StatisticsTableReaderSink,
-    connector_control: Arc<dyn ConnectorControlRegistry>,
-) -> Result<(), String> {
-    sink.bind_statistics_table_reader(Arc::new(ConnectorStatisticsTableReader::new(
-        connector_control,
-    )))
-}
-
 /// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
 ///
 /// The connector registry is intentionally absent: Core creates and retains
@@ -723,12 +699,14 @@ impl StatisticsAttemptExecutorPorts {
     }
 }
 
-/// Build the native statistics attempt executor from Frontend-owned leaves.
-pub fn statistics_attempt_executor(
+/// Build the product worker's explicit prepare/collect/publish adapter from
+/// the same role-owned leaves. This is constructed before SQL serving opens;
+/// it is deliberately not a late-bound sink on the product port.
+pub(crate) fn statistics_three_phase_attempt_executor(
     ports: StatisticsAttemptExecutorPorts,
-) -> Arc<dyn StatisticsAttemptExecutor> {
+) -> Arc<dyn novarocks_statistics_application::StatisticsAttemptExecutor> {
     Arc::new(
-        crate::statistics_jobs::attempt_executor::FrontendStatisticsAttemptExecutor::new(
+        crate::statistics_jobs::attempt_executor::FrontendThreePhaseStatisticsAttemptExecutor::new(
             crate::statistics_jobs::attempt_executor::StatisticsAttemptExecutionPorts::new(
                 ports.execution_role,
                 ports.connector_control,
@@ -740,16 +718,6 @@ pub fn statistics_attempt_executor(
             ),
         ),
     )
-}
-
-/// Bind the durable ANALYZE executor after connector control and native
-/// coordinator leaves are ready.  A missing sink remains a Frontend decision;
-/// this helper never supplies an in-memory job fallback.
-pub fn bind_statistics_attempt_executor(
-    sink: &dyn StatisticsAttemptExecutorSink,
-    ports: StatisticsAttemptExecutorPorts,
-) -> Result<(), String> {
-    sink.bind_statistics_attempt_executor(statistics_attempt_executor(ports))
 }
 
 /// Build the automatic-maintenance engine from the same maintenance command
