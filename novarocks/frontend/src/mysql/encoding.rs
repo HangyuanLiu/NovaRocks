@@ -36,14 +36,13 @@ use opensrv_mysql::{
 use tokio::io::AsyncWrite;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-use crate::runtime::statement_result::{
-    GovernedImmediateStatementResult, StreamingStatementResult,
-};
+use crate::runtime::statement_result::GovernedImmediateStatementResult;
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
+use novarocks_query_application::protocol_delivery::StreamingStatementResult;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::{FieldRenderSchema, format_mysql_container_value_with_schema};
 use novarocks_workload_control::{
@@ -1331,8 +1330,8 @@ mod streaming_result_tests {
     };
 
     use super::*;
-    use crate::runtime::statement_result::StreamingStatementResult;
     use novarocks_query_application::client_connection::ClientConnectionToken;
+    use novarocks_query_application::protocol_delivery::StreamingStatementResult;
     use novarocks_query_application::query_control::QueryApplicationControl;
     use novarocks_query_application::session_control::{
         QueryCancelOutcome, QueryControlPort, QueryControlService, QuerySessionLease,

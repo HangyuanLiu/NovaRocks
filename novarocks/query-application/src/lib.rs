@@ -51,6 +51,9 @@ pub mod sql;
 /// Query-scoped acquisition of immutable metadata and optional optimization facts.
 pub mod observation;
 
+/// Move-only settlement of governed protocol output and streaming rows.
+pub mod protocol_delivery;
+
 /// Pure, topology-free preparation and its immutable execution handoff.
 pub mod preparation;
 

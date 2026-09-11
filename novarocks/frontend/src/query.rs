@@ -1411,7 +1411,7 @@ impl FrontendQuerySession {
                 return Err(governed_execution_error(error, completion));
             }
         };
-        crate::runtime::statement_result::StreamingStatementResult::try_from_execution(
+        novarocks_query_application::protocol_delivery::StreamingStatementResult::try_from_execution(
             execution,
             self.service.workload_resources.clone(),
             statement,
