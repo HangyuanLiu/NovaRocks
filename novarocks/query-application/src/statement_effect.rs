@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use novarocks_spi::connector::LakePublicationId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ExternalDispatchKind {
+pub enum ExternalDispatchKind {
     Writer,
     Staging,
     CatalogMutation,
@@ -36,7 +36,7 @@ pub(crate) enum ExternalDispatchKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TopologyRetryClosure {
+pub enum TopologyRetryClosure {
     ExternalDispatch(ExternalDispatchKind),
     UnknownExternalDispatch,
     ControlReady,
@@ -52,13 +52,13 @@ enum EffectState {
 /// A capability issued only after the tracker positively observes that this
 /// statement has not crossed any external-effect boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TopologyRetryPermit {
+pub enum TopologyRetryPermit {
     ReadOnly,
     Mutating { publication_id: LakePublicationId },
 }
 
 impl TopologyRetryPermit {
-    pub(crate) const fn publication_id(self) -> Option<LakePublicationId> {
+    pub const fn publication_id(self) -> Option<LakePublicationId> {
         match self {
             Self::ReadOnly => None,
             Self::Mutating { publication_id } => Some(publication_id),
@@ -67,7 +67,7 @@ impl TopologyRetryPermit {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum TopologyRetryPermitError {
+pub enum TopologyRetryPermitError {
     Closed(TopologyRetryClosure),
 }
 
@@ -75,20 +75,20 @@ pub(crate) enum TopologyRetryPermitError {
 /// intentionally small and protects only the one-way state transition; no
 /// connector or provider callback is made while it is held.
 #[derive(Clone, Debug)]
-pub(crate) struct StatementEffectTracker {
+pub struct StatementEffectTracker {
     publication_id: Option<LakePublicationId>,
     state: Arc<Mutex<EffectState>>,
 }
 
 impl StatementEffectTracker {
-    pub(crate) fn read_only() -> Self {
+    pub fn read_only() -> Self {
         Self {
             publication_id: None,
             state: Arc::new(Mutex::new(EffectState::NoExternalDispatch)),
         }
     }
 
-    pub(crate) fn mutating(publication_id: LakePublicationId) -> Self {
+    pub fn mutating(publication_id: LakePublicationId) -> Self {
         Self {
             publication_id: Some(publication_id),
             state: Arc::new(Mutex::new(EffectState::NoExternalDispatch)),
@@ -98,27 +98,27 @@ impl StatementEffectTracker {
     /// Must run immediately before a writer, staging, catalog publication, or
     /// provider mutation adapter call.  A failure after this call remains
     /// closed: it is never evidence that dispatch did not occur.
-    pub(crate) fn close_before_dispatch(&self, kind: ExternalDispatchKind) {
+    pub fn close_before_dispatch(&self, kind: ExternalDispatchKind) {
         self.close(TopologyRetryClosure::ExternalDispatch(kind));
     }
 
     /// Close at an adapter boundary whose dispatch result cannot be proven.
-    pub(crate) fn close_for_unknown_dispatch(&self) {
+    pub fn close_for_unknown_dispatch(&self) {
         self.close(TopologyRetryClosure::UnknownExternalDispatch);
     }
 
     /// `ControlReady` is the crash-only boundary of this retry mechanism.
-    pub(crate) fn close_after_control_ready(&self) {
+    pub fn close_after_control_ready(&self) {
         self.close(TopologyRetryClosure::ControlReady);
     }
 
     /// Stage or Start permanently closes the pre-ready retry window even for
     /// a read-only statement.
-    pub(crate) fn close_after_stage_or_start(&self) {
+    pub fn close_after_stage_or_start(&self) {
         self.close(TopologyRetryClosure::StageOrStart);
     }
 
-    pub(crate) fn issue_topology_retry_permit(
+    pub fn issue_topology_retry_permit(
         &self,
     ) -> Result<TopologyRetryPermit, TopologyRetryPermitError> {
         match *self
@@ -134,7 +134,7 @@ impl StatementEffectTracker {
         }
     }
 
-    pub(crate) fn closure(&self) -> Option<TopologyRetryClosure> {
+    pub fn closure(&self) -> Option<TopologyRetryClosure> {
         match *self
             .state
             .lock()

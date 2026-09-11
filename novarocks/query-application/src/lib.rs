@@ -43,6 +43,8 @@ pub mod session;
 
 /// Session generations, governed statement control, and protocol settlement.
 pub mod session_control;
+/// Statement-local external-effect boundary for safe topology retry.
+pub mod statement_effect;
 
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.

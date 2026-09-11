@@ -568,7 +568,7 @@ impl PreparedIcebergWrite {
                     Box::new(IcebergWriteRoundFactory {
                         binding: Arc::clone(&self.semantic_binding),
                         effect_tracker:
-                            crate::common::statement_effect::StatementEffectTracker::mutating(
+                            novarocks_query_application::statement_effect::StatementEffectTracker::mutating(
                                 publication_id,
                             ),
                     }),
@@ -701,7 +701,7 @@ impl FrozenIcebergWriteSemanticBinding {
 
 struct IcebergWriteRoundFactory {
     binding: Arc<FrozenIcebergWriteSemanticBinding>,
-    effect_tracker: crate::common::statement_effect::StatementEffectTracker,
+    effect_tracker: novarocks_query_application::statement_effect::StatementEffectTracker,
 }
 
 impl crate::query_execution::completion::PreReadyRetryBoundary for IcebergWriteRoundFactory {

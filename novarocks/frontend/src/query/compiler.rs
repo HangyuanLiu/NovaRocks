@@ -29,7 +29,6 @@ use crate::catalog_application::virtual_table;
 use crate::common::admitted_query_context::{
     QueryExecutionContext, RequestContext, StatementAdmissionContext,
 };
-use crate::common::statement_effect::StatementEffectTracker;
 use crate::connector::connector_planning_context_for_query;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
@@ -53,6 +52,7 @@ use crate::query_execution::{PreparedQueryDistributedOperation, PreparedQueryOpe
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::statement_effect::StatementEffectTracker;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::analyze_error::AnalyzeError;
 use novarocks_sql::compiler::{
