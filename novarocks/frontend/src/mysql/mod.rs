@@ -19,11 +19,13 @@ mod encoding;
 mod error_mapping;
 pub mod session;
 
-pub use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
+pub use novarocks_mysql_adapter::{
+    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
+};
 
 use std::future::Future;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 #[cfg(test)]
@@ -61,8 +63,7 @@ use novarocks_query_application::session_control::GovernedStatementVisibilitySea
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
-const DEFAULT_MYSQL_PORT: u16 = 9030;
-const ROOT_USER: &str = "root";
+const ROOT_USER: &str = novarocks_mysql_adapter::DEFAULT_MYSQL_USER;
 const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct ClientDisconnectWatcher {
@@ -75,60 +76,6 @@ impl Drop for ClientDisconnectWatcher {
             handle.abort();
         }
     }
-}
-
-/// Fully resolved MySQL listener settings.
-///
-/// Frontend composition resolves these settings before opening the protocol
-/// listener.  The protocol server receives an already-ready
-/// [`QuerySessionFactory`]; it neither reads configuration nor opens a Core
-/// application host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ResolvedMysqlListenerSettings {
-    bind_addr: SocketAddr,
-    user: String,
-}
-
-impl ResolvedMysqlListenerSettings {
-    pub fn new(bind_addr: SocketAddr, user: impl Into<String>) -> Self {
-        Self {
-            bind_addr,
-            user: user.into(),
-        }
-    }
-
-    pub fn bind_addr(&self) -> SocketAddr {
-        self.bind_addr
-    }
-
-    pub fn user(&self) -> &str {
-        &self.user
-    }
-}
-
-/// Resolves the protocol listener settings from an already-loaded config.
-///
-/// This is the production composition boundary: Frontend owns configuration
-/// and application startup, then passes the resulting settings and a ready
-/// [`QuerySessionFactory`] to [`run_mysql_server_until_shutdown`].
-pub fn resolve_mysql_listener_settings(
-    configured_port: Option<u16>,
-    configured_user: Option<&str>,
-    port_override: Option<u16>,
-) -> Result<ResolvedMysqlListenerSettings, String> {
-    let mysql_port = port_override
-        .or(configured_port)
-        .unwrap_or(DEFAULT_MYSQL_PORT);
-    let user = configured_user.unwrap_or(ROOT_USER);
-    if user != ROOT_USER {
-        return Err(format!(
-            "standalone server only supports user `{ROOT_USER}`, got `{user}`"
-        ));
-    }
-    Ok(ResolvedMysqlListenerSettings::new(
-        SocketAddr::from((Ipv4Addr::LOCALHOST, mysql_port)),
-        user,
-    ))
 }
 
 /// Runs the MySQL protocol listener with a ready frontend-owned session
@@ -186,10 +133,10 @@ where
     F: Future<Output = ()> + Send,
     G: Future<Output = ()> + Send,
 {
-    let ready_user = settings.user.clone();
-    let session_user = settings.user;
+    let (bind_addr, session_user) = settings.into_parts();
+    let ready_user = session_user.clone();
     serve_until_drain_then_shutdown(
-        settings.bind_addr,
+        bind_addr,
         drain,
         finalize,
         move |stream, peer_addr| {
@@ -880,10 +827,8 @@ mod protocol_api_tests {
         let factory: Arc<dyn QuerySessionFactory> = Arc::new(CancellationProbeFactory {
             cancelled: Arc::clone(&cancelled),
         });
-        let settings = ResolvedMysqlListenerSettings {
-            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            user: ROOT_USER.to_string(),
-        };
+        let settings =
+            ResolvedMysqlListenerSettings::new(SocketAddr::from(([127, 0, 0, 1], 0)), ROOT_USER);
 
         run_mysql_server_until_shutdown(
             settings,
@@ -907,10 +852,8 @@ mod protocol_api_tests {
         let mut registration = connections
             .register()
             .expect("register protocol connection");
-        let settings = ResolvedMysqlListenerSettings {
-            bind_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-            user: ROOT_USER.to_string(),
-        };
+        let settings =
+            ResolvedMysqlListenerSettings::new(SocketAddr::from(([127, 0, 0, 1], 0)), ROOT_USER);
 
         run_mysql_server_until_shutdown(settings, factory, Arc::clone(&connections), async {})
             .await
@@ -1029,6 +972,7 @@ mod tests {
 
     mod shutdown_lifecycle {
         use super::*;
+        use std::net::Ipv4Addr;
 
         const TEST_TIMEOUT: Duration = Duration::from_secs(1);
 

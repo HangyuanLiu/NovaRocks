@@ -184,9 +184,9 @@ def main():
     verify_forbidden_closure(metadata, WORKLOAD, WORKLOAD_FORBIDDEN)
     if CATALOG in package_names(metadata):
         verify_forbidden_closure(metadata, CATALOG, CATALOG_FORBIDDEN)
+    verify_forbidden_closure(metadata, QUERY, QUERY_FORBIDDEN)
     verify_products(metadata)
     verify_mysql_adapter(metadata)
-    verify_forbidden_closure(metadata, QUERY, QUERY_FORBIDDEN)
     if WORKLOAD not in normal_closure(metadata, QUERY):
         fail(f"{QUERY} normal dependency closure must contain {WORKLOAD}")
     print("application domain dependency boundary: PASS")

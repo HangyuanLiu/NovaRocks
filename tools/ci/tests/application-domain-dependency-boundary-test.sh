@@ -49,7 +49,7 @@ assert_edge_rejected() {
           dep_kinds: [{kind: null, target: null}]
         }]
       else
-        .deps |= map(select(.pkg != $source_id))
+        .
       end
     )
   ' "$base_metadata" >"$output"
@@ -91,7 +91,7 @@ jq --arg query_id "$query_id" --arg worker_id "$worker_id" '
         dep_kinds: [{kind: null, target: "cfg(target_os = \"none\")"}]
       }]
     else
-      .deps |= map(select(.pkg != $query_id))
+      .
     end
   )
 ' "$base_metadata" >"$target_gated"
@@ -159,32 +159,26 @@ grep -Fq \
   "novarocks-query-application normal dependency closure must contain novarocks-workload-control" \
   "$query_without_workload.stderr"
 
-# Future product packages are checked by package identity. A legal product to
-# query edge is accepted; adding wire ownership beside it is rejected.
-product_id="path+file:///application-boundary-fixture#novarocks-mv-application@0.0.0"
+# A product's legal query edge is accepted; adding wire ownership beside it is
+# rejected. Use the real package identity because the workspace now owns this
+# product application rather than a synthetic metadata fixture.
+product_id="$(package_id novarocks-mv-application)"
 task_codec_id="$(package_id novarocks-task-codec)"
 legal_product="$tmpdir/legal-product.json"
 jq \
   --arg product_id "$product_id" \
-  --arg query_id "$query_id" \
-  --arg workload_id "$workload_id" '
-  (.packages[] | select(.name == "novarocks-workload-control")) as $template
-  | .packages += [
-      ($template
-        | .name = "novarocks-mv-application"
-        | .id = $product_id
-        | .dependencies = [])
-    ]
-  | (.resolve.nodes[] | select(.id == $workload_id)) as $node
-  | .resolve.nodes += [
-      ($node
-        | .id = $product_id
-        | .deps = [{
-            name: "novarocks_query_application",
-            pkg: $query_id,
-            dep_kinds: [{kind: null, target: null}]
-          }])
-    ]
+  --arg query_id "$query_id" '
+  .resolve.nodes |= map(
+    if .id == $product_id then
+      .deps = [{
+        name: "novarocks_query_application",
+        pkg: $query_id,
+        dep_kinds: [{kind: null, target: null}]
+      }]
+    else
+      .
+    end
+  )
 ' "$base_metadata" >"$legal_product"
 python3 "$CHECKER" --metadata-path "$legal_product" >/dev/null
 
