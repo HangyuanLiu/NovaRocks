@@ -17,6 +17,7 @@
 
 //! MySQL protocol adaptation for Query Application contracts.
 
+mod authentication;
 mod connection_registry;
 mod error_mapping;
 mod listener;
@@ -25,6 +26,7 @@ mod listener_settings;
 use novarocks_query_application::session_error::QueryServiceErrorKind;
 use opensrv_mysql::{ErrorKind, IntermediaryOptions};
 
+pub use authentication::authenticate_empty_password;
 pub use connection_registry::MysqlClientConnectionRegistry;
 pub use error_mapping::error_kind_for_domain_code;
 pub use listener::{

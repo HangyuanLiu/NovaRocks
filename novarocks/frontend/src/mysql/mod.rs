@@ -33,7 +33,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use mysql_common::scramble::scramble_native;
 use opensrv_mysql::{
     AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, OkResponse, ParamParser,
     QueryResultWriter, StatementMetaWriter,
@@ -320,17 +319,13 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
         salt: &[u8],
         auth_data: &[u8],
     ) -> bool {
-        if auth_plugin != "mysql_native_password" || username != self.user.as_bytes() {
-            return false;
-        }
-        let authenticated = if auth_data.is_empty() {
-            true
-        } else {
-            scramble_native(salt, b"")
-                .map(|expected| auth_data == expected.as_slice())
-                .unwrap_or(false)
-        };
-        if !authenticated {
+        if !novarocks_mysql_adapter::authenticate_empty_password(
+            &self.user,
+            auth_plugin,
+            username,
+            salt,
+            auth_data,
+        ) {
             return false;
         }
         let session = match self
