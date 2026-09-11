@@ -56,7 +56,7 @@ use crate::runtime::statement_result::GovernedImmediateStatementResult;
 use crate::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason, QueryServiceError, QueryServiceErrorKind, QuerySession,
-    QuerySessionFactory, QuerySessionOpenRequest, SessionExecutionSettings,
+    QuerySessionFactory, QuerySessionOpenRequest,
 };
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -67,9 +67,11 @@ use novarocks_parser::{
     printer::{print_expr, print_statement},
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
+use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSettingError};
 use novarocks_query_application::sql::{
     SqlStatementParseError, parse_optional_single_statement, parse_single_statement,
 };
@@ -970,7 +972,8 @@ impl FrontendQuerySession {
                 })?;
                 state
                     .execution_settings
-                    .set_runtime_filter_scan_wait_time_ms(value)?;
+                    .set_runtime_filter_scan_wait_time_ms(value)
+                    .map_err(session_setting_error)?;
             }
             "global_runtime_filter_wait_timeout" => {
                 let value = value.parse::<i32>().map_err(|_| {
@@ -981,7 +984,8 @@ impl FrontendQuerySession {
                 })?;
                 state
                     .execution_settings
-                    .set_runtime_filter_wait_timeout_ms(value)?;
+                    .set_runtime_filter_wait_timeout_ms(value)
+                    .map_err(session_setting_error)?;
             }
             "disable_optimizer_rules" | "cbo_disabled_rules" => {
                 state.optimizer_settings.set_disabled_rules(
@@ -1078,7 +1082,7 @@ impl FrontendQuerySession {
             optimizer_settings,
         ));
         let query_options = with_query_hints(
-            state.execution_settings.query_options(),
+            query_options_from_session_settings(&state.execution_settings),
             match &parsed_statement {
                 ParsedStatement::Query(query) => Some(query),
                 _ => None,
@@ -1487,7 +1491,7 @@ impl FrontendQuerySession {
         let ctas_engine = Arc::clone(&self.service.ctas_engine);
         let truncate_engine = Arc::clone(&self.service.truncate_engine);
         let query_options = with_query_hints(
-            state.execution_settings.query_options(),
+            query_options_from_session_settings(&state.execution_settings),
             match &parsed_statement {
                 ParsedStatement::ExplainQuery(explain) => Some(&explain.query),
                 _ => None,
@@ -2756,6 +2760,32 @@ fn governed_query_deadline(
     ))
 }
 
+/// Frontend's one-way projection from Query Application session state into
+/// the native query-options DTO consumed at the execution boundary.
+fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
+    QueryOptions::parse(novarocks::QueryOptions {
+        group_concat_max_len: Some(settings.group_concat_max_len()),
+        query_timeout: settings
+            .query_timeout_secs()
+            .and_then(|value| value.try_into().ok())
+            .unwrap_or_default(),
+        pipeline_dop: settings.pipeline_dop().unwrap_or_default(),
+        runtime_filter_scan_wait_time_ms: settings.runtime_filter_scan_wait_time_ms(),
+        runtime_filter_wait_timeout_ms: settings.runtime_filter_wait_timeout_ms(),
+        enable_parquet_reader_page_index: settings.enable_parquet_reader_page_index(),
+        enable_scan_datacache: settings.enable_scan_datacache(),
+        enable_populate_datacache: settings.enable_populate_datacache(),
+        ..Default::default()
+    })
+    // Session settings never enable spilling, so the Protocol validation
+    // performed here cannot reject an internally constructed value.
+    .expect("session settings must satisfy the native query-options contract")
+}
+
+fn session_setting_error(error: SessionSettingError) -> QueryServiceError {
+    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error.to_string())
+}
+
 fn governed_statement_begin_error(
     error: crate::query_execution::control::GovernedQueryStatementBeginError,
 ) -> QueryServiceError {
@@ -2850,6 +2880,34 @@ mod tests {
     fn default_query_options() -> QueryOptions {
         QueryOptions::parse(novarocks_proto_models::novarocks::QueryOptions::default())
             .expect("default wire query options are valid")
+    }
+
+    #[test]
+    fn frontend_projects_query_application_session_settings_to_native_options() {
+        let mut settings = SessionExecutionSettings::default();
+        settings.set_query_timeout_secs(17);
+        settings.set_group_concat_max_len(-1);
+        settings.set_pipeline_dop(4);
+        settings
+            .set_runtime_filter_scan_wait_time_ms(0)
+            .expect("zero is valid");
+        settings
+            .set_runtime_filter_wait_timeout_ms(3)
+            .expect("positive timeout is valid");
+        settings.set_enable_parquet_reader_page_index(true);
+        settings.set_enable_scan_datacache(true);
+        settings.set_enable_populate_datacache(true);
+
+        let options = query_options_from_session_settings(&settings);
+        let proto = options.as_proto();
+        assert_eq!(proto.group_concat_max_len, Some(-1));
+        assert_eq!(proto.query_timeout, 17);
+        assert_eq!(proto.pipeline_dop, 4);
+        assert_eq!(proto.runtime_filter_scan_wait_time_ms, Some(0));
+        assert_eq!(proto.runtime_filter_wait_timeout_ms, Some(3));
+        assert!(proto.enable_parquet_reader_page_index);
+        assert!(proto.enable_scan_datacache);
+        assert!(proto.enable_populate_datacache);
     }
 
     fn scalar_stream_fixture(

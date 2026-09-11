@@ -21,6 +21,10 @@ use std::fmt;
 
 use novarocks_parser::{ParserError, ast::Statement};
 
+/// Connection-local execution settings after SQL/session validation and before
+/// a role adapter projects them into a particular wire contract.
+pub mod session;
+
 /// The application boundary accepts one already-framed SQL statement.
 ///
 /// Protocol adapters own batch framing and multi-result negotiation. Once a

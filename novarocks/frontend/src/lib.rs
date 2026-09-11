@@ -71,7 +71,7 @@ pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
 pub use mysql::session::{
     QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest, SessionExecutionSettings,
+    QuerySessionOpenRequest,
 };
 pub use mysql::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
@@ -79,6 +79,7 @@ pub use mysql::{
 };
 pub use native::report_server::FrontendReportServerHandle;
 pub use native::transport::FrontendNativeTransport;
+pub use novarocks_query_application::sql::session::SessionExecutionSettings;
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{

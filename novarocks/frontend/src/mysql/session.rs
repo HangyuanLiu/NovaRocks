@@ -30,8 +30,6 @@ use async_trait::async_trait;
 use crate::client_connection::ClientConnectionToken;
 use crate::common::query_cancellation::QueryCancellationReason;
 use crate::runtime::statement_result::StatementResult;
-use novarocks_proto_codec::lifecycle::QueryOptions;
-use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::LakePublicationTerminal;
 use novarocks_user_error::UserError;
 
@@ -39,117 +37,6 @@ use novarocks_user_error::UserError;
 pub struct QuerySessionOpenRequest {
     connection: ClientConnectionToken,
     principal: Arc<str>,
-}
-
-/// Connection-local execution settings owned by the frontend session.
-///
-/// This is intentionally a neutral value object: it materializes only the
-/// validated Protocol contract, which Core decodes at its execution boundary.
-#[derive(Clone, Debug, PartialEq)]
-pub struct SessionExecutionSettings {
-    query_timeout_secs: Option<u64>,
-    group_concat_max_len: i64,
-    pipeline_dop: Option<i32>,
-    enable_parquet_reader_page_index: bool,
-    enable_scan_datacache: bool,
-    enable_populate_datacache: bool,
-    runtime_filter_scan_wait_time_ms: Option<i64>,
-    runtime_filter_wait_timeout_ms: Option<i32>,
-}
-
-impl Default for SessionExecutionSettings {
-    fn default() -> Self {
-        Self {
-            query_timeout_secs: None,
-            group_concat_max_len: 1024,
-            pipeline_dop: None,
-            enable_parquet_reader_page_index: false,
-            enable_scan_datacache: false,
-            enable_populate_datacache: false,
-            runtime_filter_scan_wait_time_ms: None,
-            runtime_filter_wait_timeout_ms: None,
-        }
-    }
-}
-
-impl SessionExecutionSettings {
-    pub fn query_timeout_secs(&self) -> Option<u64> {
-        self.query_timeout_secs
-    }
-
-    pub fn set_query_timeout_secs(&mut self, seconds: u64) {
-        self.query_timeout_secs = (seconds > 0).then_some(seconds);
-    }
-
-    /// Keep the session value verbatim; aggregate lowering clamps it to the
-    /// supported minimum before execution.
-    pub fn set_group_concat_max_len(&mut self, value: i64) {
-        self.group_concat_max_len = value;
-    }
-
-    pub fn set_pipeline_dop(&mut self, value: i32) {
-        self.pipeline_dop = (value > 0).then_some(value);
-    }
-
-    pub fn set_enable_parquet_reader_page_index(&mut self, enabled: bool) {
-        self.enable_parquet_reader_page_index = enabled;
-    }
-
-    pub fn set_enable_scan_datacache(&mut self, enabled: bool) {
-        self.enable_scan_datacache = enabled;
-    }
-
-    pub fn set_enable_populate_datacache(&mut self, enabled: bool) {
-        self.enable_populate_datacache = enabled;
-    }
-
-    pub fn set_runtime_filter_scan_wait_time_ms(
-        &mut self,
-        value: i64,
-    ) -> Result<(), QueryServiceError> {
-        if value < 0 {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                "runtime_filter_scan_wait_time must be non-negative",
-            ));
-        }
-        self.runtime_filter_scan_wait_time_ms = Some(value);
-        Ok(())
-    }
-
-    pub fn set_runtime_filter_wait_timeout_ms(
-        &mut self,
-        value: i32,
-    ) -> Result<(), QueryServiceError> {
-        if value < 0 {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                "global_runtime_filter_wait_timeout must be non-negative",
-            ));
-        }
-        self.runtime_filter_wait_timeout_ms = Some(value);
-        Ok(())
-    }
-
-    pub fn query_options(&self) -> QueryOptions {
-        QueryOptions::parse(novarocks::QueryOptions {
-            group_concat_max_len: Some(self.group_concat_max_len),
-            query_timeout: self
-                .query_timeout_secs
-                .and_then(|value| value.try_into().ok())
-                .unwrap_or_default(),
-            pipeline_dop: self.pipeline_dop.unwrap_or_default(),
-            runtime_filter_scan_wait_time_ms: self.runtime_filter_scan_wait_time_ms,
-            runtime_filter_wait_timeout_ms: self.runtime_filter_wait_timeout_ms,
-            enable_parquet_reader_page_index: self.enable_parquet_reader_page_index,
-            enable_scan_datacache: self.enable_scan_datacache,
-            enable_populate_datacache: self.enable_populate_datacache,
-            ..Default::default()
-        })
-        // Session settings never enable spilling, so the Protocol validation
-        // performed here cannot reject an internally constructed value.
-        .expect("session query options must satisfy the Protocol contract")
-    }
 }
 
 impl QuerySessionOpenRequest {
@@ -332,69 +219,5 @@ mod tests {
         assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
         assert_eq!(error.user_error(), Some(&parser_error));
         assert_eq!(error.message(), parser_error.to_string());
-    }
-
-    #[test]
-    fn execution_settings_preserve_group_concat_value_before_materializing_options() {
-        let mut settings = SessionExecutionSettings::default();
-        settings.set_query_timeout_secs(17);
-        settings.set_pipeline_dop(4);
-        settings
-            .set_runtime_filter_scan_wait_time_ms(0)
-            .expect("zero is valid");
-        assert_eq!(settings.query_timeout_secs(), Some(17));
-        settings.set_group_concat_max_len(-1);
-        assert_eq!(
-            settings.query_options().as_proto().group_concat_max_len,
-            Some(-1)
-        );
-        let _validated_protocol_options = settings.query_options();
-    }
-
-    #[test]
-    fn execution_settings_projects_the_page_index_switch() {
-        let mut settings = SessionExecutionSettings::default();
-        assert!(
-            !settings
-                .query_options()
-                .as_proto()
-                .enable_parquet_reader_page_index
-        );
-
-        settings.set_enable_parquet_reader_page_index(true);
-        assert!(
-            settings
-                .query_options()
-                .as_proto()
-                .enable_parquet_reader_page_index
-        );
-
-        settings.set_enable_parquet_reader_page_index(false);
-        assert!(
-            !settings
-                .query_options()
-                .as_proto()
-                .enable_parquet_reader_page_index
-        );
-    }
-
-    #[test]
-    fn execution_settings_projects_external_datacache_switches() {
-        let mut settings = SessionExecutionSettings::default();
-        let initial = settings.query_options();
-        assert!(!initial.as_proto().enable_scan_datacache);
-        assert!(!initial.as_proto().enable_populate_datacache);
-
-        settings.set_enable_scan_datacache(true);
-        settings.set_enable_populate_datacache(true);
-        let enabled = settings.query_options();
-        assert!(enabled.as_proto().enable_scan_datacache);
-        assert!(enabled.as_proto().enable_populate_datacache);
-
-        settings.set_enable_scan_datacache(false);
-        settings.set_enable_populate_datacache(false);
-        let disabled = settings.query_options();
-        assert!(!disabled.as_proto().enable_scan_datacache);
-        assert!(!disabled.as_proto().enable_populate_datacache);
     }
 }

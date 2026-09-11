@@ -1,0 +1,201 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Query-application session execution state.
+
+use std::fmt;
+
+/// Connection-local settings that SQL admission has validated.
+///
+/// This type deliberately contains no protocol DTO. MySQL and native role
+/// adapters project this state into their own validated wire contracts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionExecutionSettings {
+    query_timeout_secs: Option<u64>,
+    group_concat_max_len: i64,
+    pipeline_dop: Option<i32>,
+    enable_parquet_reader_page_index: bool,
+    enable_scan_datacache: bool,
+    enable_populate_datacache: bool,
+    runtime_filter_scan_wait_time_ms: Option<i64>,
+    runtime_filter_wait_timeout_ms: Option<i32>,
+}
+
+impl Default for SessionExecutionSettings {
+    fn default() -> Self {
+        Self {
+            query_timeout_secs: None,
+            group_concat_max_len: 1024,
+            pipeline_dop: None,
+            enable_parquet_reader_page_index: false,
+            enable_scan_datacache: false,
+            enable_populate_datacache: false,
+            runtime_filter_scan_wait_time_ms: None,
+            runtime_filter_wait_timeout_ms: None,
+        }
+    }
+}
+
+impl SessionExecutionSettings {
+    pub const fn query_timeout_secs(&self) -> Option<u64> {
+        self.query_timeout_secs
+    }
+
+    pub fn set_query_timeout_secs(&mut self, seconds: u64) {
+        self.query_timeout_secs = (seconds > 0).then_some(seconds);
+    }
+
+    pub const fn group_concat_max_len(&self) -> i64 {
+        self.group_concat_max_len
+    }
+
+    /// Keep the session value verbatim; aggregate lowering clamps it to the
+    /// supported minimum before execution.
+    pub fn set_group_concat_max_len(&mut self, value: i64) {
+        self.group_concat_max_len = value;
+    }
+
+    pub const fn pipeline_dop(&self) -> Option<i32> {
+        self.pipeline_dop
+    }
+
+    pub fn set_pipeline_dop(&mut self, value: i32) {
+        self.pipeline_dop = (value > 0).then_some(value);
+    }
+
+    pub const fn enable_parquet_reader_page_index(&self) -> bool {
+        self.enable_parquet_reader_page_index
+    }
+
+    pub fn set_enable_parquet_reader_page_index(&mut self, enabled: bool) {
+        self.enable_parquet_reader_page_index = enabled;
+    }
+
+    pub const fn enable_scan_datacache(&self) -> bool {
+        self.enable_scan_datacache
+    }
+
+    pub fn set_enable_scan_datacache(&mut self, enabled: bool) {
+        self.enable_scan_datacache = enabled;
+    }
+
+    pub const fn enable_populate_datacache(&self) -> bool {
+        self.enable_populate_datacache
+    }
+
+    pub fn set_enable_populate_datacache(&mut self, enabled: bool) {
+        self.enable_populate_datacache = enabled;
+    }
+
+    pub const fn runtime_filter_scan_wait_time_ms(&self) -> Option<i64> {
+        self.runtime_filter_scan_wait_time_ms
+    }
+
+    pub fn set_runtime_filter_scan_wait_time_ms(
+        &mut self,
+        value: i64,
+    ) -> Result<(), SessionSettingError> {
+        if value < 0 {
+            return Err(SessionSettingError::NegativeRuntimeFilterScanWaitTime);
+        }
+        self.runtime_filter_scan_wait_time_ms = Some(value);
+        Ok(())
+    }
+
+    pub const fn runtime_filter_wait_timeout_ms(&self) -> Option<i32> {
+        self.runtime_filter_wait_timeout_ms
+    }
+
+    pub fn set_runtime_filter_wait_timeout_ms(
+        &mut self,
+        value: i32,
+    ) -> Result<(), SessionSettingError> {
+        if value < 0 {
+            return Err(SessionSettingError::NegativeRuntimeFilterWaitTimeout);
+        }
+        self.runtime_filter_wait_timeout_ms = Some(value);
+        Ok(())
+    }
+}
+
+/// A closed validation failure for one SQL-session setting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionSettingError {
+    NegativeRuntimeFilterScanWaitTime,
+    NegativeRuntimeFilterWaitTimeout,
+}
+
+impl fmt::Display for SessionSettingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NegativeRuntimeFilterScanWaitTime => {
+                formatter.write_str("runtime_filter_scan_wait_time must be non-negative")
+            }
+            Self::NegativeRuntimeFilterWaitTimeout => {
+                formatter.write_str("global_runtime_filter_wait_timeout must be non-negative")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionSettingError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionExecutionSettings, SessionSettingError};
+
+    #[test]
+    fn preserves_session_values_before_wire_projection() {
+        let mut settings = SessionExecutionSettings::default();
+        settings.set_query_timeout_secs(17);
+        settings.set_pipeline_dop(4);
+        settings
+            .set_runtime_filter_scan_wait_time_ms(0)
+            .expect("zero is valid");
+        settings.set_group_concat_max_len(-1);
+
+        assert_eq!(settings.query_timeout_secs(), Some(17));
+        assert_eq!(settings.pipeline_dop(), Some(4));
+        assert_eq!(settings.runtime_filter_scan_wait_time_ms(), Some(0));
+        assert_eq!(settings.group_concat_max_len(), -1);
+    }
+
+    #[test]
+    fn preserves_boolean_switches() {
+        let mut settings = SessionExecutionSettings::default();
+        settings.set_enable_parquet_reader_page_index(true);
+        settings.set_enable_scan_datacache(true);
+        settings.set_enable_populate_datacache(true);
+
+        assert!(settings.enable_parquet_reader_page_index());
+        assert!(settings.enable_scan_datacache());
+        assert!(settings.enable_populate_datacache());
+    }
+
+    #[test]
+    fn rejects_negative_runtime_filter_settings() {
+        let mut settings = SessionExecutionSettings::default();
+        assert_eq!(
+            settings.set_runtime_filter_scan_wait_time_ms(-1),
+            Err(SessionSettingError::NegativeRuntimeFilterScanWaitTime)
+        );
+        assert_eq!(
+            settings.set_runtime_filter_wait_timeout_ms(-1),
+            Err(SessionSettingError::NegativeRuntimeFilterWaitTimeout)
+        );
+    }
+}
