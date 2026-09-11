@@ -20,9 +20,17 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_parser::ast::{self, Fold, Statement};
+use novarocks_parser::{
+    ast::{self, Fold, Statement},
+    printer::print_expr,
+};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
+
+use crate::{
+    session_error::{QueryServiceError, QueryServiceErrorKind},
+    sql::session_admit::SessionAdmitError,
+};
 
 /// Connection-local SQL state that is independent of a protocol adapter or
 /// role-local runtime. Adapters may validate and apply mutations to this
@@ -49,6 +57,11 @@ impl Default for SessionSqlState {
 }
 
 impl SessionSqlState {
+    /// Records one SQL expression as a connection-local user variable.
+    pub fn set_user_variable(&mut self, name: &str, value: String) {
+        self.user_variables.insert(name.to_ascii_lowercase(), value);
+    }
+
     /// Rewrites references to this session's user variables with their stored
     /// scalar SQL expressions before a role adapter prepares the statement.
     pub fn substitute_user_variables(&self, statement: Statement) -> Result<Statement, String> {
@@ -98,6 +111,380 @@ impl SessionSqlState {
 
         Ok(Substituter { values }.fold_statement(statement))
     }
+}
+
+/// The result of applying a parser-admitted SET assignment to application
+/// session state. Catalog selection is returned to the role owner because it
+/// requires that owner's external catalog projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionSetAssignmentOutcome {
+    Applied,
+    SelectCatalog(String),
+}
+
+/// Applies the parser and session-state portion of one SET assignment.
+///
+/// The caller retains only catalog resolution and any role-local projection it
+/// requires. This function deliberately has no frontend dependency.
+pub fn apply_session_set_assignment(
+    source: &str,
+    assignment: &ast::SetAssignment,
+    state: &mut SessionSqlState,
+) -> Result<SessionSetAssignmentOutcome, QueryServiceError> {
+    match &assignment.target {
+        ast::SetTarget::UserVariable(variable) => {
+            let value = match &assignment.value {
+                ast::SetValue::Expression(value) => print_expr(value),
+                ast::SetValue::Query(_) => {
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::Internal,
+                        "SET query value bypassed the governed scalar route",
+                    ));
+                }
+                ast::SetValue::Words(_) => {
+                    return Err(QueryServiceError::new(
+                        QueryServiceErrorKind::InvalidValue,
+                        "user variable assignment requires an expression",
+                    ));
+                }
+            };
+            state.set_user_variable(&variable.value, value);
+            Ok(SessionSetAssignmentOutcome::Applied)
+        }
+        ast::SetTarget::SystemVariable(variable) => {
+            let name = variable.value.to_ascii_lowercase();
+            if matches!(assignment.scope, ast::SetScope::Global) && is_known_session_setting(&name)
+            {
+                return Err(QueryServiceError::from_user_error(
+                    SessionAdmitError::GlobalScopeUnsupported.to_user_error(
+                        source,
+                        assignment.span,
+                        format!("SET GLOBAL {name} is not supported"),
+                    ),
+                ));
+            }
+            let value = session_setting_value(&assignment.value)?;
+            apply_session_system_variable(state, &name, &value)
+        }
+        ast::SetTarget::Catalog { .. } => {
+            if matches!(assignment.scope, ast::SetScope::Global) {
+                return Err(QueryServiceError::from_user_error(
+                    SessionAdmitError::GlobalScopeUnsupported.to_user_error(
+                        source,
+                        assignment.span,
+                        "SET GLOBAL CATALOG is not supported",
+                    ),
+                ));
+            }
+            Ok(SessionSetAssignmentOutcome::SelectCatalog(
+                session_catalog_value(&assignment.value)?,
+            ))
+        }
+        ast::SetTarget::Names { .. } | ast::SetTarget::Transaction { .. } => {
+            Ok(SessionSetAssignmentOutcome::Applied)
+        }
+    }
+}
+
+/// Rejects the one transaction-setting spelling that would imply state across
+/// NovaRocks' statement-level autocommit boundary.
+pub fn admit_session_set_assignment(
+    source: &str,
+    assignment: &ast::SetAssignment,
+) -> Result<(), QueryServiceError> {
+    let ast::SetTarget::SystemVariable(variable) = &assignment.target else {
+        return Ok(());
+    };
+    if !variable.value.eq_ignore_ascii_case("autocommit") {
+        return Ok(());
+    }
+    match lower_autocommit_setting(&assignment.value)? {
+        AutocommitSetting::Enabled => Ok(()),
+        AutocommitSetting::Disabled => Err(QueryServiceError::from_user_error(
+            SessionAdmitError::TransactionUnsupported.to_user_error(
+                source,
+                assignment.span,
+                "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
+            ),
+        )),
+    }
+}
+
+fn apply_session_system_variable(
+    state: &mut SessionSqlState,
+    name: &str,
+    value: &str,
+) -> Result<SessionSetAssignmentOutcome, QueryServiceError> {
+    if name == "catalog" {
+        return Ok(SessionSetAssignmentOutcome::SelectCatalog(
+            value.to_string(),
+        ));
+    }
+    if name == "autocommit" {
+        debug_assert!(matches!(
+            lower_autocommit_value(value),
+            Ok(AutocommitSetting::Enabled)
+        ));
+        return Ok(SessionSetAssignmentOutcome::Applied);
+    }
+    match name {
+        "query_timeout" => {
+            let seconds = parse_value(value, "query_timeout")?;
+            state.execution_settings.set_query_timeout_secs(seconds);
+        }
+        "group_concat_max_len" => {
+            let value = parse_value(value, "group_concat_max_len")?;
+            state.execution_settings.set_group_concat_max_len(value);
+        }
+        "pipeline_dop" => {
+            let value = parse_value(value, "pipeline_dop")?;
+            state.execution_settings.set_pipeline_dop(value);
+        }
+        "enable_parquet_reader_page_index" => state
+            .execution_settings
+            .set_enable_parquet_reader_page_index(parse_bool(value)?),
+        "enable_scan_datacache" => state
+            .execution_settings
+            .set_enable_scan_datacache(parse_bool(value)?),
+        "enable_populate_datacache" => state
+            .execution_settings
+            .set_enable_populate_datacache(parse_bool(value)?),
+        "runtime_filter_scan_wait_time" => {
+            let value = parse_value(value, "runtime_filter_scan_wait_time")?;
+            state
+                .execution_settings
+                .set_runtime_filter_scan_wait_time_ms(value)
+                .map_err(session_setting_error)?;
+        }
+        "global_runtime_filter_wait_timeout" => {
+            let value = parse_value(value, "global_runtime_filter_wait_timeout")?;
+            state
+                .execution_settings
+                .set_runtime_filter_wait_timeout_ms(value)
+                .map_err(session_setting_error)?;
+        }
+        "disable_optimizer_rules" | "cbo_disabled_rules" => {
+            state.optimizer_settings.set_disabled_rules(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|rule| !rule.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect(),
+            )
+        }
+        "enable_eliminate_agg" => state
+            .optimizer_settings
+            .set_enable_eliminate_agg(parse_bool(value)?),
+        "enable_ukfk_opt" => state
+            .optimizer_settings
+            .set_enable_ukfk_opt(parse_bool(value)?),
+        _ => apply_optimizer_session_set(&mut state.optimizer_settings, name, value)?,
+    }
+    Ok(SessionSetAssignmentOutcome::Applied)
+}
+
+fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
+    match value {
+        ast::SetValue::Expression(value) => Ok(print_expr(value)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string()),
+        ast::SetValue::Words(words) => {
+            let [ast::SetWord::Ident(value)] = words.as_slice() else {
+                return Err(session_value_expression_error());
+            };
+            if matches!(value.value.to_ascii_lowercase().as_str(), "on" | "off") {
+                Ok(value.value.to_ascii_lowercase())
+            } else {
+                Err(session_value_expression_error())
+            }
+        }
+        ast::SetValue::Query(_) => Err(session_value_expression_error()),
+    }
+}
+
+fn session_value_expression_error() -> QueryServiceError {
+    QueryServiceError::new(
+        QueryServiceErrorKind::InvalidValue,
+        "session variable assignment requires an expression",
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AutocommitSetting {
+    Enabled,
+    Disabled,
+}
+
+fn lower_autocommit_setting(value: &ast::SetValue) -> Result<AutocommitSetting, QueryServiceError> {
+    lower_autocommit_value(&session_setting_value(value)?)
+}
+
+fn lower_autocommit_value(value: &str) -> Result<AutocommitSetting, QueryServiceError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(AutocommitSetting::Enabled),
+        "0" | "off" | "false" => Ok(AutocommitSetting::Disabled),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            format!("invalid autocommit value `{value}`; expected 1, ON, TRUE, 0, OFF, or FALSE"),
+        )),
+    }
+}
+
+fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
+    if let ast::SetValue::Expression(value) = value {
+        return Ok(print_expr(value)
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_string());
+    }
+    let ast::SetValue::Words(words) = value else {
+        return Err(catalog_value_error());
+    };
+    let [ast::SetWord::Ident(catalog)] = words.as_slice() else {
+        return Err(catalog_value_error());
+    };
+    Ok(catalog.value.clone())
+}
+
+fn catalog_value_error() -> QueryServiceError {
+    QueryServiceError::new(
+        QueryServiceErrorKind::InvalidValue,
+        "SET CATALOG requires a catalog name",
+    )
+}
+
+fn is_known_session_setting(name: &str) -> bool {
+    matches!(
+        name,
+        "autocommit"
+            | "catalog"
+            | "query_timeout"
+            | "group_concat_max_len"
+            | "pipeline_dop"
+            | "enable_parquet_reader_page_index"
+            | "enable_scan_datacache"
+            | "enable_populate_datacache"
+            | "runtime_filter_scan_wait_time"
+            | "global_runtime_filter_wait_timeout"
+            | "disable_optimizer_rules"
+            | "cbo_disabled_rules"
+            | "enable_eliminate_agg"
+            | "enable_ukfk_opt"
+            | "cbo_broadcast_backend_count"
+            | "cbo_broadcast_node_mem_budget_bytes"
+            | "global_runtime_filter_build_max_size"
+            | "global_runtime_filter_build_min_size"
+            | "global_runtime_filter_probe_min_size"
+            | "global_runtime_filter_probe_min_selectivity"
+            | "cbo_max_reorder_node_use_exhaustive"
+            | "cbo_max_reorder_node_use_dp"
+            | "cbo_max_reorder_node_use_greedy"
+            | "cbo_max_reorder_node"
+            | "enable_query_rewrite_table_prune"
+            | "enable_cbo_table_prune"
+            | "enable_table_prune_on_update"
+            | "enable_common_subexpr_reuse"
+            | "enable_global_runtime_filter"
+            | "enable_materialized_view_rewrite"
+            | "enable_connector_static_predicate_pushdown"
+            | "cbo_enable_dp_join_reorder"
+            | "cbo_enable_greedy_join_reorder"
+            | "enable_global_runtime_filter_cross_exchange"
+    )
+}
+
+fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" => Ok(true),
+        "0" | "off" | "false" => Ok(false),
+        _ => Err(QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            format!("invalid boolean value `{value}`"),
+        )),
+    }
+}
+
+fn parse_value<T: std::str::FromStr>(value: &str, name: &str) -> Result<T, QueryServiceError> {
+    value.parse().map_err(|_| {
+        QueryServiceError::new(
+            QueryServiceErrorKind::InvalidValue,
+            format!("invalid {name}"),
+        )
+    })
+}
+
+fn session_setting_error(error: SessionSettingError) -> QueryServiceError {
+    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error.to_string())
+}
+
+fn apply_optimizer_session_set(
+    settings: &mut SessionOptimizerSettings,
+    name: &str,
+    value: &str,
+) -> Result<(), QueryServiceError> {
+    let parse_bool_value = || parse_bool(value);
+    let parse_u64_value = || parse_value(value, name);
+    let parse_f64_value = || parse_value(value, name);
+    let parse_usize_value = || parse_value(value, name);
+
+    match name {
+        "cbo_broadcast_backend_count" => settings.set_broadcast_backend_count(parse_f64_value()?),
+        "cbo_broadcast_node_mem_budget_bytes" => {
+            settings.cbo_broadcast_node_mem_budget_bytes = Some(parse_f64_value()?)
+        }
+        "global_runtime_filter_build_max_size" => {
+            settings.rf_build_max_bytes = Some(parse_u64_value()?)
+        }
+        "global_runtime_filter_build_min_size" => {
+            settings.rf_build_min_bytes = Some(parse_u64_value()?)
+        }
+        "global_runtime_filter_probe_min_size" => {
+            settings.rf_probe_min_bytes = Some(parse_u64_value()?)
+        }
+        "global_runtime_filter_probe_min_selectivity" => {
+            settings.rf_probe_min_selectivity = Some(parse_f64_value()?)
+        }
+        "cbo_max_reorder_node_use_exhaustive" => {
+            settings.max_reorder_node_use_exhaustive = Some(parse_usize_value()?)
+        }
+        "cbo_max_reorder_node_use_dp" => {
+            settings.max_reorder_node_use_dp = Some(parse_usize_value()?)
+        }
+        "cbo_max_reorder_node_use_greedy" => {
+            settings.max_reorder_node_use_greedy = Some(parse_usize_value()?)
+        }
+        "cbo_max_reorder_node" => settings.max_reorder_node = Some(parse_usize_value()?),
+        "enable_query_rewrite_table_prune" => {
+            settings.enable_query_rewrite_table_prune = parse_bool_value()?
+        }
+        "enable_cbo_table_prune" => settings.enable_cbo_table_prune = parse_bool_value()?,
+        "enable_table_prune_on_update" => {
+            settings.enable_table_prune_on_update = parse_bool_value()?
+        }
+        "enable_common_subexpr_reuse" => {
+            settings.enable_common_subexpr_reuse = Some(parse_bool_value()?)
+        }
+        "enable_global_runtime_filter" => {
+            settings.enable_global_runtime_filter = Some(parse_bool_value()?)
+        }
+        "enable_materialized_view_rewrite" => {
+            settings.enable_materialized_view_rewrite = Some(parse_bool_value()?)
+        }
+        "enable_connector_static_predicate_pushdown" => {
+            settings.enable_connector_static_predicate_pushdown = Some(parse_bool_value()?)
+        }
+        "cbo_enable_dp_join_reorder" => settings.enable_dp_join_reorder = Some(parse_bool_value()?),
+        "cbo_enable_greedy_join_reorder" => {
+            settings.enable_greedy_join_reorder = Some(parse_bool_value()?)
+        }
+        "enable_global_runtime_filter_cross_exchange" => {
+            settings.allow_cross_exchange_rf = Some(parse_bool_value()?)
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Connection-local settings that SQL admission has validated.
@@ -237,7 +624,12 @@ impl std::error::Error for SessionSettingError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionExecutionSettings, SessionSettingError, SessionSqlState};
+    use super::{
+        SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSettingError,
+        SessionSqlState, admit_session_set_assignment, apply_session_set_assignment,
+    };
+    use crate::session_error::QueryServiceErrorKind;
+    use novarocks_parser::{ast, ast::Statement as ParsedStatement};
     use novarocks_types::naming::DEFAULT_DATABASE;
 
     #[test]
@@ -310,5 +702,80 @@ mod tests {
                 .expect("substitute session variable"),
         );
         assert_eq!(rendered, "SELECT 7");
+    }
+
+    fn set_assignment(sql: &str) -> ast::SetAssignment {
+        let statements = novarocks_parser::parse(sql).expect("SET must parse");
+        let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
+            statements.as_slice()
+        else {
+            panic!("expected one SET statement");
+        };
+        statement.assignments[0].clone()
+    }
+
+    #[test]
+    fn applies_boolean_and_optimizer_settings_without_a_frontend_router() {
+        let mut state = SessionSqlState::default();
+        for sql in [
+            "SET enable_eliminate_agg = on",
+            "SET cbo_broadcast_node_mem_budget_bytes = 0",
+            "SET global_runtime_filter_probe_min_selectivity = 0.0",
+            "SET enable_common_subexpr_reuse = false",
+            "SET cbo_max_reorder_node_use_exhaustive = 2",
+        ] {
+            let assignment = set_assignment(sql);
+            assert_eq!(
+                apply_session_set_assignment(sql, &assignment, &mut state)
+                    .expect("setting must apply"),
+                SessionSetAssignmentOutcome::Applied,
+            );
+        }
+
+        assert!(state.optimizer_settings.enable_eliminate_agg);
+        assert_eq!(
+            state.optimizer_settings.cbo_broadcast_node_mem_budget_bytes,
+            Some(0.0)
+        );
+        assert_eq!(state.optimizer_settings.rf_probe_min_selectivity, Some(0.0));
+        assert_eq!(
+            state.optimizer_settings.enable_common_subexpr_reuse,
+            Some(false)
+        );
+        assert_eq!(
+            state.optimizer_settings.max_reorder_node_use_exhaustive,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn keeps_catalog_resolution_outside_application_session_state() {
+        let assignment = set_assignment("SET CATALOG external_catalog");
+        let mut state = SessionSqlState::default();
+        assert_eq!(
+            apply_session_set_assignment("SET CATALOG external_catalog", &assignment, &mut state)
+                .expect("catalog target must lower"),
+            SessionSetAssignmentOutcome::SelectCatalog("external_catalog".to_string()),
+        );
+        assert_eq!(state.current_catalog, None);
+    }
+
+    #[test]
+    fn rejects_disabled_autocommit_and_global_known_settings_at_admission() {
+        let disabled = set_assignment("SET autocommit = OFF");
+        let error = admit_session_set_assignment("SET autocommit = OFF", &disabled)
+            .expect_err("disabled autocommit is unsupported");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+        assert!(error.message().contains("statement-level autocommit"));
+
+        let global = set_assignment("SET GLOBAL query_timeout = 1");
+        let error = apply_session_set_assignment(
+            "SET GLOBAL query_timeout = 1",
+            &global,
+            &mut SessionSqlState::default(),
+        )
+        .expect_err("global known setting is unsupported");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+        assert!(error.message().contains("SET GLOBAL query_timeout"));
     }
 }

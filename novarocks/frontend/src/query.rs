@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use crate::catalog_application::command::CatalogCommandExecutor;
 use crate::catalog_application::iceberg_ref_command::IcebergRefCommandExecutor;
 use crate::common::admitted_query_context::{
-    LakePublicationRuntimePolicy, RequestAdmission, RequestContext, SessionOptimizerSettings,
+    LakePublicationRuntimePolicy, RequestAdmission, RequestContext,
 };
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::common::engine_error::EngineError;
@@ -82,13 +82,15 @@ use novarocks_query_application::session_control::{
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::session::{
-    SessionExecutionSettings, SessionSettingError, SessionSqlState,
+    SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
+    admit_session_set_assignment as admit_query_application_session_set_assignment,
+    apply_session_set_assignment as apply_query_application_session_set_assignment,
 };
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
     SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
-    parse_single_statement, split_sql_statements, strip_leading_line_comments,
+    parse_single_statement, strip_leading_line_comments,
 };
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
@@ -857,22 +859,7 @@ impl FrontendQuerySession {
         source: &str,
         assignment: &ast::SetAssignment,
     ) -> Result<(), QueryServiceError> {
-        let ast::SetTarget::SystemVariable(variable) = &assignment.target else {
-            return Ok(());
-        };
-        if !variable.value.eq_ignore_ascii_case("autocommit") {
-            return Ok(());
-        }
-        match lower_autocommit_setting(&assignment.value)? {
-            AutocommitSetting::Enabled => Ok(()),
-            AutocommitSetting::Disabled => Err(QueryServiceError::from_user_error(
-                SessionAdmitError::TransactionUnsupported.to_user_error(
-                    source,
-                    assignment.span,
-                    "SET autocommit=0 is not supported because NovaRocks only provides statement-level autocommit frontiers",
-                ),
-            )),
-        }
+        admit_query_application_session_set_assignment(source, assignment)
     }
 
     async fn apply_session_set_assignment(
@@ -890,170 +877,12 @@ impl FrontendQuerySession {
         assignment: &ast::SetAssignment,
         state: &mut SessionSqlState,
     ) -> Result<(), QueryServiceError> {
-        match &assignment.target {
-            ast::SetTarget::UserVariable(variable) => {
-                let value = match &assignment.value {
-                    ast::SetValue::Expression(value) => print_expr(value),
-                    ast::SetValue::Query(_) => {
-                        return Err(internal_error(
-                            "SET query value bypassed the governed scalar route",
-                        ));
-                    }
-                    ast::SetValue::Words(_) => {
-                        return Err(QueryServiceError::new(
-                            QueryServiceErrorKind::InvalidValue,
-                            "user variable assignment requires an expression",
-                        ));
-                    }
-                };
-                state
-                    .user_variables
-                    .insert(variable.value.to_ascii_lowercase(), value);
-                Ok(())
-            }
-            ast::SetTarget::SystemVariable(variable) => {
-                let name = variable.value.to_ascii_lowercase();
-                if matches!(assignment.scope, ast::SetScope::Global)
-                    && is_known_session_setting(&name)
-                {
-                    return Err(QueryServiceError::from_user_error(
-                        SessionAdmitError::GlobalScopeUnsupported.to_user_error(
-                            source,
-                            assignment.span,
-                            format!("SET GLOBAL {name} is not supported"),
-                        ),
-                    ));
-                }
-                let value = session_setting_value(&assignment.value)?;
-                self.apply_session_system_variable(state, &name, &value)
-            }
-            ast::SetTarget::Catalog { .. } => {
-                if matches!(assignment.scope, ast::SetScope::Global) {
-                    return Err(QueryServiceError::from_user_error(
-                        SessionAdmitError::GlobalScopeUnsupported.to_user_error(
-                            source,
-                            assignment.span,
-                            "SET GLOBAL CATALOG is not supported",
-                        ),
-                    ));
-                }
-                let catalog = session_catalog_value(&assignment.value)?;
+        match apply_query_application_session_set_assignment(source, assignment, state)? {
+            SessionSetAssignmentOutcome::Applied => Ok(()),
+            SessionSetAssignmentOutcome::SelectCatalog(catalog) => {
                 self.apply_session_catalog(state, &catalog)
             }
-            ast::SetTarget::Names { .. } | ast::SetTarget::Transaction { .. } => Ok(()),
         }
-    }
-
-    fn apply_session_system_variable(
-        &self,
-        state: &mut SessionSqlState,
-        name: &str,
-        value: &str,
-    ) -> Result<(), QueryServiceError> {
-        if name == "catalog" {
-            return self.apply_session_catalog(state, value);
-        }
-        if name == "autocommit" {
-            // `admit_session_set_assignment` has already lowered and accepted
-            // only the truthful enabled spelling. Do not turn this into a
-            // session state bit: the portable SQL profile has no transaction
-            // state to retain across statements.
-            debug_assert!(matches!(
-                lower_autocommit_value(value),
-                Ok(AutocommitSetting::Enabled)
-            ));
-            return Ok(());
-        }
-        match name {
-            "query_timeout" => {
-                let seconds = value.parse::<u64>().map_err(|_| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "invalid query_timeout",
-                    )
-                })?;
-                state.execution_settings.set_query_timeout_secs(seconds);
-            }
-            "group_concat_max_len" => {
-                let value = value.parse::<i64>().map_err(|_| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "invalid group_concat_max_len",
-                    )
-                })?;
-                state.execution_settings.set_group_concat_max_len(value);
-            }
-            "pipeline_dop" => {
-                let value = value.parse::<i32>().map_err(|_| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "invalid pipeline_dop",
-                    )
-                })?;
-                state.execution_settings.set_pipeline_dop(value);
-            }
-            "enable_parquet_reader_page_index" => {
-                state
-                    .execution_settings
-                    .set_enable_parquet_reader_page_index(parse_bool(value)?);
-            }
-            "enable_scan_datacache" => {
-                state
-                    .execution_settings
-                    .set_enable_scan_datacache(parse_bool(value)?);
-            }
-            "enable_populate_datacache" => {
-                state
-                    .execution_settings
-                    .set_enable_populate_datacache(parse_bool(value)?);
-            }
-            "runtime_filter_scan_wait_time" => {
-                let value = value.parse::<i64>().map_err(|_| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "invalid runtime_filter_scan_wait_time",
-                    )
-                })?;
-                state
-                    .execution_settings
-                    .set_runtime_filter_scan_wait_time_ms(value)
-                    .map_err(session_setting_error)?;
-            }
-            "global_runtime_filter_wait_timeout" => {
-                let value = value.parse::<i32>().map_err(|_| {
-                    QueryServiceError::new(
-                        QueryServiceErrorKind::InvalidValue,
-                        "invalid global_runtime_filter_wait_timeout",
-                    )
-                })?;
-                state
-                    .execution_settings
-                    .set_runtime_filter_wait_timeout_ms(value)
-                    .map_err(session_setting_error)?;
-            }
-            "disable_optimizer_rules" | "cbo_disabled_rules" => {
-                state.optimizer_settings.set_disabled_rules(
-                    value
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|rule| !rule.is_empty())
-                        .map(ToOwned::to_owned)
-                        .collect(),
-                );
-            }
-            "enable_eliminate_agg" => {
-                state
-                    .optimizer_settings
-                    .set_enable_eliminate_agg(parse_bool(value)?);
-            }
-            "enable_ukfk_opt" => {
-                state
-                    .optimizer_settings
-                    .set_enable_ukfk_opt(parse_bool(value)?);
-            }
-            _ => apply_optimizer_session_set(&mut state.optimizer_settings, name, value)?,
-        }
-        Ok(())
     }
 
     fn apply_session_catalog(
@@ -1218,9 +1047,7 @@ impl FrontendQuerySession {
                     ));
                 }
             };
-            staged_state
-                .user_variables
-                .insert(variable.value.to_ascii_lowercase(), value);
+            staged_state.set_user_variable(&variable.value, value);
         }
         let mut live_state = self.state.lock().map_err(poisoned_state)?;
         match statement.seal_success_visibility() {
@@ -1761,123 +1588,6 @@ fn reject_plain_query_from_legacy_typed_route(
     Ok(())
 }
 
-fn session_setting_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
-    match value {
-        ast::SetValue::Expression(value) => Ok(print_expr(value)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string()),
-        ast::SetValue::Words(words) => {
-            let [ast::SetWord::Ident(value)] = words.as_slice() else {
-                return Err(QueryServiceError::new(
-                    QueryServiceErrorKind::InvalidValue,
-                    "session variable assignment requires an expression",
-                ));
-            };
-            if matches!(value.value.to_ascii_lowercase().as_str(), "on" | "off") {
-                Ok(value.value.to_ascii_lowercase())
-            } else {
-                Err(QueryServiceError::new(
-                    QueryServiceErrorKind::InvalidValue,
-                    "session variable assignment requires an expression",
-                ))
-            }
-        }
-        ast::SetValue::Query(_) => Err(QueryServiceError::new(
-            QueryServiceErrorKind::InvalidValue,
-            "session variable assignment requires an expression",
-        )),
-    }
-}
-
-/// Closed lowering for the one session setting that would otherwise create a
-/// cross-statement publication boundary. Other boolean settings remain on the
-/// generic session-value path; autocommit must not silently inherit its
-/// permissive/no-op behavior.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AutocommitSetting {
-    Enabled,
-    Disabled,
-}
-
-fn lower_autocommit_setting(value: &ast::SetValue) -> Result<AutocommitSetting, QueryServiceError> {
-    let value = session_setting_value(value)?;
-    lower_autocommit_value(&value)
-}
-
-fn lower_autocommit_value(value: &str) -> Result<AutocommitSetting, QueryServiceError> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(AutocommitSetting::Enabled),
-        "0" | "off" | "false" => Ok(AutocommitSetting::Disabled),
-        _ => Err(QueryServiceError::new(
-            QueryServiceErrorKind::InvalidValue,
-            format!("invalid autocommit value `{value}`; expected 1, ON, TRUE, 0, OFF, or FALSE"),
-        )),
-    }
-}
-
-fn session_catalog_value(value: &ast::SetValue) -> Result<String, QueryServiceError> {
-    if let ast::SetValue::Expression(value) = value {
-        return Ok(print_expr(value)
-            .trim_matches('\'')
-            .trim_matches('"')
-            .to_string());
-    }
-    let ast::SetValue::Words(words) = value else {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::InvalidValue,
-            "SET CATALOG requires a catalog name",
-        ));
-    };
-    let [ast::SetWord::Ident(catalog)] = words.as_slice() else {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::InvalidValue,
-            "SET CATALOG requires a catalog name",
-        ));
-    };
-    Ok(catalog.value.clone())
-}
-
-fn is_known_session_setting(name: &str) -> bool {
-    matches!(
-        name,
-        "autocommit"
-            | "catalog"
-            | "query_timeout"
-            | "group_concat_max_len"
-            | "pipeline_dop"
-            | "enable_parquet_reader_page_index"
-            | "enable_scan_datacache"
-            | "enable_populate_datacache"
-            | "runtime_filter_scan_wait_time"
-            | "global_runtime_filter_wait_timeout"
-            | "disable_optimizer_rules"
-            | "cbo_disabled_rules"
-            | "enable_eliminate_agg"
-            | "enable_ukfk_opt"
-            | "cbo_broadcast_backend_count"
-            | "cbo_broadcast_node_mem_budget_bytes"
-            | "global_runtime_filter_build_max_size"
-            | "global_runtime_filter_build_min_size"
-            | "global_runtime_filter_probe_min_size"
-            | "global_runtime_filter_probe_min_selectivity"
-            | "cbo_max_reorder_node_use_exhaustive"
-            | "cbo_max_reorder_node_use_dp"
-            | "cbo_max_reorder_node_use_greedy"
-            | "cbo_max_reorder_node"
-            | "enable_query_rewrite_table_prune"
-            | "enable_cbo_table_prune"
-            | "enable_table_prune_on_update"
-            | "enable_common_subexpr_reuse"
-            | "enable_global_runtime_filter"
-            | "enable_materialized_view_rewrite"
-            | "enable_connector_static_predicate_pushdown"
-            | "cbo_enable_dp_join_reorder"
-            | "cbo_enable_greedy_join_reorder"
-            | "enable_global_runtime_filter_cross_exchange"
-    )
-}
-
 fn with_query_hints(
     query_options: QueryOptions,
     query: Option<&novarocks_parser::ast::Query>,
@@ -2247,114 +1957,6 @@ fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceE
         }
     }
     Ok(statement)
-}
-
-fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
-    match value.to_ascii_lowercase().as_str() {
-        "1" | "on" | "true" => Ok(true),
-        "0" | "off" | "false" => Ok(false),
-        _ => Err(QueryServiceError::new(
-            QueryServiceErrorKind::InvalidValue,
-            format!("invalid boolean value `{value}`"),
-        )),
-    }
-}
-
-fn apply_optimizer_session_set(
-    settings: &mut SessionOptimizerSettings,
-    name: &str,
-    value: &str,
-) -> Result<(), QueryServiceError> {
-    let parse_bool_value = || parse_bool(value);
-    let parse_u64_value = || {
-        value.parse::<u64>().map_err(|_| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                format!("invalid {name}"),
-            )
-        })
-    };
-    let parse_f64_value = || {
-        value.parse::<f64>().map_err(|_| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                format!("invalid {name}"),
-            )
-        })
-    };
-    let parse_usize_value = || {
-        value.parse::<usize>().map_err(|_| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::InvalidValue,
-                format!("invalid {name}"),
-            )
-        })
-    };
-
-    match name {
-        "cbo_broadcast_backend_count" => {
-            settings.set_broadcast_backend_count(parse_f64_value()?);
-        }
-        "cbo_broadcast_node_mem_budget_bytes" => {
-            settings.cbo_broadcast_node_mem_budget_bytes = Some(parse_f64_value()?);
-        }
-        "global_runtime_filter_build_max_size" => {
-            settings.rf_build_max_bytes = Some(parse_u64_value()?);
-        }
-        "global_runtime_filter_build_min_size" => {
-            settings.rf_build_min_bytes = Some(parse_u64_value()?);
-        }
-        "global_runtime_filter_probe_min_size" => {
-            settings.rf_probe_min_bytes = Some(parse_u64_value()?);
-        }
-        "global_runtime_filter_probe_min_selectivity" => {
-            settings.rf_probe_min_selectivity = Some(parse_f64_value()?);
-        }
-        "cbo_max_reorder_node_use_exhaustive" => {
-            settings.max_reorder_node_use_exhaustive = Some(parse_usize_value()?);
-        }
-        "cbo_max_reorder_node_use_dp" => {
-            settings.max_reorder_node_use_dp = Some(parse_usize_value()?);
-        }
-        "cbo_max_reorder_node_use_greedy" => {
-            settings.max_reorder_node_use_greedy = Some(parse_usize_value()?);
-        }
-        "cbo_max_reorder_node" => {
-            settings.max_reorder_node = Some(parse_usize_value()?);
-        }
-        "enable_query_rewrite_table_prune" => {
-            settings.enable_query_rewrite_table_prune = parse_bool_value()?;
-        }
-        "enable_cbo_table_prune" => {
-            settings.enable_cbo_table_prune = parse_bool_value()?;
-        }
-        "enable_table_prune_on_update" => {
-            settings.enable_table_prune_on_update = parse_bool_value()?;
-        }
-        "enable_common_subexpr_reuse" => {
-            settings.enable_common_subexpr_reuse = Some(parse_bool_value()?);
-        }
-        "enable_global_runtime_filter" => {
-            settings.enable_global_runtime_filter = Some(parse_bool_value()?);
-        }
-        "enable_materialized_view_rewrite" => {
-            settings.enable_materialized_view_rewrite = Some(parse_bool_value()?);
-        }
-        "enable_connector_static_predicate_pushdown" => {
-            settings.enable_connector_static_predicate_pushdown = Some(parse_bool_value()?);
-        }
-        "cbo_enable_dp_join_reorder" => {
-            settings.enable_dp_join_reorder = Some(parse_bool_value()?);
-        }
-        "cbo_enable_greedy_join_reorder" => {
-            settings.enable_greedy_join_reorder = Some(parse_bool_value()?);
-        }
-        "enable_global_runtime_filter_cross_exchange" => {
-            settings.allow_cross_exchange_rf = Some(parse_bool_value()?);
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, QueryServiceError> {
@@ -2750,10 +2352,6 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
     .expect("session settings must satisfy the native query-options contract")
 }
 
-fn session_setting_error(error: SessionSettingError) -> QueryServiceError {
-    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, error.to_string())
-}
-
 fn governed_statement_begin_error(
     error: novarocks_query_application::session_control::GovernedQueryStatementBeginError,
 ) -> QueryServiceError {
@@ -2839,9 +2437,11 @@ mod tests {
     use novarocks_query_application::api::ResultField;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::client_connection::ClientConnectionToken;
+    use novarocks_query_application::sql::split_sql_statements;
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,
     };
+    use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::schema::ColumnDef;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
     use novarocks_workload_control::ResourceConfig;
@@ -3900,67 +3500,6 @@ mod tests {
     }
 
     #[test]
-    fn session_setting_value_accepts_parser_owned_boolean_words() {
-        let statements = novarocks_parser::parse("SET enable_eliminate_agg = on")
-            .expect("SET boolean value must parse");
-        let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
-            statements.as_slice()
-        else {
-            panic!("expected one SET statement");
-        };
-        assert_eq!(
-            session_setting_value(&statement.assignments[0].value).expect("boolean value"),
-            "on"
-        );
-    }
-
-    #[test]
-    fn autocommit_lowering_is_closed_over_truthful_boolean_spellings() {
-        for (source, expected) in [
-            ("SET autocommit = 1", AutocommitSetting::Enabled),
-            ("SET autocommit = ON", AutocommitSetting::Enabled),
-            ("SET autocommit = TRUE", AutocommitSetting::Enabled),
-            ("SET autocommit = 0", AutocommitSetting::Disabled),
-            ("SET autocommit = OFF", AutocommitSetting::Disabled),
-            ("SET autocommit = FALSE", AutocommitSetting::Disabled),
-        ] {
-            let statements = novarocks_parser::parse(source).expect("SET must parse");
-            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
-                statements.as_slice()
-            else {
-                panic!("expected one SET statement");
-            };
-            assert_eq!(
-                lower_autocommit_setting(&statement.assignments[0].value)
-                    .expect("autocommit spelling must lower"),
-                expected,
-                "source={source}"
-            );
-        }
-    }
-
-    #[test]
-    fn autocommit_lowering_rejects_values_outside_the_closed_boolean_surface() {
-        for source in ["SET autocommit = 2", "SET autocommit = inherited"] {
-            let statements = novarocks_parser::parse(source).expect("SET must parse");
-            let [ParsedStatement::Session(ast::SessionStatement::Set(statement))] =
-                statements.as_slice()
-            else {
-                panic!("expected one SET statement");
-            };
-            let error = lower_autocommit_setting(&statement.assignments[0].value)
-                .expect_err("unrecognized autocommit value must be rejected");
-            assert_eq!(error.kind(), QueryServiceErrorKind::InvalidValue);
-            assert!(error.message().contains("invalid autocommit value"));
-        }
-    }
-
-    #[test]
-    fn autocommit_is_not_an_unknown_global_no_op() {
-        assert!(is_known_session_setting("autocommit"));
-    }
-
-    #[test]
     fn batch_split_ignores_semicolons_inside_leading_comments() {
         let statements = split_sql_statements(
             "SET query_timeout=120;\n-- license; users may obtain a copy\nCREATE CATALOG c;",
@@ -4078,38 +3617,6 @@ mod tests {
             1_000
         );
         assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
-    }
-
-    #[test]
-    fn optimizer_session_settings_preserve_frontend_admission_contract() {
-        let mut settings = SessionOptimizerSettings::default();
-        apply_optimizer_session_set(&mut settings, "cbo_broadcast_node_mem_budget_bytes", "0")
-            .expect("broadcast budget setting");
-        apply_optimizer_session_set(
-            &mut settings,
-            "global_runtime_filter_probe_min_selectivity",
-            "0.0",
-        )
-        .expect("runtime filter selectivity setting");
-        apply_optimizer_session_set(&mut settings, "enable_common_subexpr_reuse", "false")
-            .expect("cse setting");
-        apply_optimizer_session_set(
-            &mut settings,
-            "enable_connector_static_predicate_pushdown",
-            "false",
-        )
-        .expect("connector static predicate setting");
-        apply_optimizer_session_set(&mut settings, "cbo_max_reorder_node_use_exhaustive", "2")
-            .expect("join reorder setting");
-
-        assert_eq!(settings.cbo_broadcast_node_mem_budget_bytes, Some(0.0));
-        assert_eq!(settings.rf_probe_min_selectivity, Some(0.0));
-        assert_eq!(settings.enable_common_subexpr_reuse, Some(false));
-        assert_eq!(
-            settings.enable_connector_static_predicate_pushdown,
-            Some(false)
-        );
-        assert_eq!(settings.max_reorder_node_use_exhaustive, Some(2));
     }
 
     #[test]
