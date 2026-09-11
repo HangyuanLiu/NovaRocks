@@ -28,9 +28,7 @@ use crate::common::admitted_query_context::{
 };
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::common::engine_error::EngineError;
-use crate::common::query_cancellation::{
-    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
-};
+use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
 use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::control::{
@@ -702,7 +700,6 @@ impl FrontendQuerySession {
         statement: &str,
         admission: FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
-        let cancellation = admission.cancellation_source();
         let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
         if trimmed.is_empty() {
             return Ok(StatementResult::Ok);
@@ -723,7 +720,7 @@ impl FrontendQuerySession {
                     .await
             }
             ParsedStatement::Session(statement) => {
-                self.execute_session_statement(trimmed, &statement, cancellation)
+                self.execute_session_statement(trimmed, &statement, &admission)
                     .await
             }
             ParsedStatement::Query(_) => {
@@ -761,16 +758,35 @@ impl FrontendQuerySession {
         &self,
         source: &str,
         statement: &ast::SessionStatement,
-        _cancellation: QueryCancellationSource,
+        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
-        match statement {
+        let token = self.token()?;
+        let mut governed = self
+            .service
+            .query_control
+            .begin_governed_statement(
+                token,
+                &self.service.workload_root_admission,
+                WorkClass::Management,
+                None,
+                None,
+            )
+            .map_err(governed_statement_begin_error)?;
+        let query_control = self.service.query_control.clone();
+        lifecycle_admission.bind_external_cancellation(move |reason| {
+            let _ = query_control.cancel_session_statement(token, reason);
+        });
+        let result = match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
-                    self.admit_session_set_assignment(source, assignment)?;
+                    if let Err(error) = self.admit_session_set_assignment(source, assignment) {
+                        return Ok(self.governed_typed_error(error, governed));
+                    }
                 }
                 for assignment in &statement.assignments {
-                    self.apply_session_set_assignment(source, assignment)
-                        .await?;
+                    if let Err(error) = self.apply_session_set_assignment(source, assignment).await {
+                        return Ok(self.governed_typed_error(error, governed));
+                    }
                 }
                 Ok(StatementResult::Ok)
             }
@@ -779,12 +795,14 @@ impl FrontendQuerySession {
                     || statement.database.value.clone(),
                     |catalog| format!("{}.{}", catalog.value, statement.database.value),
                 );
-                self.init_database(&schema).await?;
+                if let Err(error) = self.init_database(&schema).await {
+                    return Ok(self.governed_typed_error(error, governed));
+                }
                 Ok(StatementResult::Ok)
             }
             ast::SessionStatement::Kill(statement) => self.execute_session_kill(source, statement),
-            ast::SessionStatement::TransactionControl(statement) => {
-                Err(QueryServiceError::from_user_error(
+            ast::SessionStatement::TransactionControl(statement) => Err(
+                QueryServiceError::from_user_error(
                     crate::session_error::SessionAdmitError::TransactionUnsupported.to_user_error(
                         source,
                         statement.span,
@@ -793,8 +811,39 @@ impl FrontendQuerySession {
                             statement.kind.sql()
                         ),
                     ),
+                ),
+            ),
+        };
+        match result {
+            Ok(StatementResult::Ok) => {
+                governed.complete_execution();
+                Ok(StatementResult::GovernedCompletion(
+                    GovernedCompletionStatementResult::new(
+                        self.service.workload_resources.clone(),
+                        governed,
+                    ),
                 ))
             }
+            Ok(StatementResult::Query(result)) => {
+                governed.complete_execution();
+                Ok(StatementResult::GovernedQuery(
+                    GovernedImmediateStatementResult::new(
+                        result,
+                        self.service.workload_resources.clone(),
+                        governed,
+                    ),
+                ))
+            }
+            Ok(
+                StatementResult::GovernedQuery(_)
+                | StatementResult::StreamingQuery(_)
+                | StatementResult::GovernedCompletion(_)
+                | StatementResult::GovernedError(_),
+            ) => Ok(self.governed_typed_error(
+                internal_error("session statement returned an already-owned protocol result"),
+                governed,
+            )),
+            Err(error) => Ok(self.governed_typed_error(error, governed)),
         }
     }
 
