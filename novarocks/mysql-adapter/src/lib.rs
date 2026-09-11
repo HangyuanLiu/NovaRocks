@@ -22,13 +22,28 @@ mod error_mapping;
 mod listener_settings;
 
 use novarocks_query_application::session_error::QueryServiceErrorKind;
-use opensrv_mysql::ErrorKind;
+use opensrv_mysql::{ErrorKind, IntermediaryOptions};
 
 pub use connection_registry::MysqlClientConnectionRegistry;
 pub use error_mapping::error_kind_for_domain_code;
 pub use listener_settings::{
     DEFAULT_MYSQL_USER, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
+
+/// `USE ...` must remain an ordinary COM_QUERY for typed SQL validation;
+/// genuine COM_INIT_DB packets still use the protocol callback.
+pub const MYSQL_INTERMEDIARY_OPTIONS: IntermediaryOptions = IntermediaryOptions {
+    process_use_statement_on_query: true,
+    reject_connection_on_dbname_absence: false,
+};
+
+pub fn normalize_init_database_schema(schema: &str) -> String {
+    schema
+        .split('.')
+        .map(|part| part.trim_matches('`'))
+        .collect::<Vec<_>>()
+        .join(".")
+}
 
 pub fn error_kind_for_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
     match kind {
