@@ -13,6 +13,7 @@ test-support = []
 [dependencies]
 arrow.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-parser.workspace = true
 novarocks-spi.workspace = true
 novarocks-sql.workspace = true
 novarocks-types.workspace = true

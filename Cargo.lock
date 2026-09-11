@@ -4043,6 +4043,7 @@ dependencies = [
  "arrow",
  "bytes",
  "novarocks-execution-contract",
+ "novarocks-parser",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",

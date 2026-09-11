@@ -70,6 +70,9 @@ use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
+use novarocks_query_application::sql::{
+    SqlStatementParseError, parse_optional_single_statement, parse_single_statement,
+};
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
@@ -639,6 +642,18 @@ fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceE
     }
 }
 
+fn query_application_parse_error(error: SqlStatementParseError, source: &str) -> QueryServiceError {
+    match error {
+        SqlStatementParseError::Parser(error) => {
+            QueryServiceError::from_user_error(error.to_user_error(source))
+        }
+        SqlStatementParseError::ExpectedExactlyOne { .. } => QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            "command admission requires exactly one statement",
+        ),
+    }
+}
+
 #[derive(Clone)]
 struct FrontendSessionState {
     current_catalog: Option<String>,
@@ -700,14 +715,8 @@ impl FrontendQuerySession {
         if let Some(error) = admin_raise_engine_error(trimmed)? {
             return Err(error);
         }
-        let statements = novarocks_parser::parse(trimmed)
-            .map_err(|error| QueryServiceError::from_user_error(error.to_user_error(trimmed)))?;
-        let [parsed_statement] = statements.as_slice() else {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "command admission requires exactly one statement",
-            ));
-        };
+        let parsed_statement = parse_single_statement(trimmed)
+            .map_err(|error| query_application_parse_error(error, trimmed))?;
         let result = match parsed_statement {
             ParsedStatement::Session(ast::SessionStatement::Set(statement))
                 if statement
@@ -717,11 +726,11 @@ impl FrontendQuerySession {
             {
                 drop(admission);
                 return self
-                    .execute_governed_set(trimmed.to_string(), statement)
+                    .execute_governed_set(trimmed.to_string(), &statement)
                     .await;
             }
             ParsedStatement::Session(statement) => {
-                self.execute_session_statement(trimmed, statement, cancellation)
+                self.execute_session_statement(trimmed, &statement, cancellation)
                     .await
             }
             ParsedStatement::Query(_) => {
@@ -730,11 +739,11 @@ impl FrontendQuerySession {
                 // generation, both owned by the workload-backed statement owner.
                 drop(admission);
                 return self
-                    .execute_governed_read(trimmed.to_string(), parsed_statement.clone())
+                    .execute_governed_read(trimmed.to_string(), parsed_statement)
                     .await;
             }
             statement => {
-                self.execute_typed_statement(trimmed.to_string(), statement.clone(), cancellation)
+                self.execute_typed_statement(trimmed.to_string(), statement, cancellation)
                     .await
             }
         };
@@ -2182,10 +2191,10 @@ impl<'a> SqlBatchCursor<'a> {
             if fragment.is_empty() {
                 continue;
             }
-            let statements = novarocks_parser::parse(fragment).map_err(|error| {
-                QueryServiceError::from_user_error(error.to_user_error(fragment))
-            })?;
-            if !statements.is_empty() {
+            if parse_optional_single_statement(fragment)
+                .map_err(|error| query_application_parse_error(error, fragment))?
+                .is_some()
+            {
                 return Ok(true);
             }
         }

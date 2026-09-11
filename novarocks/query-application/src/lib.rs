@@ -23,6 +23,10 @@
 
 pub mod api;
 
+/// SQL source parsing and statement-shape admission owned by the query
+/// application before role adapters route a statement to a product consumer.
+pub mod sql;
+
 /// Query-scoped acquisition of immutable metadata and optional optimization facts.
 pub mod observation;
 
