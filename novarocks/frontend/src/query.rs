@@ -28,7 +28,9 @@ use crate::common::admitted_query_context::{
 };
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::common::engine_error::EngineError;
+use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
+use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -47,6 +49,12 @@ use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_
 use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult,
+};
+use crate::statistics::command::StatisticsCommandExecutor;
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use crate::view::command::ViewCommandExecutor;
+use crate::workload_lifecycle::{
+    FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
 };
 use crate::{QuerySession, QuerySessionFactory};
 use arrow::array::StringArray;
@@ -67,7 +75,7 @@ use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason,
 };
-use novarocks_query_application::cpu::QueryCpuExecutor;
+use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
 use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
@@ -86,16 +94,6 @@ use novarocks_user_error::UserError;
 use novarocks_workload_control::{
     CancellationReason as WorkCancellationReason, LocalResourceAuthority, RootAdmissionHandle,
     WorkClass, WorkRequest,
-};
-use tokio::task;
-
-use crate::dml::DmlService;
-use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
-use crate::statistics::command::StatisticsCommandExecutor;
-use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
-use crate::view::command::ViewCommandExecutor;
-use crate::workload_lifecycle::{
-    FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
 };
 
 pub(crate) mod compiler;
@@ -529,6 +527,7 @@ pub struct FrontendQueryService {
     ctas_engine: Arc<dyn CtasEngine>,
     truncate_engine: Arc<dyn TruncateEngine>,
     query_cpu_executor: QueryCpuExecutor,
+    query_blocking_executor: QueryBlockingExecutor,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
     /// Cost budget frozen from `[runtime]` and handed to statement admission
     /// whenever the session did not set one itself.
@@ -566,6 +565,7 @@ impl FrontendQueryService {
         ctas_engine: Arc<dyn CtasEngine>,
         truncate_engine: Arc<dyn TruncateEngine>,
         query_cpu_executor: QueryCpuExecutor,
+        query_blocking_executor: QueryBlockingExecutor,
         connector_blocking_io: ConnectorBlockingIoSupervisor,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
@@ -600,6 +600,7 @@ impl FrontendQueryService {
             ctas_engine,
             truncate_engine,
             query_cpu_executor,
+            query_blocking_executor,
             connector_blocking_io,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
@@ -1550,10 +1551,20 @@ impl FrontendQuerySession {
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
-        let mut worker = task::spawn_blocking(move || {
+        let worker_cancellation = cancellation.clone();
+        let mut worker = Box::pin(self.service.query_blocking_executor.run(move || {
             let _diagnostic_scope =
                 crate::preparation_diagnostics::enter_statement(diagnostic_statement);
-            let result: Result<StatementResult, RoutedExecutionError> = {
+            let result: Result<StatementResult, RoutedExecutionError> = if worker_cancellation
+                .is_cancelled()
+            {
+                // Queue admission can outlive a session deadline. Do not let
+                // an already-cancelled command start provider work merely
+                // because a bounded worker became available later.
+                Err(RoutedExecutionError::Engine(
+                    "typed statement was cancelled before synchronous execution began".to_owned(),
+                ))
+            } else {
                 let statement = parsed_statement;
                 if matches!(statement, ParsedStatement::ExplainQuery(_)) {
                     compiler
@@ -1636,10 +1647,10 @@ impl FrontendQuerySession {
             };
             execution_owner.complete();
             result
-        });
+        }));
         let result = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
-                Ok(result) => result.map_err(|error| internal_error(error.to_string()))?,
+                Ok(result) => result.map_err(internal_error)?,
                 Err(_) => {
                     let timeout_ms = timeout_message_millis(timeout_duration);
                     self.cancel_current(QueryCancellationReason::DeadlineExceeded { timeout_ms });
@@ -1664,7 +1675,7 @@ impl FrontendQuerySession {
             // first-wins typed cancellation to its already-admitted client.
             loop {
                 tokio::select! {
-                    result = &mut worker => break result.map_err(|error| internal_error(error.to_string()))?,
+                    result = &mut worker => break result.map_err(internal_error)?,
                     _ = tokio::time::sleep(Duration::from_millis(10)) => {
                         if cancellation.is_cancelled() {
                             let reason = cancellation
@@ -1678,7 +1689,7 @@ impl FrontendQuerySession {
                                 // and is rejected as StatementBusy.
                                 break (&mut worker)
                                     .await
-                                    .map_err(|error| internal_error(error.to_string()))?;
+                                    .map_err(internal_error)?;
                             }
                             return Ok(self.governed_typed_error(
                                 cancellation_error(reason),

@@ -354,6 +354,7 @@ pub fn build_frontend_query_session_factory(
         dml_engines.ctas,
         dml_engines.truncate,
         host.query_cpu_executor(),
+        host.query_blocking_executor(),
         host.connector_blocking_io_supervisor(),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),

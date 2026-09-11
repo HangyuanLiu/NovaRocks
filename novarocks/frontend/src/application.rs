@@ -30,6 +30,7 @@ use novarocks_query_application::coordination::{
     RootResultDecodeRuntime, RootResultDecodeRuntimeOwner,
 };
 use novarocks_query_application::cpu::{
+    QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_task_codec::TransportBudget;
@@ -91,6 +92,8 @@ const DEFAULT_RESULT_DECODE_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).un
 const DEFAULT_RESULT_DECODE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_QUERY_CPU_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const DEFAULT_QUERY_CPU_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+const DEFAULT_QUERY_BLOCKING_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
@@ -226,6 +229,7 @@ pub enum FrontendApplicationErrorKind {
     ClusterBackendOpen,
     CoordinatorOpen,
     QueryCpuExecutorOpen,
+    QueryBlockingExecutorOpen,
     ResultDecodeRuntimeOpen,
     WorkloadControlOpen,
     Server,
@@ -284,6 +288,8 @@ struct FrontendExecutionRuntimeOwner {
     resources: LocalResourceAuthority,
     query_cpu: QueryCpuExecutorOwner,
     query_cpu_executor: QueryCpuExecutor,
+    query_blocking: QueryBlockingExecutorOwner,
+    query_blocking_executor: QueryBlockingExecutor,
     decode: RootResultDecodeRuntimeOwner,
     decode_runtime: RootResultDecodeRuntime,
     terminal_error: Option<String>,
@@ -297,6 +303,7 @@ impl FrontendExecutionRuntimeOwner {
         workload_config: WorkloadConfig,
         resource_config: ResourceConfig,
         query_cpu_config: QueryCpuExecutorConfig,
+        query_blocking_config: QueryBlockingExecutorConfig,
         decode_worker_count: NonZeroUsize,
         decode_queue_capacity: NonZeroUsize,
     ) -> Result<Self, FrontendApplicationError> {
@@ -311,6 +318,14 @@ impl FrontendExecutionRuntimeOwner {
             FrontendApplicationError::new(FrontendApplicationErrorKind::QueryCpuExecutorOpen, error)
         })?;
         let query_cpu_executor = query_cpu.executor();
+        let query_blocking =
+            QueryBlockingExecutorOwner::try_new(query_blocking_config).map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::QueryBlockingExecutorOpen,
+                    error,
+                )
+            })?;
+        let query_blocking_executor = query_blocking.executor();
         let decode =
             RootResultDecodeRuntimeOwner::try_new(decode_worker_count, decode_queue_capacity)
                 .map_err(|error| {
@@ -348,6 +363,8 @@ impl FrontendExecutionRuntimeOwner {
             resources: workload.resources,
             query_cpu,
             query_cpu_executor,
+            query_blocking,
+            query_blocking_executor,
             decode,
             decode_runtime,
             terminal_error: None,
@@ -416,6 +433,10 @@ impl FrontendExecutionRuntimeOwner {
             return Err(error);
         }
 
+        if let Err(error) = self.query_blocking.shutdown_until(deadline).await {
+            return Err(error);
+        }
+
         if let Err(error) = self.decode.shutdown_until(deadline).await {
             if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
                 return Err(error.to_string());
@@ -431,6 +452,7 @@ impl FrontendExecutionRuntimeOwner {
         self.close_admission();
         self.supervisor.abandon_for_process_exit();
         self.query_cpu.request_shutdown_for_process_exit();
+        self.query_blocking.request_shutdown_for_process_exit();
         self.decode.request_shutdown_for_process_exit();
         self.workload.take();
         self.shutdown_complete = true;
@@ -502,6 +524,10 @@ impl FrontendExecutionRuntimeOwner {
 
     fn query_cpu_executor(&self) -> QueryCpuExecutor {
         self.query_cpu_executor.clone()
+    }
+
+    fn query_blocking_executor(&self) -> QueryBlockingExecutor {
+        self.query_blocking_executor.clone()
     }
 
     fn decode_runtime(&self) -> RootResultDecodeRuntime {
@@ -660,6 +686,8 @@ pub struct FrontendExecutionConfig {
     result_fetch_byte_limit: ResultByteLimit,
     /// Fixed process-wide CPU preparation workers and bounded waiting queue.
     query_cpu_executor_config: QueryCpuExecutorConfig,
+    /// Fixed process-wide workers for legacy synchronous query command edges.
+    query_blocking_executor_config: QueryBlockingExecutorConfig,
     /// Fixed process-wide worker and waiting bounds for synchronous result decode.
     result_decode_worker_count: NonZeroUsize,
     result_decode_queue_capacity: NonZeroUsize,
@@ -711,6 +739,10 @@ impl FrontendExecutionConfig {
             query_cpu_executor_config: QueryCpuExecutorConfig::new(
                 DEFAULT_QUERY_CPU_WORKER_COUNT,
                 DEFAULT_QUERY_CPU_QUEUE_CAPACITY,
+            ),
+            query_blocking_executor_config: QueryBlockingExecutorConfig::new(
+                DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
+                DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
             ),
             result_decode_worker_count: logical_runtime.decode_worker_count,
             result_decode_queue_capacity: logical_runtime.decode_queue_capacity,
@@ -806,6 +838,16 @@ impl FrontendExecutionConfig {
     /// Frontend opens any process runtime.
     pub fn with_query_cpu_executor_config(mut self, config: QueryCpuExecutorConfig) -> Self {
         self.query_cpu_executor_config = config;
+        self
+    }
+
+    /// Server composition freezes the bounded legacy command-worker capacity
+    /// before opening any Frontend runtime.
+    pub fn with_query_blocking_executor_config(
+        mut self,
+        config: QueryBlockingExecutorConfig,
+    ) -> Self {
+        self.query_blocking_executor_config = config;
         self
     }
 
@@ -983,6 +1025,7 @@ impl FrontendApplicationHost {
             execution.workload.clone(),
             execution.workload_resources.clone(),
             execution.query_cpu_executor_config,
+            execution.query_blocking_executor_config,
             execution.result_decode_worker_count,
             execution.result_decode_queue_capacity,
         )?;
@@ -1567,6 +1610,12 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.query_cpu_executor()
     }
 
+    /// Cloneable submission handle for synchronous command edges whose
+    /// provider contracts are not asynchronous yet.
+    pub(crate) fn query_blocking_executor(&self) -> QueryBlockingExecutor {
+        self.execution_runtime_owner.query_blocking_executor()
+    }
+
     /// Cloneable handle for the one process-owned Connector blocking-I/O
     /// supervisor. SQL session initialization uses its ordinary lane only for
     /// external catalog metadata, never for local catalog lookups.
@@ -1979,7 +2028,7 @@ mod tests {
         },
     };
     use async_trait::async_trait;
-    use novarocks_query_application::cpu::QueryCpuExecutorConfig;
+    use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
     use novarocks_state_store_api::{
         StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderDescriptor,
         StateStoreProviderFactory, StateStoreProviderInstance,
@@ -2024,6 +2073,10 @@ mod tests {
                 per_scope_bytes: 1 << 18,
             },
             QueryCpuExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            QueryBlockingExecutorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(1).unwrap(),
             ),

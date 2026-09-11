@@ -62,6 +62,46 @@ pub struct QueryCpuExecutor {
     handle: BoundedResultDecodeHandle<CpuResult>,
 }
 
+/// Fixed process limits for legacy synchronous query command edges.
+///
+/// This is deliberately separate from [`QueryCpuExecutorConfig`]: command
+/// routes may call providers or wait on durable catalog work, so charging them
+/// to compiler CPU capacity would let those waits starve pure preparation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct QueryBlockingExecutorConfig {
+    worker_threads: NonZeroUsize,
+    queue_capacity: NonZeroUsize,
+}
+
+impl QueryBlockingExecutorConfig {
+    pub const fn new(worker_threads: NonZeroUsize, queue_capacity: NonZeroUsize) -> Self {
+        Self {
+            worker_threads,
+            queue_capacity,
+        }
+    }
+
+    pub const fn worker_threads(self) -> NonZeroUsize {
+        self.worker_threads
+    }
+
+    pub const fn queue_capacity(self) -> NonZeroUsize {
+        self.queue_capacity
+    }
+}
+
+/// The process owner for bounded synchronous command edges that have not yet
+/// acquired an asynchronous provider contract.
+pub struct QueryBlockingExecutorOwner {
+    owner: BoundedResultDecodeOwner<CpuResult>,
+    executor: QueryBlockingExecutor,
+}
+
+#[derive(Clone)]
+pub struct QueryBlockingExecutor {
+    handle: BoundedResultDecodeHandle<CpuResult>,
+}
+
 impl QueryCpuExecutorOwner {
     pub fn try_new(config: QueryCpuExecutorConfig) -> Result<Self, String> {
         let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
@@ -114,6 +154,58 @@ impl QueryCpuExecutor {
     }
 }
 
+impl QueryBlockingExecutorOwner {
+    pub fn try_new(config: QueryBlockingExecutorConfig) -> Result<Self, String> {
+        let owner = BoundedResultDecodeOwner::try_new(ResultDecodeExecutorConfig::new(
+            config.worker_threads(),
+            config.queue_capacity(),
+        ))
+        .map_err(|error| format!("open query blocking executor: {error}"))?;
+        let executor = QueryBlockingExecutor {
+            handle: owner.handle(),
+        };
+        Ok(Self { owner, executor })
+    }
+
+    pub fn executor(&self) -> QueryBlockingExecutor {
+        self.executor.clone()
+    }
+
+    /// Stops admission and joins the same fixed worker set.
+    pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        self.owner
+            .shutdown_until(deadline)
+            .await
+            .map_err(|error| format!("shut down query blocking executor: {error}"))
+    }
+
+    /// Only process teardown may close this executor without waiting.
+    pub fn request_shutdown_for_process_exit(&self) {
+        self.owner.request_close();
+    }
+}
+
+impl QueryBlockingExecutor {
+    pub async fn run<T, F>(&self, work: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let receipt = self
+            .handle
+            .submit(ResultDecodeJob::new(move || Box::new(work()) as CpuResult))
+            .await
+            .map_err(|_| "query blocking executor closed before admitting work".to_owned())?;
+        receipt
+            .complete()
+            .await
+            .map_err(|error| format!("query blocking worker failed: {error}"))?
+            .downcast::<T>()
+            .map(|result| *result)
+            .map_err(|_| "query blocking worker returned an invalid result type".to_owned())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -125,7 +217,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{QueryCpuExecutorConfig, QueryCpuExecutorOwner};
+    use super::{
+        QueryBlockingExecutorConfig, QueryBlockingExecutorOwner, QueryCpuExecutorConfig,
+        QueryCpuExecutorOwner,
+    };
 
     fn executor(workers: usize, queue: usize) -> QueryCpuExecutorOwner {
         QueryCpuExecutorOwner::try_new(QueryCpuExecutorConfig::new(
@@ -184,5 +279,60 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("shut down CPU workers");
+    }
+
+    #[tokio::test]
+    async fn fixed_blocking_workers_bound_concurrent_work() {
+        let owner = QueryBlockingExecutorOwner::try_new(QueryBlockingExecutorConfig::new(
+            NonZeroUsize::new(1).expect("nonzero workers"),
+            NonZeroUsize::new(2).expect("nonzero queue"),
+        ))
+        .expect("open blocking executor");
+        let executor = owner.executor();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut work = Vec::new();
+        for value in 0..2 {
+            let gate = Arc::clone(&gate);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let executor = executor.clone();
+            work.push(tokio::spawn(async move {
+                executor
+                    .run(move || {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        let (lock, ready) = &*gate;
+                        let mut open = lock.lock().expect("gate lock");
+                        while !*open {
+                            open = ready.wait(open).expect("gate wait");
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        value
+                    })
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one fixed blocking worker started");
+        let (lock, ready) = &*gate;
+        *lock.lock().expect("gate lock") = true;
+        ready.notify_all();
+        for (expected, work) in work.into_iter().enumerate() {
+            assert_eq!(work.await.expect("join").expect("run"), expected);
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+        drop(executor);
+        let mut owner = owner;
+        owner
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shut down blocking workers");
     }
 }

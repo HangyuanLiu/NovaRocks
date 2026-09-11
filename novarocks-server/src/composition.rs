@@ -49,7 +49,7 @@ use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
     LogicalExecutionSupervisorConfig,
 };
-use novarocks_query_application::cpu::QueryCpuExecutorConfig;
+use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
@@ -469,6 +469,10 @@ pub fn compose_frontend_server_config(
         .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_worker_threads must be nonzero"))?;
     let query_cpu_queue = NonZeroUsize::new(runtime_config.query_cpu_queue_capacity)
         .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_queue_capacity must be nonzero"))?;
+    let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?;
+    let query_blocking_queue = NonZeroUsize::new(runtime_config.query_blocking_queue_capacity)
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?;
     let failure_backoff_ms = config
         .standalone_server
         .as_ref()
@@ -579,6 +583,10 @@ pub fn compose_frontend_server_config(
     .with_query_cpu_executor_config(QueryCpuExecutorConfig::new(
         query_cpu_workers,
         query_cpu_queue,
+    ))
+    .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
+        query_blocking_workers,
+        query_blocking_queue,
     ))
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
