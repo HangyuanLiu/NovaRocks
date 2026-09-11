@@ -555,6 +555,18 @@ impl GovernedQueryStatementOwner {
         self.execution_owner.take()
     }
 
+    /// Returns the root responsibility after a synchronous executor has
+    /// produced a protocol-visible result. The result owner must keep it live
+    /// until the protocol reaches a terminal outcome, because that delivery
+    /// may still acquire data credits under the same scope.
+    pub fn restore_execution_owner(&mut self, owner: WorkOwner) {
+        assert!(
+            self.execution_owner.is_none(),
+            "governed statement must not retain two execution owners"
+        );
+        self.execution_owner = Some(owner);
+    }
+
     /// Releases only the execution root after synchronous work has stopped.
     /// The statement generation and business permit intentionally remain with
     /// this owner until the protocol terminal outcome is known.

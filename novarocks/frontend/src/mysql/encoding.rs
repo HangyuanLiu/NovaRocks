@@ -186,15 +186,15 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
         };
         let cancellation = protocol.cancellation();
         let (resources, scope) = protocol.reservation_inputs();
-        let reserve_decoded = resources.reserve_result_credit_when_available(&scope, decoded_bytes);
-        tokio::pin!(reserve_decoded);
+        let reserve_fetch = resources.reserve_result_credit_when_available(&scope, decoded_bytes);
+        tokio::pin!(reserve_fetch);
         let credit = match tokio::select! {
             biased;
             reason = cancellation.cancelled() => {
                 Err(cancelled_query_result_delivery(reason))
             }
-            credit = &mut reserve_decoded => credit.map_err(|error| {
-                failed_query_result_delivery(format!("reserve decoded immediate result bytes: {error}"))
+            credit = &mut reserve_fetch => credit.map_err(|error| {
+                failed_query_result_delivery(format!("reserve immediate result fetch bytes: {error}"))
             })
         } {
             Ok(credit) => credit,
@@ -204,6 +204,64 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 } else {
                     let _ = protocol.fail();
                 }
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        // The result batch is already materialized by the synchronous command
+        // executor. Account it through the normal fetch/decode transitions
+        // before handing that exact Arrow backing to the protocol writer.
+        let credit = match credit.begin_fetch() {
+            Ok(credit) => credit,
+            Err(error) => {
+                let error = failed_query_result_delivery(format!(
+                    "begin immediate result credit fetch: {error}"
+                ));
+                let _ = protocol.fail();
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        let credit = match credit.retain_raw(decoded_bytes) {
+            Ok(credit) => credit,
+            Err(error) => {
+                let (error, _credit) = error.into_parts();
+                let error =
+                    failed_query_result_delivery(format!("retain immediate result bytes: {error}"));
+                let _ = protocol.fail();
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        let cancellation = protocol.cancellation();
+        let resources = protocol.reservation_inputs().0;
+        let reserve_decode = credit.reserve_decode_when_available(&resources, decoded_bytes);
+        tokio::pin!(reserve_decode);
+        let credit = match tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                Err(cancelled_query_result_delivery(reason))
+            }
+            credit = &mut reserve_decode => credit.map_err(|error| {
+                let (error, _credit) = error.into_parts();
+                failed_query_result_delivery(format!("reserve immediate result decode bytes: {error}"))
+            })
+        } {
+            Ok(credit) => credit,
+            Err(error) => {
+                if error.kind() == QueryExecutionErrorKind::Cancelled {
+                    let _ = protocol.settle_cancellation();
+                } else {
+                    let _ = protocol.fail();
+                }
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        let credit = match credit.queue_decoded(decoded_bytes) {
+            Ok(credit) => credit,
+            Err(error) => {
+                let (error, _credit) = error.into_parts();
+                let error = failed_query_result_delivery(format!(
+                    "queue immediate decoded result bytes: {error}"
+                ));
+                let _ = protocol.fail();
                 return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
             }
         };

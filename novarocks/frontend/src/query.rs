@@ -1645,10 +1645,9 @@ impl FrontendQuerySession {
                         .map_err(RoutedExecutionError::Engine)
                 }
             };
-            execution_owner.complete();
-            result
+            (result, execution_owner)
         }));
-        let result = if let Some(timeout_duration) = timeout_duration {
+        let (result, execution_owner) = if let Some(timeout_duration) = timeout_duration {
             match tokio::time::timeout(timeout_duration, &mut worker).await {
                 Ok(result) => result.map_err(internal_error)?,
                 Err(_) => {
@@ -1657,7 +1656,8 @@ impl FrontendQuerySession {
                     // A timeout is not complete until the worker releases the
                     // statement lease. Waiting here also fences Backend abort
                     // acknowledgement before this session admits its next SQL.
-                    let _ = worker.await;
+                    let (_, execution_owner) = worker.await.map_err(internal_error)?;
+                    statement.restore_execution_owner(execution_owner);
                     return Ok(self.governed_typed_error(
                         QueryServiceError::new(
                             QueryServiceErrorKind::Timeout,
@@ -1700,6 +1700,7 @@ impl FrontendQuerySession {
                 }
             }
         };
+        statement.restore_execution_owner(execution_owner);
         if cancellation.is_cancelled() {
             return Ok(self.governed_typed_error(
                 cancellation_error(cancellation.reason().expect("cancelled view has a reason")),

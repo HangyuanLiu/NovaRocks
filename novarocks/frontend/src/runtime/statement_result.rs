@@ -163,13 +163,9 @@ mod tests {
         )
         .expect("workload control");
         workload.mark_ready().expect("workload ready");
-        let mut statement = control
+        let statement = control
             .begin_governed_query_statement(session.token(), &workload.root_admission(), None, None)
             .expect("governed statement");
-        statement
-            .take_execution_owner()
-            .expect("execution owner")
-            .complete();
         let result = GovernedImmediateStatementResult::new(
             QueryResult::empty(),
             workload.resources(),
@@ -194,6 +190,18 @@ mod tests {
             GovernedStatementFinishOutcome::Completed
         );
         assert_eq!(workload.snapshot().businesses, 0);
+    }
+
+    #[test]
+    fn governed_immediate_retains_root_scope_for_protocol_data_credit() {
+        let (result, _workload, _session) = immediate_fixture();
+        let (_, protocol) = result.into_parts();
+        let (resources, scope) = protocol.reservation_inputs();
+
+        let reservation = resources
+            .reserve(&scope, 1, novarocks_workload_control::ResourceClass::Data)
+            .expect("protocol-visible immediate result retains data-credit scope");
+        drop(reservation);
     }
 
     #[test]
