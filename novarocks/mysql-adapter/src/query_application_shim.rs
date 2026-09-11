@@ -17,9 +17,11 @@
 
 //! MySQL protocol dispatch over Query Application session contracts.
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opensrv_mysql::{
@@ -41,6 +43,84 @@ use novarocks_query_application::session::{
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 
 use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_disconnect_watcher};
+
+/// Default upper bound for draining protocol tasks during an immediate
+/// application shutdown.
+pub const QUERY_APPLICATION_MYSQL_SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs a ready Query Application session factory until shutdown.
+///
+/// The adapter owns protocol-task draining; the caller supplies the already
+/// composed session factory and the role-specific readiness action.
+pub async fn serve_query_application_mysql_until_shutdown<F, R>(
+    settings: crate::ResolvedMysqlListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    shutdown: F,
+    on_ready: R,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    R: FnOnce(SocketAddr),
+{
+    let shutdown_factory = Arc::clone(&session_factory);
+    let shutdown_connections = Arc::clone(&connections);
+    serve_query_application_mysql_until_drain_then_shutdown(
+        settings,
+        server_version,
+        session_factory,
+        connections,
+        async move {
+            shutdown.await;
+        },
+        async move {
+            shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
+            shutdown_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
+        },
+        QUERY_APPLICATION_MYSQL_SESSION_DRAIN_TIMEOUT,
+        on_ready,
+    )
+    .await
+}
+
+/// Stops accepting new sockets at `drain`, runs role-owned finalization, then
+/// drains established Query Application protocol tasks.
+pub async fn serve_query_application_mysql_until_drain_then_shutdown<F, G, R>(
+    settings: crate::ResolvedMysqlListenerSettings,
+    server_version: String,
+    session_factory: Arc<dyn QuerySessionFactory>,
+    connections: Arc<MysqlClientConnectionRegistry>,
+    drain: F,
+    finalize: G,
+    cleanup_timeout: Duration,
+    on_ready: R,
+) -> Result<(), String>
+where
+    F: Future<Output = ()> + Send,
+    G: Future<Output = ()> + Send,
+    R: FnOnce(SocketAddr),
+{
+    let (bind_addr, session_user) = settings.into_parts();
+    crate::serve_tcp_until_drain_then_shutdown(
+        bind_addr,
+        drain,
+        finalize,
+        move |stream, peer_addr| {
+            serve_query_application_mysql_connection(
+                session_user.clone(),
+                server_version.clone(),
+                Arc::clone(&session_factory),
+                Arc::clone(&connections),
+                stream,
+                peer_addr,
+            )
+        },
+        on_ready,
+        cleanup_timeout,
+    )
+    .await
+}
 
 pub async fn serve_query_application_mysql_connection(
     user: String,

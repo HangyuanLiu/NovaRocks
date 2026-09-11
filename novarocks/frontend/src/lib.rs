@@ -31,6 +31,7 @@ pub(crate) mod durable;
 pub mod maintenance;
 pub mod metrics;
 pub mod mv;
+#[cfg(test)]
 mod mysql;
 mod native;
 mod preparation_diagnostics;
@@ -62,12 +63,11 @@ pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
-pub use mysql::{
-    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
-    run_mysql_server_until_shutdown,
-};
 pub use native::report_server::FrontendReportServerHandle;
 pub use native::transport::FrontendNativeTransport;
+pub use novarocks_mysql_adapter::{
+    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
+};
 pub use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
 pub use novarocks_query_application::sql::session::SessionExecutionSettings;
 pub use query::FrontendQueryService;

@@ -15,11 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub use novarocks_mysql_adapter::{
-    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
-};
-
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 #[cfg(test)]
@@ -28,12 +23,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-#[cfg(test)]
-use opensrv_mysql::{AsyncMysqlShim, ErrorKind};
-use tracing::info;
-
-use novarocks_version as version;
-
+use novarocks_mysql_adapter::{
+    MysqlClientConnectionRegistry, QUERY_APPLICATION_MYSQL_SESSION_DRAIN_TIMEOUT,
+    ResolvedMysqlListenerSettings,
+};
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::ClientConnectionTerminationReason;
 #[cfg(test)]
@@ -43,106 +36,10 @@ use novarocks_query_application::session::QuerySessionFactory;
 use novarocks_query_application::session::{QuerySession, QuerySessionOpenRequest};
 #[cfg(test)]
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
-use novarocks_types::naming::DEFAULT_DATABASE;
-
+#[cfg(test)]
+use opensrv_mysql::{AsyncMysqlShim, ErrorKind};
 #[cfg(test)]
 const ROOT_USER: &str = novarocks_mysql_adapter::DEFAULT_MYSQL_USER;
-const SESSION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Runs the MySQL protocol listener with a ready frontend-owned session
-/// factory.
-///
-/// The listener preserves the public ready marker and the shutdown drain
-/// contract.  On shutdown it first asks the session factory to cancel all
-/// sessions, stops accepting new connections, then waits for active protocol
-/// tasks to drain (or aborts them after the bounded drain timeout).
-// Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
-// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
-pub async fn run_mysql_server_until_shutdown<F>(
-    settings: ResolvedMysqlListenerSettings,
-    session_factory: Arc<dyn QuerySessionFactory>,
-    connections: Arc<MysqlClientConnectionRegistry>,
-    shutdown: F,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-{
-    let shutdown_factory = Arc::clone(&session_factory);
-    let shutdown_connections = Arc::clone(&connections);
-    run_mysql_server_until_drain_then_shutdown(
-        settings,
-        session_factory,
-        connections,
-        async move {
-            shutdown.await;
-        },
-        async move {
-            shutdown_factory.cancel_all(QueryCancellationReason::ServerShutdown);
-            shutdown_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-        },
-        SESSION_DRAIN_TIMEOUT,
-    )
-    .await
-}
-
-/// Stops accepting new sockets at `drain`, but retains already accepted
-/// protocol tasks until the FE lifecycle owner performs final teardown.
-///
-/// This is deliberately separate from `run_mysql_server_until_shutdown`: an
-/// idle MySQL session is not an admitted workload and must not decide the FE
-/// drain deadline, while an admitted statement needs its socket and result
-/// path until it completes or the deadline cancellation wins.
-pub async fn run_mysql_server_until_drain_then_shutdown<F, G>(
-    settings: ResolvedMysqlListenerSettings,
-    session_factory: Arc<dyn QuerySessionFactory>,
-    connections: Arc<MysqlClientConnectionRegistry>,
-    drain: F,
-    finalize: G,
-    cleanup_timeout: Duration,
-) -> Result<(), String>
-where
-    F: Future<Output = ()> + Send,
-    G: Future<Output = ()> + Send,
-{
-    let (bind_addr, session_user) = settings.into_parts();
-    let ready_user = session_user.clone();
-    novarocks_mysql_adapter::serve_tcp_until_drain_then_shutdown(
-        bind_addr,
-        drain,
-        finalize,
-        move |stream, peer_addr| {
-            novarocks_mysql_adapter::serve_query_application_mysql_connection(
-                session_user.clone(),
-                version::short_version().to_string(),
-                Arc::clone(&session_factory),
-                Arc::clone(&connections),
-                stream,
-                peer_addr,
-            )
-        },
-        move |bound_addr| emit_standalone_ready(bound_addr, &ready_user),
-        cleanup_timeout,
-    )
-    .await
-}
-
-fn emit_standalone_ready(bind_addr: SocketAddr, user: &str) {
-    info!(
-        "standalone mysql server listening on {} (user={}, db={})",
-        bind_addr, user, DEFAULT_DATABASE
-    );
-    // Emit a parser-friendly readiness marker on stdout. Orchestration
-    // scripts must wait for this exact line before connecting; probing the
-    // mysql port alone cannot distinguish a freshly-bound server from a
-    // pre-existing process that already owned the port. The keyword
-    // `NOVAROCKS_READY` is the wait-for-ready contract — do not change it
-    // without updating callers (CLAUDE.md, SQL test harness, etc.).
-    println!(
-        "NOVAROCKS_READY mysql_port={} pid={}",
-        bind_addr.port(),
-        std::process::id()
-    );
-}
 
 #[cfg(test)]
 #[test]
@@ -255,11 +152,13 @@ mod protocol_api_tests {
         let settings =
             ResolvedMysqlListenerSettings::new(SocketAddr::from(([127, 0, 0, 1], 0)), ROOT_USER);
 
-        run_mysql_server_until_shutdown(
+        novarocks_mysql_adapter::serve_query_application_mysql_until_shutdown(
             settings,
+            "test".to_string(),
             factory,
             Arc::new(MysqlClientConnectionRegistry::new()),
             async {},
+            |_| {},
         )
         .await
         .expect("ready protocol server should shut down cleanly");
@@ -280,9 +179,16 @@ mod protocol_api_tests {
         let settings =
             ResolvedMysqlListenerSettings::new(SocketAddr::from(([127, 0, 0, 1], 0)), ROOT_USER);
 
-        run_mysql_server_until_shutdown(settings, factory, Arc::clone(&connections), async {})
-            .await
-            .expect("ready protocol server should shut down cleanly");
+        novarocks_mysql_adapter::serve_query_application_mysql_until_shutdown(
+            settings,
+            "test".to_string(),
+            factory,
+            Arc::clone(&connections),
+            async {},
+            |_| {},
+        )
+        .await
+        .expect("ready protocol server should shut down cleanly");
 
         assert!(cancelled.load(Ordering::SeqCst));
         assert_eq!(
@@ -587,7 +493,10 @@ mod tests {
 
         #[tokio::test]
         async fn drain_timeout_aborts_stuck_session() {
-            assert_eq!(SESSION_DRAIN_TIMEOUT, Duration::from_secs(5));
+            assert_eq!(
+                QUERY_APPLICATION_MYSQL_SESSION_DRAIN_TIMEOUT,
+                Duration::from_secs(5)
+            );
 
             let (ready_tx, ready_rx) = oneshot::channel();
             let (shutdown_tx, shutdown_rx) = oneshot::channel();

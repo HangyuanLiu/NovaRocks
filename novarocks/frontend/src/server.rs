@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
 use tokio::runtime::Handle;
+use tracing::info;
 
 use crate::capabilities as core_capabilities;
 use crate::native::transport::FrontendNativeTransport;
@@ -36,6 +37,8 @@ use novarocks_query_application::client_connection::{
 };
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_types::naming::DEFAULT_DATABASE;
+use novarocks_version as version;
 
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
@@ -709,14 +712,18 @@ where
             }
         }
     };
-    let mysql_server = crate::mysql::run_mysql_server_until_drain_then_shutdown(
-        mysql_listener,
-        Arc::clone(&session_factory),
-        Arc::clone(&client_connections),
-        wait_for_signal(drain_rx),
-        wait_for_signal(finalize_rx),
-        cleanup_timeout,
-    );
+    let ready_user = mysql_listener.user().to_string();
+    let mysql_server =
+        novarocks_mysql_adapter::serve_query_application_mysql_until_drain_then_shutdown(
+            mysql_listener,
+            version::short_version().to_string(),
+            Arc::clone(&session_factory),
+            Arc::clone(&client_connections),
+            wait_for_signal(drain_rx),
+            wait_for_signal(finalize_rx),
+            cleanup_timeout,
+            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user),
+        );
     tokio::pin!(mysql_server);
 
     tokio::select! {
@@ -764,6 +771,22 @@ where
             }
         }
     }
+}
+
+fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
+    info!(
+        "standalone mysql server listening on {} (user={}, db={})",
+        bind_addr, user, DEFAULT_DATABASE
+    );
+    // Emit a parser-friendly readiness marker on stdout. Orchestration
+    // scripts must wait for this exact line before connecting; probing the
+    // mysql port alone cannot distinguish a freshly-bound server from a
+    // pre-existing process that already owned the port.
+    println!(
+        "NOVAROCKS_READY mysql_port={} pid={}",
+        bind_addr.port(),
+        std::process::id()
+    );
 }
 
 async fn wait_for_frontend_listener_failure(
