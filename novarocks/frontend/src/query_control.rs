@@ -20,14 +20,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
-use crate::query_execution::control::{
+use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
+use novarocks_query_application::client_connection::ClientConnectionToken;
+use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
     GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
     QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionToken,
     StatementFinishOutcome, StatementRegistration, StatementToken,
 };
-use novarocks_query_application::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     CancellationReason, WorkCancellationRequestOutcome, WorkError, WorkSuccessSealOutcome,
 };
@@ -68,10 +68,10 @@ impl ActiveStatementCancellation {
     fn request(&self, reason: QueryCancellationReason) -> QueryCancelOutcome {
         match self {
             Self::Legacy(cancellation) => match cancellation.request(reason) {
-                crate::common::query_cancellation::QueryCancellationRequestResult::Requested => {
+                novarocks_query_application::cancellation::QueryCancellationRequestResult::Requested => {
                     QueryCancelOutcome::Requested
                 }
-                crate::common::query_cancellation::QueryCancellationRequestResult::AlreadyRequested(
+                novarocks_query_application::cancellation::QueryCancellationRequestResult::AlreadyRequested(
                     reason,
                 ) => QueryCancelOutcome::AlreadyRequested(reason),
             },
@@ -561,7 +561,9 @@ impl QueryControlPort for FrontendQueryControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::control::{GovernedQueryStatementBeginError, QueryControlPort};
+    use novarocks_query_application::session_control::{
+        GovernedQueryStatementBeginError, QueryControlPort,
+    };
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     fn register(
@@ -698,7 +700,7 @@ mod tests {
             source.request(QueryCancellationReason::FrontendDrainDeadlineExceeded {
                 timeout_ms: 300_000,
             }),
-            crate::common::query_cancellation::QueryCancellationRequestResult::Requested
+            novarocks_query_application::cancellation::QueryCancellationRequestResult::Requested
         );
         assert!(active.cancellation().is_cancelled());
         assert_eq!(

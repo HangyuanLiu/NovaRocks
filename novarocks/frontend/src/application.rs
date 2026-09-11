@@ -510,7 +510,7 @@ pub struct FrontendApplicationHost {
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
-    query_control: crate::query_execution::control::QueryControlService,
+    query_control: novarocks_query_application::session_control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
@@ -1563,7 +1563,9 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.resources()
     }
 
-    pub fn query_control_service(&self) -> crate::query_execution::control::QueryControlService {
+    pub fn query_control_service(
+        &self,
+    ) -> novarocks_query_application::session_control::QueryControlService {
         self.query_control.clone()
     }
 

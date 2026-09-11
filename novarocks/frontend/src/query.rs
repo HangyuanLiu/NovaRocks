@@ -28,13 +28,8 @@ use crate::common::admitted_query_context::{
 };
 use crate::common::backend_topology::{BackendTopologyService, BackendTopologySnapshot};
 use crate::common::engine_error::EngineError;
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationView};
 use crate::mv::command::MvCommandExecutor;
 use crate::query_execution::backend_command::BackendCommandExecutor;
-use crate::query_execution::control::{
-    ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
-};
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::dml::delete::DeleteEngine;
@@ -70,9 +65,14 @@ use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
+use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason,
+};
+use novarocks_query_application::session_control::{
+    ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
+    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
@@ -1214,7 +1214,7 @@ impl FrontendQuerySession {
         }
         let mut live_state = self.state.lock().map_err(poisoned_state)?;
         match statement.seal_success_visibility() {
-            crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Sealed => {
+            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Sealed => {
                 *live_state = staged_state;
                 drop(live_state);
                 statement.complete_execution();
@@ -1225,13 +1225,13 @@ impl FrontendQuerySession {
                     ),
                 ))
             }
-            crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Cancelled(
+            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Cancelled(
                 reason,
             ) => {
                 drop(live_state);
                 Ok(self.governed_typed_error(governed_cancellation_error(reason), statement))
             }
-            crate::query_execution::control::GovernedStatementVisibilitySealOutcome::Stale => {
+            novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Stale => {
                 drop(live_state);
                 Ok(self.governed_typed_error(
                     internal_error(
@@ -1249,7 +1249,7 @@ impl FrontendQuerySession {
         parsed: ParsedStatement,
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
-        statement: &crate::query_execution::control::GovernedQueryStatementOwner,
+        statement: &novarocks_query_application::session_control::GovernedQueryStatementOwner,
         state: SessionSqlState,
     ) -> Result<String, QueryServiceError> {
         let prepared = self
@@ -1732,7 +1732,7 @@ impl FrontendQuerySession {
     fn governed_typed_error(
         &self,
         error: QueryServiceError,
-        statement: crate::query_execution::control::GovernedQueryStatementOwner,
+        statement: novarocks_query_application::session_control::GovernedQueryStatementOwner,
     ) -> StatementResult {
         StatementResult::GovernedError(GovernedErrorStatementResult::new(
             error,
@@ -2851,7 +2851,7 @@ fn session_setting_error(error: SessionSettingError) -> QueryServiceError {
 }
 
 fn governed_statement_begin_error(
-    error: crate::query_execution::control::GovernedQueryStatementBeginError,
+    error: novarocks_query_application::session_control::GovernedQueryStatementBeginError,
 ) -> QueryServiceError {
     QueryServiceError::new(
         QueryServiceErrorKind::Unavailable,
@@ -2919,7 +2919,6 @@ mod tests {
 
     use crate::common::admitted_query_context::QueryExecutionContext;
     use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::QueryCancellationSource;
     use crate::query_execution::dml::delete::{
         DeleteEngine, DeleteOperation, DeletePrepared, DeleteWriteReport, PrepareDeleteRequest,
         PreparedDelete,
@@ -2934,6 +2933,7 @@ mod tests {
     };
     use arrow::array::Int64Array;
     use novarocks_query_application::api::ResultField;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,

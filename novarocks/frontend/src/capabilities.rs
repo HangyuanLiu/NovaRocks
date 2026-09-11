@@ -737,7 +737,7 @@ pub fn background_maintenance_attempt(
     let deadline = std::time::Instant::now()
         .checked_add(max_attempt_duration)
         .ok_or_else(|| "automatic maintenance deadline overflow".to_string())?;
-    let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
+    let cancellation = novarocks_query_application::cancellation::QueryCancellationSource::new();
     let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
         role,
         topology,

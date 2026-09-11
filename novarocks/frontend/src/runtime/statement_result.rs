@@ -17,14 +17,14 @@
 
 use super::query_result::QueryResult;
 use crate::QueryServiceError;
-use crate::common::query_cancellation::QueryCancellationView;
-use crate::query_execution::control::{
-    GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
-    GovernedStatementVisibilitySealOutcome,
-};
 use novarocks_query_application::api::{
     ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind,
     QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
+};
+use novarocks_query_application::cancellation::QueryCancellationView;
+use novarocks_query_application::session_control::{
+    GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
+    GovernedStatementVisibilitySealOutcome,
 };
 use novarocks_workload_control::{LocalResourceAuthority, WorkScope};
 
@@ -337,10 +337,10 @@ mod tests {
 
     use super::*;
     use crate::query_control::FrontendQueryControl;
-    use crate::query_execution::control::{
+    use novarocks_query_application::client_connection::ClientConnectionToken;
+    use novarocks_query_application::session_control::{
         QueryControlPort, QueryControlService, QuerySessionLease, SessionIdentity,
     };
-    use novarocks_query_application::client_connection::ClientConnectionToken;
 
     fn immediate_fixture() -> (
         GovernedImmediateStatementResult,
@@ -528,7 +528,7 @@ mod tests {
 
         assert_eq!(
             protocol.cancellation().cancelled().await,
-            crate::common::query_cancellation::QueryCancellationReason::DeadlineExceeded {
+            novarocks_query_application::cancellation::QueryCancellationReason::DeadlineExceeded {
                 timeout_ms: 73,
             }
         );
