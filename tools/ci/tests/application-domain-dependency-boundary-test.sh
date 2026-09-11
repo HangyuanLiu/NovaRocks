@@ -73,6 +73,8 @@ assert_edge_rejected novarocks-query-application novarocks-task-codec \
   "novarocks-query-application normal dependency closure contains forbidden domains:"
 assert_edge_rejected novarocks-worker novarocks-proto-models \
   "novarocks-worker normal dependency closure contains forbidden domains:"
+assert_edge_rejected novarocks-mysql-adapter novarocks-frontend \
+  "novarocks-mysql-adapter normal dependency closure contains forbidden owners:"
 
 # The checker follows package ids in the resolved graph, so dependency aliases
 # cannot hide a violation. A target predicate remains a normal edge for the

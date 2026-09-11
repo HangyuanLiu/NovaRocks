@@ -30,6 +30,7 @@ WORKER = "novarocks-worker"
 EXECUTION = "novarocks-execution"
 WORKLOAD = "novarocks-workload-control"
 CATALOG = "novarocks-catalog-application"
+MYSQL_ADAPTER = "novarocks-mysql-adapter"
 
 PRODUCTS = {
     "novarocks-mv-application",
@@ -129,6 +130,23 @@ def verify_products(metadata):
             fail(f"{product} normal dependency closure contains forbidden owners: " + ", ".join(forbidden))
 
 
+def verify_mysql_adapter(metadata):
+    if MYSQL_ADAPTER not in package_names(metadata):
+        return
+    closure = normal_closure(metadata, MYSQL_ADAPTER)
+    if QUERY not in closure:
+        fail(f"{MYSQL_ADAPTER} normal dependency closure must contain {QUERY}")
+    forbidden = sorted(
+        closure
+        & (PRODUCTS | ROLE_IMPLEMENTATIONS | WIRE | {WORKER, EXECUTION, "novarocks-server"})
+    )
+    if forbidden:
+        fail(
+            f"{MYSQL_ADAPTER} normal dependency closure contains forbidden owners: "
+            + ", ".join(forbidden)
+        )
+
+
 def load_metadata(arguments):
     if arguments.metadata_path is not None:
         return json.loads(arguments.metadata_path.read_text())
@@ -167,6 +185,7 @@ def main():
     if CATALOG in package_names(metadata):
         verify_forbidden_closure(metadata, CATALOG, CATALOG_FORBIDDEN)
     verify_products(metadata)
+    verify_mysql_adapter(metadata)
     verify_forbidden_closure(metadata, QUERY, QUERY_FORBIDDEN)
     if WORKLOAD not in normal_closure(metadata, QUERY):
         fail(f"{QUERY} normal dependency closure must contain {WORKLOAD}")
