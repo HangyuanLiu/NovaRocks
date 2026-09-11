@@ -456,15 +456,16 @@ impl FrontendServingLifecycle {
 
     /// First-wins cancellation for all leases still held at the drain deadline.
     pub fn cancel_active_at_drain_deadline(&self, timeout_ms: u64) -> usize {
-        let (sources, cancelled) = {
+        let (external_cancellations, cancelled) = {
             let mut inner = self
                 .shared
                 .inner
                 .lock()
                 .expect("frontend lifecycle lock poisoned");
-            let sources = inner.active.values().cloned().collect::<Vec<_>>();
+            let active = inner.active.values().cloned().collect::<Vec<_>>();
+            let mut external_cancellations = Vec::new();
             let mut cancelled = 0;
-            for lease in &sources {
+            for lease in active {
                 if matches!(
                     lease.cancellation.request(
                         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms },
@@ -472,17 +473,17 @@ impl FrontendServingLifecycle {
                     crate::common::query_cancellation::QueryCancellationRequestResult::Requested
                 ) {
                     increment_total(&mut inner.deadline_cancelled, lease.kind);
+                    if let Some(cancel) = lease.external_cancellation {
+                        external_cancellations.push(cancel);
+                    }
                     cancelled += 1;
                 }
             }
-            (sources, cancelled)
+            (external_cancellations, cancelled)
         };
-        for lease in &sources {
-            if let Some(cancel) = &lease.external_cancellation {
-                cancel(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms });
-            }
+        for cancel in external_cancellations {
+            cancel(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms });
         }
-        drop(sources);
         self.publish_metrics();
         cancelled
     }
@@ -640,7 +641,7 @@ fn unix_millis(time: SystemTime) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -731,6 +732,50 @@ mod tests {
         let snapshot = lifecycle.frontend_serving_snapshot();
         assert_eq!(snapshot.workload.completed_during_drain.background, 1);
         assert_eq!(snapshot.workload.deadline_cancelled.background, 1);
+    }
+
+    #[test]
+    fn drain_deadline_notifies_external_cancellation_after_releasing_lifecycle_lock() {
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        lifecycle.mark_ready().expect("mark ready");
+        let lease = lifecycle
+            .try_admit(FrontendWorkloadKind::Statement)
+            .expect("admit statement");
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let callback_lifecycle = Arc::clone(&lifecycle);
+        let callback_observed = Arc::clone(&observed);
+        lease.bind_external_cancellation(move |reason| {
+            // Taking this snapshot acquires the lifecycle mutex. The callback
+            // must therefore run after drain cancellation releases that mutex.
+            assert_eq!(
+                callback_lifecycle
+                    .frontend_serving_snapshot()
+                    .workload
+                    .active
+                    .statement,
+                1
+            );
+            callback_observed
+                .lock()
+                .expect("observed cancellation lock")
+                .push(reason);
+        });
+
+        lifecycle.begin_drain(Duration::from_secs(1));
+        assert_eq!(lifecycle.cancel_active_at_drain_deadline(1_000), 1);
+        assert_eq!(
+            observed
+                .lock()
+                .expect("observed cancellation lock")
+                .as_slice(),
+            [QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 1_000 }]
+        );
+        assert_eq!(lifecycle.cancel_active_at_drain_deadline(1_000), 0);
+        assert_eq!(
+            observed.lock().expect("observed cancellation lock").len(),
+            1,
+            "the external owner observes only the first-wins drain cancellation"
+        );
     }
 
     #[test]
