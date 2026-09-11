@@ -43,7 +43,9 @@ pub use listener_settings::{
 };
 pub use result_encoding::mysql_column_for_result_field;
 pub use result_value::MysqlResultValue;
-pub use terminal::{mysql_error_kind, write_governed_terminal_error, write_governed_terminal_ok};
+pub use terminal::{
+    mysql_error_kind, write_governed_terminal_error, write_governed_terminal_ok, write_terminal_ok,
+};
 
 /// `USE ...` must remain an ordinary COM_QUERY for typed SQL validation;
 /// genuine COM_INIT_DB packets still use the protocol callback.

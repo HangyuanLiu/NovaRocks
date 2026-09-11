@@ -32,8 +32,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, OkResponse, ParamParser,
-    QueryResultWriter, StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, ParamParser, QueryResultWriter,
+    StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
@@ -431,7 +431,7 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                 novarocks_mysql_adapter::write_governed_terminal_error(error, protocol, results)
                     .await
             }
-            Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
+            Ok(StatementResult::Ok) => novarocks_mysql_adapter::write_terminal_ok(results).await,
             Err(error) => {
                 results
                     .error(

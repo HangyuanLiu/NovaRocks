@@ -35,6 +35,13 @@ pub fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
         .unwrap_or_else(|| error_kind_for_query_service_error(error.kind()))
 }
 
+/// Writes an ungoverned terminal OK response.
+pub async fn write_terminal_ok<W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'_, W>,
+) -> io::Result<()> {
+    results.completed(OkResponse::default()).await
+}
+
 /// Writes the final OK response and settles its governed statement owner.
 pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
     mut protocol: GovernedProtocolOwner,
