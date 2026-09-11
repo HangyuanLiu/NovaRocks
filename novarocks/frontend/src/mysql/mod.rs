@@ -16,7 +16,6 @@
 // under the License.
 
 mod encoding;
-mod error_mapping;
 pub mod session;
 
 pub use novarocks_mysql_adapter::{
@@ -49,7 +48,6 @@ use novarocks_version as version;
 use self::encoding::{
     write_governed_query_result, write_query_result, write_streaming_query_result,
 };
-use self::error_mapping::error_kind_for_code;
 use self::session::{QuerySession, QuerySessionFactory};
 use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
@@ -683,7 +681,9 @@ fn normalize_init_database_schema(schema: &str) -> String {
 fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
     error
         .user_error()
-        .and_then(|user_error| error_kind_for_code(user_error.code()))
+        .and_then(|user_error| {
+            novarocks_mysql_adapter::error_kind_for_domain_code(user_error.code().as_str())
+        })
         .unwrap_or_else(|| {
             novarocks_mysql_adapter::error_kind_for_query_service_error(error.kind())
         })
@@ -736,6 +736,32 @@ fn user_error_code_overrides_the_legacy_session_error_kind() {
     );
     let error = QueryServiceError::from_user_error(user_error);
     assert_eq!(mysql_error_kind(&error), ErrorKind::ER_NO_SUCH_TABLE);
+}
+
+#[cfg(test)]
+#[test]
+fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
+    use std::collections::BTreeSet;
+
+    use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
+    use novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS as ANALYZE_ERROR_CODE_DESCRIPTORS;
+    use novarocks_user_error::ErrorCodeStatus;
+
+    let descriptor_codes = PARSER_ERROR_CODE_DESCRIPTORS
+        .iter()
+        .chain(ANALYZE_ERROR_CODE_DESCRIPTORS)
+        .chain(crate::DML_ERROR_CODE_DESCRIPTORS)
+        .chain(crate::SESSION_ERROR_CODE_DESCRIPTORS)
+        .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
+        .map(|descriptor| descriptor.code.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(descriptor_codes.len(), 29);
+    for code in descriptor_codes {
+        assert!(
+            novarocks_mysql_adapter::error_kind_for_domain_code(code).is_some(),
+            "active descriptor `{code}` must have one MySQL wire mapping"
+        );
+    }
 }
 
 #[cfg(unix)]
