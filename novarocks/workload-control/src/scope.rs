@@ -1142,6 +1142,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn observation_waits_for_the_last_root_responsibility() {
+        let control = controller();
+        let observation = control.observation();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit root work");
+        let mut waiter = Box::pin(tokio::spawn(async move {
+            observation.wait_until_no_root_responsibilities().await;
+        }));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err(),
+            "observation must not report drained while a root remains"
+        );
+
+        drop(work.business);
+        work.owner.complete();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("observation wakes when the last root is released")
+            .expect("wait task joins");
+    }
+
     #[test]
     fn identity_exhaustion_is_rejected_without_reusing_an_id_or_charging_work() {
         let control = controller();

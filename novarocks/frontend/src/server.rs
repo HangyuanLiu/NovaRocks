@@ -671,6 +671,7 @@ where
         &mut report_server,
         metrics_http_server,
         host.serving_lifecycle(),
+        host.workload_observation(),
         config.frontend_drain_timeout,
         config.frontend_cleanup_timeout,
     )
@@ -689,6 +690,7 @@ async fn run_mysql_with_listener_supervision<F>(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut crate::metrics::MetricsHttpServer,
     lifecycle: Arc<crate::workload_lifecycle::FrontendServingLifecycle>,
+    workload_observation: novarocks_workload_control::WorkloadObservationHandle,
     drain_timeout: Duration,
     cleanup_timeout: Duration,
 ) -> Result<(), FrontendApplicationError>
@@ -719,7 +721,11 @@ where
         _ = shutdown => {
             lifecycle.begin_drain(drain_timeout);
             let _ = drain_tx.send(true);
-            let graceful = tokio::time::timeout(drain_timeout, lifecycle.wait_for_no_active_work()).await;
+            let graceful = tokio::time::timeout(
+                drain_timeout,
+                workload_observation.wait_until_no_root_responsibilities(),
+            )
+            .await;
             if graceful.is_err() {
                 lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
                 // Keep the admitted protocol tasks alive long enough to
@@ -727,7 +733,11 @@ where
                 // its typed error. Final connection termination remains the
                 // fallback when a cancelled attempt does not converge inside
                 // the configured bounded cleanup window.
-                let _ = tokio::time::timeout(cleanup_timeout, lifecycle.wait_for_no_active_work()).await;
+                let _ = tokio::time::timeout(
+                    cleanup_timeout,
+                    workload_observation.wait_until_no_root_responsibilities(),
+                )
+                .await;
             }
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);

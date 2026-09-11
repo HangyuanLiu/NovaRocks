@@ -130,6 +130,21 @@ impl WorkloadObservationHandle {
     pub fn snapshot(&self) -> WorkloadSnapshot {
         snapshot(&self.inner)
     }
+
+    /// Wait until no root responsibility remains. This is an observation-only
+    /// convergence point for role supervision; it cannot admit, cancel, or
+    /// complete work.
+    pub async fn wait_until_no_root_responsibilities(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.inner.state.lock().unwrap().roots == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
 }
 
 fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
