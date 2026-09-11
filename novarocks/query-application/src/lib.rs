@@ -29,6 +29,9 @@ pub mod cancellation;
 /// Exact client-session identity and protocol-owned termination contracts.
 pub mod client_connection;
 
+/// Session registry and cancellation implementation owned by the query application.
+pub mod query_control;
+
 /// Session generations, governed statement control, and protocol settlement.
 pub mod session_control;
 

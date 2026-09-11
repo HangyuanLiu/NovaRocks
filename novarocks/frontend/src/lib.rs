@@ -35,7 +35,6 @@ mod mysql;
 mod native;
 mod preparation_diagnostics;
 pub mod query;
-pub mod query_control;
 pub mod query_execution;
 pub mod runtime;
 pub mod runtime_filter;

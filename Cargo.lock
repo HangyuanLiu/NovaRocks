@@ -4052,6 +4052,7 @@ dependencies = [
  "novarocks-types",
  "novarocks-workload-control",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

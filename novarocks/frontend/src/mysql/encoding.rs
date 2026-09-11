@@ -1331,9 +1331,9 @@ mod streaming_result_tests {
     };
 
     use super::*;
-    use crate::query_control::FrontendQueryControl;
     use crate::runtime::statement_result::StreamingStatementResult;
     use novarocks_query_application::client_connection::ClientConnectionToken;
+    use novarocks_query_application::query_control::QueryApplicationControl;
     use novarocks_query_application::session_control::{
         QueryCancelOutcome, QueryControlPort, QueryControlService, QuerySessionLease,
         SessionIdentity,
@@ -1367,7 +1367,7 @@ mod streaming_result_tests {
         )
         .expect("open result stream");
 
-        let port: Arc<dyn QueryControlPort> = Arc::new(FrontendQueryControl::default());
+        let port: Arc<dyn QueryControlPort> = Arc::new(QueryApplicationControl::default());
         let control = QueryControlService::new(port);
         let session = control
             .register_session(SessionIdentity::new(

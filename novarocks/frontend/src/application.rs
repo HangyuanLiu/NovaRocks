@@ -62,7 +62,6 @@ use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::FrontendNativeTransport;
-use crate::query_control::FrontendQueryControl;
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{
@@ -80,6 +79,7 @@ use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle,
 };
+use novarocks_query_application::query_control::QueryApplicationControl;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -969,7 +969,7 @@ impl FrontendApplicationHost {
             state_store_host: None,
             query_execution: None,
             logical_read_launcher: None,
-            query_control: FrontendQueryControl::service(),
+            query_control: QueryApplicationControl::service(),
             coordinator: None,
             execution_runtime_owner,
             execution_role: backend.role(),

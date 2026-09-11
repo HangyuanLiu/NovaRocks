@@ -336,8 +336,8 @@ mod tests {
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     use super::*;
-    use crate::query_control::FrontendQueryControl;
     use novarocks_query_application::client_connection::ClientConnectionToken;
+    use novarocks_query_application::query_control::QueryApplicationControl;
     use novarocks_query_application::session_control::{
         QueryControlPort, QueryControlService, QuerySessionLease, SessionIdentity,
     };
@@ -348,7 +348,7 @@ mod tests {
         QuerySessionLease,
     ) {
         let control = QueryControlService::new(
-            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+            Arc::new(QueryApplicationControl::default()) as Arc<dyn QueryControlPort>
         );
         let session = control
             .register_session(SessionIdentity::new(
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn governed_completion_retains_business_until_terminal_ok() {
         let control = QueryControlService::new(
-            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+            Arc::new(QueryApplicationControl::default()) as Arc<dyn QueryControlPort>
         );
         let session = control
             .register_session(SessionIdentity::new(
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn governed_error_retains_business_until_terminal_error() {
         let control = QueryControlService::new(
-            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+            Arc::new(QueryApplicationControl::default()) as Arc<dyn QueryControlPort>
         );
         let session = control
             .register_session(SessionIdentity::new(
@@ -497,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn governed_protocol_cancellation_preserves_configured_timeout() {
         let control = QueryControlService::new(
-            Arc::new(FrontendQueryControl::default()) as Arc<dyn QueryControlPort>
+            Arc::new(QueryApplicationControl::default()) as Arc<dyn QueryControlPort>
         );
         let session = control
             .register_session(SessionIdentity::new(

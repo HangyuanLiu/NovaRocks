@@ -3421,7 +3421,8 @@ mod tests {
 
     #[test]
     fn kill_query_treats_an_idle_authorized_target_as_ok() {
-        let control = crate::query_control::FrontendQueryControl::service();
+        let control =
+            novarocks_query_application::query_control::QueryApplicationControl::service();
         let requester = register_kill_session(&control, 8, 1, "alice");
         let _target = register_kill_session(&control, 7, 1, "alice");
         let source = "KILL QUERY 7";
@@ -3444,7 +3445,8 @@ mod tests {
             ClientConnectionTerminateOutcome::AlreadyTerminating,
         ] {
             for source in ["KILL 7", "KILL CONNECTION 7"] {
-                let control = crate::query_control::FrontendQueryControl::service();
+                let control =
+                    novarocks_query_application::query_control::QueryApplicationControl::service();
                 let requester = register_kill_session(&control, 8, 1, "alice");
                 let _target = register_kill_session(&control, 7, 11, "alice");
                 let connection_control = FixedConnectionControl::new(outcome);
@@ -3480,7 +3482,8 @@ mod tests {
 
     #[test]
     fn kill_connection_stale_target_maps_to_no_such_session() {
-        let control = crate::query_control::FrontendQueryControl::service();
+        let control =
+            novarocks_query_application::query_control::QueryApplicationControl::service();
         let requester = register_kill_session(&control, 8, 1, "alice");
         let _target = register_kill_session(&control, 7, 1, "alice");
         let connection_control =
@@ -3502,7 +3505,8 @@ mod tests {
     #[test]
     fn kill_denial_is_a_typed_admit_error_for_query_and_connection() {
         for source in ["KILL QUERY 7", "KILL CONNECTION 7"] {
-            let control = crate::query_control::FrontendQueryControl::service();
+            let control =
+                novarocks_query_application::query_control::QueryApplicationControl::service();
             let requester = register_kill_session(&control, 8, 1, "alice");
             let _target = register_kill_session(&control, 7, 1, "bob");
             let connection_control =

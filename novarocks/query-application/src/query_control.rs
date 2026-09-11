@@ -15,14 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned session and statement cancellation state.
+//! Query-application-owned session and statement cancellation state.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
-use novarocks_query_application::client_connection::ClientConnectionToken;
-use novarocks_query_application::session_control::{
+use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
+use crate::client_connection::ClientConnectionToken;
+use crate::session_control::{
     ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
     GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
     QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionToken,
@@ -34,7 +34,7 @@ use novarocks_workload_control::{
 
 // Design: ADR-0102 (docs/adr/ADR-0102-mysql-kill-connection-lifecycle-ownership.md)
 #[derive(Default)]
-pub struct FrontendQueryControl {
+pub struct QueryApplicationControl {
     state: Mutex<QueryControlState>,
 }
 
@@ -68,16 +68,19 @@ impl ActiveStatementCancellation {
     fn request(&self, reason: QueryCancellationReason) -> QueryCancelOutcome {
         match self {
             Self::Legacy(cancellation) => match cancellation.request(reason) {
-                novarocks_query_application::cancellation::QueryCancellationRequestResult::Requested => {
+                crate::cancellation::QueryCancellationRequestResult::Requested => {
                     QueryCancelOutcome::Requested
                 }
-                novarocks_query_application::cancellation::QueryCancellationRequestResult::AlreadyRequested(
-                    reason,
-                ) => QueryCancelOutcome::AlreadyRequested(reason),
+                crate::cancellation::QueryCancellationRequestResult::AlreadyRequested(reason) => {
+                    QueryCancelOutcome::AlreadyRequested(reason)
+                }
             },
             Self::Governed(cancellation) => {
                 let workload_reason = workload_cancellation_reason(&reason);
-                match cancellation.requester().request_with_outcome(workload_reason) {
+                match cancellation
+                    .requester()
+                    .request_with_outcome(workload_reason)
+                {
                     Ok(WorkCancellationRequestOutcome::Requested) => {
                         cancellation.remember_query_reason(reason);
                         QueryCancelOutcome::Requested
@@ -160,7 +163,7 @@ fn query_cancellation_reason(
     }
 }
 
-impl FrontendQueryControl {
+impl QueryApplicationControl {
     pub fn service() -> QueryControlService {
         QueryControlService::new(Arc::new(Self::default()))
     }
@@ -172,7 +175,7 @@ impl FrontendQueryControl {
     }
 }
 
-impl QueryControlPort for FrontendQueryControl {
+impl QueryControlPort for QueryApplicationControl {
     fn register_session(
         &self,
         identity: SessionIdentity,
@@ -561,13 +564,11 @@ impl QueryControlPort for FrontendQueryControl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_query_application::session_control::{
-        GovernedQueryStatementBeginError, QueryControlPort,
-    };
+    use crate::session_control::{GovernedQueryStatementBeginError, QueryControlPort};
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     fn register(
-        control: &FrontendQueryControl,
+        control: &QueryApplicationControl,
         id: u32,
         generation: u64,
         principal: &str,
@@ -582,7 +583,7 @@ mod tests {
 
     #[test]
     fn stale_session_and_statement_cannot_remove_successor() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let first = register(&control, 7, 1, "root");
         let old = control.begin_statement(first).expect("begin old");
         control.unregister_session(first);
@@ -612,7 +613,7 @@ mod tests {
 
     #[test]
     fn repeated_kill_preserves_first_reason() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let target = register(&control, 7, 1, "root");
         let requester = register(&control, 8, 1, "root");
         let active = control.begin_statement(target).expect("begin target");
@@ -636,7 +637,7 @@ mod tests {
 
     #[test]
     fn permission_and_idle_do_not_change_target() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let target = register(&control, 7, 1, "root");
         let foreign = register(&control, 8, 1, "other");
         let own = register(&control, 9, 1, "root");
@@ -658,7 +659,7 @@ mod tests {
 
     #[test]
     fn finish_and_cancel_are_linearized_and_busy_session_rejects_successor() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let target = register(&control, 7, 1, "root");
         let requester = register(&control, 8, 1, "root");
         let active = control.begin_statement(target).expect("begin target");
@@ -689,7 +690,7 @@ mod tests {
 
     #[test]
     fn caller_owned_cancellation_source_controls_the_registered_statement() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let session = register(&control, 7, 1, "root");
         let source = QueryCancellationSource::new();
         let active = control
@@ -700,7 +701,7 @@ mod tests {
             source.request(QueryCancellationReason::FrontendDrainDeadlineExceeded {
                 timeout_ms: 300_000,
             }),
-            novarocks_query_application::cancellation::QueryCancellationRequestResult::Requested
+            crate::cancellation::QueryCancellationRequestResult::Requested
         );
         assert!(active.cancellation().is_cancelled());
         assert_eq!(
@@ -715,7 +716,7 @@ mod tests {
 
     #[test]
     fn connection_kill_authorization_returns_only_the_exact_target_token() {
-        let control = FrontendQueryControl::default();
+        let control = QueryApplicationControl::default();
         let target = register(&control, 7, 3, "root");
         let requester = register(&control, 8, 4, "root");
         let foreign = register(&control, 9, 5, "other");
@@ -747,11 +748,11 @@ mod tests {
     }
 
     fn governed_control() -> (
-        Arc<FrontendQueryControl>,
+        Arc<QueryApplicationControl>,
         QueryControlService,
         WorkloadControl,
     ) {
-        let control = Arc::new(FrontendQueryControl::default());
+        let control = Arc::new(QueryApplicationControl::default());
         let service = QueryControlService::new(control.clone());
         let workload = WorkloadControl::try_new(
             WorkloadConfig::default(),

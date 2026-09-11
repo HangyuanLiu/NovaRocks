@@ -20,6 +20,7 @@ novarocks-types.workspace = true
 novarocks-workload-control.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 novarocks-sql = { workspace = true, features = ["test-support"] }
