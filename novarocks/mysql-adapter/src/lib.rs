@@ -17,8 +17,12 @@
 
 //! MySQL protocol adaptation for Query Application contracts.
 
+mod connection_registry;
+
 use novarocks_query_application::session_error::QueryServiceErrorKind;
 use opensrv_mysql::ErrorKind;
+
+pub use connection_registry::MysqlClientConnectionRegistry;
 
 pub fn error_kind_for_query_service_error(kind: QueryServiceErrorKind) -> ErrorKind {
     match kind {

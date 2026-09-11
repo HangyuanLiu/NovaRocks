@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod connection_registry;
 mod encoding;
 mod error_mapping;
 pub mod session;
 
-pub use connection_registry::MysqlClientConnectionRegistry;
+pub use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
 
 use std::future::Future;
 use std::io;

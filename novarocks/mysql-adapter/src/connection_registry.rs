@@ -56,13 +56,13 @@ struct Entry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ConnectionRegistrationError {
+pub enum ConnectionRegistrationError {
     ConnectionIdExhausted,
     GenerationExhausted,
 }
 
 /// A registration whose drop removes only the exact generation it created.
-pub(crate) struct MysqlClientConnectionRegistration {
+pub struct MysqlClientConnectionRegistration {
     registry: MysqlClientConnectionRegistry,
     token: ClientConnectionToken,
     termination: oneshot::Receiver<ClientConnectionTerminationReason>,
@@ -95,7 +95,7 @@ impl MysqlClientConnectionRegistry {
         }
     }
 
-    pub(crate) fn register(
+    pub fn register(
         &self,
     ) -> Result<MysqlClientConnectionRegistration, ConnectionRegistrationError> {
         let (token, termination) = {
@@ -125,7 +125,7 @@ impl MysqlClientConnectionRegistry {
         })
     }
 
-    pub(crate) fn terminate_all(&self, reason: ClientConnectionTerminationReason) -> usize {
+    pub fn terminate_all(&self, reason: ClientConnectionTerminationReason) -> usize {
         let senders = {
             let mut state = self.lock();
             state
@@ -184,11 +184,11 @@ impl ClientConnectionControlPort for MysqlClientConnectionRegistry {
 }
 
 impl MysqlClientConnectionRegistration {
-    pub(crate) const fn token(&self) -> ClientConnectionToken {
+    pub const fn token(&self) -> ClientConnectionToken {
         self.token
     }
 
-    pub(crate) fn termination_receiver(
+    pub fn termination_receiver(
         &mut self,
     ) -> &mut oneshot::Receiver<ClientConnectionTerminationReason> {
         &mut self.termination
@@ -338,7 +338,7 @@ mod tests {
             registration
                 .termination_receiver()
                 .try_recv()
-                .expect("first reason is delivered"),
+                .expect("registration receives first signal"),
             first
         );
     }
