@@ -555,6 +555,15 @@ impl GovernedQueryStatementOwner {
         self.execution_owner.take()
     }
 
+    /// Releases only the execution root after synchronous work has stopped.
+    /// The statement generation and business permit intentionally remain with
+    /// this owner until the protocol terminal outcome is known.
+    pub fn complete_execution(&mut self) {
+        if let Some(owner) = self.execution_owner.take() {
+            owner.complete();
+        }
+    }
+
     /// Atomically wins the terminal success boundary against every later
     /// cancellation request while retaining business and statement ownership.
     pub fn seal_success_visibility(&mut self) -> GovernedStatementVisibilitySealOutcome {
