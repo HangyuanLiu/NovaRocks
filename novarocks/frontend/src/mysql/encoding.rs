@@ -97,22 +97,12 @@ pub(super) async fn write_query_result<W: AsyncWrite + Unpin>(
     result: QueryResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    let columns = result
-        .columns
+    let batches = result
+        .chunks
         .iter()
-        .map(query_result_column_to_mysql_column)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(invalid_data_error)?;
-
-    let mut writer = results.start(columns.as_slice()).await?;
-    for chunk in &result.chunks {
-        for row_idx in 0..chunk.len() {
-            let row = mysql_adapter_build_mysql_row(&chunk.batch, &result.columns, row_idx)
-                .map_err(invalid_data_error)?;
-            writer.write_row(row).await?;
-        }
-    }
-    writer.finish().await
+        .map(|chunk| &chunk.batch)
+        .collect::<Vec<_>>();
+    novarocks_mysql_adapter::write_record_batches(&result.columns, &batches, results).await
 }
 
 pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
