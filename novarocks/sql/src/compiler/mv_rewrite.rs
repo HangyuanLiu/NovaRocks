@@ -68,6 +68,7 @@ impl SqlMvRewritePublicationRelation {
 pub struct SqlMvRewriteSelectionFacts {
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
+    publication_provenance: Arc<str>,
     publication_inputs: Vec<SqlMvRewritePublicationRelation>,
     publication_target: SqlMvRewritePublicationRelation,
 }
@@ -121,6 +122,7 @@ impl SqlMvRewriteSelectionFacts {
         Self::try_new_with_publication(
             publication_id,
             definition_fingerprint,
+            Arc::from("test-provider-provenance"),
             publication_inputs,
             SqlMvRewritePublicationRelation::new(
                 publication_target,
@@ -137,11 +139,15 @@ impl SqlMvRewriteSelectionFacts {
     pub fn try_new_with_publication(
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
+        publication_provenance: Arc<str>,
         publication_inputs: Vec<SqlMvRewritePublicationRelation>,
         publication_target: SqlMvRewritePublicationRelation,
     ) -> Result<Self, String> {
         if publication_id == [0; 16] || definition_fingerprint == [0; 32] {
             return Err("MV rewrite selection identity cannot be zero".to_string());
+        }
+        if publication_provenance.is_empty() {
+            return Err("MV rewrite selection has no provider provenance".to_string());
         }
         if publication_inputs.is_empty() {
             return Err("MV rewrite selection must name every publication input".to_string());
@@ -157,6 +163,7 @@ impl SqlMvRewriteSelectionFacts {
         Ok(Self {
             publication_id,
             definition_fingerprint,
+            publication_provenance,
             publication_inputs,
             publication_target,
         })
@@ -168,6 +175,10 @@ impl SqlMvRewriteSelectionFacts {
 
     pub(crate) const fn definition_fingerprint(&self) -> [u8; 32] {
         self.definition_fingerprint
+    }
+
+    pub(crate) fn publication_provenance(&self) -> &str {
+        &self.publication_provenance
     }
 
     pub(crate) fn publication_inputs(&self) -> &[SqlMvRewritePublicationRelation] {

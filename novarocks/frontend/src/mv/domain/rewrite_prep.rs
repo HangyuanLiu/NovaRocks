@@ -176,6 +176,7 @@ fn freeze_mv_rewrite_selection(
     SqlMvRewriteSelectionFacts::try_new_with_publication(
         *publication.publication_id.as_uuid().as_bytes(),
         fingerprint,
+        Arc::from(publication.provenance_hash.as_str()),
         publication_inputs,
         publication_target,
     )

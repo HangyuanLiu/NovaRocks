@@ -17,6 +17,8 @@
 
 //! Stage-neutral leaf payloads shared by logical and physical planner IR.
 
+use std::sync::Arc;
+
 use arrow::datatypes::DataType;
 
 use crate::analysis::{OutputColumn, ProjectItem, SortItem, TypedExpr};
@@ -77,6 +79,7 @@ pub struct MvRewriteSelection {
     name: String,
     publication_id: Option<[u8; 16]>,
     definition_fingerprint: Option<[u8; 32]>,
+    publication_provenance: Option<Arc<str>>,
     input_mapping: Vec<MvRewriteInputSelection>,
     publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
     publication_target: Option<crate::compiler::SqlMvRewritePublicationRelation>,
@@ -89,6 +92,7 @@ impl MvRewriteSelection {
             name,
             publication_id: None,
             definition_fingerprint: None,
+            publication_provenance: None,
             input_mapping: Vec::new(),
             publication_inputs: Vec::new(),
             publication_target: None,
@@ -99,6 +103,7 @@ impl MvRewriteSelection {
         name: String,
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
+        publication_provenance: Arc<str>,
         input_mapping: Vec<(SqlScanOccurrence, usize)>,
         publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
         publication_target: crate::compiler::SqlMvRewritePublicationRelation,
@@ -107,6 +112,7 @@ impl MvRewriteSelection {
             name,
             publication_id: Some(publication_id),
             definition_fingerprint: Some(definition_fingerprint),
+            publication_provenance: Some(publication_provenance),
             input_mapping: input_mapping
                 .into_iter()
                 .map(
@@ -131,6 +137,10 @@ impl MvRewriteSelection {
 
     pub(crate) const fn definition_fingerprint(&self) -> Option<[u8; 32]> {
         self.definition_fingerprint
+    }
+
+    pub(crate) fn publication_provenance(&self) -> Option<&str> {
+        self.publication_provenance.as_deref()
     }
 
     pub(crate) fn input_mapping(&self) -> &[MvRewriteInputSelection] {
