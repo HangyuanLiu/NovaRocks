@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use novarocks_parser::ast::{self, Fold, Statement};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::naming::DEFAULT_DATABASE;
 
@@ -44,6 +45,58 @@ impl Default for SessionSqlState {
             optimizer_settings: SessionOptimizerSettings::default(),
             user_variables: BTreeMap::new(),
         }
+    }
+}
+
+impl SessionSqlState {
+    /// Rewrites references to this session's user variables with their stored
+    /// scalar SQL expressions before a role adapter prepares the statement.
+    pub fn substitute_user_variables(&self, statement: Statement) -> Result<Statement, String> {
+        if self.user_variables.is_empty() {
+            return Ok(statement);
+        }
+
+        let mut values = BTreeMap::new();
+        for (name, value) in &self.user_variables {
+            let statements = novarocks_parser::parse(&format!("SELECT {value}"))
+                .map_err(|error| format!("invalid session user variable {name}: {error}"))?;
+            let [Statement::Query(query)] = statements.as_slice() else {
+                return Err(format!("invalid session user variable {name}"));
+            };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else {
+                return Err(format!("invalid session user variable {name}"));
+            };
+            let [item] = select.projection.as_slice() else {
+                return Err(format!("invalid session user variable {name}"));
+            };
+            let expression = match item {
+                ast::SelectItem::UnnamedExpr(expression)
+                | ast::SelectItem::ExprWithAlias {
+                    expr: expression, ..
+                } => expression.clone(),
+                ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => {
+                    return Err(format!("invalid session user variable {name}"));
+                }
+            };
+            values.insert(name.to_ascii_lowercase(), expression);
+        }
+
+        struct Substituter {
+            values: BTreeMap<String, ast::Expr>,
+        }
+
+        impl Fold for Substituter {
+            fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
+                if let ast::Expr::UserVariable(variable) = &expression
+                    && let Some(value) = self.values.get(&variable.value.to_ascii_lowercase())
+                {
+                    return value.clone();
+                }
+                ast::fold_expr(self, expression)
+            }
+        }
+
+        Ok(Substituter { values }.fold_statement(statement))
     }
 }
 
@@ -238,5 +291,24 @@ mod tests {
             settings.set_runtime_filter_wait_timeout_ms(-1),
             Err(SessionSettingError::NegativeRuntimeFilterWaitTimeout)
         );
+    }
+
+    #[test]
+    fn substitutes_user_variables_without_a_frontend_router() {
+        let mut state = SessionSqlState::default();
+        state
+            .user_variables
+            .insert("@limit".to_string(), "7".to_string());
+        let statement = novarocks_parser::parse("SELECT @limit")
+            .expect("parse query")
+            .pop()
+            .expect("one statement");
+
+        let rendered = novarocks_parser::printer::print_statement(
+            &state
+                .substitute_user_variables(statement)
+                .expect("substitute session variable"),
+        );
+        assert_eq!(rendered, "SELECT 7");
     }
 }

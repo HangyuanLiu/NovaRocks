@@ -17,7 +17,6 @@
 
 //! Frontend-owned SQL session admission and routing boundary.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,7 +56,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks_parser::{
-    ast::{self, Fold, Statement as ParsedStatement},
+    ast::{self, Statement as ParsedStatement},
     printer::{print_expr, print_statement},
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
@@ -1101,12 +1100,8 @@ impl FrontendQuerySession {
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
     ) -> Result<PreparedQueryOperation, QueryServiceError> {
-        let assignments = state
-            .user_variables
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<Vec<_>>();
-        let parsed_statement = substitute_session_user_variables(parsed_statement, &assignments)
+        let parsed_statement = state
+            .substitute_user_variables(parsed_statement)
             .map_err(|error| internal_error(error.to_string()))?;
         let cancellation = QueryCancellationView::governed(cancellation, timeout_ms);
         let topology =
@@ -1431,12 +1426,8 @@ impl FrontendQuerySession {
     ) -> Result<StatementResult, QueryServiceError> {
         reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
         let state = self.state.lock().map_err(poisoned_state)?.clone();
-        let assignments = state
-            .user_variables
-            .iter()
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect::<Vec<_>>();
-        let parsed_statement = substitute_session_user_variables(parsed_statement, &assignments)
+        let parsed_statement = state
+            .substitute_user_variables(parsed_statement)
             .map_err(|error| internal_error(error.to_string()))?;
         let query_timeout_secs = state.execution_settings.query_timeout_secs();
         let session_deadline = match query_timeout_secs {
@@ -1885,57 +1876,6 @@ fn is_known_session_setting(name: &str) -> bool {
             | "cbo_enable_greedy_join_reorder"
             | "enable_global_runtime_filter_cross_exchange"
     )
-}
-
-fn substitute_session_user_variables(
-    statement: ParsedStatement,
-    assignments: &[(String, String)],
-) -> Result<ParsedStatement, String> {
-    if assignments.is_empty() {
-        return Ok(statement);
-    }
-
-    let mut values = BTreeMap::new();
-    for (name, value) in assignments {
-        let statements = novarocks_parser::parse(&format!("SELECT {value}"))
-            .map_err(|error| format!("invalid session user variable {name}: {error}"))?;
-        let [ParsedStatement::Query(query)] = statements.as_slice() else {
-            return Err(format!("invalid session user variable {name}"));
-        };
-        let ast::SetExpr::Select(select) = query.body.as_ref() else {
-            return Err(format!("invalid session user variable {name}"));
-        };
-        let [item] = select.projection.as_slice() else {
-            return Err(format!("invalid session user variable {name}"));
-        };
-        let expression = match item {
-            ast::SelectItem::UnnamedExpr(expression)
-            | ast::SelectItem::ExprWithAlias {
-                expr: expression, ..
-            } => expression.clone(),
-            ast::SelectItem::Wildcard { .. } | ast::SelectItem::QualifiedWildcard { .. } => {
-                return Err(format!("invalid session user variable {name}"));
-            }
-        };
-        values.insert(name.to_ascii_lowercase(), expression);
-    }
-
-    struct Substituter {
-        values: BTreeMap<String, ast::Expr>,
-    }
-
-    impl Fold for Substituter {
-        fn fold_expr(&mut self, expression: ast::Expr) -> ast::Expr {
-            if let ast::Expr::UserVariable(variable) = &expression
-                && let Some(value) = self.values.get(&variable.value.to_ascii_lowercase())
-            {
-                return value.clone();
-            }
-            ast::fold_expr(self, expression)
-        }
-    }
-
-    Ok(Substituter { values }.fold_statement(statement))
 }
 
 fn with_query_hints(
