@@ -384,6 +384,17 @@ impl ConnectorRequestContext {
         self
     }
 
+    /// Project an admitted request onto the planning boundary. Planning may
+    /// retain deadlines, cancellation, and request resource accounting, but
+    /// it cannot resolve attempt storage or collect credentials for a future
+    /// execution attempt.
+    pub fn without_attempt_capabilities(mut self) -> Self {
+        self.storage_resolver = None;
+        self.vended_credential_lease_sink = None;
+        self.vended_credential_lease_collection = None;
+        self
+    }
+
     pub const fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -460,10 +471,11 @@ mod tests {
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
-        ConnectorRequestResources, ConnectorResourceCheckpoint, ConnectorResourceClass,
-        ConnectorResourceLease, ConnectorResourceLedger, ConnectorVendedCredentialLeaseSink,
-        CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        StorageAccessDomainId, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        ConnectorProviderId, ConnectorRequestResources, ConnectorResourceCheckpoint,
+        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+        ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
+        VendedS3CredentialLeaseContribution,
     };
     use novarocks_secret::SecretValue;
 
@@ -592,5 +604,30 @@ mod tests {
         assert!(ConnectorPlanningContext::try_from_request(resolver_decorated).is_err());
         let attempt_decorated = base.with_vended_credential_lease_sink(Arc::new(RejectingSink));
         assert!(ConnectorPlanningContext::try_from_request(attempt_decorated).is_err());
+
+        let catalog_properties = CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("planning-projection").expect("catalog"),
+                CatalogVersion::from_bytes([2; 32]),
+            ),
+            ConnectorProviderId::parse("test").expect("provider"),
+            1,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("properties");
+        let projected = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(Active),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+        .with_storage_resolver(Arc::new(RejectingResolver))
+        .with_vended_credential_lease_sink(Arc::new(RejectingSink))
+        .with_vended_credential_lease_collection(catalog_properties)
+        .expect("collection")
+        .without_attempt_capabilities();
+        assert!(ConnectorPlanningContext::try_from_request(projected).is_ok());
     }
 }

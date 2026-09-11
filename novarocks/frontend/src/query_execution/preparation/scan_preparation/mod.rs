@@ -966,7 +966,7 @@ fn prepare_typed_relation_scan(
                     novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
                         request_context
                             .clone()
-                            .without_vended_credential_lease_sink(),
+                            .without_attempt_capabilities(),
                     )?;
                 factory.for_planning(&planning_context)
             },
