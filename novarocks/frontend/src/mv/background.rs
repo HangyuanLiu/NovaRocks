@@ -140,13 +140,6 @@ pub(crate) struct MvBackgroundBindings {
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
 }
 
-pub(crate) trait MvBackgroundEngineSink: Send + Sync {
-    fn bind_mv_background_engine(
-        &self,
-        bindings: MvBackgroundBindings,
-    ) -> Result<(), MvBackgroundEngineError>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::{MvBackgroundEngineError, MvBackgroundEngineErrorKind};

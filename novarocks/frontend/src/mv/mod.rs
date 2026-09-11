@@ -32,5 +32,4 @@ mod service;
 #[allow(dead_code)]
 pub(crate) mod startup_restore;
 
-pub(crate) use refresh::FrontendMvRefreshProviderActivationPort;
 pub use service::FrontendMvService;

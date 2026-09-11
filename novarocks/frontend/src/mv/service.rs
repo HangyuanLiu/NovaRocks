@@ -22,7 +22,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::background::{
     MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
-    MvBackgroundEngineSink,
 };
 use crate::common::admitted_query_context::{
     RequestAdmission, RequestContext, SessionOptimizerSettings,
@@ -33,8 +32,6 @@ use crate::mv::domain::application::{
     MvStatementResult,
 };
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::repository::MvRepository;
-use crate::mv::process_runtime::ProcessRuntime;
 use crate::query_execution::maintenance::{TableMaintenanceEngine, TableMaintenanceService};
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, MvRefreshPreparationRequest, MvRefreshPreparationService,
@@ -83,10 +80,12 @@ impl FrontendMvService {
         reason = "Frontend MV composition keeps independently owned ports explicit at the application boundary."
     )]
     pub(crate) fn with_refresh_dependencies(
-        repository: Arc<dyn MvRepository>,
+        readiness: Arc<MvReadinessPort>,
         query_execution: QueryExecutionService,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        provider_activation: Arc<refresh::FrontendMvRefreshProviderActivationPort>,
+        provider_activation: Arc<
+            dyn crate::query_execution::mv_native_write::MvRefreshProviderActivation,
+        >,
         execution_role: novarocks_types::ClusterRole,
         topology: BackendTopologyService,
         scheduler_config: FrontendMvSchedulerConfig,
@@ -95,12 +94,6 @@ impl FrontendMvService {
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
     ) -> Self {
-        let runtime = Arc::new(ProcessRuntime::default());
-        let readiness = Arc::new(MvReadinessPort::new(
-            Arc::clone(&repository),
-            runtime,
-            tokio::runtime::Handle::current(),
-        ));
         Self {
             refresh: refresh::FrontendMvRefreshDependencies {
                 query_execution,
@@ -128,10 +121,6 @@ impl FrontendMvService {
     pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
         self.workload_lifecycle = Some(lifecycle);
         self
-    }
-
-    pub(crate) fn background_engine_sink(service: Arc<Self>) -> Arc<dyn MvBackgroundEngineSink> {
-        Arc::new(FrontendMvBackgroundEngineSink { service })
     }
 
     pub(crate) fn readiness_port(&self) -> Arc<MvReadinessPort> {
@@ -176,7 +165,7 @@ impl FrontendMvService {
         }
     }
 
-    fn bind_background_engine(
+    pub(crate) fn start_background_workers(
         &self,
         bindings: MvBackgroundBindings,
     ) -> Result<(), MvBackgroundEngineError> {
@@ -355,19 +344,6 @@ fn preparation_application_error(
         RefreshErrorKind::CommitUnknown => MvApplicationErrorKind::CommitUnknown,
     };
     MvApplicationError::new(kind, error.message)
-}
-
-struct FrontendMvBackgroundEngineSink {
-    service: Arc<FrontendMvService>,
-}
-
-impl MvBackgroundEngineSink for FrontendMvBackgroundEngineSink {
-    fn bind_mv_background_engine(
-        &self,
-        bindings: MvBackgroundBindings,
-    ) -> Result<(), MvBackgroundEngineError> {
-        self.service.bind_background_engine(bindings)
-    }
 }
 
 #[derive(Clone)]

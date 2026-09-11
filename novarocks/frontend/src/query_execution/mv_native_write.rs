@@ -154,13 +154,3 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         connector_context: &ConnectorRequestContext,
     ) -> Result<MvLakePackageObservation, String>;
 }
-
-/// Composition sink installed before the activation adapter exists. The
-/// adapter is bound only after connector control and the engine state are
-/// available, avoiding a direct all-in-one call path.
-pub trait MvRefreshProviderActivationSink: Send + Sync {
-    fn bind_mv_refresh_provider_activation(
-        &self,
-        activation: std::sync::Arc<dyn MvRefreshProviderActivation>,
-    ) -> Result<(), String>;
-}

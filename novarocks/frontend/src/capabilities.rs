@@ -653,14 +653,6 @@ pub(crate) fn mv_refresh_provider_activation(
     )
 }
 
-/// Bind MV refresh activation before the Frontend performs startup restore.
-pub(crate) fn bind_mv_refresh_provider_activation(
-    sink: &dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink,
-    ports: MvRefreshProviderActivationPorts,
-) -> Result<(), String> {
-    sink.bind_mv_refresh_provider_activation(mv_refresh_provider_activation(ports))
-}
-
 /// Exact leaves retained by the Frontend-owned durable ANALYZE worker.
 ///
 /// The connector registry is intentionally absent: Core creates and retains
@@ -821,14 +813,4 @@ pub(crate) fn mv_background_bindings(
         ),
         table_maintenance_engine,
     }
-}
-
-/// Bind the MV background capability only after the Frontend has completed
-/// its ordered restore and recovery sequence.
-pub(crate) fn bind_mv_background_engine(
-    sink: &dyn crate::mv::background::MvBackgroundEngineSink,
-    ports: MvBackgroundPorts,
-    table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
-) -> Result<(), crate::mv::background::MvBackgroundEngineError> {
-    sink.bind_mv_background_engine(mv_background_bindings(ports, table_maintenance_engine))
 }

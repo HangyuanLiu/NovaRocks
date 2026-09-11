@@ -59,9 +59,7 @@ use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConv
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
-use crate::mv::{
-    FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
-};
+use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::FrontendNativeTransport;
 use crate::query_control::FrontendQueryControl;
@@ -509,8 +507,6 @@ pub struct FrontendApplicationHost {
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     mv_application_service: Option<Arc<dyn crate::mv::domain::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
-    mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
-    mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
@@ -522,6 +518,8 @@ pub struct FrontendApplicationHost {
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
+    mv_scheduler_config: FrontendMvSchedulerConfig,
+    mv_maintenance_config: MaintenanceCoordinatorConfig,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
 
@@ -968,8 +966,6 @@ impl FrontendApplicationHost {
             mv_repository: None,
             mv_application_service: None,
             mv_service: None,
-            mv_refresh_provider_activation: None,
-            mv_background_engine_sink: None,
             state_store_host: None,
             query_execution: None,
             logical_read_launcher: None,
@@ -981,6 +977,8 @@ impl FrontendApplicationHost {
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
+            mv_scheduler_config: execution.mv_scheduler.clone(),
+            mv_maintenance_config: execution.mv_maintenance.clone(),
             function_catalog: execution.function_catalog(),
         };
 
@@ -1243,35 +1241,6 @@ impl FrontendApplicationHost {
                 Ok(repository) => {
                     let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
                         repository;
-                    let provider_activation =
-                        Arc::new(FrontendMvRefreshProviderActivationPort::new());
-                    let service = Arc::new(
-                        FrontendMvService::with_refresh_dependencies(
-                            Arc::clone(&repository),
-                            host.query_execution_service(),
-                            Arc::clone(&host.connector_control)
-                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-                            Arc::clone(&provider_activation),
-                            host.execution_role,
-                            host.backend_topology_port(),
-                            execution.mv_scheduler.clone(),
-                            execution.mv_maintenance.clone(),
-                            host.table_maintenance_service(),
-                            host.optimizer_query_mem_limit_bytes,
-                            Duration::from_secs(30 * 60),
-                        )
-                        .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
-                    );
-                    let application_service: Arc<
-                        dyn crate::mv::domain::application::MvApplicationService,
-                    > = Arc::clone(&service)
-                        as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-                    host.mv_background_engine_sink = Some(
-                        FrontendMvService::background_engine_sink(Arc::clone(&service)),
-                    );
-                    host.mv_refresh_provider_activation = Some(provider_activation);
-                    host.mv_application_service = Some(application_service);
-                    host.mv_service = Some(service);
                     host.mv_repository = Some(repository);
                 }
                 Err(error) => {
@@ -1450,19 +1419,26 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_refresh_provider_activation_sink(
-        &self,
-    ) -> Option<Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>>
-    {
-        self.mv_refresh_provider_activation.as_ref().map(|port| {
-            Arc::clone(port) as Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>
-        })
+    pub(crate) fn mv_scheduler_config(&self) -> FrontendMvSchedulerConfig {
+        self.mv_scheduler_config.clone()
     }
 
-    pub(crate) fn mv_background_engine_sink(
-        &self,
-    ) -> Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>> {
-        self.mv_background_engine_sink.as_ref().map(Arc::clone)
+    pub(crate) fn mv_maintenance_config(&self) -> MaintenanceCoordinatorConfig {
+        self.mv_maintenance_config.clone()
+    }
+
+    pub(crate) fn install_mv_service(
+        &mut self,
+        service: Arc<FrontendMvService>,
+    ) -> Result<(), String> {
+        if self.mv_application_service.is_some() || self.mv_service.is_some() {
+            return Err("frontend MV service is already installed".to_string());
+        }
+        let application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
+            Arc::clone(&service) as Arc<dyn crate::mv::domain::application::MvApplicationService>;
+        self.mv_application_service = Some(application);
+        self.mv_service = Some(service);
+        Ok(())
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -1911,8 +1887,6 @@ impl FrontendApplicationHost {
         self.view_service.take();
         self.mv_application_service.take();
         self.mv_service.take();
-        self.mv_refresh_provider_activation.take();
-        self.mv_background_engine_sink.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {

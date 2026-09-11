@@ -16,7 +16,7 @@
 
 //! Frontend execution of a lake-authoritative MV publication.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 #[cfg(debug_assertions)]
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
 use crate::query_execution::mv_native_write::{
-    MvRefreshProviderActivation, MvRefreshProviderActivationSink, PreparedMvNativeWriteAssembly,
+    MvRefreshProviderActivation, PreparedMvNativeWriteAssembly,
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{
@@ -46,94 +46,8 @@ use novarocks_spi::connector::{
 pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
-    pub(super) provider_activation: Arc<FrontendMvRefreshProviderActivationPort>,
+    pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
     pub(super) readiness: Arc<MvReadinessPort>,
-}
-
-pub(crate) struct FrontendMvRefreshProviderActivationPort {
-    activation: RwLock<Option<Arc<dyn MvRefreshProviderActivation>>>,
-}
-
-impl FrontendMvRefreshProviderActivationPort {
-    pub(crate) fn new() -> Self {
-        Self {
-            activation: RwLock::new(None),
-        }
-    }
-
-    fn get(&self) -> Result<Arc<dyn MvRefreshProviderActivation>, MvApplicationError> {
-        self.activation
-            .read()
-            .map_err(|_| unavailable("MV refresh provider activation lock is poisoned"))?
-            .clone()
-            .ok_or_else(|| unavailable("MV refresh provider activation is unavailable"))
-    }
-
-    fn bind(&self, activation: Arc<dyn MvRefreshProviderActivation>) -> Result<(), String> {
-        let mut slot = self
-            .activation
-            .write()
-            .map_err(|_| "MV refresh provider activation lock is poisoned".to_string())?;
-        if slot.is_some() {
-            return Err("MV refresh provider activation is already bound".to_string());
-        }
-        *slot = Some(activation);
-        Ok(())
-    }
-
-    fn activate_write(
-        &self,
-        prepared: PreparedMvRefreshWrite,
-        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        write: &novarocks_spi::connector::ConnectorWriteLease,
-        execution: &QueryExecutionContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, MvApplicationError> {
-        self.get()?
-            .activate_write(prepared, planning, write, execution)
-            .map_err(invalid)
-    }
-
-    fn validate_write_commit(
-        &self,
-        intent: crate::query_execution::mv_assembly::refresh_artifact::MvRefreshPublicationIntent,
-        receipt: &ConnectorWriteReceipt,
-    ) -> Result<MvRefreshCommittedFacts, MvApplicationError> {
-        self.get()?
-            .interpret_write_commit(intent, receipt)
-            .map_err(invalid)
-    }
-
-    fn observe_published_package(
-        &self,
-        planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
-        table: &ConnectorTableIdentity,
-        snapshot: i64,
-        context: &ConnectorRequestContext,
-    ) -> Result<crate::mv::domain::storage_observation::MvLakePackageObservation, MvApplicationError>
-    {
-        self.get()?
-            .observe_published_package(planning, table, snapshot, context)
-            .map_err(|error| error.to_string())
-            .and_then(|package| {
-                crate::mv::domain::storage_observation::lake_package_from_spi(package)
-                    .map_err(|error| error.to_string())
-            })
-            .map_err(|error| {
-                MvApplicationError::new(
-                    MvApplicationErrorKind::KnownCommittedFinalizeFailed,
-                    error.to_string(),
-                )
-            })
-    }
-}
-
-impl MvRefreshProviderActivationSink for FrontendMvRefreshProviderActivationPort {
-    fn bind_mv_refresh_provider_activation(
-        &self,
-        activation: Arc<dyn MvRefreshProviderActivation>,
-    ) -> Result<(), String> {
-        self.bind(activation)
-    }
 }
 
 pub(super) fn execute(
@@ -232,12 +146,10 @@ fn execute_data(
     let write_lease = planning
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
-    let assembly = dependencies.provider_activation.activate_write(
-        prepared,
-        planning,
-        &write_lease,
-        execution,
-    )?;
+    let assembly = dependencies
+        .provider_activation
+        .activate_write(prepared, planning, &write_lease, execution)
+        .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
     let (effect, receipt) = commit_known(authority, context.clone())?;
@@ -264,7 +176,8 @@ fn execute_data(
     }
     let committed = dependencies
         .provider_activation
-        .validate_write_commit(intent, &receipt)?;
+        .interpret_write_commit(intent, &receipt)
+        .map_err(invalid)?;
     wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
     let publication_version = if committed.intent().partition_spec_replacement().is_some() {
         committed.committed_version().clone()
@@ -285,7 +198,15 @@ fn execute_data(
     };
     let package = dependencies
         .provider_activation
-        .observe_published_package(planning, &table, snapshot, &context)?;
+        .observe_published_package(planning, &table, snapshot, &context)
+        .map_err(|error| error.to_string())
+        .and_then(|package| {
+            crate::mv::domain::storage_observation::lake_package_from_spi(package)
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| {
+            MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+        })?;
     wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
     dependencies
         .readiness
@@ -562,7 +483,15 @@ fn execute_metadata_only(
         .ok_or_else(|| invalid("metadata-only MV publication committed without a snapshot ID"))?;
     let package = dependencies
         .provider_activation
-        .observe_published_package(planning, &table, snapshot, &context)?;
+        .observe_published_package(planning, &table, snapshot, &context)
+        .map_err(|error| error.to_string())
+        .and_then(|package| {
+            crate::mv::domain::storage_observation::lake_package_from_spi(package)
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| {
+            MvApplicationError::new(MvApplicationErrorKind::KnownCommittedFinalizeFailed, error)
+        })?;
     wait_for_known_committed_before_projector_cas(&attempt.publication_id)?;
     dependencies
         .readiness

@@ -118,7 +118,7 @@ pub async fn open_frontend_application_for_server(
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
 pub fn build_frontend_query_session_factory(
-    host: &FrontendApplicationHost,
+    host: &mut FrontendApplicationHost,
     system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -138,9 +138,6 @@ pub fn build_frontend_query_session_factory(
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
-    let mv_application = host.mv_application_service();
-    let mv_service = host.mv_service();
-    let mv_readiness = mv_service.readiness_port();
     let view_service = host.view_service();
     let statistics_application = host.statistics_application_port();
     let maintenance_service = host.table_maintenance_service();
@@ -152,33 +149,54 @@ pub fn build_frontend_query_session_factory(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    if let Some(sink) = host.mv_refresh_provider_activation_sink() {
-        core_capabilities::bind_mv_refresh_provider_activation(
-            sink.as_ref(),
-            core_capabilities::MvRefreshProviderActivationPorts::new(
-                Arc::clone(&function_catalog),
-                Arc::clone(&catalog_service),
-                Some(Arc::clone(&catalog_application)),
-                Arc::clone(&connector_control),
-                Arc::clone(&typed_connector_control),
-                Arc::clone(&unified_statistics),
-                query_execution.clone(),
-                topology.clone(),
-                exchange_port,
-                Arc::clone(&mv_repository),
-                Arc::clone(&mv_readiness),
-                Arc::clone(&mv_storage_observation),
-            ),
+    let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::new(
+        Arc::clone(&mv_repository),
+        Arc::new(crate::mv::process_runtime::ProcessRuntime::default()),
+        tokio::runtime::Handle::current(),
+    ));
+    let mv_activation = core_capabilities::mv_refresh_provider_activation(
+        core_capabilities::MvRefreshProviderActivationPorts::new(
+            Arc::clone(&function_catalog),
+            Arc::clone(&catalog_service),
+            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&connector_control),
+            Arc::clone(&typed_connector_control),
+            Arc::clone(&unified_statistics),
+            query_execution.clone(),
+            topology.clone(),
+            exchange_port,
+            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
+            Arc::clone(&mv_storage_observation),
+        ),
+    );
+    let mv_service = Arc::new(
+        crate::mv::FrontendMvService::with_refresh_dependencies(
+            Arc::clone(&mv_readiness),
+            query_execution.clone(),
+            Arc::clone(&connector_control),
+            mv_activation,
+            role,
+            topology.clone(),
+            host.mv_scheduler_config(),
+            host.mv_maintenance_config(),
+            host.table_maintenance_service(),
+            host.optimizer_query_mem_limit_bytes(),
+            host.lake_publication_runtime_policy()
+                .max_attempt_duration(),
         )
+        .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
+    );
+    host.install_mv_service(Arc::clone(&mv_service))
         .map_err(FrontendApplicationError::server)?;
-    }
+    let mv_application = host.mv_application_service();
 
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_storage_observation),
-        mv_service.readiness_port(),
+        Arc::clone(&mv_readiness),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
@@ -208,9 +226,8 @@ pub fn build_frontend_query_session_factory(
             "start table maintenance service failed: {error}"
         )));
     }
-    if let Some(sink) = host.mv_background_engine_sink()
-        && let Err(error) = core_capabilities::bind_mv_background_engine(
-            sink.as_ref(),
+    if let Err(error) =
+        mv_service.start_background_workers(core_capabilities::mv_background_bindings(
             core_capabilities::MvBackgroundPorts::new(
                 Arc::clone(&function_catalog),
                 Arc::clone(&catalog_service),
@@ -221,12 +238,12 @@ pub fn build_frontend_query_session_factory(
                 Arc::clone(&mv_storage_observation),
             ),
             Arc::clone(&maintenance_engine),
-        )
+        ))
     {
         // Do not start a private blocking join here. Returning preserves the
         // exact worker owner for the Host's deadline-aware cleanup.
         return Err(FrontendApplicationError::server(format!(
-            "bind frontend MV background engine failed: {error}"
+            "start frontend MV background workers failed: {error}"
         )));
     }
 
@@ -426,7 +443,7 @@ where
     }
     let server_result = serve_ready_frontend_session_factory(
         config,
-        &host,
+        &mut host,
         mv_storage_observation,
         shutdown,
         &mut metrics_http_server,
@@ -506,7 +523,7 @@ where
     let server_result = run_server_until_signal(config, (), signal, |config, (), shutdown| {
         serve_ready_frontend_session_factory(
             config,
-            &host,
+            &mut host,
             mv_storage_observation,
             shutdown,
             &mut metrics_http_server,
@@ -610,7 +627,7 @@ fn start_early_management_server(
 
 async fn serve_ready_frontend_session_factory<F>(
     config: FrontendServerConfig,
-    host: &FrontendApplicationHost,
+    host: &mut FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     shutdown: F,
     metrics_http_server: &mut crate::metrics::MetricsHttpServer,
@@ -1122,7 +1139,7 @@ mod tests {
         .expect("open catalog attachment repository");
 
         let session_factory = build_frontend_query_session_factory(
-            &host,
+            &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
@@ -1265,7 +1282,7 @@ mod tests {
         .await
         .expect("open frontend application host");
         let session_factory = build_frontend_query_session_factory(
-            &host,
+            &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
