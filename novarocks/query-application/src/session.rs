@@ -43,3 +43,20 @@ impl QuerySessionOpenRequest {
         &self.principal
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admission_request_retains_exact_connection_identity_and_principal() {
+        let request = QuerySessionOpenRequest::new(
+            ClientConnectionToken::new(42, 7).expect("connection token"),
+            "alice",
+        );
+
+        assert_eq!(request.connection_id(), 42);
+        assert_eq!(request.connection_token().generation(), 7);
+        assert_eq!(request.principal(), "alice");
+    }
+}
