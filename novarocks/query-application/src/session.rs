@@ -24,6 +24,42 @@ use crate::client_connection::ClientConnectionToken;
 use crate::protocol_delivery::QuerySessionOutput;
 use crate::session_error::QueryServiceError;
 
+/// Role-local lifetime that remains live until a protocol adapter has reached
+/// its terminal wire outcome.
+pub trait SessionProtocolTerminal: Send {
+    fn complete(self: Box<Self>);
+}
+
+struct OutputOwnsProtocolTerminal;
+
+impl SessionProtocolTerminal for OutputOwnsProtocolTerminal {
+    fn complete(self: Box<Self>) {}
+}
+
+/// Move-only session output together with the exact terminal lifecycle the
+/// protocol adapter must consume after its final wire outcome.
+#[must_use = "the session output must be consumed by a protocol terminal"]
+pub struct QuerySessionStatement {
+    output: QuerySessionOutput,
+    terminal: Box<dyn SessionProtocolTerminal>,
+}
+
+impl QuerySessionStatement {
+    pub fn new(output: QuerySessionOutput, terminal: Box<dyn SessionProtocolTerminal>) -> Self {
+        Self { output, terminal }
+    }
+
+    /// Use when the output itself owns every statement lifetime, such as a
+    /// governed query result whose protocol owner is embedded in the output.
+    pub fn output_owned(output: QuerySessionOutput) -> Self {
+        Self::new(output, Box::new(OutputOwnsProtocolTerminal))
+    }
+
+    pub fn into_parts(self) -> (QuerySessionOutput, Box<dyn SessionProtocolTerminal>) {
+        (self.output, self.terminal)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
     connection: ClientConnectionToken,
@@ -54,11 +90,7 @@ impl QuerySessionOpenRequest {
 pub trait QuerySession: Send + Sync + 'static {
     async fn init_database(&self, schema: &str) -> Result<(), QueryServiceError>;
 
-    async fn execute_batch(&self, sql: &str) -> Result<QuerySessionOutput, QueryServiceError>;
-
-    /// Settle any terminal protocol ownership after the adapter has produced
-    /// its final wire outcome.
-    fn complete_statement(&self);
+    async fn execute_batch(&self, sql: &str) -> Result<QuerySessionStatement, QueryServiceError>;
 
     fn cancel_current(&self, reason: QueryCancellationReason);
 
@@ -76,7 +108,17 @@ pub trait QuerySessionFactory: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+
+    struct ProbeTerminal(Arc<AtomicBool>);
+
+    impl SessionProtocolTerminal for ProbeTerminal {
+        fn complete(self: Box<Self>) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     #[test]
     fn admission_request_retains_exact_connection_identity_and_principal() {
@@ -88,5 +130,20 @@ mod tests {
         assert_eq!(request.connection_id(), 42);
         assert_eq!(request.connection_token().generation(), 7);
         assert_eq!(request.principal(), "alice");
+    }
+
+    #[test]
+    fn statement_carries_terminal_until_the_adapter_consumes_it() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let statement = QuerySessionStatement::new(
+            QuerySessionOutput::Ok,
+            Box::new(ProbeTerminal(Arc::clone(&completed))),
+        );
+
+        let (output, terminal) = statement.into_parts();
+        assert!(matches!(output, QuerySessionOutput::Ok));
+        assert!(!completed.load(Ordering::Acquire));
+        terminal.complete();
+        assert!(completed.load(Ordering::Acquire));
     }
 }

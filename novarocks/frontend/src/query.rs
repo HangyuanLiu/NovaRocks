@@ -625,7 +625,6 @@ impl QuerySessionFactory for FrontendQueryService {
         Ok(Arc::new(FrontendQuerySession {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
-            active_statements: Mutex::new(Vec::new()),
             state: Mutex::new(SessionSqlState::default()),
         }))
     }
@@ -666,8 +665,18 @@ fn query_application_parse_error(error: SqlStatementParseError, source: &str) ->
 struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
-    active_statements: Mutex<Vec<FrontendWorkloadLease>>,
     state: Mutex<SessionSqlState>,
+}
+
+struct FrontendSessionProtocolTerminal(FrontendWorkloadLease);
+
+impl novarocks_query_application::session::SessionProtocolTerminal
+    for FrontendSessionProtocolTerminal
+{
+    fn complete(self: Box<Self>) {
+        let Self(admission) = *self;
+        drop(admission);
+    }
 }
 
 impl FrontendQuerySession {
@@ -694,59 +703,58 @@ impl FrontendQuerySession {
         &self,
         statement: &str,
         admission: FrontendWorkloadLease,
-    ) -> Result<StatementResult, QueryServiceError> {
+    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+    {
         let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
         if trimmed.is_empty() {
-            return Ok(StatementResult::Ok);
+            return Ok(
+                novarocks_query_application::session::QuerySessionStatement::new(
+                    StatementResult::Ok,
+                    Box::new(FrontendSessionProtocolTerminal(admission)),
+                ),
+            );
         }
         if let Some(error) = admin_raise_engine_error(trimmed)? {
             return Err(error);
         }
         let parsed_statement = parse_single_statement(trimmed)
             .map_err(|error| query_application_parse_error(error, trimmed))?;
-        let result = match parsed_statement {
-            ParsedStatement::Session(ast::SessionStatement::Set(statement))
-                if statement
-                    .assignments
-                    .iter()
-                    .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
-            {
-                self.execute_governed_set(trimmed.to_string(), &statement, &admission)
-                    .await
-            }
-            ParsedStatement::Session(statement) => {
-                self.execute_session_statement(trimmed, &statement, &admission)
-                    .await
-            }
-            ParsedStatement::Query(_) => {
-                // The process serving latch has completed its readiness check.
-                // Plain reads now have one business admission and one active
-                // generation, both owned by the workload-backed statement owner.
-                drop(admission);
-                return self
+        let result =
+            match parsed_statement {
+                ParsedStatement::Session(ast::SessionStatement::Set(statement))
+                    if statement
+                        .assignments
+                        .iter()
+                        .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
+                {
+                    self.execute_governed_set(trimmed.to_string(), &statement, &admission)
+                        .await
+                }
+                ParsedStatement::Session(statement) => {
+                    self.execute_session_statement(trimmed, &statement, &admission)
+                        .await
+                }
+                ParsedStatement::Query(_) => {
+                    // The process serving latch has completed its readiness check.
+                    // Plain reads now have one business admission and one active
+                    // generation, both owned by the workload-backed statement owner.
+                    drop(admission);
+                    return self
                     .execute_governed_read(trimmed.to_string(), parsed_statement)
-                    .await;
-            }
-            statement => {
-                self.execute_typed_statement(trimmed.to_string(), statement, &admission)
                     .await
-            }
-        };
-        if result.is_ok() {
-            let mut active_statements = self.active_statements.lock().map_err(poisoned_state)?;
-            // The MySQL protocol consumes every successful statement result
-            // after this method returns. Retain lifecycle observation through
-            // that terminal write; governed statements receive drain
-            // cancellation through their query-control owner, not this lease.
-            active_statements.push(admission);
-        }
-        result
-    }
-
-    fn complete_active_statement(&self) {
-        if let Ok(mut active_statements) = self.active_statements.lock() {
-            active_statements.clear();
-        }
+                    .map(novarocks_query_application::session::QuerySessionStatement::output_owned);
+                }
+                statement => {
+                    self.execute_typed_statement(trimmed.to_string(), statement, &admission)
+                        .await
+                }
+            };
+        result.map(|output| {
+            novarocks_query_application::session::QuerySessionStatement::new(
+                output,
+                Box::new(FrontendSessionProtocolTerminal(admission)),
+            )
+        })
     }
 
     async fn execute_session_statement(
@@ -1982,7 +1990,11 @@ impl QuerySession for FrontendQuerySession {
         Ok(())
     }
 
-    async fn execute_batch(&self, sql: &str) -> Result<StatementResult, QueryServiceError> {
+    async fn execute_batch(
+        &self,
+        sql: &str,
+    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+    {
         // Preserve the serving lifecycle's admission linearization before
         // inspecting the COM_QUERY. The current handshake advertises neither
         // multi-statement nor multi-result support, so inspection still
@@ -1993,13 +2005,14 @@ impl QuerySession for FrontendQuerySession {
             .try_admit(FrontendWorkloadKind::Statement)
             .map_err(query_service_admission_error)?;
         let Some(statement) = unnegotiated_query_statement(sql)? else {
-            return Ok(StatementResult::Ok);
+            return Ok(
+                novarocks_query_application::session::QuerySessionStatement::new(
+                    StatementResult::Ok,
+                    Box::new(FrontendSessionProtocolTerminal(admission)),
+                ),
+            );
         };
         self.execute_statement(statement, admission).await
-    }
-
-    fn complete_statement(&self) {
-        self.complete_active_statement();
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {
@@ -2018,7 +2031,6 @@ impl QuerySession for FrontendQuerySession {
 
     fn close(&self) {
         self.cancel_current(QueryCancellationReason::ClientDisconnected);
-        self.complete_active_statement();
         if let Ok(mut lease) = self.lease.lock() {
             lease.take();
         }

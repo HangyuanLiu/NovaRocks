@@ -47,8 +47,9 @@ use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_query_application::session::QuerySessionOpenRequest;
-use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
+use novarocks_query_application::session::{
+    QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
+};
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
@@ -412,37 +413,37 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                     .await;
             }
         };
-        let outcome = match session.execute_batch(query).await {
-            Ok(StatementResult::Query(result)) => write_query_result(result, results).await,
-            Ok(StatementResult::GovernedQuery(result)) => {
-                write_governed_query_result(result, results).await
-            }
-            Ok(StatementResult::StreamingQuery(result)) => {
-                write_streaming_query_result(result, results).await
-            }
-            Ok(StatementResult::GovernedCompletion(result)) => {
-                novarocks_mysql_adapter::write_governed_terminal_ok(result.into_protocol(), results)
-                    .await
-            }
-            Ok(StatementResult::GovernedError(result)) => {
-                let (error, protocol) = result.into_parts();
-                novarocks_mysql_adapter::write_governed_terminal_error(error, protocol, results)
-                    .await
-            }
-            Ok(StatementResult::Ok) => novarocks_mysql_adapter::write_terminal_ok(results).await,
+        let (statement, terminal) = match session.execute_batch(query).await {
+            Ok(statement) => statement.into_parts(),
             Err(error) => {
-                results
+                return results
                     .error(
                         novarocks_mysql_adapter::mysql_error_kind(&error),
                         error.message().as_bytes(),
                     )
-                    .await
+                    .await;
             }
         };
-        // Query sessions may retain their admission while the protocol streams
-        // a result. Release it only after this response has reached its final
-        // protocol outcome.
-        session.complete_statement();
+        let outcome = match statement {
+            StatementResult::Query(result) => write_query_result(result, results).await,
+            StatementResult::GovernedQuery(result) => {
+                write_governed_query_result(result, results).await
+            }
+            StatementResult::StreamingQuery(result) => {
+                write_streaming_query_result(result, results).await
+            }
+            StatementResult::GovernedCompletion(result) => {
+                novarocks_mysql_adapter::write_governed_terminal_ok(result.into_protocol(), results)
+                    .await
+            }
+            StatementResult::GovernedError(result) => {
+                let (error, protocol) = result.into_parts();
+                novarocks_mysql_adapter::write_governed_terminal_error(error, protocol, results)
+                    .await
+            }
+            StatementResult::Ok => novarocks_mysql_adapter::write_terminal_ok(results).await,
+        };
+        terminal.complete();
         outcome
     }
 }

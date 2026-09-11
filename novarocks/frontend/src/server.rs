@@ -983,25 +983,29 @@ mod tests {
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-    use novarocks_query_application::session::QuerySessionOpenRequest;
+    use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};
     use novarocks_query_application::session_error::QueryServiceErrorKind;
 
-    fn settle_governed_completion(result: StatementResult) {
+    fn settle_governed_completion(statement: QuerySessionStatement) {
+        let (result, terminal) = statement.into_parts();
         let StatementResult::GovernedCompletion(result) = result else {
             panic!("successful statement must retain its owner through terminal OK");
         };
         let mut protocol = result.into_protocol();
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
+        terminal.complete();
     }
 
-    fn settle_governed_query(result: StatementResult) {
+    fn settle_governed_query(statement: QuerySessionStatement) {
+        let (result, terminal) = statement.into_parts();
         let StatementResult::GovernedQuery(result) = result else {
             panic!("query result must retain its owner through terminal EOF");
         };
         let (_result, mut protocol) = result.into_parts();
         let _ = protocol.seal_success_visibility();
         let _ = protocol.complete();
+        terminal.complete();
     }
 
     fn test_native_trust() -> Arc<NativeTrust> {
@@ -1193,7 +1197,6 @@ mod tests {
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
         settle_governed_completion(result);
-        session.complete_statement();
         let created = attachments
             .get(&instance_id)
             .await
@@ -1210,14 +1213,12 @@ mod tests {
             .await
             .expect("the committed attachment is admitted by this frontend session");
         settle_governed_completion(result);
-        session.complete_statement();
 
         let result = session
             .execute_batch("DROP CATALOG warehouse")
             .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
         settle_governed_completion(result);
-        session.complete_statement();
         assert!(
             attachments
                 .get(&instance_id)
@@ -1234,13 +1235,14 @@ mod tests {
             .execute_batch("SET CATALOG warehouse")
             .await
             .expect("admission error is retained until the protocol terminal error");
+        let (result, terminal) = result.into_parts();
         let StatementResult::GovernedError(result) = result else {
             panic!("a dropped catalog must produce a governed terminal error");
         };
         let (error, mut protocol) = result.into_parts();
         assert_eq!(error.kind(), QueryServiceErrorKind::BadDatabase);
         let _ = protocol.fail();
-        session.complete_statement();
+        terminal.complete();
 
         // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
@@ -1342,7 +1344,6 @@ mod tests {
             .await
             .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
         settle_governed_query(result);
-        session.complete_statement();
 
         session.close();
         drop(session);
