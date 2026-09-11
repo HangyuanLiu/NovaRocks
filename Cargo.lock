@@ -3973,6 +3973,7 @@ dependencies = [
  "novarocks-query-application",
  "novarocks-types",
  "novarocks-user-error",
+ "novarocks-workload-control",
  "opensrv-mysql",
  "tokio",
  "tracing",

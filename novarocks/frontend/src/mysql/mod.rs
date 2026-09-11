@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod encoding;
 pub use novarocks_mysql_adapter::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
@@ -39,9 +38,6 @@ use tracing::{info, warn};
 
 use novarocks_version as version;
 
-use self::encoding::{
-    write_governed_query_result, write_query_result, write_streaming_query_result,
-};
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
@@ -425,12 +421,14 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             }
         };
         let outcome = match statement {
-            StatementResult::Query(result) => write_query_result(result, results).await,
+            StatementResult::Query(result) => {
+                novarocks_mysql_adapter::write_query_result(result, results).await
+            }
             StatementResult::GovernedQuery(result) => {
-                write_governed_query_result(result, results).await
+                novarocks_mysql_adapter::write_governed_query_result(result, results).await
             }
             StatementResult::StreamingQuery(result) => {
-                write_streaming_query_result(result, results).await
+                novarocks_mysql_adapter::write_streaming_query_result(result, results).await
             }
             StatementResult::GovernedCompletion(result) => {
                 novarocks_mysql_adapter::write_governed_terminal_ok(result.into_protocol(), results)

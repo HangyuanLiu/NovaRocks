@@ -14,9 +14,11 @@ libc.workspace = true
 mysql_common = "0.32"
 novarocks-query-application.workspace = true
 novarocks-types.workspace = true
+novarocks-workload-control.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing.workspace = true
 
 [dev-dependencies]
+novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-user-error.workspace = true

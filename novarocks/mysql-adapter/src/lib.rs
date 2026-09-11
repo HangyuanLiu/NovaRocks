@@ -21,6 +21,7 @@ mod authentication;
 mod connection_registry;
 mod disconnect_watcher;
 mod error_mapping;
+mod governed_result_writer;
 mod listener;
 mod listener_settings;
 mod result_encoding;
@@ -36,6 +37,9 @@ pub use authentication::authenticate_empty_password;
 pub use connection_registry::MysqlClientConnectionRegistry;
 pub use disconnect_watcher::{ClientDisconnectWatcher, spawn_disconnect_watcher};
 pub use error_mapping::error_kind_for_domain_code;
+pub use governed_result_writer::{
+    write_governed_query_result, write_query_result, write_streaming_query_result,
+};
 pub use listener::{
     serve_tcp_until_drain_then_shutdown, serve_tcp_until_shutdown,
     serve_tcp_until_shutdown_with_drain_timeout,

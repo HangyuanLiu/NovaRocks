@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Arrow → MySQL wire value conversion for the standalone MySQL server.
+//! Governed Query Application result delivery over the MySQL wire.
 
 use std::io;
 
@@ -23,42 +23,23 @@ use arrow::array::{
     Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeListArray, LargeStringArray, ListArray,
     MapArray, StringArray, StructArray,
 };
-#[cfg(test)]
-use arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array,
-    Int8Array, Int16Array, Int32Array, Int64Array, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
-};
 use arrow::datatypes::DataType;
-#[cfg(test)]
-use arrow::datatypes::TimeUnit;
 use arrow::record_batch::RecordBatch;
-#[cfg(test)]
-use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
-use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, U24_MAX};
-use tokio::io::AsyncWrite;
-
-#[cfg(test)]
-use novarocks_mysql_adapter::MysqlResultValue as StandaloneMysqlValue;
-use novarocks_mysql_adapter::mysql_column_for_result_field;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, QueryResult, ResultDelivery, ResultFailureView,
     ResultField as QueryResultColumn, ResultSchema, decoded_result_batch_governance_charge,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use novarocks_query_application::protocol_delivery::StreamingStatementResult;
 use novarocks_query_application::protocol_delivery::{
-    GovernedImmediateStatementResult, ImmediateResultBatch,
+    GovernedImmediateStatementResult, ImmediateResultBatch, StreamingStatementResult,
 };
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::FieldRenderSchema;
-#[cfg(test)]
-use novarocks_types::format_mysql_container_value_with_schema;
 use novarocks_workload_control::{
     LocalResourceAuthority, Reservation, ResourceClass, WorkError, WorkScope,
 };
+use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, U24_MAX};
+use tokio::io::AsyncWrite;
 
 const MYSQL_TERMINAL_PROTOCOL_BYTES_UPPER_BOUND: u64 = 64;
 
@@ -86,15 +67,19 @@ impl ProtocolWriteFailure {
     }
 }
 
-pub(super) async fn write_query_result<W: AsyncWrite + Unpin>(
+/// Delivers an already-materialized immediate Query Application result.
+///
+/// This result has no governed delivery owner, but the MySQL adapter still
+/// owns its schema, rows, and terminal wire transitions.
+pub async fn write_query_result<W: AsyncWrite + Unpin>(
     result: QueryResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
     let batches = result.batches.iter().collect::<Vec<_>>();
-    novarocks_mysql_adapter::write_record_batches(&result.columns, &batches, results).await
+    crate::write_record_batches(&result.columns, &batches, results).await
 }
 
-pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
+pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
     result: GovernedImmediateStatementResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
@@ -132,18 +117,17 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
         }
     };
-    let mysql_columns =
-        match novarocks_mysql_adapter::mysql_columns_for_result_fields(&result.columns) {
-            Ok(columns) => columns,
-            Err(error) => {
-                let error = invalid_query_result_delivery(error.to_string());
-                let _ = protocol.fail();
-                let message = error.to_string().into_bytes();
-                return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
-            }
-        };
+    let mysql_columns = match crate::mysql_columns_for_result_fields(&result.columns) {
+        Ok(columns) => columns,
+        Err(error) => {
+            let error = invalid_query_result_delivery(error.to_string());
+            let _ = protocol.fail();
+            let message = error.to_string().into_bytes();
+            return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
+        }
+    };
     let cancellation = protocol.cancellation();
-    let mut writer = match novarocks_mysql_adapter::start_cancellable_result(
+    let mut writer = match crate::start_cancellable_result(
         results,
         mysql_columns.as_slice(),
         cancellation,
@@ -151,11 +135,11 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
     .await
     {
         Ok(writer) => writer,
-        Err(novarocks_mysql_adapter::MysqlResultStartError::Cancelled(error)) => {
+        Err(crate::MysqlResultStartError::Cancelled(error)) => {
             let _ = protocol.settle_cancellation();
             return Err(interrupted_error(error.to_string()));
         }
-        Err(novarocks_mysql_adapter::MysqlResultStartError::Io(error)) => {
+        Err(crate::MysqlResultStartError::Io(error)) => {
             let _ = protocol.client_disconnected();
             return Err(error);
         }
@@ -375,7 +359,7 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
         }
     }
-    match novarocks_mysql_adapter::finish_result(writer).await {
+    match crate::finish_result(writer).await {
         Ok(()) => {
             drop(terminal_reservation);
             let _ = protocol.complete();
@@ -391,7 +375,7 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
 
 /// Writes one Query Application result without detaching its delivery and
 /// resource owners from the protocol operation which consumes them.
-pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
+pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
     mut result: StreamingStatementResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
@@ -456,7 +440,7 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
         }
     };
     let columns = result_schema_to_query_result_columns(schema_delivery.schema());
-    let mysql_columns = match novarocks_mysql_adapter::mysql_columns_for_result_fields(&columns) {
+    let mysql_columns = match crate::mysql_columns_for_result_fields(&columns) {
         Ok(columns) => columns,
         Err(error) => {
             let error = invalid_query_result_delivery(error.to_string());
@@ -466,7 +450,7 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
         }
     };
     let cancellation = result.cancellation();
-    let mut writer = match novarocks_mysql_adapter::start_streaming_result(
+    let mut writer = match crate::start_streaming_result(
         results,
         mysql_columns.as_slice(),
         cancellation,
@@ -475,23 +459,23 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
     .await
     {
         Ok(writer) => writer,
-        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Native(error)) => {
+        Err(crate::MysqlBatchWriteError::Native(error)) => {
             schema_delivery.fail(error.clone());
             let _ = result.fail();
             return Err(invalid_data_error(error.to_string()));
         }
-        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error)) => {
+        Err(crate::MysqlBatchWriteError::Cancelled(error)) => {
             schema_delivery.fail(error.clone());
             let _ = result.settle_cancellation();
             return Err(interrupted_error(error.to_string()));
         }
-        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error)) => {
+        Err(crate::MysqlBatchWriteError::Encoding(error)) => {
             let error = invalid_query_result_delivery(error.to_string());
             schema_delivery.fail(error.clone());
             let _ = result.fail();
             return Err(invalid_data_error(error.to_string()));
         }
-        Err(novarocks_mysql_adapter::MysqlBatchWriteError::Io(error)) => {
+        Err(crate::MysqlBatchWriteError::Io(error)) => {
             schema_delivery.fail(failed_query_result_delivery(format!(
                 "write MySQL result schema: {error}"
             )));
@@ -722,8 +706,7 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                             .await;
                     }
                 }
-                let finished =
-                    novarocks_mysql_adapter::finish_streaming_result(writer, failure.clone()).await;
+                let finished = crate::finish_streaming_result(writer, failure.clone()).await;
                 match finished {
                     Ok(()) => {
                         drop(terminal_reservation);
@@ -731,13 +714,13 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         let _ = result.complete();
                         return Ok(());
                     }
-                    Err(novarocks_mysql_adapter::MysqlResultFinishError::Native(error)) => {
+                    Err(crate::MysqlResultFinishError::Native(error)) => {
                         drop(terminal_reservation);
                         delivery.fail(error.clone());
                         let _ = result.fail();
                         return Err(invalid_data_error(error.to_string()));
                     }
-                    Err(novarocks_mysql_adapter::MysqlResultFinishError::Io(error)) => {
+                    Err(crate::MysqlResultFinishError::Io(error)) => {
                         drop(terminal_reservation);
                         delivery.fail(failed_query_result_delivery(format!(
                             "write MySQL success EOF: {error}"
@@ -756,7 +739,7 @@ async fn finish_stream_error<W: AsyncWrite + Unpin>(
     kind: ErrorKind,
     error: &QueryExecutionError,
 ) -> io::Result<()> {
-    novarocks_mysql_adapter::finish_result_error(writer, kind, error).await
+    crate::finish_result_error(writer, kind, error).await
 }
 
 async fn reserve_data_when_available(
@@ -804,21 +787,13 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
     cancellation: QueryCancellationView,
     failure: ResultFailureView,
 ) -> Result<(), ProtocolWriteFailure> {
-    novarocks_mysql_adapter::write_streaming_batch(writer, batch, columns, cancellation, failure)
+    crate::write_streaming_batch(writer, batch, columns, cancellation, failure)
         .await
         .map_err(|error| match error {
-            novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error) => {
-                ProtocolWriteFailure::Cancelled(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Native(error) => {
-                ProtocolWriteFailure::Native(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error) => {
-                ProtocolWriteFailure::Encoding(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Io(error) => {
-                ProtocolWriteFailure::Io(error)
-            }
+            crate::MysqlBatchWriteError::Cancelled(error) => ProtocolWriteFailure::Cancelled(error),
+            crate::MysqlBatchWriteError::Native(error) => ProtocolWriteFailure::Native(error),
+            crate::MysqlBatchWriteError::Encoding(error) => ProtocolWriteFailure::Encoding(error),
+            crate::MysqlBatchWriteError::Io(error) => ProtocolWriteFailure::Io(error),
         })
 }
 
@@ -828,21 +803,13 @@ async fn write_governed_batch<W: AsyncWrite + Unpin>(
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
 ) -> Result<(), ProtocolWriteFailure> {
-    novarocks_mysql_adapter::write_cancellable_batch(writer, batch, columns, cancellation)
+    crate::write_cancellable_batch(writer, batch, columns, cancellation)
         .await
         .map_err(|error| match error {
-            novarocks_mysql_adapter::MysqlBatchWriteError::Cancelled(error) => {
-                ProtocolWriteFailure::Cancelled(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Native(error) => {
-                ProtocolWriteFailure::Native(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Encoding(error) => {
-                ProtocolWriteFailure::Encoding(error)
-            }
-            novarocks_mysql_adapter::MysqlBatchWriteError::Io(error) => {
-                ProtocolWriteFailure::Io(error)
-            }
+            crate::MysqlBatchWriteError::Cancelled(error) => ProtocolWriteFailure::Cancelled(error),
+            crate::MysqlBatchWriteError::Native(error) => ProtocolWriteFailure::Native(error),
+            crate::MysqlBatchWriteError::Encoding(error) => ProtocolWriteFailure::Encoding(error),
+            crate::MysqlBatchWriteError::Io(error) => ProtocolWriteFailure::Io(error),
         })
 }
 
@@ -1280,6 +1247,13 @@ fn usize_to_u64(value: usize) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| "MySQL value length does not fit u64".to_string())
 }
 
+fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Result<&'a T, String> {
+    column
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| format!("failed to downcast output column to {expected}"))
+}
+
 fn invalid_query_result_delivery(message: impl Into<String>) -> QueryExecutionError {
     QueryExecutionError::new(QueryExecutionErrorKind::InvalidRequest, message.into())
 }
@@ -1306,6 +1280,10 @@ fn governed_cancelled_query_result_delivery(
 
 fn interrupted_error(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::Interrupted, message.into())
+}
+
+fn invalid_data_error(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 #[cfg(test)]
@@ -1549,7 +1527,7 @@ mod streaming_result_tests {
             None,
         )];
         let upper = mysql_text_batch_protocol_bytes_upper_bound(&batch, &columns).unwrap();
-        let values = build_mysql_row(&batch, &columns, 0).unwrap();
+        let values = crate::build_mysql_row(&batch, &columns, 0).unwrap();
         let mut rendered = Vec::new();
         for value in values {
             value.to_mysql_text(&mut rendered).unwrap();
@@ -1914,520 +1892,5 @@ mod streaming_result_tests {
             Some(CancellationReason::Requested)
         );
         fixture.producer.finish();
-    }
-}
-
-pub(super) fn query_result_column_to_mysql_column(
-    column: &QueryResultColumn,
-) -> Result<Column, String> {
-    mysql_column_for_result_field(column)
-}
-
-#[cfg(test)]
-pub(super) fn build_mysql_row(
-    batch: &RecordBatch,
-    columns: &[QueryResultColumn],
-    row_idx: usize,
-) -> Result<Vec<StandaloneMysqlValue>, String> {
-    if batch.num_columns() != columns.len() {
-        return Err(format!(
-            "query result column count mismatch: metadata has {}, batch has {}",
-            columns.len(),
-            batch.num_columns()
-        ));
-    }
-    if batch.schema().fields().len() != columns.len() {
-        return Err(format!(
-            "query result field count mismatch: schema has {}, metadata has {}",
-            batch.schema().fields().len(),
-            columns.len()
-        ));
-    }
-    batch
-        .columns()
-        .iter()
-        .zip(batch.schema().fields().iter())
-        .zip(columns.iter())
-        .map(|((column, field), declared)| {
-            let field_schema = FieldRenderSchema::from_field(field.as_ref());
-            array_value_to_mysql_value(column, declared, row_idx, Some(&field_schema))
-        })
-        .collect()
-}
-
-#[cfg(test)]
-pub(super) fn array_value_to_mysql_value(
-    column: &ArrayRef,
-    declared: &QueryResultColumn,
-    row_idx: usize,
-    field_schema: Option<&FieldRenderSchema>,
-) -> Result<StandaloneMysqlValue, String> {
-    if column.is_null(row_idx) {
-        return Ok(StandaloneMysqlValue::Null);
-    }
-
-    if let Some(novarocks_types::schema::SqlType::Decimal { scale, .. }) = declared.logical_type() {
-        return decimal_to_mysql_value(column, row_idx, *scale);
-    }
-
-    if matches!(declared.data_type(), DataType::Date32)
-        && matches!(column.data_type(), DataType::Timestamp(_, _))
-    {
-        return timestamp_to_date_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
-    }
-    if matches!(
-        declared.data_type(),
-        DataType::Time32(_) | DataType::Time64(_)
-    ) && matches!(column.data_type(), DataType::Timestamp(_, _))
-    {
-        return timestamp_to_time_mysql_value(column, timestamp_unit(column.data_type())?, row_idx);
-    }
-
-    if field_schema.is_some_and(FieldRenderSchema::renders_opaque_binary) {
-        return Ok(StandaloneMysqlValue::Null);
-    }
-
-    let name_lower = declared.name().to_lowercase();
-    if matches!(column.data_type(), DataType::Binary | DataType::LargeBinary)
-        && (name_lower.starts_with("bitmap_agg(")
-            || name_lower.starts_with("bitmap_union(")
-            || name_lower.starts_with("hll_union(")
-            || name_lower.starts_with("hll_raw_agg("))
-    {
-        return Ok(StandaloneMysqlValue::Null);
-    }
-
-    match column.data_type() {
-        DataType::Boolean => downcast_array::<BooleanArray>(column, "BooleanArray")
-            .map(|arr| StandaloneMysqlValue::Int(if arr.value(row_idx) { 1 } else { 0 })),
-        DataType::Int8 => downcast_array::<Int8Array>(column, "Int8Array")
-            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
-        DataType::Int16 => downcast_array::<Int16Array>(column, "Int16Array")
-            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
-        DataType::Int32 => downcast_array::<Int32Array>(column, "Int32Array")
-            .map(|arr| StandaloneMysqlValue::Int(i64::from(arr.value(row_idx)))),
-        DataType::Int64 => downcast_array::<Int64Array>(column, "Int64Array")
-            .map(|arr| StandaloneMysqlValue::Int(arr.value(row_idx))),
-        DataType::UInt8 => downcast_array::<UInt8Array>(column, "UInt8Array")
-            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
-        DataType::UInt16 => downcast_array::<UInt16Array>(column, "UInt16Array")
-            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
-        DataType::UInt32 => downcast_array::<UInt32Array>(column, "UInt32Array")
-            .map(|arr| StandaloneMysqlValue::UInt(u64::from(arr.value(row_idx)))),
-        DataType::UInt64 => downcast_array::<UInt64Array>(column, "UInt64Array")
-            .map(|arr| StandaloneMysqlValue::UInt(arr.value(row_idx))),
-        DataType::Float32 => downcast_array::<Float32Array>(column, "Float32Array")
-            .map(|arr| StandaloneMysqlValue::Float(arr.value(row_idx))),
-        DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
-            .map(|arr| StandaloneMysqlValue::Double(arr.value(row_idx))),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            let arr = downcast_array::<FixedSizeBinaryArray>(column, "FixedSizeBinaryArray")?;
-            let value = novarocks_types::largeint::i128_from_be_bytes(arr.value(row_idx))?;
-            Ok(StandaloneMysqlValue::Bytes(value.to_string().into_bytes()))
-        }
-        DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
-            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
-        DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
-            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).as_bytes().to_vec())),
-        DataType::Binary => downcast_array::<BinaryArray>(column, "BinaryArray")
-            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).to_vec())),
-        DataType::LargeBinary => downcast_array::<LargeBinaryArray>(column, "LargeBinaryArray")
-            .map(|arr| StandaloneMysqlValue::Bytes(arr.value(row_idx).to_vec())),
-        DataType::Date32 => {
-            let arr = downcast_array::<Date32Array>(column, "Date32Array")?;
-            date32_to_mysql_value(arr.value(row_idx))
-        }
-        DataType::Decimal128(_, scale) => decimal128_to_mysql_value(column, row_idx, *scale),
-        DataType::Time32(unit) => time_to_mysql_value(column, *unit, row_idx),
-        DataType::Time64(unit) => time_to_mysql_value(column, *unit, row_idx),
-        DataType::Timestamp(unit, _) => timestamp_to_mysql_value(column, *unit, row_idx),
-        DataType::Null => Ok(StandaloneMysqlValue::Null),
-        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_) => {
-            Ok(StandaloneMysqlValue::Bytes(
-                format_mysql_container_value_with_schema(column, row_idx, field_schema)?
-                    .into_bytes(),
-            ))
-        }
-        other => Err(format!(
-            "standalone mysql server does not support output column type {:?}",
-            other
-        )),
-    }
-}
-
-#[cfg(test)]
-fn decimal128_to_mysql_value(
-    column: &ArrayRef,
-    row_idx: usize,
-    scale: i8,
-) -> Result<StandaloneMysqlValue, String> {
-    let arr = downcast_array::<Decimal128Array>(column, "Decimal128Array")?;
-    Ok(StandaloneMysqlValue::Bytes(
-        format_decimal128_string(arr.value(row_idx), scale)?.into_bytes(),
-    ))
-}
-
-#[cfg(test)]
-fn format_decimal128_string(value: i128, scale: i8) -> Result<String, String> {
-    if scale < 0 {
-        return Err(format!("unsupported decimal scale: {scale}"));
-    }
-    let scale = u32::try_from(scale).map_err(|_| format!("unsupported decimal scale: {scale}"))?;
-    if scale == 0 {
-        return Ok(value.to_string());
-    }
-    let factor = 10_u128
-        .checked_pow(scale)
-        .ok_or_else(|| format!("unsupported decimal scale: {scale}"))?;
-    let negative = value.is_negative();
-    let abs = value.unsigned_abs();
-    let whole = abs / factor;
-    let fraction = abs % factor;
-    Ok(format!(
-        "{}{}.{:0width$}",
-        if negative { "-" } else { "" },
-        whole,
-        fraction,
-        width = scale as usize
-    ))
-}
-
-#[cfg(test)]
-fn decimal_to_mysql_value(
-    column: &ArrayRef,
-    row_idx: usize,
-    scale: i8,
-) -> Result<StandaloneMysqlValue, String> {
-    let scale =
-        usize::try_from(scale).map_err(|_| format!("unsupported decimal scale: {scale}"))?;
-    let formatted = match column.data_type() {
-        DataType::Int8 => downcast_array::<Int8Array>(column, "Int8Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::Int16 => downcast_array::<Int16Array>(column, "Int16Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::Int32 => downcast_array::<Int32Array>(column, "Int32Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::Int64 => downcast_array::<Int64Array>(column, "Int64Array")
-            .map(|arr| format!("{:.*}", scale, arr.value(row_idx) as f64))?,
-        DataType::UInt8 => downcast_array::<UInt8Array>(column, "UInt8Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::UInt16 => downcast_array::<UInt16Array>(column, "UInt16Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::UInt32 => downcast_array::<UInt32Array>(column, "UInt32Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::UInt64 => downcast_array::<UInt64Array>(column, "UInt64Array")
-            .map(|arr| format!("{:.*}", scale, arr.value(row_idx) as f64))?,
-        DataType::Float32 => downcast_array::<Float32Array>(column, "Float32Array")
-            .map(|arr| format!("{:.*}", scale, f64::from(arr.value(row_idx))))?,
-        DataType::Float64 => downcast_array::<Float64Array>(column, "Float64Array")
-            .map(|arr| format!("{:.*}", scale, arr.value(row_idx)))?,
-        DataType::Utf8 => downcast_array::<StringArray>(column, "StringArray")
-            .map(|arr| arr.value(row_idx).to_string())?,
-        DataType::LargeUtf8 => downcast_array::<LargeStringArray>(column, "LargeStringArray")
-            .map(|arr| arr.value(row_idx).to_string())?,
-        other => {
-            return Err(format!(
-                "standalone mysql server does not support decimal output column type {:?}",
-                other
-            ));
-        }
-    };
-    Ok(StandaloneMysqlValue::Bytes(formatted.into_bytes()))
-}
-
-#[cfg(test)]
-fn timestamp_unit(data_type: &DataType) -> Result<TimeUnit, String> {
-    match data_type {
-        DataType::Timestamp(unit, _) => Ok(*unit),
-        other => Err(format!("expected timestamp data type, got {:?}", other)),
-    }
-}
-
-fn downcast_array<'a, T: 'static>(column: &'a ArrayRef, expected: &str) -> Result<&'a T, String> {
-    column
-        .as_any()
-        .downcast_ref::<T>()
-        .ok_or_else(|| format!("failed to downcast output column to {}", expected))
-}
-
-#[cfg(test)]
-fn date32_to_mysql_value(days: i32) -> Result<StandaloneMysqlValue, String> {
-    if days == novarocks_execution::exec::expr::function::date::zero_date_sentinel_date32() {
-        return Ok(StandaloneMysqlValue::Bytes(b"0000-00-00".to_vec()));
-    }
-    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
-    let date = epoch
-        .checked_add_signed(Duration::days(i64::from(days)))
-        .ok_or_else(|| format!("date32 value out of range: {days}"))?;
-    Ok(StandaloneMysqlValue::Date(date))
-}
-
-#[cfg(test)]
-fn timestamp_to_naive_datetime(
-    column: &ArrayRef,
-    unit: TimeUnit,
-    row_idx: usize,
-) -> Result<NaiveDateTime, String> {
-    let raw = timestamp_raw_micros(column, unit, row_idx)?;
-    let secs = raw.div_euclid(1_000_000);
-    let micros = raw.rem_euclid(1_000_000);
-    let secs = i64::try_from(secs).map_err(|_| format!("timestamp value out of range: {raw}"))?;
-    let micros =
-        u32::try_from(micros).map_err(|_| format!("timestamp micros out of range: {raw}"))?;
-    let dt = chrono::DateTime::<Utc>::from_timestamp(secs, micros * 1_000)
-        .ok_or_else(|| format!("timestamp value out of range: {raw}"))?;
-    Ok(dt.naive_utc())
-}
-
-#[cfg(test)]
-fn timestamp_raw_micros(column: &ArrayRef, unit: TimeUnit, row_idx: usize) -> Result<i128, String> {
-    let raw = match unit {
-        TimeUnit::Second => {
-            i128::from(
-                downcast_array::<TimestampSecondArray>(column, "TimestampSecondArray")?
-                    .value(row_idx),
-            ) * 1_000_000
-        }
-        TimeUnit::Millisecond => {
-            i128::from(
-                downcast_array::<TimestampMillisecondArray>(column, "TimestampMillisecondArray")?
-                    .value(row_idx),
-            ) * 1_000
-        }
-        TimeUnit::Microsecond => i128::from(
-            downcast_array::<TimestampMicrosecondArray>(column, "TimestampMicrosecondArray")?
-                .value(row_idx),
-        ),
-        TimeUnit::Nanosecond => {
-            i128::from(
-                downcast_array::<TimestampNanosecondArray>(column, "TimestampNanosecondArray")?
-                    .value(row_idx),
-            ) / 1_000
-        }
-    };
-    Ok(raw)
-}
-
-#[cfg(test)]
-fn timestamp_to_mysql_value(
-    column: &ArrayRef,
-    unit: TimeUnit,
-    row_idx: usize,
-) -> Result<StandaloneMysqlValue, String> {
-    Ok(StandaloneMysqlValue::DateTime(timestamp_to_naive_datetime(
-        column, unit, row_idx,
-    )?))
-}
-
-#[cfg(test)]
-fn timestamp_to_date_mysql_value(
-    column: &ArrayRef,
-    unit: TimeUnit,
-    row_idx: usize,
-) -> Result<StandaloneMysqlValue, String> {
-    Ok(StandaloneMysqlValue::Date(
-        timestamp_to_naive_datetime(column, unit, row_idx)?.date(),
-    ))
-}
-
-#[cfg(test)]
-fn timestamp_to_time_mysql_value(
-    column: &ArrayRef,
-    unit: TimeUnit,
-    row_idx: usize,
-) -> Result<StandaloneMysqlValue, String> {
-    time_micros_to_mysql_value(timestamp_raw_micros(column, unit, row_idx)?)
-}
-
-#[cfg(test)]
-fn time_to_mysql_value(
-    column: &ArrayRef,
-    unit: TimeUnit,
-    row_idx: usize,
-) -> Result<StandaloneMysqlValue, String> {
-    let micros = match unit {
-        TimeUnit::Second => {
-            i128::from(
-                downcast_array::<Time32SecondArray>(column, "Time32SecondArray")?.value(row_idx),
-            ) * 1_000_000
-        }
-        TimeUnit::Millisecond => {
-            i128::from(
-                downcast_array::<Time32MillisecondArray>(column, "Time32MillisecondArray")?
-                    .value(row_idx),
-            ) * 1_000
-        }
-        TimeUnit::Microsecond => i128::from(
-            downcast_array::<Time64MicrosecondArray>(column, "Time64MicrosecondArray")?
-                .value(row_idx),
-        ),
-        TimeUnit::Nanosecond => {
-            i128::from(
-                downcast_array::<Time64NanosecondArray>(column, "Time64NanosecondArray")?
-                    .value(row_idx),
-            ) / 1_000
-        }
-    };
-
-    time_micros_to_mysql_value(micros)
-}
-
-#[cfg(test)]
-fn time_micros_to_mysql_value(micros: i128) -> Result<StandaloneMysqlValue, String> {
-    let total_seconds = micros.div_euclid(1_000_000);
-    let microseconds = micros.rem_euclid(1_000_000) as u32;
-    let hours = total_seconds.div_euclid(3_600);
-    let minutes = total_seconds.rem_euclid(3_600).div_euclid(60);
-    let seconds = total_seconds.rem_euclid(60);
-    let days = hours.div_euclid(24);
-    let hour_of_day = hours.rem_euclid(24);
-
-    Ok(StandaloneMysqlValue::Time {
-        negative: micros.is_negative(),
-        days: u32::try_from(days.unsigned_abs())
-            .map_err(|_| format!("time value out of range: {micros}"))?,
-        hours: u8::try_from(hour_of_day.unsigned_abs())
-            .map_err(|_| format!("time value out of range: {micros}"))?,
-        minutes: u8::try_from(minutes.unsigned_abs())
-            .map_err(|_| format!("time value out of range: {micros}"))?,
-        seconds: u8::try_from(seconds.unsigned_abs())
-            .map_err(|_| format!("time value out of range: {micros}"))?,
-        micros: microseconds,
-    })
-}
-
-pub(super) fn invalid_data_error(err: String) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, err)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use arrow::array::{BinaryArray, ListBuilder, StringBuilder, TimestampMicrosecondArray};
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-    use opensrv_mysql::ToMysqlValue;
-
-    use super::*;
-    use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-    use novarocks_types::SlotId;
-    use novarocks_types::logical::{LogicalType, field_with_logical_type};
-
-    #[test]
-    fn declared_date_timestamp_value_serializes_without_time_component() {
-        let declared = QueryResultColumn::new("d", DataType::Date32, false, None);
-        let value = array_value_to_mysql_value(
-            &(Arc::new(TimestampMicrosecondArray::from(vec![
-                1_580_601_600_000_000i64,
-            ])) as ArrayRef),
-            &declared,
-            0,
-            None,
-        )
-        .expect("convert timestamp to DATE");
-
-        assert_eq!(
-            value,
-            StandaloneMysqlValue::Date(NaiveDate::from_ymd_opt(2020, 2, 2).expect("valid date"))
-        );
-
-        let mut encoded = Vec::new();
-        value
-            .to_mysql_text(&mut encoded)
-            .expect("encode DATE text payload");
-        assert_eq!(encoded[0], 10);
-        assert_eq!(&encoded[1..], b"2020-02-02");
-    }
-
-    #[test]
-    fn build_mysql_row_uses_arrow_field_metadata_for_array_json() {
-        let mut builder = ListBuilder::new(StringBuilder::new());
-        builder.values().append_value(r#"{"2:3": null}"#);
-        builder.append(true);
-        let raw_array = Arc::new(builder.finish()) as ArrayRef;
-        let payload_field = Field::new(
-            "payload",
-            DataType::List(Arc::new(field_with_logical_type(
-                Field::new("item", DataType::Utf8, true),
-                LogicalType::Json,
-            ))),
-            true,
-        );
-        let array = novarocks_execution::exec::chunk::type_compatibility::retag_column(
-            &raw_array,
-            payload_field.data_type(),
-        )
-        .expect("retag array with logical metadata");
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![payload_field.clone()])),
-            vec![Arc::clone(&array)],
-        )
-        .expect("batch");
-        let chunk = Chunk::new_with_chunk_schema(
-            batch,
-            Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                    SlotId::new(1),
-                    payload_field,
-                    None,
-                    None,
-                )])
-                .expect("chunk schema"),
-            ),
-        );
-        let columns = vec![QueryResultColumn::new(
-            "payload",
-            array.data_type().clone(),
-            true,
-            None,
-        )];
-
-        let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
-
-        assert_eq!(
-            row,
-            vec![StandaloneMysqlValue::Bytes(
-                br#"['{"2:3": null}']"#.to_vec()
-            )]
-        );
-    }
-
-    #[test]
-    fn build_mysql_row_uses_arrow_field_metadata_for_opaque_binary() {
-        let payload_field = field_with_logical_type(
-            Field::new("payload", DataType::Binary, true),
-            LogicalType::Hll,
-        );
-        let array = Arc::new(BinaryArray::from(vec![Some(b"opaque".as_slice())])) as ArrayRef;
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![payload_field.clone()])),
-            vec![Arc::clone(&array)],
-        )
-        .expect("batch");
-        let chunk = Chunk::new_with_chunk_schema(
-            batch,
-            Arc::new(
-                ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
-                    SlotId::new(1),
-                    payload_field,
-                    None,
-                    None,
-                )])
-                .expect("chunk schema"),
-            ),
-        );
-        let columns = vec![QueryResultColumn::new(
-            "payload",
-            array.data_type().clone(),
-            true,
-            None,
-        )];
-
-        let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
-
-        assert_eq!(row, vec![StandaloneMysqlValue::Null]);
     }
 }
