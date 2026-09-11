@@ -248,6 +248,7 @@ impl FrontendServingSnapshotReader for LateBoundFrontendServingSnapshotReader {
 struct ActiveLease {
     kind: FrontendWorkloadKind,
     cancellation: QueryCancellationSource,
+    external_cancellation: Option<Arc<dyn Fn(QueryCancellationReason) + Send + Sync>>,
 }
 
 struct Inner {
@@ -432,6 +433,7 @@ impl FrontendServingLifecycle {
                     ActiveLease {
                         kind,
                         cancellation: cancellation.clone(),
+                        external_cancellation: None,
                     },
                 );
                 Ok(FrontendWorkloadLease {
@@ -463,6 +465,9 @@ impl FrontendServingLifecycle {
             let sources = inner.active.values().cloned().collect::<Vec<_>>();
             let mut cancelled = 0;
             for lease in &sources {
+                if let Some(cancel) = &lease.external_cancellation {
+                    cancel(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms });
+                }
                 if matches!(
                     lease.cancellation.request(
                         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms },
@@ -574,6 +579,20 @@ pub struct FrontendWorkloadLease {
 }
 
 impl FrontendWorkloadLease {
+    pub fn bind_external_cancellation(
+        &self,
+        cancel: impl Fn(QueryCancellationReason) + Send + Sync + 'static,
+    ) {
+        let mut inner = self
+            .shared
+            .inner
+            .lock()
+            .expect("frontend lifecycle lock poisoned");
+        if let Some(active) = inner.active.get_mut(&self.id) {
+            active.external_cancellation = Some(Arc::new(cancel));
+        }
+    }
+
     pub fn cancellation_source(&self) -> QueryCancellationSource {
         self.cancellation.clone()
     }
