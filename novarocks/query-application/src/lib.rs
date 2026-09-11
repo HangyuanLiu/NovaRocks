@@ -32,6 +32,9 @@ pub mod client_connection;
 /// Session registry and cancellation implementation owned by the query application.
 pub mod query_control;
 
+/// Query-session errors before protocol-specific encoding.
+pub mod session_error;
+
 /// Session generations, governed statement control, and protocol settlement.
 pub mod session_control;
 

@@ -4050,6 +4050,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
+ "novarocks-user-error",
  "novarocks-workload-control",
  "tokio",
  "tracing",

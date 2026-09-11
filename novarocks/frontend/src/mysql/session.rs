@@ -22,7 +22,6 @@
 //! frontend session through this port; all request admission, routing and
 //! cancellation identity remain with that session.
 
-use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -30,8 +29,7 @@ use async_trait::async_trait;
 use crate::runtime::statement_result::StatementResult;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::ClientConnectionToken;
-use novarocks_spi::connector::LakePublicationTerminal;
-use novarocks_user_error::UserError;
+use novarocks_query_application::session_error::QueryServiceError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
@@ -59,97 +57,6 @@ impl QuerySessionOpenRequest {
         &self.principal
     }
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum QueryServiceErrorKind {
-    Parse,
-    BadDatabase,
-    Unsupported,
-    PermissionDenied,
-    NoSuchSession,
-    Interrupted,
-    Timeout,
-    InvalidValue,
-    Unavailable,
-    /// The FE-local serving lifecycle has irreversibly closed workload admission.
-    FrontendDraining,
-    Internal,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QueryServiceError {
-    kind: QueryServiceErrorKind,
-    message: String,
-    user_error: Option<UserError>,
-    publication_terminal: Option<LakePublicationTerminal>,
-}
-
-impl QueryServiceError {
-    pub const FRONTEND_DRAINING_MESSAGE: &'static str =
-        "FRONTEND_DRAINING: frontend is draining; retry on another frontend";
-
-    pub fn frontend_draining() -> Self {
-        Self::new(
-            QueryServiceErrorKind::FrontendDraining,
-            Self::FRONTEND_DRAINING_MESSAGE,
-        )
-    }
-
-    pub fn new(kind: QueryServiceErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-            user_error: None,
-            publication_terminal: None,
-        }
-    }
-
-    /// Retains parser-owned facts until MySQL encodes the broad error class.
-    pub fn from_user_error(error: UserError) -> Self {
-        Self {
-            kind: QueryServiceErrorKind::Parse,
-            message: error.to_string(),
-            user_error: Some(error),
-            publication_terminal: None,
-        }
-    }
-
-    pub fn with_publication_terminal(
-        message: impl Into<String>,
-        terminal: LakePublicationTerminal,
-    ) -> Self {
-        Self {
-            kind: QueryServiceErrorKind::Internal,
-            message: message.into(),
-            user_error: None,
-            publication_terminal: Some(terminal),
-        }
-    }
-
-    pub const fn kind(&self) -> QueryServiceErrorKind {
-        self.kind
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub fn user_error(&self) -> Option<&UserError> {
-        self.user_error.as_ref()
-    }
-
-    pub fn publication_terminal(&self) -> Option<&LakePublicationTerminal> {
-        self.publication_terminal.as_ref()
-    }
-}
-
-impl fmt::Display for QueryServiceError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for QueryServiceError {}
 
 #[async_trait]
 pub trait QuerySession: Send + Sync + 'static {
@@ -189,35 +96,5 @@ mod tests {
         assert_eq!(request.connection_id(), 42);
         assert_eq!(request.connection_token().generation(), 7);
         assert_eq!(request.principal(), "alice");
-    }
-
-    #[test]
-    fn typed_error_preserves_kind_and_message() {
-        let error = QueryServiceError::new(QueryServiceErrorKind::Timeout, "deadline elapsed");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Timeout);
-        assert_eq!(error.message(), "deadline elapsed");
-        assert!(error.user_error().is_none());
-    }
-
-    #[test]
-    fn frontend_draining_error_uses_the_fixed_retry_message() {
-        let error = QueryServiceError::frontend_draining();
-        assert_eq!(error.kind(), QueryServiceErrorKind::FrontendDraining);
-        assert_eq!(
-            error.message(),
-            "FRONTEND_DRAINING: frontend is draining; retry on another frontend"
-        );
-    }
-
-    #[test]
-    fn parser_user_error_is_preserved_without_message_classification() {
-        let parser_error = novarocks_parser::parse("SHOW")
-            .expect_err("incomplete SHOW command must be a parser error")
-            .to_user_error("SHOW");
-        let error = QueryServiceError::from_user_error(parser_error.clone());
-
-        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
-        assert_eq!(error.user_error(), Some(&parser_error));
-        assert_eq!(error.message(), parser_error.to_string());
     }
 }

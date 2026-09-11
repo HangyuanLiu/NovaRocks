@@ -979,7 +979,8 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
-    use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+    use crate::{QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+    use novarocks_query_application::session_error::QueryServiceErrorKind;
 
     fn settle_governed_completion(result: StatementResult) {
         let StatementResult::GovernedCompletion(result) = result else {

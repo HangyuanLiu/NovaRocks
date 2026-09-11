@@ -17,6 +17,7 @@ novarocks-parser.workspace = true
 novarocks-spi.workspace = true
 novarocks-sql.workspace = true
 novarocks-types.workspace = true
+novarocks-user-error.workspace = true
 novarocks-workload-control.workspace = true
 bytes.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

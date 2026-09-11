@@ -48,10 +48,7 @@ use crate::runtime::statement_result::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult,
 };
-use crate::{
-    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest,
-};
+use crate::{QuerySession, QuerySessionFactory, QuerySessionOpenRequest};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -74,6 +71,7 @@ use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
     QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
+use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
 };

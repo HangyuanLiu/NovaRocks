@@ -16,7 +16,6 @@
 // under the License.
 
 use super::query_result::QueryResult;
-use crate::QueryServiceError;
 use novarocks_query_application::api::{
     ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind,
     QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
@@ -26,6 +25,7 @@ use novarocks_query_application::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
     GovernedStatementVisibilitySealOutcome,
 };
+use novarocks_query_application::session_error::QueryServiceError;
 use novarocks_workload_control::{LocalResourceAuthority, WorkScope};
 
 /// Neutral statement result carrier shared by Core domain handlers and the
@@ -480,7 +480,10 @@ mod tests {
             .expect("governed statement");
         statement.complete_execution();
         let result = GovernedErrorStatementResult::new(
-            QueryServiceError::new(crate::QueryServiceErrorKind::Internal, "failed command"),
+            QueryServiceError::new(
+                novarocks_query_application::session_error::QueryServiceErrorKind::Internal,
+                "failed command",
+            ),
             workload.resources(),
             statement,
         );

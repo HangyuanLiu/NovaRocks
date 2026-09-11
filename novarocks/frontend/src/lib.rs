@@ -63,10 +63,7 @@ pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
-pub use mysql::session::{
-    QueryServiceError, QueryServiceErrorKind, QuerySession, QuerySessionFactory,
-    QuerySessionOpenRequest,
-};
+pub use mysql::session::{QuerySession, QuerySessionFactory, QuerySessionOpenRequest};
 pub use mysql::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
     run_mysql_server_until_shutdown,
