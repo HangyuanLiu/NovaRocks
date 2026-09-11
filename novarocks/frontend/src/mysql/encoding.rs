@@ -62,11 +62,6 @@ use novarocks_workload_control::{
 
 const MYSQL_TERMINAL_PROTOCOL_BYTES_UPPER_BOUND: u64 = 64;
 
-enum ProtocolFinishFailure {
-    Native(QueryExecutionError),
-    Io(io::Error),
-}
-
 enum ProtocolWriteFailure {
     Cancelled(QueryExecutionError),
     Native(QueryExecutionError),
@@ -385,7 +380,7 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
         }
     }
-    match writer.finish().await {
+    match novarocks_mysql_adapter::finish_result(writer).await {
         Ok(()) => {
             drop(terminal_reservation);
             let _ = protocol.complete();
@@ -732,13 +727,8 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                             .await;
                     }
                 }
-                let finish = writer.finish();
-                tokio::pin!(finish);
-                let finished = tokio::select! {
-                    biased;
-                    error = failure.wait() => Err(ProtocolFinishFailure::Native(error)),
-                    finished = &mut finish => finished.map_err(ProtocolFinishFailure::Io),
-                };
+                let finished =
+                    novarocks_mysql_adapter::finish_streaming_result(writer, failure.clone()).await;
                 match finished {
                     Ok(()) => {
                         drop(terminal_reservation);
@@ -746,13 +736,13 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         let _ = result.complete();
                         return Ok(());
                     }
-                    Err(ProtocolFinishFailure::Native(error)) => {
+                    Err(novarocks_mysql_adapter::MysqlResultFinishError::Native(error)) => {
                         drop(terminal_reservation);
                         delivery.fail(error.clone());
                         let _ = result.fail();
                         return Err(invalid_data_error(error.to_string()));
                     }
-                    Err(ProtocolFinishFailure::Io(error)) => {
+                    Err(novarocks_mysql_adapter::MysqlResultFinishError::Io(error)) => {
                         drop(terminal_reservation);
                         delivery.fail(failed_query_result_delivery(format!(
                             "write MySQL success EOF: {error}"

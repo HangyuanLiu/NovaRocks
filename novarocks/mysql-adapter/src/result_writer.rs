@@ -118,6 +118,34 @@ pub async fn finish_result_error<W: AsyncWrite + Unpin>(
     writer.finish_error(kind, &message).await
 }
 
+/// Finishes one already-open result with its success EOF.
+pub async fn finish_result<W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'_, W>,
+) -> io::Result<()> {
+    writer.finish().await
+}
+
+/// The wire-visible result of attempting a streaming success EOF.
+pub enum MysqlResultFinishError {
+    Native(QueryExecutionError),
+    Io(io::Error),
+}
+
+/// Finishes a streaming result while keeping the logical failure observation
+/// ahead of the MySQL success EOF write.
+pub async fn finish_streaming_result<W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'_, W>,
+    mut failure: ResultFailureView,
+) -> Result<(), MysqlResultFinishError> {
+    let finish = writer.finish();
+    tokio::pin!(finish);
+    tokio::select! {
+        biased;
+        error = failure.wait() => Err(MysqlResultFinishError::Native(error)),
+        finished = &mut finish => finished.map_err(MysqlResultFinishError::Io),
+    }
+}
+
 fn invalid_data_error(error: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
