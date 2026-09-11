@@ -3967,9 +3967,11 @@ dependencies = [
 name = "novarocks-mysql-adapter"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "libc",
  "mysql_common 0.32.4",
  "novarocks-query-application",
+ "novarocks-types",
  "opensrv-mysql",
  "tokio",
  "tracing",

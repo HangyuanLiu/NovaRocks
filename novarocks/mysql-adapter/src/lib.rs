@@ -23,6 +23,7 @@ mod disconnect_watcher;
 mod error_mapping;
 mod listener;
 mod listener_settings;
+mod result_encoding;
 
 use novarocks_query_application::session_error::QueryServiceErrorKind;
 use opensrv_mysql::{ErrorKind, IntermediaryOptions};
@@ -38,6 +39,7 @@ pub use listener::{
 pub use listener_settings::{
     DEFAULT_MYSQL_USER, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
+pub use result_encoding::mysql_column_for_result_field;
 
 /// `USE ...` must remain an ordinary COM_QUERY for typed SQL validation;
 /// genuine COM_INIT_DB packets still use the protocol callback.

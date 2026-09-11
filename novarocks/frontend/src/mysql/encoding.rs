@@ -31,13 +31,12 @@ use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use mysql_common::value::Value as MySqlValue;
-use opensrv_mysql::{
-    Column, ColumnFlags, ColumnType, ErrorKind, QueryResultWriter, ToMysqlValue, U24_MAX,
-};
+use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, ToMysqlValue, U24_MAX};
 use tokio::io::AsyncWrite;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::runtime::statement_result::GovernedImmediateStatementResult;
+use novarocks_mysql_adapter::mysql_column_for_result_field;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
     decoded_result_batch_governance_charge,
@@ -1965,62 +1964,12 @@ mod streaming_result_tests {
 pub(super) fn query_result_column_to_mysql_column(
     column: &QueryResultColumn,
 ) -> Result<Column, String> {
-    let mut colflags = ColumnFlags::empty();
-    if !column.nullable {
-        colflags.insert(ColumnFlags::NOT_NULL_FLAG);
-    }
-    if matches!(
-        column.logical_type,
-        Some(novarocks_types::schema::SqlType::Decimal { .. })
-    ) {
-        return Ok(Column {
-            table: String::new(),
-            column: column.name.clone(),
-            coltype: ColumnType::MYSQL_TYPE_NEWDECIMAL,
-            colflags,
-        });
-    }
-    let coltype = match column.data_type {
-        DataType::Boolean => ColumnType::MYSQL_TYPE_TINY,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 => ColumnType::MYSQL_TYPE_LONG,
-        DataType::Int64 => ColumnType::MYSQL_TYPE_LONGLONG,
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-            colflags.insert(ColumnFlags::UNSIGNED_FLAG);
-            ColumnType::MYSQL_TYPE_LONGLONG
-        }
-        DataType::Float32 => ColumnType::MYSQL_TYPE_FLOAT,
-        DataType::Float64 => ColumnType::MYSQL_TYPE_DOUBLE,
-        DataType::FixedSizeBinary(width)
-            if width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            ColumnType::MYSQL_TYPE_STRING
-        }
-        DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Binary
-        | DataType::LargeBinary
-        | DataType::List(_)
-        | DataType::Map(_, _)
-        | DataType::Struct(_) => ColumnType::MYSQL_TYPE_VAR_STRING,
-        DataType::Decimal128(_, _) => ColumnType::MYSQL_TYPE_NEWDECIMAL,
-        DataType::Date32 => ColumnType::MYSQL_TYPE_DATE,
-        DataType::Time32(_) | DataType::Time64(_) => ColumnType::MYSQL_TYPE_TIME,
-        DataType::Timestamp(_, _) => ColumnType::MYSQL_TYPE_DATETIME,
-        DataType::Null => ColumnType::MYSQL_TYPE_NULL,
-        ref other => {
-            return Err(format!(
-                "standalone mysql server does not support output column type {:?}",
-                other
-            ));
-        }
-    };
-
-    Ok(Column {
-        table: String::new(),
-        column: column.name.clone(),
-        coltype,
-        colflags,
-    })
+    mysql_column_for_result_field(&novarocks_query_application::api::ResultField::new(
+        column.name.clone(),
+        column.data_type.clone(),
+        column.nullable,
+        column.logical_type.clone(),
+    ))
 }
 
 pub(super) fn build_mysql_row(

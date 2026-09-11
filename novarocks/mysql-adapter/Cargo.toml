@@ -8,9 +8,11 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+arrow.workspace = true
 libc.workspace = true
 mysql_common = "0.32"
 novarocks-query-application.workspace = true
+novarocks-types.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing.workspace = true
