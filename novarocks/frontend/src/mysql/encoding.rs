@@ -17,7 +17,7 @@
 
 //! Arrow → MySQL wire value conversion for the standalone MySQL server.
 
-use std::io::{self, Write};
+use std::io;
 
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
@@ -30,13 +30,14 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
-use mysql_common::value::Value as MySqlValue;
-use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, ToMysqlValue, U24_MAX};
+use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, U24_MAX};
 use tokio::io::AsyncWrite;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::runtime::statement_result::GovernedImmediateStatementResult;
-use novarocks_mysql_adapter::mysql_column_for_result_field;
+use novarocks_mysql_adapter::{
+    MysqlResultValue as StandaloneMysqlValue, mysql_column_for_result_field,
+};
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
     decoded_result_batch_governance_charge,
@@ -78,76 +79,6 @@ impl ProtocolWriteFailure {
             Self::Native(_) | Self::Encoding(_) => ProtocolWriteSettlement::ProtocolFailed,
             Self::Io(_) => ProtocolWriteSettlement::ClientDisconnected,
         }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(super) enum StandaloneMysqlValue {
-    Null,
-    Bytes(Vec<u8>),
-    Int(i64),
-    UInt(u64),
-    Float(f32),
-    Double(f64),
-    Date(NaiveDate),
-    DateTime(NaiveDateTime),
-    Time {
-        negative: bool,
-        days: u32,
-        hours: u8,
-        minutes: u8,
-        seconds: u8,
-        micros: u32,
-    },
-}
-
-impl ToMysqlValue for StandaloneMysqlValue {
-    fn to_mysql_text<W: Write>(&self, w: &mut W) -> io::Result<()> {
-        match self {
-            Self::Null => None::<u8>.to_mysql_text(w),
-            Self::Bytes(bytes) => bytes.to_mysql_text(w),
-            Self::Int(value) => value.to_mysql_text(w),
-            Self::UInt(value) => value.to_mysql_text(w),
-            Self::Float(value) => value.to_mysql_text(w),
-            Self::Double(value) => value.to_mysql_text(w),
-            Self::Date(value) => value.to_mysql_text(w),
-            Self::DateTime(value) => value.to_mysql_text(w),
-            Self::Time {
-                negative,
-                days,
-                hours,
-                minutes,
-                seconds,
-                micros,
-            } => MySqlValue::Time(*negative, *days, *hours, *minutes, *seconds, *micros)
-                .to_mysql_text(w),
-        }
-    }
-
-    fn to_mysql_bin<W: Write>(&self, w: &mut W, c: &Column) -> io::Result<()> {
-        match self {
-            Self::Null => unreachable!("NULL payloads are handled by the row null bitmap"),
-            Self::Bytes(bytes) => bytes.to_mysql_bin(w, c),
-            Self::Int(value) => value.to_mysql_bin(w, c),
-            Self::UInt(value) => value.to_mysql_bin(w, c),
-            Self::Float(value) => value.to_mysql_bin(w, c),
-            Self::Double(value) => value.to_mysql_bin(w, c),
-            Self::Date(value) => value.to_mysql_bin(w, c),
-            Self::DateTime(value) => value.to_mysql_bin(w, c),
-            Self::Time {
-                negative,
-                days,
-                hours,
-                minutes,
-                seconds,
-                micros,
-            } => MySqlValue::Time(*negative, *days, *hours, *minutes, *seconds, *micros)
-                .to_mysql_bin(w, c),
-        }
-    }
-
-    fn is_null(&self) -> bool {
-        matches!(self, Self::Null)
     }
 }
 
@@ -1370,6 +1301,7 @@ mod streaming_result_tests {
     use novarocks_workload_control::{
         CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
+    use opensrv_mysql::ToMysqlValue;
 
     use super::*;
     use novarocks_query_application::client_connection::ClientConnectionToken;
@@ -2346,6 +2278,7 @@ mod tests {
     use arrow::array::{BinaryArray, ListBuilder, StringBuilder, TimestampMicrosecondArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use opensrv_mysql::ToMysqlValue;
 
     use super::*;
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
