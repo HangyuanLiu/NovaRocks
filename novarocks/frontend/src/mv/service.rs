@@ -614,7 +614,7 @@ fn scheduler_outcome_log_fields(
 fn execute_scheduled_refresh(
     dependencies: &RefreshWorkerDependencies,
     request: &ScheduledRefreshRequest,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> ScheduledRefreshDisposition {
     if scheduled_refresh_test_barrier(&request.target, &cancellation) {
         return ScheduledRefreshDisposition::ShutdownCancelled;
@@ -710,7 +710,7 @@ fn execute_scheduled_refresh(
 #[cfg(debug_assertions)]
 fn scheduled_refresh_test_barrier(
     target: &crate::mv::domain::repository::MvTarget,
-    cancellation: &crate::common::query_cancellation::QueryCancellationView,
+    cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
 ) -> bool {
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
         return false;
@@ -731,7 +731,7 @@ fn scheduled_refresh_test_barrier(
 #[cfg(not(debug_assertions))]
 fn scheduled_refresh_test_barrier(
     _target: &crate::mv::domain::repository::MvTarget,
-    _cancellation: &crate::common::query_cancellation::QueryCancellationView,
+    _cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
 ) -> bool {
     false
 }

@@ -29,7 +29,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::Notify;
 
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationSource};
 
 /// Monotonic, FE-local state for workload admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -470,7 +470,7 @@ impl FrontendServingLifecycle {
                     lease.cancellation.request(
                         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms },
                     ),
-                    crate::common::query_cancellation::QueryCancellationRequestResult::Requested
+                    novarocks_query_application::cancellation::QueryCancellationRequestResult::Requested
                 ) {
                     increment_total(&mut inner.deadline_cancelled, lease.kind);
                     if let Some(cancel) = lease.external_cancellation {

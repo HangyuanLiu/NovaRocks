@@ -516,7 +516,9 @@ fn statistics_connector_context(
     )
     .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))
 }
-struct StatisticsApplicationCancellation(crate::common::query_cancellation::QueryCancellationView);
+struct StatisticsApplicationCancellation(
+    novarocks_query_application::cancellation::QueryCancellationView,
+);
 impl novarocks_spi::connector::ConnectorCancellation for StatisticsApplicationCancellation {
     fn is_cancelled(&self) -> bool {
         self.0.is_cancelled()

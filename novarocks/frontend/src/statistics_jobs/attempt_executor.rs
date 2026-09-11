@@ -114,7 +114,7 @@ impl FrontendStatisticsAttemptExecutor {
     fn collection_context(
         &self,
         deadline: Instant,
-        cancellation: crate::common::query_cancellation::QueryCancellationView,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
         ConnectorRequestContext::try_new(
             deadline,
@@ -197,7 +197,7 @@ impl FrontendStatisticsAttemptExecutor {
 
     fn resolve_execution_disposition(
         start: StatisticsCollectionStart,
-        cancellation: &crate::common::query_cancellation::QueryCancellationView,
+        cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<StatisticsExecutionDisposition, StatisticsApplicationError> {
         let (table, data_version, read_version_ordinal, required, session) = start.into_parts();
         if required.is_empty() {
@@ -229,7 +229,7 @@ impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
     fn execute(
         &self,
         request: &StatisticsAttemptRequest,
-        cancellation: crate::common::query_cancellation::QueryCancellationView,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsApplicationError> {
         let attempt_deadline = Instant::now()
             .checked_add(self.ports.attempt_timeout)
@@ -448,7 +448,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     ) -> Result<
         (
             Instant,
-            crate::common::query_cancellation::QueryCancellationView,
+            novarocks_query_application::cancellation::QueryCancellationView,
         ),
         CoreStatisticsAttemptError,
     > {
@@ -459,10 +459,11 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
             .deadline()
             .map(Into::into)
             .unwrap_or_else(|| Instant::now() + self.ports.attempt_timeout);
-        let cancellation = crate::common::query_cancellation::QueryCancellationView::governed(
-            scope.cancellation().map_err(Self::scope_error)?,
-            None,
-        );
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationView::governed(
+                scope.cancellation().map_err(Self::scope_error)?,
+                None,
+            );
         if cancellation.is_cancelled() {
             return Err(CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
                 message: Arc::from("statistics attempt cancelled before phase start"),
@@ -474,7 +475,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     fn collection_context(
         &self,
         deadline: Instant,
-        cancellation: crate::common::query_cancellation::QueryCancellationView,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
         ConnectorRequestContext::try_new(
             deadline,
@@ -702,7 +703,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
     }
 }
 
-struct AttemptCancellation(crate::common::query_cancellation::QueryCancellationView);
+struct AttemptCancellation(novarocks_query_application::cancellation::QueryCancellationView);
 
 impl novarocks_spi::connector::ConnectorCancellation for AttemptCancellation {
     fn is_cancelled(&self) -> bool {
@@ -803,7 +804,8 @@ mod tests {
         )
         .expect("empty collection start");
 
-        let cancellation = crate::common::query_cancellation::QueryCancellationSource::new();
+        let cancellation =
+            novarocks_query_application::cancellation::QueryCancellationSource::new();
         let disposition = FrontendStatisticsAttemptExecutor::resolve_execution_disposition(
             start,
             &cancellation.view(),

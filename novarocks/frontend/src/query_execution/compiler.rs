@@ -1250,9 +1250,9 @@ fn test_request_context_with_role(
         QueryExecutionContext, RequestContext, RequestSessionContext,
     };
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
-    use crate::common::query_cancellation::QueryCancellationSource;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();

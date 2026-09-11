@@ -33,7 +33,6 @@ use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_sql::plan_read::FragmentId;
 
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::completion::QueryAttemptReservation;
@@ -50,6 +49,7 @@ use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor,
 };
+use novarocks_query_application::cancellation::QueryCancellationView;
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)
@@ -630,8 +630,10 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::task_execution::blocking_io::ConnectorBlockingIoBudget;
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
 
     fn execution_id(attempt: u64) -> QueryExecutionId {
         QueryExecutionId::new(

@@ -17,9 +17,6 @@
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::common::query_cancellation::{
-    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
-};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
@@ -29,6 +26,9 @@ use crate::query_execution::outcome::QueryOutcomeFactory;
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
 use novarocks_sql::test_support::{
     NativePreparationFixture, NativeWriteDataflowFixture, native_preparation_plan,
     native_write_dataflow_plan,

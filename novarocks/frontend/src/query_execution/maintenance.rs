@@ -29,7 +29,6 @@ pub(crate) mod iceberg;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::connector::metadata_maintenance::{
@@ -39,6 +38,7 @@ use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use crate::runtime::query_result::QueryResult;
+use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,

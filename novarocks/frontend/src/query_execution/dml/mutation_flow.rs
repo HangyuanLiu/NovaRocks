@@ -5804,7 +5804,7 @@ mod tests {
                 novarocks_types::ClusterRole::Fe,
                 crate::common::backend_topology::BackendTopologySnapshot::empty(3),
                 None,
-                crate::common::query_cancellation::QueryCancellationSource::new().view(),
+                novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
                 novarocks_sql::compiler::SessionOptimizerSettings::default(),
             ),
             connector_context: connector_context_for_test(),

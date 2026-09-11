@@ -19,5 +19,4 @@ pub mod admitted_query_context;
 pub mod backend_topology;
 pub mod engine_error;
 pub mod persisted_query_definition;
-pub use novarocks_query_application::cancellation as query_cancellation;
 pub(crate) mod statement_effect;

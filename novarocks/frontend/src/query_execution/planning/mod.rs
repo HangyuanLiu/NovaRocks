@@ -26,7 +26,7 @@ pub(crate) mod write_sink;
 
 use std::sync::Arc;
 
-use crate::common::query_cancellation::QueryCancellationView;
+use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_sql::compiler::{SqlAnalyzeRequest, SqlCancellationObservation};
 
 #[derive(Clone)]

@@ -25,13 +25,13 @@ use std::time::{Duration, Instant};
 use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::common::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
-use novarocks_frontend::common::query_cancellation::QueryCancellationSource;
 use novarocks_frontend::dml::DmlService;
 use novarocks_frontend::query_execution::dml::truncate::{
     PlanTruncateRequest, PreparedTruncate, TruncateCommand, TruncateEffect, TruncateEngine,
     TruncateEvidence, TruncateFailure, TruncateFailureKind, TruncateFinalization, TruncateOutcome,
     TruncatePlanError, TruncatePlanFacts, TruncatePlanSummary, TruncatePrepared, TruncateReceipt,
 };
+use novarocks_query_application::cancellation::QueryCancellationSource;
 use novarocks_spi::connector::LakePublicationDisposition;
 use novarocks_types::ClusterRole;
 

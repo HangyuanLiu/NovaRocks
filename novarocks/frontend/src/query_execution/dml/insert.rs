@@ -635,9 +635,11 @@ mod tests {
     use super::*;
     use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
     use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::query_execution::outcome::QueryExecutionResult;
     use crate::runtime::query_result::QueryResult;
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 

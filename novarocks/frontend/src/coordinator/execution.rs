@@ -2518,7 +2518,6 @@ mod tests {
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
@@ -2546,6 +2545,9 @@ mod tests {
     };
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
@@ -3806,7 +3808,7 @@ struct RoundHandoff<'a> {
     /// Only the request fields the task round still needs: `artifacts` is consumed
     /// by the preamble that produced `runtime_filter_ready`, so the request
     /// cannot travel whole.
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     completion: crate::query_execution::contract::QueryOutcomeFactory,
     topology: BackendTopologySnapshot,
     statistics_decoder: Option<crate::query_execution::statistics::StatisticsRootResultDecoder>,
@@ -3871,7 +3873,7 @@ struct TaskRoundFailureClassification<'a> {
     before_contexts_established: bool,
     captured: &'a BackendTopologySnapshot,
     observation_deadline: Instant,
-    cancellation: &'a crate::common::query_cancellation::QueryCancellationView,
+    cancellation: &'a novarocks_query_application::cancellation::QueryCancellationView,
 }
 
 impl TaskRoundFailureClassification<'_> {

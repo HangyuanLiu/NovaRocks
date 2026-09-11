@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::artifact::{
     PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
 };
@@ -40,6 +39,7 @@ use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
 

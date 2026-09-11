@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::common::query_cancellation::QueryCancellationView;
+use novarocks_query_application::cancellation::QueryCancellationView;
 pub use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
@@ -391,7 +391,7 @@ mod tests {
 
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
-    use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
 
     fn topology(revision: u64, backend_count: usize) -> BackendTopologySnapshot {
         let targets = (0..backend_count)
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(context.session().current_catalog(), Some("iceberg"));
         assert!(!context.execution().cancellation().is_cancelled());
         cancellation.request(
-            crate::common::query_cancellation::QueryCancellationReason::ClientDisconnected,
+            novarocks_query_application::cancellation::QueryCancellationReason::ClientDisconnected,
         );
         assert!(context.execution().cancellation().is_cancelled());
     }

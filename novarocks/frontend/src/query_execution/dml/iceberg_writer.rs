@@ -1354,7 +1354,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_types::schema::ColumnDefault;
 
     fn test_column(

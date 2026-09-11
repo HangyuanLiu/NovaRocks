@@ -121,7 +121,7 @@ pub trait StatisticsAttemptExecutor: Send + Sync {
     fn execute(
         &self,
         request: &StatisticsAttemptRequest,
-        cancellation: crate::common::query_cancellation::QueryCancellationView,
+        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<(), StatisticsApplicationError>;
 }
 

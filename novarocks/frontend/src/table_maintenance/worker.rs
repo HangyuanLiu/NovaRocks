@@ -213,7 +213,7 @@ async fn execute_claimed_job(
     engine: Arc<dyn TableMaintenanceEngine>,
     executor: Arc<dyn OptimizeJobExecutor>,
     job: OptimizeJob,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<(), String> {
     let job_id = job.job_id;
     if cancellation.is_cancelled() {
