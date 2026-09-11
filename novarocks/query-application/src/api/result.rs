@@ -88,6 +88,14 @@ fn unique_arrow_backing_bytes(batch: &RecordBatch) -> usize {
     })
 }
 
+/// Return the exact governance charge required while this decoded Arrow batch
+/// remains owned by an application or protocol consumer.
+pub fn decoded_result_batch_governance_charge(
+    batch: &RecordBatch,
+) -> Result<u64, QueryExecutionError> {
+    Ok(DecodedResultBatch::try_new(batch.clone())?.governance_charge_bytes())
+}
+
 fn array_backing_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
     let mut total = 0usize;
     for buffer in data.buffers() {

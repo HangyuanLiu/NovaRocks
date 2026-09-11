@@ -28,6 +28,7 @@ use arrow::array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
+use arrow::record_batch::RecordBatch;
 use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use mysql_common::value::Value as MySqlValue;
 use opensrv_mysql::{
@@ -37,11 +38,12 @@ use tokio::io::AsyncWrite;
 
 use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use crate::runtime::statement_result::GovernedImmediateStatementResult;
-use novarocks_execution::exec::chunk::Chunk;
 use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
+    decoded_result_batch_governance_charge,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
+use novarocks_query_application::protocol_delivery::ImmediateResultBatch;
 use novarocks_query_application::protocol_delivery::StreamingStatementResult;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::{FieldRenderSchema, format_mysql_container_value_with_schema};
@@ -164,8 +166,8 @@ pub(super) async fn write_query_result<W: AsyncWrite + Unpin>(
     let mut writer = results.start(columns.as_slice()).await?;
     for chunk in &result.chunks {
         for row_idx in 0..chunk.len() {
-            let row =
-                build_mysql_row(chunk, &result.columns, row_idx).map_err(invalid_data_error)?;
+            let row = build_mysql_row(&chunk.batch, &result.columns, row_idx)
+                .map_err(invalid_data_error)?;
             writer.write_row(row).await?;
         }
     }
@@ -244,30 +246,28 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
     };
     drop(schema_reservation);
 
-    for chunk in &result.chunks {
-        let protocol_bytes =
-            match mysql_text_batch_protocol_bytes_upper_bound(chunk, &result.columns) {
-                Ok(bytes) => bytes,
-                Err(message) => {
-                    let error = invalid_query_result_delivery(message);
-                    let _ = protocol.fail();
-                    return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
-                }
-            };
+    for chunk in result.chunks {
+        let decoded_bytes = match decoded_result_batch_governance_charge(&chunk.batch) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                let _ = protocol.fail();
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
         let cancellation = protocol.cancellation();
         let (resources, scope) = protocol.reservation_inputs();
-        let reserve = reserve_data_when_available(resources, scope, protocol_bytes);
-        tokio::pin!(reserve);
-        let row_reservation = match tokio::select! {
+        let reserve_decoded = resources.reserve_result_credit_when_available(&scope, decoded_bytes);
+        tokio::pin!(reserve_decoded);
+        let credit = match tokio::select! {
             biased;
             reason = cancellation.cancelled() => {
                 Err(cancelled_query_result_delivery(reason))
             }
-            reservation = &mut reserve => reservation.map_err(|error| {
-                failed_query_result_delivery(format!("reserve MySQL result bytes: {error}"))
+            credit = &mut reserve_decoded => credit.map_err(|error| {
+                failed_query_result_delivery(format!("reserve decoded immediate result bytes: {error}"))
             })
         } {
-            Ok(reservation) => reservation,
+            Ok(credit) => credit,
             Err(error) => {
                 if error.kind() == QueryExecutionErrorKind::Cancelled {
                     let _ = protocol.settle_cancellation();
@@ -277,18 +277,72 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
             }
         };
-        if let Err(error) =
-            write_governed_batch(&mut writer, chunk, &result.columns, protocol.cancellation()).await
+        let batch = match ImmediateResultBatch::try_new(chunk.batch.clone(), credit) {
+            Ok(batch) => batch,
+            Err(error) => {
+                let _ = protocol.fail();
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        drop(chunk);
+        let protocol_bytes =
+            match mysql_text_batch_protocol_bytes_upper_bound(batch.batch(), &result.columns) {
+                Ok(bytes) => bytes,
+                Err(message) => {
+                    let error = invalid_query_result_delivery(message);
+                    let _ = protocol.fail();
+                    return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                }
+            };
+        let cancellation = protocol.cancellation();
+        let resources = protocol.reservation_inputs().0;
+        let reserve = batch.reserve_protocol_when_available(&resources, protocol_bytes);
+        tokio::pin!(reserve);
+        let batch = match tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => {
+                Err(cancelled_query_result_delivery(reason))
+            }
+            batch = &mut reserve => batch.map_err(|error| {
+                failed_query_result_delivery(format!("reserve MySQL result bytes: {}", error.error()))
+            })
+        } {
+            Ok(batch) => batch,
+            Err(error) => {
+                if error.kind() == QueryExecutionErrorKind::Cancelled {
+                    let _ = protocol.settle_cancellation();
+                } else {
+                    let _ = protocol.fail();
+                }
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        let batch = match batch.begin_protocol_write(protocol_bytes) {
+            Ok(batch) => batch,
+            Err(error) => {
+                let _ = protocol.fail();
+                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            }
+        };
+        if let Err(error) = write_governed_batch(
+            &mut writer,
+            batch.batch(),
+            &result.columns,
+            protocol.cancellation(),
+        )
+        .await
         {
             let settlement = error.settlement();
             match error {
                 ProtocolWriteFailure::Cancelled(error) => {
                     debug_assert_eq!(settlement, ProtocolWriteSettlement::Cancellation);
+                    batch.fail();
                     let _ = protocol.settle_cancellation();
                     return Err(interrupted_error(error.to_string()));
                 }
                 ProtocolWriteFailure::Encoding(error) => {
                     debug_assert_eq!(settlement, ProtocolWriteSettlement::ProtocolFailed);
+                    batch.fail();
                     let _ = protocol.fail();
                     return Err(error);
                 }
@@ -297,6 +351,7 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                     // An I/O error, including `Interrupted`, is evidence about
                     // the socket only. Cancellation is settled exclusively by
                     // the cancellation branch above.
+                    batch.fail();
                     let _ = protocol.client_disconnected();
                     return Err(error);
                 }
@@ -305,7 +360,10 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 }
             }
         }
-        drop(row_reservation);
+        if let Err(error) = batch.complete() {
+            let _ = protocol.fail();
+            return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+        }
     }
 
     let cancellation = protocol.cancellation();
@@ -506,22 +564,9 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
 
         match delivery {
             ResultDelivery::Batch(delivery) => {
-                let chunk = match crate::runtime::query_result::record_batch_to_chunk(
-                    delivery.batch().clone(),
-                ) {
-                    Ok(chunk) => chunk,
-                    Err(message) => {
-                        let error = invalid_query_result_delivery(format!(
-                            "decode MySQL result batch metadata: {message}"
-                        ));
-                        delivery.fail(error.clone());
-                        let _ = result.fail();
-                        return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                            .await;
-                    }
-                };
+                let batch = delivery.batch().clone();
                 let protocol_bytes =
-                    match mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns) {
+                    match mysql_text_batch_protocol_bytes_upper_bound(&batch, &columns) {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             let error = invalid_query_result_delivery(error);
@@ -599,7 +644,7 @@ pub(super) async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                 let cancellation = result.cancellation();
                 if let Err(error) = write_streaming_batch(
                     &mut writer,
-                    &chunk,
+                    &batch,
                     &columns,
                     cancellation,
                     failure.clone(),
@@ -785,13 +830,13 @@ async fn reserve_when_available(
 
 async fn write_streaming_batch<W: AsyncWrite + Unpin>(
     writer: &mut opensrv_mysql::RowWriter<'_, W>,
-    chunk: &Chunk,
+    batch: &RecordBatch,
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
     mut failure: ResultFailureView,
 ) -> Result<(), ProtocolWriteFailure> {
-    for row_idx in 0..chunk.len() {
-        let values = build_mysql_row(chunk, columns, row_idx)
+    for row_idx in 0..batch.num_rows() {
+        let values = build_mysql_row(batch, columns, row_idx)
             .map_err(invalid_data_error)
             .map_err(ProtocolWriteFailure::Encoding)?;
         let write = writer.write_row(values);
@@ -814,12 +859,12 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
 
 async fn write_governed_batch<W: AsyncWrite + Unpin>(
     writer: &mut opensrv_mysql::RowWriter<'_, W>,
-    chunk: &Chunk,
+    batch: &RecordBatch,
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
 ) -> Result<(), ProtocolWriteFailure> {
-    for row_idx in 0..chunk.len() {
-        let values = build_mysql_row(chunk, columns, row_idx)
+    for row_idx in 0..batch.num_rows() {
+        let values = build_mysql_row(batch, columns, row_idx)
             .map_err(invalid_data_error)
             .map_err(ProtocolWriteFailure::Encoding)?;
         let write = writer.write_row(values);
@@ -916,24 +961,22 @@ fn mysql_schema_protocol_bytes_upper_bound<'a>(
 /// slice lengths plus the MySQL length prefix. The four-byte framing charge is
 /// added once per 24-bit protocol packet.
 fn mysql_text_batch_protocol_bytes_upper_bound(
-    chunk: &Chunk,
+    batch: &RecordBatch,
     columns: &[QueryResultColumn],
 ) -> Result<u64, String> {
     let mut largest = 0_u64;
-    for row in 0..chunk.len() {
-        if chunk.columns().len() != columns.len()
-            || chunk.chunk_schema().slots().len() != columns.len()
-        {
-            return Err("query result columns do not match Arrow batch".to_string());
-        }
+    if batch.num_columns() != columns.len() || batch.schema().fields().len() != columns.len() {
+        return Err("query result columns do not match Arrow batch".to_string());
+    }
+    for row in 0..batch.num_rows() {
         let mut payload = 0_u64;
-        for ((column, slot), declared) in chunk
+        for ((column, field), declared) in batch
             .columns()
             .iter()
-            .zip(chunk.chunk_schema().slots())
+            .zip(batch.schema().fields())
             .zip(columns)
         {
-            let schema = FieldRenderSchema::from_field(slot.field());
+            let schema = FieldRenderSchema::from_field(field.as_ref());
             payload = checked_wire_add(
                 payload,
                 mysql_text_cell_upper_bound(column, declared, row, &schema)?,
@@ -1437,7 +1480,6 @@ mod streaming_result_tests {
             vec![Arc::new(Int64Array::from(vec![i64::MIN]))],
         )
         .unwrap();
-        let chunk = crate::runtime::query_result::record_batch_to_chunk(batch).unwrap();
         let columns = vec![QueryResultColumn {
             name: "value".to_string(),
             data_type: DataType::Int64,
@@ -1449,7 +1491,7 @@ mod streaming_result_tests {
         // packet header. opensrv may retain one fallback copy after a partial
         // vectored write; the decoded fixed width is only eight.
         assert_eq!(
-            mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns).unwrap(),
+            mysql_text_batch_protocol_bytes_upper_bound(&batch, &columns).unwrap(),
             50
         );
     }
@@ -1545,15 +1587,14 @@ mod streaming_result_tests {
             vec![Arc::new(list)],
         )
         .unwrap();
-        let chunk = crate::runtime::query_result::record_batch_to_chunk(batch).unwrap();
         let columns = vec![QueryResultColumn {
             name: "items".to_string(),
             data_type: field.data_type().clone(),
             nullable: false,
             logical_type: None,
         }];
-        let upper = mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns).unwrap();
-        let values = build_mysql_row(&chunk, &columns, 0).unwrap();
+        let upper = mysql_text_batch_protocol_bytes_upper_bound(&batch, &columns).unwrap();
+        let values = build_mysql_row(&batch, &columns, 0).unwrap();
         let mut rendered = Vec::new();
         for value in values {
             value.to_mysql_text(&mut rendered).unwrap();
@@ -1580,10 +1621,9 @@ mod streaming_result_tests {
         let ResultDelivery::Batch(delivery) = result.next_delivery().await.unwrap().unwrap() else {
             panic!("expected batch")
         };
-        let chunk =
-            crate::runtime::query_result::record_batch_to_chunk(delivery.batch().clone()).unwrap();
         let columns = result_schema_to_query_result_columns(&ResultSchema::new(string_fields()));
-        let bound = mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns).unwrap();
+        let bound =
+            mysql_text_batch_protocol_bytes_upper_bound(delivery.batch(), &columns).unwrap();
         assert_eq!(
             bound, 16,
             "wire row plus PacketWriter partial-write fallback"
@@ -1649,10 +1689,9 @@ mod streaming_result_tests {
         else {
             panic!("expected batch")
         };
-        let chunk =
-            crate::runtime::query_result::record_batch_to_chunk(delivery.batch().clone()).unwrap();
         let columns = result_schema_to_query_result_columns(&ResultSchema::new(string_fields()));
-        let bound = mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns).unwrap();
+        let bound =
+            mysql_text_batch_protocol_bytes_upper_bound(delivery.batch(), &columns).unwrap();
         let delivery = delivery
             .reserve_protocol_when_available(&fixture.resources, bound)
             .await
@@ -1760,10 +1799,8 @@ mod streaming_result_tests {
         else {
             panic!("expected malformed batch")
         };
-        let chunk =
-            crate::runtime::query_result::record_batch_to_chunk(delivery.batch().clone()).unwrap();
         let columns = result_schema_to_query_result_columns(&ResultSchema::new(string_fields()));
-        let message = mysql_text_batch_protocol_bytes_upper_bound(&chunk, &columns)
+        let message = mysql_text_batch_protocol_bytes_upper_bound(delivery.batch(), &columns)
             .expect_err("column mismatch must fail closed");
         let error = invalid_query_result_delivery(message);
         delivery.fail(error);
@@ -1987,31 +2024,31 @@ pub(super) fn query_result_column_to_mysql_column(
 }
 
 pub(super) fn build_mysql_row(
-    chunk: &Chunk,
+    batch: &RecordBatch,
     columns: &[QueryResultColumn],
     row_idx: usize,
 ) -> Result<Vec<StandaloneMysqlValue>, String> {
-    if chunk.columns().len() != columns.len() {
+    if batch.num_columns() != columns.len() {
         return Err(format!(
-            "query result column count mismatch: metadata has {}, chunk has {}",
+            "query result column count mismatch: metadata has {}, batch has {}",
             columns.len(),
-            chunk.columns().len()
+            batch.num_columns()
         ));
     }
-    if chunk.chunk_schema().slots().len() != columns.len() {
+    if batch.schema().fields().len() != columns.len() {
         return Err(format!(
-            "query result slot count mismatch: schema has {}, metadata has {}",
-            chunk.chunk_schema().slots().len(),
+            "query result field count mismatch: schema has {}, metadata has {}",
+            batch.schema().fields().len(),
             columns.len()
         ));
     }
-    chunk
+    batch
         .columns()
         .iter()
-        .zip(chunk.chunk_schema().slots().iter())
+        .zip(batch.schema().fields().iter())
         .zip(columns.iter())
-        .map(|((column, slot), declared)| {
-            let field_schema = FieldRenderSchema::from_field(slot.field());
+        .map(|((column, field), declared)| {
+            let field_schema = FieldRenderSchema::from_field(field.as_ref());
             array_value_to_mysql_value(column, declared, row_idx, Some(&field_schema))
         })
         .collect()
@@ -2440,7 +2477,7 @@ mod tests {
             logical_type: None,
         }];
 
-        let row = build_mysql_row(&chunk, &columns, 0).expect("mysql row");
+        let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
 
         assert_eq!(
             row,
@@ -2481,7 +2518,7 @@ mod tests {
             logical_type: None,
         }];
 
-        let row = build_mysql_row(&chunk, &columns, 0).expect("mysql row");
+        let row = build_mysql_row(&chunk.batch, &columns, 0).expect("mysql row");
 
         assert_eq!(row, vec![StandaloneMysqlValue::Null]);
     }
