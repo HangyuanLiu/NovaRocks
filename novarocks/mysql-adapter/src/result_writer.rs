@@ -60,6 +60,31 @@ pub fn mysql_columns_for_result_fields(fields: &[ResultField]) -> io::Result<Vec
         .map_err(invalid_data_error)
 }
 
+/// The wire-visible failure of opening a cancellable MySQL result. Statement
+/// settlement remains an application decision at the composition boundary.
+pub enum MysqlResultStartError {
+    Cancelled(QueryExecutionError),
+    Io(io::Error),
+}
+
+/// Opens a MySQL result while observing query cancellation before its schema
+/// reaches the socket.
+pub async fn start_cancellable_result<'a, W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'a, W>,
+    columns: &'a [Column],
+    cancellation: QueryCancellationView,
+) -> Result<opensrv_mysql::RowWriter<'a, W>, MysqlResultStartError> {
+    let start = results.start(columns);
+    tokio::pin!(start);
+    tokio::select! {
+        biased;
+        reason = cancellation.cancelled() => {
+            Err(MysqlResultStartError::Cancelled(cancelled_delivery(reason)))
+        }
+        writer = &mut start => writer.map_err(MysqlResultStartError::Io),
+    }
+}
+
 /// Opens a streaming MySQL result after converting its immutable Query
 /// Application schema, while observing logical failure and cancellation before
 /// the schema reaches the socket.

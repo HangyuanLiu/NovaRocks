@@ -141,36 +141,32 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
         }
     };
-    let mysql_columns = match result
-        .columns
-        .iter()
-        .map(query_result_column_to_mysql_column)
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Ok(columns) => columns,
-        Err(message) => {
-            let error = invalid_query_result_delivery(message);
-            let _ = protocol.fail();
-            let message = error.to_string().into_bytes();
-            return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
-        }
-    };
+    let mysql_columns =
+        match novarocks_mysql_adapter::mysql_columns_for_result_fields(&result.columns) {
+            Ok(columns) => columns,
+            Err(error) => {
+                let error = invalid_query_result_delivery(error.to_string());
+                let _ = protocol.fail();
+                let message = error.to_string().into_bytes();
+                return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
+            }
+        };
     let cancellation = protocol.cancellation();
-    let start = results.start(mysql_columns.as_slice());
-    tokio::pin!(start);
-    let mut writer = tokio::select! {
-        biased;
-        reason = cancellation.cancelled() => {
-            let error = cancelled_query_result_delivery(reason);
+    let mut writer = match novarocks_mysql_adapter::start_cancellable_result(
+        results,
+        mysql_columns.as_slice(),
+        cancellation,
+    )
+    .await
+    {
+        Ok(writer) => writer,
+        Err(novarocks_mysql_adapter::MysqlResultStartError::Cancelled(error)) => {
             let _ = protocol.settle_cancellation();
             return Err(interrupted_error(error.to_string()));
         }
-        opened = &mut start => match opened {
-            Ok(writer) => writer,
-            Err(error) => {
-                let _ = protocol.client_disconnected();
-                return Err(error);
-            }
+        Err(novarocks_mysql_adapter::MysqlResultStartError::Io(error)) => {
+            let _ = protocol.client_disconnected();
+            return Err(error);
         }
     };
     drop(schema_reservation);
