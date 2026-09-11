@@ -3972,6 +3972,7 @@ dependencies = [
  "mysql_common 0.32.4",
  "novarocks-query-application",
  "novarocks-types",
+ "novarocks-user-error",
  "opensrv-mysql",
  "tokio",
  "tracing",

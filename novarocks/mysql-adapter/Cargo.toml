@@ -17,3 +17,6 @@ novarocks-types.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }
 tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 tracing.workspace = true
+
+[dev-dependencies]
+novarocks-user-error.workspace = true

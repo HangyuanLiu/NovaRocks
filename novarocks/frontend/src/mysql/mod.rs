@@ -45,15 +45,12 @@ use self::encoding::{
     write_governed_query_result, write_query_result, write_streaming_query_result,
 };
 use self::session::{QuerySession, QuerySessionFactory};
-use crate::runtime::statement_result::{
-    GovernedCompletionStatementResult, GovernedErrorStatementResult, StatementResult,
-};
+use crate::runtime::statement_result::StatementResult;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
 };
 use novarocks_query_application::session::QuerySessionOpenRequest;
-use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;
 
@@ -376,7 +373,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(session) => session,
             Err(error) => {
                 return writer
-                    .error(mysql_error_kind(&error), error.message().as_bytes())
+                    .error(
+                        novarocks_mysql_adapter::mysql_error_kind(&error),
+                        error.message().as_bytes(),
+                    )
                     .await;
             }
         };
@@ -389,7 +389,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(()) => writer.ok().await,
             Err(error) => {
                 writer
-                    .error(mysql_error_kind(&error), error.message().as_bytes())
+                    .error(
+                        novarocks_mysql_adapter::mysql_error_kind(&error),
+                        error.message().as_bytes(),
+                    )
                     .await
             }
         }
@@ -404,7 +407,10 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
             Ok(session) => session,
             Err(error) => {
                 return results
-                    .error(mysql_error_kind(&error), error.message().as_bytes())
+                    .error(
+                        novarocks_mysql_adapter::mysql_error_kind(&error),
+                        error.message().as_bytes(),
+                    )
                     .await;
             }
         };
@@ -417,15 +423,21 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
                 write_streaming_query_result(result, results).await
             }
             Ok(StatementResult::GovernedCompletion(result)) => {
-                write_governed_completion_result(result, results).await
+                novarocks_mysql_adapter::write_governed_terminal_ok(result.into_protocol(), results)
+                    .await
             }
             Ok(StatementResult::GovernedError(result)) => {
-                write_governed_error_result(result, results).await
+                let (error, protocol) = result.into_parts();
+                novarocks_mysql_adapter::write_governed_terminal_error(error, protocol, results)
+                    .await
             }
             Ok(StatementResult::Ok) => results.completed(OkResponse::default()).await,
             Err(error) => {
                 results
-                    .error(mysql_error_kind(&error), error.message().as_bytes())
+                    .error(
+                        novarocks_mysql_adapter::mysql_error_kind(&error),
+                        error.message().as_bytes(),
+                    )
                     .await
             }
         };
@@ -437,85 +449,9 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for FrontendMysqlShim {
     }
 }
 
-async fn write_governed_completion_result<W: AsyncWrite + Unpin>(
-    result: GovernedCompletionStatementResult,
-    results: QueryResultWriter<'_, W>,
-) -> io::Result<()> {
-    let mut protocol = result.into_protocol();
-    match protocol.seal_success_visibility() {
-        GovernedStatementVisibilitySealOutcome::Sealed => {
-            match results.completed(OkResponse::default()).await {
-                Ok(()) => {
-                    let _ = protocol.complete();
-                    Ok(())
-                }
-                Err(error) => {
-                    let _ = protocol.client_disconnected();
-                    Err(error)
-                }
-            }
-        }
-        GovernedStatementVisibilitySealOutcome::Cancelled(_) => {
-            let _ = protocol.settle_cancellation();
-            results
-                .error(
-                    ErrorKind::ER_QUERY_INTERRUPTED,
-                    b"query cancelled before terminal OK",
-                )
-                .await
-        }
-        GovernedStatementVisibilitySealOutcome::Stale => {
-            let _ = protocol.fail();
-            results
-                .error(
-                    ErrorKind::ER_UNKNOWN_ERROR,
-                    b"governed statement became stale before terminal OK",
-                )
-                .await
-        }
-    }
-}
-
-async fn write_governed_error_result<W: AsyncWrite + Unpin>(
-    result: GovernedErrorStatementResult,
-    results: QueryResultWriter<'_, W>,
-) -> io::Result<()> {
-    let (error, mut protocol) = result.into_parts();
-    if protocol.cancellation().is_cancelled() {
-        let _ = protocol.settle_cancellation();
-        return results
-            .error(ErrorKind::ER_QUERY_INTERRUPTED, b"query cancelled")
-            .await;
-    }
-    match results
-        .error(mysql_error_kind(&error), error.message().as_bytes())
-        .await
-    {
-        Ok(()) => {
-            let _ = protocol.fail();
-            Ok(())
-        }
-        Err(error) => {
-            let _ = protocol.client_disconnected();
-            Err(error)
-        }
-    }
-}
-
-fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
-    error
-        .user_error()
-        .and_then(|user_error| {
-            novarocks_mysql_adapter::error_kind_for_domain_code(user_error.code().as_str())
-        })
-        .unwrap_or_else(|| {
-            novarocks_mysql_adapter::error_kind_for_query_service_error(error.kind())
-        })
-}
-
 #[cfg(test)]
 #[test]
-fn query_service_error_mapping_keeps_wire_concerns_in_frontend() {
+fn query_service_error_mapping_is_owned_by_the_mysql_adapter() {
     assert_eq!(
         novarocks_mysql_adapter::error_kind_for_query_service_error(
             QueryServiceErrorKind::BadDatabase
@@ -559,7 +495,10 @@ fn user_error_code_overrides_the_legacy_session_error_kind() {
         RetryClass::Never,
     );
     let error = QueryServiceError::from_user_error(user_error);
-    assert_eq!(mysql_error_kind(&error), ErrorKind::ER_NO_SUCH_TABLE);
+    assert_eq!(
+        novarocks_mysql_adapter::mysql_error_kind(&error),
+        ErrorKind::ER_NO_SUCH_TABLE
+    );
 }
 
 #[cfg(test)]
