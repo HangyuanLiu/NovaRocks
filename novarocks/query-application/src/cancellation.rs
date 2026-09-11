@@ -110,7 +110,7 @@ enum QueryCancellationViewInner {
 }
 
 impl QueryCancellationView {
-    pub(crate) fn governed(
+    pub fn governed(
         view: novarocks_workload_control::CancellationView,
         timeout_ms: Option<u64>,
     ) -> Self {

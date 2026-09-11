@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned session cancellation control contract.
+//! Query-application session cancellation control contract.
 
 use std::sync::Arc;
 use tokio::time::Instant;
 
-use crate::common::query_cancellation::{
+use crate::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
 };
-use novarocks_query_application::client_connection::ClientConnectionToken;
+use crate::client_connection::ClientConnectionToken;
 use novarocks_workload_control::{
     BusinessPermit, CancellationReason, CancellationView, RootAdmissionHandle,
     WorkCancellationRequestOutcome, WorkClass, WorkError, WorkOwner, WorkRequest, WorkScope,
@@ -156,7 +156,7 @@ impl GovernedStatementCancellation {
         &self.success_sealer
     }
 
-    pub(crate) fn remember_query_reason(&self, reason: QueryCancellationReason) {
+    pub fn remember_query_reason(&self, reason: QueryCancellationReason) {
         let mut first = self
             .first_query_reason
             .lock()
@@ -166,7 +166,7 @@ impl GovernedStatementCancellation {
         }
     }
 
-    pub(crate) fn first_query_reason(&self) -> Option<QueryCancellationReason> {
+    pub fn first_query_reason(&self) -> Option<QueryCancellationReason> {
         self.first_query_reason
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -181,7 +181,7 @@ pub struct GovernedStatementRegistration {
 }
 
 impl GovernedStatementRegistration {
-    pub(crate) fn new(token: StatementToken, cancellation: CancellationView) -> Self {
+    pub fn new(token: StatementToken, cancellation: CancellationView) -> Self {
         Self {
             token,
             cancellation,

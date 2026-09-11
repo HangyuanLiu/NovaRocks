@@ -31,7 +31,7 @@ pub mod completion;
 pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
-pub mod control;
+pub use novarocks_query_application::session_control as control;
 mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;

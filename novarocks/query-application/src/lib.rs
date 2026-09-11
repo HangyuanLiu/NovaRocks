@@ -23,8 +23,14 @@
 
 pub mod api;
 
+/// First-wins statement cancellation shared by query application consumers.
+pub mod cancellation;
+
 /// Exact client-session identity and protocol-owned termination contracts.
 pub mod client_connection;
+
+/// Session generations, governed statement control, and protocol settlement.
+pub mod session_control;
 
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.
