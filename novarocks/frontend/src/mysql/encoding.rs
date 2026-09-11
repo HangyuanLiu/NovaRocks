@@ -771,8 +771,7 @@ async fn finish_stream_error<W: AsyncWrite + Unpin>(
     kind: ErrorKind,
     error: &QueryExecutionError,
 ) -> io::Result<()> {
-    let message = error.to_string().into_bytes();
-    writer.finish_error(kind, &message).await
+    novarocks_mysql_adapter::finish_result_error(writer, kind, error).await
 }
 
 async fn reserve_data_when_available(

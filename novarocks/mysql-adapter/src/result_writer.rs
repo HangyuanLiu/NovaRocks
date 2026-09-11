@@ -24,7 +24,7 @@ use novarocks_query_application::api::{
     QueryExecutionError, QueryExecutionErrorKind, ResultFailureView, ResultField,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use opensrv_mysql::{Column, QueryResultWriter};
+use opensrv_mysql::{Column, ErrorKind, QueryResultWriter};
 use tokio::io::AsyncWrite;
 
 use crate::{build_mysql_row, mysql_column_for_result_field};
@@ -104,6 +104,18 @@ pub async fn start_streaming_result<'a, W: AsyncWrite + Unpin>(
         }
         writer = &mut start => writer.map_err(MysqlBatchWriteError::Io),
     }
+}
+
+/// Closes an already-open MySQL result with one typed Query Application error.
+/// The application caller retains responsibility for settling its delivery and
+/// statement owners from the resulting socket outcome.
+pub async fn finish_result_error<W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'_, W>,
+    kind: ErrorKind,
+    error: &QueryExecutionError,
+) -> io::Result<()> {
+    let message = error.to_string().into_bytes();
+    writer.finish_error(kind, &message).await
 }
 
 fn invalid_data_error(error: String) -> io::Error {
