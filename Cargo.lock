@@ -4059,6 +4059,7 @@ name = "novarocks-query-application"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "novarocks-execution-contract",
  "novarocks-parser",

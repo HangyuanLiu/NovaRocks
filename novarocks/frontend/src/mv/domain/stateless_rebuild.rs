@@ -59,9 +59,9 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
 };
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
@@ -546,7 +546,7 @@ fn build_query_result(
         .map_err(|e| format!("build stateless rebuild result failed: {e}"))?;
     Ok(QueryResult {
         columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
+        batches: vec![batch],
     })
 }
 

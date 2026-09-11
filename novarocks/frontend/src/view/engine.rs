@@ -28,13 +28,13 @@ use std::sync::Arc;
 use crate::catalog_application::query_catalog::CatalogServiceSource;
 use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::query_execution::kernels::ViewExecutionKernel;
-use crate::runtime::query_result::QueryResult;
 use novarocks_parser::{
     Span,
     ast::{
         Ident, Literal, LiteralKind, ObjectName, Query, StructField, TypeName, TypeNameArgument,
     },
 };
+use novarocks_query_application::api::QueryResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
     ConnectorRequestContext, ConnectorViewDefinition, ConnectorViewDialect, ConnectorViewIdentity,

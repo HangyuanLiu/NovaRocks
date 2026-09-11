@@ -111,9 +111,9 @@ use crate::mv::domain::storage_observation::{
     MvLakePublication, MvSchemaValidationObservation, MvTargetCreationObservation,
     observe_lake_package,
 };
-use crate::runtime::statement_result::StatementResult;
 use mv_schema::MvPartitionContract;
 use novarocks_parser::{Span, ast};
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,

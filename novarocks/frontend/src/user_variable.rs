@@ -18,7 +18,7 @@
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 
-use crate::runtime::query_result::QueryResult;
+use novarocks_query_application::api::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::semantic::Literal;
 
@@ -37,11 +37,11 @@ pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<Str
     if row_count > 1 {
         return Err("Subquery returns more than 1 row".to_string());
     }
-    for chunk in &result.chunks {
-        if chunk.is_empty() {
+    for batch in &result.batches {
+        if batch.num_rows() == 0 {
             continue;
         }
-        let column = chunk
+        let column = batch
             .columns()
             .first()
             .ok_or_else(|| "empty query chunk".to_string())?;

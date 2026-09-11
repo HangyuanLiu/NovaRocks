@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
-use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,

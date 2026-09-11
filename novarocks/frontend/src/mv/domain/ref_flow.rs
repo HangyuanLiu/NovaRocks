@@ -22,11 +22,11 @@
 
 use std::sync::Arc;
 
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{
     AlterIcebergTable, IcebergReferenceAction, IcebergReferenceKind, IcebergTableAction,
     ObjectName, ReferenceAnchor,
 };
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,

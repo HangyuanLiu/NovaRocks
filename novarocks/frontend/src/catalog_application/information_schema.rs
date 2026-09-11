@@ -23,8 +23,8 @@ use arrow::record_batch::RecordBatch;
 use novarocks_parser::{ast, printer};
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 
 #[derive(Clone, Debug)]
 struct MaterializedViewInfoRow {
@@ -282,7 +282,7 @@ fn build_query_result(
         .map_err(|e| format!("build information_schema.materialized_views result failed: {e}"))?;
     Ok(QueryResult {
         columns: query_columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
+        batches: vec![batch],
     })
 }
 

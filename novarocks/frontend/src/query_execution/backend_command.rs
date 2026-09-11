@@ -18,8 +18,8 @@
 //! Closed Frontend backend-observability command capability.
 
 use crate::query_execution::kernels::BackendManagementKernel;
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::ShowBackends;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::ClusterRole;
 
 #[derive(Clone)]

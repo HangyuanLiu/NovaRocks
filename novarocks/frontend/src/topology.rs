@@ -46,7 +46,7 @@ use crate::common::backend_topology::{
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
@@ -1064,7 +1064,7 @@ impl BackendTopologyPort for ClusterBackendService {
                 .iter()
                 .map(|name| QueryResultColumn::new(*name, DataType::Utf8, false, None))
                 .collect(),
-            chunks: vec![record_batch_to_chunk(batch)?],
+            batches: vec![batch],
         })
     }
 }
@@ -1712,10 +1712,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("SHOW BACKENDS has no {name} column"))
         };
         let mut rows = Vec::new();
-        for chunk in &result.chunks {
+        for batch in &result.batches {
             let column = |name: &str| {
-                chunk
-                    .batch
+                batch
                     .column(index(name))
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
@@ -1728,7 +1727,7 @@ mod tests {
             let build_identity = column("BuildIdentity");
             let compatibility_id = column("NativeCompatibilityId");
             let status_detail = column("StatusDetail");
-            for row in 0..chunk.batch.num_rows() {
+            for row in 0..batch.num_rows() {
                 rows.push(BarrierRow {
                     process_id: process_id.value(row).to_string(),
                     diagnostic_status: diagnostic_status.value(row).to_string(),

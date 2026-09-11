@@ -45,11 +45,6 @@ use crate::query_execution::maintenance::command::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::{PreparedQueryOperation, StatementResult};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::statement_result::{
-    GovernedCompletionStatementResult, GovernedErrorStatementResult,
-    GovernedImmediateStatementResult,
-};
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
@@ -70,12 +65,17 @@ use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
     ClientConnectionTerminationReason,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
+use novarocks_query_application::protocol_delivery::{
+    GovernedCompletionStatementResult, GovernedErrorStatementResult,
+    GovernedImmediateStatementResult,
+};
 use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
@@ -454,7 +454,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
     .map_err(|error| format!("build ADD FILES status result failed: {error}"))?;
     Ok(QueryResult {
         columns: vec![column],
-        chunks: vec![record_batch_to_chunk(batch)?],
+        batches: vec![batch],
     })
 }
 
@@ -2752,20 +2752,9 @@ async fn consume_governed_scalar_stream(
                     return Err(scalar_query_error(message));
                 }
                 if rows == 1 {
-                    let chunk = match record_batch_to_chunk(delivery.batch().clone()) {
-                        Ok(chunk) => chunk,
-                        Err(message) => {
-                            delivery.fail(QueryExecutionError::new(
-                                QueryExecutionErrorKind::InvalidRequest,
-                                message.clone(),
-                            ));
-                            let _ = execution.request_cancel();
-                            return Err(scalar_query_error(message));
-                        }
-                    };
                     let result = QueryResult {
                         columns: vec![column.clone()],
-                        chunks: vec![chunk],
+                        batches: vec![delivery.batch().clone()],
                     };
                     value = match crate::user_variable::query_result_to_user_variable_literal(
                         &result,

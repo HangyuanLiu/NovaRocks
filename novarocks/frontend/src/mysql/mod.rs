@@ -16,8 +16,6 @@
 // under the License.
 
 mod encoding;
-pub mod session;
-
 pub use novarocks_mysql_adapter::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
@@ -44,13 +42,13 @@ use novarocks_version as version;
 use self::encoding::{
     write_governed_query_result, write_query_result, write_streaming_query_result,
 };
-use self::session::{QuerySession, QuerySessionFactory};
-use crate::runtime::statement_result::StatementResult;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason, ClientConnectionToken,
 };
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_query_application::session::QuerySessionOpenRequest;
+use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::naming::DEFAULT_DATABASE;
 

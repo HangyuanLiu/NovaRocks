@@ -23,7 +23,7 @@ use super::{
     MaintenanceRequestContext, MaintenanceStatementResult, RequestScopedMaintenanceEngine,
     TableMaintenanceService,
 };
-use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 
 /// Foreground maintenance command capability.  Each invocation creates a
 /// short-lived engine carrying only the Frontend-composed maintenance ports

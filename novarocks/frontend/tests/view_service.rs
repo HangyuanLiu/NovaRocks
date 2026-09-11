@@ -278,20 +278,19 @@ fn parse_query(sql: &str) -> Query {
 
 fn query_result(
     result: Option<ViewStatementResult>,
-) -> novarocks_frontend::runtime::query_result::QueryResult {
+) -> novarocks_query_application::api::QueryResult {
     let Some(ViewStatementResult::Query(result)) = result else {
         panic!("expected query result");
     };
     result
 }
 
-fn query_rows(result: &novarocks_frontend::runtime::query_result::QueryResult) -> Vec<String> {
+fn query_rows(result: &novarocks_query_application::api::QueryResult) -> Vec<String> {
     result
-        .chunks
+        .batches
         .iter()
-        .flat_map(|chunk| {
-            let values = chunk
-                .batch
+        .flat_map(|batch| {
+            let values = batch
                 .column(0)
                 .as_any()
                 .downcast_ref::<StringArray>()
@@ -304,15 +303,14 @@ fn query_rows(result: &novarocks_frontend::runtime::query_result::QueryResult) -
 }
 
 fn query_rows_at(
-    result: &novarocks_frontend::runtime::query_result::QueryResult,
+    result: &novarocks_query_application::api::QueryResult,
     column: usize,
 ) -> Vec<String> {
     result
-        .chunks
+        .batches
         .iter()
-        .flat_map(|chunk| {
-            let values = chunk
-                .batch
+        .flat_map(|batch| {
+            let values = batch
                 .column(column)
                 .as_any()
                 .downcast_ref::<StringArray>()

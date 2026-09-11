@@ -23,12 +23,12 @@ pub use crate::query_execution::post_compile::{
 };
 #[cfg(test)]
 use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
-use crate::runtime::query_result::QueryResult;
-#[cfg(test)]
-use crate::runtime::query_result::build_string_query_result;
 use novarocks_parser::ast::Query;
 use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::api::QueryResult;
+#[cfg(test)]
+use novarocks_query_application::api::build_string_query_result;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
@@ -1882,7 +1882,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         });
     if observer.short_circuit_after_build {
         Some(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: QueryResult::empty(),
             write_session: None,
             fragment_profiles: Vec::new(),
         })

@@ -974,7 +974,6 @@ mod tests {
     use crate::ResolvedMysqlListenerSettings;
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::native::transport::FrontendNativeTransport;
-    use crate::runtime::statement_result::StatementResult;
     use crate::state_store::{
         StateStoreProviderRegistry,
         testing::{input as test_state_store_input, registry as test_state_store_registry},
@@ -983,6 +982,7 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
+    use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
     use novarocks_query_application::session::QuerySessionOpenRequest;
     use novarocks_query_application::session_error::QueryServiceErrorKind;
 

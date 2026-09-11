@@ -1,13 +1,11 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_parser::ast;
-use novarocks_types::SlotId;
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 
 use super::FrontendStatisticsService;
 use super::model::{AnalyzeStatusRow, ColumnStatRow, TableKey};
@@ -495,21 +493,11 @@ fn string_result(columns: Vec<String>, rows: Vec<Vec<String>>) -> Result<QueryRe
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
         .map_err(|error| format!("statistics result batch failed: {error}"))?;
-    let slot_ids = (1..=batch.num_columns())
-        .map(|index| {
-            u32::try_from(index)
-                .map(SlotId::new)
-                .map_err(|_| "too many statistics output columns".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
-    let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
     Ok(QueryResult {
         columns: columns
             .into_iter()
             .map(|name| QueryResultColumn::new(name, DataType::Utf8, true, None))
             .collect(),
-        chunks: vec![chunk],
+        batches: vec![batch],
     })
 }

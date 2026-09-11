@@ -288,7 +288,7 @@ fn cancellation_view_observes_injected_flag() {
 fn outcome_factory_rejects_intent_mismatch() {
     let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).from_execution_result(
         crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: novarocks_query_application::api::QueryResult::empty(),
             write_session: None,
             fragment_profiles: vec![
                 crate::query_execution::profile::FragmentProfileTree::unattributed(
@@ -347,7 +347,7 @@ fn profile_outcome_preserves_fragment_profiles() {
     );
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: novarocks_query_application::api::build_string_query_result(
                 "status",
                 vec!["profiled".to_string()],
             )
@@ -369,7 +369,7 @@ fn profile_outcome_preserves_fragment_profiles() {
 fn result_outcome_preserves_query_result() {
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: novarocks_query_application::api::build_string_query_result(
                 "value",
                 vec!["kept".to_string()],
             )
@@ -402,7 +402,7 @@ impl DistributedQueryCoordinator for RecordingCoordinator {
         request
             .into_parts()
             .completion
-            .result(crate::runtime::query_result::QueryResult::empty())
+            .result(novarocks_query_application::api::QueryResult::empty())
     }
 }
 

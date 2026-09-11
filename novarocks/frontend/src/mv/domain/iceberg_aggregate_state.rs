@@ -23,13 +23,13 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::refresh::execution_context::MvRefreshPruningLimits;
-use crate::runtime::query_result::record_batch_to_chunk;
 use novarocks_execution::exec::change_op::{ChangeOp, change_op_array, change_op_field};
-use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_execution::exec::mv::aggregate_state::{
     build_old_state_map, merge_aggregate_state_batches_with_retractions,
 };
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
+use novarocks_types::SlotId;
 
 #[allow(
     dead_code,
@@ -201,7 +201,7 @@ pub(crate) fn build_aggregate_change_chunks(
             ],
         )
         .map_err(|e| format!("build iceberg aggregate DELETE change chunk failed: {e}"))?;
-        chunks.push(record_batch_to_chunk(batch)?);
+        chunks.push(chunk_from_record_batch(batch)?);
     }
 
     for insert_chunk in merge.insert_chunks {
@@ -219,7 +219,7 @@ pub(crate) fn build_aggregate_change_chunks(
         columns.push(change_op_array(ChangeOp::Insert, row_count));
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|e| format!("build iceberg aggregate INSERT change chunk failed: {e}"))?;
-        chunks.push(record_batch_to_chunk(batch)?);
+        chunks.push(chunk_from_record_batch(batch)?);
     }
 
     Ok(chunks)
@@ -282,7 +282,7 @@ fn append_change_op_to_physical_chunk(
     columns.push(change_op_array(op, row_count));
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|e| format!("build {context} failed: {e}"))?;
-    record_batch_to_chunk(batch)
+    chunk_from_record_batch(batch)
 }
 
 #[allow(
@@ -475,9 +475,21 @@ fn filter_physical_chunks_by_row_ids(
             .collect::<Result<Vec<_>, _>>()?;
         let filtered = RecordBatch::try_new(schema, columns)
             .map_err(|e| format!("rebuild iceberg aggregate physical chunk failed: {e}"))?;
-        out.push(record_batch_to_chunk(filtered)?);
+        out.push(chunk_from_record_batch(filtered)?);
     }
     Ok(out)
+}
+
+fn chunk_from_record_batch(batch: RecordBatch) -> Result<Chunk, String> {
+    let slot_ids = (1..=batch.num_columns())
+        .map(|index| {
+            u32::try_from(index)
+                .map(SlotId::new)
+                .map_err(|_| "too many aggregate result columns".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
+    Chunk::try_new_with_chunk_schema(batch, schema)
 }
 
 #[cfg(test)]
@@ -494,7 +506,7 @@ mod tests {
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
     fn chunk(batch: RecordBatch) -> novarocks_execution::exec::chunk::Chunk {
-        record_batch_to_chunk(batch).expect("chunk")
+        chunk_from_record_batch(batch).expect("chunk")
     }
 
     fn encoded_utf8_group_row_id(value: &str) -> String {

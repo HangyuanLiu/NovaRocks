@@ -18,7 +18,7 @@
 //! Move-only protocol settlement for governed query application output.
 
 use crate::api::{
-    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind,
+    ExecutionHandle, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, QueryResult,
     QueryResultStream, ResultDelivery, ResultFailureView, SchemaDelivery,
     decoded_result_batch_governance_charge,
 };
@@ -27,6 +27,7 @@ use crate::session_control::{
     GovernedQueryStatementOwner, GovernedStatementFinishOutcome,
     GovernedStatementVisibilitySealOutcome,
 };
+use crate::session_error::QueryServiceError;
 use arrow::record_batch::RecordBatch;
 use novarocks_workload_control::{
     LocalResourceAuthority, ResultCredit, ResultCreditStage, WorkError, WorkScope,
@@ -261,6 +262,101 @@ impl Drop for GovernedProtocolOwner {
         if !self.settled {
             drop(self.statement.take());
         }
+    }
+}
+
+/// Query-application output delivered to a client-session protocol adapter.
+///
+/// The adapter owns wire framing, while these values retain every application
+/// lifetime that must remain live until the terminal protocol outcome.
+pub enum QuerySessionOutput {
+    Query(QueryResult),
+    GovernedQuery(GovernedImmediateStatementResult),
+    StreamingQuery(StreamingStatementResult),
+    GovernedCompletion(GovernedCompletionStatementResult),
+    GovernedError(GovernedErrorStatementResult),
+    Ok,
+}
+
+impl std::fmt::Debug for QuerySessionOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query(result) => formatter.debug_tuple("Query").field(result).finish(),
+            Self::GovernedQuery(_) => formatter.write_str("GovernedQuery(..)"),
+            Self::StreamingQuery(_) => formatter.write_str("StreamingQuery(..)"),
+            Self::GovernedCompletion(_) => formatter.write_str("GovernedCompletion(..)"),
+            Self::GovernedError(_) => formatter.write_str("GovernedError(..)"),
+            Self::Ok => formatter.write_str("Ok"),
+        }
+    }
+}
+
+/// Fully materialized result whose statement permit remains live through the
+/// final protocol outcome.
+#[must_use = "the governed query result must be settled by its protocol owner"]
+pub struct GovernedImmediateStatementResult {
+    result: QueryResult,
+    protocol: GovernedProtocolOwner,
+}
+
+impl GovernedImmediateStatementResult {
+    pub fn new(
+        result: QueryResult,
+        resources: LocalResourceAuthority,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            result,
+            protocol: GovernedProtocolOwner::new(statement, resources),
+        }
+    }
+
+    pub fn into_parts(self) -> (QueryResult, GovernedProtocolOwner) {
+        (self.result, self.protocol)
+    }
+}
+
+/// Completion-only output that retains its statement permit through the
+/// terminal protocol OK packet.
+#[must_use = "the governed completion must be settled by its protocol owner"]
+pub struct GovernedCompletionStatementResult {
+    protocol: GovernedProtocolOwner,
+}
+
+impl GovernedCompletionStatementResult {
+    pub fn new(resources: LocalResourceAuthority, statement: GovernedQueryStatementOwner) -> Self {
+        Self {
+            protocol: GovernedProtocolOwner::new(statement, resources),
+        }
+    }
+
+    pub fn into_protocol(self) -> GovernedProtocolOwner {
+        self.protocol
+    }
+}
+
+/// Error output that retains its statement permit through the terminal
+/// protocol error packet.
+#[must_use = "the governed error must be settled by its protocol owner"]
+pub struct GovernedErrorStatementResult {
+    error: QueryServiceError,
+    protocol: GovernedProtocolOwner,
+}
+
+impl GovernedErrorStatementResult {
+    pub fn new(
+        error: QueryServiceError,
+        resources: LocalResourceAuthority,
+        statement: GovernedQueryStatementOwner,
+    ) -> Self {
+        Self {
+            error,
+            protocol: GovernedProtocolOwner::new(statement, resources),
+        }
+    }
+
+    pub fn into_parts(self) -> (QueryServiceError, GovernedProtocolOwner) {
+        (self.error, self.protocol)
     }
 }
 

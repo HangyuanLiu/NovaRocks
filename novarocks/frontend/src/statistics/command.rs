@@ -24,12 +24,12 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::query_execution::StatementResult;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone)]
@@ -182,7 +182,7 @@ fn statistics_string_result(
         .map_err(|error| format!("build statistics application result failed: {error}"))?;
     Ok(StatementResult::Query(QueryResult {
         columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
+        batches: vec![batch],
     }))
 }
 
@@ -361,13 +361,14 @@ mod tests {
         let show_stats = executor
             .execute(statement, None, "default", None)
             .expect("show typed table stats");
-        let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
+        let novarocks_query_application::protocol_delivery::QuerySessionOutput::Query(show_stats) =
+            show_stats
         else {
             panic!("SHOW TABLE STATS must return a query result");
         };
         assert_eq!(show_stats.columns[0].name(), "metric");
         assert_eq!(show_stats.columns[1].name(), "value");
-        let value = show_stats.chunks[0].batch.column(1);
+        let value = show_stats.batches[0].column(1);
         let value = value
             .as_any()
             .downcast_ref::<StringArray>()

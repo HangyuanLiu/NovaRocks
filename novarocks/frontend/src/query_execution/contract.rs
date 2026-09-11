@@ -706,7 +706,10 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
     fn execute_prepared(
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
-    ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
+    ) -> Result<
+        novarocks_query_application::protocol_delivery::QuerySessionOutput,
+        DistributedQueryError,
+    > {
         let (request, completion, attempt_factory, _logical_reservation) = operation.into_parts();
         if attempt_factory.is_some() {
             return Err(DistributedQueryError::new(

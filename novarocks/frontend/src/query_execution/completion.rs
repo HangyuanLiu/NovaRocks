@@ -24,8 +24,8 @@
 use crate::query_execution::lifecycle_plan::{
     AttemptCredentialLeaseCollector, QueryCredentialLeases,
 };
-use crate::runtime::query_result::build_string_query_result;
-use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::api::build_string_query_result;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 use std::sync::Arc;

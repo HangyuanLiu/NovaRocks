@@ -40,18 +40,18 @@ use chrono::{Duration, NaiveDate, NaiveDateTime, Utc};
 use opensrv_mysql::{Column, ErrorKind, QueryResultWriter, U24_MAX};
 use tokio::io::AsyncWrite;
 
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-use crate::runtime::statement_result::GovernedImmediateStatementResult;
 #[cfg(test)]
 use novarocks_mysql_adapter::MysqlResultValue as StandaloneMysqlValue;
 use novarocks_mysql_adapter::mysql_column_for_result_field;
 use novarocks_query_application::api::{
-    QueryExecutionError, QueryExecutionErrorKind, ResultDelivery, ResultFailureView, ResultSchema,
-    decoded_result_batch_governance_charge,
+    QueryExecutionError, QueryExecutionErrorKind, QueryResult, ResultDelivery, ResultFailureView,
+    ResultField as QueryResultColumn, ResultSchema, decoded_result_batch_governance_charge,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use novarocks_query_application::protocol_delivery::ImmediateResultBatch;
 use novarocks_query_application::protocol_delivery::StreamingStatementResult;
+use novarocks_query_application::protocol_delivery::{
+    GovernedImmediateStatementResult, ImmediateResultBatch,
+};
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_types::FieldRenderSchema;
 #[cfg(test)]
@@ -90,11 +90,7 @@ pub(super) async fn write_query_result<W: AsyncWrite + Unpin>(
     result: QueryResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    let batches = result
-        .chunks
-        .iter()
-        .map(|chunk| &chunk.batch)
-        .collect::<Vec<_>>();
+    let batches = result.batches.iter().collect::<Vec<_>>();
     novarocks_mysql_adapter::write_record_batches(&result.columns, &batches, results).await
 }
 
@@ -166,8 +162,8 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
     };
     drop(schema_reservation);
 
-    for chunk in result.chunks {
-        let decoded_bytes = match decoded_result_batch_governance_charge(&chunk.batch) {
+    for raw_batch in result.batches {
+        let decoded_bytes = match decoded_result_batch_governance_charge(&raw_batch) {
             Ok(bytes) => bytes,
             Err(error) => {
                 let _ = protocol.fail();
@@ -255,14 +251,13 @@ pub(super) async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
             }
         };
-        let batch = match ImmediateResultBatch::try_new(chunk.batch.clone(), credit) {
+        let batch = match ImmediateResultBatch::try_new(raw_batch, credit) {
             Ok(batch) => batch,
             Err(error) => {
                 let _ = protocol.fail();
                 return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
             }
         };
-        drop(chunk);
         let protocol_bytes =
             match mysql_text_batch_protocol_bytes_upper_bound(batch.batch(), &result.columns) {
                 Ok(bytes) => bytes,

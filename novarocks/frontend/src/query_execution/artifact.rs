@@ -59,13 +59,13 @@ use crate::query_execution::preparation::{
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
@@ -2168,7 +2168,7 @@ impl ExpectedOutputSchema {
                     QueryResultColumn::new(column.name, column.data_type, column.nullable, None)
                 })
                 .collect(),
-            chunks,
+            batches: chunks.into_iter().map(|chunk| chunk.batch).collect(),
         })
     }
 }

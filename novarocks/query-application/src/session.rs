@@ -17,7 +17,12 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use crate::cancellation::QueryCancellationReason;
 use crate::client_connection::ClientConnectionToken;
+use crate::protocol_delivery::QuerySessionOutput;
+use crate::session_error::QueryServiceError;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QuerySessionOpenRequest {
@@ -42,6 +47,31 @@ impl QuerySessionOpenRequest {
     pub fn principal(&self) -> &str {
         &self.principal
     }
+}
+
+/// Application-owned client session consumed by a protocol adapter.
+#[async_trait]
+pub trait QuerySession: Send + Sync + 'static {
+    async fn init_database(&self, schema: &str) -> Result<(), QueryServiceError>;
+
+    async fn execute_batch(&self, sql: &str) -> Result<QuerySessionOutput, QueryServiceError>;
+
+    /// Settle any terminal protocol ownership after the adapter has produced
+    /// its final wire outcome.
+    fn complete_statement(&self);
+
+    fn cancel_current(&self, reason: QueryCancellationReason);
+
+    fn close(&self);
+}
+
+pub trait QuerySessionFactory: Send + Sync + 'static {
+    fn open_session(
+        &self,
+        request: QuerySessionOpenRequest,
+    ) -> Result<Arc<dyn QuerySession>, QueryServiceError>;
+
+    fn cancel_all(&self, reason: QueryCancellationReason);
 }
 
 #[cfg(test)]

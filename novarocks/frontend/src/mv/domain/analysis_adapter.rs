@@ -29,7 +29,7 @@ use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -364,6 +364,6 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))?;
     Ok(QueryResult {
         columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
+        batches: vec![batch],
     })
 }

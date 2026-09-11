@@ -27,7 +27,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
-    array::ArrayData,
+    array::{ArrayData, StringArray},
     buffer::Buffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -161,6 +161,61 @@ impl ResultField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultSchema {
     fields: Arc<[ResultField]>,
+}
+
+/// Fully materialized immediate query output owned by the query application.
+///
+/// Unlike distributed [`QueryResultStream`] delivery, an immediate result has
+/// already been produced by a synchronous application command. It retains
+/// only Arrow batches and application-visible column metadata: execution
+/// chunks and their slot mappings are an execution implementation detail and
+/// must not escape into a client-session contract.
+#[derive(Clone, Debug)]
+pub struct QueryResult {
+    pub columns: Vec<ResultField>,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl QueryResult {
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.batches
+    }
+
+    /// Empty schema, empty batches. Used as the no-op output when an IVM
+    /// branch (insert or delete) has zero input files or rows.
+    pub fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+}
+
+pub fn build_string_query_result(
+    column_name: &str,
+    rows: Vec<String>,
+) -> Result<QueryResult, String> {
+    let column = ResultField::new(column_name, DataType::Utf8, false, None);
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        column_name,
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![Arc::new(StringArray::from(
+            rows.into_iter().map(Some).collect::<Vec<_>>(),
+        ))],
+    )
+    .map_err(|error| format!("build immediate text result failed: {error}"))?;
+    Ok(QueryResult {
+        columns: vec![column],
+        batches: vec![batch],
+    })
 }
 
 impl ResultSchema {
@@ -841,6 +896,26 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![11_i64, 13]))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn immediate_query_result_retains_arrow_batches_without_execution_chunks() {
+        let result = build_string_query_result(
+            "Explain String",
+            vec!["first".to_string(), "second".to_string()],
+        )
+        .expect("build immediate result");
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name(), "Explain String");
+        assert_eq!(result.row_count(), 2);
+        let values = result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string output");
+        assert_eq!(values.value(0), "first");
+        assert_eq!(values.value(1), "second");
     }
 
     fn decoded(batch: RecordBatch) -> DecodedResultBatch {

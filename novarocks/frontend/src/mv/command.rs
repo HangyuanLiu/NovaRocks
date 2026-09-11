@@ -26,7 +26,6 @@ use crate::mv::domain::application::{
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,
@@ -34,6 +33,8 @@ use novarocks_parser::ast::{
     MaterializedViewRefreshPolicy as TypedRefreshPolicy, MaterializedViewStatement,
     ObjectName as TypedObjectName,
 };
+use novarocks_query_application::api::build_string_query_result;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 use novarocks_types::naming::normalize_identifier;
@@ -44,7 +45,6 @@ use crate::mv::domain::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
     execute_typed_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
 };
-use crate::runtime::query_result::build_string_query_result;
 use std::sync::Arc;
 
 #[derive(Clone)]

@@ -21,16 +21,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_parser::{
     ast::{CreateView, Query, Statement, ViewStatement},
     printer,
 };
-use novarocks_types::SlotId;
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) mod command;
@@ -336,20 +334,11 @@ fn build_query_result(columns: Vec<(String, Vec<String>)>) -> Result<QueryResult
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema.clone(), arrays)
         .map_err(|error| format!("build view query result failed: {error}"))?;
-    let slot_ids = (1..=columns.len())
-        .map(|index| {
-            u32::try_from(index)
-                .map(SlotId::new)
-                .map_err(|_| "too many view query result columns".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)?;
-    let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
     Ok(QueryResult {
         columns: columns
             .into_iter()
             .map(|(name, _)| QueryResultColumn::new(name, DataType::Utf8, false, None))
             .collect(),
-        chunks: vec![chunk],
+        batches: vec![batch],
     })
 }

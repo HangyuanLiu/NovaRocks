@@ -36,7 +36,6 @@ mod native;
 mod preparation_diagnostics;
 pub mod query;
 pub mod query_execution;
-pub mod runtime;
 pub mod runtime_filter;
 mod server;
 pub(crate) mod session_error;
@@ -63,13 +62,13 @@ pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
-pub use mysql::session::{QuerySession, QuerySessionFactory};
 pub use mysql::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
     run_mysql_server_until_shutdown,
 };
 pub use native::report_server::FrontendReportServerHandle;
 pub use native::transport::FrontendNativeTransport;
+pub use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
 pub use novarocks_query_application::sql::session::SessionExecutionSettings;
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;

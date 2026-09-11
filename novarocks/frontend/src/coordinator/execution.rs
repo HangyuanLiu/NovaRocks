@@ -44,9 +44,9 @@ use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOpt
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::TaskUpdateTransport;
-use crate::runtime::statement_result::StatementResult;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, TaskId};
 use novarocks_types::{
     AttemptId, LocalQuerySequence, NativeCompatibilityId, QueryExecutionId, QueryId,

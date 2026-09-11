@@ -28,7 +28,7 @@ use crate::query_execution::contract::{
     DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
-use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
 };

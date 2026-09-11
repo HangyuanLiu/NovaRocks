@@ -475,7 +475,7 @@ mod tests {
         )>,
     ) -> crate::query_execution::outcome::QueryExecutionResult {
         crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: novarocks_query_application::api::QueryResult::empty(),
             write_session: Some(
                 crate::query_execution::outcome::ConnectorWriteSessionCompletion::for_test(
                     Arc::clone(session),
