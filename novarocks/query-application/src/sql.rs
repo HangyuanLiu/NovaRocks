@@ -27,6 +27,9 @@ use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 /// a role adapter projects them into a particular wire contract.
 pub mod session;
 
+/// Query-result scalar conversion used by SQL session user variables.
+pub mod user_variable;
+
 /// The application boundary accepts one already-framed SQL statement.
 ///
 /// Protocol adapters own batch framing and multi-result negotiation. Once a

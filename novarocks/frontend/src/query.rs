@@ -85,6 +85,7 @@ use novarocks_query_application::session_error::{QueryServiceError, QueryService
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
 };
+use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
     SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
     parse_single_statement, split_sql_statements, strip_leading_line_comments,
@@ -1291,8 +1292,7 @@ impl FrontendQuerySession {
             PreparedQueryOperation::Immediate(operation) => {
                 let result = match operation.into_result() {
                     StatementResult::Query(result) => {
-                        crate::user_variable::query_result_to_user_variable_literal(&result)
-                            .map_err(scalar_query_error)
+                        query_result_to_user_variable_literal(&result).map_err(scalar_query_error)
                     }
                     _ => Err(internal_error(
                         "SET scalar query preparation returned non-query immediate output",
@@ -2651,9 +2651,7 @@ async fn consume_governed_scalar_stream(
                         columns: vec![column.clone()],
                         batches: vec![delivery.batch().clone()],
                     };
-                    value = match crate::user_variable::query_result_to_user_variable_literal(
-                        &result,
-                    ) {
+                    value = match query_result_to_user_variable_literal(&result) {
                         Ok(value) => Some(value),
                         Err(message) => {
                             delivery.fail(QueryExecutionError::new(

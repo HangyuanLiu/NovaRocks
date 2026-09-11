@@ -15,14 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Query-application conversion of scalar query results into SQL literals.
+
 use arrow::array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow::datatypes::DataType;
 
-use novarocks_query_application::api::QueryResult;
+use crate::api::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::semantic::Literal;
 
-/// Convert a scalar query result into SQL that can be substituted for a user variable.
+/// Converts a scalar query result into SQL that can be substituted for a user
+/// variable. The result contract belongs to Query Application, so adapters and
+/// product command routes share one literal representation.
 pub fn query_result_to_user_variable_literal(result: &QueryResult) -> Result<String, String> {
     if result.columns.len() != 1 {
         return Err(format!(
@@ -130,7 +134,7 @@ fn user_variable_text_to_sql(text: &str, declared_type: &DataType) -> Result<Str
     })
 }
 
-pub(crate) fn user_variable_literal_to_sql(literal: &Literal) -> Result<String, String> {
+fn user_variable_literal_to_sql(literal: &Literal) -> Result<String, String> {
     Ok(match literal {
         Literal::Null => "NULL".to_string(),
         Literal::Bool(value) => if *value { "TRUE" } else { "FALSE" }.to_string(),
@@ -181,4 +185,55 @@ fn single_quoted_user_variable_sql(value: &str) -> String {
         }
     }
     format!("'{escaped}'")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::DataType;
+    use arrow::record_batch::RecordBatch;
+
+    use crate::api::{QueryResult, ResultField};
+
+    use super::query_result_to_user_variable_literal;
+
+    #[test]
+    fn converts_text_values_to_escaped_sql_literals() {
+        let result = QueryResult {
+            columns: vec![ResultField::new("v", DataType::Utf8, true, None)],
+            batches: vec![
+                RecordBatch::try_from_iter(vec![(
+                    "v",
+                    Arc::new(StringArray::from(vec!["a'b\\c"])) as _,
+                )])
+                .expect("batch"),
+            ],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).expect("scalar literal"),
+            "'a''b\\\\c'"
+        );
+    }
+
+    #[test]
+    fn rejects_more_than_one_scalar_row() {
+        let result = QueryResult {
+            columns: vec![ResultField::new("v", DataType::Int64, false, None)],
+            batches: vec![
+                RecordBatch::try_from_iter(vec![(
+                    "v",
+                    Arc::new(Int64Array::from(vec![1, 2])) as _,
+                )])
+                .expect("batch"),
+            ],
+        };
+
+        assert_eq!(
+            query_result_to_user_variable_literal(&result).expect_err("multiple rows fail"),
+            "Subquery returns more than 1 row"
+        );
+    }
 }
