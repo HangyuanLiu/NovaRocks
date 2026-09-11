@@ -71,7 +71,9 @@ use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
-use novarocks_query_application::sql::session::{SessionExecutionSettings, SessionSettingError};
+use novarocks_query_application::sql::session::{
+    SessionExecutionSettings, SessionSettingError, SessionSqlState,
+};
 use novarocks_query_application::sql::{
     SqlStatementParseError, parse_optional_single_statement, parse_single_statement,
 };
@@ -619,7 +621,7 @@ impl QuerySessionFactory for FrontendQueryService {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
             active_statements: Mutex::new(Vec::new()),
-            state: Mutex::new(FrontendSessionState::default()),
+            state: Mutex::new(SessionSqlState::default()),
         }))
     }
 
@@ -656,32 +658,11 @@ fn query_application_parse_error(error: SqlStatementParseError, source: &str) ->
     }
 }
 
-#[derive(Clone)]
-struct FrontendSessionState {
-    current_catalog: Option<String>,
-    current_database: String,
-    execution_settings: SessionExecutionSettings,
-    optimizer_settings: SessionOptimizerSettings,
-    user_variables: BTreeMap<String, String>,
-}
-
-impl Default for FrontendSessionState {
-    fn default() -> Self {
-        Self {
-            current_catalog: None,
-            current_database: DEFAULT_DATABASE.to_string(),
-            execution_settings: SessionExecutionSettings::default(),
-            optimizer_settings: SessionOptimizerSettings::default(),
-            user_variables: BTreeMap::new(),
-        }
-    }
-}
-
 struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     active_statements: Mutex<Vec<FrontendWorkloadLease>>,
-    state: Mutex<FrontendSessionState>,
+    state: Mutex<SessionSqlState>,
 }
 
 impl FrontendQuerySession {
@@ -842,7 +823,7 @@ impl FrontendQuerySession {
         &self,
         source: &str,
         assignment: &ast::SetAssignment,
-        state: &mut FrontendSessionState,
+        state: &mut SessionSqlState,
     ) -> Result<(), QueryServiceError> {
         match &assignment.target {
             ast::SetTarget::UserVariable(variable) => {
@@ -902,7 +883,7 @@ impl FrontendQuerySession {
 
     fn apply_session_system_variable(
         &self,
-        state: &mut FrontendSessionState,
+        state: &mut SessionSqlState,
         name: &str,
         value: &str,
     ) -> Result<(), QueryServiceError> {
@@ -1014,7 +995,7 @@ impl FrontendQuerySession {
 
     fn apply_session_catalog(
         &self,
-        state: &mut FrontendSessionState,
+        state: &mut SessionSqlState,
         catalog: &str,
     ) -> Result<(), QueryServiceError> {
         let catalog = resolve_catalog_name(&self.service.session_catalog_resolver, catalog)?;
@@ -1050,7 +1031,7 @@ impl FrontendQuerySession {
         &self,
         sql: &str,
         parsed_statement: ParsedStatement,
-        state: FrontendSessionState,
+        state: SessionSqlState,
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
         statement_token: StatementToken,
@@ -1214,7 +1195,7 @@ impl FrontendQuerySession {
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
         statement: &crate::query_execution::control::GovernedQueryStatementOwner,
-        state: FrontendSessionState,
+        state: SessionSqlState,
     ) -> Result<String, QueryServiceError> {
         let prepared = self
             .prepare_governed_query_operation(
@@ -2715,7 +2696,7 @@ async fn wait_for_initial_query_topology(
 }
 
 fn governed_query_deadline(
-    state: &FrontendSessionState,
+    state: &SessionSqlState,
 ) -> Result<(Option<Instant>, Option<u64>), QueryServiceError> {
     let timeout_secs = state.execution_settings.query_timeout_secs();
     let deadline = match timeout_secs {

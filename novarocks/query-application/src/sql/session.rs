@@ -15,9 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Query-application session execution state.
+//! Query-application session state.
 
+use std::collections::BTreeMap;
 use std::fmt;
+
+use novarocks_sql::compiler::SessionOptimizerSettings;
+use novarocks_types::naming::DEFAULT_DATABASE;
+
+/// Connection-local SQL state that is independent of a protocol adapter or
+/// role-local runtime. Adapters may validate and apply mutations to this
+/// state, but do not own a second session representation.
+#[derive(Clone)]
+pub struct SessionSqlState {
+    pub current_catalog: Option<String>,
+    pub current_database: String,
+    pub execution_settings: SessionExecutionSettings,
+    pub optimizer_settings: SessionOptimizerSettings,
+    pub user_variables: BTreeMap<String, String>,
+}
+
+impl Default for SessionSqlState {
+    fn default() -> Self {
+        Self {
+            current_catalog: None,
+            current_database: DEFAULT_DATABASE.to_string(),
+            execution_settings: SessionExecutionSettings::default(),
+            optimizer_settings: SessionOptimizerSettings::default(),
+            user_variables: BTreeMap::new(),
+        }
+    }
+}
 
 /// Connection-local settings that SQL admission has validated.
 ///
@@ -156,7 +184,20 @@ impl std::error::Error for SessionSettingError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionExecutionSettings, SessionSettingError};
+    use super::{SessionExecutionSettings, SessionSettingError, SessionSqlState};
+    use novarocks_types::naming::DEFAULT_DATABASE;
+
+    #[test]
+    fn default_sql_session_state_is_neutral_and_empty() {
+        let state = SessionSqlState::default();
+        assert_eq!(state.current_catalog, None);
+        assert_eq!(state.current_database, DEFAULT_DATABASE);
+        assert!(state.user_variables.is_empty());
+        assert_eq!(
+            state.execution_settings,
+            SessionExecutionSettings::default()
+        );
+    }
 
     #[test]
     fn preserves_session_values_before_wire_projection() {
