@@ -465,9 +465,6 @@ impl FrontendServingLifecycle {
             let sources = inner.active.values().cloned().collect::<Vec<_>>();
             let mut cancelled = 0;
             for lease in &sources {
-                if let Some(cancel) = &lease.external_cancellation {
-                    cancel(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms });
-                }
                 if matches!(
                     lease.cancellation.request(
                         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms },
@@ -480,6 +477,11 @@ impl FrontendServingLifecycle {
             }
             (sources, cancelled)
         };
+        for lease in &sources {
+            if let Some(cancel) = &lease.external_cancellation {
+                cancel(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms });
+            }
+        }
         drop(sources);
         self.publish_metrics();
         cancelled
