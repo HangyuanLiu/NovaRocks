@@ -86,7 +86,8 @@ use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSettingError, SessionSqlState,
 };
 use novarocks_query_application::sql::{
-    SqlStatementParseError, parse_optional_single_statement, parse_single_statement,
+    SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
+    parse_single_statement, split_sql_statements, strip_leading_line_comments,
 };
 use novarocks_types::naming::{DEFAULT_DATABASE, normalize_identifier};
 use novarocks_types::{ClusterRole, EngineErrorCode};
@@ -2282,90 +2283,6 @@ async fn external_namespace_exists(
         .map_err(internal_error)
 }
 
-#[derive(Clone)]
-struct SqlBatchCursor<'a> {
-    sql: &'a str,
-    offset: usize,
-}
-
-impl<'a> SqlBatchCursor<'a> {
-    fn new(sql: &'a str) -> Self {
-        Self { sql, offset: 0 }
-    }
-
-    fn has_remaining(&self) -> bool {
-        self.offset < self.sql.len()
-    }
-
-    /// Returns one raw semicolon-delimited fragment.
-    fn next_fragment(&mut self) -> Result<Option<&'a str>, QueryServiceError> {
-        if !self.has_remaining() {
-            return Ok(None);
-        }
-        #[derive(Clone, Copy)]
-        enum State {
-            Normal,
-            SingleQuote,
-            DoubleQuote,
-            Backtick,
-            LineComment,
-            BlockComment,
-        }
-
-        let start = self.offset;
-        let bytes = self.sql.as_bytes();
-        let mut index = start;
-        let mut state = State::Normal;
-        while index < bytes.len() {
-            match state {
-                State::Normal => match bytes[index] {
-                    b'\'' => state = State::SingleQuote,
-                    b'"' => state = State::DoubleQuote,
-                    b'`' => state = State::Backtick,
-                    b'-' if bytes.get(index + 1) == Some(&b'-') => {
-                        state = State::LineComment;
-                        index += 1;
-                    }
-                    b'#' => state = State::LineComment,
-                    b'/' if bytes.get(index + 1) == Some(&b'*') => {
-                        state = State::BlockComment;
-                        index += 1;
-                    }
-                    b';' => {
-                        self.offset = index + 1;
-                        return Ok(Some(&self.sql[start..index]));
-                    }
-                    _ => {}
-                },
-                State::SingleQuote if bytes[index] == b'\'' => state = State::Normal,
-                State::DoubleQuote if bytes[index] == b'"' => state = State::Normal,
-                State::Backtick if bytes[index] == b'`' => state = State::Normal,
-                State::LineComment if bytes[index] == b'\n' => state = State::Normal,
-                State::BlockComment
-                    if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') =>
-                {
-                    state = State::Normal;
-                    index += 1;
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-        if matches!(
-            state,
-            State::SingleQuote | State::DoubleQuote | State::Backtick
-        ) {
-            self.offset = self.sql.len();
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "unterminated quoted string in SQL batch",
-            ));
-        }
-        self.offset = self.sql.len();
-        Ok(Some(&self.sql[start..]))
-    }
-}
-
 /// Return the one SQL statement permitted by the current MySQL capability
 /// negotiation. The protocol adapter currently advertises neither multi
 /// statements nor multi results, so it must reject all batches before a
@@ -2393,40 +2310,6 @@ fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceE
         }
     }
     Ok(statement)
-}
-
-fn split_sql_statements(sql: &str) -> Result<Vec<String>, QueryServiceError> {
-    let mut cursor = SqlBatchCursor::new(sql);
-    let mut statements = Vec::new();
-    while let Some(fragment) = cursor.next_fragment()? {
-        let statement = fragment.trim();
-        if !statement.is_empty() {
-            statements.push(statement.to_string());
-        }
-    }
-    Ok(statements)
-}
-
-/// Removes leading whole-line comments while retaining the first SQL token.
-/// Script fragments include the repository license header before the SQL
-/// statement, so treating the whole fragment as a comment loses the work.
-fn strip_leading_line_comments(sql: &str) -> &str {
-    let mut remaining = sql.trim();
-    loop {
-        let Some(newline) = remaining.find('\n') else {
-            return if remaining.starts_with("--") || remaining.starts_with('#') {
-                ""
-            } else {
-                remaining
-            };
-        };
-        let line = remaining[..newline].trim();
-        if line.is_empty() || line.starts_with("--") || line.starts_with('#') {
-            remaining = remaining[newline + 1..].trim_start();
-            continue;
-        }
-        return remaining;
-    }
 }
 
 fn parse_bool(value: &str) -> Result<bool, QueryServiceError> {
