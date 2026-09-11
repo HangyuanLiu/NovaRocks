@@ -1495,24 +1495,16 @@ impl FrontendQuerySession {
             let wait_deadline =
                 deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(30));
             let wait_after_revision = topology.revision();
-            let topology_service = Arc::clone(&self.service.topology);
-            match task::spawn_blocking(move || {
-                topology_service.wait_for_eligible_after(wait_after_revision, wait_deadline)
-            })
+            match wait_for_eligible_query_topology_after(
+                &self.service.topology,
+                &cancellation,
+                wait_after_revision,
+                wait_deadline,
+            )
             .await
             {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(error)) => {
-                    return Ok(self.governed_typed_error(
-                        QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string()),
-                        statement,
-                    ));
-                }
-                Err(error) => {
-                    return Ok(
-                        self.governed_typed_error(internal_error(error.to_string()), statement)
-                    );
-                }
+                Ok(snapshot) => snapshot,
+                Err(error) => return Ok(self.governed_typed_error(error, statement)),
             }
         } else {
             topology
@@ -2812,6 +2804,48 @@ async fn wait_for_initial_query_topology(
     }
 }
 
+/// Waits for the replacement round's exact eligibility condition through the
+/// topology watch stream. This owns no blocking thread while topology is empty.
+async fn wait_for_eligible_query_topology_after(
+    topology: &BackendTopologyService,
+    cancellation: &QueryCancellationView,
+    revision: u64,
+    deadline: Instant,
+) -> Result<BackendTopologySnapshot, QueryServiceError> {
+    let mut changes = topology.subscribe_changes();
+    loop {
+        if let Some(reason) = cancellation.reason() {
+            return Err(cancellation_error(reason));
+        }
+        if Instant::now() >= deadline {
+            return Err(internal_error(format!(
+                "timed out waiting for an eligible backend topology revision after {revision}"
+            )));
+        }
+        let snapshot = topology
+            .snapshot()
+            .map_err(|error| internal_error(error.to_string()))?;
+        if snapshot.revision() > revision && !snapshot.targets().is_empty() {
+            return Ok(snapshot);
+        }
+        let sleep = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
+        tokio::pin!(sleep);
+        tokio::select! {
+            biased;
+            reason = cancellation.cancelled() => return Err(cancellation_error(reason)),
+            _ = &mut sleep => return Err(internal_error(format!(
+                "timed out waiting for an eligible backend topology revision after {revision}"
+            ))),
+            changed = changes.changed() => {
+                changed.map_err(|_| QueryServiceError::new(
+                    QueryServiceErrorKind::Unavailable,
+                    "backend topology change stream closed while waiting for an eligible replacement",
+                ))?;
+            }
+        }
+    }
+}
+
 fn governed_query_deadline(
     state: &SessionSqlState,
 ) -> Result<(Option<Instant>, Option<u64>), QueryServiceError> {
@@ -3353,6 +3387,36 @@ mod tests {
             .await
             .expect_err("cancelled statement cannot keep waiting for topology");
         assert_eq!(error.kind(), QueryServiceErrorKind::Interrupted);
+        root.owner.complete();
+        root.business.release();
+    }
+
+    #[tokio::test]
+    async fn replacement_topology_wait_requires_a_new_eligible_revision() {
+        let topology = Arc::new(ChangingTopology::empty());
+        topology.publish(eligible_topology(1));
+        let service: BackendTopologyService = topology.clone();
+        let (_workload, root, cancellation) = test_governed_cancellation();
+        let publish = async {
+            tokio::task::yield_now().await;
+            topology.publish(eligible_topology(2));
+        };
+
+        let (observed, ()) = tokio::join!(
+            wait_for_eligible_query_topology_after(
+                &service,
+                &cancellation,
+                1,
+                Instant::now() + Duration::from_secs(1),
+            ),
+            publish
+        );
+        assert_eq!(
+            observed
+                .expect("replacement topology becomes eligible")
+                .revision(),
+            2
+        );
         root.owner.complete();
         root.business.release();
     }
