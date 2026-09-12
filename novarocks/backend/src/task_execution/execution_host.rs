@@ -1628,12 +1628,12 @@ mod tests {
     use novarocks_worker::IngressRejection;
 
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-    use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::host::{HostRejection, RunnableTask, TaskExecutionHost};
     use crate::task_execution::observation::TaskStatusSource;
     use crate::task_execution::status::{
         METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusOwner, TaskStatusReporter,
     };
+    use novarocks_worker::ProcessMonotonicClock;
 
     // ------------------------------------------------------------- fixtures
 

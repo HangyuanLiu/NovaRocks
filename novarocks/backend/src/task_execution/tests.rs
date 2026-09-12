@@ -61,9 +61,8 @@ use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
 use novarocks_types::{NativeCompatibilityId, UniqueId};
-use novarocks_worker::LeaseBounds;
+use novarocks_worker::{LeaseBounds, ManualClock, WorkerMonotonicClock};
 
-use super::clock::ManualClock;
 use super::host::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
     TaskExecutionHost,
@@ -587,7 +586,7 @@ impl Fixture {
         let task_host = Arc::new(FakeTaskHost::new(Arc::clone(&ledger)));
         let registry = TaskExecutionRegistry::new(
             config,
-            Arc::clone(&clock) as Arc<dyn super::clock::BackendMonotonicClock>,
+            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
         );

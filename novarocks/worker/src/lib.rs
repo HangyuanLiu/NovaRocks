@@ -25,6 +25,7 @@
 use std::num::NonZeroUsize;
 
 mod admission;
+mod clock;
 mod convergence;
 mod domain;
 mod drain;
@@ -39,6 +40,7 @@ pub use admission::{
     AdmissionTicketRedemptionRejection, AdmissionTicketState, MAX_ADMISSION_RESERVATIONS,
     MAX_ADMISSION_TICKET_VALID_FOR,
 };
+pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };

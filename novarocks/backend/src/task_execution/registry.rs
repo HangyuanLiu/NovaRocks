@@ -77,11 +77,11 @@ use novarocks_worker::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
     AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
     ContextTransition, InstalledLease, LatchOutcome, LeaseBounds, LeaseProgression,
-    MonotonicInstant, OperationAdmission, OperationWaitCaps, QueryContextDomains,
-    QueryContextEvent, RequestHorizon, classify_context_transition, classify_operation_admission,
+    MonotonicInstant, OperationAdmission, OperationWaitCaps, ProcessMonotonicClock,
+    QueryContextDomains, QueryContextEvent, RequestHorizon, WorkerMonotonicClock,
+    classify_context_transition, classify_operation_admission,
 };
 
-use super::clock::{BackendMonotonicClock, ProcessMonotonicClock};
 use super::domains::{self, InitialDomainKey, TaskDomains};
 use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
@@ -264,7 +264,7 @@ impl RegistryState {
 /// The backend-local owner of query contexts, tasks, status, and retention.
 pub struct TaskExecutionRegistry {
     config: TaskExecutionRegistryConfig,
-    clock: Arc<dyn BackendMonotonicClock>,
+    clock: Arc<dyn WorkerMonotonicClock>,
     context_host: Arc<dyn QueryContextHost>,
     task_host: Arc<dyn TaskExecutionHost>,
     admission_tickets: AdmissionTicketAuthority,
@@ -276,7 +276,7 @@ pub struct TaskExecutionRegistry {
 impl TaskExecutionRegistry {
     pub fn new(
         config: TaskExecutionRegistryConfig,
-        clock: Arc<dyn BackendMonotonicClock>,
+        clock: Arc<dyn WorkerMonotonicClock>,
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
     ) -> Arc<Self> {

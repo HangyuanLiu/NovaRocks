@@ -42,11 +42,10 @@ use novarocks_execution_contract::task_execution::status::{
 use novarocks_types::UniqueId;
 use novarocks_worker::{
     MonotonicInstant, RootDrainAction, TaskConvergence, TaskConvergenceAdvance,
-    TaskConvergenceRejection, TaskConvergenceSnapshot, TaskTransition, classify_root_drain,
-    classify_task_transition,
+    TaskConvergenceRejection, TaskConvergenceSnapshot, TaskTransition, WorkerMonotonicClock,
+    classify_root_drain, classify_task_transition,
 };
 
-use super::clock::BackendMonotonicClock;
 use super::host::TaskDynamicFilterRead;
 use super::observation::TaskStatusSource;
 
@@ -113,7 +112,7 @@ struct OwnedStatus {
 pub struct TaskStatusOwner {
     identity: TaskIdentity,
     source: Arc<TaskStatusSource>,
-    clock: Arc<dyn BackendMonotonicClock>,
+    clock: Arc<dyn WorkerMonotonicClock>,
     throttle: Duration,
     state: Mutex<OwnedStatus>,
 }
@@ -136,7 +135,7 @@ impl TaskStatusOwner {
     pub fn new(
         identity: TaskIdentity,
         source: Arc<TaskStatusSource>,
-        clock: Arc<dyn BackendMonotonicClock>,
+        clock: Arc<dyn WorkerMonotonicClock>,
         throttle: Duration,
     ) -> Self {
         let current = TaskStatus::created(identity);

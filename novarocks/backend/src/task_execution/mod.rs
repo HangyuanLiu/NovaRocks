@@ -41,7 +41,6 @@
 //! steps.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
-mod clock;
 mod completion;
 mod context_host;
 mod credential_slot;
@@ -62,8 +61,6 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(crate) use clock::{BackendMonotonicClock, ManualClock};
 pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{

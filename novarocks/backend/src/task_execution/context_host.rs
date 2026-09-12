@@ -1203,7 +1203,6 @@ mod tests {
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
         RuntimeFilterParticipantFactory,
     };
-    use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use crate::task_execution::host::{QueryContextHost, SharedFactsRequest};
     use crate::task_execution::observation::TaskStatusSource;
@@ -1211,6 +1210,7 @@ mod tests {
         METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
     };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_worker::ProcessMonotonicClock;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 

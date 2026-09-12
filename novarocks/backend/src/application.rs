@@ -972,6 +972,7 @@ mod tests {
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
     use novarocks_worker::WorkerResultRetainedLimits;
+    use novarocks_worker::{ManualClock, WorkerMonotonicClock};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1040,10 +1041,10 @@ mod tests {
         use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
 
         let backend = novarocks_types::BackendProcessId::new_v7();
-        let clock = Arc::new(crate::task_execution::ManualClock::new());
+        let clock = Arc::new(ManualClock::new());
         let registry = crate::task_execution::TaskExecutionRegistry::new(
             TaskExecutionRegistryConfig::for_process(backend),
-            Arc::clone(&clock) as Arc<dyn crate::task_execution::BackendMonotonicClock>,
+            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
         );

@@ -237,12 +237,12 @@ mod tests {
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,
         BackendFrontendFeedbackSink, BackendMaterializationOwner,
     };
-    use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::observation::TaskStatusSource;
     use crate::task_execution::shared_facts::encode_dynamic_filter_read;
     use crate::task_execution::status::{
         METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
     };
+    use novarocks_worker::ProcessMonotonicClock;
 
     fn identity() -> TaskIdentity {
         TaskIdentity::new(

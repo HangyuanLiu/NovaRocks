@@ -15,26 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The backend's own monotonic clock, taken as an injected dependency.
-//!
-//! Every deadline this module owns — the sequence-zero lease expiry, an
-//! operation's effective wait, the metric publication throttle, and terminal
-//! retention — is derived from readings of one injected clock. Nothing here
-//! reads a wall clock or an absolute deadline that crossed the process
-//! boundary, so a test drives the whole lifecycle by moving a value.
+//! Worker-owned monotonic time sources for local task lifecycle decisions.
 
 use std::fmt;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use novarocks_worker::MonotonicInstant;
+use crate::MonotonicInstant;
 
-/// The backend-local monotonic timeline.
-pub trait BackendMonotonicClock: fmt::Debug + Send + Sync {
+/// The process-local timeline used to decide Worker lifecycle deadlines.
+pub trait WorkerMonotonicClock: fmt::Debug + Send + Sync {
     fn now(&self) -> MonotonicInstant;
 }
 
-/// The production clock: readings elapsed from process start.
+/// Production clock whose readings are elapsed time since process startup.
 #[derive(Debug)]
 pub struct ProcessMonotonicClock {
     origin: Instant,
@@ -54,17 +48,13 @@ impl Default for ProcessMonotonicClock {
     }
 }
 
-impl BackendMonotonicClock for ProcessMonotonicClock {
+impl WorkerMonotonicClock for ProcessMonotonicClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(self.origin.elapsed())
     }
 }
 
-/// A clock advanced only by its owner.
-///
-/// It exists so a lease expiry, a create's own deadline, a throttle interval,
-/// and a retention horizon can all be crossed exactly, in a chosen order,
-/// without sleeping.
+/// A manually advanced timeline for deterministic Worker lifecycle tests.
 #[derive(Debug, Default)]
 pub struct ManualClock {
     elapsed: Mutex<Duration>,
@@ -77,15 +67,35 @@ impl ManualClock {
         }
     }
 
-    /// Moves the timeline forward.
+    /// Moves the timeline forward without waiting on wall time.
     pub fn advance(&self, delta: Duration) {
         let mut elapsed = self.elapsed.lock().expect("manual clock lock");
         *elapsed = elapsed.saturating_add(delta);
     }
 }
 
-impl BackendMonotonicClock for ManualClock {
+impl WorkerMonotonicClock for ManualClock {
     fn now(&self) -> MonotonicInstant {
         MonotonicInstant::from_origin(*self.elapsed.lock().expect("manual clock lock"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{ManualClock, WorkerMonotonicClock};
+    use crate::MonotonicInstant;
+
+    #[test]
+    fn manual_clock_advances_only_when_its_owner_moves_it() {
+        let clock = ManualClock::new();
+        assert_eq!(clock.now(), MonotonicInstant::ORIGIN);
+
+        clock.advance(Duration::from_millis(17));
+        assert_eq!(
+            clock.now(),
+            MonotonicInstant::from_origin(Duration::from_millis(17))
+        );
     }
 }

@@ -604,7 +604,6 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::clock::{BackendMonotonicClock, ManualClock};
     use super::super::host::{
         HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
         TaskExecutionHost,
@@ -612,6 +611,7 @@ mod tests {
     use super::super::registry::TaskExecutionRegistryConfig;
     use super::super::status::TaskStatusReporter;
     use super::*;
+    use novarocks_worker::{ManualClock, WorkerMonotonicClock};
 
     /// An execution side that accepts everything, so these cases fail only on
     /// the protocol boundary they are about.
@@ -742,7 +742,7 @@ mod tests {
             let native_compatibility_id = NativeCompatibilityId::new([0x71; 32]);
             let registry = TaskExecutionRegistry::new(
                 config,
-                Arc::new(ManualClock::new()) as Arc<dyn BackendMonotonicClock>,
+                Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
             );
