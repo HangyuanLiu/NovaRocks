@@ -4115,6 +4115,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-memory",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-query-application",
  "novarocks-secret",

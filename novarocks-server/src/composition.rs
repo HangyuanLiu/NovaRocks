@@ -848,14 +848,16 @@ fn compose_task_execution_budgets(
 
 fn backend_native_transport(
     transport: &NativeTrustTransport,
-) -> novarocks_backend::BackendNativeTransport {
+) -> novarocks_native_adapter::BackendNativeTransport {
     match transport {
-        NativeTrustTransport::Plaintext => novarocks_backend::BackendNativeTransport::Plaintext,
+        NativeTrustTransport::Plaintext => {
+            novarocks_native_adapter::BackendNativeTransport::Plaintext
+        }
         NativeTrustTransport::Automatic(material) => {
-            novarocks_backend::BackendNativeTransport::Automatic(material.clone())
+            novarocks_native_adapter::BackendNativeTransport::Automatic(material.clone())
         }
         NativeTrustTransport::Pem(material) => {
-            novarocks_backend::BackendNativeTransport::Pem(material.clone())
+            novarocks_native_adapter::BackendNativeTransport::Pem(material.clone())
         }
     }
 }

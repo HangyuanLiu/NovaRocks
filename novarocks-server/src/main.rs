@@ -163,7 +163,7 @@ fn run_backend(
         provider_manifest,
         runtime.handle().clone(),
     )?;
-    let data_runtime = novarocks_backend::BackendDataRuntime::new(
+    let data_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.handle().clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
@@ -211,7 +211,7 @@ async fn run_all_in_one(
         provider_manifest,
         runtime.clone(),
     )?;
-    let backend_runtime = novarocks_backend::BackendDataRuntime::new(
+    let backend_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
