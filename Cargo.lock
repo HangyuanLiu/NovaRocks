@@ -4119,6 +4119,7 @@ dependencies = [
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-memory",
+ "novarocks-mysql-adapter",
  "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-query-application",

@@ -29,7 +29,7 @@ use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
-use crate::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
+use novarocks_mysql_adapter::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
@@ -996,7 +996,6 @@ mod tests {
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
         run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
     };
-    use crate::ResolvedMysqlListenerSettings;
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::state_store::{
         StateStoreProviderRegistry,
@@ -1004,8 +1003,10 @@ mod tests {
     };
     use crate::{
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-        FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
+        FrontendApplicationHost, FrontendExecutionConfig,
     };
+    use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
+    use novarocks_mysql_adapter::ResolvedMysqlListenerSettings;
     use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
     use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};

@@ -628,7 +628,7 @@ pub fn compose_frontend_server_config(
         Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(
+    let mysql_listener = novarocks_mysql_adapter::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()

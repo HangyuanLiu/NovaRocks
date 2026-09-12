@@ -57,9 +57,6 @@ pub use mv::FrontendMvService;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
 pub use native::report_server::FrontendReportServerHandle;
-pub use novarocks_mysql_adapter::{
-    MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
-};
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{
