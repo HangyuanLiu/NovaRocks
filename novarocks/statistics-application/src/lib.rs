@@ -36,7 +36,7 @@ use uuid::Uuid;
 
 mod job_service;
 
-pub use job_service::StatisticsJobService;
+pub use job_service::{StatisticsJobRuntime, StatisticsJobService};
 
 pub const MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS: usize = 1024;
 pub const MAX_RECENT_TERMINAL_STATISTICS_JOBS: usize = 4096;
@@ -905,6 +905,8 @@ mod process_runtime_tests;
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
@@ -943,6 +945,48 @@ mod tests {
     struct RecordingExecutor {
         publications: AtomicUsize,
         finalization_fails: bool,
+    }
+
+    struct BlockingExecutor {
+        started: mpsc::Sender<()>,
+        release: Mutex<mpsc::Receiver<()>>,
+    }
+
+    impl StatisticsAttemptExecutor for BlockingExecutor {
+        fn prepare(
+            &self,
+            _job: &StatisticsJob,
+            _scope: &WorkScope,
+        ) -> Result<(), StatisticsAttemptError> {
+            self.started
+                .send(())
+                .expect("test observes the background preparation");
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv()
+                .expect("test releases the background preparation");
+            Ok(())
+        }
+
+        fn collect(
+            &self,
+            _job: &StatisticsJob,
+            _scope: &WorkScope,
+        ) -> Result<(), StatisticsAttemptError> {
+            Ok(())
+        }
+
+        fn publish(
+            &self,
+            _job: &StatisticsJob,
+            _scope: &WorkScope,
+        ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
+            Ok(StatisticsPublicationOutcome {
+                fact: StatisticsPublicationFact::KnownCommitted,
+                finalization_failure: None,
+            })
+        }
     }
 
     impl StatisticsAttemptExecutor for RecordingExecutor {
@@ -1051,6 +1095,68 @@ mod tests {
             cancelled.state,
             StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_returns_submission_before_its_background_attempt_concludes() {
+        let service = StatisticsJobService::new();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(BlockingExecutor {
+                started,
+                release: Mutex::new(release_rx),
+            }),
+            tokio::runtime::Handle::current(),
+        );
+
+        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background preparation started")
+        })
+        .await
+        .expect("observe preparation");
+        let observed = service
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|job| job.id == submitted.id)
+            .expect("submitted job remains observable");
+        assert_eq!(
+            observed.state,
+            StatisticsJobState::Active(StatisticsJobPhase::Preparing)
+        );
+
+        release.send(()).expect("release preparation");
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let job = service
+                    .list()
+                    .await
+                    .expect("list")
+                    .into_iter()
+                    .find(|job| job.id == submitted.id)
+                    .expect("job remains retained");
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("background job reaches terminal");
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
+        );
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown worker");
     }
 
     #[tokio::test]

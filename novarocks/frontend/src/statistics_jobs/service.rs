@@ -18,10 +18,10 @@
 //! Frontend adapters for the statistics application product owner.
 //!
 //! This module translates typed frontend commands and connector target
-//! captures. It deliberately owns neither a job ledger nor a worker. A live
-//! ANALYZE needs both a product-supplied root `WorkOwner` and a three-phase
-//! executor; without them the entrypoint fails closed until role composition
-//! (T12) supplies the binding.
+//! captures. It deliberately owns neither a job ledger nor business attempt
+//! orchestration. Role composition starts the product-owned job runtime with
+//! the concrete attempt adapter; without the required bindings the entrypoint
+//! fails closed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,14 +30,13 @@ use super::application;
 use super::model::StatisticsJobTarget;
 use novarocks_statistics_application::{
     StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
-    StatisticsJobId, StatisticsJobService, StatisticsTarget,
+    StatisticsJobId, StatisticsJobRuntime, StatisticsJobService, StatisticsTarget,
 };
 use novarocks_workload_control::{RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsStatementResult {
     JobSubmitted(StatisticsJob),
-    JobCompleted(StatisticsJob),
     JobCancellationRequested(StatisticsJob),
     AnalyzeJobs(Vec<StatisticsJob>),
     TableStats(Vec<StatisticsTableStatRow>),
@@ -147,12 +146,11 @@ pub(crate) fn table_statistics_reader_for_role(
 }
 
 pub struct FrontendStatisticsApplicationPort {
-    job_service: StatisticsJobService,
+    job_runtime: StatisticsJobRuntime,
     target_resolver: Arc<dyn application::StatisticsTargetResolver>,
     root_scope: Arc<dyn StatisticsJobRootScopeSource>,
     table_statistics: Arc<dyn TableStatisticsReader>,
     runtime: tokio::runtime::Handle,
-    core_executor: Arc<dyn StatisticsAttemptExecutor>,
 }
 impl FrontendStatisticsApplicationPort {
     pub fn new(
@@ -164,26 +162,18 @@ impl FrontendStatisticsApplicationPort {
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
-            job_service,
+            job_runtime: StatisticsJobRuntime::start(job_service, core_executor, runtime.clone()),
             target_resolver,
             root_scope,
             table_statistics,
             runtime,
-            core_executor,
         }
     }
     pub async fn shutdown_worker_until(&self, _deadline: Instant) -> Result<(), String> {
-        Ok(())
+        self.job_runtime.shutdown_until(_deadline).await
     }
-    pub fn request_worker_stop_for_process_exit(&self) {}
-    fn run_bound_job(&self, at_ms: i64) -> Result<Option<StatisticsJob>, String> {
-        tokio::task::block_in_place(|| {
-            self.runtime.block_on(
-                self.job_service
-                    .run_one(Arc::clone(&self.core_executor), at_ms),
-            )
-        })
-        .map_err(|error| error.to_string())
+    pub fn request_worker_stop_for_process_exit(&self) {
+        self.job_runtime.request_stop_for_process_exit();
     }
 
     async fn execute_command(
@@ -214,7 +204,7 @@ impl FrontendStatisticsApplicationPort {
                         )
                     }
                 };
-                self.job_service
+                self.job_runtime
                     .submit(
                         StatisticsJobCreate {
                             target: StatisticsTarget {
@@ -235,13 +225,13 @@ impl FrontendStatisticsApplicationPort {
                     })
             }
             application::StatisticsApplicationCommand::ShowAnalyzeJobs => self
-                .job_service
+                .job_runtime
                 .list()
                 .await
                 .map(StatisticsStatementResult::AnalyzeJobs)
                 .map_err(|error| application::StatisticsApplicationError::new(error.to_string())),
             application::StatisticsApplicationCommand::CancelAnalyze { job_id } => self
-                .job_service
+                .job_runtime
                 .request_cancel(StatisticsJobId::from_uuid(job_id), submitted_at_ms)
                 .await
                 .map(StatisticsStatementResult::JobCancellationRequested)
@@ -293,16 +283,6 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
             self.runtime
                 .block_on(self.execute_command(command, at_ms, connector_context))
         })?;
-        let result = match result {
-            StatisticsStatementResult::JobSubmitted(job) => match self
-                .run_bound_job(at_ms)
-                .map_err(application::StatisticsApplicationError::new)?
-            {
-                Some(completed) => StatisticsStatementResult::JobCompleted(completed),
-                None => StatisticsStatementResult::JobSubmitted(job),
-            },
-            other => other,
-        };
         Ok(map_application_result(result))
     }
 }
@@ -353,9 +333,6 @@ fn map_application_result(
     match result {
         StatisticsStatementResult::JobSubmitted(job) => {
             application::StatisticsApplicationResult::JobSubmitted(job_view(job))
-        }
-        StatisticsStatementResult::JobCompleted(job) => {
-            application::StatisticsApplicationResult::JobCompleted(job_view(job))
         }
         StatisticsStatementResult::JobCancellationRequested(job) => {
             application::StatisticsApplicationResult::JobCancellationRequested(job_view(job))

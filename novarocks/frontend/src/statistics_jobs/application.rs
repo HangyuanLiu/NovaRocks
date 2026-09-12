@@ -487,12 +487,6 @@ pub enum StatisticsApplicationResult {
     /// The job was accepted and left running: the statement did not wait for
     /// it, so its outcome is not known yet.
     JobSubmitted(StatisticsJobView),
-    /// The statement waited and the job reached a terminal state.
-    ///
-    /// This is deliberately not the same answer as `JobSubmitted`. A waited
-    /// statement knows whether the work succeeded, and collapsing the two
-    /// would report a job that failed as a statement that worked.
-    JobCompleted(StatisticsJobView),
     JobCancellationRequested(StatisticsJobView),
     AnalyzeJobs(Vec<StatisticsJobView>),
     TableStats(Vec<StatisticsTableStatView>),
