@@ -28,6 +28,7 @@ path = "src/main.rs"
 [dependencies]
 novarocks-frontend.workspace = true
 novarocks-parser.workspace = true
+novarocks-query-application.workspace = true
 novarocks-sql.workspace = true
 novarocks-user-error.workspace = true
 
