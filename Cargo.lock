@@ -3795,7 +3795,6 @@ dependencies = [
 name = "novarocks-error-manifest"
 version = "0.1.0"
 dependencies = [
- "novarocks-frontend",
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-sql",
