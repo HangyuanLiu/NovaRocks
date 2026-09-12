@@ -25,14 +25,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
+use super::background::MvBackgroundEngine;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::{
     MvPublishedProjection, MvPublishedWaterline, MvRepositoryError, MvTarget,
 };
-use novarocks_mv_application::scheduler::MvSchedulerConfig;
+use novarocks_mv_application::{
+    maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind},
+    scheduler::MvSchedulerConfig,
+};
 
 /// Why a refresh was made runnable.  A worker does not reinterpret this as a
 /// retry policy; it is purely observable scheduling state.

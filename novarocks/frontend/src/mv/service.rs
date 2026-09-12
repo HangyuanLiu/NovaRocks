@@ -23,9 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::background::{
-    MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
-};
+use super::background::{MvBackgroundBindings, MvBackgroundEngine};
 use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
 use crate::common::backend_topology::BackendTopologyService;
 use crate::mv::domain::application::{
@@ -41,7 +39,9 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
     activity::{MvActivityGate, MvActivityLease, MvActivityOwner},
-    maintenance::MaintenanceCoordinatorConfig,
+    maintenance::{
+        MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
+    },
     scheduler::MvSchedulerConfig,
 };
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};

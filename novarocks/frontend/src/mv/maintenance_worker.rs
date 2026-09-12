@@ -36,7 +36,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
+use super::background::MvBackgroundEngine;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepositoryError;
@@ -47,7 +47,8 @@ use novarocks_mv_application::{
     activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner},
     maintenance::{
         AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
-        MaintenanceCoordinatorConfig, MaintenanceExecutionReport,
+        MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
+        MvBackgroundEngineErrorKind,
     },
 };
 use novarocks_table_maintenance::{

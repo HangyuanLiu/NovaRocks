@@ -41,9 +41,9 @@ use novarocks_spi::connector::{
 use novarocks_sql::planning::mv::MvRefreshStatement;
 use novarocks_table_maintenance::MaintenanceTarget;
 
-use super::background::{
-    MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
-    MvRefreshStep,
+use super::background::{MvBackgroundEngine, MvRefreshStep};
+use novarocks_mv_application::maintenance::{
+    MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
 
 struct BackgroundConnectorCancellation {
@@ -296,8 +296,8 @@ fn repository_error(
 #[cfg(test)]
 mod tests {
     use super::preparation_error;
-    use crate::mv::background::MvBackgroundEngineErrorKind;
     use crate::mv::domain::lifecycle::RefreshError;
+    use novarocks_mv_application::maintenance::MvBackgroundEngineErrorKind;
 
     #[test]
     fn retryable_preparation_error_preserves_its_typed_disposition() {

@@ -25,9 +25,7 @@ use crate::query_execution::maintenance::TableMaintenanceEngine;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh,
 };
-pub(crate) use novarocks_mv_application::maintenance::{
-    MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
-};
+use novarocks_mv_application::maintenance::{MvBackgroundEngineError, MvMaintenanceFacts};
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_table_maintenance::MaintenanceTarget;
 
