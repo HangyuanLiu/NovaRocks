@@ -21,7 +21,7 @@ pub mod catalog_application;
 pub mod catalog_controller;
 mod catalog_projection_metrics;
 mod catalog_prune;
-pub mod common;
+mod common;
 pub(crate) mod connector;
 pub(crate) mod coordinator;
 pub mod dml;
