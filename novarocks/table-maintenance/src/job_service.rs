@@ -17,14 +17,17 @@
 
 //! Product-owned current-process OPTIMIZE submission and observation.
 
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use tokio::runtime::Handle;
 
 use crate::activity::{
     MaintenanceActivityBusy, MaintenanceActivityFamily, MaintenanceActivityPermit,
     TableMaintenanceActivity,
 };
 use crate::runtime::{JobCreate, JobHandle, MaintenanceJobState, RuntimeErrorKind};
+use crate::worker::{OptimizeJobAdmissionPort, OptimizeJobExecutionPort, OptimizeWorker};
 use crate::{MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime, OptimizeSubmission};
 
 /// Exact provider facts captured only after the product has the target gate.
@@ -49,6 +52,31 @@ pub trait OptimizeTargetCapturePort: Send + Sync {
 pub struct OptimizeJobService {
     activity: TableMaintenanceActivity,
     runtime: Arc<OptimizeProcessRuntime>,
+}
+
+enum WorkerLifecycle {
+    NotStarted,
+    Started(OptimizeWorker),
+    Stopped(Result<(), String>),
+}
+
+/// The process-local OPTIMIZE product runtime.
+///
+/// This owner combines the job ledger with its product worker lifecycle. Role
+/// composition supplies the runtime and the narrow admission/execution ports,
+/// but it cannot advance, wake, stop, or join jobs itself.
+pub struct OptimizeJobRuntime {
+    service: OptimizeJobService,
+    worker: Mutex<WorkerLifecycle>,
+}
+
+impl Default for OptimizeJobRuntime {
+    fn default() -> Self {
+        Self {
+            service: OptimizeJobService::new(),
+            worker: Mutex::new(WorkerLifecycle::NotStarted),
+        }
+    }
 }
 
 impl OptimizeJobService {
@@ -124,6 +152,127 @@ impl OptimizeJobService {
     }
 }
 
+impl OptimizeJobRuntime {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn acquire_activity(
+        &self,
+        target: &MaintenanceTarget,
+        family: MaintenanceActivityFamily,
+    ) -> Result<MaintenanceActivityPermit, MaintenanceActivityBusy> {
+        self.service.acquire_activity(target, family)
+    }
+
+    pub fn start(
+        &self,
+        runtime: &Handle,
+        admission: Arc<dyn OptimizeJobAdmissionPort>,
+        execution: Arc<dyn OptimizeJobExecutionPort>,
+    ) -> Result<(), String> {
+        let mut lifecycle = self
+            .worker
+            .lock()
+            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+        match &*lifecycle {
+            WorkerLifecycle::NotStarted => {
+                *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start(
+                    runtime,
+                    self.service.runtime(),
+                    admission,
+                    execution,
+                ));
+                Ok(())
+            }
+            WorkerLifecycle::Started(_) => {
+                Err("table maintenance service is already started".to_string())
+            }
+            WorkerLifecycle::Stopped(_) => {
+                Err("table maintenance service cannot be restarted after shutdown".to_string())
+            }
+        }
+    }
+
+    pub async fn submit_optimize(
+        &self,
+        target: MaintenanceTarget,
+        capture: &dyn OptimizeTargetCapturePort,
+    ) -> Result<OptimizeSubmission, String> {
+        let submission = self.service.submit_optimize(target, capture).await?;
+        if matches!(submission, OptimizeSubmission::Submitted { .. }) {
+            self.wakeup_worker()?;
+        }
+        Ok(submission)
+    }
+
+    pub async fn list(&self) -> Result<Vec<OptimizeJob>, String> {
+        self.service.list().await
+    }
+
+    pub async fn wait_for_completion(
+        &self,
+        handle: JobHandle,
+    ) -> Result<MaintenanceJobState, String> {
+        self.service.wait_for_completion(handle).await
+    }
+
+    pub fn stop_admission(&self) {
+        self.service.stop_admission();
+    }
+
+    pub async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
+        self.stop_admission();
+        let previous = {
+            let mut lifecycle = self
+                .worker
+                .lock()
+                .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+            std::mem::replace(&mut *lifecycle, WorkerLifecycle::Stopped(Ok(())))
+        };
+        let (next, result) = match previous {
+            WorkerLifecycle::NotStarted => (WorkerLifecycle::Stopped(Ok(())), Ok(())),
+            WorkerLifecycle::Started(mut worker) => {
+                let result = worker.shutdown_until(deadline).await;
+                if result.is_err() && worker.has_join_owner() {
+                    (WorkerLifecycle::Started(worker), result)
+                } else {
+                    (WorkerLifecycle::Stopped(result.clone()), result)
+                }
+            }
+            WorkerLifecycle::Stopped(result) => (WorkerLifecycle::Stopped(result.clone()), result),
+        };
+        let mut lifecycle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *lifecycle = next;
+        result
+    }
+
+    pub fn request_shutdown_for_process_exit(&self) {
+        self.stop_admission();
+        let lifecycle = self
+            .worker
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let WorkerLifecycle::Started(worker) = &*lifecycle {
+            worker.request_stop();
+        }
+    }
+
+    fn wakeup_worker(&self) -> Result<(), String> {
+        let worker = self
+            .worker
+            .lock()
+            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
+        if let WorkerLifecycle::Started(worker) = &*worker {
+            worker.wakeup();
+        }
+        Ok(())
+    }
+}
+
 fn now_unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -133,7 +282,12 @@ fn now_unix_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
     use super::*;
+    use crate::worker::{OptimizeJobAdmission, OptimizeJobExecution, OptimizeJobScope};
+    use crate::{MaintenanceActionOutcome, MaintenanceTargetRebind};
 
     struct FixedCapture;
 
@@ -142,6 +296,56 @@ mod tests {
             Ok(CapturedOptimizeTarget {
                 object_id: vec![7],
                 base_snapshot_id: 11,
+            })
+        }
+    }
+
+    struct ActiveScope;
+
+    impl OptimizeJobScope for ActiveScope {
+        fn is_cancelled(&self) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
+    struct ReadyAdmission;
+
+    impl OptimizeJobAdmissionPort for ReadyAdmission {
+        fn try_begin(&self) -> Result<OptimizeJobAdmission, String> {
+            Ok(OptimizeJobAdmission::Acquired(Box::new(ActiveScope)))
+        }
+    }
+
+    struct SuccessfulExecution;
+
+    impl OptimizeJobExecutionPort for SuccessfulExecution {
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
+            Some(Box::new(Self))
+        }
+    }
+
+    impl OptimizeJobExecution for SuccessfulExecution {
+        fn rebind_target(&self, _job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
+            Ok(MaintenanceTargetRebind::Bound)
+        }
+
+        fn execute(
+            &self,
+            _job: &OptimizeJob,
+        ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
+            Ok(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: Some(1),
+                rewritten_data_files_count: 1,
+                added_data_files_count: Some(1),
+                added_delete_files_count: Some(0),
+                rewritten_bytes_count: 1,
+                failed_data_files_count: 0,
+                removed_delete_files_count: 0,
+                output_record_count: Some(1),
             })
         }
     }
@@ -195,5 +399,32 @@ mod tests {
                 .expect_err("busy is not capture failure")
                 .contains("already active")
         );
+    }
+
+    #[tokio::test]
+    async fn product_runtime_owns_submission_wakeup_and_worker_join() {
+        let runtime = OptimizeJobRuntime::new();
+        runtime
+            .start(
+                &Handle::current(),
+                Arc::new(ReadyAdmission),
+                Arc::new(SuccessfulExecution),
+            )
+            .expect("start product runtime");
+        let submission = runtime
+            .submit_optimize(target(), &FixedCapture)
+            .await
+            .expect("submit optimize");
+        let handle = submission.handle().expect("submitted job has a handle");
+        let terminal =
+            tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_completion(handle))
+                .await
+                .expect("worker completes submitted job")
+                .expect("observe job terminal");
+        assert_eq!(terminal, MaintenanceJobState::Finished);
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("join product worker");
     }
 }

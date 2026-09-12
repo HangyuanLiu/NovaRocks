@@ -22,7 +22,7 @@
 //! named GC first-observation accelerator; it never owns a catalog mutation.
 
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_spi::connector::{
@@ -52,9 +52,8 @@ use novarocks_table_maintenance::activity::MaintenanceActivityFamily;
 use novarocks_table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use novarocks_table_maintenance::job_service::OptimizeJobService;
+use novarocks_table_maintenance::job_service::OptimizeJobRuntime;
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
-use novarocks_table_maintenance::worker::OptimizeWorker;
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
@@ -63,17 +62,10 @@ pub mod admission;
 pub mod result;
 pub mod worker;
 
-enum WorkerLifecycle {
-    NotStarted,
-    Started(OptimizeWorker),
-    Stopped(Result<(), String>),
-}
-
 // Design: ADR-0111 (docs/adr/ADR-0111-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
 pub struct FrontendTableMaintenanceService {
-    optimize_jobs: OptimizeJobService,
+    optimize_jobs: OptimizeJobRuntime,
     gc_observations: Option<Arc<GcOwnedRefObservationAccelerator>>,
-    worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
@@ -111,9 +103,8 @@ impl FrontendTableMaintenanceService {
             None => None,
         };
         Ok(Self {
-            optimize_jobs: OptimizeJobService::new(),
+            optimize_jobs: OptimizeJobRuntime::new(),
             gc_observations,
-            worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
             lake_publication_runtime_policy: None,
             root_admission,
@@ -341,14 +332,7 @@ impl FrontendTableMaintenanceService {
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
         let capture = FrontendOptimizeTargetCapturePort::new(engine);
-        match self.block_on(self.optimize_jobs.submit_optimize(target, &capture)) {
-            Ok(OptimizeSubmission::Submitted { job_id }) => {
-                self.wakeup_worker()?;
-                Ok(OptimizeSubmission::Submitted { job_id })
-            }
-            Ok(OptimizeSubmission::AlreadyActive) => Ok(OptimizeSubmission::AlreadyActive),
-            Err(error) => Err(error),
-        }
+        self.block_on(self.optimize_jobs.submit_optimize(target, &capture))
     }
 
     fn show_optimize(
@@ -379,55 +363,12 @@ impl FrontendTableMaintenanceService {
         optimize_jobs_result(jobs)
     }
 
-    fn wakeup_worker(&self) -> Result<(), String> {
-        let worker = self
-            .worker
-            .lock()
-            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        if let WorkerLifecycle::Started(worker) = &*worker {
-            worker.wakeup();
-        }
-        Ok(())
-    }
-
     pub(crate) async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
-        self.optimize_jobs.stop_admission();
-        let previous = {
-            let mut lifecycle = self
-                .worker
-                .lock()
-                .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-            std::mem::replace(&mut *lifecycle, WorkerLifecycle::Stopped(Ok(())))
-        };
-        let (next, result) = match previous {
-            WorkerLifecycle::NotStarted => (WorkerLifecycle::Stopped(Ok(())), Ok(())),
-            WorkerLifecycle::Started(mut worker) => {
-                let result = worker.shutdown_until(deadline).await;
-                if result.is_err() && worker.has_join_owner() {
-                    (WorkerLifecycle::Started(worker), result)
-                } else {
-                    (WorkerLifecycle::Stopped(result.clone()), result)
-                }
-            }
-            WorkerLifecycle::Stopped(result) => (WorkerLifecycle::Stopped(result.clone()), result),
-        };
-        let mut lifecycle = self
-            .worker
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        *lifecycle = next;
-        result
+        self.optimize_jobs.shutdown_until(deadline).await
     }
 
     pub(crate) fn request_shutdown_for_process_exit(&self) {
-        self.optimize_jobs.stop_admission();
-        let lifecycle = self
-            .worker
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let WorkerLifecycle::Started(worker) = &*lifecycle {
-            worker.request_stop();
-        }
+        self.optimize_jobs.request_shutdown_for_process_exit();
     }
 }
 
@@ -648,31 +589,15 @@ fn rewrite_position_delete_intent(
 #[async_trait::async_trait]
 impl TableMaintenanceService for FrontendTableMaintenanceService {
     fn start(&self, engine: Arc<dyn TableMaintenanceEngine>) -> Result<(), String> {
-        let mut lifecycle = self
-            .worker
-            .lock()
-            .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
-        match &*lifecycle {
-            WorkerLifecycle::NotStarted => {
-                *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start(
-                    &self.runtime,
-                    self.optimize_jobs.runtime(),
-                    Arc::new(FrontendOptimizeJobAdmissionPort::new(
-                        self.root_admission.clone(),
-                    )),
-                    Arc::new(FrontendOptimizeJobExecutionPort::new(Arc::downgrade(
-                        &engine,
-                    ))),
-                ));
-                Ok(())
-            }
-            WorkerLifecycle::Started(_) => {
-                Err("table maintenance service is already started".to_string())
-            }
-            WorkerLifecycle::Stopped(_) => {
-                Err("table maintenance service cannot be restarted after shutdown".to_string())
-            }
-        }
+        self.optimize_jobs.start(
+            &self.runtime,
+            Arc::new(FrontendOptimizeJobAdmissionPort::new(
+                self.root_admission.clone(),
+            )),
+            Arc::new(FrontendOptimizeJobExecutionPort::new(Arc::downgrade(
+                &engine,
+            ))),
+        )
     }
 
     async fn handle_typed_statement(
