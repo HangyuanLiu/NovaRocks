@@ -369,3 +369,7 @@ where
         value,
     })
 }
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod codec_tests;

@@ -17,23 +17,23 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use bytes::Bytes;
-use novarocks_frontend::mv::domain::dependency::model::{
+use super::super::super::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks_frontend::mv::domain::persistence::definition::{
+use super::super::super::domain::persistence::definition::{
     MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
 };
-use novarocks_frontend::mv::domain::repository::MvTargetLookup;
-use novarocks_frontend::mv::repository::catalog::schema_catalog;
-use novarocks_frontend::mv::repository::codec::{
-    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
-    encode_record,
-};
-use novarocks_frontend::mv::repository::key::{
+use super::super::super::domain::repository::MvTargetLookup;
+use super::super::catalog::schema_catalog;
+use super::super::key::{
     MvKeyKind, decode_key, dependency_by_downstream_key, dependency_by_upstream_key,
     projection_by_id_key, sequence_key, target_lookup_key,
 };
+use super::{
+    DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,
+    encode_record,
+};
+use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
