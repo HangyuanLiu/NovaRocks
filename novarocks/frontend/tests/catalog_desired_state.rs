@@ -47,10 +47,10 @@ use novarocks_frontend::catalog_application::{
 use novarocks_frontend::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use novarocks_frontend::connector::ConnectorControlHost;
-use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig,
+use novarocks_frontend::application::{
+    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
+use novarocks_frontend::topology::ClusterBackendOpenConfig;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
