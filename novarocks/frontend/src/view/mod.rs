@@ -34,6 +34,8 @@ pub(crate) mod command;
 pub mod engine;
 mod iceberg;
 mod rewrite;
+#[cfg(test)]
+mod tests;
 
 pub use engine::{
     CreateExternalViewRequest, EmptyViewService, ExternalViewResolution, ResolvedExternalView,

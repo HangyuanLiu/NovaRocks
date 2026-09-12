@@ -19,12 +19,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, StringArray};
-use novarocks_frontend::view::FrontendViewService;
-use novarocks_frontend::view::{
-    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
-    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
+use super::{
+    CreateExternalViewRequest, ExternalViewResolution, FrontendViewService, ResolvedExternalView,
+    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
+    ViewTarget,
 };
+use arrow::array::{Array, StringArray};
 use novarocks_parser::{
     Span,
     ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
