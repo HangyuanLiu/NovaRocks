@@ -38,6 +38,7 @@ mod operation;
 mod receipt;
 mod reliable_transport;
 mod status;
+mod task_domain_execution;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -81,6 +82,11 @@ pub use reliable_transport::{
 pub use status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
+};
+pub use task_domain_execution::{
+    DomainExecutionRejection, apply_planned_task_domain_updates, apply_task_domain_updates,
+    commit_task_domain_execution_updates, plan_task_domain_execution_updates,
+    validate_task_domain_execution_membership,
 };
 
 /// Positive, ordered joint retained-result limits owned by one worker process.

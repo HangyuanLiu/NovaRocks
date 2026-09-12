@@ -15,3 +15,4 @@ novarocks-execution-contract.workspace = true
 novarocks-types.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true, features = ["v4"] }
+tracing.workspace = true

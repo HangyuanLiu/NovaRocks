@@ -4452,6 +4452,7 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-types",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

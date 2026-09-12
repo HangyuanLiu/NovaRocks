@@ -82,7 +82,6 @@ use novarocks_worker::{
     classify_context_transition, classify_operation_admission,
 };
 
-use super::domains::{self, InitialDomainKey, TaskDomains};
 use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
@@ -91,10 +90,13 @@ use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::marker;
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt, QueryContextOutcome,
-    ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding, RootResultRoute,
-    RunnableTask, SharedFactsRequest, StatusAdvance, TaskExecutionHost, TaskStatusOwner,
-    TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
+    FinalTaskInfoOutcome, InitialDomainKey, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt,
+    QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding,
+    RootResultRoute, RunnableTask, SharedFactsRequest, StatusAdvance, TaskDomains,
+    TaskExecutionHost, TaskStatusOwner, TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
+    apply_planned_task_domain_updates, apply_task_domain_updates,
+    commit_task_domain_execution_updates, initial_domain_keys, plan_task_domain_execution_updates,
+    validate_task_domain_execution_membership,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";
@@ -553,7 +555,8 @@ impl TaskExecutionRegistry {
                 IdentityMismatch::new(IdentityField::BackendProcess),
             );
         }
-        if let Err(rejection) = domains::validate_membership(descriptor, request.initial_domains())
+        if let Err(rejection) =
+            validate_task_domain_execution_membership(descriptor, request.initial_domains())
         {
             return OperationReceipt::rejected(
                 operation,
@@ -565,7 +568,7 @@ impl TaskExecutionRegistry {
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
         let deadline = self.deadline_of(envelope);
         let fingerprint = descriptor.fingerprint();
-        let initial_keys = domains::initial_domain_keys(request.initial_domains());
+        let initial_keys = initial_domain_keys(request.initial_domains());
 
         let (cell, source) = match self.elect_creation_owner(
             context,
@@ -615,7 +618,7 @@ impl TaskExecutionRegistry {
         transaction.capability_installed = true;
 
         let mut task_domains = TaskDomains::for_descriptor(&transaction.descriptor);
-        let receipts = match domains::apply_updates(
+        let receipts = match apply_task_domain_updates(
             &*self.task_host,
             &transaction.descriptor,
             &mut task_domains,
@@ -995,19 +998,10 @@ impl TaskExecutionRegistry {
             }
         };
 
-        let plan = match domains::plan_updates(&descriptor, &task_domains, request.domains()) {
-            Ok(plan) => plan,
-            Err(rejection) => {
-                return OperationReceipt::rejected(
-                    operation,
-                    rejection.outcome(),
-                    rejection.detail(),
-                );
-            }
-        };
-        let queued =
-            match domains::apply_planned(&*self.task_host, &descriptor, request.domains(), &plan) {
-                Ok(queued) => queued,
+        let plan =
+            match plan_task_domain_execution_updates(&descriptor, &task_domains, request.domains())
+            {
+                Ok(plan) => plan,
                 Err(rejection) => {
                     return OperationReceipt::rejected(
                         operation,
@@ -1016,6 +1010,21 @@ impl TaskExecutionRegistry {
                     );
                 }
             };
+        let queued = match apply_planned_task_domain_updates(
+            &*self.task_host,
+            &descriptor,
+            request.domains(),
+            &plan,
+        ) {
+            Ok(queued) => queued,
+            Err(rejection) => {
+                return OperationReceipt::rejected(
+                    operation,
+                    rejection.outcome(),
+                    rejection.detail(),
+                );
+            }
+        };
 
         let (receipts, applied) = {
             let mut state = self.state.lock().expect(REGISTRY_LOCK);
@@ -1028,7 +1037,11 @@ impl TaskExecutionRegistry {
             };
             // Re-classified against the tokens as they are now, so a
             // concurrent update cannot be rolled back by this one.
-            match domains::commit_updates(&mut live.domains, request.domains(), &queued) {
+            match commit_task_domain_execution_updates(
+                &mut live.domains,
+                request.domains(),
+                &queued,
+            ) {
                 Ok(result) => result,
                 Err(rejection) => {
                     return OperationReceipt::rejected(

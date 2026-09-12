@@ -44,7 +44,6 @@
 mod completion;
 mod context_host;
 mod credential_slot;
-mod domains;
 mod entry;
 mod execution_host;
 mod fault;
