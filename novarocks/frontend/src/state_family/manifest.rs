@@ -22,17 +22,6 @@ use super::classification::{
     DurabilityAdmission, PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract,
     RebuildDeterminism, StateFamilyClassification,
 };
-use novarocks_state_store_runtime::PersistentStateFamily;
-
-// Frozen key prefixes.  These bytes are already in deployed stores, so they are
-// literals rather than anything composed: the whole point of moving them here
-// is that they now have exactly one definition point, not that they became
-// derivable.  `prefix_literals_are_byte_stable` is the tripwire against an
-// edit that silently orphans existing records.
-//
-// The MV prefix carries no trailing separator because its owner joins with
-// `/` itself. It is frozen because normalizing it would rewrite live keys.
-const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
 
 /// Every frontend state family, registered exactly once.
 ///
@@ -40,15 +29,12 @@ const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
 /// binary has no reader for them, so registering them would be the compatibility
 /// surface the hard cut exists to remove.
 ///
-/// Maintenance, statistics, and MV refresh process runtimes are likewise
-/// absent: their product crates own those lifetimes. They never had Frontend
-/// durable records, so this manifest must not retain a nominal ownership entry
-/// after their product owners became the only runtime authority.
+/// Maintenance, statistics, and MV process state are likewise absent: their
+/// product crates own those lifetimes and their durable descriptors. Frontend
+/// must not retain a nominal ownership entry after a product becomes the only
+/// authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StateFamily {
-    /// MV definitions, target and dependency indexes, and the aggregate
-    /// published waterline.
-    MvAccelerator,
     /// Resolved connector table metadata, validated against the connector's
     /// current schema version.
     SchemaCache,
@@ -67,7 +53,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 6;
+    pub const COUNT: usize = 5;
 
     /// Every registered family, in manifest order.
     ///
@@ -77,7 +63,7 @@ impl StateFamily {
     /// automatically.
     pub const ALL: [Self; Self::COUNT] = Self::enumerate();
 
-    const FIRST: Self = Self::MvAccelerator;
+    const FIRST: Self = Self::SchemaCache;
 
     /// The contract this family declares.
     ///
@@ -86,18 +72,6 @@ impl StateFamily {
     /// before it can exist.
     pub const fn classification(self) -> StateFamilyClassification {
         match self {
-            Self::MvAccelerator => {
-                StateFamilyClassification::Accelerator(AcceleratorContract::new(
-                    AcceleratorResidence::Durable {
-                        prefix: PersistentKeyPrefix::new(MV_ACCELERATOR_PREFIX),
-                        record_version: 1,
-                    },
-                    AcceleratorRebuildAuthority::MvLakeDescriptorAndPublicationFacts,
-                    RebuildDeterminism::UserVisibleIdentical,
-                    true,
-                    ClonePolicy::RevalidateSourceRevisionOrWipe,
-                ))
-            }
             Self::SchemaCache => StateFamilyClassification::Accelerator(AcceleratorContract::new(
                 AcceleratorResidence::InProcess,
                 AcceleratorRebuildAuthority::ConnectorSchemaVersion,
@@ -135,7 +109,6 @@ impl StateFamily {
     /// spelled out rather than derived from the variant name.
     pub const fn family_id(self) -> &'static str {
         match self {
-            Self::MvAccelerator => "frontend/mv/accelerator",
             Self::SchemaCache => "frontend/catalog/schema-cache",
             Self::StatisticsArtifactCache => "frontend/statistics/immutable-artifact-cache",
             Self::LocalViewRegistry => "frontend/view/local-registry",
@@ -144,11 +117,12 @@ impl StateFamily {
         }
     }
 
-    /// This family's persistent key prefix, or `None` when it owns no StateStore
-    /// records.
+    /// This frontend family's persistent key prefix, or `None` when it owns no
+    /// StateStore records.
     ///
-    /// Owner modules read their prefix from here; there is no second definition
-    /// point to drift from.
+    /// Frontend currently owns no durable family. Product-owned descriptors
+    /// intentionally live in their product crates instead of being projected
+    /// into this local manifest.
     pub const fn persistent_prefix(self) -> Option<PersistentKeyPrefix> {
         self.classification().persistent_prefix()
     }
@@ -174,30 +148,10 @@ impl StateFamily {
         self.classification().record_version()
     }
 
-    /// This Frontend owner's durable families as composition descriptors.
-    ///
-    /// The array is intentionally limited to Frontend-owned variants. Other
-    /// applications supply their own descriptors to the composition root, and
-    /// StateStore runtime validates the combined set without owning it.
-    pub fn persistent_state_families() -> Vec<PersistentStateFamily> {
-        Self::ALL
-            .into_iter()
-            .filter_map(|family| {
-                let prefix = family.persistent_prefix()?;
-                let record_version = family.record_version()?;
-                Some(PersistentStateFamily::new(
-                    family.family_id(),
-                    prefix.as_str(),
-                    record_version,
-                ))
-            })
-            .collect()
-    }
-
     /// The registered family that owns `key`, or `None` when no family does.
     ///
-    /// Attribution is by persistent prefix, and only the two persistent
-    /// classifications can carry one, so a `Some` answer already implies the
+    /// Attribution is by persistent prefix, and only the durable accelerator
+    /// classification can carry one, so a `Some` answer already implies the
     /// owner is allowed to be durable.  The store-content gate still asks
     /// [`StateFamily::durability_admission`] separately, so "the key is
     /// attributable" and "its owner may persist" stay two independent
@@ -221,7 +175,6 @@ impl StateFamily {
     /// and rejects a length that disagrees with [`StateFamily::COUNT`].
     const fn next_in_manifest(self) -> Option<Self> {
         match self {
-            Self::MvAccelerator => Some(Self::SchemaCache),
             Self::SchemaCache => Some(Self::StatisticsArtifactCache),
             Self::StatisticsArtifactCache => Some(Self::LocalViewRegistry),
             Self::LocalViewRegistry => Some(Self::DmlRuntime),
@@ -261,7 +214,7 @@ mod tests {
     use super::*;
     use crate::state_family::WipeEntry;
 
-    /// Six Frontend families: three `Accelerator` (two of them in-process) and
+    /// Five Frontend families: two in-process `Accelerator` and
     /// three `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
@@ -273,8 +226,8 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            6,
-            "the manifest registers six frontend state families"
+            5,
+            "the manifest registers five frontend state families"
         );
 
         let mut process_runtime = 0;
@@ -288,10 +241,7 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            accelerator, 3,
-            "MV, schema cache, statistics artifact cache"
-        );
+        assert_eq!(accelerator, 2, "schema cache, statistics artifact cache");
         assert_eq!(process_runtime, 3, "local views, DML, backend observations");
     }
 
@@ -328,7 +278,7 @@ mod tests {
                     .map(|prefix| (family, prefix.as_str()))
             })
             .collect();
-        assert_eq!(prefixes.len(), 1, "one Frontend family is durable today");
+        assert!(prefixes.is_empty(), "Frontend owns no durable family today");
 
         let distinct: BTreeSet<&str> = prefixes.iter().map(|(_, prefix)| *prefix).collect();
         assert_eq!(
@@ -349,30 +299,6 @@ mod tests {
                     right_family.family_id()
                 );
             }
-        }
-    }
-
-    /// These bytes are already in deployed stores.  The literals are repeated
-    /// here on purpose: reading them from the manifest constants would make the
-    /// assertion vacuous, and the whole value of this test is that an edit to a
-    /// prefix has to be made twice, deliberately.
-    #[test]
-    fn prefix_literals_are_byte_stable() {
-        let expected: [(StateFamily, &[u8]); 1] = [(
-            StateFamily::MvAccelerator,
-            b"novarocks/frontend/mv/accelerator/v1",
-        )];
-
-        for (family, bytes) in expected {
-            let prefix = family
-                .persistent_prefix()
-                .expect("registered durable family");
-            assert_eq!(
-                prefix.as_bytes(),
-                bytes,
-                "{} prefix must stay byte-identical",
-                family.family_id()
-            );
         }
     }
 
@@ -494,7 +420,7 @@ mod tests {
                 family.family_id()
             );
         }
-        assert_eq!(accelerators, 3);
+        assert_eq!(accelerators, 2);
     }
 
     #[test]
@@ -520,37 +446,17 @@ mod tests {
         )));
     }
 
-    /// The prefix API has to serve Frontend's durable owners without either
-    /// re-declaring a prefix. These are the exact keys those owners build.
-    #[test]
-    fn prefix_api_reproduces_every_owner_key_scheme() {
-        // mv: the prefix carries no trailing separator, so the owner joins with
-        // its own `/`.
-        assert_eq!(
-            StateFamily::MvAccelerator
-                .persistent_prefix()
-                .expect("durable family")
-                .key_with_suffix("/sequence/mv-id")
-                .expect("mv sequence key")
-                .as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
-        );
-    }
-
     #[test]
     fn key_attribution_names_the_owning_family_or_nothing() {
-        assert_eq!(
-            StateFamily::for_key(
-                b"novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000001"
-            ),
-            Some(StateFamily::MvAccelerator)
-        );
-
         // Retired families are unattributable by construction: they are absent
         // from the manifest, so the store-content gate reports them instead of
         // finding an owner willing to claim them.
         assert_eq!(StateFamily::for_key(b"\0novarocks/cp/v1/control"), None);
         assert_eq!(StateFamily::for_key(b"novarocks/frontend/views/v2/x"), None);
+        assert_eq!(
+            StateFamily::for_key(b"novarocks/frontend/mv/accelerator/v1/projection/by-id/1"),
+            None
+        );
         assert_eq!(StateFamily::for_key(b""), None);
 
         for family in StateFamily::ALL {

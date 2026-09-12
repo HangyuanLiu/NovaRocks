@@ -27,20 +27,14 @@ use novarocks_state_store_api::Key;
 
 /// A StateStore key prefix owned by exactly one persistent state family.
 ///
-/// The literal is private and [`PersistentKeyPrefix::new`] is visible only
-/// inside the `state_family` module tree, so a prefix can be *read* anywhere in
-/// the crate but *minted* only by the manifest.  That is what makes "an owner
-/// module declares its own `const PREFIX`" unrepresentable rather than merely
-/// discouraged: an owner has nothing to build a `PersistentKeyPrefix` from, so
-/// a second definition point for a prefix cannot exist.
+/// The literal is private and has no public constructor. Frontend no longer
+/// owns a durable state family; product descriptors live with their product
+/// crates. Keeping this carrier private prevents a Frontend module from
+/// recreating a local durable-owner escape hatch.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PersistentKeyPrefix(&'static str);
 
 impl PersistentKeyPrefix {
-    pub(super) const fn new(prefix: &'static str) -> Self {
-        Self(prefix)
-    }
-
     pub const fn as_str(self) -> &'static str {
         self.0
     }

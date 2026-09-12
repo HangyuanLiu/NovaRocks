@@ -53,7 +53,7 @@ use novarocks_frontend::mv::domain::dependency::model::{
 use novarocks_frontend::mv::domain::repository::MvRepository;
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_frontend::mv::repository::key::{dependency_by_upstream_key, target_lookup_key};
-use novarocks_frontend::state_family::StateFamily;
+use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlResolver, ConnectorError,
     ConnectorErrorKind, ConnectorExecutionDistribution, ConnectorInstanceDescriptor,
@@ -246,10 +246,7 @@ struct AcceleratorUnreadableStore {
 }
 
 fn accelerator_prefix_bytes() -> &'static [u8] {
-    StateFamily::MvAccelerator
-        .persistent_prefix()
-        .expect("the MV accelerator is a durable family")
-        .as_bytes()
+    MV_ACCELERATOR_STATE_FAMILY.prefix().as_bytes()
 }
 
 struct AcceleratorUnreadableRead {
@@ -508,9 +505,7 @@ async fn put_marker(store: &Arc<dyn StateStore>, key: Key, purpose: &str) {
 
 async fn accelerator_key_count(store: &Arc<dyn StateStore>) -> usize {
     let range = KeyRange::for_prefix(
-        StateFamily::MvAccelerator
-            .persistent_prefix()
-            .expect("the MV accelerator is a durable family")
+        MV_ACCELERATOR_STATE_FAMILY
             .key()
             .expect("accelerator prefix key"),
     )

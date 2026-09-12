@@ -17,15 +17,11 @@
 
 //! Closed manifest of frontend-local state families.
 //!
-//! Every piece of frontend state belongs to exactly one family, and every
-//! family is registered here with exactly one classification, one authority or
-//! rebuild source, one record version, and one retain/clone/wipe policy.  The
-//! manifest exists because those facts used to live wherever each owner module
-//! happened to put them: an owner declared its own `const PREFIX`, picked its
-//! own schema version, and — unless the author thought of it — said nothing at
-//! all about what a restart or a deployment clone should do to its records.
-//! Adding a durable family cost nothing and broke nothing, which is exactly
-//! why the frontend accumulated durable state nobody owned.
+//! Every remaining Frontend-local state belongs to exactly one family and has
+//! one classification, one authority or rebuild source, and one
+//! retain/clone/wipe policy. Durable product state is deliberately absent:
+//! each product exposes its own descriptor and the composition root validates
+//! their complete set before opening a StateStore.
 //!
 //! Two structural properties do the enforcing, so the manifest is not another
 //! convention that has to be remembered during review:
@@ -34,13 +30,9 @@
 //!    lives in the `Accelerator` variant only, so the illegal state is not
 //!    representable — see
 //!    [`ProcessRuntimeContract`].
-//! 2. **Only the manifest can mint a prefix.** [`PersistentKeyPrefix`] has a
-//!    private literal and a constructor visible only inside this module tree,
-//!    so an owner module can read a prefix from the manifest but cannot invent
-//!    a second definition point for one.
-//!
-//! Owner modules keep their own suffix schemes and build keys through
-//! [`PersistentKeyPrefix::key`] / [`PersistentKeyPrefix::key_with_suffix`].
+//! 2. **Frontend cannot mint a durable prefix.** [`PersistentKeyPrefix`] has
+//!    no public constructor. Product descriptors are the sole definition point
+//!    for their deployed prefix and record version.
 //!
 //! The manifest is a frontend application fact, not an SPI contract: the
 //! StateStore boundary knows about keys and values, and has no opinion about

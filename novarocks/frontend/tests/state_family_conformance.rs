@@ -47,6 +47,7 @@ use novarocks_frontend::{
     state_store::StateStoreHostInput,
     topology::ClusterBackendOpenConfig,
 };
+use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
@@ -108,7 +109,7 @@ async fn scan_all_keys(store: &Arc<dyn StateStore>) -> Vec<Vec<u8>> {
     keys
 }
 
-/// Assert every observed key is attributable to a durability-permitted family.
+/// Assert every observed key belongs to a durability-permitted owner.
 ///
 /// Callers pass the workload they ran so a failure names it: the useful part of
 /// this assertion is which statement produced an unregistered key.
@@ -116,7 +117,9 @@ fn assert_keys_conform(keys: &[Vec<u8>], workload: &str) {
     let mut unattributed = Vec::new();
     let mut forbidden = Vec::new();
     for key in keys {
-        if key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes()) {
+        if key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes())
+            || key.starts_with(MV_ACCELERATOR_STATE_FAMILY.prefix().as_bytes())
+        {
             continue;
         }
         match StateFamily::for_key(key) {
@@ -134,7 +137,7 @@ fn assert_keys_conform(keys: &[Vec<u8>], workload: &str) {
     assert!(
         unattributed.is_empty(),
         "after {workload}, these keys belong to no registered state family; \
-         a durable family was added without a composed owner descriptor: {unattributed:?}"
+         a durable owner was added without a composed descriptor: {unattributed:?}"
     );
     assert!(
         forbidden.is_empty(),
@@ -294,7 +297,7 @@ async fn opening_the_whole_frontend_writes_no_durable_record_at_all() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn durable_records_written_by_real_owners_all_attribute_to_the_manifest() {
+async fn durable_records_written_by_real_owners_match_their_product_descriptor() {
     // The scan is only evidence if something actually wrote. Drive a real
     // owner's write path, then attribute every resulting key.
     let mut host = state_store_fixture::open("state-family-conformance-writes").await;

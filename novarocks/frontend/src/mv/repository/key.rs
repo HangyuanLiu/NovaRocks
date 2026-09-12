@@ -15,22 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_state_store_api::Key;
 use novarocks_types::naming::normalize_identifier;
 
 use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use crate::state_family::{PersistentKeyPrefix, StateFamily};
-
-/// Read from the closed state family manifest, which is the only place a
-/// persistent prefix is defined.  The prefix carries no trailing separator, so
-/// this owner supplies the `/` that joins it to its own path.
-const ACCELERATOR_PREFIX: PersistentKeyPrefix = match StateFamily::MvAccelerator.persistent_prefix()
-{
-    Some(prefix) => prefix,
-    None => panic!("MV accelerator is a durable accelerator family"),
 };
 const DEPENDENCY_SEPARATOR: char = '|';
 const MAX_MV_KEY_BYTES: usize = 512;
@@ -142,11 +133,11 @@ pub fn decode_key(key: &Key) -> Result<DecodedMvKey, String> {
     // The leading segments are compared against the manifest prefix rather than
     // a literal repeated here, so the classifier cannot drift from the prefix
     // the encoder writes under.
-    let prefix_segments = ACCELERATOR_PREFIX.as_str().split('/').count();
+    let prefix_segments = MV_ACCELERATOR_STATE_FAMILY.prefix().split('/').count();
     let carries_prefix = segments.get(..prefix_segments).is_some_and(|head| {
         head.iter()
             .copied()
-            .eq(ACCELERATOR_PREFIX.as_str().split('/'))
+            .eq(MV_ACCELERATOR_STATE_FAMILY.prefix().split('/'))
     });
     if !carries_prefix {
         return Err(format!("invalid MV Accelerator key prefix: {raw}"));
@@ -184,13 +175,13 @@ pub(crate) fn expected_record_kind(key: &Key) -> Result<MvKeyKind, String> {
 
 fn key_from_path(path: &str) -> Result<Key, String> {
     let suffix = format!("/{path}");
-    let key_bytes = ACCELERATOR_PREFIX.as_bytes().len() + suffix.len();
+    let key_bytes = MV_ACCELERATOR_STATE_FAMILY.prefix().len() + suffix.len();
     if key_bytes > MAX_MV_KEY_BYTES {
         return Err(format!(
             "MV Accelerator StateStore key exceeds the 512-byte limit: {key_bytes} bytes"
         ));
     }
-    ACCELERATOR_PREFIX
+    MV_ACCELERATOR_STATE_FAMILY
         .key_with_suffix(&suffix)
         .map_err(|error| format!("encode MV Accelerator StateStore key failed: {error}"))
 }

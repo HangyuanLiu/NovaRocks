@@ -68,7 +68,6 @@ use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
 };
-use crate::state_family::StateFamily;
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, RootAdmissionStatisticsJobSource,
 };
@@ -922,7 +921,8 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
-        let mut durable_families = StateFamily::persistent_state_families();
+        let mut durable_families =
+            vec![novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY];
         durable_families.push(novarocks_catalog_application::CATALOG_DESIRED_STATE_FAMILY);
         durable_families.push(
             novarocks_table_maintenance::gc_observation::GC_OWNED_REF_OBSERVATION_STATE_FAMILY,

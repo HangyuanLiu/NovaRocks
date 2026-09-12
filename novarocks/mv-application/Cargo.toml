@@ -9,5 +9,6 @@ workspace = true
 
 [dependencies]
 novarocks-query-application.workspace = true
+novarocks-state-store-runtime.workspace = true
 novarocks-table-maintenance.workspace = true
 tracing.workspace = true
