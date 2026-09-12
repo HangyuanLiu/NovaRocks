@@ -24,10 +24,10 @@ use crate::query_execution::completion::{
     QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
-    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
-    DistributedQueryRequest,
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
+use crate::query_execution::outcome::DistributedQueryOutcome;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,

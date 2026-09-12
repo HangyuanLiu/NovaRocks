@@ -575,7 +575,7 @@ impl PreparedIcebergWrite {
                 )
                 .with_attempt_reservation(attempt_reservation),
             )
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map_err(|error| error.to_string())?;
         Ok(outcome.into_execution_result())
     }

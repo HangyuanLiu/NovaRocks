@@ -442,7 +442,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .ports
             .query_execution
             .execute(request)
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
+            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_statistics)
             .map(|outcome| outcome.into_artifacts())
             .map_err(|error| Self::failure(error.to_string()))?;
         pending.artifacts = Some(artifacts);

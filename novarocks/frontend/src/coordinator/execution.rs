@@ -37,14 +37,15 @@ use crate::query_execution::artifact::{
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
-    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
-    PreReadyTopologyOutcome, ProfileTerminalBuilder,
+    DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
 };
 use crate::query_execution::lifecycle_diagnostics::{
     FrontendLifecycleDiagnostics, QueryLifecycleConvergenceSnapshot,
     RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
+use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
+use crate::query_execution::profile::ProfileTerminalBuilder;
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::TaskUpdateTransport;
@@ -3803,7 +3804,7 @@ struct RoundHandoff<'a> {
     /// by the preamble that produced `runtime_filter_ready`, so the request
     /// cannot travel whole.
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    completion: crate::query_execution::contract::QueryOutcomeFactory,
+    completion: QueryOutcomeFactory,
     topology: BackendTopologySnapshot,
     statistics_decoder: Option<crate::query_execution::statistics::StatisticsRootResultDecoder>,
     write_decoder: Option<crate::query_execution::write_result::RootWriteResultDecoder>,

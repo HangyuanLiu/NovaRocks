@@ -3067,7 +3067,7 @@ fn execute_exact_cow_match_query(
     Ok(state
         .query_execution()
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
         .map_err(|error| error.to_string())?)
 }

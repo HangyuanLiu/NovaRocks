@@ -870,7 +870,7 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         &self,
         request: crate::query_execution::contract::DistributedQueryRequest,
     ) -> Result<
-        crate::query_execution::contract::DistributedQueryOutcome,
+        crate::query_execution::outcome::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
         let intent = request.intent();
@@ -1987,7 +1987,7 @@ fn execute_bound_distributed_write_request(
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
 }
@@ -2230,7 +2230,7 @@ fn execute_distributed_result_with_execution(
     .map_err(|error| error.to_string())?;
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
         .map_err(|error| error.to_string())
 }
@@ -2261,7 +2261,7 @@ fn execute_distributed_write_request(
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
 }
@@ -2287,7 +2287,7 @@ fn execute_distributed_profile_with_execution(
     .map_err(|error| error.to_string())?;
     let (query_result, fragment_profiles) = query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_profile)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_profile)
         .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
     Ok(crate::query_execution::outcome::QueryExecutionResult {

@@ -1682,7 +1682,7 @@ impl FrontendApplicationHost {
         &self,
         request: crate::query_execution::contract::DistributedQueryRequest,
     ) -> Result<
-        crate::query_execution::contract::DistributedQueryOutcome,
+        crate::query_execution::outcome::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
         crate::query_execution::contract::DistributedQueryCoordinator::execute(

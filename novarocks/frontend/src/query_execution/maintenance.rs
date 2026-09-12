@@ -116,7 +116,7 @@ impl PreparedDistributedRewriteCohort {
         let session_completion = self
             .query_execution
             .execute(request)
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
             .map_err(|error| error.to_string())?;
         // The dual barrier is what produces a session completion, so its

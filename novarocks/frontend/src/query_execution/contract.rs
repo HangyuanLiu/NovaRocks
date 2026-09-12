@@ -26,14 +26,9 @@ use crate::query_execution::artifact::{
     PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-pub use crate::query_execution::outcome::DistributedQueryOutcome;
-pub use crate::query_execution::outcome::FragmentProfileSet;
-pub use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
-pub use crate::query_execution::profile::ProfileTerminalBuilder;
-pub use crate::query_execution::statistics::StatisticsCollectionProgram;
-pub use crate::query_execution::statistics::StatisticsExecutionMode;
-pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
+use crate::query_execution::statistics::StatisticsCollectionProgram;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,

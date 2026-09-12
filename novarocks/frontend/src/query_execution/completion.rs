@@ -447,7 +447,7 @@ impl PreparedQueryCompletion {
 
     pub fn complete(
         self,
-        outcome: crate::query_execution::contract::DistributedQueryOutcome,
+        outcome: crate::query_execution::outcome::DistributedQueryOutcome,
     ) -> Result<StatementResult, String> {
         match self.formatter {
             PreparedQueryFormatter::Result => outcome
@@ -462,7 +462,7 @@ impl PreparedQueryCompletion {
 
 fn complete_profile(
     formatter: PreparedProfileFormatter,
-    outcome: crate::query_execution::contract::DistributedQueryOutcome,
+    outcome: crate::query_execution::outcome::DistributedQueryOutcome,
 ) -> Result<StatementResult, String> {
     let outcome = outcome
         .into_profile()
