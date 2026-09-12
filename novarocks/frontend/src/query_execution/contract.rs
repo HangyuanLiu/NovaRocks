@@ -43,9 +43,6 @@ use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
 
-#[cfg(test)]
-pub(crate) use novarocks_types::QueryId;
-
 /// Query options resolved by core before ownership crosses into frontend.
 ///
 /// The runtime representation stays private; frontend only receives stable

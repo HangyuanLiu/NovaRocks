@@ -40,13 +40,13 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadWorkSource, ConnectorSession, ConnectorValueType, SchemaTableName,
     SystemTableDistribution, TupleDomain,
 };
-use novarocks_spi::connector::{ConnectorControlReadBinding, ConnectorReadAttemptAccess};
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorControlReadBinding, ConnectorReadAttemptAccess,
+};
 use novarocks_sql::plan_read::PlanScanNode;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::query_execution::connector_domain::{
-    CatalogHandle, DynamicFilterBinding, TableHandle, TableScanNode,
-};
+use crate::query_execution::connector_domain::{DynamicFilterBinding, TableHandle, TableScanNode};
 
 use super::scan::ResolvedScanColumn;
 use super::typed_predicate::{lower_scan_predicates, scan_output_value_type};

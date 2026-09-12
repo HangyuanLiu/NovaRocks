@@ -1011,7 +1011,7 @@ mod tests {
 
     use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
     use crate::common::backend_topology::LiveBackendTarget;
-    use crate::query_execution::contract::{QueryId, ResolvedQueryOptions};
+    use crate::query_execution::contract::ResolvedQueryOptions;
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId, QueryOptions};
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
@@ -1026,6 +1026,7 @@ mod tests {
         VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
     };
     use novarocks_types::BackendProcessId;
+    use novarocks_types::QueryId;
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

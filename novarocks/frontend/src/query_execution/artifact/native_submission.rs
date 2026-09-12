@@ -328,8 +328,8 @@ impl NativeSubmissionAttachment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::contract::QueryId;
     use novarocks_proto_codec::lifecycle::AttemptId;
+    use novarocks_types::QueryId;
 
     #[allow(
         dead_code,
