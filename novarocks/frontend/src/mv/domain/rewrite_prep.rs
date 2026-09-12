@@ -38,17 +38,13 @@ pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = optional_candidate_inventory(candidate_reader.list_candidate_projections());
+    let definitions = optional_candidate_inventory(candidate_reader.list_candidate_definitions());
 
     let report = novarocks_mv_application::candidate::inspect_candidates(
         definitions,
-        |projection| projection.definition.mv_id.to_string(),
-        |projection| {
-            freeze_mv_rewrite_definition(
-                connector_control,
-                storage_observation,
-                projection.definition,
-            )
+        |definition| definition.mv_id.to_string(),
+        |definition| {
+            freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
         },
     );
     for diagnostic in report.diagnostics() {

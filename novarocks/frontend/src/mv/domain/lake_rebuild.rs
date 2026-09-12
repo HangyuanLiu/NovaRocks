@@ -877,8 +877,8 @@ mod tests {
         assert_eq!(
             readiness
                 .candidate_reader()
-                .list_candidate_projections()
-                .expect("list query candidate projections")
+                .list_candidate_definitions()
+                .expect("list query candidate definitions")
                 .len(),
             1,
             "query candidate discovery retains the row for strict publication validation"

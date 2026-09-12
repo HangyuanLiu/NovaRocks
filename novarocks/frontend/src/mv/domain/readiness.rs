@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::mv::activity::{CanonicalMvTarget, canonical_mv_target};
 use crate::mv::domain::dependency::model::MvDependencyObjectRef;
+use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
 use crate::mv::domain::repository::{
@@ -352,17 +353,33 @@ impl MvReadinessPort {
 }
 
 impl MvCandidateReader {
-    /// Enumerate retained candidate descriptions without importing refresh
-    /// executor readiness. Every member remains optional until its exact lake
-    /// publication and every frozen input/output revision are verified.
-    pub(crate) fn list_candidate_projections(
+    /// Enumerate retained candidate definitions without exposing a loaded
+    /// projection's CAS version to query discovery. Every member remains
+    /// optional until its exact lake publication and every frozen input/output
+    /// revision are verified.
+    pub(crate) fn list_candidate_definitions(
         &self,
-    ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+    ) -> Result<Vec<StoredMvDefinition>, MvRepositoryError> {
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| {
-                self.handle.block_on(self.repository.list_projections())
+                self.handle
+                    .block_on(self.repository.list_projections())
+                    .map(|projections| {
+                        projections
+                            .into_iter()
+                            .map(|projection| projection.definition)
+                            .collect()
+                    })
             }),
-            Err(_) => self.handle.block_on(self.repository.list_projections()),
+            Err(_) => self
+                .handle
+                .block_on(self.repository.list_projections())
+                .map(|projections| {
+                    projections
+                        .into_iter()
+                        .map(|projection| projection.definition)
+                        .collect()
+                }),
         }
     }
 }
