@@ -35,6 +35,7 @@ mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod kernels;
+pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
 pub(crate) mod logical_read;
 pub mod maintenance;

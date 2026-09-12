@@ -808,6 +808,8 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     coordination_budgets: CoordinationBudgets,
     transport_budget: TransportBudget,
     abort_capacity: NonZeroUsize,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
@@ -843,6 +845,9 @@ impl FrontendNativeLogicalExecutionRuntime {
         coordination_budgets: CoordinationBudgets,
         transport_budget: TransportBudget,
         abort_capacity: NonZeroUsize,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
     ) -> Self {
         Self {
             topology,
@@ -856,6 +861,7 @@ impl FrontendNativeLogicalExecutionRuntime {
             coordination_budgets,
             transport_budget,
             abort_capacity,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1119,6 +1125,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
         Ok(FrontendTaskProtocolDormantBehavior::new(
             self.projection.clone(),
             ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            Arc::clone(&self.projection.runtime.lifecycle_diagnostics),
         ))
     }
 
@@ -1400,6 +1407,8 @@ fn projection_message(message: impl Into<String>) -> NativeAttemptActivationFail
 pub(crate) struct FrontendTaskProtocolDormantBehavior<P> {
     projection: P,
     completion: ManifestAttemptCompletion,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl<P> std::fmt::Debug for FrontendTaskProtocolDormantBehavior<P>
@@ -1416,10 +1425,17 @@ where
 }
 
 impl<P> FrontendTaskProtocolDormantBehavior<P> {
-    pub(crate) const fn new(projection: P, completion: ManifestAttemptCompletion) -> Self {
+    pub(crate) fn new(
+        projection: P,
+        completion: ManifestAttemptCompletion,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
+    ) -> Self {
         Self {
             projection,
             completion,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1462,6 +1478,7 @@ where
             Ok(FrontendTaskProtocolActiveBehavior::new(
                 attempt,
                 self.completion,
+                Arc::clone(&self.lifecycle_diagnostics),
             ))
         })
     }
@@ -1489,6 +1506,8 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     split_assignment: Option<SplitAssignmentRoundGuard>,
     credential_rotation: Option<Arc<CredentialRotationPump>>,
     abort_route: Option<LogicalAbortRoute>,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
@@ -1504,6 +1523,9 @@ impl FrontendTaskProtocolActiveBehavior {
     pub(crate) fn new(
         attempt: ProjectedManifestAttempt,
         completion: ManifestAttemptCompletion,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
     ) -> Self {
         let ProjectedManifestAttempt {
             round,
@@ -1521,6 +1543,7 @@ impl FrontendTaskProtocolActiveBehavior {
             split_assignment,
             credential_rotation,
             abort_route,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1541,10 +1564,39 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
 
     fn converge<'a>(
         &'a mut self,
-        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        inputs: &'a mut ManifestBoundNativeAttemptInputs,
         cancellation: CancellationView,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        Box::pin(self.attempt.converge(cancellation))
+        let execution_id = inputs.execution_id();
+        Box::pin(async move {
+            let convergence = self.attempt.converge(cancellation).await;
+            let contributions = self
+                .attempt
+                .round
+                .execution()
+                .released_runtime_filter_contributions();
+            let runtime_filter = if contributions.is_complete() {
+                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Available(
+                    crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions(
+                        contributions.contributions(),
+                    ),
+                )
+            } else {
+                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+                )
+            };
+            self.lifecycle_diagnostics.publish(
+                crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+                    execution_id,
+                    error_source: None,
+                    primary_error: None,
+                    runtime_filter,
+                    metrics: crate::metrics::FrontendProcessQueryCountersSnapshot::default(),
+                },
+            );
+            convergence
+        })
     }
 }
 

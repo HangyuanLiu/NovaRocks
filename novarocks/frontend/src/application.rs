@@ -65,6 +65,7 @@ use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
+use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{
@@ -191,6 +192,7 @@ impl std::error::Error for FrontendApplicationError {}
 struct FrontendExecutionRuntimeOwner {
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
+    lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     workload: Option<WorkloadControl>,
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
@@ -255,6 +257,7 @@ impl FrontendExecutionRuntimeOwner {
             frontend_process_id = %frontend_process_id,
             "frontend logical execution runtime initialized"
         );
+        let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime,
             Arc::new(FrontendLogicalExecutionNativePort),
@@ -266,6 +269,7 @@ impl FrontendExecutionRuntimeOwner {
         Ok(Self {
             supervisor,
             logical_execution_client,
+            lifecycle_diagnostics,
             workload: Some(workload.owner),
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
@@ -417,6 +421,10 @@ impl FrontendExecutionRuntimeOwner {
 
     fn logical_execution_client(&self) -> QueryExecutionClient {
         self.logical_execution_client.clone()
+    }
+
+    fn lifecycle_diagnostics(&self) -> Arc<FrontendLifecycleDiagnostics> {
+        Arc::clone(&self.lifecycle_diagnostics)
     }
 
     fn root_admission(&self) -> RootAdmissionHandle {
@@ -1150,6 +1158,7 @@ impl FrontendApplicationHost {
             execution.coordination_budgets,
             execution.transport_budget.into_codec(),
             execution.logical_abort_effect_capacity,
+            host.execution_runtime_owner.lifecycle_diagnostics(),
         );
         host.logical_read_launcher = Some(Arc::new(FrontendNativeLogicalReadLauncher::new(
             host.logical_execution_client(),
@@ -1625,10 +1634,8 @@ impl FrontendApplicationHost {
     }
 
     pub(crate) fn lifecycle_convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .convergence_reader()
+        self.execution_runtime_owner.lifecycle_diagnostics()
+            as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
     #[cfg(test)]
@@ -1737,6 +1744,7 @@ impl FrontendApplicationHost {
                 execution.result_fetch_byte_limit,
                 self.backend_topology_port(),
                 self.data_runtime.clone(),
+                self.execution_runtime_owner.lifecycle_diagnostics(),
             )
             .map_err(FrontendApplicationError::server)?,
         );

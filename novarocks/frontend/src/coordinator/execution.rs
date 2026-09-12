@@ -40,6 +40,10 @@ use crate::query_execution::contract::{
     DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
     PreReadyTopologyOutcome, ProfileTerminalBuilder,
 };
+use crate::query_execution::lifecycle_diagnostics::{
+    FrontendLifecycleDiagnostics, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
+};
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
@@ -53,11 +57,7 @@ use novarocks_types::{
     QueryIdAttribution, QueryProcessNamespace,
 };
 
-use super::query_registry::{
-    FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
-};
+use super::query_registry::{FrontendQueryRegistry, QueryFailureCause};
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
@@ -313,6 +313,7 @@ pub struct FrontendDistributedQueryCoordinator {
     runtime_filter_worker_count: NonZeroUsize,
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
+    lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     data_runtime: FrontendDataRuntime,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
@@ -347,6 +348,7 @@ impl FrontendDistributedQueryCoordinator {
         result_fetch_byte_limit: ResultByteLimit,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
+        lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -368,6 +370,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
+            lifecycle_diagnostics,
             data_runtime,
             coordination_budgets,
             transport_budget,
@@ -438,6 +441,7 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
+            lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
@@ -505,6 +509,7 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
+            lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
                 crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
@@ -512,10 +517,6 @@ impl FrontendDistributedQueryCoordinator {
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
-    }
-
-    pub(crate) fn convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
-        Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
     pub fn execute(
@@ -1869,8 +1870,8 @@ impl FrontendDistributedQueryCoordinator {
             complete = contributions.is_complete(),
             "task protocol attempt published its runtime filter convergence evidence"
         );
-        self.registry
-            .publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+        self.lifecycle_diagnostics
+            .publish(QueryLifecycleConvergenceSnapshot {
                 execution_id,
                 error_source: None,
                 primary_error: None,

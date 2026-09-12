@@ -330,6 +330,10 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
+    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
+        self.manifest.execution()
+    }
+
     /// Starts a borrowed activation transaction.
     ///
     /// The exact manifest and Connector access capability remain in this
