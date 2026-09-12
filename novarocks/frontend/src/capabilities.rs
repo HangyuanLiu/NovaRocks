@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_spi::connector::ConnectorControlRegistry;
+use tokio::runtime::Handle;
 
 use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
@@ -346,6 +347,7 @@ pub struct MaintenanceCommandPorts {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     service: Arc<dyn TableMaintenanceService>,
+    runtime: Handle,
 }
 
 impl MaintenanceCommandPorts {
@@ -359,6 +361,7 @@ impl MaintenanceCommandPorts {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
+        runtime: Handle,
     ) -> Self {
         Self {
             functions,
@@ -369,6 +372,7 @@ impl MaintenanceCommandPorts {
             mv_storage_observation,
             query_execution,
             service,
+            runtime,
         }
     }
 
@@ -389,16 +393,19 @@ impl MaintenanceCommandPorts {
 pub fn maintenance_command_executor(
     ports: MaintenanceCommandPorts,
 ) -> maintenance_command::MaintenanceCommandExecutor {
-    maintenance_command::MaintenanceCommandExecutor::new(domain::MaintenanceExecutionKernel::new(
-        ports.functions,
-        ports.catalog_service,
-        ports.catalog_application,
-        ports.connector_control,
-        ports.typed_connector_control,
-        ports.mv_storage_observation,
-        ports.query_execution,
-        ports.service,
-    ))
+    maintenance_command::MaintenanceCommandExecutor::new(
+        domain::MaintenanceExecutionKernel::new(
+            ports.functions,
+            ports.catalog_service,
+            ports.catalog_application,
+            ports.connector_control,
+            ports.typed_connector_control,
+            ports.mv_storage_observation,
+            ports.query_execution,
+            ports.service,
+        ),
+        ports.runtime,
+    )
 }
 
 /// Build the read-only maintenance command capability.  It deliberately has

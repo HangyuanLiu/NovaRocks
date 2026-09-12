@@ -214,6 +214,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&mv_storage_observation),
         query_execution.clone(),
         Arc::clone(&maintenance_service),
+        Handle::current(),
     );
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),

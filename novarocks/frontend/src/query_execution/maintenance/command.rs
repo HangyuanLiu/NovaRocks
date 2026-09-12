@@ -32,11 +32,15 @@ use novarocks_query_application::protocol_delivery::QuerySessionOutput as Statem
 #[derive(Clone)]
 pub struct MaintenanceCommandExecutor {
     kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
+    runtime: tokio::runtime::Handle,
 }
 
 impl MaintenanceCommandExecutor {
-    pub fn new(kernel: crate::query_execution::kernels::MaintenanceExecutionKernel) -> Self {
-        Self { kernel }
+    pub fn new(
+        kernel: crate::query_execution::kernels::MaintenanceExecutionKernel,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self { kernel, runtime }
     }
 
     /// Executes one parser-admitted maintenance write without reparsing SQL.
@@ -62,24 +66,26 @@ impl MaintenanceCommandExecutor {
         );
         // The maintenance domain contract is async, because its durable work is
         // I/O. This call site is not: every SQL statement runs inside the
-        // `spawn_blocking` closure in `query.rs`, which is where the foreground
-        // statement lease, timeout and cancellation are anchored.
+        // process-owned bounded query-blocking worker in `query.rs`, which is
+        // where the foreground statement lease, timeout and cancellation are
+        // anchored.
         //
         // Hoisting the command branch out of that closure means restructuring
         // statement admission itself, which belongs to the query-application and
         // query-preparation work lines, not here. So the adapter sits at this
         // edge — the SQL routing boundary another work line owns — and never in
-        // a domain contract. It deletes when that closure is lifted.
+        // a domain contract. The worker has no Tokio reactor, so composition
+        // supplies the process runtime explicitly rather than this boundary
+        // manufacturing a runtime or assuming `Handle::current()` succeeds.
         let spark_call = crate::table_maintenance::is_typed_spark_maintenance_call(statement);
         let service = self.kernel.service();
         let context = MaintenanceRequestContext {
             current_catalog,
             current_database,
         };
-        let outcome = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(service.handle_typed_statement(&engine, lowered, spark_call, context))
-        });
+        let outcome = self
+            .runtime
+            .block_on(service.handle_typed_statement(&engine, lowered, spark_call, context));
         outcome.map(statement_result)
     }
 }
@@ -129,6 +135,7 @@ mod tests {
     };
     use super::*;
     use std::sync::Arc;
+    use std::thread;
 
     struct ReadOnlyService {
         called: std::sync::atomic::AtomicBool,
@@ -193,5 +200,15 @@ mod tests {
             .expect("execute");
         assert!(matches!(result, StatementResult::Ok));
         assert!(service.called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn injected_process_runtime_drives_work_from_a_plain_worker_thread() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        let result = thread::spawn(move || handle.block_on(async { 17_u8 }))
+            .join()
+            .expect("plain worker must not require a current Tokio reactor");
+        assert_eq!(result, 17);
     }
 }
