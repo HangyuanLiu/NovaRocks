@@ -39,7 +39,7 @@ use crate::catalog_application::statement::{
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use novarocks_parser::ast::{CatalogStatement, LiteralKind};
-use novarocks_query_application::api::ResultField as QueryResultColumn;
+use novarocks_query_application::api::build_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::literal::arrow_data_type_to_sql_type;
@@ -605,10 +605,6 @@ fn execute_show_create_table(
     current_database: &str,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<StatementResult, String> {
-    use arrow::array::StringArray;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
-
     let target = crate::catalog_application::resolver::resolve_existing_table_target(
         executor,
         &table_name,
@@ -649,25 +645,12 @@ fn execute_show_create_table(
     }
     let ddl =
         build_iceberg_create_table_ddl(&target.catalog, &target.namespace, &target.table, &loaded)?;
-    let fields = vec![
-        Field::new("Table", DataType::Utf8, false),
-        Field::new("Create Table", DataType::Utf8, false),
-    ];
-    let arrays: Vec<Arc<dyn arrow::array::Array>> = vec![
-        Arc::new(StringArray::from(vec![target.table.clone()])),
-        Arc::new(StringArray::from(vec![ddl])),
-    ];
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))?;
-    Ok(StatementResult::Query(
-        novarocks_query_application::api::QueryResult {
-            columns: vec![
-                QueryResultColumn::new("Table", DataType::Utf8, false, None),
-                QueryResultColumn::new("Create Table", DataType::Utf8, false, None),
-            ],
-            batches: vec![batch],
-        },
-    ))
+    build_utf8_query_result(
+        &["Table", "Create Table"],
+        vec![vec![target.table.clone(), ddl]],
+    )
+    .map(StatementResult::Query)
+    .map_err(|error| format!("build SHOW CREATE TABLE result failed: {error}"))
 }
 
 #[cfg(test)]
