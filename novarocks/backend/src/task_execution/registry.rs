@@ -78,8 +78,9 @@ use novarocks_worker::{
     AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
     ContextTransition, InstalledLease, LatchOutcome, LeaseBounds, LeaseProgression,
     MonotonicInstant, OperationAdmission, OperationWaitCaps, ProcessMonotonicClock,
-    QueryContextDomains, QueryContextEvent, RequestHorizon, WorkerMonotonicClock,
-    classify_context_transition, classify_operation_admission,
+    QueryContextDomains, QueryContextEvent, RequestHorizon, RuntimeFilterReleaseObservation,
+    TaskProtocolEvent, WorkerMonotonicClock, classify_context_transition,
+    classify_operation_admission,
 };
 
 use super::entry::{
@@ -532,7 +533,9 @@ impl TaskExecutionRegistry {
         // names the same verdict the frontend is given. Re-deriving it from
         // registry state here could disagree with that answer, because the
         // lock is released by now.
-        marker::create_task(request.identity(), &receipt);
+        if let Some(event) = TaskProtocolEvent::create_task(request.identity(), &receipt) {
+            marker::emit(event);
+        }
         receipt
     }
 
@@ -1073,7 +1076,11 @@ impl TaskExecutionRegistry {
                 // Emitted on the receipt, not inside the handler: the
                 // establish decision has several exit paths and the receipt is
                 // the one place all of them agree on.
-                marker::establish_query_context(establish.context(), &receipt);
+                if let Some(event) =
+                    TaskProtocolEvent::establish_query_context(establish.context(), &receipt)
+                {
+                    marker::emit(event);
+                }
                 receipt
             }
             UpdateQueryContext::AdvanceDomain(advance) => {
@@ -1081,7 +1088,13 @@ impl TaskExecutionRegistry {
             }
             UpdateQueryContext::RenewLease(renew) => {
                 let receipt = self.renew_query_execution_lease(renew);
-                marker::renew_query_execution_lease(renew.context(), renew.sequence(), &receipt);
+                if let Some(event) = TaskProtocolEvent::renew_query_execution_lease(
+                    renew.context(),
+                    renew.sequence(),
+                    &receipt,
+                ) {
+                    marker::emit(event);
+                }
                 receipt
             }
         }
@@ -1615,7 +1628,9 @@ impl TaskExecutionRegistry {
 
     pub fn abort_query_context(&self, request: &AbortQueryContext) -> QueryContextOutcome {
         let receipt = self.apply_abort_query_context(request);
-        marker::abort_query_context(request.context(), &receipt);
+        if let Some(event) = TaskProtocolEvent::abort_query_context(request.context(), &receipt) {
+            marker::emit(event);
+        }
         receipt
     }
 
@@ -1686,11 +1701,21 @@ impl TaskExecutionRegistry {
         request: &ReleaseQueryContext,
     ) -> ReleaseQueryContextOutcome {
         let receipt = self.apply_release_query_context(request);
-        marker::release_query_context(
-            request.context(),
-            &receipt,
-            &self.released_context_evidence(request.context()),
-        );
+        let runtime_filter = match self
+            .released_context_evidence(request.context())
+            .runtime_filter()
+        {
+            None => RuntimeFilterReleaseObservation::Absent,
+            Some(telemetry) if telemetry.available().is_some() => {
+                RuntimeFilterReleaseObservation::Available
+            }
+            Some(_) => RuntimeFilterReleaseObservation::Unavailable,
+        };
+        if let Some(event) =
+            TaskProtocolEvent::release_query_context(request.context(), &receipt, runtime_filter)
+        {
+            marker::emit(event);
+        }
         receipt
     }
 
@@ -2029,7 +2054,7 @@ impl TaskExecutionRegistry {
                 now,
             ) {
                 self.counters.lease_expiries.fetch_add(1, Ordering::Relaxed);
-                marker::query_execution_lease_expired(context);
+                marker::emit(TaskProtocolEvent::query_execution_lease_expired(context));
                 count += 1;
             }
         }
@@ -2260,7 +2285,11 @@ impl TaskExecutionRegistry {
                 state.retained_tasks = state.retained_tasks.saturating_add(1);
                 state.retained_bytes = state.retained_bytes.saturating_add(bytes);
                 state.retired_task_order.push_back((context, identity));
-                marker::task_terminal_retained(identity, terminal_state, bytes);
+                marker::emit(TaskProtocolEvent::task_terminal_retained(
+                    identity,
+                    terminal_state,
+                    bytes,
+                ));
                 retired += 1;
             }
         }
@@ -2325,11 +2354,11 @@ impl TaskExecutionRegistry {
                     .contexts
                     .get(&context)
                     .expect("a completing context exists");
-                marker::context_termination_completed(
+                marker::emit(TaskProtocolEvent::context_termination_completed(
                     context,
                     entry.latch.cause(),
                     entry.tasks.len(),
-                );
+                ));
             }
             self.retain_context_terminal_locked(state, context, now);
         }

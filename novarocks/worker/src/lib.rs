@@ -39,6 +39,7 @@ mod receipt;
 mod reliable_transport;
 mod status;
 mod task_domain_execution;
+mod task_protocol_event;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -88,6 +89,7 @@ pub use task_domain_execution::{
     commit_task_domain_execution_updates, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
 };
+pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
