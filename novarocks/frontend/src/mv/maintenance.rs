@@ -24,12 +24,18 @@
 //! [`MaintenanceCoordinator::try_begin`]; a queued gate ticket therefore never
 //! consumes the independent maintenance concurrency budget.
 
-use super::background::{MvBackgroundEngineErrorKind, MvMaintenanceFacts};
 pub use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 pub(crate) use novarocks_mv_application::maintenance::{
-    AutomaticMaintenanceAction, AutomaticMaintenanceRunner, MaintenanceActionKind,
-    MaintenanceAdmission, MaintenanceAttempt, MaintenanceExecutionReport, MaintenanceSkipReason,
+    AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceExecutionReport,
 };
+
+#[cfg(test)]
+use super::background::{MvBackgroundEngineErrorKind, MvMaintenanceFacts};
+#[cfg(test)]
+use novarocks_mv_application::maintenance::{
+    AutomaticMaintenanceAction, MaintenanceActionKind, MaintenanceAttempt, MaintenanceSkipReason,
+};
+#[cfg(test)]
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
