@@ -61,7 +61,7 @@ pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{
     FrontendServerConfig, build_frontend_query_session_factory,
-    open_frontend_application_for_server, run_frontend_server, run_frontend_server_until_shutdown,
+    open_frontend_application_for_server, run_frontend_server_until_shutdown,
 };
 pub use state_store::{
     RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,

@@ -17,10 +17,10 @@
 
 use novarocks_native_trust::NativeTrust;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
+use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
+use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
 use tracing::info;
 
@@ -49,7 +49,8 @@ use crate::{
     FrontendExecutionConfig,
 };
 
-type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(test)]
+type ShutdownSignal = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
@@ -369,23 +370,6 @@ pub fn build_frontend_query_session_factory(
     Ok(query_service)
 }
 
-pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|error| {
-            FrontendApplicationError::server(format!(
-                "build frontend Tokio runtime failed: {error}"
-            ))
-        })?;
-
-    runtime.block_on(run_frontend_server_with_signal(
-        config,
-        tokio::signal::ctrl_c(),
-    ))
-}
-
 // Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 pub async fn run_frontend_server_until_shutdown<F>(
     config: FrontendServerConfig,
@@ -454,87 +438,6 @@ where
         shutdown,
         &mut metrics_http_server,
     )
-    .await;
-    let shutdown_result =
-        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-    let metrics_stop = metrics_http_server
-        .stop()
-        .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(
-        combine_server_and_shutdown(server_result, shutdown_result),
-        metrics_stop,
-    )
-}
-
-async fn run_frontend_server_with_signal<S, E>(
-    config: FrontendServerConfig,
-    signal: S,
-) -> Result<(), FrontendApplicationError>
-where
-    S: Future<Output = Result<(), E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-{
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
-        start_early_management_server(&config)?;
-    let mut host = match open_frontend_application_for_server(&config, Handle::current()).await {
-        Ok(host) => host,
-        Err(error) => {
-            let cleanup = metrics_http_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), cleanup);
-        }
-    };
-    if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend serving reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend island reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend lifecycle convergence reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    let server_result = run_server_until_signal(config, (), signal, |config, (), shutdown| {
-        serve_ready_frontend_session_factory(
-            config,
-            &mut host,
-            mv_storage_observation,
-            shutdown,
-            &mut metrics_http_server,
-        )
-    })
     .await;
     let shutdown_result =
         shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
@@ -992,7 +895,7 @@ mod tests {
     use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
-        FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
+        FrontendServerConfig, build_frontend_query_session_factory,
         run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
         run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
     };
@@ -1381,17 +1284,12 @@ mod tests {
 
     #[test]
     fn runner_exports_typed_application_errors() {
-        fn accepts_sync_runner(
-            _: fn(FrontendServerConfig) -> Result<(), FrontendApplicationError>,
-        ) {
-        }
         fn accepts_async_runner<F>(_: F)
         where
             F: Future<Output = Result<(), FrontendApplicationError>>,
         {
         }
 
-        accepts_sync_runner(run_frontend_server);
         let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
         accepts_async_runner(run_frontend_server_until_shutdown(
             frontend_config(),
