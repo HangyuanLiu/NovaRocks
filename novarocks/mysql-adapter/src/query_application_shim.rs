@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opensrv_mysql::{
-    AsyncMysqlIntermediary, AsyncMysqlShim, ErrorKind, InitWriter, ParamParser, QueryResultWriter,
-    StatementMetaWriter,
+    AsyncMysqlIntermediary, AsyncMysqlShim, CapabilityFlags, ErrorKind, InitWriter, ParamParser,
+    QueryResultWriter, StatementMetaWriter,
 };
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
@@ -41,8 +41,38 @@ use novarocks_query_application::session::{
     QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
+use novarocks_query_application::sql::admission::negotiated_query_statements;
 
 use crate::{ClientDisconnectWatcher, MysqlClientConnectionRegistry, spawn_disconnect_watcher};
+
+async fn write_negotiated_statement<'writer, W: AsyncWrite + Unpin>(
+    statement: StatementResult,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<crate::MysqlStatementWriteOutcome<'writer, W>> {
+    match statement {
+        StatementResult::Query(result) => crate::write_query_result_one(result, results)
+            .await
+            .map(crate::MysqlStatementWriteOutcome::Continue),
+        StatementResult::GovernedQuery(result) => {
+            crate::write_governed_query_result_one(result, results).await
+        }
+        StatementResult::StreamingQuery(result) => {
+            crate::write_streaming_query_result_one(result, results).await
+        }
+        StatementResult::GovernedCompletion(result) => {
+            crate::write_governed_terminal_ok_one(result.into_protocol(), results).await
+        }
+        StatementResult::GovernedError(result) => {
+            let (error, protocol) = result.into_parts();
+            crate::write_governed_terminal_error(error, protocol, results)
+                .await
+                .map(|_| crate::MysqlStatementWriteOutcome::Terminated)
+        }
+        StatementResult::Ok => crate::write_terminal_ok_one(results)
+            .await
+            .map(crate::MysqlStatementWriteOutcome::Continue),
+    }
+}
 
 /// Default upper bound for draining protocol tasks during an immediate
 /// application shutdown.
@@ -372,6 +402,43 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
                     .await;
             }
         };
+        let capabilities = results.client_capabilities();
+        let multi_results_negotiated = capabilities
+            .contains(CapabilityFlags::CLIENT_MULTI_STATEMENTS)
+            && capabilities.contains(CapabilityFlags::CLIENT_MULTI_RESULTS);
+        let statements = if multi_results_negotiated {
+            match negotiated_query_statements(query) {
+                Ok(statements) => statements,
+                Err(error) => {
+                    return results
+                        .error(crate::mysql_error_kind(&error), error.message().as_bytes())
+                        .await;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if statements.len() > 1 {
+            let mut results = results;
+            for statement_sql in statements {
+                let statement = match session.execute_statement(statement_sql).await {
+                    Ok(statement) => statement,
+                    Err(error) => {
+                        return results
+                            .error(crate::mysql_error_kind(&error), error.message().as_bytes())
+                            .await;
+                    }
+                };
+                let (statement, terminal) = statement.into_parts();
+                let outcome = write_negotiated_statement(statement, results).await;
+                terminal.complete();
+                match outcome? {
+                    crate::MysqlStatementWriteOutcome::Continue(next) => results = next,
+                    crate::MysqlStatementWriteOutcome::Terminated => return Ok(()),
+                }
+            }
+            return results.no_more_results().await;
+        }
         let (statement, terminal) = match session.execute_batch(query).await {
             Ok(statement) => statement.into_parts(),
             Err(error) => {
