@@ -58,7 +58,7 @@ pub enum TaskStatusEvent {
 /// It is never stored in [`TaskStatusSource`], so overlapping reconnect streams
 /// cannot advance or consume each other's task or context observations.
 #[derive(Debug)]
-pub(crate) struct TaskStatusSubscriptionPosition {
+pub struct TaskStatusSubscriptionPosition {
     context_cursor: Option<QueryContextConvergenceCursor>,
     task_versions: BTreeMap<TaskIdentity, Option<TaskStatusVersion>>,
     gone: BTreeSet<TaskIdentity>,
@@ -67,7 +67,7 @@ pub(crate) struct TaskStatusSubscriptionPosition {
 }
 
 impl TaskStatusSubscriptionPosition {
-    pub(crate) fn new(
+    pub fn new(
         task_cursors: &[TaskStatusCursor],
         context_cursor: Option<QueryContextConvergenceCursor>,
     ) -> Self {
@@ -84,7 +84,7 @@ impl TaskStatusSubscriptionPosition {
     }
 
     /// Advances only the stream that actually handed this frame to its caller.
-    pub(crate) fn note_delivered(&mut self, event: &TaskStatusEvent) {
+    pub fn note_delivered(&mut self, event: &TaskStatusEvent) {
         match event {
             TaskStatusEvent::ContextConvergence(receipt) => {
                 self.context_cursor = Some(QueryContextConvergenceCursor::at(
@@ -351,7 +351,7 @@ impl TaskStatusSource {
     }
 
     /// Waits for the next frame owed to one subscription's own cursor.
-    pub(crate) async fn next_subscription_event_owned(
+    pub async fn next_subscription_event_owned(
         &self,
         context: QueryContextRef,
         position: &Mutex<TaskStatusSubscriptionPosition>,
@@ -371,7 +371,7 @@ impl TaskStatusSource {
     }
 
     /// Reads the next fact owed to one stream without consuming shared state.
-    pub(crate) fn next_subscription_event_at(
+    pub fn next_subscription_event_at(
         &self,
         context: QueryContextRef,
         position: &Mutex<TaskStatusSubscriptionPosition>,

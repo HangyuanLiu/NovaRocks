@@ -16,7 +16,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::{WorkerDrainState, WorkerResultRetainedLimits};
+use novarocks_worker::{TaskStatusReporter, WorkerDrainState, WorkerResultRetainedLimits};
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
@@ -34,7 +34,7 @@ use novarocks_native_adapter::{
 #[cfg(test)]
 use crate::task_execution::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost, TaskStatusReporter,
+    TaskExecutionHost,
 };
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{

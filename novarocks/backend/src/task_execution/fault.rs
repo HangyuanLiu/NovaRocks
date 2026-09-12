@@ -513,7 +513,7 @@ pub(super) fn create_task_receipt_foreign_task(
 /// fact is the backend process inside the event's own `TaskIdentity`.
 ///
 /// Claimed at the encode boundary rather than in
-/// [`super::observation::TaskStatusSource`], which is a process-local snapshot
+/// [`novarocks_worker::TaskStatusSource`], which is a process-local snapshot
 /// holder with no wire and no identity of its own to misstate: a status
 /// published there is the truth this backend holds, and the lie belongs where
 /// the frame leaves the process. Both the catch-up frames and the live ones

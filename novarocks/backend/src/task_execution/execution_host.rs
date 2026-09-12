@@ -100,7 +100,7 @@ use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
 use super::fault;
 use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
 use super::shared_facts::fragment_plan;
-use super::status::TaskStatusReporter;
+use novarocks_worker::TaskStatusReporter;
 
 /// Everything one query context contributes to preparing and running a task.
 ///
@@ -1629,11 +1629,11 @@ mod tests {
 
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
     use crate::task_execution::host::{HostRejection, RunnableTask, TaskExecutionHost};
-    use crate::task_execution::observation::TaskStatusSource;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusOwner, TaskStatusReporter,
-    };
     use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusOwner, TaskStatusReporter,
+        TaskStatusSource,
+    };
 
     // ------------------------------------------------------------- fixtures
 

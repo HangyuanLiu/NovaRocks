@@ -52,10 +52,8 @@ mod feedback;
 mod host;
 pub(crate) mod ingress;
 mod marker;
-mod observation;
 mod registry;
 pub(crate) mod shared_facts;
-mod status;
 
 #[cfg(test)]
 mod tests;
@@ -72,6 +70,3 @@ pub(crate) use host::{
 };
 pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub(crate) use registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
-#[cfg(test)]
-pub(crate) use status::TaskStatusReporter;
-pub(crate) use status::{RootResultRoute, StatusAdvance};

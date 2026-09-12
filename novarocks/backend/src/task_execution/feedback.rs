@@ -57,7 +57,7 @@ use crate::runtime_filter::domain::{
 };
 
 use super::fault;
-use super::status::TaskStatusReporter;
+use novarocks_worker::TaskStatusReporter;
 
 /// Publishes one query context's terminal logical feedback through one task.
 pub(crate) struct TaskRuntimeFilterFeedbackEgress {
@@ -237,12 +237,11 @@ mod tests {
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,
         BackendFrontendFeedbackSink, BackendMaterializationOwner,
     };
-    use crate::task_execution::observation::TaskStatusSource;
     use crate::task_execution::shared_facts::encode_dynamic_filter_read;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
-    };
     use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
+    };
 
     fn identity() -> TaskIdentity {
         TaskIdentity::new(

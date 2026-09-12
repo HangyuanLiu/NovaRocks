@@ -13,9 +13,7 @@ use super::data_plane_handlers::{ExchangeRouteAuthority, ExchangeRouteClaim, Exc
 use crate::runtime::result_buffer::{
     TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed, wait_fetch_typed_legacy,
 };
-use crate::task_execution::{
-    RootResultRoute, StatusAdvance, TaskExecutionRegistry, TaskInboundCapabilities,
-};
+use crate::task_execution::{TaskExecutionRegistry, TaskInboundCapabilities};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
@@ -23,6 +21,7 @@ use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models as proto;
 use novarocks_task_codec::operation::decode_fetch_task_result;
+use novarocks_worker::{RootResultRoute, StatusAdvance};
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);

@@ -75,7 +75,6 @@ use super::host::{HostRejection, QueryContextHost, ReleasedContextEvidence, Shar
 use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
 };
-use super::status::TaskStatusReporter;
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
 };
@@ -91,6 +90,7 @@ use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_worker::TaskStatusReporter;
 
 /// The mutable half of one context's installed facts.
 ///
@@ -1205,12 +1205,11 @@ mod tests {
     };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use crate::task_execution::host::{QueryContextHost, SharedFactsRequest};
-    use crate::task_execution::observation::TaskStatusSource;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
-    };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
+    };
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 

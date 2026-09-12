@@ -40,7 +40,7 @@ use novarocks_execution_contract::task_execution::status::{
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 
-use super::status::TaskStatusReporter;
+use novarocks_worker::TaskStatusReporter;
 
 /// A bounded, already-redacted rejection from an execution-side port.
 ///

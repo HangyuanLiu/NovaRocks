@@ -76,14 +76,14 @@ use tokio_stream::Stream;
 
 use super::fault;
 use super::host::HostRejection;
-use super::observation::{
-    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
-    TaskStatusSubscriptionPosition,
-};
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-use novarocks_worker::OperationReceipt;
+use novarocks_worker::{
+    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
+};
+use novarocks_worker::{OperationReceipt, TaskStatusReporter};
 
 type ReceiptAck = proto::task_operation_receipt::Ack;
 
@@ -609,7 +609,6 @@ mod tests {
         TaskExecutionHost,
     };
     use super::super::registry::TaskExecutionRegistryConfig;
-    use super::super::status::TaskStatusReporter;
     use super::*;
     use novarocks_worker::{ManualClock, WorkerMonotonicClock};
 

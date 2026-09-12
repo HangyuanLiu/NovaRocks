@@ -44,8 +44,7 @@ use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, Te
 
 use super::domains::{InitialDomainKey, TaskDomains};
 use super::host::{ReleasedContextEvidence, RunnableTask};
-use super::observation::TaskStatusSource;
-use super::status::TaskStatusOwner;
+use novarocks_worker::{TaskStatusOwner, TaskStatusSource};
 
 /// The comparable, secret-free identity of one establish request.
 ///

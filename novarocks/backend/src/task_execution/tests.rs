@@ -67,15 +67,13 @@ use super::host::{
     HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
     TaskExecutionHost,
 };
-use super::observation::{
-    ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
+use novarocks_worker::OperationReceipt;
+use novarocks_worker::{
+    ContextConvergenceCursorError, CursorObservation, METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute,
+    StatusAdvance, TaskStatusEvent, TaskStatusReporter, TaskStatusSource,
     TaskStatusSubscriptionPosition,
 };
-use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
-use super::status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute, StatusAdvance, TaskStatusReporter,
-};
-use novarocks_worker::OperationReceipt;
 
 // ------------------------------------------------------------------- fixtures
 

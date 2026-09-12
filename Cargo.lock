@@ -4451,6 +4451,7 @@ version = "0.1.0"
 dependencies = [
  "novarocks-execution-contract",
  "novarocks-types",
+ "tokio",
  "uuid",
 ]
 

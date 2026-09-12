@@ -32,9 +32,11 @@ mod drain;
 mod ingress;
 mod lease;
 mod lifecycle;
+mod observation;
 mod operation;
 mod receipt;
 mod reliable_transport;
+mod status;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -59,6 +61,10 @@ pub use lifecycle::{
     RootDrainAction, TaskTransition, TerminationLatch, classify_context_transition,
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
+pub use observation::{
+    ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
+};
 pub use operation::OperationWaitCaps;
 pub use receipt::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
@@ -69,6 +75,10 @@ pub use reliable_transport::{
     ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportFailureOutcome,
     ReliableTransportPolicy, ReliableTransportResourceLimit, ReliableTransportSendOutcome,
     ReliableTransportState, ReliableTransportStateError, ReliableTransportTick,
+};
+pub use status::{
+    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
+    TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };
 
 /// Positive, ordered joint retained-result limits owned by one worker process.

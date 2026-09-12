@@ -91,15 +91,11 @@ use super::host::{
     QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 use super::marker;
-use super::observation::TaskStatusSource;
-use super::status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
-    TaskStatusOwner, TaskStatusReporter,
-};
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
-    ReleaseQueryContextOutcome, UpdateTaskOutcome,
+    FinalTaskInfoOutcome, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt, QueryContextOutcome,
+    ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding, RootResultRoute,
+    StatusAdvance, TaskStatusOwner, TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";
