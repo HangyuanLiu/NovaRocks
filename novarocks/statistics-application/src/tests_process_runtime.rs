@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Product-owner integration checks compiled in the Frontend integration target.
+//! Product-owner process-runtime integration checks.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use novarocks_statistics_application::{
+use super::{
     StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsColumns, StatisticsFailure,
     StatisticsJob, StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase,
     StatisticsJobRepository, StatisticsJobState, StatisticsPublicationFact,
@@ -102,7 +102,7 @@ fn failed(error: novarocks_workload_control::WorkError) -> StatisticsAttemptErro
 }
 
 #[tokio::test]
-async fn frontend_adapter_exposes_distinct_process_local_identities() {
+async fn process_runtime_exposes_distinct_process_local_identities() {
     let repository = StatisticsJobRepository::new();
     let submitted = repository.create(create(1), root()).await.expect("create");
     let claimed = repository.claim_next(2).await.expect("claim").expect("job");

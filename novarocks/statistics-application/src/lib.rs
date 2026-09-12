@@ -899,6 +899,10 @@ fn work_error(error: novarocks_workload_control::WorkError) -> StatisticsReposit
 }
 
 #[cfg(test)]
+#[path = "tests_process_runtime.rs"]
+mod process_runtime_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
