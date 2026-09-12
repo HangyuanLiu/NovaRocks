@@ -59,9 +59,7 @@ mod tests;
 
 pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
-pub(crate) use execution_host::{
-    NativeTaskExecutionHost, TaskInboundCapabilities, TaskQueryContextFacts,
-};
+pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use host::QueryContextHost;
 #[cfg(test)]
 pub(crate) use host::ReleasedContextEvidence;

@@ -31,6 +31,7 @@ mod convergence;
 mod domain;
 mod drain;
 mod host;
+mod inbound_capability;
 mod ingress;
 mod lease;
 mod lifecycle;
@@ -60,6 +61,7 @@ pub use domain::{
 };
 pub use drain::WorkerDrainState;
 pub use host::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+pub use inbound_capability::{InboundFrameAdmission, InboundFrameClaim, TaskInboundCapabilities};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{

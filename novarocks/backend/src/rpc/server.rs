@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-use crate::task_execution::TaskInboundCapabilities;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
@@ -37,6 +36,7 @@ use crate::runtime_filter::rpc::{
 use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder, generated::nova_rocks_grpc_server::NovaRocksGrpc,
 };
+use novarocks_worker::TaskInboundCapabilities;
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///

@@ -177,7 +177,7 @@ struct BackendApplicationServices {
     /// plane needs it directly: without it no created task can receive an
     /// exchange frame, because the frozen descriptor is the only place a
     /// task's inbound topology exists.
-    task_inbound_capabilities: Arc<crate::task_execution::TaskInboundCapabilities>,
+    task_inbound_capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     /// The task substrate's runtime-filter participant owner. The RPC ingress
     /// needs it directly, for the same reason: an `EstablishQueryContext`
     /// install is the only place a task-protocol query's participant exists.
@@ -437,7 +437,7 @@ fn compose_backend_application_services(
         ),
         data_runtime.clone(),
     ));
-    let inbound_capabilities = crate::task_execution::TaskInboundCapabilities::new();
+    let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
     let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
