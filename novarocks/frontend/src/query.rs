@@ -45,9 +45,6 @@ use crate::statistics::command::StatisticsCommandExecutor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
 use crate::workload_lifecycle::{FrontendAdmissionError, FrontendServingLifecycle};
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use novarocks_parser::{
     ast::{self, Statement as ParsedStatement},
@@ -58,7 +55,9 @@ use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
     ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_string_query_result,
+};
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminateOutcome,
@@ -409,22 +408,7 @@ fn execute_typed_dml_statement(
 }
 
 fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
-    let column = QueryResultColumn::new("status", DataType::Utf8, false, None);
-    let batch = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new(
-            "status",
-            DataType::Utf8,
-            false,
-        )])),
-        vec![Arc::new(StringArray::from(vec![format!(
-            "Added {file_count} file(s)"
-        )]))],
-    )
-    .map_err(|error| format!("build ADD FILES status result failed: {error}"))?;
-    Ok(QueryResult {
-        columns: vec![column],
-        batches: vec![batch],
-    })
+    build_string_query_result("status", vec![format!("Added {file_count} file(s)")])
 }
 
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
@@ -2044,7 +2028,11 @@ mod tests {
         MutationEngine, MutationPrepared, MutationStageOutcome, PrepareMutationRequest,
         PreparedMutation,
     };
-    use arrow::array::Int64Array;
+    use arrow::{
+        array::{Int64Array, StringArray},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
     use novarocks_query_application::api::ResultField;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::client_connection::ClientConnectionToken;
@@ -2089,6 +2077,18 @@ mod tests {
         assert!(proto.enable_parquet_reader_page_index);
         assert!(proto.enable_scan_datacache);
         assert!(proto.enable_populate_datacache);
+    }
+
+    #[test]
+    fn add_files_status_uses_query_application_immediate_result_contract() {
+        let result = add_files_status(2).expect("build ADD FILES status");
+        assert_eq!(result.columns[0].name(), "status");
+        let values = result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("status text column");
+        assert_eq!(values.value(0), "Added 2 file(s)");
     }
 
     fn scalar_stream_fixture(
