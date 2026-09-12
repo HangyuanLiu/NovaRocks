@@ -26,7 +26,7 @@ const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const TWO_ROW_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(SchemaOnce)]
+    vec![Box::new(SchemaOnce), Box::new(NegotiatedMultiResult)]
 }
 
 /// A public MySQL result must have exactly one schema prefix, then its rows,
@@ -34,6 +34,69 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 /// client library drains these packets before a scenario can prove their wire
 /// order or detect an accidental second schema prefix.
 struct SchemaOnce;
+
+/// A negotiated COM_QUERY batch emits one result per executable statement.
+/// The first result must carry SERVER_MORE_RESULTS_EXISTS, while the final
+/// result owns the single terminal success packet without that status bit.
+struct NegotiatedMultiResult;
+
+impl Scenario for NegotiatedMultiResult {
+    fn name(&self) -> &'static str {
+        "query-output/negotiated-multi-result"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = context
+            .handle()
+            .query_execution_resource_snapshot()?
+            .context("cross-process harness did not expose the query-resource oracle")?;
+        let timeout = context
+            .remaining("open negotiated raw MySQL client")?
+            .min(IO_TIMEOUT_CAP);
+        let mut stream = MysqlStream::connect_with_multi_results(
+            context.mysql_user(),
+            context.mysql_port(),
+            timeout,
+        )?;
+        stream.send_query("SET query_timeout = 1; SELECT 1")?;
+        let first = stream.read_packet("first multi-result terminal")?;
+        ensure!(
+            first.is_result_terminator() && first.has_more_results(),
+            "first statement must end with SERVER_MORE_RESULTS_EXISTS, got payload={:?}",
+            first.payload()
+        );
+
+        let packets = [
+            stream.read_packet("second result column count")?,
+            stream.read_packet("second result column definition")?,
+            stream.read_packet("second result metadata terminator")?,
+            stream.read_packet("second result row")?,
+            stream.read_packet("second result terminal")?,
+        ];
+        assert_packet_sequence(&packets)?;
+        ensure!(packets[0].payload() == [1], "expected one result column");
+        ensure_normal_packet(&packets[1], "second result column definition")?;
+        ensure!(
+            packets[2].is_result_terminator(),
+            "expected metadata terminator"
+        );
+        ensure_normal_packet(&packets[3], "second result row")?;
+        ensure!(
+            packets[4].is_result_terminator() && !packets[4].has_more_results(),
+            "final result must terminate without more-results, got payload={:?}",
+            packets[4].payload()
+        );
+        context.action("verified negotiated multi-result wire order and terminal status flags");
+        let deadline = context.deadline();
+        context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, deadline)
+            .context("await negotiated multi-result resource convergence")?;
+        context.action("verified negotiated multi-result resources converged");
+        Ok(())
+    }
+}
 
 impl Scenario for SchemaOnce {
     fn name(&self) -> &'static str {
