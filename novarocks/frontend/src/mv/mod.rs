@@ -21,7 +21,6 @@ pub(crate) mod background_engine;
 pub mod command;
 mod create;
 pub mod domain;
-pub mod maintenance;
 pub(crate) mod maintenance_worker;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;

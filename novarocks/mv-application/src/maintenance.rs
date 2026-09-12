@@ -723,12 +723,15 @@ fn failure_backoff_ms(attempt: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS, DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP,
-        DEFAULT_TARGET_FILE_SIZE_BYTES, MaintenanceAdmission, MaintenanceCoordinator,
-        MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
-        MvMaintenanceFacts, TablePolicy,
+        AutomaticMaintenanceAction, AutomaticMaintenanceRunner, DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS,
+        DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP, DEFAULT_TARGET_FILE_SIZE_BYTES,
+        MaintenanceActionKind, MaintenanceAdmission, MaintenanceCoordinator,
+        MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MaintenanceSkipReason,
+        MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts, TablePolicy,
     };
-    use novarocks_table_maintenance::MaintenanceTarget;
+    use novarocks_table_maintenance::{
+        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+    };
 
     fn facts() -> MvMaintenanceFacts {
         MvMaintenanceFacts {
@@ -821,6 +824,321 @@ mod tests {
             coordinator
                 .try_begin(2, target("second"), &facts(), 1_000_000_000)
                 .expect_err("second target must wait for product capacity"),
+            MaintenanceAdmission::AtCapacity
+        );
+        coordinator.cancel_attempt(first);
+        assert_eq!(coordinator.active_count(), 0);
+    }
+
+    const NOW: i64 = 1_000_000_000;
+
+    fn target(name: &str) -> MaintenanceTarget {
+        MaintenanceTarget {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: name.to_string(),
+        }
+    }
+
+    fn policy_facts() -> MvMaintenanceFacts {
+        MvMaintenanceFacts {
+            current_snapshot_id: Some(3),
+            total_data_files: Some(200),
+            max_compactable_data_files: Some(200),
+            total_delete_files: Some(0),
+            total_files_size_bytes: Some(200 * 1024 * 1024),
+            oldest_snapshot_timestamp_ms: Some(1_000),
+            snapshot_count: 3,
+            ..MvMaintenanceFacts::default()
+        }
+    }
+
+    struct Runner {
+        transient_expire: bool,
+        calls: Vec<MaintenanceActionKind>,
+    }
+
+    impl AutomaticMaintenanceRunner for Runner {
+        fn expire_snapshots_durably(
+            &mut self,
+            _request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
+            self.calls.push(MaintenanceActionKind::Expire);
+            if self.transient_expire {
+                return Err(MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::TransientUnavailable,
+                    "temporary metadata lease failure",
+                ));
+            }
+            Ok(MaintenanceActionOutcome::ExpireSnapshots {
+                deleted_data_files_count: None,
+                deleted_position_delete_files_count: None,
+                deleted_equality_delete_files_count: None,
+                deleted_manifest_files_count: None,
+                deleted_manifest_lists_count: None,
+                deleted_statistics_files_count: None,
+            })
+        }
+
+        fn rewrite_position_deletes_durably(
+            &mut self,
+            _request: MaintenanceActionRequest,
+        ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
+            self.calls
+                .push(MaintenanceActionKind::RewritePositionDeletes);
+            Ok(MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                rewritten_delete_files_count: 1,
+                added_delete_files_count: Some(1),
+                rewritten_bytes_count: 1,
+                added_bytes_count: 1,
+            })
+        }
+
+        fn optimize_durably(
+            &mut self,
+            _target: MaintenanceTarget,
+        ) -> Result<OptimizeSubmission, MvBackgroundEngineError> {
+            self.calls.push(MaintenanceActionKind::Optimize);
+            Ok(OptimizeSubmission::Submitted { job_id: 7 })
+        }
+    }
+
+    fn run_attempt(
+        coordinator: &mut MaintenanceCoordinator,
+        attempt: super::MaintenanceAttempt,
+        runner: &mut dyn AutomaticMaintenanceRunner,
+        now_ms: i64,
+    ) -> MaintenanceExecutionReport {
+        let report = MaintenanceCoordinator::execute_attempt(&attempt, runner);
+        coordinator.finish_attempt(attempt, &report, now_ms);
+        report
+    }
+
+    #[test]
+    fn policy_prefers_durable_optimize_and_suppresses_delete_rewrite() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW)
+            .expect("admit maintenance");
+        assert!(
+            attempt
+                .evaluation()
+                .actions
+                .contains(&AutomaticMaintenanceAction::Optimize)
+        );
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::RewritePositionDeletes,
+            MaintenanceSkipReason::SuppressedByOptimize,
+        )));
+        let report = run_attempt(
+            &mut coordinator,
+            attempt,
+            &mut Runner {
+                transient_expire: false,
+                calls: Vec::new(),
+            },
+            NOW,
+        );
+        assert!(report.completed.contains(&MaintenanceActionKind::Optimize));
+    }
+
+    #[test]
+    fn transient_failure_sets_backoff_without_direct_retry() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
+            compaction_min_data_files: 1_000,
+            ..MaintenanceCoordinatorConfig::default()
+        });
+        let first = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW)
+            .expect("admit first pass");
+        let report = run_attempt(
+            &mut coordinator,
+            first,
+            &mut Runner {
+                transient_expire: true,
+                calls: Vec::new(),
+            },
+            NOW,
+        );
+        assert_eq!(
+            report.failures,
+            vec![(
+                MaintenanceActionKind::Expire,
+                MvBackgroundEngineErrorKind::TransientUnavailable,
+            )]
+        );
+
+        let second = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+            .expect("admit policy reevaluation after gate");
+        assert!(second.evaluation().skips.contains(&(
+            MaintenanceActionKind::Expire,
+            MaintenanceSkipReason::FailureBackoff,
+        )));
+        coordinator.cancel_attempt(second);
+    }
+
+    #[test]
+    fn unchanged_snapshot_is_a_noop_after_first_completed_pass() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
+            compaction_min_data_files: 1_000,
+            ..MaintenanceCoordinatorConfig::default()
+        });
+        let first = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW)
+            .expect("admit first pass");
+        run_attempt(
+            &mut coordinator,
+            first,
+            &mut Runner {
+                transient_expire: false,
+                calls: Vec::new(),
+            },
+            NOW,
+        );
+
+        let mut current = policy_facts();
+        current.oldest_snapshot_timestamp_ms = Some(NOW);
+        let second = coordinator
+            .try_begin(1, target("mv"), &current, NOW + 1)
+            .expect("admit second pass");
+        assert!(second.evaluation().actions.is_empty());
+        assert!(second.evaluation().skips.contains(&(
+            MaintenanceActionKind::Optimize,
+            MaintenanceSkipReason::SnapshotUnchanged,
+        )));
+        let report = run_attempt(
+            &mut coordinator,
+            second,
+            &mut Runner {
+                transient_expire: false,
+                calls: Vec::new(),
+            },
+            NOW + 1,
+        );
+        assert!(report.is_noop());
+    }
+
+    #[test]
+    fn disabled_typed_fact_skips_every_action() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = policy_facts();
+        current.maintenance_enabled = Some(false);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().actions.is_empty());
+        for kind in [
+            MaintenanceActionKind::Expire,
+            MaintenanceActionKind::RewritePositionDeletes,
+            MaintenanceActionKind::Optimize,
+        ] {
+            assert!(
+                attempt
+                    .evaluation()
+                    .skips
+                    .contains(&(kind, MaintenanceSkipReason::Disabled)),
+                "missing Disabled skip for {kind:?}"
+            );
+        }
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn explicitly_enabled_typed_fact_evaluates_normally() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = policy_facts();
+        current.maintenance_enabled = Some(true);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(
+            attempt
+                .evaluation()
+                .actions
+                .contains(&AutomaticMaintenanceAction::Optimize)
+        );
+        assert!(
+            !attempt
+                .evaluation()
+                .skips
+                .iter()
+                .any(|(_, reason)| *reason == MaintenanceSkipReason::Disabled)
+        );
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_min_snapshots_to_keep_blocks_expire() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = policy_facts();
+        current.expire_min_snapshots_to_keep = Some(5);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Expire,
+            MaintenanceSkipReason::NothingToExpire,
+        )));
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_target_file_size_drives_the_small_file_ratio() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = policy_facts();
+        current.target_file_size_bytes = Some(1);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Optimize,
+            MaintenanceSkipReason::BelowThreshold,
+        )));
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn declared_expire_max_age_keeps_recent_snapshots() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let mut current = policy_facts();
+        current.oldest_snapshot_timestamp_ms = Some(NOW - 1_000);
+        current.expire_max_snapshot_age_ms = Some(10_000);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().skips.contains(&(
+            MaintenanceActionKind::Expire,
+            MaintenanceSkipReason::NothingToExpire,
+        )));
+        coordinator.cancel_attempt(attempt);
+
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        current.expire_max_snapshot_age_ms = Some(100);
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &current, NOW)
+            .expect("admit maintenance");
+        assert!(attempt.evaluation().actions.iter().any(|action| matches!(
+            action,
+            AutomaticMaintenanceAction::ExpireSnapshots { retain_last, .. } if *retain_last == 1
+        )));
+        coordinator.cancel_attempt(attempt);
+    }
+
+    #[test]
+    fn admitted_attempts_enforce_real_per_mv_capacity() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
+            max_concurrent: 1,
+            ..MaintenanceCoordinatorConfig::default()
+        });
+        let first = coordinator
+            .try_begin(1, target("mv_one"), &policy_facts(), NOW)
+            .expect("admit first MV");
+        assert_eq!(coordinator.active_count(), 1);
+        assert_eq!(
+            coordinator
+                .try_begin(2, target("mv_two"), &policy_facts(), NOW)
+                .expect_err("second MV must wait for capacity"),
             MaintenanceAdmission::AtCapacity
         );
         coordinator.cancel_attempt(first);
