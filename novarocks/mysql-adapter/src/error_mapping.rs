@@ -56,6 +56,10 @@ pub fn error_kind_for_domain_code(code: &str) -> Option<ErrorKind> {
 }
 
 #[cfg(test)]
+#[path = "error_mapping/tests_manifest.rs"]
+mod manifest_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

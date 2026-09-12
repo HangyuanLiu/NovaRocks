@@ -17,6 +17,7 @@
 
 //! Cross-product contract: every active SQL error must have an adapter mapping.
 
+use super::error_kind_for_domain_code;
 use std::collections::BTreeSet;
 
 use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
@@ -38,7 +39,7 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
     assert_eq!(descriptor_codes.len(), 29);
     for code in descriptor_codes {
         assert!(
-            novarocks_mysql_adapter::error_kind_for_domain_code(code).is_some(),
+            error_kind_for_domain_code(code).is_some(),
             "active descriptor `{code}` must have one MySQL wire mapping"
         );
     }
