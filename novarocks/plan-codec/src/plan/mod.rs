@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) use self::type_mapping::encode_type;
+pub use self::type_mapping::encode_type;
 use crate::expr::encode_expr;
 use novarocks_proto_models::plan;
 use novarocks_sql::plan_read::{

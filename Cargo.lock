@@ -3605,6 +3605,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-native-adapter",
  "novarocks-native-trust",
+ "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
