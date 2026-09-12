@@ -1954,6 +1954,13 @@ where
                 }
             };
             state.last_topology_revision = Some(snapshot.revision());
+            bind_query_lifecycle_fault_scopes(request.execution(), &snapshot).map_err(|error| {
+                attempt_failure(
+                    AttemptFailureClass::ContractViolation,
+                    QueryExecutionErrorKind::InvalidRequest,
+                    error,
+                )
+            })?;
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
@@ -1980,6 +1987,64 @@ where
                 .map_err(NativeAttemptPreparationError::from)
         })
     }
+}
+
+/// Bind every runner-armed lifecycle fault to the exact attempt and immutable
+/// backend generations that this Native preparation captured. This belongs at
+/// the process adapter, not Query Application: the fault files are test-only
+/// process instrumentation and are not a logical query capability.
+#[cfg(debug_assertions)]
+fn bind_query_lifecycle_fault_scopes(
+    execution_id: novarocks_types::QueryExecutionId,
+    snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+) -> Result<(), String> {
+    use novarocks_failpoint::{QueryLifecycleFaultKind, bind_armed_fault};
+
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(());
+    };
+    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| error.to_string())?;
+    let protocol_execution_id =
+        novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+            .map_err(|error| error.to_string())?;
+    for target in snapshot.targets() {
+        let backend_index = target.backend_idx();
+        let process_id = target.process_id().map_err(|error| error.to_string())?;
+        // Bind the manifest-wide set instead of naming individual kinds. A
+        // new runner arm must become reachable through this adapter by default.
+        for kind in QueryLifecycleFaultKind::ALL {
+            if let Some(scope) = bind_armed_fault(
+                &root,
+                kind,
+                protocol_execution_id,
+                backend_index,
+                process_id,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                eprintln!(
+                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
+                    kind.file_stem(),
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    scope.backend_index,
+                    scope.process_id,
+                    scope.token
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn bind_query_lifecycle_fault_scopes(
+    _execution_id: novarocks_types::QueryExecutionId,
+    _snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn attempt_failure(
