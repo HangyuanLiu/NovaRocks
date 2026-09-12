@@ -37,7 +37,7 @@ pub mod state_family;
 pub mod state_store;
 pub(crate) mod statistics;
 pub(crate) mod statistics_jobs;
-pub mod system_catalog;
+mod system_catalog;
 pub(crate) mod table_maintenance;
 pub(crate) mod task_execution;
 pub mod topology;
