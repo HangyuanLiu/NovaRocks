@@ -23,10 +23,7 @@ use crate::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
-use crate::{
-    state_store::{StateStoreHostInput, testing as state_store_fixture},
-    topology::ClusterBackendOpenConfig,
-};
+use crate::{state_store::testing as state_store_fixture, topology::ClusterBackendOpenConfig};
 use bytes::Bytes;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
@@ -39,6 +36,7 @@ use novarocks_parser::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
+use novarocks_state_store_runtime::StateStoreHostInput;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;

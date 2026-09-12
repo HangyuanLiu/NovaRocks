@@ -38,7 +38,7 @@ use crate::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
 use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
-use crate::state_store::{StateStoreHost, testing as state_store_fixture};
+use crate::state_store::testing as state_store_fixture;
 use crate::topology::ClusterBackendOpenConfig;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_catalog_application::{
@@ -68,6 +68,7 @@ use novarocks_state_store_api::{
     StateStoreError, StateStoreErrorKind, StateStoreLimits, StoreIdentity, WriteAttempt,
     WriteTransaction,
 };
+use novarocks_state_store_runtime::StateStoreHost;
 use tokio::sync::Notify;
 use uuid::Uuid;
 

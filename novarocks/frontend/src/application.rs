@@ -41,7 +41,6 @@ use novarocks_workload_control::{
     WorkloadConfig, WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
 };
 
-use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
@@ -50,7 +49,10 @@ use novarocks_native_trust::NativeTrust;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
-use novarocks_state_store_runtime::{StateStoreRunPolicy, validate_persistent_state_families};
+use novarocks_state_store_runtime::{
+    StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry, StateStoreRunPolicy,
+    validate_persistent_state_families,
+};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
 use crate::catalog_application::MvCatalogReferenceReader;
@@ -2006,18 +2008,18 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::time::{Duration, Instant};
 
-    use crate::state_store::{
-        StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
-        testing::{
-            TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
-            registry as test_state_store_registry,
-        },
+    use crate::state_store::testing::{
+        TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
+        registry as test_state_store_registry,
     };
     use async_trait::async_trait;
     use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
     use novarocks_state_store_api::{
         StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderDescriptor,
         StateStoreProviderFactory, StateStoreProviderInstance,
+    };
+    use novarocks_state_store_runtime::{
+        StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
     use novarocks_workload_control::{ResourceConfig, WorkClass, WorkRequest, WorkloadConfig};
 

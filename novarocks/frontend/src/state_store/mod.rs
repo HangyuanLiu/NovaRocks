@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned StateStore consumer runtime.
+//! Frontend-owned StateStore consumer support.
+//!
+//! The provider-neutral host lifecycle and provider registry belong to
+//! `novarocks-state-store-runtime`. This module retains only Frontend's
+//! business-consumer metrics, abandonment sweep driver, and test fixtures.
 
-mod host;
-pub mod host_error;
 pub mod metrics;
-pub mod provider;
 pub mod sweeper;
 
 #[cfg(test)]
@@ -30,9 +31,4 @@ pub(crate) mod testing;
 #[path = "consumer_failure_tests.rs"]
 mod consumer_failure_tests;
 
-pub use host::{StateStoreHost, StateStoreHostLifecycle};
-pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
-pub use provider::{
-    StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
-};
 pub use sweeper::{AbandonedAttemptSweeper, DEFAULT_SWEEP_INTERVAL};

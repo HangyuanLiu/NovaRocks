@@ -65,6 +65,7 @@ use novarocks_state_store_api::{
     RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StoreIdentity, Value, WriteAttempt, WriteTransaction,
 };
+use novarocks_state_store_runtime::StateStoreHost;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -541,7 +542,7 @@ async fn attachment(
         .expect("read catalog attachment")
 }
 
-async fn shutdown(mut host: crate::state_store::StateStoreHost) {
+async fn shutdown(mut host: StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");

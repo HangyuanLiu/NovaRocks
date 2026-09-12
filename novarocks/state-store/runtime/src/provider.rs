@@ -21,9 +21,8 @@ use std::sync::Arc;
 use novarocks_state_store_api::{
     StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
 };
-use novarocks_state_store_runtime::StateStoreRunPolicy;
 
-use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
+use crate::{StateStoreHostError, StateStoreHostErrorKind, StateStoreRunPolicy};
 
 /// Provider-neutral StateStore opening facts resolved by Server composition.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,9 +39,6 @@ pub struct StateStoreHostInput {
 }
 
 /// A provider factory builder supplied by the concrete composition root.
-///
-/// Design: ADR-0093 keeps this registry in Frontend while Server owns concrete
-/// provider selection and leaf crates own native construction.
 pub type StateStoreProviderBinder = Arc<
     dyn Fn(&StateStoreHostInput) -> Result<Box<dyn StateStoreProviderFactory>, StateStoreHostError>
         + Send

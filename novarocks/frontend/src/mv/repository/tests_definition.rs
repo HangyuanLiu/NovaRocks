@@ -31,14 +31,14 @@ use crate::mv::domain::repository::{
     MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
     ReplaceMvProjectionRequest,
 };
-use crate::state_store::{StateStoreHost, testing as state_store_fixture};
+use crate::state_store::testing as state_store_fixture;
 use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
-use novarocks_state_store_runtime::StateStoreRunPolicy;
+use novarocks_state_store_runtime::{StateStoreHost, StateStoreRunPolicy};
 
 pub(crate) async fn repository() -> (StateStoreHost, Arc<StateStoreMvRepository>) {
     let registry = state_store_fixture::persistent_registry();

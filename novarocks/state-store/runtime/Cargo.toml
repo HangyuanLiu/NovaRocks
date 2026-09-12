@@ -35,6 +35,7 @@ novarocks-state-store-api.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 
 [dev-dependencies]
 novarocks-state-store-testkit.workspace = true

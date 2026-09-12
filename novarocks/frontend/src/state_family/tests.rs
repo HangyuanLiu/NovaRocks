@@ -43,7 +43,7 @@
 use super::{classification::DurabilityAdmission, manifest::StateFamily};
 use crate::{
     application::{FrontendApplicationHost, FrontendExecutionConfig},
-    state_store::{StateStoreHost, StateStoreHostInput, testing as state_store_fixture},
+    state_store::testing as state_store_fixture,
     topology::ClusterBackendOpenConfig,
 };
 use bytes::Bytes;
@@ -54,6 +54,7 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{Direction, Key, KeyRange, RangeRequest, StateStore};
+use novarocks_state_store_runtime::{StateStoreHost, StateStoreHostInput};
 use novarocks_table_maintenance::gc_observation::{
     GC_OWNED_REF_OBSERVATION_STATE_FAMILY, GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
 };

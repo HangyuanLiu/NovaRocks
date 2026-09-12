@@ -22,10 +22,11 @@ use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderId,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
-use novarocks_state_store_runtime::StateStoreRunPolicy;
 
-use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
-use super::provider::{StateStoreHostInput, StateStoreProviderRegistry};
+use crate::{
+    StateStoreHostError, StateStoreHostErrorKind, StateStoreHostInput, StateStoreProviderRegistry,
+    StateStoreRunPolicy,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateStoreHostLifecycle {
@@ -98,26 +99,12 @@ impl StateStoreHost {
         self.run_policy
     }
 
-    /// The store together with the policy governing its use.
-    ///
-    /// Consumers take this pair rather than the two separately, so a component
-    /// cannot end up holding durable storage with no agreed budget for it.
     pub fn durable(&self) -> Option<(Arc<dyn StateStore>, StateStoreRunPolicy)> {
         self.state_store
             .clone()
             .map(|store| (store, self.run_policy))
     }
 
-    /// Releases evidence for attempts that were dispatched and then abandoned.
-    ///
-    /// The contract states that cleanup is driven by a host, never spawned by
-    /// the supervisor. This is that driver: without it an abandoned attempt
-    /// keeps both its capacity slot and its provider-side evidence for the life
-    /// of the instance, which is the failure the bounded-evidence rule exists
-    /// to prevent. Call it on a cadence the caller can account for.
-    ///
-    /// A provider that is not ready to release yet reports that without it
-    /// counting as a fault, so an ordinary tick is quiet.
     pub async fn release_abandoned_attempts(&self) -> Result<usize, StateStoreHostError> {
         let Some(store) = &self.state_store else {
             return Ok(0);
@@ -140,9 +127,6 @@ impl StateStoreHost {
         if self.lifecycle == StateStoreHostLifecycle::Stopped {
             return Ok(());
         }
-        // Last chance to hand evidence back before the instance goes away.
-        // A failure here must not stop the shutdown: the store is closing
-        // either way, and reporting it as a shutdown failure would hide that.
         if let Err(error) = self.release_abandoned_attempts().await {
             tracing::warn!(%error, "abandoned state store attempts were not released before shutdown");
         }
@@ -209,4 +193,78 @@ fn validate_open_instance(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use novarocks_state_store_api::{
+        StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderId,
+    };
+    use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
+
+    use super::*;
+    use crate::{
+        StateStoreHostErrorKind, StateStoreHostInput, StateStoreProviderRegistration,
+        StateStoreProviderRegistry,
+    };
+
+    const PROVIDER_ID: StateStoreProviderId = StateStoreProviderId::new("runtime-host-test");
+    const DESCRIPTOR: StateStoreProviderDescriptor =
+        StateStoreProviderDescriptor::new(PROVIDER_ID, novarocks_state_store_api::MAX_KEY_BYTES);
+
+    fn registry() -> StateStoreProviderRegistry {
+        let mut registry = StateStoreProviderRegistry::new();
+        registry
+            .register(StateStoreProviderRegistration::new(DESCRIPTOR, |_| {
+                Ok(Box::new(InMemoryStateStoreProviderFactory::new(DESCRIPTOR)))
+            }))
+            .expect("register test provider");
+        registry
+    }
+
+    fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
+        StateStoreHostInput {
+            cluster_id: cluster_id.into(),
+            provider_id: PROVIDER_ID,
+            limits: StateStoreLimits::default(),
+            run_policy: StateStoreRunPolicy::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_owns_provider_lifecycle_and_releases_the_store_before_shutdown() {
+        let mut host = StateStoreHost::open(
+            &registry(),
+            input("runtime-host-lifecycle"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect("open host");
+
+        assert_eq!(host.lifecycle(), StateStoreHostLifecycle::Ready);
+        assert!(host.state_store().is_some());
+        host.shutdown(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown host");
+        assert_eq!(host.lifecycle(), StateStoreHostLifecycle::Stopped);
+        assert!(host.state_store().is_none());
+    }
+
+    #[tokio::test]
+    async fn host_rejects_invalid_server_opening_facts_before_provider_open() {
+        let result = StateStoreHost::open(
+            &registry(),
+            input("  "),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("empty cluster identity must fail closed"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), StateStoreHostErrorKind::InvalidConfiguration);
+    }
 }

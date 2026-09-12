@@ -19,15 +19,13 @@ use super::{
     FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
     FrontendExecutionConfig,
 };
-use crate::{
-    state_store::{StateStoreHostInput, testing as state_store_fixture},
-    topology::ClusterBackendOpenConfig,
-};
+use crate::{state_store::testing as state_store_fixture, topology::ClusterBackendOpenConfig};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
+use novarocks_state_store_runtime::StateStoreHostInput;
 use std::time::Duration;
 use uuid::Uuid;
 

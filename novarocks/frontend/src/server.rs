@@ -25,7 +25,6 @@ use tokio::runtime::Handle;
 use tracing::info;
 
 use crate::capabilities as core_capabilities;
-use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
@@ -38,6 +37,7 @@ use novarocks_query_application::client_connection::{
 use novarocks_query_application::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_state_store_runtime::{StateStoreHostInput, StateStoreProviderRegistry};
 use novarocks_types::naming::DEFAULT_DATABASE;
 use novarocks_version as version;
 

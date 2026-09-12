@@ -40,9 +40,6 @@ use novarocks_frontend::{
         FrontendQueryControlTimeouts,
     },
     server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
-    state_store::{
-        StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
-    },
     topology::ClusterBackendOpenConfig,
 };
 use novarocks_fs::{
@@ -71,6 +68,9 @@ use novarocks_spi::connector::{
     WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
+use novarocks_state_store_runtime::{
+    StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
+};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};

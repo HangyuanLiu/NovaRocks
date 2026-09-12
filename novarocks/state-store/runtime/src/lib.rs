@@ -19,11 +19,16 @@
 //!
 //! Concrete provider construction and configuration belong to Server. Durable
 //! record families and prefixes remain with the application domain that owns
-//! those records.
+//! those records. This crate owns the selected provider instance's host
+//! lifecycle, but Server remains the only source of provider selection and
+//! registration contributions.
 
 mod durable;
 mod family;
+mod host;
+mod host_error;
 mod policy;
+mod provider;
 mod runner;
 
 pub use durable::{
@@ -32,9 +37,14 @@ pub use durable::{
 pub use family::{
     PersistentStateFamily, PersistentStateFamilyError, validate_persistent_state_families,
 };
+pub use host::{StateStoreHost, StateStoreHostLifecycle};
+pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 
 pub use policy::{
     DEFAULT_MAX_ATTEMPTS, DEFAULT_OPERATION_TIMEOUT, MAX_ATTEMPTS_CEILING,
     OPERATION_TIMEOUT_CEILING, StateStoreRunPolicy, StateStoreRunPolicyError,
+};
+pub use provider::{
+    StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
 pub use runner::{RunFailure, RunSuccess, StateStoreRunMetrics, run_side_effect_free};

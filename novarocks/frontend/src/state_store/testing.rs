@@ -34,9 +34,10 @@ use novarocks_state_store_testkit::testing::{
     InMemoryStateStore, InMemoryStateStoreProviderFactory,
 };
 
-use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError};
-use super::{StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry};
-use novarocks_state_store_runtime::StateStoreRunPolicy;
+use novarocks_state_store_runtime::{
+    StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreHostInput,
+    StateStoreProviderRegistration, StateStoreProviderRegistry, StateStoreRunPolicy,
+};
 
 pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("frontend-unit-test");
