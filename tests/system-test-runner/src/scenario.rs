@@ -1,8 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle,
     LaunchProfile, NativeTrustFixture, ServerHandle,
 };
+use serde::Serialize;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -92,6 +94,39 @@ pub struct ScenarioContext {
     launch_profile: LaunchProfile,
     uea1_workload_manifest: Option<PathBuf>,
     uea1_preparation_diagnostic_secret: Option<String>,
+}
+
+/// A retained, secret-free record of one system scenario outcome.
+///
+/// The cross-process handle removes its runtime directory after a successful
+/// scenario. The evidence therefore belongs to the scenario artifact root,
+/// not the disposable runtime directory. Failure diagnostics come from the
+/// harness's redacted log collector; arbitrary error chains are deliberately
+/// not persisted because a provider error can carry credential material.
+#[derive(Debug, Serialize)]
+struct ScenarioEvidence<'a> {
+    schema_version: u32,
+    scenario: &'a str,
+    outcome: ScenarioEvidenceOutcome,
+    actions: &'a [String],
+    runtime_dir: String,
+    primary_binary: String,
+    base_config_path: String,
+    cluster_size: usize,
+    launch_profile: &'static str,
+    process_launch_identities:
+        Vec<novarocks_cluster_harness::process_resources::ProcessLaunchIdentity>,
+    effective_launch_config_sha256: String,
+    effective_launch_config_semantics_sha256: String,
+    effective_launch_config: serde_json::Value,
+    diagnostics: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScenarioEvidenceOutcome {
+    Passed,
+    Failed,
 }
 
 impl ScenarioContext {
@@ -238,6 +273,50 @@ impl ScenarioContext {
 
     pub fn retain_artifacts(&mut self) {
         self.handle.retain_runtime_artifacts();
+    }
+
+    /// Writes the retained evidence outside the disposable runtime directory.
+    ///
+    /// `diagnostics` is present only for a failed scenario and is produced by
+    /// the harness's secret-redacting failure-log collector. The full error
+    /// chain remains on stderr for the immediate caller rather than becoming a
+    /// durable artifact with an unknown credential-redaction contract.
+    pub fn write_evidence(&self, outcome: ScenarioEvidenceOutcome) -> Result<PathBuf> {
+        let (frontend, backends) = self.process_launch_identities();
+        let process_launch_identities = std::iter::once(frontend.clone())
+            .chain(backends.iter().cloned())
+            .collect::<Vec<_>>();
+        let effective_launch_config = self.effective_launch_config_evidence();
+        let effective_launch_config_value =
+            serde_json::from_slice(effective_launch_config.artifact_bytes())
+                .context("decode secret-free effective launch config for scenario evidence")?;
+        let evidence = ScenarioEvidence {
+            schema_version: 1,
+            scenario: self.name,
+            outcome,
+            actions: &self.actions,
+            runtime_dir: self.runtime_dir().display().to_string(),
+            primary_binary: self.primary_binary().display().to_string(),
+            base_config_path: self.base_config_path().display().to_string(),
+            cluster_size: self.cluster_size,
+            launch_profile: match self.launch_profile {
+                LaunchProfile::FaultScenario => "fault-scenario",
+                LaunchProfile::Performance => "performance",
+            },
+            process_launch_identities,
+            effective_launch_config_sha256: effective_launch_config.artifact_sha256().to_string(),
+            effective_launch_config_semantics_sha256: effective_launch_config
+                .semantics_sha256()
+                .to_string(),
+            effective_launch_config: effective_launch_config_value,
+            diagnostics: (outcome == ScenarioEvidenceOutcome::Failed).then(|| self.diagnostics()),
+        };
+        let bytes = serde_json::to_vec_pretty(&evidence)
+            .context("serialize secret-free system scenario evidence")?;
+        let path = self.scenario_root().join("scenario-evidence.json");
+        fs::write(&path, bytes)
+            .with_context(|| format!("write system scenario evidence {}", path.display()))?;
+        Ok(path)
     }
 
     pub fn shutdown(&mut self) -> Result<()> {
