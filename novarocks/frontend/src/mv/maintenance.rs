@@ -24,8 +24,6 @@
 //! [`MaintenanceCoordinator::try_begin`]; a queued gate ticket therefore never
 //! consumes the independent maintenance concurrency budget.
 
-use std::collections::{BTreeMap, BTreeSet};
-
 use super::background::{MvBackgroundEngineErrorKind, MvMaintenanceFacts};
 pub use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 pub(crate) use novarocks_mv_application::maintenance::{
@@ -39,15 +37,13 @@ use novarocks_table_maintenance::{
 /// Process-local maintenance policy state.  It is intentionally non-durable:
 /// recovery re-evaluates current provider facts and durable action state.
 pub(crate) struct MaintenanceCoordinator {
-    policy: novarocks_mv_application::maintenance::MaintenancePolicyState,
-    active: BTreeSet<i64>,
+    inner: novarocks_mv_application::maintenance::MaintenanceCoordinator,
 }
 
 impl MaintenanceCoordinator {
     pub(crate) fn new(config: MaintenanceCoordinatorConfig) -> Self {
         Self {
-            policy: novarocks_mv_application::maintenance::MaintenancePolicyState::new(config),
-            active: BTreeSet::new(),
+            inner: novarocks_mv_application::maintenance::MaintenanceCoordinator::new(config),
         }
     }
 
@@ -56,7 +52,7 @@ impl MaintenanceCoordinator {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn config(&self) -> &MaintenanceCoordinatorConfig {
-        self.policy.config()
+        self.inner.config()
     }
 
     /// Admit work only after the caller has acquired the MV activity gate.
@@ -70,23 +66,7 @@ impl MaintenanceCoordinator {
         facts: &MvMaintenanceFacts,
         now_ms: i64,
     ) -> Result<MaintenanceAttempt, MaintenanceAdmission> {
-        if !self.policy.config().enabled {
-            return Err(MaintenanceAdmission::Disabled);
-        }
-        if self.active.contains(&mv_id) {
-            return Err(MaintenanceAdmission::AlreadyActive);
-        }
-        if self.active.len() >= self.policy.config().max_concurrent {
-            return Err(MaintenanceAdmission::AtCapacity);
-        }
-        let evaluation = self.policy.evaluate(mv_id, facts, now_ms);
-        self.active.insert(mv_id);
-        Ok(MaintenanceAttempt {
-            mv_id,
-            target,
-            observed_snapshot_id: facts.current_snapshot_id,
-            evaluation,
-        })
+        self.inner.try_begin(mv_id, target, facts, now_ms)
     }
 
     /// Execute external durable actions without holding the coordinator lock.
@@ -98,64 +78,9 @@ impl MaintenanceCoordinator {
         attempt: &MaintenanceAttempt,
         runner: &mut dyn AutomaticMaintenanceRunner,
     ) -> MaintenanceExecutionReport {
-        let mut report = MaintenanceExecutionReport {
-            evaluation: attempt.evaluation.clone(),
-            completed: Vec::new(),
-            already_active: Vec::new(),
-            failures: Vec::new(),
-        };
-        for action in &attempt.evaluation.actions {
-            let kind = action.kind();
-            let result = match action {
-                AutomaticMaintenanceAction::ExpireSnapshots {
-                    older_than_ms,
-                    retain_last,
-                } => runner.expire_snapshots_durably(MaintenanceActionRequest::ExpireSnapshots {
-                    target: attempt.target.clone(),
-                    older_than_ms: Some(*older_than_ms),
-                    retain_last: Some(*retain_last),
-                }),
-                AutomaticMaintenanceAction::RewritePositionDeletes { min_input_files } => {
-                    let mut options = BTreeMap::new();
-                    options.insert("min-input-files".to_string(), min_input_files.to_string());
-                    runner.rewrite_position_deletes_durably(
-                        MaintenanceActionRequest::RewritePositionDeleteFiles {
-                            target: attempt.target.clone(),
-                            options,
-                            where_clause: None,
-                        },
-                    )
-                }
-                AutomaticMaintenanceAction::Optimize => {
-                    match runner.optimize_durably(attempt.target.clone()) {
-                        Ok(OptimizeSubmission::Submitted { .. }) => {
-                            report.completed.push(kind);
-                            continue;
-                        }
-                        Ok(OptimizeSubmission::AlreadyActive) => {
-                            report.already_active.push(kind);
-                            continue;
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            };
-            match result {
-                Ok(outcome) if expected_outcome(kind, &outcome) => {
-                    report.completed.push(kind);
-                }
-                Ok(outcome) => {
-                    tracing::error!(action = ?kind, ?outcome, "automatic maintenance returned an incompatible durable outcome");
-                    report
-                        .failures
-                        .push((kind, MvBackgroundEngineErrorKind::InvariantViolation));
-                }
-                Err(error) => {
-                    report.failures.push((kind, error.kind()));
-                }
-            }
-        }
-        report
+        novarocks_mv_application::maintenance::MaintenanceCoordinator::execute_attempt(
+            attempt, runner,
+        )
     }
 
     /// Persist the local policy outcome and release the permit after external
@@ -167,8 +92,7 @@ impl MaintenanceCoordinator {
         report: &MaintenanceExecutionReport,
         now_ms: i64,
     ) {
-        self.policy.finish(&attempt, report, now_ms);
-        self.active.remove(&attempt.mv_id);
+        self.inner.finish_attempt(attempt, report, now_ms);
     }
 
     #[cfg(test)]
@@ -190,26 +114,13 @@ impl MaintenanceCoordinator {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn cancel_attempt(&mut self, attempt: MaintenanceAttempt) {
-        self.active.remove(&attempt.mv_id);
+        self.inner.cancel_attempt(attempt);
     }
 
     #[cfg(test)]
     fn active_count(&self) -> usize {
-        self.active.len()
+        self.inner.active_count()
     }
-}
-
-fn expected_outcome(kind: MaintenanceActionKind, outcome: &MaintenanceActionOutcome) -> bool {
-    matches!(
-        (kind, outcome),
-        (
-            MaintenanceActionKind::Expire,
-            MaintenanceActionOutcome::ExpireSnapshots { .. }
-        ) | (
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
-        )
-    )
 }
 
 #[cfg(test)]

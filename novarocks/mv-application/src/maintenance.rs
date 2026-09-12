@@ -376,6 +376,149 @@ impl MaintenancePolicyState {
     }
 }
 
+/// Product-owned coordinator for process-local automatic MV maintenance.
+/// Hosts acquire the per-target activity lease before admission and execute
+/// the returned attempt through their own durable runner adapter.
+pub struct MaintenanceCoordinator {
+    policy: MaintenancePolicyState,
+    active: BTreeSet<i64>,
+}
+
+impl MaintenanceCoordinator {
+    pub fn new(config: MaintenanceCoordinatorConfig) -> Self {
+        Self {
+            policy: MaintenancePolicyState::new(config),
+            active: BTreeSet::new(),
+        }
+    }
+
+    pub fn config(&self) -> &MaintenanceCoordinatorConfig {
+        self.policy.config()
+    }
+
+    /// Admit work only after the host has acquired the matching activity
+    /// lease, so a FIFO gate waiter never consumes a maintenance permit.
+    pub fn try_begin(
+        &mut self,
+        mv_id: i64,
+        target: MaintenanceTarget,
+        facts: &MvMaintenanceFacts,
+        now_ms: i64,
+    ) -> Result<MaintenanceAttempt, MaintenanceAdmission> {
+        if !self.policy.config().enabled {
+            return Err(MaintenanceAdmission::Disabled);
+        }
+        if self.active.contains(&mv_id) {
+            return Err(MaintenanceAdmission::AlreadyActive);
+        }
+        if self.active.len() >= self.policy.config().max_concurrent {
+            return Err(MaintenanceAdmission::AtCapacity);
+        }
+        let evaluation = self.policy.evaluate(mv_id, facts, now_ms);
+        self.active.insert(mv_id);
+        Ok(MaintenanceAttempt {
+            mv_id,
+            target,
+            observed_snapshot_id: facts.current_snapshot_id,
+            evaluation,
+        })
+    }
+
+    /// Run product actions without holding a host coordinator lock. The host
+    /// must settle the result with [`Self::finish_attempt`] exactly once.
+    pub fn execute_attempt(
+        attempt: &MaintenanceAttempt,
+        runner: &mut dyn AutomaticMaintenanceRunner,
+    ) -> MaintenanceExecutionReport {
+        let mut report = MaintenanceExecutionReport {
+            evaluation: attempt.evaluation.clone(),
+            completed: Vec::new(),
+            already_active: Vec::new(),
+            failures: Vec::new(),
+        };
+        for action in &attempt.evaluation.actions {
+            let kind = action.kind();
+            let result = match action {
+                AutomaticMaintenanceAction::ExpireSnapshots {
+                    older_than_ms,
+                    retain_last,
+                } => runner.expire_snapshots_durably(MaintenanceActionRequest::ExpireSnapshots {
+                    target: attempt.target.clone(),
+                    older_than_ms: Some(*older_than_ms),
+                    retain_last: Some(*retain_last),
+                }),
+                AutomaticMaintenanceAction::RewritePositionDeletes { min_input_files } => {
+                    let mut options = BTreeMap::new();
+                    options.insert("min-input-files".to_string(), min_input_files.to_string());
+                    runner.rewrite_position_deletes_durably(
+                        MaintenanceActionRequest::RewritePositionDeleteFiles {
+                            target: attempt.target.clone(),
+                            options,
+                            where_clause: None,
+                        },
+                    )
+                }
+                AutomaticMaintenanceAction::Optimize => {
+                    match runner.optimize_durably(attempt.target.clone()) {
+                        Ok(OptimizeSubmission::Submitted { .. }) => {
+                            report.completed.push(kind);
+                            continue;
+                        }
+                        Ok(OptimizeSubmission::AlreadyActive) => {
+                            report.already_active.push(kind);
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            };
+            match result {
+                Ok(outcome) if expected_outcome(kind, &outcome) => report.completed.push(kind),
+                Ok(outcome) => {
+                    tracing::error!(action = ?kind, ?outcome, "automatic maintenance returned an incompatible durable outcome");
+                    report
+                        .failures
+                        .push((kind, MvBackgroundEngineErrorKind::InvariantViolation));
+                }
+                Err(error) => report.failures.push((kind, error.kind())),
+            }
+        }
+        report
+    }
+
+    pub fn finish_attempt(
+        &mut self,
+        attempt: MaintenanceAttempt,
+        report: &MaintenanceExecutionReport,
+        now_ms: i64,
+    ) {
+        self.policy.finish(&attempt, report, now_ms);
+        self.active.remove(&attempt.mv_id);
+    }
+
+    pub fn cancel_attempt(&mut self, attempt: MaintenanceAttempt) {
+        self.active.remove(&attempt.mv_id);
+    }
+
+    #[doc(hidden)]
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+}
+
+fn expected_outcome(kind: MaintenanceActionKind, outcome: &MaintenanceActionOutcome) -> bool {
+    matches!(
+        (kind, outcome),
+        (
+            MaintenanceActionKind::Expire,
+            MaintenanceActionOutcome::ExpireSnapshots { .. }
+        ) | (
+            MaintenanceActionKind::RewritePositionDeletes,
+            MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
+        )
+    )
+}
+
 #[derive(Clone, Debug)]
 struct TablePolicy {
     enabled: bool,
