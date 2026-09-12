@@ -68,7 +68,6 @@ use novarocks_query_application::client_connection::{
     ClientConnectionTerminationReason,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
-use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
     GovernedImmediateStatementResult,
@@ -80,6 +79,9 @@ use novarocks_query_application::session_control::{
     QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
+use novarocks_query_application::sql::admission::{
+    admin_raise_engine_error, unnegotiated_query_statement,
+};
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -88,11 +90,10 @@ use novarocks_query_application::sql::session::{
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
-    SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
-    parse_single_statement, strip_leading_line_comments,
+    SqlStatementParseError, parse_single_statement, strip_leading_line_comments,
 };
+use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
-use novarocks_types::{ClusterRole, EngineErrorCode};
 use novarocks_user_error::UserError;
 use novarocks_workload_control::{
     CancellationReason as WorkCancellationReason, LocalResourceAuthority, RootAdmissionHandle,
@@ -1927,113 +1928,6 @@ async fn external_namespace_exists(
         .map_err(internal_error)
 }
 
-/// Return the one SQL statement permitted by the current MySQL capability
-/// negotiation. The protocol adapter currently advertises neither multi
-/// statements nor multi results, so it must reject all batches before a
-/// statement can produce an externally visible effect.
-fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
-    let mut cursor = SqlBatchCursor::new(sql);
-    let mut statement = None;
-    while let Some(fragment) = cursor.next_fragment()? {
-        let trimmed = strip_leading_line_comments(fragment.trim());
-        if trimmed.is_empty() {
-            continue;
-        }
-        let is_statement = admin_raise_engine_error(trimmed)?.is_some()
-            || parse_optional_single_statement(trimmed)
-                .map_err(|error| query_application_parse_error(error, trimmed))?
-                .is_some();
-        if !is_statement {
-            continue;
-        }
-        if statement.replace(fragment).is_some() {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Unsupported,
-                "multiple SQL statements require negotiated MySQL multi-statement support",
-            ));
-        }
-    }
-    Ok(statement)
-}
-
-fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, QueryServiceError> {
-    let parts = sql.split_whitespace().collect::<Vec<_>>();
-    if !matches!(parts.as_slice(), [admin, raise, engine, error, _]
-        if admin.eq_ignore_ascii_case("admin")
-            && raise.eq_ignore_ascii_case("raise")
-            && engine.eq_ignore_ascii_case("engine")
-            && error.eq_ignore_ascii_case("error"))
-    {
-        return Ok(None);
-    }
-    let [_, _, _, _, raw_code] = parts.as_slice() else {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
-        ));
-    };
-    let raw_code = raw_code
-        .strip_prefix('\'')
-        .and_then(|inner| inner.strip_suffix('\''))
-        .or_else(|| {
-            raw_code
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-        })
-        .ok_or_else(|| {
-            QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                "expected ADMIN RAISE ENGINE ERROR '<engine_error_code>'",
-            )
-        })?;
-    let code = EngineErrorCode::parse(raw_code).ok_or_else(|| {
-        QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            format!("unknown engine error code: {raw_code}"),
-        )
-    })?;
-    let error = match code {
-        EngineErrorCode::UnsupportedDistributedDmlShape => {
-            EngineError::unsupported_distributed_dml_shape(
-                "ADMIN RAISE ENGINE ERROR",
-                "forced P8 SQL runner error-code smoke",
-            )
-        }
-        EngineErrorCode::IcebergWriteDescriptorMismatch => {
-            EngineError::iceberg_write_descriptor_mismatch("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::UnsupportedPositionDeleteDescriptor => {
-            EngineError::unsupported_position_delete_descriptor(
-                "forced position-delete descriptor error-code smoke",
-            )
-        }
-        EngineErrorCode::CommitKnownUncommitted => {
-            EngineError::commit_known_uncommitted("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::CommitUnknown => {
-            EngineError::commit_unknown("forced P8 SQL runner error-code smoke")
-        }
-        EngineErrorCode::CommitKnownCommittedFinalizeFailed => {
-            EngineError::commit_known_committed_finalize_failed(
-                "forced P8 SQL runner error-code smoke",
-            )
-        }
-        EngineErrorCode::ProtocolDecodeError => {
-            EngineError::protocol_decode("forced P8 SQL runner error-code smoke")
-        }
-        _ => {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Parse,
-                format!("unsupported engine error code for ADMIN RAISE ENGINE ERROR: {raw_code}"),
-            ));
-        }
-    };
-    Ok(Some(QueryServiceError::new(
-        QueryServiceErrorKind::Unsupported,
-        error.to_bracketed_user_message(),
-    )))
-}
-
 fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {
     QueryServiceError::new(
         QueryServiceErrorKind::Internal,
@@ -2434,7 +2328,7 @@ mod tests {
     use novarocks_query_application::api::ResultField;
     use novarocks_query_application::cancellation::QueryCancellationSource;
     use novarocks_query_application::client_connection::ClientConnectionToken;
-    use novarocks_query_application::sql::split_sql_statements;
+    use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,
     };
@@ -3583,51 +3477,12 @@ mod tests {
     }
 
     #[test]
-    fn unnegotiated_query_accepts_one_statement_with_empty_and_comment_fragments() {
-        assert_eq!(
-            unnegotiated_query_statement("; /* leading comment */; SELECT ';'; -- done\n")
-                .expect("one statement is valid"),
-            Some(" SELECT ';'")
-        );
-        assert_eq!(
-            unnegotiated_query_statement("; -- comment only\n; /* still empty */")
-                .expect("comments are not statements"),
-            None
-        );
-    }
-
-    #[test]
-    fn unnegotiated_query_rejects_multiple_statements_before_execution() {
-        let error = unnegotiated_query_statement("SET query_timeout = 1; SELECT 1")
-            .expect_err("multi-statement COM_QUERY must fail closed");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
-        assert_eq!(
-            error.message(),
-            "multiple SQL statements require negotiated MySQL multi-statement support"
-        );
-    }
-
-    #[test]
     fn timeout_message_rounds_a_sampled_deadline_up_to_milliseconds() {
         assert_eq!(
             timeout_message_millis(Duration::from_nanos(999_999_999)),
             1_000
         );
         assert_eq!(timeout_message_millis(Duration::from_millis(1_000)), 1_000);
-    }
-
-    #[test]
-    fn admin_raise_engine_error_keeps_the_engine_code_visible() {
-        let error =
-            admin_raise_engine_error("ADMIN RAISE ENGINE ERROR 'UnsupportedDistributedDmlShape'")
-                .expect("parse command")
-                .expect("recognized command");
-        assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
-        assert!(
-            error
-                .to_string()
-                .contains("[UnsupportedDistributedDmlShape]")
-        );
     }
 
     #[test]

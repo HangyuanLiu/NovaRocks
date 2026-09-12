@@ -23,6 +23,9 @@ use novarocks_parser::{ParserError, ast::Statement};
 
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 
+/// SQL batch admission and test-only stable error injection.
+pub mod admission;
+
 /// Connection-local execution settings after SQL/session validation and before
 /// a role adapter projects them into a particular wire contract.
 pub mod session;
