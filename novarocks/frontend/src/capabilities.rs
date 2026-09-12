@@ -34,6 +34,7 @@ use crate::catalog_application::{command as catalog_command, iceberg_ref_command
 use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
+use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::backend_command;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
@@ -60,7 +61,7 @@ use crate::query::compiler::FrontendQueryCompiler;
 /// This is one query-domain value, not an application-service bundle: it has
 /// no command execution, durable job, or maintenance capability.
 #[derive(Clone)]
-pub struct QueryCompilerPorts {
+pub(crate) struct QueryCompilerPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -73,12 +74,13 @@ pub struct QueryCompilerPorts {
     view_service: Arc<dyn ViewService>,
     system_catalog: Arc<dyn SystemCatalog>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 }
 
 impl QueryCompilerPorts {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -91,6 +93,7 @@ impl QueryCompilerPorts {
         view_service: Arc<dyn ViewService>,
         system_catalog: Arc<dyn SystemCatalog>,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+        mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
@@ -106,6 +109,7 @@ impl QueryCompilerPorts {
             view_service,
             system_catalog,
             mv_readiness,
+            mv_candidate_reader,
             mv_storage_observation,
         }
     }
@@ -137,14 +141,13 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.system_catalog,
         Arc::clone(&ports.mv_readiness),
     );
-    let mv_candidate_reader = ports.mv_readiness.candidate_reader();
     FrontendQueryCompiler::new(
         ports.functions,
         query,
         view,
         system_tables,
         ports.mv_readiness,
-        mv_candidate_reader,
+        ports.mv_candidate_reader,
         ports.mv_storage_observation,
     )
 }

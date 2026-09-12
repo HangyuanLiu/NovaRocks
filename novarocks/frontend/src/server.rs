@@ -174,6 +174,10 @@ pub fn build_frontend_query_session_factory(
         Arc::new(crate::mv::process_runtime::ProcessRuntime::default()),
         tokio::runtime::Handle::current(),
     ));
+    let mv_candidate_reader = crate::mv::domain::readiness::MvCandidateReader::new(
+        Arc::clone(&mv_repository),
+        tokio::runtime::Handle::current(),
+    );
     let mv_activation = core_capabilities::mv_refresh_provider_activation(
         core_capabilities::MvRefreshProviderActivationPorts::new(
             Arc::clone(&function_catalog),
@@ -282,6 +286,7 @@ pub fn build_frontend_query_session_factory(
             view_service.clone(),
             system_catalog,
             Arc::clone(&mv_readiness),
+            mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
         ));
     let session_catalog_resolver =

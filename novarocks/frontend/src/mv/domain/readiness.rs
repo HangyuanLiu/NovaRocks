@@ -87,12 +87,12 @@ impl MvReadinessPort {
         }
     }
 
-    /// Construct the separate, read-only query candidate inventory.
+    /// Test-only convenience for constructing the separate query inventory
+    /// from the same repository fixture. Production composition constructs
+    /// the reader directly as an independent query leaf port.
+    #[cfg(test)]
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
-        MvCandidateReader {
-            repository: Arc::clone(&self.repository),
-            handle: self.handle.clone(),
-        }
+        MvCandidateReader::new(Arc::clone(&self.repository), self.handle.clone())
     }
 
     /// Drives one durable MV operation from a synchronous caller. Confined to
@@ -353,6 +353,13 @@ impl MvReadinessPort {
 }
 
 impl MvCandidateReader {
+    /// Construct the read-only query candidate inventory from its durable
+    /// discovery dependency. This intentionally accepts neither process
+    /// readiness nor any refresh executor capability.
+    pub(crate) fn new(repository: Arc<dyn MvRepository>, handle: tokio::runtime::Handle) -> Self {
+        Self { repository, handle }
+    }
+
     /// Enumerate retained candidate definitions without exposing a loaded
     /// projection's CAS version to query discovery. Every member remains
     /// optional until its exact lake publication and every frozen input/output
