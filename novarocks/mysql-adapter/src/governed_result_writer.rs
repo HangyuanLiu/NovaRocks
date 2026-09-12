@@ -75,8 +75,20 @@ pub async fn write_query_result<W: AsyncWrite + Unpin>(
     result: QueryResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
+    write_query_result_one(result, results)
+        .await?
+        .no_more_results()
+        .await
+}
+
+/// Writes one materialized result and returns the writer for the next
+/// negotiated result on this exact connection.
+pub async fn write_query_result_one<'writer, W: AsyncWrite + Unpin>(
+    result: QueryResult,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<QueryResultWriter<'writer, W>> {
     let batches = result.batches.iter().collect::<Vec<_>>();
-    crate::write_record_batches(&result.columns, &batches, results).await
+    crate::write_record_batches_one(&result.columns, &batches, results).await
 }
 
 pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
@@ -739,7 +751,7 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
 }
 
 async fn finish_stream_error<W: AsyncWrite + Unpin>(
-    writer: opensrv_mysql::RowWriter<'_, W>,
+    writer: opensrv_mysql::RowWriter<'_, '_, W>,
     kind: ErrorKind,
     error: &QueryExecutionError,
 ) -> io::Result<()> {
@@ -785,7 +797,7 @@ async fn reserve_when_available(
 }
 
 async fn write_streaming_batch<W: AsyncWrite + Unpin>(
-    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    writer: &mut opensrv_mysql::RowWriter<'_, '_, W>,
     batch: &RecordBatch,
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,
@@ -802,7 +814,7 @@ async fn write_streaming_batch<W: AsyncWrite + Unpin>(
 }
 
 async fn write_governed_batch<W: AsyncWrite + Unpin>(
-    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    writer: &mut opensrv_mysql::RowWriter<'_, '_, W>,
     batch: &RecordBatch,
     columns: &[QueryResultColumn],
     cancellation: QueryCancellationView,

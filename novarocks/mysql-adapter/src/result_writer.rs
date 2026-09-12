@@ -38,6 +38,19 @@ pub async fn write_record_batches<W: AsyncWrite + Unpin>(
     batches: &[&RecordBatch],
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
+    write_record_batches_one(fields, batches, results)
+        .await?
+        .no_more_results()
+        .await
+}
+
+/// Writes one ordinary result and returns the MySQL writer so a negotiated
+/// multi-statement request can continue with its next result.
+pub async fn write_record_batches_one<'writer, W: AsyncWrite + Unpin>(
+    fields: &[ResultField],
+    batches: &[&RecordBatch],
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<QueryResultWriter<'writer, W>> {
     let columns = mysql_columns_for_result_fields(fields)?;
     let mut writer = results.start(columns.as_slice()).await?;
     for batch in batches {
@@ -47,7 +60,7 @@ pub async fn write_record_batches<W: AsyncWrite + Unpin>(
                 .await?;
         }
     }
-    writer.finish().await
+    writer.finish_one().await
 }
 
 /// Converts immutable Query Application fields to their MySQL schema form.
@@ -69,11 +82,11 @@ pub enum MysqlResultStartError {
 
 /// Opens a MySQL result while observing query cancellation before its schema
 /// reaches the socket.
-pub async fn start_cancellable_result<'a, W: AsyncWrite + Unpin>(
-    results: QueryResultWriter<'a, W>,
-    columns: &'a [Column],
+pub async fn start_cancellable_result<'writer, 'columns, W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'writer, W>,
+    columns: &'columns [Column],
     cancellation: QueryCancellationView,
-) -> Result<opensrv_mysql::RowWriter<'a, W>, MysqlResultStartError> {
+) -> Result<opensrv_mysql::RowWriter<'writer, 'columns, W>, MysqlResultStartError> {
     let start = results.start(columns);
     tokio::pin!(start);
     tokio::select! {
@@ -88,12 +101,12 @@ pub async fn start_cancellable_result<'a, W: AsyncWrite + Unpin>(
 /// Opens a streaming MySQL result after converting its immutable Query
 /// Application schema, while observing logical failure and cancellation before
 /// the schema reaches the socket.
-pub async fn start_streaming_result<'a, W: AsyncWrite + Unpin>(
-    results: QueryResultWriter<'a, W>,
-    columns: &'a [Column],
+pub async fn start_streaming_result<'writer, 'columns, W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'writer, W>,
+    columns: &'columns [Column],
     cancellation: QueryCancellationView,
     mut failure: ResultFailureView,
-) -> Result<opensrv_mysql::RowWriter<'a, W>, MysqlBatchWriteError> {
+) -> Result<opensrv_mysql::RowWriter<'writer, 'columns, W>, MysqlBatchWriteError> {
     let start = results.start(columns);
     tokio::pin!(start);
     tokio::select! {
@@ -110,7 +123,7 @@ pub async fn start_streaming_result<'a, W: AsyncWrite + Unpin>(
 /// The application caller retains responsibility for settling its delivery and
 /// statement owners from the resulting socket outcome.
 pub async fn finish_result_error<W: AsyncWrite + Unpin>(
-    writer: opensrv_mysql::RowWriter<'_, W>,
+    writer: opensrv_mysql::RowWriter<'_, '_, W>,
     kind: ErrorKind,
     error: &QueryExecutionError,
 ) -> io::Result<()> {
@@ -120,7 +133,7 @@ pub async fn finish_result_error<W: AsyncWrite + Unpin>(
 
 /// Finishes one already-open result with its success EOF.
 pub async fn finish_result<W: AsyncWrite + Unpin>(
-    writer: opensrv_mysql::RowWriter<'_, W>,
+    writer: opensrv_mysql::RowWriter<'_, '_, W>,
 ) -> io::Result<()> {
     writer.finish().await
 }
@@ -134,7 +147,7 @@ pub enum MysqlResultFinishError {
 /// Finishes a streaming result while keeping the logical failure observation
 /// ahead of the MySQL success EOF write.
 pub async fn finish_streaming_result<W: AsyncWrite + Unpin>(
-    writer: opensrv_mysql::RowWriter<'_, W>,
+    writer: opensrv_mysql::RowWriter<'_, '_, W>,
     mut failure: ResultFailureView,
 ) -> Result<(), MysqlResultFinishError> {
     let finish = writer.finish();
@@ -162,7 +175,7 @@ pub enum MysqlBatchWriteError {
 /// Writes a result batch while observing the Query Application cancellation
 /// view before each row reaches the MySQL socket.
 pub async fn write_cancellable_batch<W: AsyncWrite + Unpin>(
-    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    writer: &mut opensrv_mysql::RowWriter<'_, '_, W>,
     batch: &RecordBatch,
     fields: &[ResultField],
     cancellation: QueryCancellationView,
@@ -187,7 +200,7 @@ pub async fn write_cancellable_batch<W: AsyncWrite + Unpin>(
 /// Writes one streaming result batch while observing both logical delivery
 /// failure and query cancellation before each row reaches the MySQL socket.
 pub async fn write_streaming_batch<W: AsyncWrite + Unpin>(
-    writer: &mut opensrv_mysql::RowWriter<'_, W>,
+    writer: &mut opensrv_mysql::RowWriter<'_, '_, W>,
     batch: &RecordBatch,
     fields: &[ResultField],
     cancellation: QueryCancellationView,
