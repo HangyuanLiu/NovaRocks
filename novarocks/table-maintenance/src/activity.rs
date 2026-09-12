@@ -16,8 +16,11 @@
 // under the License.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, Weak};
+
+use crate::MaintenanceTarget;
 
 /// Process-local mutual exclusion for one application-maintenance target.
 /// The generic key makes the business owner independent of a SQL/catalog
@@ -90,9 +93,88 @@ impl<K: Eq + Hash> std::fmt::Debug for TargetActivityPermit<K> {
     }
 }
 
+/// Product operation class used to explain an otherwise shared target conflict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceActivityFamily {
+    Optimize,
+    Metadata,
+    Rewrite,
+    Cleanup,
+}
+
+impl fmt::Display for MaintenanceActivityFamily {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Optimize => "OPTIMIZE",
+            Self::Metadata => "metadata maintenance",
+            Self::Rewrite => "distributed rewrite",
+            Self::Cleanup => "orphan cleanup",
+        })
+    }
+}
+
+/// Process-local mutual exclusion for all maintenance work on one exact target.
+#[derive(Clone, Default)]
+pub struct TableMaintenanceActivity {
+    active: TargetActivity<MaintenanceTarget>,
+}
+
+impl fmt::Debug for TableMaintenanceActivity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TableMaintenanceActivity")
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableMaintenanceActivity {
+    pub fn acquire(
+        &self,
+        target: &MaintenanceTarget,
+        family: MaintenanceActivityFamily,
+    ) -> Result<MaintenanceActivityPermit, MaintenanceActivityBusy> {
+        self.active
+            .acquire(target.clone())
+            .map_err(|error| MaintenanceActivityBusy {
+                family,
+                target: target.clone(),
+                detail: match error {
+                    TargetBusy::Busy => {
+                        "another maintenance action is already active for this table in this frontend process"
+                            .to_string()
+                    }
+                    TargetBusy::Poisoned => "the process-local activity gate is poisoned".to_string(),
+                },
+            })
+    }
+}
+
+/// Drop-released proof that the product owns one target operation.
+pub type MaintenanceActivityPermit = TargetActivityPermit<MaintenanceTarget>;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceActivityBusy {
+    family: MaintenanceActivityFamily,
+    target: MaintenanceTarget,
+    detail: String,
+}
+
+impl fmt::Display for MaintenanceActivityBusy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} is busy for {}.{}.{}: {}",
+            self.family, self.target.catalog, self.target.namespace, self.target.table, self.detail
+        )
+    }
+}
+
+impl std::error::Error for MaintenanceActivityBusy {}
+
 #[cfg(test)]
 mod tests {
-    use super::{TargetActivity, TargetBusy};
+    use super::{MaintenanceActivityFamily, TableMaintenanceActivity, TargetActivity, TargetBusy};
+    use crate::MaintenanceTarget;
 
     #[test]
     fn one_target_has_one_owner_until_every_handle_drops() {
@@ -104,5 +186,37 @@ mod tests {
         assert!(matches!(activity.acquire("table-a"), Err(TargetBusy::Busy)));
         drop(child);
         activity.acquire("table-a").expect("released owner");
+    }
+
+    fn target(table: &str) -> MaintenanceTarget {
+        MaintenanceTarget {
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: table.into(),
+        }
+    }
+
+    #[test]
+    fn product_activity_keeps_one_target_owned_until_the_last_clone_drops() {
+        let activity = TableMaintenanceActivity::default();
+        let first = activity
+            .acquire(&target("one"), MaintenanceActivityFamily::Optimize)
+            .expect("first owner");
+        assert!(
+            activity
+                .acquire(&target("one"), MaintenanceActivityFamily::Cleanup)
+                .is_err()
+        );
+        let child = first.clone();
+        drop(first);
+        assert!(
+            activity
+                .acquire(&target("one"), MaintenanceActivityFamily::Rewrite)
+                .is_err()
+        );
+        drop(child);
+        activity
+            .acquire(&target("one"), MaintenanceActivityFamily::Rewrite)
+            .expect("released owner");
     }
 }

@@ -53,3 +53,10 @@ pub struct OptimizeJobOutcome {
 
 /// Current-process OPTIMIZE job state owned by the table-maintenance product.
 pub type OptimizeJob = runtime::JobRecord<MaintenanceTarget, OptimizeJobOutcome>;
+
+/// Current-process OPTIMIZE job ledger and target permit owner.
+pub type OptimizeProcessRuntime = runtime::ProcessRuntime<
+    MaintenanceTarget,
+    OptimizeJobOutcome,
+    activity::MaintenanceActivityPermit,
+>;

@@ -34,7 +34,6 @@ use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_workload_control::RootAdmissionHandle;
 use tokio::runtime::Handle;
 
-use self::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
 pub(crate) use self::admission::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, ParsedShowOptimize,
     is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
@@ -43,7 +42,6 @@ use self::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
 use self::result::{action_result, optimize_jobs_result};
-use self::runtime::OptimizeProcessRuntime;
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::query_execution::maintenance::{
@@ -51,16 +49,17 @@ use crate::query_execution::maintenance::{
     MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
     TableMaintenanceService,
 };
+use novarocks_table_maintenance::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
 use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };
-use novarocks_table_maintenance::{MaintenanceTarget, OptimizeJob};
+use novarocks_table_maintenance::{
+    MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime,
+};
 
-pub mod activity;
 pub mod admission;
 pub mod gc_observation;
 pub mod result;
-pub mod runtime;
 pub mod worker;
 
 enum WorkerLifecycle {

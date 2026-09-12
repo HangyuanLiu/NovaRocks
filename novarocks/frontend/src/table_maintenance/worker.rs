@@ -38,9 +38,8 @@ use crate::query_execution::maintenance::{
 };
 
 use super::now_unix_millis;
-use super::runtime::OptimizeProcessRuntime;
-use novarocks_table_maintenance::OptimizeJob;
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
+use novarocks_table_maintenance::{OptimizeJob, OptimizeProcessRuntime};
 
 /// Runner-owned test root for the STAT-2F cross-process maintenance race.
 ///
@@ -461,10 +460,8 @@ mod lifecycle_tests {
         MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
         MaintenanceTargetRebind, TableMaintenanceEngine,
     };
-    use crate::table_maintenance::runtime::OptimizeProcessRuntime;
-    use novarocks_table_maintenance::MaintenanceTarget;
-    use novarocks_table_maintenance::OptimizeJob;
     use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
+    use novarocks_table_maintenance::{MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime};
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     struct NeverRunEngine;
