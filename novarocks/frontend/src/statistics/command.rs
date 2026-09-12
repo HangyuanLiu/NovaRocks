@@ -23,13 +23,13 @@ use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use crate::query_execution::StatementResult;
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone)]

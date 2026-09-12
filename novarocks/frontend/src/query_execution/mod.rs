@@ -51,7 +51,6 @@ pub use completion::{
     PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
     PreparedLogicalRead, PreparedQueryCompletion, PreparedQueryOperation,
 };
-pub use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 pub use outcome::WriteExecutionOutcome;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
 pub mod preparation;

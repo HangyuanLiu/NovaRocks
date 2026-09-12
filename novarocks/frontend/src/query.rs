@@ -27,6 +27,7 @@ use crate::common::backend_topology::{BackendTopologyService, BackendTopologySna
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
+use crate::query_execution::PreparedQueryOperation;
 use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
@@ -40,7 +41,6 @@ use crate::query_execution::maintenance::command::{
     MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
 };
 use crate::query_execution::service::QueryExecutionService;
-use crate::query_execution::{PreparedQueryOperation, StatementResult};
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
@@ -69,7 +69,7 @@ use novarocks_query_application::client_connection::{
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
 use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
-    GovernedImmediateStatementResult,
+    GovernedImmediateStatementResult, QuerySessionOutput as StatementResult,
 };
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::session::{
