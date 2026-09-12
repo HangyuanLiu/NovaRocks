@@ -15,21 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub mod app_config;
-pub mod catalog_credential_registry;
-pub mod catalog_source_config;
-pub mod composition;
-mod env_reference;
-pub mod launch;
-pub mod logging;
-pub mod memory_limit;
-pub mod memory_observation;
-pub mod native_compatibility;
-pub mod native_trust;
-pub mod network;
-mod paimon_access;
-pub mod provider_manifest;
-pub mod roles;
-pub mod state_store_config;
-mod state_store_limits;
-pub mod supervisor;
+//! Server-owned role runners over role-local application hosts.
+
+pub mod backend;

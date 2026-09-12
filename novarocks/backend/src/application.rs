@@ -1,5 +1,4 @@
 use std::fmt;
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
@@ -54,7 +53,6 @@ use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
-const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often the task protocol owner re-evaluates its own deadlines.
 ///
@@ -125,7 +123,7 @@ impl BackendApplicationError {
         }
     }
 
-    fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
+    pub fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup_error}"));
         self
@@ -886,109 +884,7 @@ impl BackendApplicationHost {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "This library entrypoint is invoked by the backend server binary, not backend lib tests."
-)]
-pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendApplicationError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Start,
-                format!("build backend Tokio runtime failed: {error}"),
-            )
-        })?;
-    let data_runtime = BackendDataRuntime::new(
-        runtime.handle().clone(),
-        Arc::clone(&config.native_trust),
-        config.native_transport.clone(),
-    );
-    runtime.block_on(run_backend_server_until_signal(config, data_runtime))
-}
-pub async fn run_backend_server_until_shutdown<F>(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-    shutdown: F,
-) -> Result<(), BackendApplicationError>
-where
-    F: Future<Output = ()> + Send,
-{
-    run_backend_server_until(config, data_runtime, async move {
-        shutdown.await;
-        Ok(())
-    })
-    .await
-}
-
-pub async fn run_backend_server_until_signal(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-) -> Result<(), BackendApplicationError> {
-    #[cfg(unix)]
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|error| {
-        BackendApplicationError::new(
-            BackendApplicationErrorKind::Signal,
-            format!("install SIGINT listener failed: {error}"),
-        )
-    })?;
-
-    run_backend_server_until(config, data_runtime, async {
-        #[cfg(unix)]
-        {
-            // Register the OS handler before the host emits its ready marker.
-            // A supervisor can otherwise deliver SIGINT in the narrow window
-            // between readiness and the first poll of `tokio::signal::ctrl_c`.
-            interrupt.recv().await;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Signal,
-                format!("Ctrl-C listener failed: {error}"),
-            )
-        })
-    })
-    .await
-}
-
-async fn run_backend_server_until<F>(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-    shutdown: F,
-) -> Result<(), BackendApplicationError>
-where
-    F: Future<Output = Result<(), BackendApplicationError>> + Send,
-{
-    let mut host = BackendApplicationHost::open(config, data_runtime)?;
-    println!("{}", host.ready_marker());
-    tokio::pin!(shutdown);
-
-    let primary = loop {
-        tokio::select! {
-            signal_result = &mut shutdown => break signal_result,
-            _ = tokio::time::sleep(SUPERVISION_POLL_INTERVAL) => match host.poll_failure() {
-                Ok(Some(error)) | Err(error) => break Err(error),
-                Ok(None) => {}
-            },
-        }
-    };
-
-    let primary = match primary {
-        Ok(()) => match host.poll_failure() {
-            Ok(Some(error)) | Err(error) => Err(error),
-            Ok(None) => Ok(()),
-        },
-        Err(error) => Err(error),
-    };
-    host.begin_drain();
-    combine_primary_and_shutdown(primary, host.shutdown())
-}
-
+#[cfg(test)]
 fn combine_primary_and_shutdown(
     primary: Result<(), BackendApplicationError>,
     shutdown: Result<(), BackendApplicationError>,

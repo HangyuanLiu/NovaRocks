@@ -169,7 +169,7 @@ fn run_backend(
         backend.native_transport.clone(),
     );
     runtime
-        .block_on(novarocks_backend::run_backend_server_until_shutdown(
+        .block_on(novarocks_server::roles::backend::run_until_shutdown(
             backend,
             data_runtime,
             termination_signal(),
@@ -229,7 +229,7 @@ async fn run_all_in_one(
         .map_err(|error| anyhow::anyhow!("{error}"))
     };
     let backend_run = async move {
-        novarocks_backend::run_backend_server_until_shutdown(
+        novarocks_server::roles::backend::run_until_shutdown(
             backend,
             backend_runtime,
             wait_for_stop(backend_stop_rx),
