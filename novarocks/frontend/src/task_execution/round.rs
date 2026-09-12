@@ -46,7 +46,7 @@ use super::abort_effect::{
 };
 use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
-use super::error::TaskExecutionError;
+use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
 use super::intent::{AckPayload, OperationAcknowledgement};
 use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
@@ -454,6 +454,12 @@ impl TaskRound {
                     .resubscribe(context, self.execution.status_cursors(context))
                     .map_err(TaskExecutionError::Schedule)?;
                 report.resubscriptions += 1;
+                if let Some(state) = self.subscriber.settled_fatally(context) {
+                    return Err(TaskExecutionError::ParticipantUnobservable {
+                        backend: context.backend_process_id(),
+                        state: participant_observation_failure(state),
+                    });
+                }
             }
         }
 
@@ -502,7 +508,7 @@ impl TaskRound {
             if let Some(state) = self.subscriber.settled_fatally(context) {
                 return Err(TaskExecutionError::ParticipantUnobservable {
                     backend: context.backend_process_id(),
-                    state: state.as_str(),
+                    state: participant_observation_failure(state),
                 });
             }
         }
@@ -1007,5 +1013,14 @@ impl TaskRound {
 
     pub(crate) const fn execution_mut(&mut self) -> &mut QueryTaskExecution {
         &mut self.execution
+    }
+}
+
+fn participant_observation_failure(state: SubscriptionState) -> ParticipantObservationFailure {
+    match state {
+        SubscriptionState::ProcessMismatch | SubscriptionState::QueryMismatch => {
+            ParticipantObservationFailure::IdentityViolation(state.as_str())
+        }
+        _ => ParticipantObservationFailure::Transport(state.as_str()),
     }
 }

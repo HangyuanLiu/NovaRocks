@@ -35,6 +35,23 @@ use novarocks_types::identity::{BackendProcessId, TaskId};
 
 use crate::query_execution::FragmentInstancePlacement;
 
+/// Why a task-status subscription can no longer represent its frozen
+/// participant. Identity violations are not transport uncertainty and must
+/// never select attempt recovery.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ParticipantObservationFailure {
+    Transport(&'static str),
+    IdentityViolation(&'static str),
+}
+
+impl ParticipantObservationFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport(state) | Self::IdentityViolation(state) => state,
+        }
+    }
+}
+
 /// Why the frontend task-protocol owners refuse to continue.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TaskExecutionError {
@@ -119,7 +136,7 @@ pub enum TaskExecutionError {
     /// deadline whenever the killed process did not host the root task.
     ParticipantUnobservable {
         backend: BackendProcessId,
-        state: &'static str,
+        state: ParticipantObservationFailure,
     },
 }
 
@@ -282,7 +299,8 @@ impl fmt::Display for TaskExecutionError {
             Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
             Self::ParticipantUnobservable { backend, state } => write!(
                 formatter,
-                "backend {backend} is no longer observable: task status subscription {state}"
+                "backend {backend} is no longer observable: task status subscription {}",
+                state.as_str()
             ),
         }
     }

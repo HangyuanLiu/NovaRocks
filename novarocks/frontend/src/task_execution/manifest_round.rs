@@ -35,7 +35,7 @@ use novarocks_workload_control::{CancellationReason, CancellationView};
 use super::abort_effect::NativeAbortEffectIntake;
 use super::actor_gate::{ActorGateOwner, ActorGatedTaskOperationSink};
 use super::clock::ProcessMonotonicClock;
-use super::error::TaskExecutionError;
+use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::QueryTaskExecution;
 use super::graph::build_task_graph_from_manifest;
 use super::intent::TaskOperationSink;
@@ -311,7 +311,14 @@ impl ManifestAssembledRound {
                     false
                 }
             };
-            if self.pending_terminal.is_some() && self.actor_gate.prepare_convergence() {
+            if self.pending_terminal.is_some() {
+                // A Task-protocol failure is already an authoritative attempt
+                // terminal. Closing the actor gate prevents any further
+                // admission, but outstanding actor-owned transport effects
+                // are residual convergence work: waiting for them here would
+                // deadlock a failure that needs Query Application to issue its
+                // Abort effects first.
+                let _ = self.actor_gate.prepare_convergence();
                 let terminal = self
                     .pending_terminal
                     .take()
@@ -443,6 +450,13 @@ fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
             AttemptFailureClass::ResourceGovernance,
             QueryExecutionErrorKind::Rejected,
         ),
+        TaskExecutionError::ParticipantUnobservable {
+            state: ParticipantObservationFailure::IdentityViolation(_),
+            ..
+        } => (
+            AttemptFailureClass::ContractViolation,
+            QueryExecutionErrorKind::InvalidRequest,
+        ),
         TaskExecutionError::ParticipantUnobservable { .. }
         | TaskExecutionError::QueueResidenceExpired { .. }
         | TaskExecutionError::ResultStream(_) => (
@@ -481,4 +495,25 @@ fn cancellation_failure(reason: CancellationReason) -> NativeAttemptTerminal {
         class,
         QueryExecutionError::new(kind, format!("Native Task attempt cancelled: {reason:?}")),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn foreign_status_identity_violation_refuses_attempt_recovery() {
+        let terminal = task_protocol_failure(TaskExecutionError::ParticipantUnobservable {
+            backend: novarocks_types::identity::BackendProcessId::new_v7(),
+            state: ParticipantObservationFailure::IdentityViolation("process_mismatch"),
+        });
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("task protocol refusal must fail the attempt");
+        };
+        assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
+        assert_eq!(
+            failure.error().kind(),
+            QueryExecutionErrorKind::InvalidRequest
+        );
+    }
 }

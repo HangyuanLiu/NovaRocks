@@ -3232,6 +3232,7 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
 #[test]
 fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
     use crate::native::task_transport::{SubscriptionState, TaskAckIntake};
+    use crate::task_execution::error::ParticipantObservationFailure;
     use crate::task_execution::round::TaskRound;
 
     let processes = backends(2);
@@ -3240,6 +3241,7 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
     let harness = Harness::from_graph(graph);
     let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
+    let status_intake = harness.execution.intake().handle();
     let subscriptions = Arc::new(RecordingSubscriptions::default());
     let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
     let acks = intake.handle();
@@ -3274,18 +3276,31 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
         .turn()
         .expect("a recoverable subscription decides nothing");
 
-    // One that has settled is.
-    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::BudgetExhausted);
+    // A fatal state discovered while reconciling an observation boundary must
+    // fail before the round submits another task operation.
+    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::ProcessMismatch);
+    status_intake.note_observation_incomplete();
     let error = round
         .turn()
         .expect_err("a backend out of observation fails the attempt");
     let TaskExecutionError::ParticipantUnobservable { backend, state } = error else {
         panic!("expected an unobservable participant, got {error:?}");
     };
-    assert_eq!(state, "budget_exhausted");
+    assert_eq!(
+        state,
+        ParticipantObservationFailure::IdentityViolation("process_mismatch")
+    );
     assert!(
         processes.values().any(|process| *process == backend),
         "the failure has to name a backend of this attempt, got {backend}"
+    );
+    assert!(
+        !subscriptions
+            .resubscribed
+            .lock()
+            .expect("resubscription ledger")
+            .is_empty(),
+        "the fatal state was checked at the observation-loss reconciliation boundary"
     );
 }
 
