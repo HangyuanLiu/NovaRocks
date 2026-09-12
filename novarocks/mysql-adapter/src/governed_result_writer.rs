@@ -57,6 +57,11 @@ enum ProtocolWriteSettlement {
     ClientDisconnected,
 }
 
+pub enum MysqlStatementWriteOutcome<'writer, W: AsyncWrite + Unpin> {
+    Continue(QueryResultWriter<'writer, W>),
+    Terminated,
+}
+
 impl ProtocolWriteFailure {
     fn settlement(&self) -> ProtocolWriteSettlement {
         match self {
@@ -95,6 +100,16 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
     result: GovernedImmediateStatementResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
+    match write_governed_query_result_one(result, results).await? {
+        MysqlStatementWriteOutcome::Continue(results) => results.no_more_results().await,
+        MysqlStatementWriteOutcome::Terminated => Ok(()),
+    }
+}
+
+pub async fn write_governed_query_result_one<'writer, W: AsyncWrite + Unpin>(
+    result: GovernedImmediateStatementResult,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let (result, mut protocol) = result.into_parts();
     let schema_bytes = match mysql_query_result_schema_protocol_bytes_upper_bound(&result.columns) {
         Ok(bytes) => bytes,
@@ -102,7 +117,10 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             let error = invalid_query_result_delivery(message);
             let _ = protocol.fail();
             let message = error.to_string().into_bytes();
-            return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
+            return results
+                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                .await
+                .map(|_| MysqlStatementWriteOutcome::Terminated);
         }
     };
     let cancellation = protocol.cancellation();
@@ -126,7 +144,10 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 let _ = protocol.fail();
             }
             let message = error.to_string().into_bytes();
-            return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
+            return results
+                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                .await
+                .map(|_| MysqlStatementWriteOutcome::Terminated);
         }
     };
     let mysql_columns = match crate::mysql_columns_for_result_fields(&result.columns) {
@@ -135,7 +156,10 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             let error = invalid_query_result_delivery(error.to_string());
             let _ = protocol.fail();
             let message = error.to_string().into_bytes();
-            return results.error(ErrorKind::ER_UNKNOWN_ERROR, &message).await;
+            return results
+                .error(ErrorKind::ER_UNKNOWN_ERROR, &message)
+                .await
+                .map(|_| MysqlStatementWriteOutcome::Terminated);
         }
     };
     let cancellation = protocol.cancellation();
@@ -163,7 +187,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             Ok(bytes) => bytes,
             Err(error) => {
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let cancellation = protocol.cancellation();
@@ -186,7 +211,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 } else {
                     let _ = protocol.fail();
                 }
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         // The result batch is already materialized by the synchronous command
@@ -199,7 +225,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                     "begin immediate result credit fetch: {error}"
                 ));
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let credit = match credit.retain_raw(decoded_bytes) {
@@ -209,7 +236,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 let error =
                     failed_query_result_delivery(format!("retain immediate result bytes: {error}"));
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let cancellation = protocol.cancellation();
@@ -233,7 +261,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 } else {
                     let _ = protocol.fail();
                 }
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let credit = match credit.queue_decoded(decoded_bytes) {
@@ -244,14 +273,16 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                     "queue immediate decoded result bytes: {error}"
                 ));
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let batch = match ImmediateResultBatch::try_new(raw_batch, credit) {
             Ok(batch) => batch,
             Err(error) => {
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let protocol_bytes =
@@ -260,7 +291,12 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 Err(message) => {
                     let error = invalid_query_result_delivery(message);
                     let _ = protocol.fail();
-                    return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                    return finish_stream_error_terminated(
+                        writer,
+                        ErrorKind::ER_UNKNOWN_ERROR,
+                        &error,
+                    )
+                    .await;
                 }
             };
         let cancellation = protocol.cancellation();
@@ -283,14 +319,16 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
                 } else {
                     let _ = protocol.fail();
                 }
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         let batch = match batch.begin_protocol_write(protocol_bytes) {
             Ok(batch) => batch,
             Err(error) => {
                 let _ = protocol.fail();
-                return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                    .await;
             }
         };
         if let Err(error) = write_governed_batch(
@@ -331,7 +369,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
         }
         if let Err(error) = batch.complete() {
             let _ = protocol.fail();
-            return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                .await;
         }
     }
 
@@ -353,7 +392,8 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
             } else {
                 let _ = protocol.fail();
             }
-            return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                .await;
         }
     };
     match protocol.seal_success_visibility() {
@@ -361,21 +401,23 @@ pub async fn write_governed_query_result<W: AsyncWrite + Unpin>(
         GovernedStatementVisibilitySealOutcome::Cancelled(reason) => {
             let error = governed_cancelled_query_result_delivery(reason);
             let _ = protocol.settle_cancellation();
-            return finish_stream_error(writer, ErrorKind::ER_QUERY_INTERRUPTED, &error).await;
+            return finish_stream_error_terminated(writer, ErrorKind::ER_QUERY_INTERRUPTED, &error)
+                .await;
         }
         GovernedStatementVisibilitySealOutcome::Stale => {
             let error = failed_query_result_delivery(
                 "governed query lost its statement generation before success visibility",
             );
             let _ = protocol.fail();
-            return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+            return finish_stream_error_terminated(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
+                .await;
         }
     }
-    match crate::finish_result(writer).await {
-        Ok(()) => {
+    match crate::finish_result_one(writer).await {
+        Ok(writer) => {
             drop(terminal_reservation);
             let _ = protocol.complete();
-            Ok(())
+            Ok(MysqlStatementWriteOutcome::Continue(writer))
         }
         Err(error) => {
             drop(terminal_reservation);
@@ -756,6 +798,16 @@ async fn finish_stream_error<W: AsyncWrite + Unpin>(
     error: &QueryExecutionError,
 ) -> io::Result<()> {
     crate::finish_result_error(writer, kind, error).await
+}
+
+async fn finish_stream_error_terminated<'writer, W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'writer, '_, W>,
+    kind: ErrorKind,
+    error: &QueryExecutionError,
+) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
+    finish_stream_error(writer, kind, error)
+        .await
+        .map(|_| MysqlStatementWriteOutcome::Terminated)
 }
 
 async fn reserve_data_when_available(

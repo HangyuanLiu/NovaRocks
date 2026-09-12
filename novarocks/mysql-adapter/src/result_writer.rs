@@ -138,6 +138,14 @@ pub async fn finish_result<W: AsyncWrite + Unpin>(
     writer.finish().await
 }
 
+/// Finishes one result and returns the connection writer for a negotiated
+/// subsequent result.
+pub async fn finish_result_one<'writer, W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'writer, '_, W>,
+) -> io::Result<QueryResultWriter<'writer, W>> {
+    writer.finish_one().await
+}
+
 /// The wire-visible result of attempting a streaming success EOF.
 pub enum MysqlResultFinishError {
     Native(QueryExecutionError),
