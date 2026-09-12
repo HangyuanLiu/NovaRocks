@@ -17,9 +17,7 @@
 
 //! Frontend adapters for MV application-owned activity coordination.
 
-pub(crate) use novarocks_mv_application::activity::{
-    CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityLease, MvActivityOwner,
-};
+use novarocks_mv_application::activity::CanonicalMvTarget;
 
 use crate::mv::domain::repository::MvTarget;
 

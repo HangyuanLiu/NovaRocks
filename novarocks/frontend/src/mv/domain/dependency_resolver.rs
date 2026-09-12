@@ -306,7 +306,9 @@ mod tests {
         let repository = crate::mv::domain::test_repository::InMemoryMvRepository::default();
         let readiness = MvReadinessPort::new(
             std::sync::Arc::new(repository),
-            std::sync::Arc::new(crate::mv::process_runtime::ProcessRuntime::default()),
+            std::sync::Arc::new(
+                novarocks_mv_application::process_runtime::ProcessRuntime::default(),
+            ),
             tokio::runtime::Handle::current(),
         );
         let error = resolve_create_mv_dependencies_with_readiness(

@@ -171,7 +171,7 @@ pub fn build_frontend_query_session_factory(
 
     let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::new(
         Arc::clone(&mv_repository),
-        Arc::new(crate::mv::process_runtime::ProcessRuntime::default()),
+        Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
         tokio::runtime::Handle::current(),
     ));
     let mv_candidate_reader = crate::mv::domain::readiness::MvCandidateReader::new(

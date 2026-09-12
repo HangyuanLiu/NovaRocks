@@ -11,9 +11,13 @@
 
 use std::sync::Arc;
 
+use novarocks_mv_application::{
+    activity::CanonicalMvTarget,
+    process_runtime::{ProcessRuntime, TargetReadiness},
+};
 use uuid::Uuid;
 
-use crate::mv::activity::{CanonicalMvTarget, canonical_mv_target};
+use crate::mv::activity::canonical_mv_target;
 use crate::mv::domain::dependency::model::MvDependencyObjectRef;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
@@ -23,7 +27,7 @@ use crate::mv::domain::repository::{
     MvRepositoryErrorKind, MvTarget,
 };
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
-use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
+use novarocks_spi::connector::LakePublicationId;
 
 /// The synchronous face of an asynchronous MV projection store.
 ///
@@ -41,7 +45,7 @@ use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
 pub struct MvReadinessPort {
     repository: Arc<dyn MvRepository>,
     projector: MvAcceleratorProjector,
-    runtime: Arc<ProcessRuntime>,
+    runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
     handle: tokio::runtime::Handle,
 }
 
@@ -62,7 +66,7 @@ pub(crate) struct MvCandidateReader {
 ///
 /// It has no durable representation: process loss intentionally forgets it.
 pub(crate) struct MvRuntimePublicationLease {
-    runtime: Arc<ProcessRuntime>,
+    runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
     target: CanonicalMvTarget,
     publication_id: novarocks_spi::connector::LakePublicationId,
 }
@@ -76,7 +80,7 @@ impl Drop for MvRuntimePublicationLease {
 impl MvReadinessPort {
     pub(crate) fn new(
         repository: Arc<dyn MvRepository>,
-        runtime: Arc<ProcessRuntime>,
+        runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
         handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
@@ -162,7 +166,7 @@ impl MvReadinessPort {
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
         let canonical = canonical_mv_target(target);
-        if let MvTargetReadiness::Unavailable(reason) = self.runtime.readiness(&canonical) {
+        if let TargetReadiness::Unavailable(reason) = self.runtime.readiness(&canonical) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Unavailable,
                 format!("MV target is unavailable: {reason}"),
@@ -199,7 +203,7 @@ impl MvReadinessPort {
                     && !target.name.is_empty()
                     && !matches!(
                         self.runtime.readiness(&canonical_mv_target(&target)),
-                        MvTargetReadiness::Unavailable(_)
+                        TargetReadiness::Unavailable(_)
                     )
             })
             .collect::<Vec<_>>();

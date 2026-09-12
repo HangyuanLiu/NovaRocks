@@ -18,7 +18,6 @@
 //! Closed typed executor for Iceberg MV statements.
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::mv::activity::MvActivityOwner;
 use crate::mv::domain::application::{
     MvAlterAction, MvAlterStatement, MvApplicationService, MvCreateDistribution,
     MvCreatePartitionField, MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement,
@@ -26,6 +25,7 @@ use crate::mv::domain::application::{
 };
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use novarocks_mv_application::activity::MvActivityOwner;
 use novarocks_parser::ast::{
     CallStatement, Literal, LiteralKind, MaterializedViewAlterAction as TypedAlterAction,
     MaterializedViewExplainLevel, MaterializedViewPartitionArgument,

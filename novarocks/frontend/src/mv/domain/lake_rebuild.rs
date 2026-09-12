@@ -219,7 +219,7 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
                 MvLakePackageOutcome::Observed(package) => package,
                 MvLakePackageOutcome::Failed(failure) => {
                     ctx.readiness.quarantine(
-                        crate::mv::activity::CanonicalMvTarget::from_parts(
+                        novarocks_mv_application::activity::CanonicalMvTarget::from_parts(
                             Some(failure.table().instance_id.as_str()),
                             &failure.table().namespace,
                             &failure.table().table,
@@ -236,7 +236,7 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
             // assertion correctly refuses. Skipping keeps a foreign or
             // already-dropped package from failing frontend startup, while the
             // targeted rebuild procedure still fails closed on the same condition.
-            let target = crate::mv::activity::CanonicalMvTarget::from_parts(
+            let target = novarocks_mv_application::activity::CanonicalMvTarget::from_parts(
                 Some(package.table.instance_id.as_str()),
                 &package.table.namespace,
                 &package.table.table,
@@ -316,8 +316,11 @@ fn audit_retained_lake_mv_base_identities(
         ) else {
             continue;
         };
-        let target =
-            crate::mv::activity::CanonicalMvTarget::from_parts(Some(catalog), namespace, table);
+        let target = novarocks_mv_application::activity::CanonicalMvTarget::from_parts(
+            Some(catalog),
+            namespace,
+            table,
+        );
         let audit = (|| -> Result<(), String> {
             let exact_lease =
                 crate::connector::acquire_metadata_planning_lease(ctx.connector_control, catalog)?;
@@ -588,7 +591,7 @@ mod tests {
         MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
     use crate::mv::domain::test_repository::InMemoryMvRepository;
-    use crate::mv::process_runtime::ProcessRuntime;
+    use novarocks_mv_application::process_runtime::ProcessRuntime;
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
     };

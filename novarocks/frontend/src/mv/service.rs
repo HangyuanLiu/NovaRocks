@@ -39,13 +39,16 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
-use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
-use novarocks_mv_application::scheduler::MvSchedulerConfig;
+use novarocks_mv_application::{
+    activity::{MvActivityGate, MvActivityLease, MvActivityOwner},
+    maintenance::MaintenanceCoordinatorConfig,
+    scheduler::MvSchedulerConfig,
+};
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
 use super::{
-    activity::{MvActivityGate, MvActivityOwner, canonical_mv_target},
+    activity::canonical_mv_target,
     create,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
     refresh,
@@ -277,7 +280,7 @@ impl FrontendMvService {
         target: &crate::mv::domain::repository::MvTarget,
         owner: MvActivityOwner,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
-    ) -> Result<crate::mv::activity::MvActivityLease, MvApplicationError> {
+    ) -> Result<MvActivityLease, MvApplicationError> {
         let mut gate_ticket = self
             .activity_gate
             .request(canonical_mv_target(target), owner)

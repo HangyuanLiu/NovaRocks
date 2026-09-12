@@ -43,12 +43,14 @@ use crate::mv::domain::repository::MvRepositoryError;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
-use novarocks_mv_application::maintenance::{MaintenanceCoordinator, MaintenanceCoordinatorConfig};
+use novarocks_mv_application::{
+    activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner},
+    maintenance::{MaintenanceCoordinator, MaintenanceCoordinatorConfig},
+};
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
-use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{
     AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceExecutionReport,
 };
