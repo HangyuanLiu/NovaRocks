@@ -592,8 +592,14 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use novarocks_parser::printer::Printer;
+    use novarocks_parser::{
+        Span,
+        ast::{Ident, ObjectName, TypeName},
+    };
 
     #[derive(Default)]
     struct FakeViewEngine;
@@ -658,6 +664,67 @@ mod tests {
             panic!("expected query");
         };
         query.clone()
+    }
+
+    fn native_bigint_type() -> TypeName {
+        let span = Span::new(0, 0);
+        TypeName {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: "BIGINT".to_string(),
+                    quoted: false,
+                    quote_style: None,
+                    span,
+                }],
+                span,
+            },
+            arguments: Vec::new(),
+            argument_separator_spaces: Vec::new(),
+            span,
+        }
+    }
+
+    #[test]
+    fn view_ports_and_dtos_are_constructible_by_the_owning_module() {
+        let target = ViewTarget {
+            catalog: "rest".to_string(),
+            database: "analytics".to_string(),
+            view: "daily_sales".to_string(),
+        };
+        let request = CreateExternalViewRequest {
+            target: target.clone(),
+            columns: vec![ViewColumnDefinition {
+                name: "sale_count".to_string(),
+                data_type: native_bigint_type(),
+                nullable: false,
+            }],
+            definition: PersistedQueryDefinition::new(
+                "SELECT COUNT(*) AS sale_count FROM sales",
+                PersistedQueryDialect::StarRocks,
+                "rest",
+                "analytics",
+            )
+            .expect("valid definition"),
+            comment: Some("Daily sales".to_string()),
+            or_replace: false,
+            if_not_exists: false,
+            properties: vec![],
+        };
+        let resolved = ResolvedExternalView {
+            definition: request.definition.clone(),
+            column_names: vec!["sale_count".to_string()],
+            comment: request.comment.clone(),
+            properties: HashMap::new(),
+        };
+        let context = ViewRequestContext {
+            current_catalog: Some("rest"),
+            current_database: "analytics",
+            connector_context: None,
+        };
+
+        fn ports_are_object_safe(_service: &dyn ViewService, _engine: &dyn ViewEngine) {}
+        let _ = ports_are_object_safe;
+        let _ = (request, resolved, context, ViewStatementResult::Ok);
     }
 
     #[test]
