@@ -218,6 +218,55 @@ pub fn build_string_query_result(
     })
 }
 
+/// Builds a bounded immediate table whose protocol-visible cells are nullable
+/// UTF-8 values.
+///
+/// Product command adapters retain ownership of their row semantics; this
+/// helper owns only the common Arrow/schema projection into the query-session
+/// result contract. It rejects ragged rows before constructing any batch, so a
+/// product cannot publish a schema that disagrees with its visible cells.
+pub fn build_nullable_utf8_query_result(
+    column_names: &[&str],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<QueryResult, String> {
+    if column_names.is_empty() {
+        return Err("immediate tabular result requires at least one column".to_owned());
+    }
+    if column_names.iter().any(|name| name.is_empty()) {
+        return Err("immediate tabular result column names must be nonempty".to_owned());
+    }
+    if rows.iter().any(|row| row.len() != column_names.len()) {
+        return Err(
+            "immediate tabular result contains a row with the wrong column count".to_owned(),
+        );
+    }
+    let columns = column_names
+        .iter()
+        .map(|name| ResultField::new(*name, DataType::Utf8, true, None))
+        .collect::<Vec<_>>();
+    let schema = Arc::new(Schema::new(
+        column_names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays = (0..column_names.len())
+        .map(|column| {
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row[column].clone())
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef
+        })
+        .collect::<Vec<_>>();
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|error| format!("build immediate tabular result failed: {error}"))?;
+    Ok(QueryResult {
+        columns,
+        batches: vec![batch],
+    })
+}
+
 impl ResultSchema {
     pub fn new(fields: impl Into<Arc<[ResultField]>>) -> Self {
         Self {
@@ -916,6 +965,41 @@ mod tests {
             .expect("string output");
         assert_eq!(values.value(0), "first");
         assert_eq!(values.value(1), "second");
+    }
+
+    #[test]
+    fn nullable_text_table_projection_preserves_schema_cells_and_nulls() {
+        let result = build_nullable_utf8_query_result(
+            &["job_id", "detail"],
+            vec![
+                vec![Some("job-1".to_owned()), None],
+                vec![Some("job-2".to_owned()), Some("complete".to_owned())],
+            ],
+        )
+        .expect("build nullable text table");
+
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.columns.iter().all(ResultField::nullable));
+        let detail = result.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("nullable string output");
+        assert!(detail.is_null(0));
+        assert_eq!(detail.value(1), "complete");
+    }
+
+    #[test]
+    fn nullable_text_table_projection_rejects_ragged_rows() {
+        let error = build_nullable_utf8_query_result(
+            &["job_id", "detail"],
+            vec![vec![Some("job-1".to_owned())]],
+        )
+        .expect_err("ragged rows must not produce a visible schema");
+        assert_eq!(
+            error,
+            "immediate tabular result contains a row with the wrong column count"
+        );
     }
 
     fn decoded(batch: RecordBatch) -> DecodedResultBatch {

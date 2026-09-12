@@ -19,16 +19,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::build_nullable_utf8_query_result;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::naming::normalize_identifier;
 
@@ -156,34 +152,7 @@ fn statistics_string_result(
     names: &[&str],
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<StatementResult, String> {
-    if rows.iter().any(|row| row.len() != names.len()) {
-        return Err("statistics application returned malformed tabular result".to_string());
-    }
-    let columns = names
-        .iter()
-        .map(|name| QueryResultColumn::new(*name, DataType::Utf8, true, None))
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(
-        names
-            .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    ));
-    let arrays = (0..names.len())
-        .map(|column| {
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row[column].clone())
-                    .collect::<Vec<_>>(),
-            )) as arrow::array::ArrayRef
-        })
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|error| format!("build statistics application result failed: {error}"))?;
-    Ok(StatementResult::Query(QueryResult {
-        columns,
-        batches: vec![batch],
-    }))
+    build_nullable_utf8_query_result(names, rows).map(StatementResult::Query)
 }
 
 impl StatisticsCommandExecutor {
