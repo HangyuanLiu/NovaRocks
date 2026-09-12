@@ -490,12 +490,12 @@ pub fn compose_frontend_server_config(
     )
     .map_err(|error| anyhow::anyhow!("construct result fetch byte limit: {error}"))?;
     if result_fetch_byte_limit.get()
-        > novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
+        > novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
     {
         anyhow::bail!(
             "runtime.result_retained_bytes_per_root {} exceeds the Native root-result payload limit {}",
             result_fetch_byte_limit.get(),
-            novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
+            novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
         );
     }
     let (

@@ -51,9 +51,8 @@ pub mod view;
 pub mod workload_lifecycle;
 
 pub use application::{
-    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendApplicationError,
-    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
-    FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
 };
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::FrontendMvService;

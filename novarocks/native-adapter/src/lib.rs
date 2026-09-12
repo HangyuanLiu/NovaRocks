@@ -31,6 +31,10 @@ use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
 
+/// Largest root-result payload admitted by the Native task wire.
+pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
+    novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
+
 #[derive(Clone, Debug)]
 pub enum BackendNativeTransport {
     Plaintext,

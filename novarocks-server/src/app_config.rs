@@ -29,8 +29,10 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
-use novarocks_frontend::{FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, StateStoreRunPolicy};
-use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_frontend::StateStoreRunPolicy;
+use novarocks_native_adapter::{
+    FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
+};
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_query_application::coordination::{
     DEFAULT_STATUS_SUBSCRIPTION_ERROR_BUDGET, DispatchBudget,
@@ -2477,13 +2479,15 @@ impl Default for CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES,
-        LeaseBounds, LeaseValidFor, MaxWait, NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR,
-        RuntimeConfig, StandaloneServerConfig, validate_connector_blocking_io_config,
-        validate_query_blocking_config, validate_query_control_config,
-        validate_result_retained_config, validate_task_execution_config,
+        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
+        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
+        validate_connector_blocking_io_config, validate_query_blocking_config,
+        validate_query_control_config, validate_result_retained_config,
+        validate_task_execution_config,
     };
-    use novarocks_native_adapter::FrontendTaskTransportBudget;
+    use novarocks_native_adapter::{
+        FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
+    };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
 

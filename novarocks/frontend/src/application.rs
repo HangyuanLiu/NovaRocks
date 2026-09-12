@@ -107,10 +107,6 @@ const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Largest root-result payload accepted by the Frontend Native adapter.
-pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
-    novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
-
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
     use novarocks_native_trust::{
