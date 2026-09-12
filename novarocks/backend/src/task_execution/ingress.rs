@@ -606,8 +606,8 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::registry::TaskExecutionRegistryConfig;
     use super::*;
+    use novarocks_worker::TaskExecutionRegistryConfig;
     use novarocks_worker::{
         HostRejection, ManualClock, QueryContextHost, ReleasedContextEvidence, RunnableTask,
         SharedFactsRequest, TaskExecutionHost, TaskStatusReporter, WorkerMonotonicClock,
@@ -734,7 +734,11 @@ mod tests {
 
         fn with_transport(native_transport_confidentiality: ConfidentialTransport) -> Self {
             let backend = BackendProcessId::new_v7();
-            let mut config = TaskExecutionRegistryConfig::for_process(backend);
+            let mut config = TaskExecutionRegistryConfig::for_process(
+                backend,
+                novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+                novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+            );
             // Nothing here waits on a gate, and no case may depend on
             // elapsed wall time.
             config.gate_poll_interval = Duration::from_secs(3600);

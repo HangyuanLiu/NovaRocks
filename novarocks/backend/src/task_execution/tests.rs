@@ -66,9 +66,10 @@ use novarocks_worker::{
     RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
 };
 
-use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
+use super::registry::TaskExecutionRegistry;
 use super::shared_facts::sealed_runtime_filter_evidence;
 use novarocks_worker::OperationReceipt;
+use novarocks_worker::TaskExecutionRegistryConfig;
 use novarocks_worker::{
     ContextConvergenceCursorError, CursorObservation, METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute,
     StatusAdvance, TaskStatusEvent, TaskStatusReporter, TaskStatusSource,
@@ -570,7 +571,11 @@ impl Fixture {
     fn with_config(adjust: impl FnOnce(&mut TaskExecutionRegistryConfig)) -> Self {
         let backend = BackendProcessId::new_v7();
         let frontend = FrontendProcessId::new_v7();
-        let mut config = TaskExecutionRegistryConfig::for_process(backend);
+        let mut config = TaskExecutionRegistryConfig::for_process(
+            backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        );
         // Only an explicit `advance_deadlines` may wake a waiter, so nothing
         // in these tests depends on elapsed wall time.
         config.gate_poll_interval = Duration::from_secs(3600);
@@ -946,9 +951,13 @@ fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     // Past the request horizon the record is reclaimed and a create can no
     // longer prove anything about it.
     fixture.clock.advance(
-        TaskExecutionRegistryConfig::for_process(fixture.backend)
-            .request_horizon
-            .total()
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .request_horizon
+        .total()
             + Duration::from_secs(1),
     );
     fixture.registry.advance_deadlines();
@@ -1864,9 +1873,13 @@ fn retention_expiry_yields_gone() {
         .expect("an active context has a source");
     while source.next_event().is_some() {}
 
-    let horizon = TaskExecutionRegistryConfig::for_process(fixture.backend)
-        .request_horizon
-        .total();
+    let horizon = TaskExecutionRegistryConfig::for_process(
+        fixture.backend,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    )
+    .request_horizon
+    .total();
     // Just inside the horizon the record is still retained.
     fixture.clock.advance(horizon - Duration::from_secs(1));
     let sweep = fixture.registry.advance_deadlines();
@@ -3237,9 +3250,13 @@ fn a_reclaimed_context_answers_gone_rather_than_absent() {
             context,
         ));
 
-    let horizon = TaskExecutionRegistryConfig::for_process(fixture.backend)
-        .request_horizon
-        .total();
+    let horizon = TaskExecutionRegistryConfig::for_process(
+        fixture.backend,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    )
+    .request_horizon
+    .total();
     fixture.clock.advance(horizon + Duration::from_secs(1));
     let sweep = fixture.registry.advance_deadlines();
     assert!(sweep.contexts_reaped >= 1);
@@ -3319,9 +3336,15 @@ fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
 
     // Inside the grace the owner keeps waiting rather than lying about the
     // task's outcome.
-    fixture
-        .clock
-        .advance(TaskExecutionRegistryConfig::for_process(fixture.backend).termination_grace / 2);
+    fixture.clock.advance(
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .termination_grace
+            / 2,
+    );
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),
@@ -3329,9 +3352,14 @@ fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
     );
     assert_eq!(fixture.registry.admission_reservation_count(), 1);
 
-    fixture
-        .clock
-        .advance(TaskExecutionRegistryConfig::for_process(fixture.backend).termination_grace);
+    fixture.clock.advance(
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .termination_grace,
+    );
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),

@@ -44,6 +44,7 @@ mod status;
 mod task_domain_execution;
 mod task_execution_ports;
 mod task_protocol_event;
+mod task_registry_config;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -104,6 +105,7 @@ pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
+pub use task_registry_config::TaskExecutionRegistryConfig;
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

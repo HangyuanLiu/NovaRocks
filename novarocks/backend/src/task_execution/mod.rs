@@ -62,5 +62,6 @@ pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub(crate) use novarocks_worker::QueryContextHost;
+pub(crate) use novarocks_worker::TaskExecutionRegistryConfig;
 pub(crate) use ports::backend_task_execution_ports;
-pub(crate) use registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
+pub(crate) use registry::TaskExecutionRegistry;

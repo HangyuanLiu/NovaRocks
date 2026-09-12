@@ -49,7 +49,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::time::Duration;
 
 use novarocks_execution::exec::fragment::program::FragmentSinkKind;
 use novarocks_execution_contract::task_execution::context_convergence::{
@@ -72,14 +71,13 @@ use novarocks_execution_contract::task_execution::status::{
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_task_codec::TransportBudget;
-use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
+use novarocks_types::identity::QueryExecutionId;
 use novarocks_worker::{
-    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
-    AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
-    ContextTransition, InstalledLease, LatchOutcome, LeaseBounds, LeaseProgression,
-    MonotonicInstant, OperationAdmission, OperationWaitCaps, ProcessMonotonicClock,
-    QueryContextDomains, QueryContextEvent, RequestHorizon, TaskProtocolEvent,
-    WorkerMonotonicClock, classify_context_transition, classify_operation_admission,
+    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketProgression,
+    AdmissionTicketRedemptionRejection, ContextOperationKind, ContextTransition, InstalledLease,
+    LatchOutcome, LeaseProgression, MonotonicInstant, OperationAdmission, ProcessMonotonicClock,
+    QueryContextDomains, QueryContextEvent, TaskProtocolEvent, WorkerMonotonicClock,
+    classify_context_transition, classify_operation_admission,
 };
 
 use super::entry::{
@@ -88,11 +86,11 @@ use super::entry::{
 };
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, InitialDomainKey, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt,
-    QueryContextHost, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
+    FinalTaskInfoOutcome, InitialDomainKey, OperationReceipt, QueryContextHost,
+    QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
     ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
-    StatusAdvance, TaskDomains, TaskExecutionHost, TaskStatusOwner, TaskStatusReporter,
-    TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
+    StatusAdvance, TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
+    TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
     apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, initial_domain_keys, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
@@ -117,63 +115,6 @@ const REGISTRY_LOCK: &str = "task execution registry lock";
 /// A latch, its fan-out, retirement, and completion take one pass each; the
 /// extra passes exist only for a fan-out that latches something new.
 const MAX_SETTLE_PASSES: usize = 4;
-
-/// The bounds and budgets one owner runs with.
-///
-/// The two task-count bounds are the frozen protocol budgets from
-/// [`TransportBudget`]; they live here as fields so that a test can shrink
-/// them without redefining the neutral type or reaching into it.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct TaskExecutionRegistryConfig {
-    pub backend_process_id: BackendProcessId,
-    pub lease_bounds: LeaseBounds,
-    pub wait_caps: OperationWaitCaps,
-    pub admission_tickets: AdmissionTicketConfig,
-    pub request_horizon: RequestHorizon,
-    pub metric_publish_min_interval: Duration,
-    /// Cumulative task identities one context may consume. Retiring a task
-    /// does not replenish this bound.
-    pub max_tasks_per_context: usize,
-    pub max_active_tasks_per_backend: usize,
-    /// Terminal task records retained past retirement.
-    pub retained_task_capacity: usize,
-    /// Estimated bytes of retained terminal task records.
-    pub retained_task_max_bytes: usize,
-    /// Query contexts retained in `TERMINAL_RETAINED`.
-    pub retained_context_capacity: usize,
-    /// Reclaimed-record fences kept after retention ends. Past this, a late
-    /// request no longer proves anything and the owner answers as if the
-    /// identity were unknown.
-    pub gone_fence_capacity: usize,
-    /// How long a terminating context waits for a task to converge on its
-    /// own terminal before the owner forces one.
-    pub termination_grace: Duration,
-    /// Liveness backstop for a creation-gate wait. It never decides an
-    /// outcome; the injected clock does.
-    pub gate_poll_interval: Duration,
-}
-
-impl TaskExecutionRegistryConfig {
-    pub fn for_process(backend_process_id: BackendProcessId) -> Self {
-        let budget = TransportBudget::DEFAULT;
-        Self {
-            backend_process_id,
-            lease_bounds: LeaseBounds::DEFAULT,
-            wait_caps: OperationWaitCaps::DEFAULT,
-            admission_tickets: AdmissionTicketConfig::DEFAULT,
-            request_horizon: RequestHorizon::DEFAULT,
-            metric_publish_min_interval: METRIC_PUBLISH_MIN_INTERVAL,
-            max_tasks_per_context: budget.max_tasks_per_context(),
-            max_active_tasks_per_backend: budget.max_active_tasks_per_backend(),
-            retained_task_capacity: budget.max_tasks_per_context(),
-            retained_task_max_bytes: 16 * 1024 * 1024,
-            retained_context_capacity: 1024,
-            gone_fence_capacity: budget.max_tasks_per_context(),
-            termination_grace: RequestHorizon::DEFAULT.server_wait(),
-            gate_poll_interval: Duration::from_millis(50),
-        }
-    }
-}
 
 /// What one deadline sweep did.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]

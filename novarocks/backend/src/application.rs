@@ -366,8 +366,11 @@ fn compose_backend_application_services(
     let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
-    let task_execution_registry_config =
-        TaskExecutionRegistryConfig::for_process(backend_process_id);
+    let task_execution_registry_config = TaskExecutionRegistryConfig::for_process(
+        backend_process_id,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    );
     let task_completion_supervisor = crate::task_execution::TaskCompletionSupervisor::start(
         data_runtime.clone(),
         task_execution_registry_config.max_active_tasks_per_backend,
@@ -806,7 +809,11 @@ mod tests {
         let backend = novarocks_types::BackendProcessId::new_v7();
         let clock = Arc::new(ManualClock::new());
         let registry = crate::task_execution::TaskExecutionRegistry::new(
-            TaskExecutionRegistryConfig::for_process(backend),
+            TaskExecutionRegistryConfig::for_process(
+                backend,
+                novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+                novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+            ),
             Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
