@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
-use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::{LaunchProfile, ServerHandle};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
@@ -91,6 +91,19 @@ struct FixtureReport {
 impl Scenario for StartupBaseline {
     fn name(&self) -> &'static str {
         "task-execution/startup-baseline"
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        launch_profile: LaunchProfile,
+        _uea1_workload_manifest: Option<&Path>,
+    ) -> Result<()> {
+        ensure!(
+            launch_profile == LaunchProfile::Performance,
+            "{} requires --launch-profile performance because formal release measurement cannot carry debug fault markers",
+            self.name()
+        );
+        Ok(())
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {

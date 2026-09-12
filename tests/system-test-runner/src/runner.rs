@@ -269,4 +269,23 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn startup_baseline_requires_the_performance_profile_before_launch() {
+        let scenarios = crate::scenarios::all();
+        let selected = select(&scenarios, &["task-execution/startup-baseline".to_string()])
+            .expect("select startup baseline scenario");
+        let scenario = selected[0];
+        assert!(
+            scenario
+                .validate_runner_inputs(
+                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                    None
+                )
+                .is_err()
+        );
+        scenario
+            .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
+            .expect("performance profile is accepted before startup");
+    }
 }
