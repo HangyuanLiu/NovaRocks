@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_frontend::{
-    application::{
-        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig,
-    },
-    state_store::StateStoreHostInput,
+use super::{
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig,
+};
+use crate::{
+    state_store::{StateStoreHostInput, testing as state_store_fixture},
     topology::ClusterBackendOpenConfig,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -28,10 +28,8 @@ use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };
 use novarocks_secret::SecretValue;
-mod common;
-use common::state_store_fixture;
 use std::time::Duration;
-use tempfile::TempDir;
+use uuid::Uuid;
 
 fn test_native_trust() -> std::sync::Arc<NativeTrust> {
     std::sync::Arc::new(NativeTrust::new(
@@ -43,8 +41,8 @@ fn test_native_trust() -> std::sync::Arc<NativeTrust> {
     ))
 }
 
-fn state_store_input(temp: &TempDir) -> StateStoreHostInput {
-    state_store_fixture::input(format!("frontend-mv-host-{}", temp.path().display()))
+fn state_store_input() -> StateStoreHostInput {
+    state_store_fixture::persistent_input(format!("frontend-mv-host-{}", Uuid::now_v7()))
 }
 
 fn execution_config() -> FrontendExecutionConfig {
@@ -63,7 +61,7 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     input: Option<StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    let registry = state_store_fixture::registry();
+    let registry = state_store_fixture::persistent_registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         input,
         &registry,
@@ -89,9 +87,8 @@ fn backend_config() -> ClusterBackendOpenConfig {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_sqlite_opens_and_reopens_mv_repository() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = state_store_input(&temp);
+async fn configured_state_store_opens_and_reopens_mv_repository() {
+    let config = state_store_input();
 
     let mut host = open_host(Some(config.clone()))
         .await
@@ -105,7 +102,7 @@ async fn configured_sqlite_opens_and_reopens_mv_repository() {
 
     let mut reopened = open_host(Some(config))
         .await
-        .expect("same SQLite store must reopen its MV repository");
+        .expect("same StateStore must reopen its MV repository");
     assert!(reopened.mv_repository().list_projections().await.is_ok());
     reopened.shutdown().await.expect("reopened host shutdown");
 }

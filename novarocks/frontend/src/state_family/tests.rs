@@ -40,7 +40,7 @@
 //! Naming the gaps matters: a scan that silently covered less than the
 //! statement surface would look exactly like one that covered all of it.
 
-use super::{DurabilityAdmission, StateFamily};
+use super::{classification::DurabilityAdmission, manifest::StateFamily};
 use crate::{
     application::{FrontendApplicationHost, FrontendExecutionConfig},
     state_store::{StateStoreHost, StateStoreHostInput, testing as state_store_fixture},

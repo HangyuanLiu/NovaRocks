@@ -211,8 +211,8 @@ impl StateFamily {
 mod tests {
     use std::collections::BTreeSet;
 
+    use super::super::classification::WipeEntry;
     use super::*;
-    use crate::state_family::WipeEntry;
 
     /// Five Frontend families: two in-process `Accelerator` and
     /// three `ProcessRuntime`.

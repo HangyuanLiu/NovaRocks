@@ -1988,6 +1988,10 @@ impl FrontendApplicationHost {
 mod host_tests;
 
 #[cfg(test)]
+#[path = "application/tests_mv_host.rs"]
+mod mv_host_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::time::{Duration, Instant};
