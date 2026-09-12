@@ -1364,6 +1364,14 @@ impl FrontendApplicationHost {
         Arc::clone(&self.serving_lifecycle)
     }
 
+    /// Begins the one-way serving drain. Close governed-root admission before
+    /// publishing Draining so no new workload root can enter after the role
+    /// has started refusing statements.
+    pub fn begin_serving_drain(&self, timeout: Duration) {
+        self.execution_runtime_owner.close_admission();
+        self.serving_lifecycle.begin_drain(timeout);
+    }
+
     /// Opens both the legacy serving gate and the new governed root gate after
     /// Server composition has installed every required service.
     pub(crate) fn mark_ready(&self) -> Result<(), FrontendApplicationError> {

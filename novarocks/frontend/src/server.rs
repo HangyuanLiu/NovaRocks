@@ -550,8 +550,7 @@ where
         shutdown,
         &mut report_server,
         management_server,
-        host.serving_lifecycle(),
-        host.workload_observation(),
+        host,
         config.frontend_drain_timeout,
         config.frontend_cleanup_timeout,
     )
@@ -569,8 +568,7 @@ async fn run_mysql_with_listener_supervision<F>(
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
     management_server: &mut FrontendManagementServer,
-    lifecycle: Arc<crate::workload_lifecycle::FrontendServingLifecycle>,
-    workload_observation: novarocks_workload_control::WorkloadObservationHandle,
+    host: &FrontendApplicationHost,
     drain_timeout: Duration,
     cleanup_timeout: Duration,
 ) -> Result<(), FrontendApplicationError>
@@ -603,15 +601,15 @@ where
     tokio::select! {
         result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
         _ = shutdown => {
-            lifecycle.begin_drain(drain_timeout);
+            host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
             let graceful = tokio::time::timeout(
                 drain_timeout,
-                workload_observation.wait_until_no_root_responsibilities(),
+                host.workload_observation().wait_until_no_root_responsibilities(),
             )
             .await;
             if graceful.is_err() {
-                lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
+                host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
                 // Keep the admitted protocol tasks alive long enough to
                 // observe the first-wins deadline cancellation and return
                 // its typed error. Final connection termination remains the
@@ -619,23 +617,23 @@ where
                 // the configured bounded cleanup window.
                 let _ = tokio::time::timeout(
                     cleanup_timeout,
-                    workload_observation.wait_until_no_root_responsibilities(),
+                    host.workload_observation().wait_until_no_root_responsibilities(),
                 )
                 .await;
             }
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            lifecycle.mark_stopping();
+            host.serving_lifecycle().mark_stopping();
             let _ = finalize_tx.send(true);
             mysql_server.await.map_err(FrontendApplicationError::server)
         }
         error = wait_for_frontend_listener_failure(report_server, management_server) => {
-            lifecycle.begin_drain(drain_timeout);
+            host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
-            lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
+            host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            lifecycle.mark_stopping();
+            host.serving_lifecycle().mark_stopping();
             let _ = finalize_tx.send(true);
             let mysql_result = mysql_server.await.map_err(FrontendApplicationError::server);
             match mysql_result {
