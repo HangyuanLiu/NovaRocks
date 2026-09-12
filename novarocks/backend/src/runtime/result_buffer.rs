@@ -1380,16 +1380,16 @@ pub fn fetch_wait_timeout_ms(finst_id: UniqueId) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime::query_context::{QueryId, query_context_manager};
+    use crate::runtime::query_context::query_context_manager;
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::{DataType, Field};
     use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use novarocks_execution::runtime::exchange::encode_chunks_bounded;
     use novarocks_execution::runtime::fragment::io::ResultAbort;
-    use novarocks_types::SlotId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId as NativeQueryId, StageId, TaskId,
     };
+    use novarocks_types::{QueryId, SlotId};
 
     fn test_result_cap() -> NonZeroUsize {
         NonZeroUsize::new(1024 * 1024).expect("nonzero test result cap")

@@ -28,7 +28,7 @@ use std::time::Duration;
 use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::runtime::query_context::{
-    QueryContextManager, QueryExecutionKey, QueryId, query_context_manager,
+    QueryContextManager, QueryExecutionKey, query_context_manager,
 };
 use crate::runtime::sink_commit::BackendSinkCommitPort;
 use novarocks_execution::exec::node::scan::ScanOp;
@@ -41,6 +41,7 @@ use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
 #[derive(Clone)]
@@ -367,9 +368,9 @@ mod tests {
     use std::time::Duration;
 
     use super::NativeFragmentQueryRuntime;
-    use crate::runtime::query_context::{QueryContextManager, QueryId};
+    use crate::runtime::query_context::QueryContextManager;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_types::UniqueId;
+    use novarocks_types::{QueryId, UniqueId};
 
     #[test]
     fn native_admission_installs_one_query_memory_limit() {
