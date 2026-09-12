@@ -17,33 +17,32 @@
 
 use std::sync::Arc;
 
+use super::ConnectorControlHost;
 use bytes::Bytes;
-use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorBeginScanRequest,
     ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,
     ConnectorCatalogMutationReconcileRequest, ConnectorCatalogMutationRequest,
     ConnectorCatalogMutationResolver, ConnectorCleanupCandidatePageRequest,
     ConnectorCleanupExecuteRequest, ConnectorCleanupFinalizeRequest, ConnectorCleanupMaintenance,
-    ConnectorCleanupMaintenanceResolver, ConnectorCleanupPlan, ConnectorCleanupPlanningRequest,
-    ConnectorCleanupPrepareRequest, ConnectorControlBinding, ConnectorControlResolver,
-    ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
-    ConnectorDataMutationPlan, ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationResolver,
-    ConnectorDistributedRewrite, ConnectorDistributedRewritePlan,
-    ConnectorDistributedRewritePlanningRequest, ConnectorDistributedRewriteReceipt,
-    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
+    ConnectorCleanupPlan, ConnectorCleanupPlanningRequest, ConnectorCleanupPrepareRequest,
+    ConnectorControlBinding, ConnectorControlResolver, ConnectorControlRuntimeId,
+    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
+    ConnectorDataMutationReconcileRequest, ConnectorDistributedRewrite,
+    ConnectorDistributedRewritePlan, ConnectorDistributedRewritePlanningRequest,
+    ConnectorDistributedRewriteReceipt, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorMetadataMaintenance,
     ConnectorMetadataMaintenanceExecuteRequest, ConnectorMetadataMaintenancePlan,
     ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceipt,
-    ConnectorMetadataMaintenanceResolver, ConnectorNamespaceRequest, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorStatistics,
-    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorTableMetadata,
-    ConnectorTableRequest, ConnectorWriteControl, ConnectorWriteReceipt, ExternalMutationOutcome,
-    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidence, StatisticsEvidenceRevision,
-    StatisticsReadRequest, StatisticsReader, StatisticsRowCoverage,
+    ConnectorNamespaceRequest, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorSplitPlanningRequest, ConnectorStatistics, ConnectorStatisticsResolver,
+    ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ConnectorWriteControl,
+    ConnectorWriteReceipt, ExternalMutationOutcome, ProviderBindingEpoch, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsReadRequest, StatisticsReader,
+    StatisticsRowCoverage,
 };
 
 struct TestControl {

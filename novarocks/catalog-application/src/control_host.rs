@@ -974,6 +974,10 @@ impl Default for ConnectorControlHost {
 }
 
 #[cfg(test)]
+#[path = "control_host_tests.rs"]
+mod integration_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
