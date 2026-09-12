@@ -39,7 +39,18 @@ pub fn mysql_error_kind(error: &QueryServiceError) -> ErrorKind {
 pub async fn write_terminal_ok<W: AsyncWrite + Unpin>(
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    results.completed(OkResponse::default()).await
+    write_terminal_ok_one(results)
+        .await?
+        .no_more_results()
+        .await
+}
+
+/// Writes one terminal OK and returns the writer for a negotiated following
+/// statement result.
+pub async fn write_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<QueryResultWriter<'writer, W>> {
+    results.complete_one(OkResponse::default()).await
 }
 
 /// Writes the final OK response and settles its governed statement owner.

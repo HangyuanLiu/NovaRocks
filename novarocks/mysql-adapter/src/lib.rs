@@ -66,6 +66,7 @@ pub use result_writer::{
 pub use row_encoding::{array_value_to_mysql_value, build_mysql_row};
 pub use terminal::{
     mysql_error_kind, write_governed_terminal_error, write_governed_terminal_ok, write_terminal_ok,
+    write_terminal_ok_one,
 };
 
 /// `USE ...` must remain an ordinary COM_QUERY for typed SQL validation;
