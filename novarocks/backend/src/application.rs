@@ -32,7 +32,7 @@ use novarocks_native_adapter::{
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
-use crate::task_execution::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
+use crate::task_execution::{QueryContextHost, ReleasedContextEvidence};
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -51,7 +51,7 @@ use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
 use novarocks_worker::TaskStatusReporter;
 #[cfg(test)]
-use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost};
+use novarocks_worker::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1161,7 +1161,7 @@ mod tests {
         use super::native_runtime_filter_envelope_ingress;
         use crate::runtime_filter::domain::BackendEnvelopeKind;
         use crate::runtime_filter::test_support::delivery_envelope_for_test;
-        use crate::task_execution::{QueryContextHost, SharedFactsRequest};
+        use crate::task_execution::QueryContextHost;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
@@ -1171,6 +1171,7 @@ mod tests {
         use novarocks_proto_models::filter;
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
+        use novarocks_worker::SharedFactsRequest;
 
         let services = compose_backend_application_services(
             test_data_runtime(),

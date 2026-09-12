@@ -65,6 +65,6 @@ pub(crate) use execution_host::{
 };
 pub(crate) use host::QueryContextHost;
 #[cfg(test)]
-pub(crate) use host::{ReleasedContextEvidence, SharedFactsRequest};
+pub(crate) use host::ReleasedContextEvidence;
 pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub(crate) use registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};

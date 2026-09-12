@@ -87,14 +87,14 @@ use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
+use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::marker;
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt, QueryContextOutcome,
     ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding, RootResultRoute,
-    RunnableTask, StatusAdvance, TaskExecutionHost, TaskStatusOwner, TaskStatusReporter,
-    TaskStatusSource, UpdateTaskOutcome,
+    RunnableTask, SharedFactsRequest, StatusAdvance, TaskExecutionHost, TaskStatusOwner,
+    TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";

@@ -603,12 +603,12 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
+    use super::super::host::{QueryContextHost, ReleasedContextEvidence};
     use super::super::registry::TaskExecutionRegistryConfig;
     use super::*;
     use novarocks_worker::{
-        HostRejection, ManualClock, RunnableTask, TaskExecutionHost, TaskStatusReporter,
-        WorkerMonotonicClock,
+        HostRejection, ManualClock, RunnableTask, SharedFactsRequest, TaskExecutionHost,
+        TaskStatusReporter, WorkerMonotonicClock,
     };
 
     /// An execution side that accepts everything, so these cases fail only on

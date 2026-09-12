@@ -71,7 +71,7 @@ use tracing::error;
 use super::credential_slot::QueryContextCredentialSlot;
 use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
-use super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
+use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
 };
@@ -90,7 +90,7 @@ use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 use novarocks_native_adapter::BackendDataRuntime;
-use novarocks_worker::{HostRejection, TaskStatusReporter};
+use novarocks_worker::{HostRejection, SharedFactsRequest, TaskStatusReporter};
 
 /// The mutable half of one context's installed facts.
 ///
@@ -1204,11 +1204,12 @@ mod tests {
         RuntimeFilterParticipantFactory,
     };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
-    use crate::task_execution::host::{QueryContextHost, SharedFactsRequest};
+    use crate::task_execution::host::QueryContextHost;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
+        METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
+        TaskStatusSource,
     };
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
