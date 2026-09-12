@@ -35,8 +35,7 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
-    FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
-    TaskUpdateRetryPolicy,
+    FrontendQueryControlTimeouts, FrontendServerConfig, TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -51,6 +50,7 @@ use novarocks_query_application::coordination::{
     LogicalExecutionSupervisorConfig,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
