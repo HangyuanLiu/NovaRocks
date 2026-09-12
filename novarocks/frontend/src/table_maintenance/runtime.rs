@@ -17,11 +17,6 @@
 
 //! Frontend bindings for the application-owned table-maintenance runtime.
 
-pub use novarocks_table_maintenance::runtime::{
-    RuntimeError as OptimizeRuntimeError, RuntimeErrorKind as OptimizeRuntimeErrorKind,
-    TerminalError as OptimizeTerminalError,
-};
-
 use novarocks_table_maintenance::runtime::ProcessRuntime;
 
 use super::activity::MaintenanceActivityPermit;

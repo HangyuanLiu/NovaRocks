@@ -51,8 +51,11 @@ use self::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
 use self::result::{action_result, optimize_jobs_result};
-use self::runtime::{OptimizeProcessRuntime, OptimizeRuntimeErrorKind};
+use self::runtime::OptimizeProcessRuntime;
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
+use novarocks_table_maintenance::runtime::{
+    RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
+};
 
 pub mod activity;
 pub mod admission;
@@ -466,7 +469,7 @@ impl OptimizeJobExecutor for DirectOptimizeExecutor {
         _runtime: &Handle,
         engine: &dyn TableMaintenanceEngine,
         job: &model::OptimizeJob,
-    ) -> Result<MaintenanceActionOutcome, self::runtime::OptimizeTerminalError> {
+    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
         execute_distributed_rewrite_terminal(
             engine,
             &job.target,
@@ -495,14 +498,14 @@ fn execute_distributed_rewrite_terminal(
     engine: &dyn TableMaintenanceEngine,
     target: &MaintenanceTarget,
     intent: DistributedRewriteIntent,
-) -> Result<MaintenanceActionOutcome, self::runtime::OptimizeTerminalError> {
+) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
     let session = engine
         .plan_distributed_rewrite(target, ConnectorWriteOperationId::new(), intent)
-        .map_err(self::runtime::OptimizeTerminalError::failed)?;
+        .map_err(OptimizeTerminalError::failed)?;
     let plan = session.plan();
     if session.is_noop() {
         return rewrite_outcome(intent, None, plan.summary())
-            .map_err(self::runtime::OptimizeTerminalError::failed);
+            .map_err(OptimizeTerminalError::failed);
     }
 
     for cohort in plan.cohorts() {
@@ -521,20 +524,20 @@ fn execute_distributed_rewrite_terminal(
             Ok(completion) => completion,
             Err(error) => {
                 return abort_distributed_rewrite(engine, &session, error)
-                    .map_err(self::runtime::OptimizeTerminalError::failed);
+                    .map_err(OptimizeTerminalError::failed);
             }
         };
         // Each group runs as its own query, so the session collects their
         // prepared sets and commits the union once below.
         if let Err(error) = engine.accumulate_distributed_rewrite_group(&session, completion) {
             return abort_distributed_rewrite(engine, &session, error)
-                .map_err(self::runtime::OptimizeTerminalError::failed);
+                .map_err(OptimizeTerminalError::failed);
         }
     }
 
     match engine
         .commit_distributed_rewrite(&session)
-        .map_err(self::runtime::OptimizeTerminalError::failed)?
+        .map_err(OptimizeTerminalError::failed)?
     {
         ExternalMutationOutcome::KnownCommitted {
             receipt,
@@ -542,18 +545,16 @@ fn execute_distributed_rewrite_terminal(
             ..
         } => {
             if let ExternalMutationFinalization::Failed(error) = finalization {
-                return Err(
-                    self::runtime::OptimizeTerminalError::known_committed_finalization_failed(
-                        format!("distributed optimize committed but finalization failed: {error}"),
-                    ),
-                );
+                return Err(OptimizeTerminalError::known_committed_finalization_failed(
+                    format!("distributed optimize committed but finalization failed: {error}"),
+                ));
             }
             let receipt = engine
                 .finalize_distributed_rewrite(&session, &receipt)
-                .map_err(self::runtime::OptimizeTerminalError::failed)?;
+                .map_err(OptimizeTerminalError::failed)?;
             let summary = receipt.summary();
             rewrite_outcome(intent, Some(summary), plan.summary())
-                .map_err(self::runtime::OptimizeTerminalError::failed)
+                .map_err(OptimizeTerminalError::failed)
         }
         ExternalMutationOutcome::KnownUncommitted { failure } => {
             let error = format!("distributed rewrite commit was not applied: {failure}");
@@ -561,15 +562,13 @@ fn execute_distributed_rewrite_terminal(
                 Err(error) => error,
                 Ok(_) => "distributed rewrite commit was not applied".to_string(),
             };
-            Err(self::runtime::OptimizeTerminalError::known_uncommitted(
-                error,
-            ))
+            Err(OptimizeTerminalError::known_uncommitted(error))
         }
-        ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(
-            self::runtime::OptimizeTerminalError::commit_unknown(format!(
+        ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+            Err(OptimizeTerminalError::commit_unknown(format!(
                 "distributed rewrite commit outcome is unknown: {failure}; do not retry automatically"
-            )),
-        ),
+            )))
+        }
     }
 }
 
