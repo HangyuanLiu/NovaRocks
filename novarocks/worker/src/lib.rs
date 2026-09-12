@@ -29,6 +29,7 @@ mod clock;
 mod convergence;
 mod domain;
 mod drain;
+mod host;
 mod ingress;
 mod lease;
 mod lifecycle;
@@ -54,6 +55,7 @@ pub use domain::{
     task_domain_reaches_execution, validate_task_domain_membership,
 };
 pub use drain::WorkerDrainState;
+pub use host::{HostRejection, RunnableTask, TaskExecutionHost};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{

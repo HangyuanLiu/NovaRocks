@@ -29,7 +29,7 @@ use novarocks_worker::{
 
 pub(super) use novarocks_worker::{InitialDomainKey, TaskDomains};
 
-use super::host::{HostRejection, TaskExecutionHost};
+use novarocks_worker::{HostRejection, TaskExecutionHost};
 
 #[derive(Clone, Debug)]
 pub(super) struct DomainRejection {

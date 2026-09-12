@@ -71,7 +71,7 @@ use tracing::error;
 use super::credential_slot::QueryContextCredentialSlot;
 use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
-use super::host::{HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
+use super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
 use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
 };
@@ -90,7 +90,7 @@ use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 use novarocks_native_adapter::BackendDataRuntime;
-use novarocks_worker::TaskStatusReporter;
+use novarocks_worker::{HostRejection, TaskStatusReporter};
 
 /// The mutable half of one context's installed facts.
 ///

@@ -49,7 +49,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_task_codec::domain::{VendedCredentialLease, WireCredential};
 
-use super::host::HostRejection;
+use novarocks_worker::HostRejection;
 
 /// One installed lease: an immutable scope and the exact secret it authorizes.
 struct InstalledLease {

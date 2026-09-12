@@ -61,12 +61,11 @@ use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
 use novarocks_types::{NativeCompatibilityId, UniqueId};
-use novarocks_worker::{LeaseBounds, ManualClock, WorkerMonotonicClock};
-
-use super::host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost,
+use novarocks_worker::{
+    HostRejection, LeaseBounds, ManualClock, RunnableTask, TaskExecutionHost, WorkerMonotonicClock,
 };
+
+use super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::{

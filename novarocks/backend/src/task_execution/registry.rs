@@ -21,7 +21,7 @@
 //! one linearization point per operation: the establish creation gate, the
 //! creation owner election, every domain token, the first-wins termination
 //! latch, release readiness, and retirement. The execution side is reached
-//! only through the ports in [`super::host`].
+//! only through the context and execution ports it receives.
 //!
 //! # Lock discipline
 //!
@@ -87,15 +87,14 @@ use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use super::host::{
-    QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-};
+use super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
 use super::marker;
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt, QueryContextOutcome,
     ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding, RootResultRoute,
-    StatusAdvance, TaskStatusOwner, TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
+    RunnableTask, StatusAdvance, TaskExecutionHost, TaskStatusOwner, TaskStatusReporter,
+    TaskStatusSource, UpdateTaskOutcome,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";

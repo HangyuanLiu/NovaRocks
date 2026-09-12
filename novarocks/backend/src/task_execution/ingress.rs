@@ -75,15 +75,14 @@ use novarocks_types::NativeCompatibilityId;
 use tokio_stream::Stream;
 
 use super::fault;
-use super::host::HostRejection;
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
+use novarocks_worker::OperationReceipt;
 use novarocks_worker::{
-    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
+    ContextConvergenceCursorError, HostRejection, TaskStatusEvent, TaskStatusSource,
     TaskStatusSubscriptionPosition,
 };
-use novarocks_worker::{OperationReceipt, TaskStatusReporter};
 
 type ReceiptAck = proto::task_operation_receipt::Ack;
 
@@ -604,13 +603,13 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::host::{
-        HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-        TaskExecutionHost,
-    };
+    use super::super::host::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
     use super::super::registry::TaskExecutionRegistryConfig;
     use super::*;
-    use novarocks_worker::{ManualClock, WorkerMonotonicClock};
+    use novarocks_worker::{
+        HostRejection, ManualClock, RunnableTask, TaskExecutionHost, TaskStatusReporter,
+        WorkerMonotonicClock,
+    };
 
     /// An execution side that accepts everything, so these cases fail only on
     /// the protocol boundary they are about.

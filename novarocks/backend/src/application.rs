@@ -16,7 +16,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::{TaskStatusReporter, WorkerDrainState, WorkerResultRetainedLimits};
+use novarocks_worker::{WorkerDrainState, WorkerResultRetainedLimits};
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
@@ -32,10 +32,7 @@ use novarocks_native_adapter::{
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
-use crate::task_execution::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost,
-};
+use crate::task_execution::{QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -51,6 +48,10 @@ use novarocks_execution_contract::task_execution::operation::{
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
+#[cfg(test)]
+use novarocks_worker::TaskStatusReporter;
+#[cfg(test)]
+use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);

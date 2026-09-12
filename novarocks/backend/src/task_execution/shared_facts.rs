@@ -46,8 +46,7 @@ use novarocks_task_codec::domain::{
 };
 use novarocks_task_codec::identity::encode_task_identity;
 
-use super::host::HostRejection;
-use novarocks_worker::TaskDynamicFilterRead;
+use novarocks_worker::{HostRejection, TaskDynamicFilterRead};
 
 /// The catalogs one establish asks this backend to materialize.
 ///
