@@ -35,7 +35,7 @@
 //!
 //! `FetchTaskDynamicFiltersResponse` carries the filter domains themselves,
 //! but a retained payload reaches this adapter as
-//! [`TaskDynamicFilterRead`](super::host::TaskDynamicFilterRead), whose
+//! [`TaskDynamicFilterRead`](novarocks_worker::TaskDynamicFilterRead), whose
 //! content sits behind `CodecOwnedContent` and exposes only a fingerprint and
 //! a size — no wire projection. So a read that really has a payload is refused
 //! as an internal invariant violation instead of being answered with an empty
@@ -80,10 +80,10 @@ use super::observation::{
     ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
     TaskStatusSubscriptionPosition,
 };
-use super::receipt::OperationReceipt;
 use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
+use novarocks_worker::OperationReceipt;
 
 type ReceiptAck = proto::task_operation_receipt::Ack;
 

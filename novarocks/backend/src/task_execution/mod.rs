@@ -53,7 +53,6 @@ mod host;
 pub(crate) mod ingress;
 mod marker;
 mod observation;
-mod receipt;
 mod registry;
 pub(crate) mod shared_facts;
 mod status;

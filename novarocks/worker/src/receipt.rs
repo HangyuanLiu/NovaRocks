@@ -1,28 +1,28 @@
 // Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
+// or more contributor license agreements. See the NOTICE file
 // distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
+// regarding copyright ownership. The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// with the License. You may obtain a copy of the License at
 //
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
 // software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
+// KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-//! What every handler returns: one operation id, one machine-readable
-//! outcome, and at most one typed acknowledgement body.
+//! Worker-owned results of linearized task operations.
 //!
-//! The shape mirrors the wire receipt exactly, minus the encoding. That is
-//! deliberate: a transport adapter maps these fields one-to-one and therefore
-//! cannot invent an outcome, drop an acknowledgement, or classify a result by
-//! reading its diagnostic text.
+//! These receipts are transport-neutral facts. Native adapters encode them,
+//! but cannot construct or reinterpret a Worker verdict.
 
+use std::sync::Arc;
+
+use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskOperationId};
 use novarocks_execution_contract::task_execution::operation::{
     CreateTaskReceipt, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
@@ -33,9 +33,7 @@ use novarocks_execution_contract::task_execution::status::{
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 
-use super::host::TaskDynamicFilterRead;
-
-/// One operation's receipt.
+/// One operation's settled Worker verdict and optional acknowledgement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationReceipt<T> {
     operation_id: TaskOperationId,
@@ -45,7 +43,6 @@ pub struct OperationReceipt<T> {
 }
 
 impl<T> OperationReceipt<T> {
-    /// A receipt carrying an acknowledgement body.
     pub const fn acknowledged(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
@@ -59,7 +56,6 @@ impl<T> OperationReceipt<T> {
         }
     }
 
-    /// A receipt that carries only an outcome and a redacted diagnostic.
     pub fn rejected(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
@@ -73,12 +69,6 @@ impl<T> OperationReceipt<T> {
         }
     }
 
-    /// A settled receipt with nothing to acknowledge.
-    ///
-    /// It is the same shape as a rejection, and deliberately a different
-    /// constructor: some outcomes — an observation that is already up to date,
-    /// a read whose subject retains nothing — are settled rather than refused,
-    /// and reading `rejected` at those call sites would misstate them.
     pub fn settled(
         operation_id: TaskOperationId,
         outcome: OperationOutcome,
@@ -103,13 +93,12 @@ impl<T> OperationReceipt<T> {
         self.acknowledgement.as_ref()
     }
 
-    /// The acknowledgement, for a caller that already checked the outcome.
     pub fn into_acknowledgement(self) -> Option<T> {
         self.acknowledgement
     }
 }
 
-/// The acknowledgement body of a release.
+/// The acknowledgement body of a context release.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct ReleaseAcknowledgement {
     context: QueryContextRef,
@@ -145,10 +134,31 @@ impl ReleaseAcknowledgement {
         self.state
     }
 
-    /// The shared-resource lifecycle cause, present once terminal. It is never
-    /// a second authority over a task's own terminal outcome.
     pub const fn termination_cause(self) -> Option<AbortCause> {
         self.termination_cause
+    }
+}
+
+/// One task's retained dynamic-filter domain, if it has published one.
+///
+/// The payload remains opaque to the Worker lifecycle owner and any adapter.
+#[derive(Clone, Debug)]
+pub struct TaskDynamicFilterRead {
+    version: DomainVersion,
+    payload: Arc<dyn CodecOwnedContent>,
+}
+
+impl TaskDynamicFilterRead {
+    pub const fn new(version: DomainVersion, payload: Arc<dyn CodecOwnedContent>) -> Self {
+        Self { version, payload }
+    }
+
+    pub const fn version(&self) -> DomainVersion {
+        self.version
+    }
+
+    pub fn payload(&self) -> &Arc<dyn CodecOwnedContent> {
+        &self.payload
     }
 }
 
@@ -160,3 +170,27 @@ pub type ReleaseQueryContextOutcome = OperationReceipt<ReleaseAcknowledgement>;
 pub type CancelTaskOutcome = OperationReceipt<TaskStatus>;
 pub type DynamicFilterReadOutcome = OperationReceipt<TaskDynamicFilterRead>;
 pub type FinalTaskInfoOutcome = OperationReceipt<FinalTaskInfo>;
+
+#[cfg(test)]
+mod tests {
+    use novarocks_execution_contract::task_execution::identity::TaskOperationId;
+    use novarocks_execution_contract::task_execution::operation::OperationOutcome;
+
+    use super::OperationReceipt;
+
+    #[test]
+    fn rejected_receipt_retains_only_a_bounded_safe_detail() {
+        let receipt: OperationReceipt<()> = OperationReceipt::rejected(
+            TaskOperationId::new_v7(),
+            OperationOutcome::InvalidStateOrRequest,
+            "invalid state",
+        );
+
+        assert_eq!(receipt.outcome(), OperationOutcome::InvalidStateOrRequest);
+        assert_eq!(
+            receipt.detail().expect("safe detail").as_str(),
+            "invalid state"
+        );
+        assert!(receipt.acknowledgement().is_none());
+    }
+}

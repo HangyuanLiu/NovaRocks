@@ -71,11 +71,11 @@ use super::observation::{
     ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
     TaskStatusSubscriptionPosition,
 };
-use super::receipt::OperationReceipt;
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
 use super::status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute, StatusAdvance, TaskStatusReporter,
 };
+use novarocks_worker::OperationReceipt;
 
 // ------------------------------------------------------------------- fixtures
 

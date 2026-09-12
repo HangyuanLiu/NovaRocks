@@ -42,7 +42,7 @@ use novarocks_execution_contract::task_execution::operation::{OperationOutcome, 
 use novarocks_execution_contract::task_execution::status::{TaskState, TerminationDetail};
 
 use super::host::ReleasedContextEvidence;
-use super::receipt::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};
+use novarocks_worker::{CreateTaskOutcome, QueryContextOutcome, ReleaseQueryContextOutcome};
 
 /// Whether this process emits task-protocol operation evidence.
 ///

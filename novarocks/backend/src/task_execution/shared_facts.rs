@@ -46,7 +46,8 @@ use novarocks_task_codec::domain::{
 };
 use novarocks_task_codec::identity::encode_task_identity;
 
-use super::host::{HostRejection, TaskDynamicFilterRead};
+use super::host::HostRejection;
+use novarocks_worker::TaskDynamicFilterRead;
 
 /// The catalogs one establish asks this backend to materialize.
 ///
@@ -179,7 +180,7 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use crate::task_execution::host::TaskDynamicFilterRead;
+    use novarocks_worker::TaskDynamicFilterRead;
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 

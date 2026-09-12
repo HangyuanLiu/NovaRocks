@@ -46,8 +46,8 @@ use novarocks_worker::{
     classify_root_drain, classify_task_transition,
 };
 
-use super::host::TaskDynamicFilterRead;
 use super::observation::TaskStatusSource;
+use novarocks_worker::TaskDynamicFilterRead;
 
 /// The shortest interval between two metric-only status versions.
 ///

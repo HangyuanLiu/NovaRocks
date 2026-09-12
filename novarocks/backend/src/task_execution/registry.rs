@@ -92,14 +92,14 @@ use super::host::{
 };
 use super::marker;
 use super::observation::TaskStatusSource;
-use super::receipt::{
-    AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
-    ReleaseQueryContextOutcome, UpdateTaskOutcome,
-};
 use super::status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskStatusOwner, TaskStatusReporter,
+};
+use novarocks_worker::{
+    AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
+    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
+    ReleaseQueryContextOutcome, UpdateTaskOutcome,
 };
 
 const REGISTRY_LOCK: &str = "task execution registry lock";

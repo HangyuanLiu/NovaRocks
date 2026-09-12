@@ -30,7 +30,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
+use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
 use novarocks_execution_contract::task_execution::operation::{
     CredentialUpdate, QueryContextDomainUpdate, TaskDomainUpdate,
@@ -270,28 +270,4 @@ pub trait TaskExecutionHost: Send + Sync {
         descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
     ) -> Result<Option<u64>, HostRejection>;
-}
-
-/// One task's readable dynamic filter domain.
-///
-/// The payload stays behind [`CodecOwnedContent`]: the owner retains what a
-/// task published and hands it back, never inspecting or re-encoding it.
-#[derive(Clone, Debug)]
-pub struct TaskDynamicFilterRead {
-    version: DomainVersion,
-    payload: Arc<dyn CodecOwnedContent>,
-}
-
-impl TaskDynamicFilterRead {
-    pub const fn new(version: DomainVersion, payload: Arc<dyn CodecOwnedContent>) -> Self {
-        Self { version, payload }
-    }
-
-    pub const fn version(&self) -> DomainVersion {
-        self.version
-    }
-
-    pub fn payload(&self) -> &Arc<dyn CodecOwnedContent> {
-        &self.payload
-    }
 }

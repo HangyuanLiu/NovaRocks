@@ -33,6 +33,7 @@ mod ingress;
 mod lease;
 mod lifecycle;
 mod operation;
+mod receipt;
 mod reliable_transport;
 
 pub use admission::{
@@ -59,6 +60,11 @@ pub use lifecycle::{
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
 pub use operation::OperationWaitCaps;
+pub use receipt::{
+    AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
+    FinalTaskInfoOutcome, OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement,
+    ReleaseQueryContextOutcome, TaskDynamicFilterRead, UpdateTaskOutcome,
+};
 pub use reliable_transport::{
     ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportFailureOutcome,
     ReliableTransportPolicy, ReliableTransportResourceLimit, ReliableTransportSendOutcome,
