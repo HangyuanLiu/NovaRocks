@@ -62,31 +62,20 @@ mod status;
 #[cfg(test)]
 mod tests;
 
-pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
+#[cfg(test)]
+pub(crate) use clock::{BackendMonotonicClock, ManualClock};
 pub(crate) use completion::TaskCompletionSupervisor;
-pub use context_host::NativeQueryContextHost;
-pub use credential_slot::QueryContextCredentialSlot;
-pub use execution_host::{
-    InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
-    TaskInboundCapabilities, TaskQueryContextFacts,
+pub(crate) use context_host::NativeQueryContextHost;
+pub(crate) use execution_host::{
+    NativeTaskExecutionHost, TaskInboundCapabilities, TaskQueryContextFacts,
 };
-pub use host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskDynamicFilterRead, TaskExecutionHost,
+pub(crate) use host::QueryContextHost;
+#[cfg(test)]
+pub(crate) use host::{
+    HostRejection, ReleasedContextEvidence, RunnableTask, SharedFactsRequest, TaskExecutionHost,
 };
 pub(crate) use ingress::RegistryTaskExecutionIngress;
-pub use observation::{
-    CursorObservation, TaskStatusEvent, TaskStatusSource, TaskStatusSourceStats,
-};
-pub use receipt::{
-    CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome, FinalTaskInfoOutcome,
-    OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
-    UpdateTaskOutcome,
-};
-pub use registry::{
-    DeadlineSweep, RegistryCounters, TaskExecutionRegistry, TaskExecutionRegistryConfig,
-};
-pub use status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
-    TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
-};
+pub(crate) use registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
+#[cfg(test)]
+pub(crate) use status::TaskStatusReporter;
+pub(crate) use status::{RootResultRoute, StatusAdvance};
