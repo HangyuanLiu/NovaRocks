@@ -23,7 +23,55 @@ use super::{
 };
 use crate::engine_error::EngineError;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
+use novarocks_parser::ast::{self, Statement as ParsedStatement};
 use novarocks_types::EngineErrorCode;
+use novarocks_workload_control::WorkClass;
+
+/// Return whether this admitted statement needs the provider-publication
+/// deadline policy rather than only the session deadline.
+pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
+    match statement {
+        ParsedStatement::Dml(_) | ParsedStatement::Table(_) | ParsedStatement::Iceberg(_) => true,
+        ParsedStatement::Catalog(statement) => {
+            !matches!(statement, ast::CatalogStatement::ShowCreateTable(_))
+        }
+        ParsedStatement::Maintenance(statement) => {
+            !matches!(statement, ast::MaintenanceStatement::ShowOptimize(_))
+        }
+        ParsedStatement::MaterializedView(statement) => !matches!(
+            statement,
+            ast::MaterializedViewStatement::Show(_)
+                | ast::MaterializedViewStatement::ExplainRefresh(_)
+        ),
+        ParsedStatement::View(statement) => !matches!(
+            statement,
+            ast::ViewStatement::Show(_) | ast::ViewStatement::ShowCreate(_)
+        ),
+        ParsedStatement::Statistics(statement) => matches!(
+            statement,
+            ast::StatisticsStatement::AnalyzeTable(_)
+                | ast::StatisticsStatement::DropStats(_)
+                | ast::StatisticsStatement::DropHistogram(_)
+                | ast::StatisticsStatement::DropMultipleColumnsStats(_)
+        ),
+        ParsedStatement::ShowBackends(_) => false,
+        ParsedStatement::Session(_)
+        | ParsedStatement::Query(_)
+        | ParsedStatement::ExplainQuery(_) => false,
+    }
+}
+
+/// Classify a statement that has already been routed to the typed command
+/// path. Plain queries and session commands must use their dedicated routes.
+pub fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
+    match statement {
+        ParsedStatement::Dml(_) | ParsedStatement::ExplainQuery(_) => WorkClass::Query,
+        ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
+            unreachable!("session and plain query statements do not use the typed route")
+        }
+        _ => WorkClass::Management,
+    }
+}
 
 /// Returns all executable SQL fragments from one COM_QUERY request. Empty
 /// fragments and comments have no effect. Callers must gate use of more than
@@ -155,6 +203,7 @@ fn parse_error(error: SqlStatementParseError, source: &str) -> QueryServiceError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::parse_single_statement;
 
     #[test]
     fn unnegotiated_admission_ignores_empty_fragments_and_returns_one_statement() {
@@ -191,5 +240,29 @@ mod tests {
                 .expect("parse")
                 .expect("admin error");
         assert!(error.message().contains("UnsupportedDistributedDmlShape"));
+    }
+
+    #[test]
+    fn typed_statement_work_class_keeps_data_plane_work_distinct_from_management() {
+        let explain = parse_single_statement("EXPLAIN SELECT 1").expect("parse explain");
+        let dml = parse_single_statement("INSERT INTO target VALUES (1)").expect("parse DML");
+        let management =
+            parse_single_statement("CREATE DATABASE governed_management").expect("parse DDL");
+
+        assert_eq!(typed_statement_work_class(&explain), WorkClass::Query);
+        assert_eq!(typed_statement_work_class(&dml), WorkClass::Query);
+        assert_eq!(
+            typed_statement_work_class(&management),
+            WorkClass::Management
+        );
+    }
+
+    #[test]
+    fn publication_deadline_applies_only_to_effect_capable_statement_shapes() {
+        let query = parse_single_statement("SELECT 1").expect("parse query");
+        let dml = parse_single_statement("INSERT INTO target VALUES (1)").expect("parse DML");
+
+        assert!(!requires_lake_publication_deadline(&query));
+        assert!(requires_lake_publication_deadline(&dml));
     }
 }

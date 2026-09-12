@@ -84,7 +84,8 @@ use novarocks_query_application::session_outcome::{
     governed_statement_begin_error, scalar_query_error,
 };
 use novarocks_query_application::sql::admission::{
-    admin_raise_engine_error, unnegotiated_query_statement,
+    admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
+    unnegotiated_query_statement,
 };
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_query_application::sql::session::{
@@ -463,48 +464,6 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
         columns: vec![column],
         batches: vec![batch],
     })
-}
-
-fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
-    match statement {
-        ParsedStatement::Dml(_) | ParsedStatement::Table(_) | ParsedStatement::Iceberg(_) => true,
-        ParsedStatement::Catalog(statement) => {
-            !matches!(statement, ast::CatalogStatement::ShowCreateTable(_))
-        }
-        ParsedStatement::Maintenance(statement) => {
-            !matches!(statement, ast::MaintenanceStatement::ShowOptimize(_))
-        }
-        ParsedStatement::MaterializedView(statement) => !matches!(
-            statement,
-            ast::MaterializedViewStatement::Show(_)
-                | ast::MaterializedViewStatement::ExplainRefresh(_)
-        ),
-        ParsedStatement::View(statement) => !matches!(
-            statement,
-            ast::ViewStatement::Show(_) | ast::ViewStatement::ShowCreate(_)
-        ),
-        ParsedStatement::Statistics(statement) => matches!(
-            statement,
-            ast::StatisticsStatement::AnalyzeTable(_)
-                | ast::StatisticsStatement::DropStats(_)
-                | ast::StatisticsStatement::DropHistogram(_)
-                | ast::StatisticsStatement::DropMultipleColumnsStats(_)
-        ),
-        ParsedStatement::ShowBackends(_) => false,
-        ParsedStatement::Session(_)
-        | ParsedStatement::Query(_)
-        | ParsedStatement::ExplainQuery(_) => false,
-    }
-}
-
-fn typed_statement_work_class(statement: &ParsedStatement) -> WorkClass {
-    match statement {
-        ParsedStatement::Dml(_) | ParsedStatement::ExplainQuery(_) => WorkClass::Query,
-        ParsedStatement::Session(_) | ParsedStatement::Query(_) => {
-            unreachable!("session and plain query statements do not use the typed route")
-        }
-        _ => WorkClass::Management,
-    }
 }
 
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
@@ -2181,21 +2140,6 @@ mod tests {
         assert!(proto.enable_parquet_reader_page_index);
         assert!(proto.enable_scan_datacache);
         assert!(proto.enable_populate_datacache);
-    }
-
-    #[test]
-    fn typed_statement_work_class_keeps_data_plane_work_distinct_from_management() {
-        let explain = parse_single_statement("EXPLAIN SELECT 1").expect("parse explain");
-        let dml = parse_single_statement("INSERT INTO target VALUES (1)").expect("parse DML");
-        let management =
-            parse_single_statement("CREATE DATABASE governed_management").expect("parse DDL");
-
-        assert_eq!(typed_statement_work_class(&explain), WorkClass::Query);
-        assert_eq!(typed_statement_work_class(&dml), WorkClass::Query);
-        assert_eq!(
-            typed_statement_work_class(&management),
-            WorkClass::Management
-        );
     }
 
     fn scalar_stream_fixture(
