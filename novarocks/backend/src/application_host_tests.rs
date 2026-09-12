@@ -1,9 +1,8 @@
 use std::net::TcpListener;
 use std::sync::Arc;
-
 use std::time::Duration;
 
-use novarocks_backend::application::{BackendApplicationHost, BackendServerConfig};
+use super::{BackendApplicationHost, BackendServerConfig};
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
@@ -97,8 +96,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
             sink_io_worker_threads: 1,
             sink_io_max_blocking_threads: 1,
         },
-        catalog_manager_config:
-            novarocks_backend::connector::catalog_manager::CatalogManagerConfig::default(),
+        catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig::default(),
         execution_role_binding_factories: Vec::new(),
     }
 }

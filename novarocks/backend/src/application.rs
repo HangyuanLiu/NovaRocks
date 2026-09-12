@@ -942,6 +942,10 @@ fn wait_for_native_ready(
 }
 
 #[cfg(test)]
+#[path = "application_host_tests.rs"]
+mod application_host_tests;
+
+#[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
