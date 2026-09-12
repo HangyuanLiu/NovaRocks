@@ -27,5 +27,13 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
 novarocks-spi.workspace = true
+
+[dev-dependencies]
+arrow.workspace = true
+bytes.workspace = true
+novarocks-connector-starrocks.workspace = true

@@ -21,9 +21,16 @@
 //! Query-local compiler mappings and Connector execution instances belong to
 //! their respective application domains and are intentionally absent.
 
+mod control_host;
 mod generation;
 
+pub use control_host::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorWriteStackLease,
+};
 pub use generation::{
     CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
     PreparedCatalogGeneration,
 };
+
+#[cfg(feature = "test-support")]
+pub mod test_support;

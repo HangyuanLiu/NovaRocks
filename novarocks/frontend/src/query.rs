@@ -2882,9 +2882,7 @@ mod tests {
                     logical_type: None,
                 }],
                 planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease::new(
-                    Arc::new(crate::connector::control_host::tests::test_control_binding(
-                        1,
-                    )),
+                    Arc::new(novarocks_catalog_application::test_support::test_control_binding(1)),
                     || {},
                 ),
                 attempt_reservation: None,

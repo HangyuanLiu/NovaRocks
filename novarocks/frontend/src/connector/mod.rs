@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod control_host;
-
 pub mod backend;
 pub mod cleanup_maintenance;
 pub mod data_mutation;
@@ -49,7 +47,7 @@ pub(crate) use application::{
     context_for_planning_lease_typed, install_frontend_connector_resources, metadata_binding_typed,
     metadata_load_connector_table_with_planning_lease_typed,
 };
-pub use control_host::ConnectorControlHost;
+pub(crate) use novarocks_catalog_application::{ConnectorControlHost, ConnectorWriteStackLease};
 pub use unified_statistics::UnifiedStatisticsResolver;
 
 #[cfg(test)]

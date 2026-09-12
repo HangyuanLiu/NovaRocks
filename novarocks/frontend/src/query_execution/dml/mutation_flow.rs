@@ -5735,7 +5735,7 @@ mod tests {
             calls: Arc::clone(&calls),
             finish_outcome: Mutex::new(Some(outcome)),
         });
-        let lease = crate::connector::control_host::ConnectorWriteStackLease::new(
+        let lease = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             novarocks_spi::connector::ConnectorControlWriteBinding::new(
                 Arc::new(UnusedLegacyWriteControl),

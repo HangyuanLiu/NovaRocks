@@ -77,7 +77,7 @@ pub trait DistributedRewriteSealing {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
-        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        write_stack: crate::connector::ConnectorWriteStackLease,
         table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Self::Sealed, String>;
@@ -143,7 +143,7 @@ impl<S: SealedDistributedRewrite> DistributedRewriteApplicationSession<S> {
 pub fn plan_distributed_rewrite_session<S: DistributedRewriteSealing>(
     sealing: &S,
     resolver: &dyn ConnectorDistributedRewriteResolver,
-    control_host: &crate::connector::control_host::ConnectorControlHost,
+    control_host: &crate::connector::ConnectorControlHost,
     instance_id: &ConnectorInstanceId,
     table: ConnectorTableIdentity,
     operation_id: ConnectorWriteOperationId,

@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::state_store_fixture;
+use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_frontend::catalog_application::desired_state::CatalogDesiredStateSource;
 use novarocks_frontend::catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
@@ -48,7 +49,6 @@ use novarocks_frontend::catalog_application::{
 use novarocks_frontend::catalog_attachment::{
     CatalogAttachmentRepository, CatalogAttachmentVersioned,
 };
-use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };

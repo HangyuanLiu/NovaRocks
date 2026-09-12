@@ -684,12 +684,13 @@ mod tests {
             self.materializations.fetch_add(1, Ordering::Relaxed);
             let incarnation = self.incarnations.fetch_add(1, Ordering::Relaxed) + 1;
             async move {
-                let control = crate::connector::control_host::tests::test_control_binding_for(
-                    properties.handle().catalog_name().clone(),
-                    incarnation,
-                )
-                .with_catalog_properties(properties.as_catalog_properties().clone())
-                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                let control =
+                    novarocks_catalog_application::test_support::test_control_binding_for(
+                        properties.handle().catalog_name().clone(),
+                        incarnation,
+                    )
+                    .with_catalog_properties(properties.as_catalog_properties().clone())
+                    .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
                 novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                     properties,
                     Arc::new(control),

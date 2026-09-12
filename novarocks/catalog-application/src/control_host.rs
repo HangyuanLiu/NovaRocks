@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
-use novarocks_catalog_application::{
+use crate::{
     CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
     PreparedCatalogGeneration,
 };
@@ -168,7 +168,7 @@ impl ConnectorControlHost {
     /// Resolve the one factory selected for a provider during composition.
     /// The returned object owns no host state and cannot publish a generation
     /// by itself.
-    pub(crate) fn role_factory(
+    pub fn role_factory(
         &self,
         provider_id: &ConnectorProviderId,
     ) -> Result<Arc<dyn ConnectorControlRoleBindingFactory>, ConnectorError> {
@@ -191,9 +191,7 @@ impl ConnectorControlHost {
     /// Retiring generations remain present until their last planning or effect
     /// lease drains. Callers combine this with one complete desired-state
     /// snapshot before issuing a best-effort BE prune.
-    pub(crate) fn reachable_catalog_handles(
-        &self,
-    ) -> Result<BTreeSet<CatalogHandle>, ConnectorError> {
+    pub fn reachable_catalog_handles(&self) -> Result<BTreeSet<CatalogHandle>, ConnectorError> {
         self.generations
             .retained_handles()
             .map(|handles| handles.into_iter().collect())
@@ -279,7 +277,7 @@ impl ConnectorControlHost {
     /// Returns the typed-read group carried by the exact generation already
     /// retained by `planning_lease`.  This is a snapshot lookup only; it does
     /// not acquire another host lease or consult a parallel typed registry.
-    pub(crate) fn typed_read_for_planning_lease(
+    pub fn typed_read_for_planning_lease(
         &self,
         planning_lease: &ConnectorControlPlanningLease,
     ) -> Result<ConnectorControlReadBinding, ConnectorError> {
@@ -658,7 +656,7 @@ impl ConnectorControlHost {
     /// replaced, and committing through the replacement would attach staged
     /// work to a runtime that never admitted it. Callers pass the runtime id of
     /// the planning lease they are already holding.
-    pub(crate) fn acquire_exact_write_stack(
+    pub fn acquire_exact_write_stack(
         &self,
         control_runtime_id: ConnectorControlRuntimeId,
     ) -> Result<ConnectorWriteStackLease, ConnectorError> {
@@ -671,7 +669,7 @@ impl ConnectorControlHost {
     ///
     /// Only for a caller that has not already pinned one; anything that planned
     /// against a retained generation must use [`Self::acquire_exact_write_stack`].
-    pub(crate) fn acquire_current_write_stack(
+    pub fn acquire_current_write_stack(
         &self,
         instance_id: &ConnectorInstanceId,
     ) -> Result<ConnectorWriteStackLease, ConnectorError> {
@@ -1150,10 +1148,6 @@ pub(crate) mod tests {
         )
     }
 
-    pub(crate) fn test_control_binding(incarnation: u8) -> ConnectorControlBinding {
-        binding(incarnation)
-    }
-
     /// A control binding for an arbitrary instance ID, so a factory fixture can
     /// answer whichever catalog name the request carries.
     pub(crate) fn test_control_binding_for(
@@ -1190,14 +1184,6 @@ pub(crate) mod tests {
         host.register(starrocks_binding())
             .expect("register StarRocks generation");
         let planning_lease = host.acquire_current(&instance_id).expect("planning lease");
-
-        let error =
-            crate::connector::write_target::derive_write_stack_lease(&host, &planning_lease)
-                .expect_err("StarRocks has no distributed write capability");
-        assert!(
-            error.contains("no distributed write capability"),
-            "unexpected error: {error}"
-        );
 
         let typed_error = host
             .acquire_exact_write_stack(planning_lease.control_runtime_id())

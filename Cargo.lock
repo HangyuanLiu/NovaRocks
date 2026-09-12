@@ -3631,6 +3631,9 @@ dependencies = [
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "bytes",
+ "novarocks-connector-starrocks",
  "novarocks-spi",
 ]
 

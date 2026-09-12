@@ -36,6 +36,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use common::state_store_fixture;
+use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_frontend::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
@@ -49,7 +50,6 @@ use novarocks_frontend::catalog_application::{
 };
 use novarocks_frontend::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
-use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_frontend::topology::ClusterBackendOpenConfig;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{

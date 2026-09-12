@@ -18,7 +18,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use novarocks_frontend::connector::ConnectorControlHost;
+use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorBeginScanRequest,
     ConnectorCatalogMutation, ConnectorCatalogMutationReceipt,

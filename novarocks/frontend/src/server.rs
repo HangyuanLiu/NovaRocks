@@ -1002,12 +1002,13 @@ mod tests {
             use futures::FutureExt;
 
             async move {
-                let control = crate::connector::control_host::tests::test_control_binding_for(
-                    properties.handle().catalog_name().clone(),
-                    1,
-                )
-                .with_catalog_properties(properties.as_catalog_properties().clone())
-                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                let control =
+                    novarocks_catalog_application::test_support::test_control_binding_for(
+                        properties.handle().catalog_name().clone(),
+                        1,
+                    )
+                    .with_catalog_properties(properties.as_catalog_properties().clone())
+                    .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
                 novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                     properties,
                     Arc::new(control),
