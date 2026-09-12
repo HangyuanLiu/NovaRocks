@@ -418,13 +418,17 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
             error = failure.wait() => {
                 schema_delivery.fail(error.clone());
                 let _ = result.fail();
-                return Err(invalid_data_error(error.to_string()));
+                return results
+                    .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
+                    .await;
             }
             reason = cancellation.cancelled() => {
                 let error = cancelled_query_result_delivery(reason);
                 schema_delivery.fail(error.clone());
                 let _ = result.settle_cancellation();
-                return Err(interrupted_error(error.to_string()));
+                return results
+                    .error(ErrorKind::ER_QUERY_INTERRUPTED, error.to_string().as_bytes())
+                    .await;
             }
             reservation = &mut reservation => match reservation {
                 Ok(reservation) => reservation,
