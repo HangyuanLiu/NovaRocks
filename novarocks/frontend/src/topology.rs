@@ -27,9 +27,6 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -46,7 +43,7 @@ use crate::common::backend_topology::{
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::{QueryResult, build_utf8_query_result};
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
@@ -1047,25 +1044,11 @@ impl BackendTopologyPort for ClusterBackendService {
                     .unwrap_or_else(|| facts.compatibility.detail().to_string()),
             );
         }
-        let arrays = columns
-            .into_iter()
-            .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+        let rows = (0..state.processes.len())
+            .map(|row| columns.iter().map(|column| column[row].clone()).collect())
             .collect();
-        let schema = Schema::new(
-            names
-                .iter()
-                .map(|name| Field::new(*name, DataType::Utf8, false))
-                .collect::<Vec<_>>(),
-        );
-        let batch = RecordBatch::try_new(Arc::new(schema), arrays)
-            .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))?;
-        Ok(QueryResult {
-            columns: names
-                .iter()
-                .map(|name| QueryResultColumn::new(*name, DataType::Utf8, false, None))
-                .collect(),
-            batches: vec![batch],
-        })
+        build_utf8_query_result(&names, rows)
+            .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))
     }
 }
 

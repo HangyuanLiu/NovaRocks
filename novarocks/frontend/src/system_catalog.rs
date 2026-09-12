@@ -25,9 +25,9 @@ use std::sync::Arc;
 use crate::catalog_application::system_catalog::{
     SystemCatalog, SystemCatalogInputs, SystemTableData,
 };
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_query_application::api::{build_utf8_query_result, build_utf8_table_query_result};
 use novarocks_types::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";
@@ -96,33 +96,30 @@ fn schemata_columns() -> Vec<ColumnDef> {
 /// fixed to `catalog`. Byte-identical to the former core `build_schemata_batch`
 /// (`information_schema.rs`); schema exactly matches `schemata_columns()`.
 fn build_schemata_batch(catalog: &str, databases: &[String]) -> Result<Vec<RecordBatch>, String> {
-    let row_count = databases.len();
-    let catalog_name = StringArray::from(vec![catalog; row_count]);
-    let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
-    let default_charset = StringArray::from(vec!["utf8"; row_count]);
-    let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
-    let sql_path: StringArray = std::iter::repeat_n(None::<&str>, row_count).collect();
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("catalog_name", DataType::Utf8, false),
-        Field::new("schema_name", DataType::Utf8, false),
-        Field::new("default_character_set_name", DataType::Utf8, false),
-        Field::new("default_collation_name", DataType::Utf8, false),
-        Field::new("sql_path", DataType::Utf8, true),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(catalog_name) as ArrayRef,
-            Arc::new(schema_name) as ArrayRef,
-            Arc::new(default_charset) as ArrayRef,
-            Arc::new(default_collation) as ArrayRef,
-            Arc::new(sql_path) as ArrayRef,
+    let rows = databases
+        .iter()
+        .map(|database| {
+            vec![
+                Some(catalog.to_owned()),
+                Some(database.clone()),
+                Some("utf8".to_owned()),
+                Some("utf8_general_ci".to_owned()),
+                None,
+            ]
+        })
+        .collect();
+    build_utf8_table_query_result(
+        &[
+            ("catalog_name", false),
+            ("schema_name", false),
+            ("default_character_set_name", false),
+            ("default_collation_name", false),
+            ("sql_path", true),
         ],
+        rows,
     )
-    .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
-    Ok(vec![batch])
+    .map(|result| result.into_batches())
+    .map_err(|error| format!("build information_schema.schemata batch failed: {error}"))
 }
 
 const TABLES_COLUMNS: &[(&str, bool)] = &[
@@ -155,34 +152,26 @@ fn build_tables_batch(
     catalog: &str,
     tables: &[(String, String)],
 ) -> Result<Vec<RecordBatch>, String> {
-    let row_count = tables.len();
-    let table_catalog = StringArray::from(vec![catalog; row_count]);
-    let table_schema =
-        StringArray::from_iter_values(tables.iter().map(|(schema, _)| schema.as_str()));
-    let table_name = StringArray::from_iter_values(tables.iter().map(|(_, name)| name.as_str()));
     // Every row is a base table: this listing comes from the catalog's table
     // enumeration, and a catalog that also holds views reports those through
     // the view metadata surface instead.
-    let table_type = StringArray::from(vec!["BASE TABLE"; row_count]);
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("table_catalog", DataType::Utf8, false),
-        Field::new("table_schema", DataType::Utf8, false),
-        Field::new("table_name", DataType::Utf8, false),
-        Field::new("table_type", DataType::Utf8, false),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(table_catalog) as ArrayRef,
-            Arc::new(table_schema) as ArrayRef,
-            Arc::new(table_name) as ArrayRef,
-            Arc::new(table_type) as ArrayRef,
-        ],
+    let rows = tables
+        .iter()
+        .map(|(schema, name)| {
+            vec![
+                catalog.to_owned(),
+                schema.clone(),
+                name.clone(),
+                "BASE TABLE".to_owned(),
+            ]
+        })
+        .collect();
+    build_utf8_query_result(
+        &["table_catalog", "table_schema", "table_name", "table_type"],
+        rows,
     )
-    .map_err(|e| format!("build information_schema.tables batch failed: {e}"))?;
-    Ok(vec![batch])
+    .map(|result| result.into_batches())
+    .map_err(|error| format!("build information_schema.tables batch failed: {error}"))
 }
 
 struct TablesProvider;

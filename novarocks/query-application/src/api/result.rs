@@ -218,39 +218,64 @@ pub fn build_string_query_result(
     })
 }
 
-/// Builds a bounded immediate table whose protocol-visible cells are nullable
+/// Builds a bounded immediate table whose protocol-visible cells are required
 /// UTF-8 values.
 ///
-/// Product command adapters retain ownership of their row semantics; this
-/// helper owns only the common Arrow/schema projection into the query-session
-/// result contract. It rejects ragged rows before constructing any batch, so a
-/// product cannot publish a schema that disagrees with its visible cells.
-pub fn build_nullable_utf8_query_result(
+/// Command adapters retain their row semantics; this helper owns only the
+/// common Arrow/schema projection into the query-session result contract.
+/// It rejects ragged rows before constructing any batch, so a product cannot
+/// publish a schema that disagrees with its visible cells.
+pub fn build_utf8_query_result(
     column_names: &[&str],
+    rows: Vec<Vec<String>>,
+) -> Result<QueryResult, String> {
+    let columns = column_names
+        .iter()
+        .map(|name| (*name, false))
+        .collect::<Vec<_>>();
+    let rows = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(Some).collect())
+        .collect();
+    build_utf8_table_query_result(&columns, rows)
+}
+
+/// Builds a bounded immediate UTF-8 table with the supplied per-column
+/// nullability. Product command adapters retain ownership of the row and
+/// column semantics; this helper owns the common Arrow/schema projection.
+pub fn build_utf8_table_query_result(
+    columns: &[(&str, bool)],
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<QueryResult, String> {
-    if column_names.is_empty() {
+    if columns.is_empty() {
         return Err("immediate tabular result requires at least one column".to_owned());
     }
-    if column_names.iter().any(|name| name.is_empty()) {
+    if columns.iter().any(|(name, _)| name.is_empty()) {
         return Err("immediate tabular result column names must be nonempty".to_owned());
     }
-    if rows.iter().any(|row| row.len() != column_names.len()) {
+    if rows.iter().any(|row| row.len() != columns.len()) {
         return Err(
             "immediate tabular result contains a row with the wrong column count".to_owned(),
         );
     }
-    let columns = column_names
+    if rows.iter().any(|row| {
+        row.iter()
+            .enumerate()
+            .any(|(column_index, value)| value.is_none() && !columns[column_index].1)
+    }) {
+        return Err("immediate tabular result contains null in a required column".to_owned());
+    }
+    let result_columns = columns
         .iter()
-        .map(|name| ResultField::new(*name, DataType::Utf8, true, None))
+        .map(|(name, nullable)| ResultField::new(*name, DataType::Utf8, *nullable, None))
         .collect::<Vec<_>>();
     let schema = Arc::new(Schema::new(
-        column_names
+        columns
             .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .map(|(name, nullable)| Field::new(*name, DataType::Utf8, *nullable))
             .collect::<Vec<_>>(),
     ));
-    let arrays = (0..column_names.len())
+    let arrays = (0..columns.len())
         .map(|column| {
             Arc::new(StringArray::from(
                 rows.iter()
@@ -262,9 +287,27 @@ pub fn build_nullable_utf8_query_result(
     let batch = RecordBatch::try_new(schema, arrays)
         .map_err(|error| format!("build immediate tabular result failed: {error}"))?;
     Ok(QueryResult {
-        columns,
+        columns: result_columns,
         batches: vec![batch],
     })
+}
+
+/// Builds a bounded immediate table whose protocol-visible cells are nullable
+/// UTF-8 values.
+///
+/// Product command adapters retain ownership of their row semantics; this
+/// helper owns only the common Arrow/schema projection into the query-session
+/// result contract. It rejects ragged rows before constructing any batch, so a
+/// product cannot publish a schema that disagrees with its visible cells.
+pub fn build_nullable_utf8_query_result(
+    column_names: &[&str],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<QueryResult, String> {
+    let columns = column_names
+        .iter()
+        .map(|name| (*name, true))
+        .collect::<Vec<_>>();
+    build_utf8_table_query_result(&columns, rows)
 }
 
 impl ResultSchema {
@@ -990,6 +1033,24 @@ mod tests {
     }
 
     #[test]
+    fn required_text_table_projection_preserves_schema_cells() {
+        let result = build_utf8_query_result(
+            &["name", "state"],
+            vec![vec!["be-1".to_owned(), "Live".to_owned()]],
+        )
+        .expect("build required text table");
+
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.columns.iter().all(|column| !column.nullable()));
+        let state = result.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("required string output");
+        assert_eq!(state.value(0), "Live");
+    }
+
+    #[test]
     fn nullable_text_table_projection_rejects_ragged_rows() {
         let error = build_nullable_utf8_query_result(
             &["job_id", "detail"],
@@ -999,6 +1060,30 @@ mod tests {
         assert_eq!(
             error,
             "immediate tabular result contains a row with the wrong column count"
+        );
+    }
+
+    #[test]
+    fn mixed_text_table_projection_preserves_per_column_nullability() {
+        let result = build_utf8_table_query_result(
+            &[("catalog_name", false), ("sql_path", true)],
+            vec![vec![Some("lake".to_owned()), None]],
+        )
+        .expect("build mixed-nullability text table");
+
+        assert!(!result.columns[0].nullable());
+        assert!(result.columns[1].nullable());
+        assert!(!result.batches[0].schema().field(0).is_nullable());
+        assert!(result.batches[0].schema().field(1).is_nullable());
+    }
+
+    #[test]
+    fn mixed_text_table_projection_rejects_null_in_required_column() {
+        let error = build_utf8_table_query_result(&[("catalog_name", false)], vec![vec![None]])
+            .expect_err("required column must reject null");
+        assert_eq!(
+            error,
+            "immediate tabular result contains null in a required column"
         );
     }
 

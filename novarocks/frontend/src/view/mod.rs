@@ -18,16 +18,13 @@
 //! Frontend-owned view DDL, metadata, and query rewrite service.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use novarocks_parser::{
     ast::{CreateView, Query, Statement, ViewStatement},
     printer,
 };
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::{QueryResult, build_utf8_query_result};
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
@@ -325,22 +322,18 @@ fn build_query_result(columns: Vec<(String, Vec<String>)>) -> Result<QueryResult
     if columns.iter().any(|(_, rows)| rows.len() != row_count) {
         return Err("view query result columns have different row counts".to_string());
     }
-    let fields = columns
+    let names = columns
         .iter()
-        .map(|(name, _)| Field::new(name, DataType::Utf8, false))
+        .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
-    let arrays = columns
-        .iter()
-        .map(|(_, rows)| Arc::new(StringArray::from(rows.clone())) as ArrayRef)
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|error| format!("build view query result failed: {error}"))?;
-    Ok(QueryResult {
-        columns: columns
-            .into_iter()
-            .map(|(name, _)| QueryResultColumn::new(name, DataType::Utf8, false, None))
-            .collect(),
-        batches: vec![batch],
-    })
+    let rows = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|(_, values)| values[row].clone())
+                .collect()
+        })
+        .collect();
+    build_utf8_query_result(&names, rows)
+        .map_err(|error| format!("build view query result failed: {error}"))
 }
