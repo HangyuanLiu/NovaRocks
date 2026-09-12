@@ -29,9 +29,10 @@ use crate::query_execution::dml::insert::{
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
-use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::error::DmlError;
 use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
 pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
 pub use shaping::reorder_insert_rows;
@@ -161,7 +162,7 @@ impl DmlService {
 }
 
 fn insert_admit_error(source: &str, span: novarocks_parser::Span, message: String) -> DmlError {
-    DmlError::admit(AdmitError::InsertUnsupportedForm.to_user_error(source, span, message))
+    DmlError::admit(DmlAdmissionError::InsertUnsupportedForm.to_user_error(source, span, message))
 }
 
 fn split_target_ref(

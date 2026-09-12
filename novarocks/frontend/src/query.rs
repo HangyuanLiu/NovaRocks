@@ -86,6 +86,7 @@ use novarocks_query_application::session_outcome::{
 use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, unnegotiated_query_statement,
 };
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -356,8 +357,7 @@ fn table_statement_admission_error(
 
     let TableStatement::Create(statement) = statement;
     let unsupported = |span, message| {
-        crate::dml::error::AdmitError::CreateTableUnsupportedForm
-            .to_user_error(source, span, message)
+        DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(source, span, message)
     };
     if statement.temporary || statement.external {
         return Some(unsupported(

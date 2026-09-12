@@ -19,8 +19,8 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_frontend::dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
+use novarocks_query_application::sql::dml_admission::DML_ADMISSION_ERROR_CODE_DESCRIPTORS;
 use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
 use novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS as ANALYZE_ERROR_CODE_DESCRIPTORS;
 use novarocks_user_error::ErrorCodeStatus;
@@ -30,7 +30,7 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
     let descriptor_codes = PARSER_ERROR_CODE_DESCRIPTORS
         .iter()
         .chain(ANALYZE_ERROR_CODE_DESCRIPTORS)
-        .chain(DML_ERROR_CODE_DESCRIPTORS)
+        .chain(DML_ADMISSION_ERROR_CODE_DESCRIPTORS)
         .chain(SESSION_ERROR_CODE_DESCRIPTORS)
         .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
         .map(|descriptor| descriptor.code.as_str())
