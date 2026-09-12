@@ -26,12 +26,12 @@ use super::super::context::NativePlanDecodeContext;
 use super::super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use super::super::layout::Layout;
 use crate::connector::batch_transform::ConnectorBatchTransform;
-use crate::fragment::decode::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
+use novarocks_plan_codec::native_type::{decode_field_type, decode_type};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;

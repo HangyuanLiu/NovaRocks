@@ -567,9 +567,7 @@ mod tests {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
-            r#type: Some(
-                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
-            ),
+            r#type: Some(novarocks_plan_codec::encode_native_type(data_type).expect("encode type")),
             nullable: true,
             is_internal: false,
         }
@@ -579,7 +577,7 @@ mod tests {
         plan::ColumnDef {
             name: name.to_string(),
             data_type: Some(
-                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
+                novarocks_plan_codec::encode_native_type(data_type).expect("encode type"),
             ),
             nullable: true,
             write_default_json: None,
@@ -643,7 +641,7 @@ mod tests {
                         synthetic_column: "__nr_var_v_0".to_string(),
                         canonical_path: "$.a.b".to_string(),
                         requested_type: Some(
-                            crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
+                            novarocks_plan_codec::encode_native_type(&DataType::Int64)
                                 .expect("encode type"),
                         ),
                         strict: true,

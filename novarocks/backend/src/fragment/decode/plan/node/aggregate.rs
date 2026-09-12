@@ -206,7 +206,7 @@ pub(super) fn lower_hash_aggregate_node(
                 .field("aggregates")
                 .index(idx)
                 .field("result_type"),
-            crate::fragment::decode::type_decode::decode_type(result_type),
+            novarocks_plan_codec::native_type::decode_type(result_type),
         )?;
         let function_name = aggregate_function_name(call);
         let call_path = path.clone().field("aggregates").index(idx);
@@ -410,7 +410,7 @@ pub(super) fn decode_resolved_aggregate_signature(
         .map(|(idx, data_type)| {
             NativeFragmentDecodeError::map_invalid(
                 signature_path.clone().field("argument_types").index(idx),
-                crate::fragment::decode::type_decode::decode_type(data_type),
+                novarocks_plan_codec::native_type::decode_type(data_type),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -422,7 +422,7 @@ pub(super) fn decode_resolved_aggregate_signature(
     })?;
     let intermediate_type = NativeFragmentDecodeError::map_invalid(
         signature_path.clone().field("intermediate_type"),
-        crate::fragment::decode::type_decode::decode_type(intermediate_type),
+        novarocks_plan_codec::native_type::decode_type(intermediate_type),
     )?;
     let output_type = signature.output_type.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -432,7 +432,7 @@ pub(super) fn decode_resolved_aggregate_signature(
     })?;
     let output_type = NativeFragmentDecodeError::map_invalid(
         signature_path.clone().field("output_type"),
-        crate::fragment::decode::type_decode::decode_type(output_type),
+        novarocks_plan_codec::native_type::decode_type(output_type),
     )?;
     let state_format = AggregateStateFormatIdentity::try_new(&signature.state_format_identity)
         .map_err(|error| {
@@ -467,7 +467,7 @@ fn aggregate_signature_arg_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 path.clone().field("args").index(idx).field("type"),
-                crate::fragment::decode::type_decode::decode_type(ty),
+                novarocks_plan_codec::native_type::decode_type(ty),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -494,7 +494,7 @@ fn aggregate_signature_arg_types(
                 .index(idx)
                 .field("expr")
                 .field("type"),
-            crate::fragment::decode::type_decode::decode_type(data_type),
+            novarocks_plan_codec::native_type::decode_type(data_type),
         )?);
     }
     Ok(types)
@@ -516,7 +516,7 @@ fn aggregate_logical_arg_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 path.clone().field("args").index(idx).field("type"),
-                crate::fragment::decode::type_decode::decode_type(ty),
+                novarocks_plan_codec::native_type::decode_type(ty),
             )
         })
         .collect()
@@ -1056,7 +1056,7 @@ mod tests {
             &[DataType::Utf8, DataType::Utf8],
             &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         );
-        let intermediate_type = crate::fragment::decode::type_decode::decode_type(
+        let intermediate_type = novarocks_plan_codec::native_type::decode_type(
             resolved_signature
                 .as_ref()
                 .and_then(|signature| signature.intermediate_type.as_ref())

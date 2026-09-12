@@ -327,7 +327,7 @@ fn table_function_arg_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 path.clone().field("args").index(idx).field("type"),
-                crate::fragment::decode::type_decode::decode_type(type_desc),
+                novarocks_plan_codec::native_type::decode_type(type_desc),
             )
         })
         .collect()
@@ -354,7 +354,7 @@ fn table_function_result_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 column_path.field("type"),
-                crate::fragment::decode::type_decode::decode_type(type_desc),
+                novarocks_plan_codec::native_type::decode_type(type_desc),
             )
         })
         .collect()
@@ -382,9 +382,9 @@ fn table_function_param_schemas(
         })?;
         let data_type = NativeFragmentDecodeError::map_invalid(
             arg_path.clone().field("type"),
-            crate::fragment::decode::type_decode::decode_type(type_desc),
+            novarocks_plan_codec::native_type::decode_type(type_desc),
         )?;
-        let field = crate::fragment::decode::type_decode::decode_field_type(
+        let field = novarocks_plan_codec::native_type::decode_field_type(
             &format!("__tf_arg_{idx}"),
             arg.nullable,
             type_desc,
@@ -437,8 +437,8 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 

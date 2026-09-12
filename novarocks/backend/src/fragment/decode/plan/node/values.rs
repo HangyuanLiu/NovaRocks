@@ -234,8 +234,8 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 

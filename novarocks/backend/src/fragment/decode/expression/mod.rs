@@ -20,9 +20,9 @@
 use arrow::datatypes::DataType;
 
 use self::error::NativeExpressionDecodeError;
-use super::type_decode::{decode_field_type, decode_type};
 use novarocks_execution::exec::chunk::ChunkFieldSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_plan_codec::native_type::{decode_field_type, decode_type};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
 use novarocks_types::SlotId;
@@ -628,12 +628,12 @@ pub(crate) mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Schema};
     use std::sync::Arc;
 
-    use super::super::type_decode::encode_type;
     use super::*;
     use novarocks_execution::exec::chunk::Chunk;
     use novarocks_execution::exec::expr::{
         ExprArena, ExprNode, LiteralValue, function::FunctionKind,
     };
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr};
     use novarocks_types::SlotId;
     use novarocks_types::logical::{LogicalType, field_with_logical_type};

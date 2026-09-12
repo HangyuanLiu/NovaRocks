@@ -291,7 +291,7 @@ fn project_item_output(
             .append_field("expr")
             .append_field("type")
     };
-    let field = crate::fragment::decode::type_decode::decode_field_type(
+    let field = novarocks_plan_codec::native_type::decode_field_type(
         &item.output_name,
         expr.nullable,
         &r#type,
@@ -318,8 +318,8 @@ mod tests {
 
     use super::super::{NativePlanDecodeContext, decode_node};
     use super::*;
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, expr, plan};
 

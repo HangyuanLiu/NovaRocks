@@ -196,7 +196,7 @@ mod tests {
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
     use crate::fragment::decode::instance::decode_instance_params;
     use crate::fragment::decode::request::NativeFragmentRequest;
-    use crate::fragment::decode::type_decode::encode_type;
+    use novarocks_plan_codec::encode_native_type as encode_type;
 
     struct NeverCancelled;
 

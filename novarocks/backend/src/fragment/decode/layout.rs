@@ -25,7 +25,7 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::common;
 use novarocks_types::SlotId;
 
-use super::type_decode::decode_field_type;
+use novarocks_plan_codec::native_type::decode_field_type;
 
 pub(crate) fn chunk_schema_from_output_columns(
     columns: &[common::OutputColumn],

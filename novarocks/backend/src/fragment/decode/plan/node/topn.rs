@@ -115,9 +115,9 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
 
     fn type_desc(data_type: &DataType) -> common::TypeDesc {

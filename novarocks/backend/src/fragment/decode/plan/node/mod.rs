@@ -623,7 +623,7 @@ fn validate_scan_domain_target(
             ),
         )
     })?;
-    let expression_type = crate::fragment::decode::type_decode::decode_type(expression_type).map_err(|error| {
+    let expression_type = novarocks_plan_codec::native_type::decode_type(expression_type).map_err(|error| {
         NativeFragmentDecodeError::invalid_value(
             binding.expression_path.clone().field("type"),
             format!(
@@ -1209,7 +1209,7 @@ fn validate_column_refs_exact(
                 ),
             )
         })?;
-        let actual = crate::fragment::decode::type_decode::decode_field_type(
+        let actual = novarocks_plan_codec::native_type::decode_field_type(
             "_runtime_filter_column",
             expression.nullable,
             type_desc,
@@ -1735,12 +1735,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
     use novarocks_execution::exec::node::set_op::SetOpKind;
     use novarocks_execution::runtime_filter as execution;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 

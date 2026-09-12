@@ -153,7 +153,7 @@ pub(super) fn parse_native_scan_variant_path_columns(
                 "requested_type missing",
             )
         })?;
-        let requested_type = crate::fragment::decode::type_decode::decode_type(requested_type_desc)
+        let requested_type = novarocks_plan_codec::native_type::decode_type(requested_type_desc)
             .map_err(|err| {
                 variant_error(idx, "requested_type", ProtocolErrorKind::InvalidValue, err)
             })?;

@@ -26,9 +26,9 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 
 use super::error::NativeFragmentLeafDecodeError;
 #[cfg(test)]
-use crate::fragment::decode::type_decode::decode_field_type;
-#[cfg(test)]
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+#[cfg(test)]
+use novarocks_plan_codec::native_type::decode_field_type;
 use novarocks_proto_codec::ProtocolErrorKind;
 #[cfg(test)]
 use novarocks_proto_models::common;

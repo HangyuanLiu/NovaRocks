@@ -1900,10 +1900,8 @@ mod tests {
             |columns| columns[0].column_id -= 1,
             |columns| columns[0].name = "wrong_kind".to_string(),
             |columns| {
-                columns[0].r#type = Some(
-                    crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
-                        .expect("type"),
-                )
+                columns[0].r#type =
+                    Some(novarocks_plan_codec::encode_native_type(&DataType::Int64).expect("type"))
             },
             |columns| columns[0].nullable = true,
         ];

@@ -29,4 +29,3 @@ pub(crate) mod runtime_filter;
 pub(crate) mod scan_contract;
 pub(crate) mod sink_assignment;
 pub(crate) mod submission_validation;
-pub(crate) mod type_decode;
