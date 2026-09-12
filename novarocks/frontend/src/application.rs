@@ -850,9 +850,17 @@ impl FrontendExecutionConfig {
         self
     }
 
-    pub fn with_catalog_prune_config(mut self, config: CatalogPruneConfig) -> Self {
-        self.catalog_prune = config;
-        self
+    /// Validates the Server-resolved catalog-prune policy before the FE role
+    /// opens its role-local worker. The concrete policy type stays internal to
+    /// the Frontend owner; Server supplies only configuration values.
+    pub fn try_with_catalog_prune_config(
+        mut self,
+        interval: Duration,
+        rpc_timeout: Duration,
+        max_inflight: usize,
+    ) -> Result<Self, String> {
+        self.catalog_prune = CatalogPruneConfig::try_new(interval, rpc_timeout, max_inflight)?;
+        Ok(self)
     }
 
     /// Supplies the already preflighted, closed desired-state source input.
