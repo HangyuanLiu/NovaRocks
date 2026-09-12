@@ -631,6 +631,10 @@ fn format_run_failure(context: &str, failure: RunFailure) -> GcOwnedRefObservati
 }
 
 #[cfg(test)]
+#[path = "gc_observation/tests_reopen.rs"]
+mod reopen_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -15,17 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod common;
-
 use std::sync::Arc;
 
-use bytes::Bytes;
-use common::state_store_fixture;
-use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
-use novarocks_state_store_runtime::StateStoreRunPolicy;
-use novarocks_table_maintenance::gc_observation::{
+use super::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
+use bytes::Bytes;
+use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
+use novarocks_state_store_testkit::testing::InMemoryStateStore;
 use uuid::Uuid;
 
 const GC_OBSERVATION_PREFIX: &str =
@@ -36,8 +34,13 @@ const GC_OBSERVATION_PREFIX: &str =
 /// They are handed out together because that is how the host exposes them: the
 /// retry budget belongs to the caller, not to the provider underneath.
 async fn store() -> (Arc<dyn StateStore>, StateStoreRunPolicy) {
-    let host = state_store_fixture::open(format!("gc-observation-{}", Uuid::now_v7())).await;
-    host.durable().expect("test StateStore exposure")
+    (
+        Arc::new(InMemoryStateStore::new(format!(
+            "gc-observation-{}",
+            Uuid::now_v7()
+        ))),
+        StateStoreRunPolicy::default(),
+    )
 }
 
 fn observation(
