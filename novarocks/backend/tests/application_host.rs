@@ -3,12 +3,11 @@ use std::sync::Arc;
 
 use std::time::Duration;
 
-use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport, BackendServerConfig,
-};
+use novarocks_backend::{BackendApplicationHost, BackendServerConfig};
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
+use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };

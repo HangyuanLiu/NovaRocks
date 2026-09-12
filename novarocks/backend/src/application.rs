@@ -20,12 +20,10 @@ use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::WorkerResultRetainedLimits;
 
-use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::rpc::client::BackendRpcClient;
-use crate::rpc::runtime::BackendNativeTransport;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
@@ -33,6 +31,7 @@ use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
 };
+use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
 use crate::task_execution::{
@@ -1050,6 +1049,7 @@ mod tests {
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
@@ -1104,7 +1104,7 @@ mod tests {
         Arc::new(builder.seal().expect("builtin execution function set"))
     }
 
-    fn test_data_runtime() -> crate::BackendDataRuntime {
+    fn test_data_runtime() -> BackendDataRuntime {
         crate::rpc::runtime::test_backend_data_runtime()
     }
 
@@ -1199,7 +1199,7 @@ mod tests {
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             function_set: test_execution_function_set(),
-            native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
+            native_transport: BackendNativeTransport::Plaintext,
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
             announce_interval: Duration::from_secs(60),

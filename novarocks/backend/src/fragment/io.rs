@@ -5,8 +5,8 @@ use novarocks_execution::runtime::fragment::io::{
     FragmentIoErrorKind, FragmentIoOperation,
 };
 
-use crate::BackendDataRuntime;
 use crate::rpc::client::BackendRpcClient;
+use novarocks_native_adapter::BackendDataRuntime;
 
 pub(crate) fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,

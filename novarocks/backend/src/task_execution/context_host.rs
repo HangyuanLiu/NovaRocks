@@ -74,7 +74,6 @@ use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
 };
 use super::status::TaskStatusReporter;
-use crate::BackendDataRuntime;
 use crate::connector::ConnectorExecutionRoleBinding;
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
@@ -90,6 +89,7 @@ use crate::runtime_filter::participant::{
 use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
+use novarocks_native_adapter::BackendDataRuntime;
 
 /// The mutable half of one context's installed facts.
 ///

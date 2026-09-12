@@ -31,7 +31,7 @@ use novarocks_execution::runtime::fragment::FragmentTerminalFact;
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use tokio::sync::{Notify, mpsc, watch};
 
-use crate::BackendDataRuntime;
+use novarocks_native_adapter::BackendDataRuntime;
 
 const COMPLETION_STATE_LOCK: &str = "task completion supervisor state lock";
 const COMPLETION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

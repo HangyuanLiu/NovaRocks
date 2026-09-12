@@ -28,7 +28,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use novarocks_native_trust::NativeTrust;
 
-pub use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
+#[cfg(test)]
+use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 
 #[cfg(test)]
 pub(crate) fn test_backend_data_runtime() -> BackendDataRuntime {
