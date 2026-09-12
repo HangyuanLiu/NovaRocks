@@ -608,7 +608,6 @@ where
             .await;
             if graceful.is_err() {
                 host.cancel_governed_work_at_drain_deadline();
-                host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
                 // Keep the admitted protocol tasks alive long enough to
                 // observe the first-wins deadline cancellation and return
                 // its typed error. Final connection termination remains the
@@ -630,7 +629,6 @@ where
             host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
             host.cancel_governed_work_at_drain_deadline();
-            host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
             host.serving_lifecycle().mark_stopping();

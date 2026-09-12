@@ -44,9 +44,7 @@ use crate::query_execution::service::QueryExecutionService;
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
-use crate::workload_lifecycle::{
-    FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
-};
+use crate::workload_lifecycle::{FrontendAdmissionError, FrontendServingLifecycle};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -677,17 +675,6 @@ struct FrontendQuerySession {
     state: Mutex<SessionSqlState>,
 }
 
-struct FrontendSessionProtocolTerminal(FrontendWorkloadLease);
-
-impl novarocks_query_application::session::SessionProtocolTerminal
-    for FrontendSessionProtocolTerminal
-{
-    fn complete(self: Box<Self>) {
-        let Self(admission) = *self;
-        drop(admission);
-    }
-}
-
 impl FrontendQuerySession {
     fn token(&self) -> Result<SessionToken, QueryServiceError> {
         self.lease
@@ -711,15 +698,13 @@ impl FrontendQuerySession {
     async fn execute_statement(
         &self,
         statement: &str,
-        admission: FrontendWorkloadLease,
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
         let trimmed = strip_leading_line_comments(statement.trim().trim_end_matches(';').trim());
         if trimmed.is_empty() {
             return Ok(
-                novarocks_query_application::session::QuerySessionStatement::new(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::Ok,
-                    Box::new(FrontendSessionProtocolTerminal(admission)),
                 ),
             );
         }
@@ -728,49 +713,39 @@ impl FrontendQuerySession {
         }
         let parsed_statement = parse_single_statement(trimmed)
             .map_err(|error| query_application_parse_error(error, trimmed))?;
-        let result =
-            match parsed_statement {
-                ParsedStatement::Session(ast::SessionStatement::Set(statement))
-                    if statement
-                        .assignments
-                        .iter()
-                        .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
-                {
-                    self.execute_governed_set(trimmed.to_string(), &statement, &admission)
-                        .await
-                }
-                ParsedStatement::Session(statement) => {
-                    self.execute_session_statement(trimmed, &statement, &admission)
-                        .await
-                }
-                ParsedStatement::Query(_) => {
-                    // The process serving latch has completed its readiness check.
-                    // Plain reads now have one business admission and one active
-                    // generation, both owned by the workload-backed statement owner.
-                    drop(admission);
-                    return self
+        let result = match parsed_statement {
+            ParsedStatement::Session(ast::SessionStatement::Set(statement))
+                if statement
+                    .assignments
+                    .iter()
+                    .any(|assignment| matches!(assignment.value, ast::SetValue::Query(_))) =>
+            {
+                self.execute_governed_set(trimmed.to_string(), &statement)
+                    .await
+            }
+            ParsedStatement::Session(statement) => {
+                self.execute_session_statement(trimmed, &statement).await
+            }
+            ParsedStatement::Query(_) => {
+                return self
                     .execute_governed_read(trimmed.to_string(), parsed_statement)
                     .await
-                    .map(novarocks_query_application::session::QuerySessionStatement::output_owned);
-                }
-                statement => {
-                    self.execute_typed_statement(trimmed.to_string(), statement, &admission)
-                        .await
-                }
-            };
-        result.map(|output| {
-            novarocks_query_application::session::QuerySessionStatement::new(
-                output,
-                Box::new(FrontendSessionProtocolTerminal(admission)),
-            )
-        })
+                    .map(
+                        novarocks_query_application::session::QuerySessionStatement::output_owned,
+                    );
+            }
+            statement => {
+                self.execute_typed_statement(trimmed.to_string(), statement)
+                    .await
+            }
+        };
+        result.map(novarocks_query_application::session::QuerySessionStatement::output_owned)
     }
 
     async fn execute_session_statement(
         &self,
         source: &str,
         statement: &ast::SessionStatement,
-        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
         let token = self.token()?;
         let mut governed = self
@@ -784,10 +759,6 @@ impl FrontendQuerySession {
                 None,
             )
             .map_err(governed_statement_begin_error)?;
-        let query_control = self.service.query_control.clone();
-        lifecycle_admission.bind_external_cancellation(move |reason| {
-            let _ = query_control.cancel_session_statement(token, reason);
-        });
         let result = match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
@@ -984,7 +955,6 @@ impl FrontendQuerySession {
         &self,
         source: String,
         set: &ast::SetStatement,
-        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
         for assignment in &set.assignments {
             self.admit_session_set_assignment(&source, assignment)?;
@@ -1002,11 +972,6 @@ impl FrontendQuerySession {
                 timeout_ms,
             )
             .map_err(governed_statement_begin_error)?;
-        let query_control = self.service.query_control.clone();
-        lifecycle_admission.bind_external_cancellation(move |reason| {
-            let _ = query_control.cancel_session_statement(token, reason);
-        });
-
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
                 if let Err(error) = self.apply_session_set_assignment_to_state(
@@ -1252,7 +1217,6 @@ impl FrontendQuerySession {
         &self,
         sql: String,
         parsed_statement: ParsedStatement,
-        lifecycle_admission: &FrontendWorkloadLease,
     ) -> Result<StatementResult, QueryServiceError> {
         reject_plain_query_from_legacy_typed_route(&parsed_statement)?;
         let state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -1297,10 +1261,6 @@ impl FrontendQuerySession {
                 timeout_ms,
             )
             .map_err(governed_statement_begin_error)?;
-        let query_control = self.service.query_control.clone();
-        lifecycle_admission.bind_external_cancellation(move |reason| {
-            let _ = query_control.cancel_session_statement(token, reason);
-        });
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
@@ -1648,24 +1608,14 @@ impl QuerySession for FrontendQuerySession {
         sql: &str,
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
     {
-        // Preserve the serving lifecycle's admission linearization before
-        // inspecting the COM_QUERY. The current handshake advertises neither
-        // multi-statement nor multi-result support, so inspection still
-        // completes before execution can mutate session or catalog state.
-        let admission = self
-            .service
-            .serving_lifecycle
-            .try_admit(FrontendWorkloadKind::Statement)
-            .map_err(query_service_admission_error)?;
         let Some(statement) = unnegotiated_query_statement(sql)? else {
             return Ok(
-                novarocks_query_application::session::QuerySessionStatement::new(
+                novarocks_query_application::session::QuerySessionStatement::output_owned(
                     StatementResult::Ok,
-                    Box::new(FrontendSessionProtocolTerminal(admission)),
                 ),
             );
         };
-        self.execute_statement(statement, admission).await
+        self.execute_statement(statement).await
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {
