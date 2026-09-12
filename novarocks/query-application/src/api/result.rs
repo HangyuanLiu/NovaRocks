@@ -27,7 +27,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
-    array::{ArrayData, StringArray},
+    array::{ArrayData, ArrayRef, StringArray},
     buffer::Buffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -195,27 +195,43 @@ impl QueryResult {
     }
 }
 
+/// Builds one bounded, fully materialized immediate result from product-owned
+/// columns and Arrow arrays. Product adapters retain the meaning of their
+/// columns and cells; this function owns the shared query-session schema and
+/// batch projection.
+pub fn build_arrow_query_result(
+    columns: Vec<ResultField>,
+    arrays: Vec<ArrayRef>,
+) -> Result<QueryResult, String> {
+    if columns.len() != arrays.len() {
+        return Err("immediate result column and array counts must match".to_owned());
+    }
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|error| format!("build immediate result batch failed: {error}"))?;
+    Ok(QueryResult {
+        columns,
+        batches: vec![batch],
+    })
+}
+
 pub fn build_string_query_result(
     column_name: &str,
     rows: Vec<String>,
 ) -> Result<QueryResult, String> {
     let column = ResultField::new(column_name, DataType::Utf8, false, None);
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        column_name,
-        DataType::Utf8,
-        false,
-    )]));
-    let batch = RecordBatch::try_new(
-        schema,
+    build_arrow_query_result(
+        vec![column],
         vec![Arc::new(StringArray::from(
             rows.into_iter().map(Some).collect::<Vec<_>>(),
         ))],
     )
-    .map_err(|error| format!("build immediate text result failed: {error}"))?;
-    Ok(QueryResult {
-        columns: vec![column],
-        batches: vec![batch],
-    })
+    .map_err(|error| format!("build immediate text result failed: {error}"))
 }
 
 /// Builds a bounded immediate table whose protocol-visible cells are required
@@ -269,12 +285,6 @@ pub fn build_utf8_table_query_result(
         .iter()
         .map(|(name, nullable)| ResultField::new(*name, DataType::Utf8, *nullable, None))
         .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|(name, nullable)| Field::new(*name, DataType::Utf8, *nullable))
-            .collect::<Vec<_>>(),
-    ));
     let arrays = (0..columns.len())
         .map(|column| {
             Arc::new(StringArray::from(
@@ -284,12 +294,8 @@ pub fn build_utf8_table_query_result(
             )) as arrow::array::ArrayRef
         })
         .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|error| format!("build immediate tabular result failed: {error}"))?;
-    Ok(QueryResult {
-        columns: result_columns,
-        batches: vec![batch],
-    })
+    build_arrow_query_result(result_columns, arrays)
+        .map_err(|error| format!("build immediate tabular result failed: {error}"))
 }
 
 /// Builds a bounded immediate table whose protocol-visible cells are nullable
@@ -1008,6 +1014,43 @@ mod tests {
             .expect("string output");
         assert_eq!(values.value(0), "first");
         assert_eq!(values.value(1), "second");
+    }
+
+    #[test]
+    fn generic_immediate_result_projection_preserves_typed_columns() {
+        let result = build_arrow_query_result(
+            vec![
+                ResultField::new("count", DataType::Int64, false, None),
+                ResultField::new("active", DataType::Boolean, true, None),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef,
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(true)])) as ArrayRef,
+            ],
+        )
+        .expect("build typed immediate result");
+
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(result.batches[0].num_rows(), 1);
+        assert_eq!(
+            result.batches[0].schema().field(0).data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            result.batches[0].schema().field(1).data_type(),
+            &DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn generic_immediate_result_projection_rejects_mismatched_columns_and_arrays() {
+        let error = build_arrow_query_result(
+            vec![ResultField::new("count", DataType::Int64, false, None)],
+            Vec::new(),
+        )
+        .expect_err("mismatched immediate result must fail");
+
+        assert_eq!(error, "immediate result column and array counts must match");
     }
 
     #[test]

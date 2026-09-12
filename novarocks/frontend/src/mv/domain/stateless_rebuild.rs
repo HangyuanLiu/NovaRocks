@@ -51,8 +51,7 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
 use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 
 use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -60,7 +59,9 @@ use crate::mv::domain::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
 };
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
+};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
@@ -539,16 +540,8 @@ fn build_query_result(
     columns: Vec<QueryResultColumn>,
     arrays: Vec<ArrayRef>,
 ) -> Result<QueryResult, String> {
-    let fields = columns
-        .iter()
-        .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("build stateless rebuild result failed: {e}"))?;
-    Ok(QueryResult {
-        columns,
-        batches: vec![batch],
-    })
+    build_arrow_query_result(columns, arrays)
+        .map_err(|e| format!("build stateless rebuild result failed: {e}"))
 }
 
 fn column(name: &str, nullable: bool) -> QueryResultColumn {

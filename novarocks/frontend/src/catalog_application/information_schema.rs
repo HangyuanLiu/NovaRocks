@@ -18,12 +18,13 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 use novarocks_parser::{ast, printer};
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
+};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 
 #[derive(Clone, Debug)]
@@ -270,20 +271,12 @@ fn build_query_result(
             )
         })
         .collect::<Vec<_>>();
-    let fields = columns
-        .iter()
-        .map(|column| Field::new(column.sql_name(), column.data_type(), column.nullable()))
-        .collect::<Vec<_>>();
     let arrays = columns
         .iter()
         .map(|column| build_column_array(*column, rows))
         .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("build information_schema.materialized_views result failed: {e}"))?;
-    Ok(QueryResult {
-        columns: query_columns,
-        batches: vec![batch],
-    })
+    build_arrow_query_result(query_columns, arrays)
+        .map_err(|e| format!("build information_schema.materialized_views result failed: {e}"))
 }
 
 fn build_column_array(column: InfoColumn, rows: &[MaterializedViewInfoRow]) -> ArrayRef {

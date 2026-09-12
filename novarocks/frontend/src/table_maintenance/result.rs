@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use crate::query_execution::maintenance::MaintenanceStatementResult;
 use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
+use arrow::datatypes::DataType;
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
+};
+use std::sync::Arc;
 
 use novarocks_table_maintenance::{MaintenanceActionOutcome, OptimizeJob, OptimizeJobOutcome};
 
@@ -237,16 +237,7 @@ fn build_query_result(
     arrays: Vec<ArrayRef>,
     context: &str,
 ) -> Result<QueryResult, String> {
-    let fields = columns
-        .iter()
-        .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|error| format!("{context} failed: {error}"))?;
-    Ok(QueryResult {
-        columns,
-        batches: vec![batch],
-    })
+    build_arrow_query_result(columns, arrays).map_err(|error| format!("{context} failed: {error}"))
 }
 
 fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn {
