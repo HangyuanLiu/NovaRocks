@@ -36,6 +36,9 @@ pub mod session_admit;
 /// Typed DML statement-shape admission errors and their stable user-error descriptors.
 pub mod dml_admission;
 
+/// Parser-admitted KILL statement execution over query and connection ports.
+pub mod kill;
+
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
 

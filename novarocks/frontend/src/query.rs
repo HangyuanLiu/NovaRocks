@@ -59,10 +59,7 @@ use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_string_query_result,
 };
 use novarocks_query_application::cancellation::{QueryCancellationReason, QueryCancellationView};
-use novarocks_query_application::client_connection::{
-    ClientConnectionControlPort, ClientConnectionTerminateOutcome,
-    ClientConnectionTerminationReason,
-};
+use novarocks_query_application::client_connection::ClientConnectionControlPort;
 use novarocks_query_application::cpu::{QueryBlockingExecutor, QueryCpuExecutor};
 use novarocks_query_application::protocol_delivery::{
     GovernedCompletionStatementResult, GovernedErrorStatementResult,
@@ -73,8 +70,7 @@ use novarocks_query_application::session::{
     QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
 };
 use novarocks_query_application::session_control::{
-    ConnectionKillAuthorization, QueryCancelOutcome, QueryControlService, QuerySessionLease,
-    SessionIdentity, SessionToken, StatementToken,
+    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::session_outcome::{
@@ -87,6 +83,7 @@ use novarocks_query_application::sql::admission::{
     unnegotiated_query_statement,
 };
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
+use novarocks_query_application::sql::kill::execute_kill_statement;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -750,7 +747,7 @@ impl FrontendQuerySession {
             statement,
             requester,
             &self.service.query_control,
-            Some(self.service.client_connection_control.as_ref()),
+            self.service.client_connection_control.as_ref(),
         )
     }
 
@@ -1532,93 +1529,6 @@ struct DatabaseContext {
     database: String,
 }
 
-/// Resolves the frontend-owned KILL semantics after the protocol owner has
-/// supplied its transport-neutral connection-control capability.
-///
-/// Connection lifecycle composition is intentionally outside this helper: the
-/// MySQL protocol owner supplies the port only once its registry and runner
-/// share the same instance. Until then, a connection KILL cannot be admitted.
-fn execute_kill_statement(
-    source: &str,
-    statement: &ast::KillStatement,
-    requester: SessionToken,
-    query_control: &QueryControlService,
-    connection_control: Option<&dyn ClientConnectionControlPort>,
-) -> Result<StatementResult, QueryServiceError> {
-    let connection_id = kill_connection_id(statement)?;
-    match statement.kind {
-        ast::KillKind::Query => match query_control.kill_query(requester, connection_id) {
-            QueryCancelOutcome::Requested
-            | QueryCancelOutcome::AlreadyRequested(_)
-            | QueryCancelOutcome::NoActiveStatement => Ok(StatementResult::Ok),
-            QueryCancelOutcome::Failed(error) => Err(internal_error(format!(
-                "request governed query cancellation failed: {error}"
-            ))),
-            QueryCancelOutcome::UnknownSession => Err(no_such_connection_error(connection_id)),
-            QueryCancelOutcome::PermissionDenied => Err(kill_denied_error(source, statement)),
-        },
-        ast::KillKind::Default | ast::KillKind::Connection => {
-            let target = match query_control.authorize_connection_kill(requester, connection_id) {
-                ConnectionKillAuthorization::Authorized(target) => target,
-                ConnectionKillAuthorization::UnknownSession => {
-                    return Err(no_such_connection_error(connection_id));
-                }
-                ConnectionKillAuthorization::PermissionDenied => {
-                    return Err(kill_denied_error(source, statement));
-                }
-            };
-            let connection_control = connection_control.ok_or_else(|| {
-                QueryServiceError::new(
-                    QueryServiceErrorKind::Unavailable,
-                    "client connection control is not composed",
-                )
-            })?;
-            match connection_control.terminate(
-                target,
-                ClientConnectionTerminationReason::ExplicitKillConnection {
-                    requester_connection_id: requester.connection_id(),
-                },
-            ) {
-                ClientConnectionTerminateOutcome::Requested
-                | ClientConnectionTerminateOutcome::AlreadyTerminating => Ok(StatementResult::Ok),
-                ClientConnectionTerminateOutcome::Stale => {
-                    Err(no_such_connection_error(connection_id))
-                }
-            }
-        }
-    }
-}
-
-fn kill_connection_id(statement: &ast::KillStatement) -> Result<u32, QueryServiceError> {
-    let ast::LiteralKind::Number(connection_id) = &statement.connection_id.kind else {
-        return Err(QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "KILL requires an integer connection id",
-        ));
-    };
-    connection_id.parse::<u32>().map_err(|_| {
-        QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "KILL requires an integer connection id",
-        )
-    })
-}
-
-fn no_such_connection_error(connection_id: u32) -> QueryServiceError {
-    QueryServiceError::new(
-        QueryServiceErrorKind::NoSuchSession,
-        format!("unknown connection {connection_id}"),
-    )
-}
-
-fn kill_denied_error(source: &str, statement: &ast::KillStatement) -> QueryServiceError {
-    QueryServiceError::from_user_error(SessionAdmitError::KillDenied.to_user_error(
-        source,
-        statement.span,
-        "permission denied to kill connection owned by another principal",
-    ))
-}
-
 fn resolve_catalog_name(
     resolver: &SessionCatalogResolver,
     catalog: &str,
@@ -2019,7 +1929,6 @@ mod tests {
     };
     use novarocks_query_application::api::ResultField;
     use novarocks_query_application::cancellation::QueryCancellationSource;
-    use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_query_application::sql::{SqlBatchCursor, split_sql_statements};
     use novarocks_query_application::test_support::{
         ResultStreamTestProducer, TestResultDeliveryDisposition,
@@ -2462,16 +2371,6 @@ mod tests {
         root.business.release();
     }
 
-    fn parsed_kill(source: &str) -> ast::KillStatement {
-        let statements = novarocks_parser::parse(source).expect("KILL statement must parse");
-        let [ParsedStatement::Session(ast::SessionStatement::Kill(statement))] =
-            statements.as_slice()
-        else {
-            panic!("expected one KILL session statement");
-        };
-        statement.clone()
-    }
-
     #[test]
     fn legacy_typed_route_rejects_plain_query_but_keeps_explain() {
         let plain = novarocks_parser::parse("SELECT 1").expect("plain query parses");
@@ -2485,168 +2384,6 @@ mod tests {
         assert_eq!(explain.len(), 1);
         reject_plain_query_from_legacy_typed_route(&explain[0])
             .expect("EXPLAIN remains on the legacy typed execution route");
-    }
-
-    fn register_kill_session(
-        control: &QueryControlService,
-        connection_id: u32,
-        generation: u64,
-        principal: &str,
-    ) -> QuerySessionLease {
-        control
-            .register_session(SessionIdentity::new(
-                ClientConnectionToken::new(connection_id, generation)
-                    .expect("valid test connection token"),
-                principal,
-            ))
-            .expect("register test session")
-    }
-
-    struct FixedConnectionControl {
-        outcome: ClientConnectionTerminateOutcome,
-        calls: Mutex<Vec<(ClientConnectionToken, ClientConnectionTerminationReason)>>,
-    }
-
-    impl FixedConnectionControl {
-        fn new(outcome: ClientConnectionTerminateOutcome) -> Self {
-            Self {
-                outcome,
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl ClientConnectionControlPort for FixedConnectionControl {
-        fn terminate(
-            &self,
-            target: ClientConnectionToken,
-            reason: ClientConnectionTerminationReason,
-        ) -> ClientConnectionTerminateOutcome {
-            self.calls
-                .lock()
-                .expect("connection control calls lock")
-                .push((target, reason));
-            self.outcome
-        }
-    }
-
-    #[test]
-    fn kill_query_treats_an_idle_authorized_target_as_ok() {
-        let control =
-            novarocks_query_application::query_control::QueryApplicationControl::service();
-        let requester = register_kill_session(&control, 8, 1, "alice");
-        let _target = register_kill_session(&control, 7, 1, "alice");
-        let source = "KILL QUERY 7";
-
-        let result = execute_kill_statement(
-            source,
-            &parsed_kill(source),
-            requester.token(),
-            &control,
-            None,
-        );
-
-        assert!(matches!(result, Ok(StatementResult::Ok)));
-    }
-
-    #[test]
-    fn kill_connection_forms_accept_requested_and_already_terminating() {
-        for outcome in [
-            ClientConnectionTerminateOutcome::Requested,
-            ClientConnectionTerminateOutcome::AlreadyTerminating,
-        ] {
-            for source in ["KILL 7", "KILL CONNECTION 7"] {
-                let control =
-                    novarocks_query_application::query_control::QueryApplicationControl::service();
-                let requester = register_kill_session(&control, 8, 1, "alice");
-                let _target = register_kill_session(&control, 7, 11, "alice");
-                let connection_control = FixedConnectionControl::new(outcome);
-
-                let result = execute_kill_statement(
-                    source,
-                    &parsed_kill(source),
-                    requester.token(),
-                    &control,
-                    Some(&connection_control),
-                );
-
-                assert!(
-                    matches!(result, Ok(StatementResult::Ok)),
-                    "{source}: {outcome:?}"
-                );
-                assert_eq!(
-                    connection_control
-                        .calls
-                        .lock()
-                        .expect("connection control calls lock")
-                        .as_slice(),
-                    &[(
-                        ClientConnectionToken::new(7, 11).expect("valid test connection token"),
-                        ClientConnectionTerminationReason::ExplicitKillConnection {
-                            requester_connection_id: 8,
-                        },
-                    )]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn kill_connection_stale_target_maps_to_no_such_session() {
-        let control =
-            novarocks_query_application::query_control::QueryApplicationControl::service();
-        let requester = register_kill_session(&control, 8, 1, "alice");
-        let _target = register_kill_session(&control, 7, 1, "alice");
-        let connection_control =
-            FixedConnectionControl::new(ClientConnectionTerminateOutcome::Stale);
-        let source = "KILL CONNECTION 7";
-
-        let error = execute_kill_statement(
-            source,
-            &parsed_kill(source),
-            requester.token(),
-            &control,
-            Some(&connection_control),
-        )
-        .expect_err("stale protocol target must be rejected");
-
-        assert_eq!(error.kind(), QueryServiceErrorKind::NoSuchSession);
-    }
-
-    #[test]
-    fn kill_denial_is_a_typed_admit_error_for_query_and_connection() {
-        for source in ["KILL QUERY 7", "KILL CONNECTION 7"] {
-            let control =
-                novarocks_query_application::query_control::QueryApplicationControl::service();
-            let requester = register_kill_session(&control, 8, 1, "alice");
-            let _target = register_kill_session(&control, 7, 1, "bob");
-            let connection_control =
-                FixedConnectionControl::new(ClientConnectionTerminateOutcome::Requested);
-
-            let error = execute_kill_statement(
-                source,
-                &parsed_kill(source),
-                requester.token(),
-                &control,
-                Some(&connection_control),
-            )
-            .expect_err("cross-principal KILL must be denied");
-            let user_error = error.user_error().expect("typed KILL error");
-
-            assert_eq!(user_error.code().as_str(), "sql.admit.kill_denied");
-            assert_eq!(user_error.phase(), novarocks_user_error::ErrorPhase::Admit);
-            assert_eq!(
-                user_error.location().map(|location| location.column()),
-                Some(1)
-            );
-            assert!(
-                connection_control
-                    .calls
-                    .lock()
-                    .expect("connection control calls lock")
-                    .is_empty()
-            );
-        }
     }
 
     #[derive(Default)]
