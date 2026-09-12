@@ -23,7 +23,7 @@ use std::time::Instant;
 use crate::common::backend_topology::BackendTopologySnapshot;
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::request_session::RequestSessionContext;
-pub use novarocks_sql::compiler::SessionOptimizerSettings;
+use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
 
 /// All inputs accepted at the frontend statement-admission boundary.

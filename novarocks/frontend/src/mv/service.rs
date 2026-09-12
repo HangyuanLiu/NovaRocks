@@ -26,9 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use super::background::{
     MvBackgroundBindings, MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
 };
-use crate::common::admitted_query_context::{
-    RequestAdmission, RequestContext, SessionOptimizerSettings,
-};
+use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
 use crate::common::backend_topology::BackendTopologyService;
 use crate::mv::domain::application::{
     MvApplicationError, MvApplicationService, MvApplicationStatement, MvEngine, MvRequestContext,
@@ -42,6 +40,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
+use novarocks_sql::compiler::SessionOptimizerSettings;
 
 use super::{
     activity::{CanonicalMvTarget, MvActivityGate, MvActivityOwner},
