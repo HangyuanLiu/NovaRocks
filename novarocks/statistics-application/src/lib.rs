@@ -1200,7 +1200,13 @@ mod tests {
                     .into_iter()
                     .find(|job| job.id == submitted.id)
                     .expect("job remains retained");
-                if job.state.is_terminal() {
+                // A business conclusion is deliberately visible before its
+                // resource-release facts are all observed. This test is
+                // specifically about cancellation reaching the active root,
+                // so wait for the independent convergence record rather than
+                // treating the first terminal observation as synthetic proof
+                // of cleanup.
+                if job.state.is_terminal() && job.convergence.is_complete() {
                     return job;
                 }
                 tokio::task::yield_now().await;
