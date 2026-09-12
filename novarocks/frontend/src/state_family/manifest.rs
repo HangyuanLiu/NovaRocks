@@ -294,8 +294,8 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            10,
-            "the manifest registers ten frontend state families"
+            9,
+            "the manifest registers nine frontend state families"
         );
 
         let mut process_runtime = 0;
