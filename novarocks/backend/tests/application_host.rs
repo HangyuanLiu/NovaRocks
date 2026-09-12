@@ -4,8 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_backend::{
-    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport,
-    BackendResultRetainedLimits, BackendServerConfig,
+    BackendApplicationHost, BackendDataRuntime, BackendNativeTransport, BackendServerConfig,
 };
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
@@ -15,6 +14,7 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_types::AdvertiseEndpoint;
+use novarocks_worker::WorkerResultRetainedLimits;
 
 fn test_native_trust() -> Arc<NativeTrust> {
     Arc::new(NativeTrust::new(
@@ -71,7 +71,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         announce_max_backoff: Duration::from_secs(2),
         write_commit_evidence_limits: novarocks_spi::connector::WriteCommitEvidenceLimits::default(
         ),
-        result_retained_limits: BackendResultRetainedLimits::try_new(
+        result_retained_limits: WorkerResultRetainedLimits::try_new(
             16 * 1024 * 1024,
             32 * 1024 * 1024,
         )

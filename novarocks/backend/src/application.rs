@@ -18,7 +18,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::WorkerResultRetainedLimits as BackendResultRetainedLimits;
+use novarocks_worker::WorkerResultRetainedLimits;
 
 use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -91,7 +91,7 @@ pub struct BackendServerConfig {
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     /// Server-validated hierarchy for retained native query results.
-    pub result_retained_limits: BackendResultRetainedLimits,
+    pub result_retained_limits: WorkerResultRetainedLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
@@ -515,7 +515,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
-    result_retained_limits: BackendResultRetainedLimits,
+    result_retained_limits: WorkerResultRetainedLimits,
     catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -1039,9 +1039,9 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendResultRetainedLimits, BackendServerConfig,
-        ConfidentialTransport, QueryContextRef, TaskDeadlineTickTask, TaskExecutionRegistryConfig,
-        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
+        TaskDeadlineTickTask, TaskExecutionRegistryConfig, UnroutedQueryContextHost,
+        UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
@@ -1054,6 +1054,7 @@ mod tests {
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
+    use novarocks_worker::WorkerResultRetainedLimits;
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1205,7 +1206,7 @@ mod tests {
             announce_initial_backoff: Duration::from_millis(100),
             announce_max_backoff: Duration::from_secs(2),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
-            result_retained_limits: BackendResultRetainedLimits::try_new(
+            result_retained_limits: WorkerResultRetainedLimits::try_new(
                 16 * 1024 * 1024,
                 32 * 1024 * 1024,
             )
@@ -1261,7 +1262,7 @@ mod tests {
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ConfidentialTransport::Plaintext,
             WriteCommitEvidenceLimits::default(),
-            BackendResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
+            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
             crate::connector::catalog_manager::CatalogManagerConfig::default(),
             &[],
