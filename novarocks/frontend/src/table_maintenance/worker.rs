@@ -26,16 +26,15 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_workload_control::{
+    RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
+};
 use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
-};
-use crate::workload_lifecycle::{
-    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingState,
-    FrontendWorkloadKind,
 };
 
 use super::model::OptimizeJob;
@@ -77,7 +76,7 @@ impl OptimizeWorker {
         jobs: Arc<OptimizeProcessRuntime>,
         engine: Weak<dyn TableMaintenanceEngine>,
         executor: Arc<dyn OptimizeJobExecutor>,
-        workload_lifecycle: FrontendServingLifecycle,
+        root_admission: RootAdmissionHandle,
     ) -> Result<Self, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let wakeup = Arc::new(Notify::new());
@@ -93,7 +92,7 @@ impl OptimizeWorker {
                 executor,
                 worker_stop,
                 worker_wakeup,
-                workload_lifecycle,
+                root_admission,
             )
             .await
         });
@@ -142,7 +141,7 @@ async fn run_worker(
     executor: Arc<dyn OptimizeJobExecutor>,
     stop: Arc<AtomicBool>,
     wakeup: Arc<Notify>,
-    workload_lifecycle: FrontendServingLifecycle,
+    root_admission: RootAdmissionHandle,
 ) -> Result<(), String> {
     loop {
         if stop.load(Ordering::Acquire) {
@@ -161,50 +160,71 @@ async fn run_worker(
                 })?;
             return Ok(());
         };
-        match workload_lifecycle.frontend_serving_snapshot().serving_state {
-            FrontendServingState::Starting => {
-                tokio::select! {
-                    _ = wakeup.notified() => {}
-                    _ = jobs.wait_for_change() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+        let work =
+            match root_admission.try_begin_root(WorkRequest::new(WorkClass::TableMaintenance)) {
+                Ok(work) => work,
+                Err(WorkError::NotReady)
+                | Err(WorkError::Capacity(_))
+                | Err(WorkError::CapacityWaitTimeout) => {
+                    tokio::select! {
+                        _ = wakeup.notified() => {}
+                        _ = jobs.wait_for_change() => {}
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    }
+                    continue;
                 }
-                continue;
+                Err(WorkError::Closed) => {
+                    jobs.request_shutdown_cancellation()
+                        .await
+                        .map_err(|error| {
+                            format!("cancel optimize jobs after governed admission closed: {error}")
+                        })?;
+                    return Ok(());
+                }
+                Err(error) => return Err(format!("admit governed optimize root failed: {error}")),
+            };
+        let RootWork { owner, business } = work;
+        let cancellation = match owner.scope().cancellation() {
+            Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
+                view, None,
+            ),
+            Err(error) => {
+                drop(business);
+                owner.complete();
+                return Err(format!(
+                    "observe governed optimize cancellation failed: {error}"
+                ));
             }
-            FrontendServingState::Ready => {}
-            FrontendServingState::Draining | FrontendServingState::Stopping => {
-                jobs.request_shutdown_cancellation()
-                    .await
-                    .map_err(|error| {
-                        format!("cancel optimize jobs after frontend drain began failed: {error}")
-                    })?;
-                return Ok(());
-            }
-        }
-        let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
-            Ok(lease) => lease,
-            Err(_) => return Ok(()),
         };
-        let Some(job) = jobs
-            .claim_next(now_unix_millis())
-            .await
-            .map_err(|error| format!("claim current optimize job failed: {error}"))?
-        else {
-            drop(workload_lease);
+        let claimed = match jobs.claim_next(now_unix_millis()).await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                drop(business);
+                owner.complete();
+                return Err(format!("claim current optimize job failed: {error}"));
+            }
+        };
+        let Some(job) = claimed else {
+            drop(business);
+            owner.complete();
             tokio::select! {
                 _ = wakeup.notified() => {}
                 _ = jobs.wait_for_change() => {}
             }
             continue;
         };
-        execute_claimed_job(
+        let result = execute_claimed_job(
             &runtime,
             jobs.as_ref(),
             engine,
             Arc::clone(&executor),
             job,
-            workload_lease.cancellation_source().view(),
+            cancellation,
         )
-        .await?;
+        .await;
+        drop(business);
+        owner.complete();
+        result?;
     }
 }
 
@@ -444,8 +464,8 @@ mod lifecycle_tests {
     };
     use crate::table_maintenance::model::OptimizeJob;
     use crate::table_maintenance::runtime::OptimizeProcessRuntime;
-    use crate::workload_lifecycle::FrontendServingLifecycle;
     use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
+    use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     struct NeverRunEngine;
 
@@ -503,8 +523,17 @@ mod lifecycle_tests {
     }
 
     #[tokio::test]
-    async fn starting_worker_waits_for_the_serving_lifecycle() {
-        let lifecycle = FrontendServingLifecycle::new();
+    async fn starting_worker_waits_for_governed_admission() {
+        let parts = WorkloadControl::try_new_split(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 128,
+                control_bytes: 16,
+                per_scope_bytes: 112,
+            },
+        )
+        .expect("workload control opens");
+        let control = parts.owner;
         let jobs = Arc::new(OptimizeProcessRuntime::new());
         let engine: Arc<dyn TableMaintenanceEngine> = Arc::new(NeverRunEngine);
         let executor: Arc<dyn OptimizeJobExecutor> = Arc::new(NeverRunExecutor);
@@ -515,7 +544,7 @@ mod lifecycle_tests {
             executor,
             Arc::new(AtomicBool::new(false)),
             Arc::new(tokio::sync::Notify::new()),
-            lifecycle.clone(),
+            parts.root_admission,
         ));
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -524,8 +553,8 @@ mod lifecycle_tests {
             "the optimize worker must not exit while the frontend is starting"
         );
 
-        lifecycle.mark_ready().expect("mark lifecycle ready");
-        lifecycle.begin_drain(Duration::from_secs(1));
+        control.mark_ready().expect("mark governed admission ready");
+        control.close_admission();
         tokio::time::timeout(Duration::from_secs(1), worker)
             .await
             .expect("worker observes the terminal serving state")

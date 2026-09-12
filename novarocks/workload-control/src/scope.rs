@@ -640,6 +640,45 @@ impl WorkloadControl {
         self.inner.update(|state| state.closed = true);
     }
 
+    /// Requests first-wins cancellation for every active root owned by this
+    /// process authority. Closing admission and cancelling existing roots are
+    /// deliberately separate lifecycle facts: callers use this only after a
+    /// bounded drain has elapsed.
+    pub fn cancel_active_roots(&self, reason: CancellationReason) -> usize {
+        let roots = {
+            let state = self.inner.state.lock().unwrap();
+            state
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.parent.is_none() && !node.completed)
+                .map(|(&id, node)| (id, Arc::clone(&node.cancellation)))
+                .collect::<Vec<_>>()
+        };
+
+        let mut requested = 0;
+        for (id, cancellation) in roots {
+            let outcome = cancellation.request(reason.clone());
+            if outcome == CancellationRequestOutcome::Requested {
+                requested += 1;
+            }
+            if outcome != CancellationRequestOutcome::SuccessSealed {
+                self.inner
+                    .update(|state| {
+                        let Some(node) = state.nodes.get_mut(&id) else {
+                            return Ok(());
+                        };
+                        if node.parent.is_some() || node.completed || node.cancellation_signalled {
+                            return Ok(());
+                        }
+                        node.cancellation_signalled = true;
+                        crate::observation::queue_control(state, id, crate::ControlIntent::Cancel)
+                    })
+                    .expect("active root cancellation updates a live local authority");
+            }
+        }
+        requested
+    }
+
     /// Role composition opens data admission only after its required services
     /// are ready. Repeating readiness is harmless; closed admission never reopens.
     pub fn mark_ready(&self) -> Result<(), WorkError> {
@@ -1166,6 +1205,50 @@ mod tests {
             .await
             .expect("observation wakes when the last root is released")
             .expect("wait task joins");
+    }
+
+    #[test]
+    fn process_owner_cancels_each_active_root_once() {
+        let control = controller();
+        let first = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit first root");
+        let second = control
+            .try_begin_root(WorkRequest::new(WorkClass::TableMaintenance))
+            .expect("admit second root");
+        let first_cancellation = first
+            .owner
+            .scope()
+            .cancellation()
+            .expect("first cancellation");
+        let second_cancellation = second
+            .owner
+            .scope()
+            .cancellation()
+            .expect("second cancellation");
+
+        assert_eq!(
+            control.cancel_active_roots(CancellationReason::FrontendDrainDeadlineExceeded),
+            2
+        );
+        assert_eq!(
+            first_cancellation.reason(),
+            Some(CancellationReason::FrontendDrainDeadlineExceeded)
+        );
+        assert_eq!(
+            second_cancellation.reason(),
+            Some(CancellationReason::FrontendDrainDeadlineExceeded)
+        );
+        assert_eq!(
+            control.cancel_active_roots(CancellationReason::ServerShutdown),
+            0,
+            "a drain deadline must preserve the first cancellation reason"
+        );
+
+        drop(first.business);
+        first.owner.complete();
+        drop(second.business);
+        second.owner.complete();
     }
 
     #[test]

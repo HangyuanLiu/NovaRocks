@@ -609,6 +609,7 @@ where
             )
             .await;
             if graceful.is_err() {
+                host.cancel_governed_work_at_drain_deadline();
                 host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
                 // Keep the admitted protocol tasks alive long enough to
                 // observe the first-wins deadline cancellation and return
@@ -630,6 +631,7 @@ where
         error = wait_for_frontend_listener_failure(report_server, management_server) => {
             host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
+            host.cancel_governed_work_at_drain_deadline();
             host.serving_lifecycle().cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
@@ -865,7 +867,7 @@ mod tests {
     use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
-    use novarocks_workload_control::{WorkClass, WorkRequest};
+    use novarocks_workload_control::{CancellationReason, WorkClass, WorkRequest};
 
     use super::{
         FrontendTestServerConfig, build_frontend_query_session_factory,
@@ -1365,6 +1367,15 @@ mod tests {
         .expect("open frontend application host");
         host.mark_ready().expect("mark frontend host ready");
 
+        let active = host
+            .workload_root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit one root before drain");
+        let cancellation = active
+            .owner
+            .scope()
+            .cancellation()
+            .expect("observe active root cancellation");
         host.begin_serving_drain(Duration::from_secs(1));
         assert!(
             host.workload_root_admission()
@@ -1372,6 +1383,17 @@ mod tests {
                 .is_err(),
             "serving drain must close the one governed root-admission authority"
         );
+        assert_eq!(
+            host.cancel_governed_work_at_drain_deadline(),
+            1,
+            "the process owner cancels the admitted root after the drain deadline"
+        );
+        assert_eq!(
+            cancellation.reason(),
+            Some(CancellationReason::FrontendDrainDeadlineExceeded)
+        );
+        drop(active.business);
+        active.owner.complete();
 
         host.shutdown().await.expect("shutdown drained host");
     }

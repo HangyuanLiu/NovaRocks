@@ -30,6 +30,7 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_state_store_api::StateStore;
+use novarocks_workload_control::RootAdmissionHandle;
 use tokio::runtime::Handle;
 
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
@@ -40,7 +41,6 @@ use crate::query_execution::maintenance::{
     TableMaintenanceService,
 };
 use crate::state_store::StateStoreRunPolicy;
-use crate::workload_lifecycle::FrontendServingLifecycle;
 
 use self::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
 pub(crate) use self::admission::{
@@ -80,7 +80,7 @@ pub struct FrontendTableMaintenanceService {
     runtime: Handle,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
-    workload_lifecycle: Option<FrontendServingLifecycle>,
+    root_admission: RootAdmissionHandle,
 }
 
 impl FrontendTableMaintenanceService {
@@ -91,13 +91,15 @@ impl FrontendTableMaintenanceService {
     pub async fn open(
         durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
         runtime: Handle,
+        root_admission: RootAdmissionHandle,
     ) -> Result<Self, String> {
-        Self::open_inner(durable, runtime).await
+        Self::open_inner(durable, runtime, root_admission).await
     }
 
     async fn open_inner(
         durable: Option<(Arc<dyn StateStore>, StateStoreRunPolicy)>,
         runtime: Handle,
+        root_admission: RootAdmissionHandle,
     ) -> Result<Self, String> {
         let gc_observations = match durable {
             Some((store, policy)) => Some(Arc::new(
@@ -118,7 +120,7 @@ impl FrontendTableMaintenanceService {
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
             lake_publication_runtime_policy: None,
-            workload_lifecycle: None,
+            root_admission,
         })
     }
 
@@ -127,12 +129,6 @@ impl FrontendTableMaintenanceService {
         policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         self.lake_publication_runtime_policy = Some(policy);
-        self
-    }
-
-    /// Installs the FE lifecycle used to admit current-process OPTIMIZE attempts.
-    pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
-        self.workload_lifecycle = Some(lifecycle);
         self
     }
 
@@ -701,16 +697,12 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         match &*lifecycle {
             WorkerLifecycle::NotStarted => {
-                let workload_lifecycle = self.workload_lifecycle.clone().ok_or_else(|| {
-                    "table maintenance worker requires the shared frontend serving lifecycle"
-                        .to_string()
-                })?;
                 *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start_with_executor(
                     &self.runtime,
                     Arc::clone(&self.optimize_runtime),
                     Arc::downgrade(&engine),
                     Arc::new(DirectOptimizeExecutor),
-                    workload_lifecycle,
+                    self.root_admission.clone(),
                 )?);
                 Ok(())
             }

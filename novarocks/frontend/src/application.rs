@@ -35,8 +35,8 @@ use novarocks_query_application::cpu::{
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
 use novarocks_workload_control::{
-    LocalResourceAuthority, ResourceConfig, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
-    WorkloadObservationHandle, WorkloadShutdownError,
+    CancellationReason, LocalResourceAuthority, ResourceConfig, RootAdmissionHandle,
+    WorkloadConfig, WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
 };
 
 use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
@@ -303,6 +303,12 @@ impl FrontendExecutionRuntimeOwner {
         if let Some(workload) = self.workload.as_ref() {
             workload.close_admission();
         }
+    }
+
+    fn cancel_active_roots_at_drain_deadline(&self) -> usize {
+        self.workload.as_ref().map_or(0, |workload| {
+            workload.cancel_active_roots(CancellationReason::FrontendDrainDeadlineExceeded)
+        })
     }
 
     async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -1213,12 +1219,11 @@ impl FrontendApplicationHost {
         let table_maintenance_open = FrontendTableMaintenanceService::open(
             host.durable(),
             tokio::runtime::Handle::current(),
+            host.workload_root_admission(),
         )
         .await
         .map(|service| {
-            service
-                .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
-                .with_workload_lifecycle((*host.serving_lifecycle()).clone())
+            service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
         });
         match table_maintenance_open {
             Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
@@ -1367,6 +1372,14 @@ impl FrontendApplicationHost {
     pub fn begin_serving_drain(&self, timeout: Duration) {
         self.execution_runtime_owner.close_admission();
         self.serving_lifecycle.begin_drain(timeout);
+    }
+
+    /// Requests the drain-deadline cancellation through the sole governed
+    /// workload authority. The legacy lifecycle bridge remains responsible
+    /// only for statement paths not yet converted to governed roots.
+    pub fn cancel_governed_work_at_drain_deadline(&self) -> usize {
+        self.execution_runtime_owner
+            .cancel_active_roots_at_drain_deadline()
     }
 
     /// Opens both the legacy serving gate and the new governed root gate after
