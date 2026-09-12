@@ -158,8 +158,10 @@ pub trait ViewEngine: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct EmptyViewService;
+#[cfg(test)]
+pub(super) struct EmptyViewService;
 
+#[cfg(test)]
 impl ViewService for EmptyViewService {
     fn execute_statement(
         &self,

@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use bytes::Bytes;
-use novarocks_frontend::view::{
+use super::{
+    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+    FrontendExecutionConfig,
+};
+use crate::view::{
     CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
-use novarocks_frontend::{
-    application::{
-        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig,
-    },
-    state_store::StateStoreHostInput,
+use crate::{
+    state_store::{StateStoreHostInput, testing as state_store_fixture},
     topology::ClusterBackendOpenConfig,
 };
+use bytes::Bytes;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
@@ -41,8 +41,6 @@ use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 use std::sync::Arc;
 use std::time::Duration;
-mod common;
-use common::state_store_fixture;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -72,7 +70,7 @@ fn execution_config() -> FrontendExecutionConfig {
 async fn open_host(
     input: Option<StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
-    let registry = state_store_fixture::registry();
+    let registry = state_store_fixture::persistent_registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         input,
         &registry,
@@ -194,7 +192,7 @@ fn parse_query(sql: &str) -> Query {
 }
 
 fn state_store_input() -> StateStoreHostInput {
-    state_store_fixture::input(format!("frontend-cluster-{}", Uuid::now_v7()))
+    state_store_fixture::persistent_input(format!("frontend-cluster-{}", Uuid::now_v7()))
 }
 
 fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
@@ -265,7 +263,7 @@ async fn sqlite_host_opens_store_with_single_fe_view() {
         .expect("configured SQLite host must expose its state store");
     assert_eq!(
         host.state_store_provider_id(),
-        Some(state_store_fixture::TEST_STATE_STORE_PROVIDER_ID)
+        Some(state_store_fixture::PERSISTENT_TEST_STATE_STORE_PROVIDER_ID)
     );
     assert!(
         store.identity().await.is_ok(),

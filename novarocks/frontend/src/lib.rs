@@ -41,5 +41,5 @@ mod system_catalog;
 pub(crate) mod table_maintenance;
 pub(crate) mod task_execution;
 pub mod topology;
-pub mod view;
+mod view;
 pub(crate) mod workload_lifecycle;

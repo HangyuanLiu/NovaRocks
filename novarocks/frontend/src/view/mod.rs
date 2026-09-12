@@ -38,9 +38,8 @@ mod rewrite;
 mod tests;
 
 pub use engine::{
-    CreateExternalViewRequest, EmptyViewService, ExternalViewResolution, ResolvedExternalView,
-    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
-    ViewTarget,
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 
 const DEFAULT_CATALOG: &str = "default_catalog";
