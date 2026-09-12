@@ -138,6 +138,36 @@ pub enum MaintenanceActionOutcome {
     },
 }
 
+/// Projects the only provider outcome accepted by an OPTIMIZE job into its
+/// stable product receipt.
+///
+/// The conversion preserves unknown output facts as `None`; an OPTIMIZE job
+/// must not turn a provider's missing proof into zero.
+pub fn optimize_job_outcome_from_action(
+    outcome: MaintenanceActionOutcome,
+) -> Result<OptimizeJobOutcome, String> {
+    let MaintenanceActionOutcome::RewriteDataFiles {
+        target_snapshot_id,
+        rewritten_data_files_count,
+        added_data_files_count,
+        added_delete_files_count,
+        removed_delete_files_count,
+        output_record_count,
+        ..
+    } = outcome
+    else {
+        return Err("optimize job expected a RewriteDataFiles outcome".to_string());
+    };
+    Ok(OptimizeJobOutcome {
+        target_snapshot_id,
+        rewritten_data_files: i64::from(rewritten_data_files_count),
+        deleted_data_files: i64::from(removed_delete_files_count),
+        added_data_files: added_data_files_count.map(i64::from),
+        added_delete_files: added_delete_files_count.map(i64::from),
+        output_record_count,
+    })
+}
+
 /// Result of rebinding one durable maintenance target to its current table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaintenanceTargetRebind {
@@ -166,7 +196,7 @@ impl OptimizeSubmission {
 
 #[cfg(test)]
 mod tests {
-    use super::OptimizeSubmission;
+    use super::{MaintenanceActionOutcome, OptimizeSubmission, optimize_job_outcome_from_action};
 
     #[test]
     fn submitted_handle_names_only_its_exact_job() {
@@ -178,5 +208,38 @@ mod tests {
             41
         );
         assert_eq!(OptimizeSubmission::AlreadyActive.handle(), None);
+    }
+
+    #[test]
+    fn optimize_receipt_preserves_unknown_output_facts() {
+        let receipt =
+            optimize_job_outcome_from_action(MaintenanceActionOutcome::RewriteDataFiles {
+                target_snapshot_id: Some(19),
+                rewritten_data_files_count: 2,
+                added_data_files_count: None,
+                added_delete_files_count: Some(3),
+                rewritten_bytes_count: 0,
+                failed_data_files_count: 0,
+                removed_delete_files_count: 4,
+                output_record_count: None,
+            })
+            .expect("rewrite data files is an optimize outcome");
+        assert_eq!(receipt.target_snapshot_id, Some(19));
+        assert_eq!(receipt.rewritten_data_files, 2);
+        assert_eq!(receipt.deleted_data_files, 4);
+        assert_eq!(receipt.added_data_files, None);
+        assert_eq!(receipt.added_delete_files, Some(3));
+        assert_eq!(receipt.output_record_count, None);
+    }
+
+    #[test]
+    fn optimize_rejects_a_non_rewrite_provider_outcome() {
+        assert_eq!(
+            optimize_job_outcome_from_action(MaintenanceActionOutcome::RemoveOrphanFiles {
+                orphan_file_locations: Vec::new(),
+            })
+            .expect_err("cleanup cannot complete an optimize job"),
+            "optimize job expected a RewriteDataFiles outcome"
+        );
     }
 }

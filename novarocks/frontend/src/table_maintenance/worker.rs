@@ -39,6 +39,7 @@ use super::now_unix_millis;
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceTargetRebind, OptimizeJob, OptimizeProcessRuntime,
+    optimize_job_outcome_from_action,
 };
 
 /// Runner-owned test root for the STAT-2F cross-process maintenance race.
@@ -312,7 +313,9 @@ async fn execute_claimed_job(
     })
     .await
     {
-        Ok(Ok(outcome)) => optimize_outcome(outcome).map_err(OptimizeTerminalError::failed),
+        Ok(Ok(outcome)) => {
+            optimize_job_outcome_from_action(outcome).map_err(OptimizeTerminalError::failed)
+        }
         Ok(Err(terminal)) => Err(terminal),
         Err(error) => Err(OptimizeTerminalError::failed(format!(
             "optimize job {job_id} engine task failed: {error}"
@@ -420,31 +423,6 @@ fn stat2f_test_paths(root: &std::path::Path, job_id: i64) -> Stat2fTestPaths {
         resume: root.join(format!("{stem}.before-rebind.resume")),
         dispatch_count: root.join(format!("{stem}.dispatch-count")),
     }
-}
-
-pub(crate) fn optimize_outcome(
-    outcome: MaintenanceActionOutcome,
-) -> Result<novarocks_table_maintenance::OptimizeJobOutcome, String> {
-    let MaintenanceActionOutcome::RewriteDataFiles {
-        target_snapshot_id,
-        rewritten_data_files_count,
-        added_data_files_count,
-        added_delete_files_count,
-        removed_delete_files_count,
-        output_record_count,
-        ..
-    } = outcome
-    else {
-        return Err("optimize worker expected a RewriteDataFiles outcome".to_string());
-    };
-    Ok(novarocks_table_maintenance::OptimizeJobOutcome {
-        target_snapshot_id,
-        rewritten_data_files: i64::from(rewritten_data_files_count),
-        deleted_data_files: i64::from(removed_delete_files_count),
-        added_data_files: added_data_files_count.map(i64::from),
-        added_delete_files: added_delete_files_count.map(i64::from),
-        output_record_count,
-    })
 }
 
 #[cfg(test)]
