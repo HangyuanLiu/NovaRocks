@@ -80,7 +80,7 @@ assert_edge_rejected novarocks-native-adapter novarocks-backend \
 assert_edge_rejected novarocks-statistics-application novarocks-task-codec \
   "novarocks-statistics-application normal dependency closure contains forbidden owners:"
 assert_edge_rejected novarocks-table-maintenance novarocks-task-codec \
-  "novarocks-mv-application normal dependency closure contains forbidden owners:"
+  "novarocks-table-maintenance normal dependency closure contains forbidden owners:"
 
 # The checker follows package ids in the resolved graph, so dependency aliases
 # cannot hide a violation. A target predicate remains a normal edge for the
