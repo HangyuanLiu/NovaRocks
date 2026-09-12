@@ -36,7 +36,6 @@ use uuid::Uuid;
 
 use super::application;
 use super::model::StatisticsJobTarget;
-use crate::workload_lifecycle::FrontendServingLifecycle;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AnalyzeTableStatement {
@@ -396,9 +395,6 @@ impl FrontendStatisticsApplicationPort {
             runtime,
             core_executor,
         }
-    }
-    pub(crate) fn with_workload_lifecycle(self, _lifecycle: FrontendServingLifecycle) -> Self {
-        self
     }
     pub async fn shutdown_worker_until(&self, _deadline: Instant) -> Result<(), String> {
         Ok(())

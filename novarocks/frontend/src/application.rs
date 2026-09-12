@@ -1275,28 +1275,25 @@ impl FrontendApplicationHost {
             Arc::clone(&statistics_connector_control),
             host.workload_root_admission(),
         ));
-        let statistics_application_port = Arc::new(
-            FrontendStatisticsApplicationPort::new(
-                statistics_application_service.as_ref().clone(),
-                crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
-                    &statistics_connector_control,
-                )),
-                crate::capabilities::statistics_three_phase_attempt_executor(
-                    crate::capabilities::StatisticsAttemptExecutorPorts::new(
-                        host.execution_role(),
-                        statistics_connector_control,
-                        host.typed_connector_control(),
-                        host.backend_topology_port(),
-                        host.query_execution_service(),
-                        host.function_catalog(),
-                        host.lake_publication_runtime_policy()
-                            .max_attempt_duration(),
-                    ),
+        let statistics_application_port = Arc::new(FrontendStatisticsApplicationPort::new(
+            statistics_application_service.as_ref().clone(),
+            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
+                &statistics_connector_control,
+            )),
+            crate::capabilities::statistics_three_phase_attempt_executor(
+                crate::capabilities::StatisticsAttemptExecutorPorts::new(
+                    host.execution_role(),
+                    statistics_connector_control,
+                    host.typed_connector_control(),
+                    host.backend_topology_port(),
+                    host.query_execution_service(),
+                    host.function_catalog(),
+                    host.lake_publication_runtime_policy()
+                        .max_attempt_duration(),
                 ),
-                tokio::runtime::Handle::current(),
-            )
-            .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
-        );
+            ),
+            tokio::runtime::Handle::current(),
+        ));
         host.statistics_application_service = Some(statistics_application_service);
         host.statistics_application_port = Some(statistics_application_port);
 
