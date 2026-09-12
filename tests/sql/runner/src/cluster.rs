@@ -19,8 +19,9 @@
 //! resolution. The cross-process lifecycle itself lives in cluster-harness.
 
 use crate::types::RunnerConfig;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ pub(crate) use novarocks_cluster_harness::{
     ServerHandle, build_novarocks_command, render_cross_process_config, startup_timeout_from_env,
 };
 use novarocks_cluster_harness::{
-    CrossProcessClusterOptions, CrossProcessServerHandle, LaunchProfile,
+    CrossProcessClusterOptions, CrossProcessConfigOverlay, CrossProcessServerHandle, LaunchProfile,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -72,7 +73,7 @@ pub(crate) fn launch_server(
                 launch_profile,
                 startup_timeout: startup_timeout(),
                 child_environment: Default::default(),
-                config_overlay: Default::default(),
+                config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
             },
         )?)),
@@ -157,6 +158,51 @@ fn resolve_base_frontend_config_path(
     )
 }
 
+/// Reintroduce the BE-only connector section after the cross-process harness
+/// renders from the FE config. Deployable FE and BE configs deliberately keep
+/// their credential registries separate, while the harness accepts one base
+/// config and projects credentials by role. Without this overlay a generated
+/// FE config supplies only metadata credentials, so its BE projection has no
+/// data credential to resolve.
+fn resolve_role_scoped_connector_overlay() -> Result<CrossProcessConfigOverlay> {
+    let Some(path) = std::env::var_os("NOVAROCKS_BE_CONFIG") else {
+        return Ok(CrossProcessConfigOverlay::default());
+    };
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        bail!(
+            "NOVAROCKS_BE_CONFIG points to {}, but the file does not exist",
+            path.display()
+        );
+    }
+    let source = fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .map_err(|error| error.context(format!("read backend config {}", path.display())))?;
+    let connector = connector_overlay_from_config(&source).map_err(|error| {
+        error.context(format!("extract connector section from {}", path.display()))
+    })?;
+    Ok(CrossProcessConfigOverlay {
+        be: connector,
+        ..Default::default()
+    })
+}
+
+fn connector_overlay_from_config(source: &str) -> Result<Option<String>> {
+    let config = source
+        .parse::<toml::Value>()
+        .map_err(anyhow::Error::from)
+        .context("parse backend config TOML")?;
+    let Some(connector) = config.get("connector") else {
+        return Ok(None);
+    };
+    let mut overlay = toml::map::Map::new();
+    overlay.insert("connector".to_string(), connector.clone());
+    toml::to_string(&toml::Value::Table(overlay))
+        .map(Some)
+        .map_err(anyhow::Error::from)
+        .context("serialize backend connector overlay")
+}
+
 fn startup_timeout() -> Duration {
     startup_timeout_from_env(
         std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS")
@@ -180,5 +226,40 @@ mod tests {
     fn all_in_one_rejects_multiple_backends() {
         let error = validate_cluster_args(ClusterMode::AllInOne, 2).unwrap_err();
         assert!(format!("{error:#}").contains("requires --cluster-size 1"));
+    }
+
+    #[test]
+    fn backend_connector_overlay_preserves_only_the_connector_section() {
+        let overlay = connector_overlay_from_config(
+            r#"
+[cluster]
+role = "be"
+
+[[connector.credentials]]
+purpose = "object-store-data"
+name = "warehouse-data"
+generation = "v1"
+kind = "s3"
+access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
+access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
+"#,
+        )
+        .expect("extract backend connector overlay")
+        .expect("backend connector section");
+        let value = overlay.parse::<toml::Value>().expect("parse overlay");
+        assert!(value.get("cluster").is_none());
+        assert_eq!(
+            value["connector"]["credentials"][0]["purpose"].as_str(),
+            Some("object-store-data")
+        );
+    }
+
+    #[test]
+    fn backend_config_without_connector_needs_no_overlay() {
+        assert!(
+            connector_overlay_from_config("[cluster]\nrole = 'be'\n")
+                .expect("parse backend config")
+                .is_none()
+        );
     }
 }
