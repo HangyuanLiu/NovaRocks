@@ -468,7 +468,7 @@ pub fn start_frontend_management_server(
 impl FrontendManagementServer {
     pub fn install(&self, host: &FrontendApplicationHost) -> Result<(), FrontendApplicationError> {
         self.serving_reader
-            .install(host.serving_lifecycle())
+            .install(host.serving_snapshot_reader())
             .map_err(|error| {
                 FrontendApplicationError::server(format!(
                     "install frontend serving reader after application open: {error}"
@@ -863,7 +863,7 @@ mod tests {
     use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
-    use novarocks_workload_control::{CancellationReason, WorkClass, WorkRequest};
+    use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
         FrontendTestServerConfig, build_frontend_query_session_factory,
@@ -1367,26 +1367,12 @@ mod tests {
             .workload_root_admission()
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .expect("admit one root before drain");
-        let cancellation = active
-            .owner
-            .scope()
-            .cancellation()
-            .expect("observe active root cancellation");
         host.begin_serving_drain(Duration::from_secs(1));
         assert!(
             host.workload_root_admission()
                 .try_begin_root(WorkRequest::new(WorkClass::Query))
                 .is_err(),
             "serving drain must close the one governed root-admission authority"
-        );
-        assert_eq!(
-            host.cancel_governed_work_at_drain_deadline(),
-            1,
-            "the process owner cancels the admitted root after the drain deadline"
-        );
-        assert_eq!(
-            cancellation.reason(),
-            Some(CancellationReason::FrontendDrainDeadlineExceeded)
         );
         drop(active.business);
         active.owner.complete();

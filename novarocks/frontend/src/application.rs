@@ -81,7 +81,7 @@ use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
-    FrontendServingLifecycle,
+    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingWorkloadSnapshotReader,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
@@ -1364,6 +1364,16 @@ impl FrontendApplicationHost {
     /// owners. Server orchestration alone owns its Ready/Draining transitions.
     pub fn serving_lifecycle(&self) -> Arc<FrontendServingLifecycle> {
         Arc::clone(&self.serving_lifecycle)
+    }
+
+    /// The sanitized management reader joins lifecycle facts with the sole
+    /// workload authority's read-only observation. It grants neither owner
+    /// the other's mutation authority.
+    pub fn serving_snapshot_reader(&self) -> Arc<dyn FrontendServingSnapshotReader> {
+        Arc::new(FrontendServingWorkloadSnapshotReader::new(
+            Arc::clone(&self.serving_lifecycle),
+            self.workload_observation(),
+        ))
     }
 
     /// Begins the one-way serving drain. Close governed-root admission before

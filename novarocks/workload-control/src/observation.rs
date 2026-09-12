@@ -89,6 +89,44 @@ pub struct ScopeSnapshot {
     pub control_inflight: bool,
 }
 
+/// Low-cardinality root lifecycle totals, grouped by the work's declared
+/// class. These are monotonic process-local observations; they grant no
+/// admission, cancellation, or completion authority.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkClassTotals {
+    pub query: u64,
+    pub materialized_view: u64,
+    pub statistics: u64,
+    pub table_maintenance: u64,
+    pub management: u64,
+}
+
+impl WorkClassTotals {
+    pub(crate) fn increment(&mut self, class: WorkClass) {
+        match class {
+            WorkClass::Query => self.query = self.query.saturating_add(1),
+            WorkClass::MaterializedView => {
+                self.materialized_view = self.materialized_view.saturating_add(1)
+            }
+            WorkClass::Statistics => self.statistics = self.statistics.saturating_add(1),
+            WorkClass::TableMaintenance => {
+                self.table_maintenance = self.table_maintenance.saturating_add(1)
+            }
+            WorkClass::Management => self.management = self.management.saturating_add(1),
+        }
+    }
+}
+
+/// Historical root lifecycle facts recorded by the sole workload authority.
+/// `completed_after_admission_closed` describes a root that reached its owner
+/// completion fact after role composition closed future root admission.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RootLifecycleSnapshot {
+    pub rejected_admissions: WorkClassTotals,
+    pub completed_after_admission_closed: WorkClassTotals,
+    pub frontend_drain_deadline_cancelled: WorkClassTotals,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkloadSnapshot {
     pub serving: crate::ServingState,
@@ -110,6 +148,7 @@ pub struct WorkloadSnapshot {
     pub unknown_creates: usize,
     pub control_ready: usize,
     pub control_inflight: usize,
+    pub root_lifecycle: RootLifecycleSnapshot,
     pub scopes: Vec<ScopeSnapshot>,
 }
 
@@ -173,6 +212,7 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
         unknown_creates: state.unknown_creates,
         control_ready: state.control_ready.len(),
         control_inflight: state.control_inflight,
+        root_lifecycle: state.root_lifecycle.clone(),
         scopes: state
             .nodes
             .iter()

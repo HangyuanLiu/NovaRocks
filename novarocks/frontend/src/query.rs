@@ -650,10 +650,6 @@ fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceE
                 "frontend is not ready for workload admission",
             )
         }
-        FrontendAdmissionError::SessionRequiresRegistration => QueryServiceError::new(
-            QueryServiceErrorKind::Internal,
-            "session admission must use lifecycle registration",
-        ),
     }
 }
 

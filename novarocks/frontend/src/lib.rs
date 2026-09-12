@@ -72,6 +72,6 @@ pub use view::FrontendViewService;
 pub use workload_lifecycle::{
     FrontendAdmissionError, FrontendCatalogCounts, FrontendCatalogSnapshotIdentity,
     FrontendCatalogSourceMode, FrontendServingLifecycle, FrontendServingSnapshot,
-    FrontendServingSnapshotReader, FrontendServingState, FrontendWorkloadKind,
-    FrontendWorkloadLease, LateBoundFrontendServingSnapshotReader,
+    FrontendServingSnapshotReader, FrontendServingState, FrontendServingWorkloadSnapshotReader,
+    LateBoundFrontendServingSnapshotReader,
 };

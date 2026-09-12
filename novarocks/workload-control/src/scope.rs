@@ -20,7 +20,9 @@ use crate::{
     WorkError, WorkloadObservationHandle,
     admission::{PendingAdmission, Stage},
     cancellation::{Cancellation, CancellationRequestOutcome, CancellationSuccessSealOutcome},
-    observation::{ControlIntents, ObligationKey, ObligationRecord, OwnerState},
+    observation::{
+        ControlIntents, ObligationKey, ObligationRecord, OwnerState, RootLifecycleSnapshot,
+    },
     queue::FairQueue,
 };
 use std::{
@@ -256,6 +258,7 @@ pub(crate) struct State {
     pub control_ready: VecDeque<WorkId>,
     pub control_waiting: BTreeSet<WorkId>,
     pub control_inflight: usize,
+    pub root_lifecycle: RootLifecycleSnapshot,
     pub control_cursor: Option<WorkId>,
     pub data_reserved: u64,
     pub data_used: u64,
@@ -545,41 +548,48 @@ impl WorkloadShutdownFailure {
 
 fn try_begin_root(inner: &Arc<Inner>, request: WorkRequest) -> Result<RootWork, WorkError> {
     inner.update(|state| {
-        if state.closed {
-            return Err(WorkError::Closed);
+        let class = request.class;
+        let result = (|| {
+            if state.closed {
+                return Err(WorkError::Closed);
+            }
+            if !state.ready {
+                return Err(WorkError::NotReady);
+            }
+            if state.roots >= inner.config.root_limit {
+                return Err(WorkError::Capacity("root responsibilities"));
+            }
+            if state.businesses >= inner.config.business_limit {
+                return Err(WorkError::Capacity("business admission"));
+            }
+            if state.nodes.len() >= inner.config.scope_records_limit {
+                return Err(WorkError::Capacity("scope records"));
+            }
+            let cancellation = Cancellation::root(request.deadline);
+            if let Some(reason) = cancellation.reason() {
+                return Err(WorkError::Cancelled(reason));
+            }
+            let id = WorkId(state.next_id()?);
+            let mut node = Node::new(None, id, class, cancellation);
+            node.business = true;
+            state.nodes.insert(id, node);
+            state.roots += 1;
+            state.businesses += 1;
+            let scope = WorkScope {
+                inner: Arc::clone(inner),
+                id,
+            };
+            Ok(RootWork {
+                owner: WorkOwner {
+                    scope: Some(scope.clone()),
+                },
+                business: BusinessPermit { scope: Some(scope) },
+            })
+        })();
+        if result.is_err() {
+            state.root_lifecycle.rejected_admissions.increment(class);
         }
-        if !state.ready {
-            return Err(WorkError::NotReady);
-        }
-        if state.roots >= inner.config.root_limit {
-            return Err(WorkError::Capacity("root responsibilities"));
-        }
-        if state.businesses >= inner.config.business_limit {
-            return Err(WorkError::Capacity("business admission"));
-        }
-        if state.nodes.len() >= inner.config.scope_records_limit {
-            return Err(WorkError::Capacity("scope records"));
-        }
-        let cancellation = Cancellation::root(request.deadline);
-        if let Some(reason) = cancellation.reason() {
-            return Err(WorkError::Cancelled(reason));
-        }
-        let id = WorkId(state.next_id()?);
-        let mut node = Node::new(None, id, request.class, cancellation);
-        node.business = true;
-        state.nodes.insert(id, node);
-        state.roots += 1;
-        state.businesses += 1;
-        let scope = WorkScope {
-            inner: Arc::clone(inner),
-            id,
-        };
-        Ok(RootWork {
-            owner: WorkOwner {
-                scope: Some(scope.clone()),
-            },
-            business: BusinessPermit { scope: Some(scope) },
-        })
+        result
     })
 }
 
@@ -651,15 +661,23 @@ impl WorkloadControl {
                 .nodes
                 .iter()
                 .filter(|(_, node)| node.parent.is_none() && !node.completed)
-                .map(|(&id, node)| (id, Arc::clone(&node.cancellation)))
+                .map(|(&id, node)| (id, node.class, Arc::clone(&node.cancellation)))
                 .collect::<Vec<_>>()
         };
 
         let mut requested = 0;
-        for (id, cancellation) in roots {
+        for (id, class, cancellation) in roots {
             let outcome = cancellation.request(reason.clone());
             if outcome == CancellationRequestOutcome::Requested {
                 requested += 1;
+                if reason == CancellationReason::FrontendDrainDeadlineExceeded {
+                    self.inner.update(|state| {
+                        state
+                            .root_lifecycle
+                            .frontend_drain_deadline_cancelled
+                            .increment(class);
+                    });
+                }
             }
             if outcome != CancellationRequestOutcome::SuccessSealed {
                 self.inner
@@ -972,9 +990,18 @@ impl WorkOwner {
     pub fn complete(mut self) {
         let scope = self.scope.take().unwrap();
         scope.inner.update(|state| {
-            let node = state.nodes.get_mut(&scope.id).unwrap();
-            node.completed = true;
-            node.owner = OwnerState::Completed;
+            let (is_root, class) = {
+                let node = state.nodes.get_mut(&scope.id).unwrap();
+                node.completed = true;
+                node.owner = OwnerState::Completed;
+                (node.parent.is_none(), node.class)
+            };
+            if is_root && state.closed {
+                state
+                    .root_lifecycle
+                    .completed_after_admission_closed
+                    .increment(class);
+            }
             state.collect(scope.id);
         });
     }
@@ -1249,6 +1276,40 @@ mod tests {
         first.owner.complete();
         drop(second.business);
         second.owner.complete();
+    }
+
+    #[test]
+    fn root_lifecycle_observation_records_rejection_drain_completion_and_deadline_cancel() {
+        let control = controller();
+        control.close_admission();
+        assert!(matches!(
+            control.try_begin_root(WorkRequest::new(WorkClass::Management)),
+            Err(WorkError::Closed)
+        ));
+        assert_eq!(
+            control
+                .snapshot()
+                .root_lifecycle
+                .rejected_admissions
+                .management,
+            1
+        );
+
+        let control = controller();
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit query root");
+        control.close_admission();
+        assert_eq!(
+            control.cancel_active_roots(CancellationReason::FrontendDrainDeadlineExceeded),
+            1
+        );
+        drop(work.business);
+        work.owner.complete();
+
+        let snapshot = control.snapshot().root_lifecycle;
+        assert_eq!(snapshot.frontend_drain_deadline_cancelled.query, 1);
+        assert_eq!(snapshot.completed_after_admission_closed.query, 1);
     }
 
     #[test]
