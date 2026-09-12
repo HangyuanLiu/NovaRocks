@@ -724,9 +724,11 @@ fn failure_backoff_ms(attempt: u32) -> i64 {
 mod tests {
     use super::{
         DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS, DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP,
-        DEFAULT_TARGET_FILE_SIZE_BYTES, MaintenanceCoordinatorConfig, MvBackgroundEngineError,
-        MvBackgroundEngineErrorKind, MvMaintenanceFacts, TablePolicy,
+        DEFAULT_TARGET_FILE_SIZE_BYTES, MaintenanceAdmission, MaintenanceCoordinator,
+        MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
+        MvMaintenanceFacts, TablePolicy,
     };
+    use novarocks_table_maintenance::MaintenanceTarget;
 
     fn facts() -> MvMaintenanceFacts {
         MvMaintenanceFacts {
@@ -798,5 +800,30 @@ mod tests {
         let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &negative);
         assert_eq!(policy.expire_max_age_ms, 1);
         assert_eq!(policy.target_file_size_bytes, 1);
+    }
+
+    #[test]
+    fn coordinator_keeps_admission_and_active_permits_in_product() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig {
+            max_concurrent: 1,
+            ..MaintenanceCoordinatorConfig::default()
+        });
+        let target = |table: &str| MaintenanceTarget {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: table.to_string(),
+        };
+        let first = coordinator
+            .try_begin(1, target("first"), &facts(), 1_000_000_000)
+            .expect("first target must be admitted");
+        assert_eq!(coordinator.active_count(), 1);
+        assert_eq!(
+            coordinator
+                .try_begin(2, target("second"), &facts(), 1_000_000_000)
+                .expect_err("second target must wait for product capacity"),
+            MaintenanceAdmission::AtCapacity
+        );
+        coordinator.cancel_attempt(first);
+        assert_eq!(coordinator.active_count(), 0);
     }
 }
