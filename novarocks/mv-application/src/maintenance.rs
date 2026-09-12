@@ -67,6 +67,56 @@ impl Default for MaintenanceCoordinatorConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MaintenanceActionKind {
+    Expire,
+    RewritePositionDeletes,
+    Optimize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomaticMaintenanceAction {
+    ExpireSnapshots {
+        older_than_ms: i64,
+        retain_last: u32,
+    },
+    RewritePositionDeletes {
+        min_input_files: usize,
+    },
+    Optimize,
+}
+
+impl AutomaticMaintenanceAction {
+    pub const fn kind(&self) -> MaintenanceActionKind {
+        match self {
+            Self::ExpireSnapshots { .. } => MaintenanceActionKind::Expire,
+            Self::RewritePositionDeletes { .. } => MaintenanceActionKind::RewritePositionDeletes,
+            Self::Optimize => MaintenanceActionKind::Optimize,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaintenanceSkipReason {
+    Disabled,
+    NonDefaultRefs,
+    DownstreamFloorUnknown,
+    NothingToExpire,
+    SnapshotUnchanged,
+    MissingSummaryStats,
+    BelowThreshold,
+    SuppressedByOptimize,
+    Cooldown,
+    FailureBackoff,
+    CircuitBroken,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MaintenanceEvaluation {
+    pub actions: Vec<AutomaticMaintenanceAction>,
+    pub skips: Vec<(MaintenanceActionKind, MaintenanceSkipReason)>,
+}
+
 /// Product classification of a failed background capability invocation.
 ///
 /// The Frontend adapter supplies this classification; product policy consumes

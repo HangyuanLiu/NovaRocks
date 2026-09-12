@@ -28,6 +28,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::background::{MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts};
 pub(crate) use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+pub(crate) use novarocks_mv_application::maintenance::{
+    AutomaticMaintenanceAction, MaintenanceActionKind, MaintenanceEvaluation, MaintenanceSkipReason,
+};
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
@@ -40,56 +43,6 @@ const SMALL_FILE_RATIO_NUMERATOR: i64 = 3;
 const SMALL_FILE_RATIO_DENOMINATOR: i64 = 4;
 const FAILURE_BACKOFF_BASE_MS: i64 = 60_000;
 const FAILURE_BACKOFF_MAX_MS: i64 = 1_800_000;
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum MaintenanceActionKind {
-    Expire,
-    RewritePositionDeletes,
-    Optimize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AutomaticMaintenanceAction {
-    ExpireSnapshots {
-        older_than_ms: i64,
-        retain_last: u32,
-    },
-    RewritePositionDeletes {
-        min_input_files: usize,
-    },
-    Optimize,
-}
-
-impl AutomaticMaintenanceAction {
-    pub(crate) fn kind(&self) -> MaintenanceActionKind {
-        match self {
-            Self::ExpireSnapshots { .. } => MaintenanceActionKind::Expire,
-            Self::RewritePositionDeletes { .. } => MaintenanceActionKind::RewritePositionDeletes,
-            Self::Optimize => MaintenanceActionKind::Optimize,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MaintenanceSkipReason {
-    Disabled,
-    NonDefaultRefs,
-    DownstreamFloorUnknown,
-    NothingToExpire,
-    SnapshotUnchanged,
-    MissingSummaryStats,
-    BelowThreshold,
-    SuppressedByOptimize,
-    Cooldown,
-    FailureBackoff,
-    CircuitBroken,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct MaintenanceEvaluation {
-    pub(crate) actions: Vec<AutomaticMaintenanceAction>,
-    pub(crate) skips: Vec<(MaintenanceActionKind, MaintenanceSkipReason)>,
-}
 
 #[derive(Clone, Debug, Default)]
 struct TableRuntimeState {
