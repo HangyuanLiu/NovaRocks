@@ -17,8 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::durable::{DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord};
 use crate::state_family::StateFamily;
+use novarocks_state_store_runtime::{
+    DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord,
+};
 
 /// Catalog attachments have no opaque payload fields. Their complete durable
 /// JSON record is capped at the global StateStore value budget before a write

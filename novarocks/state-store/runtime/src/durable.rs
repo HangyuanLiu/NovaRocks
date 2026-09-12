@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared frontend contract for bounded durable records.
+//! Provider-neutral contract for bounded durable records.
 //!
 //! A durable record is encoded and budget-checked before it reaches a
 //! StateStore transaction.  The encoded value remains opaque outside this
@@ -38,10 +38,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// The bound is on original bytes. Its encoded JSON representation is exactly
 /// two hexadecimal characters per byte, plus enclosing JSON framing.
 #[derive(Clone, Eq, PartialEq)]
-pub(crate) struct DurableOpaqueBytes<const MAX_BYTES: usize>(Vec<u8>);
+pub struct DurableOpaqueBytes<const MAX_BYTES: usize>(Vec<u8>);
 
 impl<const MAX_BYTES: usize> DurableOpaqueBytes<MAX_BYTES> {
-    pub(crate) fn try_new(bytes: Vec<u8>) -> Result<Self, DurableRecordError> {
+    pub fn try_new(bytes: Vec<u8>) -> Result<Self, DurableRecordError> {
         if bytes.is_empty() || bytes.len() > MAX_BYTES {
             return Err(DurableRecordError::OpaqueBytesOutOfBounds {
                 actual_bytes: bytes.len(),
@@ -51,7 +51,7 @@ impl<const MAX_BYTES: usize> DurableOpaqueBytes<MAX_BYTES> {
         Ok(Self(bytes))
     }
 
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -84,8 +84,8 @@ impl<'de, const MAX_BYTES: usize> Deserialize<'de> for DurableOpaqueBytes<MAX_BY
     }
 }
 
-/// Metadata every frontend durable record declares before encoding.
-pub(crate) trait DurableRecord: Serialize {
+/// Metadata every durable record declares before encoding.
+pub trait DurableRecord: Serialize {
     const RECORD_KIND: &'static str;
     const SCHEMA_VERSION: u8;
     const ENCODED_LIMIT: usize;
@@ -93,11 +93,15 @@ pub(crate) trait DurableRecord: Serialize {
 
 /// A checked StateStore value. Only [`DurableRecordStore`] can consume it.
 #[derive(Clone)]
-pub(crate) struct EncodedRecord(Value);
+pub struct EncodedRecord(Value);
 
 impl EncodedRecord {
-    #[cfg(test)]
-    pub(crate) fn as_bytes(&self) -> &[u8] {
+    /// Returns the already checked encoding for decode/round-trip verification.
+    ///
+    /// This does not expose a way to construct or replace the value: only
+    /// [`DurableRecordStore`] can mint an `EncodedRecord`, and only it can pass
+    /// one into a StateStore write transaction.
+    pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
 }
@@ -111,10 +115,10 @@ impl fmt::Debug for EncodedRecord {
     }
 }
 
-/// Errors at the frontend durable-record boundary. Opaque record content is
+/// Errors at the durable-record boundary. Opaque record content is
 /// intentionally never retained in an error or its formatted representation.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DurableRecordError {
+pub enum DurableRecordError {
     OpaqueBytesOutOfBounds {
         actual_bytes: usize,
         max_bytes: usize,
@@ -184,26 +188,26 @@ impl From<StateStoreError> for DurableRecordError {
     }
 }
 
-/// The only frontend durable-record encoder and transaction writer.
+/// The provider-neutral durable-record encoder and transaction writer.
 ///
 /// Repositories retain this handle beside their StateStore reference. The
 /// StateStore remains available for reads and non-record index values, while
 /// the private [`EncodedRecord`] payload makes record writes use this handle.
 #[derive(Clone)]
-pub(crate) struct DurableRecordStore {
+pub struct DurableRecordStore {
     limits: StateStoreLimits,
 }
 
 impl DurableRecordStore {
-    pub(crate) fn new(store: Arc<dyn StateStore>) -> Self {
+    pub fn new(store: Arc<dyn StateStore>) -> Self {
         Self::with_limits(store.limits().clone())
     }
 
-    pub(crate) fn with_limits(limits: StateStoreLimits) -> Self {
+    pub fn with_limits(limits: StateStoreLimits) -> Self {
         Self { limits }
     }
 
-    pub(crate) fn encode<R: DurableRecord>(
+    pub fn encode<R: DurableRecord>(
         &self,
         record: &R,
     ) -> Result<EncodedRecord, DurableRecordError> {
@@ -224,7 +228,7 @@ impl DurableRecordStore {
         Ok(EncodedRecord(value))
     }
 
-    pub(crate) async fn put_record(
+    pub async fn put_record(
         &self,
         transaction: &mut dyn WriteTransaction,
         key: Key,

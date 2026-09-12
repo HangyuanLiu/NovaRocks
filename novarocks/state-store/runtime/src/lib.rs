@@ -21,8 +21,13 @@
 //! record families and prefixes remain with the application domain that owns
 //! those records.
 
+mod durable;
 mod policy;
 mod runner;
+
+pub use durable::{
+    DurableOpaqueBytes, DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord,
+};
 
 pub use policy::{
     DEFAULT_MAX_ATTEMPTS, DEFAULT_OPERATION_TIMEOUT, MAX_ATTEMPTS_CEILING,

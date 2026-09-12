@@ -28,8 +28,12 @@ workspace = true
 doctest = false
 
 [dependencies]
+bytes.workspace = true
 futures.workspace = true
+hex.workspace = true
 novarocks-state-store-api.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]

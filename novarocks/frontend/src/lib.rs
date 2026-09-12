@@ -26,7 +26,6 @@ pub mod common;
 pub mod connector;
 pub mod coordinator;
 pub mod dml;
-pub(crate) mod durable;
 pub mod maintenance;
 pub mod metrics;
 pub mod mv;

@@ -4269,9 +4269,13 @@ dependencies = [
 name = "novarocks-state-store-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
+ "hex",
  "novarocks-state-store-api",
  "novarocks-state-store-testkit",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

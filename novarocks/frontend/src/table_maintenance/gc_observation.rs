@@ -31,10 +31,12 @@ use novarocks_state_store_api::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::durable::{DurableRecord, DurableRecordStore, EncodedRecord};
 use crate::state_family::{ClonePolicy, PersistentKeyPrefix, StateFamily};
 use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
-use novarocks_state_store_runtime::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
+use novarocks_state_store_runtime::{
+    DurableRecord, DurableRecordStore, EncodedRecord, RunFailure, StateStoreRunPolicy,
+    run_side_effect_free,
+};
 
 /// This family's entry in the closed state family manifest.  Every declarative
 /// fact below is read from it, so the module holds no second copy of the family

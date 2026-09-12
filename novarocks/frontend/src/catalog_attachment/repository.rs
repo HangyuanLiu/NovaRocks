@@ -30,10 +30,10 @@ use novarocks_state_store_api::{
     AttemptOutcome, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
-use novarocks_state_store_runtime::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
+use novarocks_state_store_runtime::{
+    DurableRecordError, DurableRecordStore, RunFailure, StateStoreRunPolicy, run_side_effect_free,
+};
 use uuid::Uuid;
-
-use crate::durable::{DurableRecordError, DurableRecordStore};
 
 use super::codec::{
     CATALOG_ATTACHMENT_SCHEMA_VERSION, StoredCatalogAttachment, StoredCredentialBinding,
