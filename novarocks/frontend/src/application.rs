@@ -417,6 +417,16 @@ impl FrontendExecutionRuntimeOwner {
                             "frontend workload admission remained open during shutdown".to_string()
                         );
                     }
+                    // `wait_progress` may resolve immediately when a
+                    // concurrent owner/control transition advanced the
+                    // revision. Check the shared deadline between shutdown
+                    // attempts as well, so a stream of immediate revisions
+                    // cannot bypass the bounded process-exit contract.
+                    if Instant::now() >= deadline {
+                        return Err(
+                            "frontend workload shutdown deadline exceeded before drain".to_string()
+                        );
+                    }
                 }
             }
 
