@@ -28,6 +28,7 @@ use crate::task_execution::{
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
     backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
+    backend_readiness::wait_for_backend_native_endpoint_ready,
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
@@ -598,14 +599,16 @@ impl BackendApplicationHost {
             catalog_manager_config,
             execution_role_binding_factories,
         } = config;
-        let readiness_endpoint =
-            NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
-                .map_err(|error| {
-                    BackendApplicationError::new(
-                        BackendApplicationErrorKind::Configuration,
-                        format!("invalid advertised Native readiness endpoint: {error}"),
-                    )
-                })?;
+        let readiness_endpoint = novarocks_types::NativeEndpoint::from_host_port(
+            &advertise_endpoint.host,
+            advertise_endpoint.port,
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("invalid advertised Native readiness endpoint: {error}"),
+            )
+        })?;
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
@@ -695,9 +698,11 @@ impl BackendApplicationHost {
             }
         };
 
-        if let Err(error) =
-            wait_for_native_ready(&readiness_runtime, readiness_endpoint, readiness_timeout)
-        {
+        if let Err(error) = wait_for_backend_native_endpoint_ready(
+            &readiness_runtime,
+            readiness_endpoint,
+            readiness_timeout,
+        ) {
             let listener_result = grpc_server.stop();
             let metrics_result = metrics_http_server.stop();
             let primary = BackendApplicationError::new(
@@ -772,28 +777,6 @@ fn combine_shutdown_results(
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
         (Err(sweep), Err(resources)) => Err(format!("{sweep}; {resources}")),
     }
-}
-
-fn wait_for_native_ready(
-    runtime: &BackendDataRuntime,
-    endpoint: NativeEndpoint,
-    timeout: Duration,
-) -> Result<(), String> {
-    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
-    runtime.block_on(async move {
-        tokio::time::timeout(timeout, connector.connect())
-            .await
-            .map_err(|_| {
-                format!(
-                    "advertised Native endpoint {endpoint} did not become ready within {}ms",
-                    timeout.as_millis()
-                )
-            })?
-            .map(|_| ())
-            .map_err(|error| {
-                format!("advertised Native endpoint {endpoint} readiness failed: {error}")
-            })
-    })
 }
 
 #[cfg(test)]
