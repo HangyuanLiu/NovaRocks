@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::drain::BackendDrainState;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
@@ -17,7 +16,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::WorkerResultRetainedLimits;
+use novarocks_worker::{WorkerDrainState, WorkerResultRetainedLimits};
 
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
@@ -150,7 +149,7 @@ pub struct BackendApplicationHost {
     task_deadline_tick: TaskDeadlineTickTask,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
-    drain: Arc<BackendDrainState>,
+    drain: Arc<WorkerDrainState>,
     announce_task: BackendAnnounceTask,
 }
 
@@ -168,7 +167,7 @@ impl BackendAnnounceTask {
         data_runtime: BackendDataRuntime,
         frontend_endpoint: NativeEndpoint,
         descriptor: BackendProcessDescriptor,
-        drain: Arc<BackendDrainState>,
+        drain: Arc<WorkerDrainState>,
         interval: Duration,
         initial_backoff: Duration,
         max_backoff: Duration,
@@ -254,7 +253,7 @@ impl BackendAnnounceTask {
 
     /// Reports the drain the process has already entered.
     ///
-    /// The flag itself belongs to `BackendDrainState`; the composition root
+    /// The flag itself belongs to `WorkerDrainState`; the composition root
     /// sets it before calling this, so the announce below and the heartbeat
     /// this BE answers cannot disagree about the same process.
     fn announce_drain(&self) {
@@ -313,7 +312,7 @@ struct BackendApplicationServices {
     /// This process's immutable identity, minted once by the composition root
     /// below. Every owner that stamps or checks it reads this one value.
     backend_process_id: BackendProcessId,
-    drain: Arc<BackendDrainState>,
+    drain: Arc<WorkerDrainState>,
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
@@ -543,7 +542,7 @@ fn compose_backend_application_services(
     // stamp their work with, so it is minted by the composition root rather
     // than by whichever owner happens to be constructed first.
     let backend_process_id = BackendProcessId::new_v7();
-    let drain = Arc::new(BackendDrainState::new());
+    let drain = Arc::new(WorkerDrainState::new());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
         BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );

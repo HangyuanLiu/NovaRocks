@@ -35,11 +35,11 @@ use novarocks_types::BackendProcessId;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::connector::catalog_manager::CatalogPruneResult;
-use crate::drain::BackendDrainState;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 use novarocks_native_adapter::generated::nova_rocks_grpc_server::NovaRocksGrpc;
+use novarocks_worker::WorkerDrainState;
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///
@@ -77,7 +77,7 @@ pub(crate) struct BackendProcessFacts {
     /// naming a different one is a stale peer talking to a replaced process.
     pub(crate) process_id: BackendProcessId,
     pub(crate) descriptor: BackendProcessDescriptor,
-    pub(crate) drain: Arc<BackendDrainState>,
+    pub(crate) drain: Arc<WorkerDrainState>,
     pub(crate) task_execution_registry: Arc<TaskExecutionRegistry>,
 }
 

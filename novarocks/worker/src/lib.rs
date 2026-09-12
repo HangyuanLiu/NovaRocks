@@ -27,6 +27,7 @@ use std::num::NonZeroUsize;
 mod admission;
 mod convergence;
 mod domain;
+mod drain;
 mod ingress;
 mod lease;
 mod lifecycle;
@@ -46,6 +47,7 @@ pub use domain::{
     commit_task_domain_updates, initial_domain_keys, plan_task_domain_updates,
     task_domain_reaches_execution, validate_task_domain_membership,
 };
+pub use drain::WorkerDrainState;
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};
 pub use lifecycle::{
