@@ -19,6 +19,7 @@
 
 use std::io;
 
+use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::protocol_delivery::GovernedProtocolOwner;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
 use novarocks_query_application::session_error::QueryServiceError;
@@ -116,7 +117,7 @@ pub async fn write_governed_terminal_error<W: AsyncWrite + Unpin>(
     mut protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
-    if protocol.cancellation().is_cancelled() {
+    if cancellation_overrides_typed_error(protocol.cancellation().reason()) {
         let _ = protocol.settle_cancellation();
         return results
             .error(ErrorKind::ER_QUERY_INTERRUPTED, b"query cancelled")
@@ -135,6 +136,13 @@ pub async fn write_governed_terminal_error<W: AsyncWrite + Unpin>(
             Err(error)
         }
     }
+}
+
+fn cancellation_overrides_typed_error(reason: Option<QueryCancellationReason>) -> bool {
+    !matches!(
+        reason,
+        Some(QueryCancellationReason::DeadlineExceeded { .. })
+    ) && reason.is_some()
 }
 
 #[cfg(test)]
@@ -161,5 +169,15 @@ mod tests {
             mysql_error_kind(&QueryServiceError::from_user_error(user_error)),
             ErrorKind::ER_NO_SUCH_TABLE
         );
+    }
+
+    #[test]
+    fn deadline_cancellation_keeps_the_typed_timeout_error() {
+        assert!(!cancellation_overrides_typed_error(Some(
+            QueryCancellationReason::DeadlineExceeded { timeout_ms: 1_000 },
+        )));
+        assert!(cancellation_overrides_typed_error(Some(
+            QueryCancellationReason::ClientDisconnected,
+        )));
     }
 }
