@@ -2031,8 +2031,9 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     // MV rewrite is an optional SQL optimization. An application composition
-    // without an MV repository supplies no snapshot; a repository that is
-    // available but fails to freeze remains a planning error.
+    // without an MV repository supplies no snapshot. An unavailable optional
+    // MV inventory likewise supplies no candidates; required table bindings
+    // still fail through their own preparation path.
     let mv_definitions = if allow_mv_rewrite_candidates {
         Some(
             crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(

@@ -21,7 +21,7 @@
 //! compiler receives the resulting immutable definition index and owns all
 //! candidate parse/analyze/statistics/selection work.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
@@ -38,9 +38,7 @@ pub fn freeze_mv_rewrite_definition_index_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = readiness
-        .list_ready_projections()
-        .map_err(|error| format!("list mv definitions: {error}"))?;
+    let definitions = optional_candidate_inventory(readiness.list_ready_projections());
 
     let report = novarocks_mv_application::candidate::inspect_candidates(
         definitions,
@@ -61,6 +59,22 @@ pub fn freeze_mv_rewrite_definition_index_with_ports(
         );
     }
     MvRewriteDefinitionIndex::try_new(report.into_accepted())
+}
+
+/// An MV inventory is an optional rewrite input.  Losing it must only remove
+/// rewrite candidates; it cannot prevent the required base-table query from
+/// being planned.
+fn optional_candidate_inventory<T, E>(inventory: Result<Vec<T>, E>) -> Vec<T>
+where
+    E: fmt::Display,
+{
+    match inventory {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
+            Vec::new()
+        }
+    }
 }
 
 fn freeze_mv_rewrite_definition(
@@ -240,4 +254,16 @@ fn freeze_base_table_state(
         reference_facts.current_snapshot_id(),
         Some(captured.object_id),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_candidate_inventory;
+
+    #[test]
+    fn unavailable_inventory_becomes_an_empty_optional_candidate_set() {
+        let candidates = optional_candidate_inventory::<u8, _>(Err("StateStore unavailable"));
+
+        assert!(candidates.is_empty());
+    }
 }
