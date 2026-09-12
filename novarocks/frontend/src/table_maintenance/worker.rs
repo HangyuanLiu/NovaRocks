@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_table_maintenance::job_service::{CapturedOptimizeTarget, OptimizeTargetCapturePort};
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::worker::{
     OptimizeJobAdmission, OptimizeJobAdmissionPort, OptimizeJobExecution, OptimizeJobExecutionPort,
@@ -34,6 +35,30 @@ use novarocks_workload_control::{
 use crate::query_execution::maintenance::TableMaintenanceEngine;
 
 use super::DistributedRewriteIntent;
+
+/// Frontend-only provider binding capture for a product-gated OPTIMIZE job.
+pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+}
+
+impl<'a> FrontendOptimizeTargetCapturePort<'a> {
+    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
+    fn capture(
+        &self,
+        target: &novarocks_table_maintenance::MaintenanceTarget,
+    ) -> Result<CapturedOptimizeTarget, String> {
+        let object_id = self.engine.capture_target_object_id(target)?;
+        Ok(CapturedOptimizeTarget {
+            object_id: object_id.as_bytes().to_vec(),
+            base_snapshot_id: self.engine.current_snapshot_id(target)?,
+        })
+    }
+}
 
 pub(crate) struct FrontendOptimizeJobAdmissionPort {
     root_admission: RootAdmissionHandle,

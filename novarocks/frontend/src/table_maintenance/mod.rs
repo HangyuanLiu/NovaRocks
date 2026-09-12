@@ -39,23 +39,24 @@ pub(crate) use self::admission::{
     is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
 };
 use self::result::{action_result, optimize_jobs_result};
-use self::worker::{FrontendOptimizeJobAdmissionPort, FrontendOptimizeJobExecutionPort};
+use self::worker::{
+    FrontendOptimizeJobAdmissionPort, FrontendOptimizeJobExecutionPort,
+    FrontendOptimizeTargetCapturePort,
+};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::query_execution::maintenance::{
     MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceEngine,
     TableMaintenanceService,
 };
-use novarocks_table_maintenance::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
+use novarocks_table_maintenance::activity::MaintenanceActivityFamily;
 use novarocks_table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };
-use novarocks_table_maintenance::runtime::{
-    RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
-};
+use novarocks_table_maintenance::job_service::OptimizeJobService;
+use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::worker::OptimizeWorker;
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeProcessRuntime,
-    OptimizeSubmission,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
 pub mod admission;
@@ -70,8 +71,7 @@ enum WorkerLifecycle {
 
 // Design: ADR-0111 (docs/adr/ADR-0111-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
 pub struct FrontendTableMaintenanceService {
-    optimize_runtime: Arc<OptimizeProcessRuntime>,
-    activity: TableMaintenanceActivity,
+    optimize_jobs: OptimizeJobService,
     gc_observations: Option<Arc<GcOwnedRefObservationAccelerator>>,
     worker: Mutex<WorkerLifecycle>,
     runtime: Handle,
@@ -111,8 +111,7 @@ impl FrontendTableMaintenanceService {
             None => None,
         };
         Ok(Self {
-            optimize_runtime: Arc::new(OptimizeProcessRuntime::new()),
-            activity: TableMaintenanceActivity::default(),
+            optimize_jobs: OptimizeJobService::new(),
             gc_observations,
             worker: Mutex::new(WorkerLifecycle::NotStarted),
             runtime,
@@ -151,8 +150,8 @@ impl FrontendTableMaintenanceService {
             }
             ParsedMaintenanceAction::RewriteDataFiles { .. } => {
                 let _permit = self
-                    .activity
-                    .acquire(&target, MaintenanceActivityFamily::Metadata)
+                    .optimize_jobs
+                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
                 execute_distributed_rewrite(
                     engine,
@@ -165,8 +164,8 @@ impl FrontendTableMaintenanceService {
                 where_clause,
             } => {
                 let _permit = self
-                    .activity
-                    .acquire(&target, MaintenanceActivityFamily::Metadata)
+                    .optimize_jobs
+                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
                 execute_distributed_rewrite(
                     engine,
@@ -176,8 +175,8 @@ impl FrontendTableMaintenanceService {
             }
             action => {
                 let _permit = self
-                    .activity
-                    .acquire(&target, MaintenanceActivityFamily::Metadata)
+                    .optimize_jobs
+                    .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
                 engine.execute_action(action.into_request(engine, target)?)?
             }
@@ -221,8 +220,8 @@ impl FrontendTableMaintenanceService {
         older_than_ms: i64,
     ) -> Result<MaintenanceActionOutcome, String> {
         let _permit = self
-            .activity
-            .acquire(&target, MaintenanceActivityFamily::Cleanup)
+            .optimize_jobs
+            .acquire_activity(&target, MaintenanceActivityFamily::Cleanup)
             .map_err(|error| error.to_string())?;
         let (now_ms, safe_age_ms) = self.cleanup_gc_timing(older_than_ms)?;
         let observations = self.gc_observations.as_ref().ok_or_else(|| {
@@ -341,34 +340,14 @@ impl FrontendTableMaintenanceService {
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String> {
-        // Acquire the target conflict right before observing any provider
-        // identity or base version. Capturing first leaves a TOCTOU window in
-        // which another maintenance operation can replace the exact object
-        // that this job would later bind and dispatch against.
-        let permit = self
-            .activity
-            .acquire(&target, MaintenanceActivityFamily::Optimize)
-            .map_err(|_| "an optimize job is already active for this table".to_string())?;
-        let object_id = engine.capture_target_object_id(&target)?;
-        let base_snapshot_id = engine.current_snapshot_id(&target)?;
-        let submitted = self.block_on(self.optimize_runtime.submit(
-            novarocks_table_maintenance::runtime::JobCreate {
-                target,
-                object_id: object_id.as_bytes().to_vec(),
-                base_snapshot_id,
-                created_at_ms: now_unix_millis(),
-            },
-            permit,
-        ));
-        match submitted {
-            Ok(job) => {
+        let capture = FrontendOptimizeTargetCapturePort::new(engine);
+        match self.block_on(self.optimize_jobs.submit_optimize(target, &capture)) {
+            Ok(OptimizeSubmission::Submitted { job_id }) => {
                 self.wakeup_worker()?;
-                Ok(OptimizeSubmission::Submitted { job_id: job.job_id })
+                Ok(OptimizeSubmission::Submitted { job_id })
             }
-            Err(error) if error.kind() == OptimizeRuntimeErrorKind::AlreadyActive => {
-                Ok(OptimizeSubmission::AlreadyActive)
-            }
-            Err(error) => Err(format!("create frontend optimize job failed: {error}")),
+            Ok(OptimizeSubmission::AlreadyActive) => Ok(OptimizeSubmission::AlreadyActive),
+            Err(error) => Err(error),
         }
     }
 
@@ -377,9 +356,7 @@ impl FrontendTableMaintenanceService {
         statement: ParsedShowOptimize,
         context: MaintenanceRequestContext<'_>,
     ) -> Result<MaintenanceStatementResult, String> {
-        let mut jobs = self
-            .block_on(self.optimize_runtime.list())
-            .map_err(|error| format!("show frontend optimize jobs failed: {error}"))?;
+        let mut jobs = self.block_on(self.optimize_jobs.list())?;
         if let Some(catalog) = statement.catalog.as_deref().or(context.current_catalog) {
             jobs.retain(|job| job.target.catalog == catalog);
         }
@@ -414,7 +391,7 @@ impl FrontendTableMaintenanceService {
     }
 
     pub(crate) async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {
-        self.optimize_runtime.stop_admission();
+        self.optimize_jobs.stop_admission();
         let previous = {
             let mut lifecycle = self
                 .worker
@@ -443,7 +420,7 @@ impl FrontendTableMaintenanceService {
     }
 
     pub(crate) fn request_shutdown_for_process_exit(&self) {
-        self.optimize_runtime.stop_admission();
+        self.optimize_jobs.stop_admission();
         let lifecycle = self
             .worker
             .lock()
@@ -679,7 +656,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             WorkerLifecycle::NotStarted => {
                 *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start(
                     &self.runtime,
-                    Arc::clone(&self.optimize_runtime),
+                    self.optimize_jobs.runtime(),
                     Arc::new(FrontendOptimizeJobAdmissionPort::new(
                         self.root_admission.clone(),
                     )),
@@ -777,8 +754,8 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                     }
                 };
                 let _permit = self
-                    .activity
-                    .acquire(target, MaintenanceActivityFamily::Metadata)
+                    .optimize_jobs
+                    .acquire_activity(target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
                 engine.execute_action(request)
             }
@@ -797,11 +774,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
         &self,
         handle: novarocks_table_maintenance::runtime::JobHandle,
     ) -> Result<novarocks_table_maintenance::runtime::MaintenanceJobState, String> {
-        self.optimize_runtime
-            .wait_for_completion(handle.job_id())
-            .await
-            .map(|job| job.state)
-            .map_err(|error| format!("wait for frontend optimize job failed: {error}"))
+        self.optimize_jobs.wait_for_completion(handle).await
     }
 
     fn execute_automatic_optimize_durably(
@@ -914,12 +887,4 @@ fn cleanup_candidates_first_page(
         return Err("cleanup discovery returned a non-terminal empty candidate page".to_string());
     }
     Ok(page.candidates().to_vec())
-}
-
-fn now_unix_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|value| i64::try_from(value.as_millis()).ok())
-        .unwrap_or(0)
 }

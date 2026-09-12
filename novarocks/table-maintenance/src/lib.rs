@@ -26,6 +26,7 @@ use std::collections::BTreeMap;
 
 pub mod activity;
 pub mod gc_observation;
+pub mod job_service;
 pub mod runtime;
 pub mod worker;
 
