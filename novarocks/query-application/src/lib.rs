@@ -50,6 +50,8 @@ pub mod session_outcome;
 /// Query-session admission requests independent of a wire protocol.
 pub mod session;
 
+/// Process-local serving admission whose transitions are driven by role composition.
+pub mod serving_admission;
 /// Session generations, governed statement control, and protocol settlement.
 pub mod session_control;
 /// Statement-local external-effect boundary for safe topology retry.

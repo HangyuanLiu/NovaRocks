@@ -381,7 +381,7 @@ pub fn build_frontend_query_session_factory(
         host.connector_blocking_io_supervisor(),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
-        (*host.serving_lifecycle()).clone(),
+        host.serving_lifecycle().admission(),
     ));
     host.mark_ready()?;
     Ok(query_service)

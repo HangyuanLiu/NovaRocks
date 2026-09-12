@@ -30,9 +30,9 @@ use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceRead
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
 use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
-    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendServingState,
-    FrontendWorkloadServingSnapshot,
+    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
 };
+use novarocks_query_application::serving_admission::FrontendServingState;
 
 use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
 

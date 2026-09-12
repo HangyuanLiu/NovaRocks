@@ -19,35 +19,17 @@
 //!
 //! Design: ADR-0121. This owner deliberately has no knowledge of MySQL,
 //! Native transport, a background scheduler, or business-root ownership. Its
-//! mutex is the single linearization point for serving-state transitions and
-//! session registration.
+//! query application owns the serving-admission linearization; this owner
+//! retains only sanitized catalog and management observation.
 
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use novarocks_query_application::serving_admission::{
+    FrontendAdmissionError, FrontendServingAdmission, FrontendServingState,
+};
 use novarocks_workload_control::{WorkClass, WorkClassTotals, WorkloadObservationHandle};
 use serde::Serialize;
-
-/// Monotonic, FE-local serving state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontendServingState {
-    Starting,
-    Ready,
-    Draining,
-    Stopping,
-}
-
-impl FrontendServingState {
-    pub const fn as_metric_label(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Ready => "ready",
-            Self::Draining => "draining",
-            Self::Stopping => "stopping",
-        }
-    }
-}
 
 /// Closed source labels exposed by the sanitized FE management surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -66,14 +48,6 @@ impl FrontendCatalogSourceMode {
             Self::ManagedController => "managed_controller",
         }
     }
-}
-
-/// Typed rejection returned before a workload can mutate session or execution state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrontendAdmissionError {
-    NotReady { state: FrontendServingState },
-    Draining,
-    Stopping,
 }
 
 /// A sanitized snapshot identity. Catalog names, properties, credential references,
@@ -290,21 +264,13 @@ fn frontend_totals_from_root(totals: &WorkClassTotals) -> FrontendWorkloadTotals
 }
 
 struct Inner {
-    state: FrontendServingState,
     catalog: FrontendCatalogServingSnapshot,
-    rejected_sessions: u64,
-    drain_started_at: Option<SystemTime>,
-    drain_deadline: Option<SystemTime>,
 }
 
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            state: FrontendServingState::Starting,
             catalog: FrontendCatalogServingSnapshot::default(),
-            rejected_sessions: 0,
-            drain_started_at: None,
-            drain_deadline: None,
         }
     }
 }
@@ -313,10 +279,11 @@ struct LifecycleShared {
     inner: Mutex<Inner>,
 }
 
-/// Process-runtime authority for serving state and session registration.
+/// Role-local management observation around the query application's admission owner.
 // Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 #[derive(Clone)]
 pub struct FrontendServingLifecycle {
+    admission: FrontendServingAdmission,
     shared: Arc<LifecycleShared>,
 }
 
@@ -329,6 +296,7 @@ impl Default for FrontendServingLifecycle {
 impl FrontendServingLifecycle {
     pub fn new() -> Self {
         let lifecycle = Self {
+            admission: FrontendServingAdmission::new(),
             shared: Arc::new(LifecycleShared {
                 inner: Mutex::new(Inner::default()),
             }),
@@ -337,18 +305,9 @@ impl FrontendServingLifecycle {
         lifecycle
     }
 
-    /// Classifies a rejected statement against the authoritative FE serving
-    /// state, including an admission that raced with drain closure.
-    pub fn admission_error(&self) -> Option<FrontendAdmissionError> {
-        let inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        match inner.state {
-            FrontendServingState::Ready => None,
-            state => Some(admission_error(state)),
-        }
+    /// The query application's exact session-admission owner.
+    pub fn admission(&self) -> FrontendServingAdmission {
+        self.admission.clone()
     }
 
     /// Publishes sanitized catalog bootstrap facts. The caller owns catalog
@@ -378,18 +337,7 @@ impl FrontendServingLifecycle {
     /// Transitions only from Starting to Ready after the bootstrap owner has
     /// completed its exact snapshot/materialization barrier.
     pub fn mark_ready(&self) -> Result<(), FrontendAdmissionError> {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        match inner.state {
-            FrontendServingState::Starting => inner.state = FrontendServingState::Ready,
-            FrontendServingState::Ready => return Ok(()),
-            FrontendServingState::Draining => return Err(FrontendAdmissionError::Draining),
-            FrontendServingState::Stopping => return Err(FrontendAdmissionError::Stopping),
-        }
-        drop(inner);
+        self.admission.mark_ready()?;
         self.publish_metrics();
         Ok(())
     }
@@ -397,58 +345,15 @@ impl FrontendServingLifecycle {
     /// Atomically closes admission and records the one-way drain deadline.
     /// Repeated calls preserve the original deadline and are idempotent.
     pub fn begin_drain(&self, timeout: Duration) -> FrontendServingState {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        if inner.state == FrontendServingState::Ready {
-            let started = SystemTime::now();
-            inner.state = FrontendServingState::Draining;
-            inner.drain_started_at = Some(started);
-            inner.drain_deadline = Some(started + timeout);
-        }
-        let state = inner.state;
-        drop(inner);
+        let state = self.admission.begin_drain(timeout);
         self.publish_metrics();
         state
     }
 
     /// Marks final teardown without creating a path back to Ready.
     pub fn mark_stopping(&self) {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        if inner.state != FrontendServingState::Stopping {
-            inner.state = FrontendServingState::Stopping;
-        }
-        drop(inner);
+        self.admission.mark_stopping();
         self.publish_metrics();
-    }
-
-    /// Runs session registration in the same mutex domain as drain. Sessions
-    /// are not active attempts and do not receive a lease.
-    pub fn register_session<T>(
-        &self,
-        registration: impl FnOnce() -> T,
-    ) -> Result<T, FrontendAdmissionError> {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        let result = match inner.state {
-            FrontendServingState::Ready => Ok(registration()),
-            state => {
-                inner.rejected_sessions = inner.rejected_sessions.saturating_add(1);
-                Err(admission_error(state))
-            }
-        };
-        drop(inner);
-        self.publish_metrics();
-        result
     }
 
     fn publish_metrics(&self) {
@@ -463,24 +368,25 @@ impl FrontendServingSnapshotReader for FrontendServingLifecycle {
             .inner
             .lock()
             .expect("frontend lifecycle lock poisoned");
+        let admission = self.admission.snapshot();
         let now = SystemTime::now();
         FrontendServingSnapshot {
             schema_version: 1,
-            serving_state: inner.state,
+            serving_state: admission.state,
             catalog: inner.catalog.clone(),
             workload: FrontendWorkloadServingSnapshot {
                 active: FrontendActiveWorkloads::default(),
                 rejected_admissions: FrontendWorkloadTotals {
-                    session: inner.rejected_sessions,
+                    session: admission.rejected_sessions,
                     ..FrontendWorkloadTotals::default()
                 },
                 completed_during_drain: FrontendWorkloadTotals::default(),
                 deadline_cancelled: FrontendWorkloadTotals::default(),
             },
             drain: FrontendDrainServingSnapshot {
-                started_at_unix_ms: inner.drain_started_at.and_then(unix_millis),
-                deadline_unix_ms: inner.drain_deadline.and_then(unix_millis),
-                elapsed_ms: inner
+                started_at_unix_ms: admission.drain_started_at.and_then(unix_millis),
+                deadline_unix_ms: admission.drain_deadline.and_then(unix_millis),
+                elapsed_ms: admission
                     .drain_started_at
                     .and_then(|started| now.duration_since(started).ok())
                     .map_or(0, |elapsed| {
@@ -488,14 +394,6 @@ impl FrontendServingSnapshotReader for FrontendServingLifecycle {
                     }),
             },
         }
-    }
-}
-
-fn admission_error(state: FrontendServingState) -> FrontendAdmissionError {
-    match state {
-        FrontendServingState::Draining => FrontendAdmissionError::Draining,
-        FrontendServingState::Stopping => FrontendAdmissionError::Stopping,
-        state => FrontendAdmissionError::NotReady { state },
     }
 }
 
@@ -575,7 +473,7 @@ mod tests {
         lifecycle.mark_ready().expect("mark ready");
         lifecycle.begin_drain(Duration::from_secs(1));
         assert_eq!(
-            lifecycle.register_session(|| 7),
+            lifecycle.admission().register_session(|| 7),
             Err(FrontendAdmissionError::Draining)
         );
     }

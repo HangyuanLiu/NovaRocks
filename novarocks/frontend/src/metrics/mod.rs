@@ -24,9 +24,8 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
-use crate::workload_lifecycle::{
-    FrontendCatalogSourceMode, FrontendServingSnapshot, FrontendServingState,
-};
+use crate::workload_lifecycle::{FrontendCatalogSourceMode, FrontendServingSnapshot};
+use novarocks_query_application::serving_admission::FrontendServingState;
 
 pub(crate) mod dml_publication;
 mod http;

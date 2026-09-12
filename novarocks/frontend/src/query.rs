@@ -42,7 +42,6 @@ use crate::query_execution::service::QueryExecutionService;
 use crate::statistics::command::StatisticsCommandExecutor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::view::command::ViewCommandExecutor;
-use crate::workload_lifecycle::{FrontendAdmissionError, FrontendServingLifecycle};
 use async_trait::async_trait;
 use novarocks_parser::{
     ast::{self, Statement as ParsedStatement},
@@ -65,6 +64,9 @@ use novarocks_query_application::protocol_delivery::{
     GovernedImmediateStatementResult, QuerySessionOutput as StatementResult,
 };
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
+use novarocks_query_application::serving_admission::{
+    FrontendAdmissionError, FrontendServingAdmission,
+};
 use novarocks_query_application::session::{
     QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
 };
@@ -412,7 +414,7 @@ pub struct FrontendQueryService {
     /// whenever the session did not set one itself.
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
-    serving_lifecycle: FrontendServingLifecycle,
+    serving_admission: FrontendServingAdmission,
 }
 
 impl FrontendQueryService {
@@ -448,7 +450,7 @@ impl FrontendQueryService {
         connector_blocking_io: ConnectorBlockingIoSupervisor,
         optimizer_query_mem_limit_bytes: u64,
         lake_publication_runtime_policy: LakePublicationRuntimePolicy,
-        serving_lifecycle: FrontendServingLifecycle,
+        serving_admission: FrontendServingAdmission,
     ) -> Self {
         Self {
             session_catalog_resolver,
@@ -483,7 +485,7 @@ impl FrontendQueryService {
             connector_blocking_io,
             optimizer_query_mem_limit_bytes,
             lake_publication_runtime_policy,
-            serving_lifecycle,
+            serving_admission,
         }
     }
 }
@@ -497,7 +499,7 @@ impl QuerySessionFactory for FrontendQueryService {
         let identity =
             SessionIdentity::new(request.connection_token(), request.principal().to_string());
         let lease = self
-            .serving_lifecycle
+            .serving_admission
             .register_session(|| query_control.register_session(identity))
             .map_err(query_service_admission_error)?
             .map_err(|error| {
@@ -545,7 +547,7 @@ impl FrontendQuerySession {
             error,
             GovernedQueryStatementBeginError::Admission(WorkError::Closed)
         ) {
-            if let Some(admission) = self.service.serving_lifecycle.admission_error() {
+            if let Some(admission) = self.service.serving_admission.admission_error() {
                 return query_service_admission_error(admission);
             }
         }
