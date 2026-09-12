@@ -17,7 +17,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::state_family::StateFamily;
 use novarocks_state_store_runtime::{
     DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord,
 };
@@ -26,15 +25,12 @@ use novarocks_state_store_runtime::{
 /// JSON record is capped at the global StateStore value budget before a write
 /// transaction is opened.
 const CATALOG_ATTACHMENT_ENCODED_LIMIT: usize = novarocks_state_store_api::MAX_VALUE_BYTES;
-/// Record version of the catalog desired-state family.
-///
-/// Declared by the manifest, not here: a second literal could disagree with
-/// the version the manifest publishes and nothing would catch it.
+use super::CATALOG_DESIRED_STATE_FAMILY;
+
+/// Record version is owned by the Catalog application's frozen family
+/// descriptor. No Frontend manifest mirrors this durable fact.
 pub(crate) const CATALOG_ATTACHMENT_SCHEMA_VERSION: u8 =
-    match StateFamily::CatalogDesiredState.record_version() {
-        Some(version) => version,
-        None => panic!("catalog desired state is a durable external projection"),
-    };
+    CATALOG_DESIRED_STATE_FAMILY.record_version();
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

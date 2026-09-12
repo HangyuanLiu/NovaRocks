@@ -22,11 +22,15 @@
 //! those records.
 
 mod durable;
+mod family;
 mod policy;
 mod runner;
 
 pub use durable::{
     DurableOpaqueBytes, DurableRecord, DurableRecordError, DurableRecordStore, EncodedRecord,
+};
+pub use family::{
+    PersistentStateFamily, PersistentStateFamilyError, validate_persistent_state_families,
 };
 
 pub use policy::{

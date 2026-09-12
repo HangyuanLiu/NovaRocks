@@ -3633,8 +3633,19 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "futures",
+ "hex",
  "novarocks-connector-starrocks",
  "novarocks-spi",
+ "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
+ "novarocks-state-store-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

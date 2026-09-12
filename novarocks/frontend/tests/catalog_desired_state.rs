@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use common::state_store_fixture;
 use novarocks_catalog_application::ConnectorControlHost;
+use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
@@ -48,7 +49,6 @@ use novarocks_frontend::catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
     CatalogDropCommand, CatalogRuntimeProjection, FrontendCatalogApplicationPort,
 };
-use novarocks_frontend::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use novarocks_frontend::topology::ClusterBackendOpenConfig;
 use novarocks_native_adapter::FrontendNativeTransport;

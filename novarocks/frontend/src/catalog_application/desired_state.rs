@@ -59,10 +59,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{CatalogApplicationError, CatalogApplicationErrorKind};
-use crate::catalog_attachment::{
-    CatalogAttachment, CatalogAttachmentRepository, CatalogAttachmentWakeupSignal,
+use novarocks_catalog_application::{
+    CATALOG_DESIRED_STATE_FAMILY, CatalogAttachment, CatalogAttachmentRepository,
+    CatalogAttachmentWakeupSignal,
 };
-use crate::state_family::StateFamily;
 
 /// Domain separator for the snapshot identity digest.
 const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v3";
@@ -78,16 +78,10 @@ const CATALOG_VERSION_DOMAIN: &[u8] = b"novarocks/frontend/catalog/execution-def
 /// The config format version the dynamic StateStore mode stamps on every entry
 /// it enumerates.
 ///
-/// Taken from the state family manifest rather than re-declared here: the
-/// durable attachment record version *is* the config format version that mode
-/// produces, and the manifest is the single definition point for it.
-const DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION: u8 =
-    match StateFamily::CatalogDesiredState.record_version() {
-        Some(version) => version,
-        // The manifest registers this family as a durable external projection,
-        // so it always declares exactly one record version.
-        None => panic!("the catalog desired-state family declares a record version"),
-    };
+/// Taken from Catalog's owned durable family descriptor rather than
+/// re-declared here: the attachment record version is the config format
+/// version that dynamic StateStore mode produces.
+const DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION: u8 = CATALOG_DESIRED_STATE_FAMILY.record_version();
 
 /// The closed set of catalog desired-state source modes.
 ///
@@ -887,7 +881,7 @@ fn invalid_logical_config(detail: impl std::fmt::Display) -> CatalogApplicationE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog_attachment::CatalogAttachment;
+    use novarocks_catalog_application::CatalogAttachment;
 
     fn config(name: &str, display: &str) -> CatalogLogicalConfig {
         CatalogLogicalConfig::try_new(
@@ -1021,12 +1015,10 @@ mod tests {
     }
 
     #[test]
-    fn the_dynamic_mode_stamps_the_manifest_record_version() {
+    fn the_dynamic_mode_stamps_the_catalog_owned_record_version() {
         assert_eq!(
             DYNAMIC_STATE_STORE_CONFIG_FORMAT_VERSION,
-            StateFamily::CatalogDesiredState
-                .record_version()
-                .expect("the catalog desired-state family declares a record version")
+            CATALOG_DESIRED_STATE_FAMILY.record_version()
         );
     }
 

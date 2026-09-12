@@ -19,7 +19,6 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
@@ -35,11 +34,13 @@ use novarocks_state_store_runtime::{
 };
 use uuid::Uuid;
 
+use super::CatalogReferenceReader;
 use super::codec::{
     CATALOG_ATTACHMENT_SCHEMA_VERSION, StoredCatalogAttachment, StoredCredentialBinding,
     StoredProperty, decode, encode,
 };
 use super::key::{attachment_key, attachment_prefix};
+use super::metrics::CatalogAttachmentMetrics;
 use super::wakeup::{CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal};
 
 const DEFAULT_ATTACHMENT_SCAN_PAGE_SIZE: usize = 256;
@@ -114,7 +115,7 @@ impl std::error::Error for CatalogAttachmentError {}
 pub struct CatalogAttachmentRepository {
     store: Arc<dyn StateStore>,
     durable: DurableRecordStore,
-    metrics: Arc<StateStoreMetrics>,
+    metrics: Arc<CatalogAttachmentMetrics>,
     policy: StateStoreRunPolicy,
     /// Wakeups for this repository instance's own committed writes. Shared by
     /// every clone, so the port that writes and the controller that reads see
@@ -129,13 +130,7 @@ impl CatalogAttachmentRepository {
     ) -> Result<Self, CatalogAttachmentError> {
         let repository = Self {
             durable: DurableRecordStore::new(Arc::clone(&store)),
-            // A business owner, not the storage provider. This consumer used to
-            // invent a `frontend-catalog` provider identity so it had something
-            // to label counters with, which attributed catalog retries to a
-            // provider that does not exist.
-            metrics: Arc::new(StateStoreMetrics::new(
-                StateStoreConsumer::CATALOG_ATTACHMENT,
-            )),
+            metrics: Arc::new(CatalogAttachmentMetrics::default()),
             store,
             policy,
             wakeup: Arc::new(CatalogAttachmentWakeup::new()),
@@ -429,35 +424,32 @@ impl CatalogAttachmentRepository {
     /// side already reports that through its existing unavailable/fail-closed
     /// paths, so the outcome is a refused refresh, never a wrong lake
     /// publication.
-    pub(crate) async fn observe_materialized_view_references(
+    pub async fn observe_references_before_drop(
         &self,
+        reader: &dyn CatalogReferenceReader,
         instance_id: &ConnectorInstanceId,
         page_size: usize,
     ) -> Result<(), CatalogAttachmentError> {
-        match crate::mv::repository::observe_catalog_references(
-            self.store.as_ref(),
-            instance_id.as_str(),
-            page_size,
-        )
-        .await
+        match reader
+            .observe_references(self.store.as_ref(), instance_id, page_size)
+            .await
         {
             Ok(None) => Ok(()),
-            Ok(Some(reference)) => Err(CatalogAttachmentError::new(
+            Ok(Some(reference_description)) => Err(CatalogAttachmentError::new(
                 CatalogAttachmentErrorKind::Conflict,
                 format!(
-                    "catalog {} still has {} in the materialized view accelerator; \
+                    "catalog {} still has {reference_description}; \
                      this is a best-effort operational check, not a cross-system \
                      serializability guarantee: drop the referencing materialized \
                      views before dropping the catalog",
                     instance_id.as_str(),
-                    reference.describe(),
                 ),
             )),
             Err(error) => {
                 tracing::warn!(
                     %error,
                     catalog = instance_id.as_str(),
-                    "materialized view reference check could not read the accelerator; \
+                    "catalog reference check could not read its observation; \
                      the catalog drop proceeds without an observation",
                 );
                 Ok(())
@@ -768,21 +760,90 @@ fn run_failure(context: &str, failure: RunFailure) -> CatalogAttachmentError {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use crate::mv::domain::dependency::model::{
-        MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-    };
-    use crate::state_store::testing::{
-        StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-        StateStoreLimitOverrides, StateStoreProviderConfig, TEST_STATE_STORE_PROVIDER_ID,
-        builtin_state_store_provider_registry,
-    };
-    use bytes::Bytes;
-    use novarocks_state_store_api::{CommitOutcome, Precondition, StateStore};
+    use futures::future::BoxFuture;
+    use novarocks_state_store_api::{StateStore, StateStoreLimits};
     use novarocks_state_store_testkit::conformance::{FaultGate, FaultInjectingStateStore};
+    use novarocks_state_store_testkit::testing::InMemoryStateStore;
 
     use super::*;
+
+    /// Test-only composition adapter. Product provider construction remains
+    /// outside Catalog; these tests need only a contract-conforming store with
+    /// the requested value bound.
+    struct StateStoreHost {
+        store: Arc<dyn StateStore>,
+    }
+
+    impl StateStoreHost {
+        async fn open(_: &(), config: StateStoreHostConfig, _: Instant) -> Result<Self, String> {
+            let StateStoreHostConfig {
+                state_store:
+                    StateStoreAppConfig {
+                        store:
+                            StateStoreConfig {
+                                cluster_id,
+                                limits,
+                                provider: StateStoreProviderConfig::Sqlite { path },
+                            },
+                        mysql_client,
+                    },
+                foundationdb_client,
+            } = config;
+            let _ = (path, mysql_client, foundationdb_client);
+            let mut resolved = StateStoreLimits::default();
+            if let Some(max_value_bytes) = limits.max_value_bytes {
+                resolved.max_value_bytes = max_value_bytes;
+            }
+            Ok(Self {
+                store: Arc::new(InMemoryStateStore::with_limits(cluster_id, resolved)),
+            })
+        }
+
+        fn state_store(&self) -> Option<Arc<dyn StateStore>> {
+            Some(Arc::clone(&self.store))
+        }
+
+        fn run_policy(&self) -> StateStoreRunPolicy {
+            StateStoreRunPolicy::default()
+        }
+
+        async fn shutdown(&mut self, _: Instant) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn builtin_state_store_provider_registry() -> Result<(), String> {
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct StateStoreLimitOverrides {
+        max_value_bytes: Option<usize>,
+    }
+
+    enum StateStoreProviderConfig {
+        Sqlite { path: PathBuf },
+    }
+
+    struct StateStoreConfig {
+        cluster_id: String,
+        limits: StateStoreLimitOverrides,
+        provider: StateStoreProviderConfig,
+    }
+
+    struct StateStoreAppConfig {
+        store: StateStoreConfig,
+        mysql_client: Option<()>,
+    }
+
+    struct StateStoreHostConfig {
+        state_store: StateStoreAppConfig,
+        foundationdb_client: Option<()>,
+    }
 
     /// Reserves one write attempt from the store that will run it.
     ///
@@ -906,7 +967,6 @@ mod tests {
         )
         .await
         .expect("open SQLite StateStore");
-        assert_eq!(host.provider_id(), TEST_STATE_STORE_PROVIDER_ID);
         let store = host.state_store().expect("ready StateStore");
         let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
             .await
@@ -1171,12 +1231,23 @@ mod tests {
             .expect("shutdown SQLite StateStore");
     }
 
-    /// The refusal survives; only where it comes from changed. It is now an
-    /// observation taken before the delete, so the assertion is on the check
-    /// and on the untouched record — not on a transaction that read two
-    /// families at once.
+    struct ReportingReferenceReader;
+
+    impl CatalogReferenceReader for ReportingReferenceReader {
+        fn observe_references<'a>(
+            &'a self,
+            _: &'a dyn StateStore,
+            _: &'a ConnectorInstanceId,
+            _: usize,
+        ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
+            Box::pin(async { Ok(Some("a materialized view upstream dependency")) })
+        }
+    }
+
+    /// The refusal remains an observation, not a transaction spanning Catalog
+    /// and MV. The MV owner supplies the narrow reader at composition.
     #[tokio::test]
-    async fn an_observed_materialized_view_dependency_refuses_the_drop_and_keeps_attachment() {
+    async fn an_observed_product_reference_refuses_the_drop_and_keeps_attachment() {
         let directory = tempfile::tempdir().expect("temporary SQLite StateStore directory");
         let registry =
             builtin_state_store_provider_registry().expect("builtin StateStore registry");
@@ -1208,39 +1279,12 @@ mod tests {
             .await
             .expect("create catalog attachment");
 
-        let upstream = MvDependencyObjectRef {
-            catalog: Some(created.attachment.instance_id.as_str().to_string()),
-            database_or_namespace: "sales".to_string(),
-            name: "orders".to_string(),
-            object_type: MvDependencyObjectType::Table,
-            storage_engine: MvDependencyStorageEngine::Iceberg,
-        };
-        let dependency_key = crate::mv::repository::key::dependency_by_upstream_key(&upstream, 1)
-            .expect("MV upstream dependency key");
-        let mut transaction = store
-            .begin_write(
-                reserve(store.as_ref()),
-                "seed materialized view dependency for catalog drop fence",
-            )
-            .await
-            .expect("begin seed transaction");
-        transaction
-            .put(
-                dependency_key,
-                Bytes::from_static(b"dependency index marker")
-                    .try_into()
-                    .expect("StateStore value"),
-                Precondition::Absent,
-            )
-            .await
-            .expect("write dependency index marker");
-        assert!(matches!(
-            transaction.commit().await,
-            CommitOutcome::Committed(_)
-        ));
-
         let refusal = repository
-            .observe_materialized_view_references(&created.attachment.instance_id, 256)
+            .observe_references_before_drop(
+                &ReportingReferenceReader,
+                &created.attachment.instance_id,
+                256,
+            )
             .await
             .expect_err("referenced catalog drop must conflict");
         assert_eq!(refusal.kind(), CatalogAttachmentErrorKind::Conflict);

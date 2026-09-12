@@ -68,7 +68,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::catalog_application::FrontendCatalogApplicationPort;
-use crate::catalog_attachment::CatalogAttachmentWakeupSignal;
+use novarocks_catalog_application::CatalogAttachmentWakeupSignal;
 
 #[derive(Default)]
 struct CatalogProjectionMetrics {
@@ -497,8 +497,8 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
-    use crate::catalog_attachment::{CatalogAttachment, CatalogAttachmentRepository};
     use crate::connector::ConnectorControlHost;
+    use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
 
     /// Mints a distinct control generation per materialization, like a real
     /// provider role factory: reusing an incarnation would trip the retired-generation guard

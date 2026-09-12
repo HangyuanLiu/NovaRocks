@@ -18,25 +18,16 @@
 use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_state_store_api::Key;
 
-use crate::state_family::{PersistentKeyPrefix, StateFamily};
-
-/// Read from the closed state family manifest, which is the only place a
-/// persistent prefix is defined.  The prefix already ends in `/`, so the
-/// suffix below is the record path alone.
-const ATTACHMENT_PREFIX: PersistentKeyPrefix =
-    match StateFamily::CatalogDesiredState.persistent_prefix() {
-        Some(prefix) => prefix,
-        None => panic!("catalog desired state is a durable external projection"),
-    };
+use super::CATALOG_DESIRED_STATE_FAMILY;
 
 pub fn attachment_prefix() -> Result<Key, String> {
-    ATTACHMENT_PREFIX
+    CATALOG_DESIRED_STATE_FAMILY
         .key()
         .map_err(|error| format!("build catalog attachment prefix: {error}"))
 }
 
 pub fn attachment_key(instance_id: &ConnectorInstanceId) -> Result<Key, String> {
-    ATTACHMENT_PREFIX
+    CATALOG_DESIRED_STATE_FAMILY
         .key_with_suffix(&hex::encode(instance_id.as_str()))
         .map_err(|error| format!("build catalog attachment key: {error}"))
 }

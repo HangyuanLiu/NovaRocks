@@ -45,6 +45,11 @@ use super::{
     CatalogRuntimePublisherSink,
 };
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
+use futures::future::BoxFuture;
+use novarocks_catalog_application::{
+    CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
+    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal, CatalogReferenceReader,
+};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
@@ -56,11 +61,34 @@ use novarocks_spi::connector::{
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
 
-use crate::catalog_attachment::{
-    CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal,
-};
 use crate::connector::ConnectorControlHost;
+
+/// Frontend's read-only adapter for the MV accelerator observation.
+///
+/// Catalog owns desired-state mutation and passes its StateStore capability
+/// only to this narrow reader. The result remains best-effort by contract; it
+/// is not a cross-family serializability fence.
+struct MvCatalogReferenceReader;
+
+impl CatalogReferenceReader for MvCatalogReferenceReader {
+    fn observe_references<'a>(
+        &'a self,
+        store: &'a dyn novarocks_state_store_api::StateStore,
+        instance_id: &'a ConnectorInstanceId,
+        page_size: usize,
+    ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
+        Box::pin(async move {
+            crate::mv::repository::observe_catalog_references(
+                store,
+                instance_id.as_str(),
+                page_size,
+            )
+            .await
+            .map(|reference| reference.map(|reference| reference.describe()))
+            .map_err(|error| error.to_string())
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogMaterializationConfig {
@@ -206,6 +234,7 @@ pub struct FrontendCatalogApplicationPort {
     complete_reachable_catalogs: Mutex<Option<BTreeSet<CatalogHandle>>>,
     next_generation: AtomicU64,
     scheduler: ProjectionScheduler,
+    reference_reader: Arc<dyn CatalogReferenceReader>,
 }
 
 impl FrontendCatalogApplicationPort {
@@ -223,6 +252,7 @@ impl FrontendCatalogApplicationPort {
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
+            reference_reader: Arc::new(MvCatalogReferenceReader),
         }
     }
 
@@ -257,6 +287,7 @@ impl FrontendCatalogApplicationPort {
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(materialization_config),
+            reference_reader: Arc::new(MvCatalogReferenceReader),
         }
     }
 
@@ -1154,7 +1185,11 @@ impl CatalogApplicationPort for FrontendCatalogApplicationPort {
         // catalog is gone, which the MV side already refuses through its
         // unavailable/fail-closed paths rather than publishing anything wrong
         // to the lake.
-        self.block_on(repository.observe_materialized_view_references(&command.instance_id, 256))?;
+        self.block_on(repository.observe_references_before_drop(
+            self.reference_reader.as_ref(),
+            &command.instance_id,
+            256,
+        ))?;
         self.block_on(repository.drop_exact(existing))?;
         self.retire_projection(&command.instance_id);
         // Durable deletion is authoritative. A local generation can be absent

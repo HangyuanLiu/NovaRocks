@@ -42,11 +42,12 @@ use novarocks_workload_control::{
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use crate::task_execution::ConnectorBlockingIoBudget;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_native_trust::NativeTrust;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
-use novarocks_state_store_runtime::StateStoreRunPolicy;
+use novarocks_state_store_runtime::{StateStoreRunPolicy, validate_persistent_state_families};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
 use crate::catalog_application::desired_state::{
@@ -56,7 +57,6 @@ use crate::catalog_application::{
     CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, FrontendCatalogApplicationPort,
     frontend_port::CatalogMaterializationConfig,
 };
-use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
@@ -74,6 +74,7 @@ use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
 };
+use crate::state_family::StateFamily;
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, StatisticsApplicationService,
 };
@@ -129,6 +130,7 @@ fn test_native_trust() -> Arc<NativeTrust> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
+    StateFamilyRegistration,
     StateStoreHost,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
@@ -923,6 +925,15 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
+        let mut durable_families = StateFamily::persistent_state_families();
+        durable_families.push(novarocks_catalog_application::CATALOG_DESIRED_STATE_FAMILY);
+        validate_persistent_state_families(&durable_families).map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::StateFamilyRegistration,
+                error,
+            )
+        })?;
+
         // The selected catalog desired-state source mode is decided here, ahead
         // of every startup side effect: nothing is open yet, no StateStore host
         // exists, no controller is running, so a mode this build implements no

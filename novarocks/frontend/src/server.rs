@@ -1048,7 +1048,7 @@ mod tests {
         .await
         .expect("open frontend application host");
         let store = host.state_store().expect("frontend StateStore");
-        let attachments = crate::catalog_attachment::CatalogAttachmentRepository::open(
+        let attachments = novarocks_catalog_application::CatalogAttachmentRepository::open(
             Arc::clone(&store),
             host.run_policy(),
         )

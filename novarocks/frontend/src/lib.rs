@@ -18,7 +18,6 @@
 pub mod application;
 pub mod capabilities;
 pub mod catalog_application;
-pub mod catalog_attachment;
 pub mod catalog_controller;
 mod catalog_projection_metrics;
 pub mod catalog_prune;

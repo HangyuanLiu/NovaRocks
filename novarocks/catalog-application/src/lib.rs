@@ -21,9 +21,16 @@
 //! Query-local compiler mappings and Connector execution instances belong to
 //! their respective application domains and are intentionally absent.
 
+pub mod attachment;
 mod control_host;
 mod generation;
 
+pub use attachment::CatalogReferenceReader;
+pub use attachment::{
+    CATALOG_DESIRED_STATE_FAMILY, CatalogAttachment, CatalogAttachmentError,
+    CatalogAttachmentErrorKind, CatalogAttachmentRepository, CatalogAttachmentVersioned,
+    CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal,
+};
 pub use control_host::{
     ConnectorControlHost, ConnectorControlRetirement, ConnectorWriteStackLease,
 };
