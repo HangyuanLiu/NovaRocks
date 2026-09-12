@@ -17,11 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_frontend::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTargetRebind,
-};
-use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_table_maintenance::runtime::MaintenanceJobState;
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
+};
 
 #[test]
 fn typed_action_variants_cannot_mix_unrelated_options() {

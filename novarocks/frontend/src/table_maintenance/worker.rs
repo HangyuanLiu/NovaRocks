@@ -33,13 +33,13 @@ use tokio::runtime::Handle;
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
-};
+use crate::query_execution::maintenance::TableMaintenanceEngine;
 
 use super::now_unix_millis;
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
-use novarocks_table_maintenance::{OptimizeJob, OptimizeProcessRuntime};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceTargetRebind, OptimizeJob, OptimizeProcessRuntime,
+};
 
 /// Runner-owned test root for the STAT-2F cross-process maintenance race.
 ///
@@ -456,12 +456,12 @@ mod lifecycle_tests {
     use novarocks_spi::connector::ConnectorTableObjectId;
 
     use super::{OptimizeJobExecutor, OptimizeWorker, run_worker};
-    use crate::query_execution::maintenance::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-        MaintenanceTargetRebind, TableMaintenanceEngine,
-    };
+    use crate::query_execution::maintenance::{MaintenanceRequestContext, TableMaintenanceEngine};
     use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
-    use novarocks_table_maintenance::{MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime};
+    use novarocks_table_maintenance::{
+        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+        MaintenanceTargetRebind, OptimizeJob, OptimizeProcessRuntime,
+    };
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 
     struct NeverRunEngine;

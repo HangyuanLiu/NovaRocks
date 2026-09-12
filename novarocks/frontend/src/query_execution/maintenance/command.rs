@@ -129,11 +129,11 @@ fn statement_result(result: MaintenanceStatementResult) -> StatementResult {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeSubmission,
-        TableMaintenanceEngine,
-    };
+    use super::super::TableMaintenanceEngine;
     use super::*;
+    use novarocks_table_maintenance::{
+        MaintenanceActionOutcome, MaintenanceActionRequest, OptimizeSubmission,
+    };
     use std::sync::Arc;
     use std::thread;
 

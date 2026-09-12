@@ -45,8 +45,7 @@ use self::result::{action_result, optimize_jobs_result};
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
+    MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceEngine,
     TableMaintenanceService,
 };
 use novarocks_table_maintenance::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
@@ -54,7 +53,8 @@ use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };
 use novarocks_table_maintenance::{
-    MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeJob,
+    OptimizeProcessRuntime, OptimizeSubmission,
 };
 
 pub mod admission;
