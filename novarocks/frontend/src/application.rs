@@ -161,11 +161,13 @@ impl FrontendApplicationError {
         }
     }
 
-    pub(crate) fn server(error: impl fmt::Display) -> Self {
+    /// Constructs a role-composition failure for the outer Server owner.
+    pub fn server(error: impl fmt::Display) -> Self {
         Self::new(FrontendApplicationErrorKind::Server, error)
     }
 
-    pub(crate) fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
+    /// Retains the first role failure while recording bounded cleanup failure.
+    pub fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup_error}"));
         self
@@ -1575,7 +1577,9 @@ impl FrontendApplicationHost {
         dead_code,
         reason = "Management integrations consume this read-only observation handle."
     )]
-    pub(crate) fn workload_observation(&self) -> WorkloadObservationHandle {
+    /// Read-only governed-root observation consumed by the Server role runner
+    /// while it drains admitted Frontend work.
+    pub fn workload_observation(&self) -> WorkloadObservationHandle {
         self.execution_runtime_owner.workload_observation()
     }
 
@@ -1620,7 +1624,9 @@ impl FrontendApplicationHost {
         .map_err(FrontendApplicationError::server)
     }
 
-    pub(crate) fn start_report_server_from_host(
+    /// Starts the Frontend report listener from Server-composed bind and trust
+    /// material.
+    pub fn start_report_server_from_host(
         &self,
         host: &str,
         port: u16,
@@ -1693,7 +1699,9 @@ impl FrontendApplicationHost {
     /// failed and the production runner has irrevocably committed to FE process
     /// exit. This is not a reusable shutdown path: admission remains closed and
     /// the Host must be dropped immediately after the runner returns.
-    pub(crate) fn abandon_for_process_exit(&mut self) {
+    /// Releases process-local join ownership only after the Server role runner
+    /// has exhausted its bounded convergence attempts and committed to exit.
+    pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
         if let Some(service) = self.mv_service.as_ref() {
             service.request_background_stop_for_process_exit();

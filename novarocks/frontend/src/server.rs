@@ -370,86 +370,6 @@ pub fn build_frontend_query_session_factory(
     Ok(query_service)
 }
 
-// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
-pub async fn run_frontend_server_until_shutdown<F>(
-    config: FrontendServerConfig,
-    data_runtime: Handle,
-    shutdown: F,
-) -> Result<(), FrontendApplicationError>
-where
-    F: Future<Output = ()> + Send,
-{
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
-        start_early_management_server(&config)?;
-    let mut host = match open_frontend_application_for_server(&config, data_runtime).await {
-        Ok(host) => host,
-        Err(error) => {
-            let cleanup = metrics_http_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), cleanup);
-        }
-    };
-    if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend serving reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend island reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend lifecycle convergence reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    let server_result = serve_ready_frontend_session_factory(
-        config,
-        &mut host,
-        mv_storage_observation,
-        shutdown,
-        &mut metrics_http_server,
-    )
-    .await;
-    let shutdown_result =
-        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-    let metrics_stop = metrics_http_server
-        .stop()
-        .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(
-        combine_server_and_shutdown(server_result, shutdown_result),
-        metrics_stop,
-    )
-}
-
 /// Drives the exact Frontend owner graph to convergence before the production
 /// runner is allowed to drop it.
 ///
@@ -458,7 +378,7 @@ where
 /// cannot converge on the second pass, the runner explicitly commits to
 /// process exit and releases process-local joins through the Host's final-exit
 /// boundary. That boundary is never available to a reusable application Host.
-async fn shutdown_frontend_application_to_convergence(
+pub async fn shutdown_frontend_application_to_convergence(
     host: &mut FrontendApplicationHost,
     attempt_timeout: Duration,
 ) -> Result<(), FrontendApplicationError> {
@@ -492,17 +412,18 @@ async fn shutdown_frontend_application_to_convergence(
     }
 }
 
-fn start_early_management_server(
+/// Frontend-owned management listener construction. The Server role runner
+/// owns when this listener starts, receives failures, and is torn down.
+pub struct FrontendManagementServer {
+    serving_reader: Arc<LateBoundFrontendServingSnapshotReader>,
+    island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
+    convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
+    metrics_http_server: crate::metrics::MetricsHttpServer,
+}
+
+pub fn start_frontend_management_server(
     config: &FrontendServerConfig,
-) -> Result<
-    (
-        Arc<LateBoundFrontendServingSnapshotReader>,
-        Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
-        Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
-        crate::metrics::MetricsHttpServer,
-    ),
-    FrontendApplicationError,
-> {
+) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
@@ -526,20 +447,56 @@ fn start_early_management_server(
         Some(management_convergence_reader),
     )
     .map_err(FrontendApplicationError::server)?;
-    Ok((
+    Ok(FrontendManagementServer {
         serving_reader,
         island_reader,
         convergence_reader,
         metrics_http_server,
-    ))
+    })
 }
 
-async fn serve_ready_frontend_session_factory<F>(
+impl FrontendManagementServer {
+    pub fn install(&self, host: &FrontendApplicationHost) -> Result<(), FrontendApplicationError> {
+        self.serving_reader
+            .install(host.serving_lifecycle())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend serving reader after application open: {error}"
+                ))
+            })?;
+        self.island_reader
+            .install(host.backend_island_snapshot_reader())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend island reader after application open: {error}"
+                ))
+            })?;
+        self.convergence_reader
+            .install(host.lifecycle_convergence_reader())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend lifecycle convergence reader after application open: {error}"
+                ))
+            })
+    }
+
+    pub fn poll_failure(&mut self) -> Result<Option<String>, FrontendApplicationError> {
+        self.metrics_http_server
+            .poll_failure()
+            .map_err(FrontendApplicationError::server)
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.metrics_http_server.stop()
+    }
+}
+
+pub async fn serve_ready_frontend_session_factory<F>(
     config: FrontendServerConfig,
     host: &mut FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     shutdown: F,
-    metrics_http_server: &mut crate::metrics::MetricsHttpServer,
+    management_server: &mut FrontendManagementServer,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
@@ -580,7 +537,7 @@ where
         client_connections,
         shutdown,
         &mut report_server,
-        metrics_http_server,
+        management_server,
         host.serving_lifecycle(),
         host.workload_observation(),
         config.frontend_drain_timeout,
@@ -599,7 +556,7 @@ async fn run_mysql_with_listener_supervision<F>(
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
-    management_server: &mut crate::metrics::MetricsHttpServer,
+    management_server: &mut FrontendManagementServer,
     lifecycle: Arc<crate::workload_lifecycle::FrontendServingLifecycle>,
     workload_observation: novarocks_workload_control::WorkloadObservationHandle,
     drain_timeout: Duration,
@@ -696,7 +653,7 @@ fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
 
 async fn wait_for_frontend_listener_failure(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
-    management_server: &mut crate::metrics::MetricsHttpServer,
+    management_server: &mut FrontendManagementServer,
 ) -> String {
     loop {
         match report_server.poll_failure() {
@@ -807,6 +764,7 @@ fn combine_server_and_shutdown(
     }
 }
 
+#[cfg(test)]
 async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
     config: FrontendServerConfig,
     service: Service,
@@ -896,8 +854,8 @@ mod tests {
 
     use super::{
         FrontendServerConfig, build_frontend_query_session_factory,
-        run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
-        run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
+        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
+        shutdown_frontend_application_to_convergence,
     };
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::state_store::{
@@ -1280,22 +1238,6 @@ mod tests {
         host.shutdown()
             .await
             .expect("shutdown frontend application host");
-    }
-
-    #[test]
-    fn runner_exports_typed_application_errors() {
-        fn accepts_async_runner<F>(_: F)
-        where
-            F: Future<Output = Result<(), FrontendApplicationError>>,
-        {
-        }
-
-        let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
-        accepts_async_runner(run_frontend_server_until_shutdown(
-            frontend_config(),
-            data_runtime.handle().clone(),
-            async {},
-        ));
     }
 
     #[tokio::test]

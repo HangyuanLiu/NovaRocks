@@ -139,7 +139,7 @@ fn run_frontend(
         runtime.handle().clone(),
     )?;
     runtime
-        .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
+        .block_on(novarocks_server::roles::frontend::run_until_shutdown(
             frontend,
             runtime.handle().clone(),
             termination_signal(),
@@ -220,7 +220,7 @@ async fn run_all_in_one(
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
     let frontend_run = async move {
-        novarocks_frontend::run_frontend_server_until_shutdown(
+        novarocks_server::roles::frontend::run_until_shutdown(
             frontend,
             frontend_runtime,
             wait_for_stop(frontend_stop_rx),

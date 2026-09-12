@@ -18,3 +18,4 @@
 //! Server-owned role runners over role-local application hosts.
 
 pub mod backend;
+pub mod frontend;
