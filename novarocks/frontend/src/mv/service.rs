@@ -39,13 +39,13 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
 use super::{
     activity::{MvActivityGate, MvActivityOwner, canonical_mv_target},
     create,
-    maintenance::MaintenanceCoordinatorConfig,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
     refresh,
     scheduler::{

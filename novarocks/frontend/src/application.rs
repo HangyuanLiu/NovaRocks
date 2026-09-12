@@ -43,6 +43,7 @@ use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProvider
 use crate::task_execution::ConnectorBlockingIoBudget;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_native_trust::NativeTrust;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
@@ -56,7 +57,6 @@ use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
 use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::dml::DmlService;
-use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;

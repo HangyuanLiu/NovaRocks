@@ -24,7 +24,8 @@
 //! [`MaintenanceCoordinator::try_begin`]; a queued gate ticket therefore never
 //! consumes the independent maintenance concurrency budget.
 
-pub use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+#[cfg(test)]
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 pub(crate) use novarocks_mv_application::maintenance::{
     AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceExecutionReport,
 };

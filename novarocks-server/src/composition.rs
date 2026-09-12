@@ -40,7 +40,7 @@ use novarocks_frontend::{
         FrontendQueryControlTimeouts,
     },
     catalog_prune::CatalogPruneConfig,
-    mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMvSchedulerConfig},
+    mv::scheduler::FrontendMvSchedulerConfig,
     server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
@@ -51,6 +51,7 @@ use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
