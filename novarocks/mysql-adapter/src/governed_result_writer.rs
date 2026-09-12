@@ -1356,19 +1356,25 @@ fn failed_query_result_delivery(message: impl Into<String>) -> QueryExecutionErr
 }
 
 fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExecutionError {
-    QueryExecutionError::new(
-        QueryExecutionErrorKind::Cancelled,
-        format!("MySQL result delivery cancelled: {reason:?}"),
-    )
+    let message = match reason {
+        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => format!(
+            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
+        ),
+        reason => format!("MySQL result delivery cancelled: {reason:?}"),
+    };
+    QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
 }
 
 fn governed_cancelled_query_result_delivery(
     reason: novarocks_workload_control::CancellationReason,
 ) -> QueryExecutionError {
-    QueryExecutionError::new(
-        QueryExecutionErrorKind::Cancelled,
-        format!("MySQL result delivery cancelled: {reason:?}"),
-    )
+    let message = match reason {
+        novarocks_workload_control::CancellationReason::FrontendDrainDeadlineExceeded => {
+            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded".to_string()
+        }
+        reason => format!("MySQL result delivery cancelled: {reason:?}"),
+    };
+    QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
 }
 
 fn interrupted_error(message: impl Into<String>) -> io::Error {
