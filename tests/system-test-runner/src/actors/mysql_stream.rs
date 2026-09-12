@@ -52,16 +52,37 @@ impl MysqlPacket {
     pub fn is_result_terminator(&self) -> bool {
         is_mysql_result_terminator(&self.payload)
     }
+
+    pub fn has_more_results(&self) -> bool {
+        mysql_status_flags(&self.payload)
+            .map(|flags| flags & 0x0008 != 0)
+            .unwrap_or(false)
+    }
 }
 
 impl MysqlStream {
     pub fn connect(user: &str, port: u16, timeout: Duration) -> Result<Self> {
+        Self::connect_with_capabilities(user, port, timeout, false)
+    }
+
+    pub fn connect_with_multi_results(user: &str, port: u16, timeout: Duration) -> Result<Self> {
+        Self::connect_with_capabilities(user, port, timeout, true)
+    }
+
+    fn connect_with_capabilities(
+        user: &str,
+        port: u16,
+        timeout: Duration,
+        multi_results: bool,
+    ) -> Result<Self> {
         const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
         const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
         const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
         const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
         const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
         const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+        const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
+        const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
 
         let address = SocketAddr::from(([127, 0, 0, 1], port));
         let mut stream = TcpStream::connect_timeout(&address, timeout)
@@ -79,12 +100,15 @@ impl MysqlStream {
             "expected MySQL protocol v10 handshake, got payload={handshake:?}"
         );
 
-        let client_flags = CLIENT_LONG_PASSWORD
+        let mut client_flags = CLIENT_LONG_PASSWORD
             | CLIENT_LONG_FLAG
             | CLIENT_PROTOCOL_41
             | CLIENT_TRANSACTIONS
             | CLIENT_SECURE_CONNECTION
             | CLIENT_PLUGIN_AUTH;
+        if multi_results {
+            client_flags |= CLIENT_MULTI_STATEMENTS | CLIENT_MULTI_RESULTS;
+        }
         let mut response = Vec::with_capacity(user.len() + 64);
         response.extend_from_slice(&client_flags.to_le_bytes());
         response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
@@ -204,6 +228,14 @@ fn mysql_error_text(payload: &[u8]) -> Result<String> {
 fn is_mysql_result_terminator(payload: &[u8]) -> bool {
     matches!(payload.first().copied(), Some(0xfe) if payload.len() < 9)
         || payload.first().copied() == Some(0)
+}
+
+fn mysql_status_flags(payload: &[u8]) -> Option<u16> {
+    match payload.first().copied() {
+        Some(0xfe) if payload.len() >= 5 => Some(u16::from_le_bytes([payload[3], payload[4]])),
+        Some(0) if payload.len() >= 5 => Some(u16::from_le_bytes([payload[3], payload[4]])),
+        _ => None,
+    }
 }
 
 fn read_wire_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
