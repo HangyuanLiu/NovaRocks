@@ -37,28 +37,14 @@ use novarocks_statistics_application::{
 use crate::common::backend_topology::BackendTopologyService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::statistics_jobs::application::{
-    StatisticsApplicationError, StatisticsAttemptExecutor, StatisticsAttemptRequest,
-    StatisticsColumnIntent, rebind_table_object,
+    StatisticsApplicationError, StatisticsAttemptRequest, StatisticsColumnIntent,
+    rebind_table_object,
 };
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
     ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionStart, StatisticsCollectionStartRequest,
-    StatisticsColumnSelection,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionStartRequest, StatisticsColumnSelection,
 };
-
-struct RequiredStatisticsExecution {
-    table: novarocks_spi::connector::ConnectorTableHandle,
-    data_version: novarocks_spi::connector::StatisticsDataVersion,
-    read_version_ordinal: Option<i64>,
-    required: Vec<novarocks_spi::connector::StatisticsRequiredAggregation>,
-    session: Box<dyn novarocks_spi::connector::StatisticsCollectionSession>,
-}
-
-enum StatisticsExecutionDisposition {
-    FinishedWithoutExecution,
-    Required(RequiredStatisticsExecution),
-}
 
 /// Exact Frontend composition leaves retained by the process-owned ANALYZE worker.
 /// Each collection takes a fresh live topology snapshot. The worker persists
@@ -100,264 +86,45 @@ impl StatisticsAttemptExecutionPorts {
     }
 }
 
-/// Implements Core's process-worker port while retaining the native encoder
-/// exclusively in Frontend.
-pub(crate) struct FrontendStatisticsAttemptExecutor {
-    ports: StatisticsAttemptExecutionPorts,
-}
-
-impl FrontendStatisticsAttemptExecutor {
-    pub(crate) fn new(ports: StatisticsAttemptExecutionPorts) -> Self {
-        Self { ports }
-    }
-
-    fn collection_context(
-        &self,
-        deadline: Instant,
-        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
-        ConnectorRequestContext::try_new(
-            deadline,
-            Arc::new(AttemptCancellation(cancellation)),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))
-    }
-
-    fn resolve_columns(
-        request: &StatisticsAttemptRequest,
-        bound_columns: &[FieldRef],
-    ) -> Result<Vec<FieldRef>, StatisticsApplicationError> {
-        match &request.columns {
-            StatisticsColumnIntent::AllColumns => Ok(bound_columns.to_vec()),
-            StatisticsColumnIntent::Explicit(requested_columns) => {
-                let mut resolved = Vec::with_capacity(requested_columns.len());
-                for requested in requested_columns {
-                    let mut matches = bound_columns
-                        .iter()
-                        .filter(|bound| bound.name().eq_ignore_ascii_case(requested));
-                    let Some(column) = matches.next() else {
-                        return Err(StatisticsApplicationError::new(format!(
-                            "ANALYZE requested column '{requested}' does not exist on the rebound table"
-                        )));
-                    };
-                    if matches.next().is_some() {
-                        return Err(StatisticsApplicationError::new(format!(
-                            "ANALYZE requested column '{requested}' matches multiple rebound table columns"
-                        )));
-                    }
-                    if resolved.iter().any(|existing: &FieldRef| {
-                        existing.name().eq_ignore_ascii_case(column.name())
-                    }) {
-                        return Err(StatisticsApplicationError::new(format!(
-                            "ANALYZE requested column '{requested}' is duplicated"
-                        )));
-                    }
-                    resolved.push(column.clone());
+fn resolve_columns(
+    request: &StatisticsAttemptRequest,
+    bound_columns: &[FieldRef],
+) -> Result<Vec<FieldRef>, StatisticsApplicationError> {
+    match &request.columns {
+        StatisticsColumnIntent::AllColumns => Ok(bound_columns.to_vec()),
+        StatisticsColumnIntent::Explicit(requested_columns) => {
+            let mut resolved = Vec::with_capacity(requested_columns.len());
+            for requested in requested_columns {
+                let mut matches = bound_columns
+                    .iter()
+                    .filter(|bound| bound.name().eq_ignore_ascii_case(requested));
+                let Some(column) = matches.next() else {
+                    return Err(StatisticsApplicationError::new(format!(
+                        "ANALYZE requested column '{requested}' does not exist on the rebound table"
+                    )));
+                };
+                if matches.next().is_some() {
+                    return Err(StatisticsApplicationError::new(format!(
+                        "ANALYZE requested column '{requested}' matches multiple rebound table columns"
+                    )));
                 }
-                Ok(resolved)
+                if resolved
+                    .iter()
+                    .any(|existing: &FieldRef| existing.name().eq_ignore_ascii_case(column.name()))
+                {
+                    return Err(StatisticsApplicationError::new(format!(
+                        "ANALYZE requested column '{requested}' is duplicated"
+                    )));
+                }
+                resolved.push(column.clone());
             }
+            Ok(resolved)
         }
-    }
-
-    fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
-        ConnectorMutationOperationId::from_bytes(request.operation_id.to_bytes())
-    }
-
-    fn outcome(
-        outcome: ExternalMutationOutcome<novarocks_spi::connector::StatisticsReceipt>,
-    ) -> Result<(), StatisticsApplicationError> {
-        match outcome {
-            ExternalMutationOutcome::KnownCommitted {
-                finalization: ExternalMutationFinalization::Complete,
-                ..
-            } => Ok(()),
-            ExternalMutationOutcome::KnownCommitted {
-                finalization: ExternalMutationFinalization::Failed(failure),
-                ..
-            } => Err(StatisticsApplicationError::publication(
-                crate::statistics_jobs::application::StatisticsPublicationTerminal::KnownCommittedFinalization,
-                failure.to_string(),
-            )),
-            ExternalMutationOutcome::KnownUncommitted { failure } => Err(
-                StatisticsApplicationError::publication(
-                    crate::statistics_jobs::application::StatisticsPublicationTerminal::KnownUncommitted,
-                    failure.to_string(),
-                ),
-            ),
-            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
-                Err(StatisticsApplicationError::publication(
-                    crate::statistics_jobs::application::StatisticsPublicationTerminal::CommitUnknown,
-                    failure.to_string(),
-                ))
-            }
-        }
-    }
-
-    fn resolve_execution_disposition(
-        start: StatisticsCollectionStart,
-        cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<StatisticsExecutionDisposition, StatisticsApplicationError> {
-        let (table, data_version, read_version_ordinal, required, session) = start.into_parts();
-        if required.is_empty() {
-            if cancellation.is_cancelled() {
-                return Err(StatisticsApplicationError::new(
-                    "statistics attempt cancelled before provider session finish",
-                ));
-            }
-            Self::outcome(
-                session
-                    .finish(Vec::new())
-                    .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-            )?;
-            return Ok(StatisticsExecutionDisposition::FinishedWithoutExecution);
-        }
-        Ok(StatisticsExecutionDisposition::Required(
-            RequiredStatisticsExecution {
-                table,
-                data_version,
-                read_version_ordinal,
-                required,
-                session,
-            },
-        ))
     }
 }
 
-impl StatisticsAttemptExecutor for FrontendStatisticsAttemptExecutor {
-    fn execute(
-        &self,
-        request: &StatisticsAttemptRequest,
-        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<(), StatisticsApplicationError> {
-        let attempt_deadline = Instant::now()
-            .checked_add(self.ports.attempt_timeout)
-            .ok_or_else(|| {
-                StatisticsApplicationError::new("statistics attempt deadline overflow")
-            })?;
-        let context = self.collection_context(attempt_deadline, cancellation.clone())?;
-        let instance_id =
-            novarocks_spi::connector::ConnectorInstanceId::parse(&request.connector_instance_id)
-                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let planning_lease = self
-            .ports
-            .connector_control
-            .acquire_current(&instance_id)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        // Rebinding and collection preparation intentionally share one current
-        // connector generation. Do not translate this error: its typed physical
-        // object binding classification must reach the process worker unchanged.
-        let binding = rebind_table_object(&planning_lease, context.clone(), request)?;
-        let selection = match &request.columns {
-            StatisticsColumnIntent::AllColumns => StatisticsColumnSelection::Default,
-            StatisticsColumnIntent::Explicit(_) => StatisticsColumnSelection::explicit(
-                Self::resolve_columns(request, &binding.sql_columns)?
-                    .into_iter()
-                    .map(|column| Arc::<str>::from(column.name().as_str()))
-                    .collect(),
-            )
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        };
-        let lease = planning_lease
-            .derive_statistics_lease()
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let start = lease
-            .begin_collection(StatisticsCollectionStartRequest {
-                operation_id: Self::operation_id(request),
-                table: binding.table.clone(),
-                data_version: binding.data_version.clone(),
-                selection,
-                context: context.clone(),
-            })
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let StatisticsExecutionDisposition::Required(required_execution) =
-            Self::resolve_execution_disposition(start, &cancellation)?
-        else {
-            return Ok(());
-        };
-        let RequiredStatisticsExecution {
-            table,
-            data_version,
-            read_version_ordinal,
-            required,
-            session,
-        } = required_execution;
-        let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-            table,
-            data_version,
-            read_version_ordinal,
-            required,
-            crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                crate::query_execution::statistics::StatisticsExecutionMode::BackgroundCollectionAttempt,
-                self.ports.attempt_timeout,
-            )
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let topology = self
-            .ports
-            .backend_topology
-            .snapshot()
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-            self.ports.execution_role,
-            topology,
-            Some(attempt_deadline),
-            cancellation.clone(),
-            novarocks_sql::compiler::SessionOptimizerSettings::default(),
-        );
-        debug_assert_eq!(Some(context.deadline()), execution.deadline());
-
-        // The attempt already names its relation; preparation must read that
-        // one and no other, so the names travel with the program rather than
-        // being recovered from a second catalog lookup.
-        let relation = crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
-            request.connector_instance_id.as_str(),
-            request.namespace.as_str(),
-            request.table.as_str(),
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        // The sequence is intentional: Core prepares immutable provider facts;
-        // Frontend maps the sealed view; Core consumes the exact attachment.
-        let prepared = crate::query_execution::statistics::prepare_statistics_collection_request(
-            crate::query_execution::statistics::StatisticsPlanningServices::new(
-                self.ports.connector_control.as_ref(),
-                &self.ports.typed_connector_control,
-                self.ports.function_catalog.as_ref(),
-            ),
-            &execution,
-            context.clone(),
-            &relation,
-            program,
-            planning_lease,
-        )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let native_attachment = crate::native::fragment_encoder::encode_native_fragment_bundle(
-            prepared.encoding_view(),
-        )
-        .map_err(StatisticsApplicationError::new)?;
-        let distributed = prepared
-            .finish(native_attachment)
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        let artifacts = self
-            .ports
-            .query_execution
-            .execute(distributed)
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_statistics)
-            .map(|outcome| outcome.into_artifacts())
-            .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
-        if cancellation.is_cancelled() {
-            return Err(StatisticsApplicationError::new(
-                "statistics attempt cancelled before provider session finish",
-            ));
-        }
-        Self::outcome(
-            session
-                .finish(artifacts)
-                .map_err(|error| StatisticsApplicationError::new(error.to_string()))?,
-        )
-    }
+fn operation_id(request: &StatisticsAttemptRequest) -> ConnectorMutationOperationId {
+    ConnectorMutationOperationId::from_bytes(request.operation_id.to_bytes())
 }
 
 /// The only state allowed to cross the collection/publication phase boundary.
@@ -370,10 +137,23 @@ struct PendingThreePhaseStatisticsAttempt {
     artifacts: Option<Vec<novarocks_spi::connector::StatisticsArtifactDraft>>,
 }
 
+fn empty_collection_pending(
+    session: Box<dyn novarocks_spi::connector::StatisticsCollectionSession>,
+) -> PendingThreePhaseStatisticsAttempt {
+    PendingThreePhaseStatisticsAttempt {
+        session,
+        request: None,
+        // A provider session, including an empty collection, crosses only into
+        // publish. This keeps closure and the authoritative publication fact
+        // in the final phase.
+        artifacts: Some(Vec::new()),
+    }
+}
+
 /// T12 adapter from the statistics product worker to the real FE query
-/// execution service.  Unlike the retired combined adapter above, its phases
-/// make the retained provider publication session explicit and cannot expose
-/// an unfinished query execution across `collect`.
+/// execution service. Its phases make the retained provider publication
+/// session explicit and cannot expose an unfinished query execution across
+/// `collect`.
 pub(crate) struct FrontendThreePhaseStatisticsAttemptExecutor {
     ports: StatisticsAttemptExecutionPorts,
     pending: Mutex<
@@ -537,7 +317,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
         let selection = match &request.columns {
             StatisticsColumnIntent::AllColumns => StatisticsColumnSelection::Default,
             StatisticsColumnIntent::Explicit(_) => StatisticsColumnSelection::explicit(
-                FrontendStatisticsAttemptExecutor::resolve_columns(&request, &binding.sql_columns)
+                resolve_columns(&request, &binding.sql_columns)
                     .map_err(Self::application_error)?
                     .into_iter()
                     .map(|column| Arc::<str>::from(column.name().as_str()))
@@ -550,7 +330,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .map_err(|error| Self::failure(error.to_string()))?;
         let start = lease
             .begin_collection(StatisticsCollectionStartRequest {
-                operation_id: FrontendStatisticsAttemptExecutor::operation_id(&request),
+                operation_id: operation_id(&request),
                 table: binding.table.clone(),
                 data_version: binding.data_version.clone(),
                 selection,
@@ -559,14 +339,7 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .map_err(|error| Self::failure(error.to_string()))?;
         let (table, data_version, read_version_ordinal, required, session) = start.into_parts();
         let pending = if required.is_empty() {
-            PendingThreePhaseStatisticsAttempt {
-                session,
-                request: None,
-                // A provider session, including an empty collection, crosses
-                // only into publish. This keeps closure and the authoritative
-                // publication fact in the final phase.
-                artifacts: Some(Vec::new()),
-            }
+            empty_collection_pending(session)
         } else {
             let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
                 table,
@@ -718,9 +491,9 @@ mod tests {
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
-        ConnectorTableHandle, ExternalMutationEffect, ProviderBindingEpoch,
-        StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsCollectionSession,
-        StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsReceipt,
+        ExternalMutationEffect, ProviderBindingEpoch, StatisticsArtifactDraft,
+        StatisticsArtifactIdentity, StatisticsCollectionSession, StatisticsDataVersion,
+        StatisticsEvidenceRevision, StatisticsReceipt,
     };
 
     use super::*;
@@ -775,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_collection_finishes_without_creating_distributed_tasks() {
+    fn empty_collection_is_retained_until_publication_without_a_query_request() {
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
             instance_id: ConnectorInstanceId::parse("ice.main").expect("instance ID"),
@@ -785,38 +558,29 @@ mod tests {
         let data_version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
             .expect("data version");
         let finish_calls = Arc::new(AtomicUsize::new(0));
-        let start = StatisticsCollectionStart::try_new(
-            ConnectorTableHandle::try_new(
-                descriptor.instance_id.clone(),
-                Bytes::from_static(b"orders"),
-            )
-            .expect("table handle"),
-            data_version.clone(),
-            None,
-            Vec::new(),
-            Box::new(EmptyCollectionSession {
-                descriptor,
-                incarnation,
-                operation_id,
-                data_version,
-                finish_calls: Arc::clone(&finish_calls),
-            }),
-        )
-        .expect("empty collection start");
+        let pending = empty_collection_pending(Box::new(EmptyCollectionSession {
+            descriptor,
+            incarnation,
+            operation_id,
+            data_version,
+            finish_calls: Arc::clone(&finish_calls),
+        }));
+        let PendingThreePhaseStatisticsAttempt {
+            session,
+            request,
+            artifacts,
+        } = pending;
 
-        let cancellation =
-            novarocks_query_application::cancellation::QueryCancellationSource::new();
-        let disposition = FrontendStatisticsAttemptExecutor::resolve_execution_disposition(
-            start,
-            &cancellation.view(),
-        )
-        .expect("empty collection succeeds");
-        let distributed_task_count = match disposition {
-            StatisticsExecutionDisposition::FinishedWithoutExecution => 0,
-            StatisticsExecutionDisposition::Required(_) => 1,
-        };
-
-        assert_eq!(distributed_task_count, 0);
+        assert!(request.is_none());
+        assert_eq!(artifacts.as_ref().map(Vec::len), Some(0));
+        assert_eq!(finish_calls.load(Ordering::SeqCst), 0);
+        let outcome = session
+            .finish(artifacts.expect("empty artifacts"))
+            .expect("empty collection publishes");
+        assert!(matches!(
+            FrontendThreePhaseStatisticsAttemptExecutor::publication_outcome(outcome).fact,
+            StatisticsPublicationFact::KnownCommitted
+        ));
         assert_eq!(finish_calls.load(Ordering::SeqCst), 1);
     }
 }

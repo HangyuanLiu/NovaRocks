@@ -111,20 +111,6 @@ pub trait StatisticsTableReader: Send + Sync {
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
 }
 
-/// Legacy combined provider adapter contract.
-///
-/// It cannot be used to start a statistics job: the product worker requires a
-/// separately bound `WorkOwner` source and three-phase executor. T12 replaces
-/// this compatibility registration with the real query-application/provider
-/// adapter.
-pub trait StatisticsAttemptExecutor: Send + Sync {
-    fn execute(
-        &self,
-        request: &StatisticsAttemptRequest,
-        cancellation: novarocks_query_application::cancellation::QueryCancellationView,
-    ) -> Result<(), StatisticsApplicationError>;
-}
-
 pub struct ConnectorStatisticsTargetResolver {
     controls: Arc<dyn ConnectorControlRegistry>,
 }
