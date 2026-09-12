@@ -48,6 +48,7 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
 };
+use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState};
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
@@ -340,8 +341,6 @@ pub enum MaintenanceActionOutcome {
     },
 }
 
-pub use novarocks_table_maintenance::runtime::MaintenanceJobState as OptimizeJobState;
-
 /// Result of rebinding a durable maintenance target to its current table.
 ///
 /// `Bound` is the only result that permits an attempt to continue. A missing
@@ -359,8 +358,6 @@ pub enum MaintenanceTargetRebind {
 /// The handle is intentionally not a durable recovery record.  It is the
 /// only value a caller may wait on after a `Submitted` answer, preventing a
 /// second lookup by target from accidentally joining a replacement job.
-pub use novarocks_table_maintenance::runtime::JobHandle as OptimizeJobHandle;
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptimizeSubmission {
     Submitted { job_id: i64 },
@@ -371,9 +368,9 @@ impl OptimizeSubmission {
     /// Returns the exact submitted job. `AlreadyActive` deliberately has no
     /// handle: joining a different caller's job would silently transfer its
     /// business responsibility and conflict gate.
-    pub const fn handle(self) -> Option<OptimizeJobHandle> {
+    pub const fn handle(self) -> Option<JobHandle> {
         match self {
-            Self::Submitted { job_id } => Some(OptimizeJobHandle::new(job_id)),
+            Self::Submitted { job_id } => Some(JobHandle::new(job_id)),
             Self::AlreadyActive => None,
         }
     }
@@ -643,8 +640,8 @@ pub trait TableMaintenanceService: Send + Sync {
     /// job is returned even if it completed before the caller subscribed.
     async fn wait_for_automatic_optimize(
         &self,
-        _handle: OptimizeJobHandle,
-    ) -> Result<OptimizeJobState, String> {
+        _handle: JobHandle,
+    ) -> Result<MaintenanceJobState, String> {
         Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
     }
 
@@ -1680,8 +1677,8 @@ mod maintenance_attempt_context_tests {
     };
 
     use super::{
-        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceTargetRebind,
-        OptimizeJobState, captured_target_object_id_from_connector_result,
+        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceJobState,
+        MaintenanceTargetRebind, captured_target_object_id_from_connector_result,
         maintenance_target_rebind_from_connector_result,
     };
 
@@ -1812,6 +1809,9 @@ mod maintenance_attempt_context_tests {
 
     #[test]
     fn optimize_target_replacement_has_a_stable_show_value() {
-        assert_eq!(OptimizeJobState::TargetReplaced.as_str(), "TARGET_REPLACED");
+        assert_eq!(
+            MaintenanceJobState::TargetReplaced.as_str(),
+            "TARGET_REPLACED"
+        );
     }
 }

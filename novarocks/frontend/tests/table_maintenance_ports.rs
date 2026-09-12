@@ -19,8 +19,9 @@ use std::collections::BTreeMap;
 
 use novarocks_frontend::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTargetRebind, OptimizeJobState,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTargetRebind,
 };
+use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
 #[test]
 fn typed_action_variants_cannot_mix_unrelated_options() {
@@ -42,8 +43,11 @@ fn typed_action_variants_cannot_mix_unrelated_options() {
             ..
         }
     ));
-    assert_eq!(OptimizeJobState::Pending.as_str(), "PENDING");
-    assert_eq!(OptimizeJobState::TargetReplaced.as_str(), "TARGET_REPLACED");
+    assert_eq!(MaintenanceJobState::Pending.as_str(), "PENDING");
+    assert_eq!(
+        MaintenanceJobState::TargetReplaced.as_str(),
+        "TARGET_REPLACED"
+    );
     let _: BTreeMap<String, String> = BTreeMap::new();
 }
 

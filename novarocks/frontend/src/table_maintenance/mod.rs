@@ -821,8 +821,8 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
 
     async fn wait_for_automatic_optimize(
         &self,
-        handle: crate::query_execution::maintenance::OptimizeJobHandle,
-    ) -> Result<crate::query_execution::maintenance::OptimizeJobState, String> {
+        handle: novarocks_table_maintenance::runtime::JobHandle,
+    ) -> Result<novarocks_table_maintenance::runtime::MaintenanceJobState, String> {
         self.optimize_runtime
             .wait_for_completion(handle.job_id())
             .await
@@ -840,7 +840,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             return Ok(submission);
         };
         let terminal = self.block_on(self.wait_for_automatic_optimize(handle))?;
-        if terminal == crate::query_execution::maintenance::OptimizeJobState::Finished {
+        if terminal == novarocks_table_maintenance::runtime::MaintenanceJobState::Finished {
             Ok(submission)
         } else {
             Err(format!(
