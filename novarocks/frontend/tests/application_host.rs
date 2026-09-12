@@ -202,13 +202,13 @@ fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
 }
 
 #[tokio::test]
-async fn host_exposes_one_statistics_service_identity() {
+async fn host_exposes_one_statistics_job_service_identity() {
     let mut host = open_host(Some(state_store_input())).await.expect("host");
-    let first = host.statistics_application_service();
-    let second = host.statistics_application_service();
+    let first = host.statistics_job_service();
+    let second = host.statistics_job_service();
     assert!(Arc::ptr_eq(&first, &second));
-    let first_application = host.statistics_application_service();
-    let second_application = host.statistics_application_service();
+    let first_application = host.statistics_job_service();
+    let second_application = host.statistics_job_service();
     assert!(Arc::ptr_eq(&first_application, &second_application));
     drop(first_application);
     drop(second_application);

@@ -50,7 +50,7 @@ use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_state_store_runtime::{StateStoreRunPolicy, validate_persistent_state_families};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
-use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
+use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
@@ -70,7 +70,7 @@ use crate::query_execution::native_execution_adapter::{
 };
 use crate::state_family::StateFamily;
 use crate::statistics_jobs::service::{
-    FrontendStatisticsApplicationPort, StatisticsApplicationService,
+    FrontendStatisticsApplicationPort, RootAdmissionStatisticsJobSource,
 };
 use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
@@ -86,6 +86,7 @@ use novarocks_catalog_application::{
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::query_control::QueryApplicationControl;
+use novarocks_statistics_application::StatisticsJobService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -475,7 +476,7 @@ pub struct FrontendApplicationHost {
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
     dml_service: Option<Arc<DmlService>>,
-    statistics_application_service: Option<Arc<StatisticsApplicationService>>,
+    statistics_job_service: Option<Arc<StatisticsJobService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
@@ -975,7 +976,7 @@ impl FrontendApplicationHost {
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
             dml_service: None,
-            statistics_application_service: None,
+            statistics_job_service: None,
             statistics_application_port: None,
             catalog_application_port: None,
             abandoned_attempt_sweeper: None,
@@ -1287,12 +1288,17 @@ impl FrontendApplicationHost {
         }
         let statistics_connector_control = Arc::clone(&host.connector_control)
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
-        let statistics_application_service = Arc::new(StatisticsApplicationService::new_for_role(
-            Arc::clone(&statistics_connector_control),
-            host.workload_root_admission(),
-        ));
+        let statistics_job_service = Arc::new(StatisticsJobService::new());
         let statistics_application_port = Arc::new(FrontendStatisticsApplicationPort::new(
-            statistics_application_service.as_ref().clone(),
+            statistics_job_service.as_ref().clone(),
+            Arc::new(
+                crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
+                    Arc::clone(&statistics_connector_control),
+                ),
+            ),
+            Arc::new(RootAdmissionStatisticsJobSource::new(
+                host.workload_root_admission(),
+            )),
             crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
                 &statistics_connector_control,
             )),
@@ -1310,7 +1316,7 @@ impl FrontendApplicationHost {
             ),
             tokio::runtime::Handle::current(),
         ));
-        host.statistics_application_service = Some(statistics_application_service);
+        host.statistics_job_service = Some(statistics_job_service);
         host.statistics_application_port = Some(statistics_application_port);
 
         Ok(host)
@@ -1332,11 +1338,11 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn statistics_application_service(&self) -> Arc<StatisticsApplicationService> {
+    pub fn statistics_job_service(&self) -> Arc<StatisticsJobService> {
         Arc::clone(
-            self.statistics_application_service
+            self.statistics_job_service
                 .as_ref()
-                .expect("statistics application service is installed before host open returns"),
+                .expect("statistics job service is installed before host open returns"),
         )
     }
 
@@ -1891,7 +1897,7 @@ impl FrontendApplicationHost {
         // Process-local job services do not own StateStore job records. Release
         // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();
-        self.statistics_application_service.take();
+        self.statistics_job_service.take();
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.

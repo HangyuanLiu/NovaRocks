@@ -34,6 +34,10 @@ use novarocks_workload_control::{WorkClass, WorkOwner, WorkRequest, WorkScope};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+mod job_service;
+
+pub use job_service::StatisticsJobService;
+
 pub const MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS: usize = 1024;
 pub const MAX_RECENT_TERMINAL_STATISTICS_JOBS: usize = 4096;
 
@@ -1015,6 +1019,23 @@ mod tests {
         );
         assert!(!job.state.is_terminal());
         assert_eq!(job.publication, StatisticsPublicationFact::NotStarted);
+    }
+
+    #[tokio::test]
+    async fn job_service_owns_submission_listing_and_cancellation() {
+        let service = StatisticsJobService::new();
+        let submitted = service.submit(create(1), root()).await.expect("submit");
+        assert_eq!(service.list().await.expect("list"), vec![submitted.clone()]);
+
+        let cancelled = service
+            .request_cancel(submitted.id, 2)
+            .await
+            .expect("request cancellation");
+        assert_eq!(cancelled.id, submitted.id);
+        assert_eq!(
+            cancelled.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
     }
 
     #[tokio::test]

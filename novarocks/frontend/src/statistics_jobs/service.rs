@@ -23,48 +23,16 @@
 //! executor; without them the entrypoint fails closed until role composition
 //! (T12) supplies the binding.
 
-use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use novarocks_statistics_application::{
-    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
-    StatisticsJobId, StatisticsJobRepository, StatisticsTarget, StatisticsWorker,
-};
-use novarocks_workload_control::{RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest};
-use uuid::Uuid;
-
 use super::application;
 use super::model::StatisticsJobTarget;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AnalyzeTableStatement {
-    pub target: StatisticsJobTarget,
-    pub columns: application::StatisticsColumnIntent,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowAnalyzeJobsStatement {
-    pub target: Option<StatisticsJobTarget>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CancelAnalyzeStatement {
-    pub job_id: Uuid,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ShowTableStatsStatement {
-    pub target: StatisticsJobTarget,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum StatisticsStatement {
-    AnalyzeTable(AnalyzeTableStatement),
-    ShowAnalyzeJobs(ShowAnalyzeJobsStatement),
-    CancelAnalyze(CancelAnalyzeStatement),
-    ShowTableStats(ShowTableStatsStatement),
-}
+use novarocks_statistics_application::{
+    StatisticsAttemptExecutor, StatisticsColumns, StatisticsJob, StatisticsJobCreate,
+    StatisticsJobId, StatisticsJobService, StatisticsTarget,
+};
+use novarocks_workload_control::{RootAdmissionHandle, WorkClass, WorkOwner, WorkRequest};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StatisticsStatementResult {
@@ -92,14 +60,6 @@ pub trait TableStatisticsReader: Send + Sync {
         target: &StatisticsJobTarget,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatRow>, String>;
-}
-
-pub trait StatisticsJobTargetResolver: Send + Sync {
-    fn capture_table_object(
-        &self,
-        target: &StatisticsJobTarget,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<application::StatisticsTargetCapture, String>;
 }
 
 /// T12's role composition supplies a root for each independently-owned
@@ -140,31 +100,10 @@ impl StatisticsJobRootScopeSource for RootAdmissionStatisticsJobSource {
     }
 }
 
-struct StatisticsTargetResolverAdapter {
-    inner: Arc<dyn application::StatisticsTargetResolver>,
-}
 struct StatisticsTableReaderAdapter {
     inner: Arc<dyn application::StatisticsTableReader>,
 }
 
-impl StatisticsJobTargetResolver for StatisticsTargetResolverAdapter {
-    fn capture_table_object(
-        &self,
-        target: &StatisticsJobTarget,
-        context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<application::StatisticsTargetCapture, String> {
-        self.inner
-            .capture_table_object(
-                &application::StatisticsTableTarget {
-                    catalog: target.catalog.clone(),
-                    namespace: target.namespace.clone(),
-                    table: target.table.clone(),
-                },
-                context,
-            )
-            .map_err(|error| error.to_string())
-    }
-}
 impl TableStatisticsReader for StatisticsTableReaderAdapter {
     fn show_table_stats(
         &self,
@@ -207,190 +146,27 @@ pub(crate) fn table_statistics_reader_for_role(
     })
 }
 
-#[derive(Clone)]
-pub struct StatisticsApplicationService {
-    repository: StatisticsJobRepository,
-    target_resolver: Arc<dyn StatisticsJobTargetResolver>,
-    root_scope: Arc<dyn StatisticsJobRootScopeSource>,
-}
-
-impl StatisticsApplicationService {
-    pub fn new(
-        target_resolver: Arc<dyn StatisticsJobTargetResolver>,
-        root_scope: Arc<dyn StatisticsJobRootScopeSource>,
-    ) -> Self {
-        Self {
-            repository: StatisticsJobRepository::new(),
-            target_resolver,
-            root_scope,
-        }
-    }
-    pub(crate) fn new_for_role(
-        controls: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-        admission: RootAdmissionHandle,
-    ) -> Self {
-        Self::new(
-            Arc::new(StatisticsTargetResolverAdapter {
-                inner: Arc::new(application::ConnectorStatisticsTargetResolver::new(
-                    controls,
-                )),
-            }),
-            Arc::new(RootAdmissionStatisticsJobSource::new(admission)),
-        )
-    }
-    pub fn repository(&self) -> StatisticsJobRepository {
-        self.repository.clone()
-    }
-    pub async fn execute(
-        &self,
-        statement: StatisticsStatement,
-        submitted_at_ms: i64,
-        table_statistics: &dyn TableStatisticsReader,
-        connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
-    ) -> Result<StatisticsStatementResult, StatisticsApplicationError> {
-        match statement {
-            StatisticsStatement::AnalyzeTable(statement) => {
-                let context = connector_context.ok_or_else(|| {
-                    StatisticsApplicationError::target_resolution(
-                        "ANALYZE target capture requires an admitted execution context",
-                    )
-                })?;
-                let capture = self
-                    .target_resolver
-                    .capture_table_object(&statement.target, context)
-                    .map_err(StatisticsApplicationError::target_resolution)?;
-                let owner = self
-                    .root_scope
-                    .begin_statistics_job()
-                    .map_err(StatisticsApplicationError::configuration)?;
-                let columns = match statement.columns {
-                    application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
-                    application::StatisticsColumnIntent::Explicit(columns) => {
-                        StatisticsColumns::Explicit(
-                            columns.into_iter().map(Arc::<str>::from).collect(),
-                        )
-                    }
-                };
-                self.repository
-                    .create(
-                        StatisticsJobCreate {
-                            target: StatisticsTarget {
-                                catalog: Arc::from(statement.target.catalog),
-                                namespace: Arc::from(statement.target.namespace),
-                                table: Arc::from(statement.target.table),
-                                object_id: Arc::from(capture.object_id),
-                            },
-                            columns,
-                            submitted_at_ms,
-                        },
-                        owner,
-                    )
-                    .await
-                    .map(StatisticsStatementResult::JobSubmitted)
-                    .map_err(StatisticsApplicationError::repository)
-            }
-            StatisticsStatement::ShowAnalyzeJobs(statement) => {
-                let mut jobs = self
-                    .repository
-                    .list()
-                    .await
-                    .map_err(StatisticsApplicationError::repository)?;
-                if let Some(target) = statement.target {
-                    jobs.retain(|job| {
-                        job.target.catalog.as_ref() == target.catalog
-                            && job.target.namespace.as_ref() == target.namespace
-                            && job.target.table.as_ref() == target.table
-                    });
-                }
-                Ok(StatisticsStatementResult::AnalyzeJobs(jobs))
-            }
-            StatisticsStatement::CancelAnalyze(statement) => self
-                .repository
-                .request_cancel(
-                    StatisticsJobId::from_uuid(statement.job_id),
-                    submitted_at_ms,
-                )
-                .await
-                .map(StatisticsStatementResult::JobCancellationRequested)
-                .map_err(StatisticsApplicationError::repository),
-            StatisticsStatement::ShowTableStats(statement) => table_statistics
-                .show_table_stats(
-                    &statement.target,
-                    connector_context.ok_or_else(|| {
-                        StatisticsApplicationError::table_statistics(
-                            "SHOW TABLE STATS requires an admitted execution context",
-                        )
-                    })?,
-                )
-                .map(StatisticsStatementResult::TableStats)
-                .map_err(StatisticsApplicationError::table_statistics),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsApplicationErrorKind {
-    Repository,
-    TableStatistics,
-    TargetResolution,
-    Configuration,
-}
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StatisticsApplicationError {
-    kind: StatisticsApplicationErrorKind,
-    message: String,
-}
-impl StatisticsApplicationError {
-    fn repository(error: novarocks_statistics_application::StatisticsRepositoryError) -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::Repository,
-            message: error.to_string(),
-        }
-    }
-    fn table_statistics(error: impl Into<String>) -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::TableStatistics,
-            message: error.into(),
-        }
-    }
-    fn target_resolution(error: impl Into<String>) -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::TargetResolution,
-            message: error.into(),
-        }
-    }
-    fn configuration(error: impl Into<String>) -> Self {
-        Self {
-            kind: StatisticsApplicationErrorKind::Configuration,
-            message: error.into(),
-        }
-    }
-    pub const fn kind(&self) -> StatisticsApplicationErrorKind {
-        self.kind
-    }
-}
-impl fmt::Display for StatisticsApplicationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl std::error::Error for StatisticsApplicationError {}
-
 pub struct FrontendStatisticsApplicationPort {
-    service: StatisticsApplicationService,
+    job_service: StatisticsJobService,
+    target_resolver: Arc<dyn application::StatisticsTargetResolver>,
+    root_scope: Arc<dyn StatisticsJobRootScopeSource>,
     table_statistics: Arc<dyn TableStatisticsReader>,
     runtime: tokio::runtime::Handle,
     core_executor: Arc<dyn StatisticsAttemptExecutor>,
 }
 impl FrontendStatisticsApplicationPort {
     pub fn new(
-        service: StatisticsApplicationService,
+        job_service: StatisticsJobService,
+        target_resolver: Arc<dyn application::StatisticsTargetResolver>,
+        root_scope: Arc<dyn StatisticsJobRootScopeSource>,
         table_statistics: Arc<dyn TableStatisticsReader>,
         core_executor: Arc<dyn StatisticsAttemptExecutor>,
         runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
-            service,
+            job_service,
+            target_resolver,
+            root_scope,
             table_statistics,
             runtime,
             core_executor,
@@ -403,11 +179,86 @@ impl FrontendStatisticsApplicationPort {
     fn run_bound_job(&self, at_ms: i64) -> Result<Option<StatisticsJob>, String> {
         tokio::task::block_in_place(|| {
             self.runtime.block_on(
-                StatisticsWorker::new(self.service.repository(), Arc::clone(&self.core_executor))
-                    .run_one(at_ms),
+                self.job_service
+                    .run_one(Arc::clone(&self.core_executor), at_ms),
             )
         })
         .map_err(|error| error.to_string())
+    }
+
+    async fn execute_command(
+        &self,
+        command: application::StatisticsApplicationCommand,
+        submitted_at_ms: i64,
+        connector_context: Option<novarocks_spi::connector::ConnectorRequestContext>,
+    ) -> Result<StatisticsStatementResult, application::StatisticsApplicationError> {
+        match command {
+            application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
+                let context = connector_context.ok_or_else(|| {
+                    application::StatisticsApplicationError::new(
+                        "ANALYZE target capture requires an admitted execution context",
+                    )
+                })?;
+                let capture = self
+                    .target_resolver
+                    .capture_table_object(&target, context)?;
+                let owner = self
+                    .root_scope
+                    .begin_statistics_job()
+                    .map_err(application::StatisticsApplicationError::new)?;
+                let columns = match columns {
+                    application::StatisticsColumnIntent::AllColumns => StatisticsColumns::All,
+                    application::StatisticsColumnIntent::Explicit(columns) => {
+                        StatisticsColumns::Explicit(
+                            columns.into_iter().map(Arc::<str>::from).collect(),
+                        )
+                    }
+                };
+                self.job_service
+                    .submit(
+                        StatisticsJobCreate {
+                            target: StatisticsTarget {
+                                catalog: Arc::from(target.catalog),
+                                namespace: Arc::from(target.namespace),
+                                table: Arc::from(target.table),
+                                object_id: Arc::from(capture.object_id),
+                            },
+                            columns,
+                            submitted_at_ms,
+                        },
+                        owner,
+                    )
+                    .await
+                    .map(StatisticsStatementResult::JobSubmitted)
+                    .map_err(|error| {
+                        application::StatisticsApplicationError::new(error.to_string())
+                    })
+            }
+            application::StatisticsApplicationCommand::ShowAnalyzeJobs => self
+                .job_service
+                .list()
+                .await
+                .map(StatisticsStatementResult::AnalyzeJobs)
+                .map_err(|error| application::StatisticsApplicationError::new(error.to_string())),
+            application::StatisticsApplicationCommand::CancelAnalyze { job_id } => self
+                .job_service
+                .request_cancel(StatisticsJobId::from_uuid(job_id), submitted_at_ms)
+                .await
+                .map(StatisticsStatementResult::JobCancellationRequested)
+                .map_err(|error| application::StatisticsApplicationError::new(error.to_string())),
+            application::StatisticsApplicationCommand::ShowTableStats { target } => self
+                .table_statistics
+                .show_table_stats(
+                    &target.into(),
+                    connector_context.ok_or_else(|| {
+                        application::StatisticsApplicationError::new(
+                            "SHOW TABLE STATS requires an admitted execution context",
+                        )
+                    })?,
+                )
+                .map(StatisticsStatementResult::TableStats)
+                .map_err(application::StatisticsApplicationError::new),
+        }
     }
 }
 
@@ -437,35 +288,11 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
             }
             _ => None,
         };
-        let statement = match command {
-            application::StatisticsApplicationCommand::AnalyzeTable { target, columns } => {
-                StatisticsStatement::AnalyzeTable(AnalyzeTableStatement {
-                    target: target.into(),
-                    columns,
-                })
-            }
-            application::StatisticsApplicationCommand::ShowAnalyzeJobs => {
-                StatisticsStatement::ShowAnalyzeJobs(ShowAnalyzeJobsStatement { target: None })
-            }
-            application::StatisticsApplicationCommand::CancelAnalyze { job_id } => {
-                StatisticsStatement::CancelAnalyze(CancelAnalyzeStatement { job_id })
-            }
-            application::StatisticsApplicationCommand::ShowTableStats { target } => {
-                StatisticsStatement::ShowTableStats(ShowTableStatsStatement {
-                    target: target.into(),
-                })
-            }
-        };
         let at_ms = now_ms().map_err(application::StatisticsApplicationError::new)?;
         let result = tokio::task::block_in_place(|| {
-            self.runtime.block_on(self.service.execute(
-                statement,
-                at_ms,
-                self.table_statistics.as_ref(),
-                connector_context,
-            ))
-        })
-        .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))?;
+            self.runtime
+                .block_on(self.execute_command(command, at_ms, connector_context))
+        })?;
         let result = match result {
             StatisticsStatementResult::JobSubmitted(job) => match self
                 .run_bound_job(at_ms)
