@@ -758,6 +758,28 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
         }
         unreachable!("statistics publication attempt loop always returns")
     }
+
+    fn abort(self: Box<Self>) -> Result<(), ConnectorError> {
+        let mut this = *self;
+        let Some(mut frontier) = this.frontier.take() else {
+            return Ok(());
+        };
+        match this
+            .provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { frontier.abort().await })
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(unavailable(format!(
+                "statistics transaction abort failed: {error}"
+            ))),
+            Err(error) => Err(unavailable(format!(
+                "statistics transaction abort runtime bridge failed: {error}"
+            ))),
+        }
+    }
 }
 
 fn abort_pending_statistics_frontier(

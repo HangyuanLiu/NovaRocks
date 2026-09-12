@@ -291,6 +291,63 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
             },
         }
     }
+
+    fn abort_pending(
+        &self,
+        job_id: novarocks_statistics_application::StatisticsJobId,
+        original: CoreStatisticsAttemptError,
+    ) -> CoreStatisticsAttemptError {
+        let pending = match self.pending.lock() {
+            Ok(mut attempts) => attempts.remove(&job_id),
+            Err(_) => {
+                return Self::with_abort_context(
+                    original,
+                    "statistics phase state lock poisoned while aborting provider session",
+                );
+            }
+        };
+        match pending {
+            Some(pending) => Self::abort_pending_session(pending, original),
+            None => original,
+        }
+    }
+
+    fn abort_pending_session(
+        pending: PendingThreePhaseStatisticsAttempt,
+        original: CoreStatisticsAttemptError,
+    ) -> CoreStatisticsAttemptError {
+        match pending.session.abort() {
+            Ok(()) => original,
+            Err(error) => Self::with_abort_context(
+                original,
+                format!("statistics provider session abort failed: {error}"),
+            ),
+        }
+    }
+
+    fn with_abort_context(
+        original: CoreStatisticsAttemptError,
+        context: impl AsRef<str>,
+    ) -> CoreStatisticsAttemptError {
+        let context = context.as_ref();
+        match original {
+            CoreStatisticsAttemptError::Failed(failure) => {
+                CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                    message: Arc::from(format!("{}; {context}", failure.message)),
+                })
+            }
+            CoreStatisticsAttemptError::Stale(failure) => {
+                CoreStatisticsAttemptError::Stale(StatisticsFailure {
+                    message: Arc::from(format!("{}; {context}", failure.message)),
+                })
+            }
+            CoreStatisticsAttemptError::Cancelled(failure) => {
+                CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                    message: Arc::from(format!("{}; {context}", failure.message)),
+                })
+            }
+        }
+    }
 }
 
 impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecutor {
@@ -341,61 +398,76 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
         let pending = if required.is_empty() {
             empty_collection_pending(session)
         } else {
-            let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
-                table,
-                data_version,
-                read_version_ordinal,
-                required,
-                crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
-                    crate::query_execution::statistics::StatisticsExecutionMode::BackgroundCollectionAttempt,
-                    self.ports.attempt_timeout,
-                )
-                .map_err(|error| Self::failure(error.to_string()))?,
-            )
-            .map_err(|error| Self::failure(error.to_string()))?;
-            let topology = self
-                .ports
-                .backend_topology
-                .snapshot()
-                .map_err(|error| Self::failure(error.to_string()))?;
-            let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
-                self.ports.execution_role,
-                topology,
-                Some(deadline),
-                cancellation,
-                novarocks_sql::compiler::SessionOptimizerSettings::default(),
-            );
-            let relation = crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
-                request.connector_instance_id.as_str(),
-                request.namespace.as_str(),
-                request.table.as_str(),
-            )
-            .map_err(|error| Self::failure(error.to_string()))?;
-            let prepared =
-                crate::query_execution::statistics::prepare_statistics_collection_request(
-                    crate::query_execution::statistics::StatisticsPlanningServices::new(
-                        self.ports.connector_control.as_ref(),
-                        &self.ports.typed_connector_control,
-                        self.ports.function_catalog.as_ref(),
-                    ),
-                    &execution,
-                    context,
-                    &relation,
-                    program,
-                    planning_lease,
+            let request = (|| {
+                let program = crate::query_execution::statistics::StatisticsCollectionProgram::try_new(
+                    table,
+                    data_version,
+                    read_version_ordinal,
+                    required,
+                    crate::query_execution::statistics::StatisticsExecutionPolicy::try_new(
+                        crate::query_execution::statistics::StatisticsExecutionMode::BackgroundCollectionAttempt,
+                        self.ports.attempt_timeout,
+                    )
+                    .map_err(|error| Self::failure(error.to_string()))?,
                 )
                 .map_err(|error| Self::failure(error.to_string()))?;
-            let native = crate::native::fragment_encoder::encode_native_fragment_bundle(
-                prepared.encoding_view(),
-            )
-            .map_err(Self::failure)?;
+                let topology = self
+                    .ports
+                    .backend_topology
+                    .snapshot()
+                    .map_err(|error| Self::failure(error.to_string()))?;
+                let execution = crate::common::admitted_query_context::QueryExecutionContext::new(
+                    self.ports.execution_role,
+                    topology,
+                    Some(deadline),
+                    cancellation,
+                    novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                );
+                let relation =
+                    crate::query_execution::statistics::StatisticsRelationIdentity::try_new(
+                        request.connector_instance_id.as_str(),
+                        request.namespace.as_str(),
+                        request.table.as_str(),
+                    )
+                    .map_err(|error| Self::failure(error.to_string()))?;
+                let prepared =
+                    crate::query_execution::statistics::prepare_statistics_collection_request(
+                        crate::query_execution::statistics::StatisticsPlanningServices::new(
+                            self.ports.connector_control.as_ref(),
+                            &self.ports.typed_connector_control,
+                            self.ports.function_catalog.as_ref(),
+                        ),
+                        &execution,
+                        context,
+                        &relation,
+                        program,
+                        planning_lease,
+                    )
+                    .map_err(|error| Self::failure(error.to_string()))?;
+                let native = crate::native::fragment_encoder::encode_native_fragment_bundle(
+                    prepared.encoding_view(),
+                )
+                .map_err(Self::failure)?;
+                prepared
+                    .finish(native)
+                    .map_err(|error| Self::failure(error.to_string()))
+            })();
+            let request = match request {
+                Ok(request) => request,
+                Err(error) => {
+                    return Err(Self::abort_pending_session(
+                        PendingThreePhaseStatisticsAttempt {
+                            session,
+                            request: None,
+                            artifacts: None,
+                        },
+                        error,
+                    ));
+                }
+            };
             PendingThreePhaseStatisticsAttempt {
                 session,
-                request: Some(
-                    prepared
-                        .finish(native)
-                        .map_err(|error| Self::failure(error.to_string()))?,
-                ),
+                request: Some(request),
                 artifacts: None,
             }
         };
@@ -404,7 +476,9 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .lock()
             .map_err(|_| Self::failure("statistics phase state lock poisoned"))?;
         if attempts.contains_key(&job.id) {
-            return Err(Self::failure("statistics attempt already prepared"));
+            drop(attempts);
+            let error = Self::failure("statistics attempt already prepared");
+            return Err(Self::abort_pending_session(pending, error));
         }
         attempts.insert(job.id, pending);
         Ok(())
@@ -415,7 +489,9 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
         job: &StatisticsJob,
         scope: &novarocks_workload_control::WorkScope,
     ) -> Result<(), CoreStatisticsAttemptError> {
-        scope.check().map_err(Self::scope_error)?;
+        if let Err(error) = scope.check().map_err(Self::scope_error) {
+            return Err(self.abort_pending(job.id, error));
+        }
         let mut pending = self
             .pending
             .lock()
@@ -424,9 +500,9 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .ok_or_else(|| Self::failure("statistics collection has no prepared attempt"))?;
         if pending.request.is_none() {
             if pending.artifacts.is_none() {
-                return Err(Self::failure(
-                    "statistics collection has neither request nor artifacts",
-                ));
+                let error =
+                    Self::failure("statistics collection has neither request nor artifacts");
+                return Err(Self::abort_pending_session(pending, error));
             }
             self.pending
                 .lock()
@@ -438,13 +514,19 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .request
             .take()
             .ok_or_else(|| Self::failure("statistics collection already executed"))?;
-        let artifacts = self
+        let artifacts = match self
             .ports
             .query_execution
             .execute(request)
             .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_statistics)
             .map(|outcome| outcome.into_artifacts())
-            .map_err(|error| Self::failure(error.to_string()))?;
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                let error = Self::failure(error.to_string());
+                return Err(Self::abort_pending_session(pending, error));
+            }
+        };
         pending.artifacts = Some(artifacts);
         self.pending
             .lock()
@@ -458,16 +540,19 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
         job: &StatisticsJob,
         scope: &novarocks_workload_control::WorkScope,
     ) -> Result<StatisticsPublicationOutcome, CoreStatisticsAttemptError> {
-        scope.check().map_err(Self::scope_error)?;
+        if let Err(error) = scope.check().map_err(Self::scope_error) {
+            return Err(self.abort_pending(job.id, error));
+        }
         let pending = self
             .pending
             .lock()
             .map_err(|_| Self::failure("statistics phase state lock poisoned"))?
             .remove(&job.id)
             .ok_or_else(|| Self::failure("statistics publication has no collected attempt"))?;
-        let artifacts = pending
-            .artifacts
-            .ok_or_else(|| Self::failure("statistics publication requires collected artifacts"))?;
+        let Some(artifacts) = pending.artifacts else {
+            let error = Self::failure("statistics publication requires collected artifacts");
+            return Err(Self::abort_pending_session(pending, error));
+        };
         pending
             .session
             .finish(artifacts)
@@ -504,6 +589,7 @@ mod tests {
         operation_id: ConnectorMutationOperationId,
         data_version: StatisticsDataVersion,
         finish_calls: Arc<AtomicUsize>,
+        abort_calls: Arc<AtomicUsize>,
     }
 
     impl StatisticsCollectionSession for EmptyCollectionSession {
@@ -545,6 +631,11 @@ mod tests {
                 finalization: ExternalMutationFinalization::Complete,
             })
         }
+
+        fn abort(self: Box<Self>) -> Result<(), novarocks_spi::connector::ConnectorError> {
+            self.abort_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[test]
@@ -558,12 +649,14 @@ mod tests {
         let data_version = StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
             .expect("data version");
         let finish_calls = Arc::new(AtomicUsize::new(0));
+        let abort_calls = Arc::new(AtomicUsize::new(0));
         let pending = empty_collection_pending(Box::new(EmptyCollectionSession {
             descriptor,
             incarnation,
             operation_id,
             data_version,
             finish_calls: Arc::clone(&finish_calls),
+            abort_calls: Arc::clone(&abort_calls),
         }));
         let PendingThreePhaseStatisticsAttempt {
             session,
@@ -582,5 +675,32 @@ mod tests {
             StatisticsPublicationFact::KnownCommitted
         ));
         assert_eq!(finish_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn abandoning_a_prepared_collection_consumes_the_provider_session_once() {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").expect("provider ID"),
+            instance_id: ConnectorInstanceId::parse("ice.main").expect("instance ID"),
+        };
+        let abort_calls = Arc::new(AtomicUsize::new(0));
+        let pending = empty_collection_pending(Box::new(EmptyCollectionSession {
+            descriptor,
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+            operation_id: ConnectorMutationOperationId::from_bytes([8; 16]),
+            data_version: StatisticsDataVersion::try_new(Bytes::from_static(b"snapshot-42"))
+                .expect("data version"),
+            finish_calls: Arc::new(AtomicUsize::new(0)),
+            abort_calls: Arc::clone(&abort_calls),
+        }));
+
+        let error = FrontendThreePhaseStatisticsAttemptExecutor::abort_pending_session(
+            pending,
+            FrontendThreePhaseStatisticsAttemptExecutor::failure("collection failed"),
+        );
+
+        assert!(matches!(error, CoreStatisticsAttemptError::Failed(_)));
+        assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
     }
 }
