@@ -162,6 +162,17 @@ pub(crate) fn persistent_input(cluster_id: impl Into<String>) -> StateStoreHostI
     }
 }
 
+pub(crate) async fn open_persistent(cluster_id: impl Into<String>) -> FrontendStateStoreHost {
+    let registry = persistent_registry();
+    FrontendStateStoreHost::open(
+        &registry,
+        persistent_input(cluster_id),
+        Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("open persistent Frontend test StateStore")
+}
+
 /// Compatibility-free test fixture input. It represents only test data; the
 /// actual host opening facts remain `StateStoreHostInput` above.
 #[derive(Clone, Debug, Default)]

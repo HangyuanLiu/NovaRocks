@@ -474,6 +474,10 @@ impl FrontendCatalogController {
 }
 
 #[cfg(test)]
+#[path = "catalog_controller_tests.rs"]
+mod integration_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::Instant as StdInstant;

@@ -29,13 +29,17 @@
 //!
 //! Each test below pins one of those, by observing behaviour rather than shape.
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use common::state_store_fixture;
+use super::{CatalogProjectionConfig, FrontendCatalogController};
+use crate::application::{
+    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
+};
+use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
+use crate::state_store::{StateStoreHost, testing as state_store_fixture};
+use crate::topology::ClusterBackendOpenConfig;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
@@ -46,12 +50,6 @@ use novarocks_catalog_application::{
     CatalogDesiredStateSourceMode, CatalogSqlMutationAdmission,
 };
 use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
-use novarocks_frontend::application::{
-    FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
-};
-use novarocks_frontend::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
-use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
-use novarocks_frontend::topology::ClusterBackendOpenConfig;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
@@ -424,7 +422,7 @@ async fn ready_attachment_id(port: &CatalogApplicationService, name: &str) -> Uu
     panic!("catalog `{name}` did not become Ready after scheduler materialization")
 }
 
-async fn shutdown(mut host: novarocks_frontend::state_store::StateStoreHost) {
+async fn shutdown(mut host: StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");
@@ -461,7 +459,7 @@ async fn seed_ready_catalogs(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapshot_path() {
     let cluster = format!("catalog-desired-state-restart-{}", Uuid::now_v7());
-    let first_host = state_store_fixture::open(cluster.clone()).await;
+    let first_host = state_store_fixture::open_persistent(cluster.clone()).await;
     let store = first_host.state_store().expect("test StateStore");
     let repository = CatalogAttachmentRepository::open(Arc::clone(&store), first_host.run_policy())
         .await
@@ -516,7 +514,7 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
     shutdown(first_host).await;
 
     // Restart: a brand new frontend composition over the same durable store.
-    let second_host = state_store_fixture::open(cluster).await;
+    let second_host = state_store_fixture::open_persistent(cluster).await;
     let store = second_host.state_store().expect("test StateStore");
     let repository =
         CatalogAttachmentRepository::open(Arc::clone(&store), second_host.run_policy())
@@ -567,7 +565,7 @@ async fn dynamic_state_store_mode_survives_a_frontend_restart_through_one_snapsh
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unimplemented_source_mode_rejects_sql_catalog_mutation_without_falling_back() {
-    let host = state_store_fixture::open(format!(
+    let host = state_store_fixture::open_persistent(format!(
         "catalog-desired-state-mode-reject-{}",
         Uuid::now_v7()
     ))
@@ -634,7 +632,7 @@ async fn an_unimplemented_source_mode_rejects_sql_catalog_mutation_without_falli
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_effect() {
-    let registry = state_store_fixture::registry();
+    let registry = state_store_fixture::persistent_registry();
     for mode in [CatalogDesiredStateSourceMode::ManagedController] {
         // No StateStore input at all: if the rejection depended on anything the
         // frontend opens, this could not fail here.
@@ -693,7 +691,7 @@ async fn selecting_an_unimplemented_source_mode_fails_before_any_startup_side_ef
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty_snapshot() {
-    let host = state_store_fixture::open(format!(
+    let host = state_store_fixture::open_persistent(format!(
         "catalog-desired-state-enumeration-{}",
         Uuid::now_v7()
     ))
@@ -784,7 +782,7 @@ async fn an_incomplete_enumeration_blocks_bootstrap_instead_of_becoming_an_empty
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving() {
-    let host = state_store_fixture::open(format!(
+    let host = state_store_fixture::open_persistent(format!(
         "catalog-desired-state-materialize-{}",
         Uuid::now_v7()
     ))
@@ -861,7 +859,7 @@ async fn one_catalogs_materialization_failure_leaves_every_other_catalog_serving
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bootstrap_submits_63_healthy_catalogs_without_waiting_for_one_hanging_provider() {
     const HANGING: &str = "catalog.hang";
-    let host = state_store_fixture::open(format!(
+    let host = state_store_fixture::open_persistent(format!(
         "catalog-desired-state-bootstrap-liveness-{}",
         Uuid::now_v7()
     ))
@@ -933,7 +931,7 @@ async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
     // scheduler. The fixture's factory constructs bindings locally, so this
     // characterizes submission/completeness without remote metadata latency.
     for catalog_count in [1, 64, 256, 1024] {
-        let host = state_store_fixture::open(format!(
+        let host = state_store_fixture::open_persistent(format!(
             "catalog-desired-state-bootstrap-scale-{catalog_count}-{}",
             Uuid::now_v7()
         ))
@@ -980,7 +978,7 @@ async fn bootstrap_enqueues_complete_no_io_snapshots_through_1024_catalogs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap() {
     let cluster = format!("catalog-desired-state-removal-{}", Uuid::now_v7());
-    let first_host = state_store_fixture::open(cluster.clone()).await;
+    let first_host = state_store_fixture::open_persistent(cluster.clone()).await;
     let store = first_host.state_store().expect("test StateStore");
     let repository = CatalogAttachmentRepository::open(Arc::clone(&store), first_host.run_policy())
         .await
@@ -1012,7 +1010,7 @@ async fn a_catalog_removed_from_the_source_is_not_revived_by_the_next_bootstrap(
     drop(store);
     shutdown(first_host).await;
 
-    let second_host = state_store_fixture::open(cluster).await;
+    let second_host = state_store_fixture::open_persistent(cluster).await;
     let store = second_host.state_store().expect("test StateStore");
     let repository =
         CatalogAttachmentRepository::open(Arc::clone(&store), second_host.run_policy())
