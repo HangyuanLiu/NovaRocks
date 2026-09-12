@@ -3978,6 +3978,7 @@ dependencies = [
  "novarocks-query-application",
  "novarocks-state-store-runtime",
  "novarocks-table-maintenance",
+ "tokio",
  "tracing",
 ]
 

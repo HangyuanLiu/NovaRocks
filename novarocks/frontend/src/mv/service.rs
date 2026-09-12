@@ -18,8 +18,8 @@
 use novarocks_workload_control::{
     BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
 };
+use std::sync::Arc;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +42,7 @@ use novarocks_mv_application::{
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
+    process_runtime::{MvBackgroundRuntime, MvBackgroundRuntimeOwner},
     scheduler::MvSchedulerConfig,
 };
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
@@ -55,7 +56,7 @@ use super::{
     scheduler::{FrontendMvScheduler, ScheduledRefreshDisposition, ScheduledRefreshRequest},
 };
 
-/// Frontend-owned application service for materialized-view statements.
+/// Frontend composition and statement adapter for materialized-view products.
 ///
 /// MVX-1 owns only Iceberg CREATE sequencing. Other MV statement classes
 /// deliberately return `None` so their existing core routes remain active.
@@ -63,7 +64,7 @@ pub struct FrontendMvService {
     readiness: Arc<MvReadinessPort>,
     refresh: refresh::FrontendMvRefreshDependencies,
     activity_gate: MvActivityGate,
-    background: Mutex<Option<FrontendMvBackgroundRuntime>>,
+    background: MvBackgroundRuntimeOwner,
     scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -106,7 +107,7 @@ impl FrontendMvService {
             },
             readiness,
             activity_gate: MvActivityGate::new(),
-            background: Mutex::new(None),
+            background: MvBackgroundRuntimeOwner::default(),
             scheduler_config,
             maintenance_config,
             table_maintenance_service,
@@ -127,77 +128,39 @@ impl FrontendMvService {
         deadline: Instant,
     ) -> Result<(), String> {
         self.activity_gate.begin_stopping();
-        let runtime = self
-            .background
-            .lock()
-            .map_err(|error| format!("lock frontend MV worker lifecycle: {error}"))?
-            .take();
-        let Some(mut runtime) = runtime else {
-            return Ok(());
-        };
-        let result = runtime.stop_and_join_until(deadline).await;
-        if result.is_err() {
-            let mut guard = self
-                .background
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if guard.replace(runtime).is_some() {
-                return Err("frontend MV worker owner changed during shutdown".to_string());
-            }
-        }
-        result
+        self.background.shutdown_until(deadline).await
     }
 
     pub(crate) fn request_background_stop_for_process_exit(&self) {
         self.activity_gate.begin_stopping();
-        if let Some(runtime) = self
-            .background
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .as_ref()
-        {
-            runtime.request_stop();
-        }
+        self.background.request_stop_for_process_exit();
     }
 
     pub(crate) fn start_background_workers(
         &self,
         bindings: MvBackgroundBindings,
     ) -> Result<(), MvBackgroundEngineError> {
+        let reservation = self.background.begin_start().map_err(lifecycle_error)?;
         let dependencies = self.refresh.clone();
         let topology = self.topology.clone();
         let table_maintenance_service = Arc::clone(&self.table_maintenance_service);
-        let mut guard = self.background.lock().map_err(|error| {
-            MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::InvariantViolation,
-                format!("lock frontend MV worker lifecycle: {error}"),
-            )
+        let runtime = start_background_workers(RefreshWorkerDependencies {
+            readiness: Arc::clone(&self.readiness),
+            refresh: dependencies,
+            background_engine: bindings.engine,
+            topology,
+            role: self.execution_role,
+            scheduler_config: self.scheduler_config.clone(),
+            maintenance_config: self.maintenance_config.clone(),
+            table_maintenance_engine: bindings.table_maintenance_engine,
+            table_maintenance_service,
+            activity_gate: self.activity_gate.clone(),
+            root_admission: self.root_admission.clone(),
+            maintenance_wakeup_tx: None,
+            optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
+            attempt_timeout: self.attempt_timeout,
         })?;
-        if guard.is_some() {
-            return Err(MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::InvariantViolation,
-                "frontend MV background engine was bound more than once",
-            ));
-        }
-        *guard = Some(FrontendMvBackgroundRuntime::start(
-            RefreshWorkerDependencies {
-                readiness: Arc::clone(&self.readiness),
-                refresh: dependencies,
-                background_engine: bindings.engine,
-                topology,
-                role: self.execution_role,
-                scheduler_config: self.scheduler_config.clone(),
-                maintenance_config: self.maintenance_config.clone(),
-                table_maintenance_engine: bindings.table_maintenance_engine,
-                table_maintenance_service,
-                activity_gate: self.activity_gate.clone(),
-                root_admission: self.root_admission.clone(),
-                maintenance_wakeup_tx: None,
-                optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
-                attempt_timeout: self.attempt_timeout,
-            },
-        )?);
-        Ok(())
+        reservation.install(runtime).map_err(lifecycle_error)
     }
 }
 
@@ -353,130 +316,72 @@ struct RefreshWorkerDependencies {
     attempt_timeout: Duration,
 }
 
-struct FrontendMvBackgroundRuntime {
-    stop_tx: mpsc::Sender<()>,
-    refresh_worker: Option<thread::JoinHandle<()>>,
-    maintenance_stop_tx: mpsc::Sender<()>,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    maintenance_wakeup_tx: mpsc::SyncSender<()>,
-    maintenance_worker: Option<thread::JoinHandle<()>>,
+fn start_background_workers(
+    dependencies: RefreshWorkerDependencies,
+) -> Result<MvBackgroundRuntime, MvBackgroundEngineError> {
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
+    let (maintenance_wakeup_tx, maintenance_wakeup_rx) = mpsc::sync_channel(1);
+    let interval = Duration::from_millis(dependencies.scheduler_config.tick_interval_ms().max(1));
+    let maintenance_interval =
+        Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
+    let maintenance = Arc::new(FrontendMaintenanceWorker::new(
+        FrontendMaintenanceWorkerDependencies {
+            readiness: Arc::clone(&dependencies.readiness),
+            background_engine: Arc::clone(&dependencies.background_engine),
+            table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
+            table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
+            activity_gate: dependencies.activity_gate.clone(),
+            root_admission: dependencies.root_admission.clone(),
+            coordinator_config: dependencies.maintenance_config.clone(),
+            attempt_timeout: dependencies.attempt_timeout,
+            runtime: tokio::runtime::Handle::current(),
+        },
+    ));
+    let mut refresh_dependencies = dependencies;
+    refresh_dependencies.maintenance_wakeup_tx = Some(maintenance_wakeup_tx.clone());
+    let refresh_worker = thread::Builder::new()
+        .name("novarocks-frontend-mv-refresh".to_string())
+        .spawn(move || run_refresh_worker(refresh_dependencies, stop_rx, interval))
+        .map_err(|error| {
+            MvBackgroundEngineError::new(
+                MvBackgroundEngineErrorKind::TransientUnavailable,
+                format!("start frontend MV refresh worker: {error}"),
+            )
+        })?;
+    let maintenance_worker = match thread::Builder::new()
+        .name("novarocks-frontend-mv-maintenance".to_string())
+        .spawn(move || {
+            maintenance.run_until_stopped(
+                &maintenance_stop_rx,
+                &maintenance_wakeup_rx,
+                maintenance_interval,
+            )
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            let _ = stop_tx.send(());
+            let _ = refresh_worker.join();
+            return Err(MvBackgroundEngineError::new(
+                MvBackgroundEngineErrorKind::TransientUnavailable,
+                format!("start frontend MV maintenance worker: {error}"),
+            ));
+        }
+    };
+    Ok(MvBackgroundRuntime::new(
+        stop_tx,
+        refresh_worker,
+        maintenance_stop_tx,
+        maintenance_wakeup_tx,
+        maintenance_worker,
+    ))
 }
 
-impl FrontendMvBackgroundRuntime {
-    fn request_stop(&self) {
-        let _ = self.stop_tx.send(());
-        let _ = self.maintenance_stop_tx.send(());
-    }
-
-    fn start(dependencies: RefreshWorkerDependencies) -> Result<Self, MvBackgroundEngineError> {
-        let (stop_tx, stop_rx) = mpsc::channel();
-        let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
-        let (maintenance_wakeup_tx, maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let interval =
-            Duration::from_millis(dependencies.scheduler_config.tick_interval_ms().max(1));
-        let maintenance_interval =
-            Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
-        let maintenance = Arc::new(FrontendMaintenanceWorker::new(
-            FrontendMaintenanceWorkerDependencies {
-                readiness: Arc::clone(&dependencies.readiness),
-                background_engine: Arc::clone(&dependencies.background_engine),
-                table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
-                table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
-                activity_gate: dependencies.activity_gate.clone(),
-                root_admission: dependencies.root_admission.clone(),
-                coordinator_config: dependencies.maintenance_config.clone(),
-                attempt_timeout: dependencies.attempt_timeout,
-                runtime: tokio::runtime::Handle::current(),
-            },
-        ));
-        let mut refresh_dependencies = dependencies;
-        refresh_dependencies.maintenance_wakeup_tx = Some(maintenance_wakeup_tx.clone());
-        let refresh_worker = thread::Builder::new()
-            .name("novarocks-frontend-mv-refresh".to_string())
-            .spawn(move || run_refresh_worker(refresh_dependencies, stop_rx, interval))
-            .map_err(|error| {
-                MvBackgroundEngineError::new(
-                    MvBackgroundEngineErrorKind::TransientUnavailable,
-                    format!("start frontend MV refresh worker: {error}"),
-                )
-            })?;
-        let maintenance_worker = match thread::Builder::new()
-            .name("novarocks-frontend-mv-maintenance".to_string())
-            .spawn(move || {
-                maintenance.run_until_stopped(
-                    &maintenance_stop_rx,
-                    &maintenance_wakeup_rx,
-                    maintenance_interval,
-                )
-            }) {
-            Ok(worker) => worker,
-            Err(error) => {
-                let _ = stop_tx.send(());
-                let _ = refresh_worker.join();
-                return Err(MvBackgroundEngineError::new(
-                    MvBackgroundEngineErrorKind::TransientUnavailable,
-                    format!("start frontend MV maintenance worker: {error}"),
-                ));
-            }
-        };
-        Ok(Self {
-            stop_tx,
-            refresh_worker: Some(refresh_worker),
-            maintenance_stop_tx,
-            maintenance_wakeup_tx,
-            maintenance_worker: Some(maintenance_worker),
-        })
-    }
-
-    async fn stop_and_join_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.request_stop();
-        if let Some(worker) = self.refresh_worker.as_ref() {
-            while !worker.is_finished() {
-                if Instant::now() >= deadline {
-                    return Err(
-                        "frontend MV refresh worker did not stop before the shared shutdown deadline"
-                            .to_string(),
-                    );
-                }
-                tokio::time::sleep(
-                    Duration::from_millis(10)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                )
-                .await;
-            }
-            self.refresh_worker
-                .take()
-                .expect("finished frontend MV refresh worker is retained")
-                .join()
-                .map_err(|_| "frontend MV refresh worker panicked during shutdown".to_string())?;
-        }
-        if let Some(worker) = self.maintenance_worker.as_ref() {
-            while !worker.is_finished() {
-                if Instant::now() >= deadline {
-                    return Err(
-                        "frontend MV maintenance worker did not stop before the shared shutdown deadline"
-                            .to_string(),
-                    );
-                }
-                tokio::time::sleep(
-                    Duration::from_millis(10)
-                        .min(deadline.saturating_duration_since(Instant::now())),
-                )
-                .await;
-            }
-            self.maintenance_worker
-                .take()
-                .expect("finished frontend MV maintenance worker is retained")
-                .join()
-                .map_err(|_| {
-                    "frontend MV maintenance worker panicked during shutdown".to_string()
-                })?;
-        }
-        Ok(())
-    }
+fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
+    MvBackgroundEngineError::new(
+        MvBackgroundEngineErrorKind::InvariantViolation,
+        error.to_string(),
+    )
 }
 
 fn run_refresh_worker(
@@ -816,7 +721,7 @@ mod shutdown_tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{FrontendMvBackgroundRuntime, application_disposition};
+    use super::{MvBackgroundRuntime, application_disposition};
     use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
     use crate::mv::scheduler::ScheduledRefreshDisposition;
 
@@ -843,28 +748,25 @@ mod shutdown_tests {
             let _ = release_rx.recv();
         });
         let maintenance_worker = thread::spawn(|| {});
-        let mut runtime = FrontendMvBackgroundRuntime {
+        let mut runtime = MvBackgroundRuntime::new(
             stop_tx,
-            refresh_worker: Some(refresh_worker),
+            refresh_worker,
             maintenance_stop_tx,
             maintenance_wakeup_tx,
-            maintenance_worker: Some(maintenance_worker),
-        };
+            maintenance_worker,
+        );
 
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV worker must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-        assert!(runtime.refresh_worker.is_some());
 
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("the retained MV worker join remains retryable");
-        assert!(runtime.refresh_worker.is_none());
-        assert!(runtime.maintenance_worker.is_none());
     }
 
     #[tokio::test]
@@ -877,27 +779,24 @@ mod shutdown_tests {
         let maintenance_worker = thread::spawn(move || {
             let _ = release_rx.recv();
         });
-        let mut runtime = FrontendMvBackgroundRuntime {
+        let mut runtime = MvBackgroundRuntime::new(
             stop_tx,
-            refresh_worker: Some(refresh_worker),
+            refresh_worker,
             maintenance_stop_tx,
             maintenance_wakeup_tx,
-            maintenance_worker: Some(maintenance_worker),
-        };
+            maintenance_worker,
+        );
 
         let error = runtime
             .stop_and_join_until(Instant::now() + Duration::from_millis(10))
             .await
             .expect_err("blocked MV maintenance must respect the shared deadline");
         assert!(error.contains("shared shutdown deadline"));
-        assert!(runtime.refresh_worker.is_none());
-        assert!(runtime.maintenance_worker.is_some());
 
         release_tx.send(()).unwrap();
         runtime
             .stop_and_join_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("retry must join the retained MV maintenance worker");
-        assert!(runtime.maintenance_worker.is_none());
     }
 }

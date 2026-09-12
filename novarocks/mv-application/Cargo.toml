@@ -12,3 +12,4 @@ novarocks-query-application.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-table-maintenance.workspace = true
 tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
