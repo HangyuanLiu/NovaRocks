@@ -39,7 +39,7 @@ pub mod statistics;
 pub mod statistics_jobs;
 pub mod system_catalog;
 pub mod table_maintenance;
-pub mod task_execution;
+pub(crate) mod task_execution;
 pub mod topology;
 pub mod view;
 pub mod workload_lifecycle;

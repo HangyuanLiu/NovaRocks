@@ -37,71 +37,26 @@
 pub(crate) mod abort_effect;
 pub(crate) mod actor_gate;
 pub(crate) mod blocking_io;
-pub mod clock;
-pub mod completion;
-pub mod context_convergence;
-pub mod context_owner;
-pub mod credential;
+pub(crate) mod clock;
+pub(crate) mod completion;
+pub(crate) mod context_convergence;
+pub(crate) mod context_owner;
+pub(crate) mod credential;
 pub(crate) mod credential_pump;
-pub mod dispatch;
-pub mod error;
-pub mod execution;
+pub(crate) mod dispatch;
+pub(crate) mod error;
+pub(crate) mod execution;
 pub(crate) mod feedback_pump;
-pub mod graph;
-pub mod intent;
+pub(crate) mod graph;
+pub(crate) mod intent;
 pub(crate) mod manifest_round;
-pub mod remote_task;
+pub(crate) mod remote_task;
 pub(crate) mod round;
-pub mod sources;
+pub(crate) mod sources;
 mod split_domain;
 pub(crate) mod split_transport;
-pub mod stage;
-pub mod status_intake;
+pub(crate) mod stage;
+pub(crate) mod status_intake;
 
 #[cfg(test)]
 mod tests;
-
-pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
-pub use completion::{
-    ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,
-};
-pub use context_convergence::{
-    ContextConvergenceIntake, ContextConvergenceIntakeHandle, ContextConvergencePublishAdmission,
-    ContextConvergencePublishError,
-};
-pub use context_owner::{
-    ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
-};
-pub use credential::{CredentialRefreshOwner, RefreshRefusal, RefreshTiming, refresh_timing};
-pub use dispatch::{ExpiredOperation, OperationDispatcher};
-pub use error::{CapacityBound, TaskExecutionError};
-pub use execution::{
-    AbortSubmission, PumpReport, QueryTaskExecution, ReleasedRuntimeFilterContributions,
-    StatusReport,
-};
-pub use graph::{
-    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
-};
-pub use intent::{
-    AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
-    TaskOperationQueueRequest, TaskOperationSink, TaskOperationSubmit,
-};
-pub use remote_task::{
-    CreateSettlement, RemoteTask, RemoteTaskState, TaskTerminalReport, UpdateAdmission,
-    UpdateSettlement,
-};
-// The coordinator still owns split delivery, so nothing consumes these yet.
-// `expect` rather than `allow`, so the attribute itself stops compiling clean
-// once the cutover gives them a caller.
-#[expect(
-    unused_imports,
-    reason = "The split delivery bridge is wired by the coordinator cutover, which is a separate step."
-)]
-pub(crate) use split_transport::{
-    DeliveryId, PendingSplitDelivery, SettleVerdict, SplitDeliveryBridge, SplitDeliveryError,
-};
-pub use stage::{EdgeOpenTracker, StageExecution};
-pub use status_intake::{
-    CountingWake, NotifyWake, StatusEvent, StatusIntake, StatusIntakeAdmission, StatusIntakeHandle,
-    StatusIntakeWake,
-};

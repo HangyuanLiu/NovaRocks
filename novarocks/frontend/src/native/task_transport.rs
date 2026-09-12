@@ -82,6 +82,9 @@ use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
 
+use crate::task_execution::context_convergence::{
+    ContextConvergenceIntakeHandle, ContextConvergencePublishError,
+};
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
     TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
@@ -89,7 +92,6 @@ use crate::task_execution::intent::{
 use crate::task_execution::status_intake::{
     StatusEvent, StatusIntakeAdmission, StatusIntakeHandle, StatusIntakeWake,
 };
-use crate::task_execution::{ContextConvergenceIntakeHandle, ContextConvergencePublishError};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
@@ -715,7 +717,7 @@ impl NativeTaskOperationSink {
 impl TaskOperationSink for NativeTaskOperationSink {
     fn try_reserve_queue(
         &self,
-        request: crate::task_execution::TaskOperationQueueRequest,
+        request: crate::task_execution::intent::TaskOperationQueueRequest,
     ) -> TaskOperationQueueAdmission {
         let lane = if request.requires_control_progress() {
             NativeTransportLane::Control
@@ -2110,7 +2112,7 @@ mod tests {
     use tonic::{Request, Response, Status};
 
     use crate::native::transport_supervisor::NativeTransportSupervisor;
-    use crate::task_execution::ContextConvergenceIntake;
+    use crate::task_execution::context_convergence::ContextConvergenceIntake;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
     use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
