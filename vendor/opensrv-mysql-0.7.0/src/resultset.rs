@@ -153,7 +153,12 @@ impl<'a, W: AsyncWrite + Unpin> QueryResultWriter<'a, W> {
         }
         match self.last_end.take() {
             None => Ok(()),
-            Some(Finalizer::Ok(ok_packet)) => {
+            Some(Finalizer::Ok(mut ok_packet)) => {
+                if more_exists {
+                    ok_packet
+                        .status_flags
+                        .set(StatusFlags::SERVER_MORE_RESULTS_EXISTS, true);
+                }
                 writers::write_ok_packet(self.writer, self.client_capabilities, ok_packet).await
             }
             Some(Finalizer::Eof) => writers::write_eof_packet(self.writer, status).await,

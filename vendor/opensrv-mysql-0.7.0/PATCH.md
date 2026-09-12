@@ -13,7 +13,8 @@ handshake. The local patch:
 3. exposes those negotiated capabilities to `QueryResultWriter` consumers; and
 4. separates `RowWriter`'s socket and column-schema borrow lifetimes, so a
    completed result can return its connection writer without retaining the
-   caller's temporary column conversion.
+   caller's temporary column conversion; and
+5. emits `SERVER_MORE_RESULTS_EXISTS` for both EOF and OK result terminators.
 
 The NovaRocks MySQL adapter uses this read-only fact to reject multi-statement
 input unless both capabilities were negotiated. The patch preserves default

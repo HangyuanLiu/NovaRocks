@@ -59,7 +59,7 @@ impl Scenario for NegotiatedMultiResult {
             context.mysql_port(),
             timeout,
         )?;
-        stream.send_query("SET query_timeout = 1; SELECT 1")?;
+        stream.send_query("SET query_timeout = 60; SELECT 1")?;
         let first = stream.read_packet("first multi-result terminal")?;
         ensure!(
             first.is_result_terminator() && first.has_more_results(),
