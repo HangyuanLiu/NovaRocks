@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use novarocks_workload_control::{
+    BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
+};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -38,7 +41,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork,
 };
 use crate::query_execution::service::QueryExecutionService;
-use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 
 use super::{
@@ -71,7 +73,7 @@ pub struct FrontendMvService {
     /// carries the value that statement admission would otherwise have to guess.
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
-    workload_lifecycle: Option<FrontendServingLifecycle>,
+    root_admission: RootAdmissionHandle,
 }
 
 impl FrontendMvService {
@@ -93,6 +95,7 @@ impl FrontendMvService {
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
+        root_admission: RootAdmissionHandle,
     ) -> Self {
         Self {
             refresh: refresh::FrontendMvRefreshDependencies {
@@ -111,16 +114,8 @@ impl FrontendMvService {
             topology,
             optimizer_query_mem_limit_bytes,
             attempt_timeout,
-            workload_lifecycle: None,
+            root_admission,
         }
-    }
-
-    /// Installs the FE-local owner that admits every effect-capable MV
-    /// background attempt. The application host must install the one shared
-    /// lifecycle before binding the background engine.
-    pub(crate) fn with_workload_lifecycle(mut self, lifecycle: FrontendServingLifecycle) -> Self {
-        self.workload_lifecycle = Some(lifecycle);
-        self
     }
 
     pub(crate) fn readiness_port(&self) -> Arc<MvReadinessPort> {
@@ -172,12 +167,6 @@ impl FrontendMvService {
         let dependencies = self.refresh.clone();
         let topology = self.topology.clone();
         let table_maintenance_service = Arc::clone(&self.table_maintenance_service);
-        let workload_lifecycle = self.workload_lifecycle.clone().ok_or_else(|| {
-            MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::InvariantViolation,
-                "frontend MV background workers require the shared serving lifecycle",
-            )
-        })?;
         let mut guard = self.background.lock().map_err(|error| {
             MvBackgroundEngineError::new(
                 MvBackgroundEngineErrorKind::InvariantViolation,
@@ -202,7 +191,7 @@ impl FrontendMvService {
                 table_maintenance_engine: bindings.table_maintenance_engine,
                 table_maintenance_service,
                 activity_gate: self.activity_gate.clone(),
-                workload_lifecycle,
+                root_admission: self.root_admission.clone(),
                 maintenance_wakeup_tx: None,
                 optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
                 attempt_timeout: self.attempt_timeout,
@@ -358,7 +347,7 @@ struct RefreshWorkerDependencies {
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     activity_gate: MvActivityGate,
-    workload_lifecycle: FrontendServingLifecycle,
+    root_admission: RootAdmissionHandle,
     maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
@@ -396,7 +385,7 @@ impl FrontendMvBackgroundRuntime {
                 table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
                 table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
                 activity_gate: dependencies.activity_gate.clone(),
-                workload_lifecycle: dependencies.workload_lifecycle.clone(),
+                root_admission: dependencies.root_admission.clone(),
                 coordinator_config: dependencies.maintenance_config.clone(),
                 attempt_timeout: dependencies.attempt_timeout,
                 runtime: tokio::runtime::Handle::current(),
@@ -525,14 +514,24 @@ fn run_scheduled_refreshes(
             scheduler.requeue(request);
             break;
         }
-        let workload_lease = match dependencies
-            .workload_lifecycle
-            .try_admit(FrontendWorkloadKind::Background)
+        let RootWork { owner, business } = match dependencies
+            .root_admission
+            .try_begin_root(WorkRequest::new(WorkClass::MaterializedView))
         {
-            Ok(lease) => lease,
+            Ok(work) => work,
             Err(_) => {
                 // Draining is terminal for this process runtime. Preserve the
                 // coalesced request without creating a new refresh attempt.
+                scheduler.requeue(request);
+                break;
+            }
+        };
+        let cancellation = match owner.scope().cancellation() {
+            Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
+                view, None,
+            ),
+            Err(_) => {
+                finish_background_root(owner, business);
                 scheduler.requeue(request);
                 break;
             }
@@ -542,23 +541,29 @@ fn run_scheduled_refreshes(
             MvActivityOwner::ScheduledRefresh,
         ) {
             Ok(ticket) => ticket,
-            Err(_) => continue,
+            Err(_) => {
+                finish_background_root(owner, business);
+                continue;
+            }
         };
         let lease = match ticket.try_acquire() {
             Ok(Some(lease)) => lease,
             Ok(None) => {
+                finish_background_root(owner, business);
                 scheduler.requeue(request);
                 continue;
             }
-            Err(_) => continue,
+            Err(_) => {
+                finish_background_root(owner, business);
+                continue;
+            }
         };
         if scheduler.mark_started(request.definition.mv_id) {
             // The scheduler has already bounded this batch. Execute its
             // transitions on this event loop rather than creating an OS thread
-            // for every due MV. Keeping the activity and workload leases local
+            // for every due MV. Keeping the activity lease and governed root local
             // to the same transition makes `complete` the exact terminal
             // observation before the next event starts.
-            let cancellation = workload_lease.cancellation_source().view();
             let disposition = execute_scheduled_refresh(dependencies, &request, cancellation);
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
             if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
@@ -575,15 +580,20 @@ fn run_scheduled_refreshes(
             } else if completed && let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
                 let _ = wakeup_tx.try_send(());
             }
-            // Keep the leases in scope through the scheduler terminal
-            // transition. Their Drop wakes the next queued owner only after
-            // this MV's outcome is durable in the process runtime.
-            let _lease = lease;
-            let _workload_lease = workload_lease;
+            // Release the activity lease only after the scheduler terminal is
+            // durable, then complete the governed root.
+            drop(lease);
+            finish_background_root(owner, business);
         } else {
+            finish_background_root(owner, business);
             scheduler.requeue(request);
         }
     }
+}
+
+fn finish_background_root(owner: WorkOwner, business: BusinessPermit) {
+    drop(business);
+    owner.complete();
 }
 
 fn scheduler_outcome_log_fields(

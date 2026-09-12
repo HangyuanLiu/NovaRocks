@@ -190,23 +190,21 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&mv_storage_observation),
         ),
     );
-    let mv_service = Arc::new(
-        crate::mv::FrontendMvService::with_refresh_dependencies(
-            Arc::clone(&mv_readiness),
-            query_execution.clone(),
-            Arc::clone(&connector_control),
-            mv_activation,
-            role,
-            topology.clone(),
-            host.mv_scheduler_config(),
-            host.mv_maintenance_config(),
-            host.table_maintenance_service(),
-            host.optimizer_query_mem_limit_bytes(),
-            host.lake_publication_runtime_policy()
-                .max_attempt_duration(),
-        )
-        .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
-    );
+    let mv_service = Arc::new(crate::mv::FrontendMvService::with_refresh_dependencies(
+        Arc::clone(&mv_readiness),
+        query_execution.clone(),
+        Arc::clone(&connector_control),
+        mv_activation,
+        role,
+        topology.clone(),
+        host.mv_scheduler_config(),
+        host.mv_maintenance_config(),
+        host.table_maintenance_service(),
+        host.optimizer_query_mem_limit_bytes(),
+        host.lake_publication_runtime_policy()
+            .max_attempt_duration(),
+        host.workload_root_admission(),
+    ));
     host.install_mv_service(Arc::clone(&mv_service))
         .map_err(FrontendApplicationError::server)?;
     let mv_application = host.mv_application_service();

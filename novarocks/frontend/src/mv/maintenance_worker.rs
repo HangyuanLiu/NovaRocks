@@ -29,6 +29,9 @@
 //! lifecycle route.  That route must claim, execute, and terminally persist a
 //! job before this worker releases its activity lease and maintenance permit.
 
+use novarocks_workload_control::{
+    BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
+};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,7 +45,6 @@ use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
-use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
 
 use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{
@@ -59,7 +61,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
     pub(crate) activity_gate: MvActivityGate,
-    pub(crate) workload_lifecycle: FrontendServingLifecycle,
+    pub(crate) root_admission: RootAdmissionHandle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
     /// Captured at construction because the worker runs on bare threads that
@@ -238,13 +240,25 @@ impl FrontendMaintenanceWorker {
             }
         };
 
-        let workload_lease = match self
+        let RootWork { owner, business } = match self
             .dependencies
-            .workload_lifecycle
-            .try_admit(FrontendWorkloadKind::Background)
+            .root_admission
+            .try_begin_root(WorkRequest::new(WorkClass::MaterializedView))
         {
-            Ok(lease) => lease,
+            Ok(work) => work,
             Err(_) => {
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
+                return;
+            }
+        };
+        let cancellation = match owner.scope().cancellation() {
+            Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
+                view, None,
+            ),
+            Err(_) => {
+                finish_automatic_root(owner, business);
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                     mv_id: definition.mv_id,
                 });
@@ -257,6 +271,7 @@ impl FrontendMaintenanceWorker {
         ) {
             Ok(ticket) => ticket,
             Err(MvActivityGateError::Stopping) => {
+                finish_automatic_root(owner, business);
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                     mv_id: definition.mv_id,
                 });
@@ -266,12 +281,14 @@ impl FrontendMaintenanceWorker {
         let lease = match ticket.try_acquire() {
             Ok(Some(lease)) => lease,
             Ok(None) => {
+                finish_automatic_root(owner, business);
                 pass.skipped.push(FrontendMaintenanceSkip::GateBusy {
                     mv_id: definition.mv_id,
                 });
                 return;
             }
             Err(MvActivityGateError::Stopping) => {
+                finish_automatic_root(owner, business);
                 pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                     mv_id: definition.mv_id,
                 });
@@ -282,10 +299,13 @@ impl FrontendMaintenanceWorker {
         // Reject pre-dispatch cancellation before acquiring the durable route.
         // A cancellation that races an external commit is retained by that
         // route as recovery evidence rather than turned into a retry.
-        if lease
-            .cancellation()
-            .is_some_and(|cancellation| cancellation.is_cancelled())
+        if cancellation.is_cancelled()
+            || lease
+                .cancellation()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
         {
+            drop(lease);
+            finish_automatic_root(owner, business);
             pass.skipped.push(FrontendMaintenanceSkip::Stopping {
                 mv_id: definition.mv_id,
             });
@@ -300,6 +320,8 @@ impl FrontendMaintenanceWorker {
         {
             Ok(attempt) => attempt,
             Err(admission) => {
+                drop(lease);
+                finish_automatic_root(owner, business);
                 pass.skipped.push(FrontendMaintenanceSkip::Admission {
                     mv_id: definition.mv_id,
                     admission,
@@ -311,7 +333,7 @@ impl FrontendMaintenanceWorker {
             engine: Arc::clone(&self.dependencies.table_maintenance_engine),
             service: Arc::clone(&self.dependencies.table_maintenance_service),
             context: AutomaticMaintenanceContext::with_deadline(
-                workload_lease.cancellation_source().view(),
+                cancellation,
                 Instant::now() + self.dependencies.attempt_timeout,
             ),
             handle: self.dependencies.runtime.clone(),
@@ -321,17 +343,22 @@ impl FrontendMaintenanceWorker {
             .lock()
             .expect("frontend MV maintenance coordinator lock poisoned")
             .finish_attempt(attempt, &execution, now_ms);
-        // Keep `lease` live until all durable calls and the coordinator's
-        // terminal transition have completed.  Its Drop wakes the next FIFO
-        // request for this MV target.
-        let _lease = lease;
-        let _workload_lease = workload_lease;
+        // Release the activity lease only after all durable calls and the
+        // coordinator's terminal transition have completed, then finish the
+        // governed root.
+        drop(lease);
+        finish_automatic_root(owner, business);
         pass.attempts.push(FrontendMaintenanceAttemptReport {
             mv_id: definition.mv_id,
             target,
             execution,
         });
     }
+}
+
+fn finish_automatic_root(owner: WorkOwner, business: BusinessPermit) {
+    drop(business);
+    owner.complete();
 }
 
 /// Narrow adapter from automatic policy actions to the existing frontend
