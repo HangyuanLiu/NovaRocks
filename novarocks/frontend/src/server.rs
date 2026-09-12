@@ -69,24 +69,16 @@ impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemp
     }
 }
 
+/// Inputs required to open the Frontend application owner.
+///
+/// The Server role composes these inputs; this type deliberately excludes
+/// listeners and process supervision policy.
 #[derive(Clone)]
-pub struct FrontendServerConfig {
+pub struct FrontendApplicationOpenConfig {
     pub execution: FrontendExecutionConfig,
     pub backend_open: ClusterBackendOpenConfig,
-    pub report_bind_host: String,
-    pub report_grpc_port: u16,
-    /// Dedicated role=fe management HTTP endpoint.
-    pub metrics_http_port: u16,
-    /// Maximum time admitted FE workload leases may continue after drain starts.
-    pub frontend_drain_timeout: Duration,
-    /// Upper bound for terminal resource cleanup after graceful/deadline drain.
-    pub frontend_cleanup_timeout: Duration,
-    pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control role factories composed by the server root.
     pub connector_control_role_factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
-    /// Application-owned storage observation composed by the server role.
-    /// Frontend and Core never decode provider table handles directly.
-    pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
     pub state_store_input: Option<StateStoreHostInput>,
@@ -100,9 +92,32 @@ pub struct FrontendServerConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
+/// Inputs for the Frontend-owned management listener.
+#[derive(Clone)]
+pub struct FrontendManagementConfig {
+    pub bind_host: String,
+    pub http_port: u16,
+    pub native_compatibility_id: novarocks_types::NativeCompatibilityId,
+}
+
+/// Inputs for serving one ready Frontend application through native and MySQL
+/// listeners. The Server role owns their process supervision.
+#[derive(Clone)]
+pub struct FrontendServingConfig {
+    pub report_bind_host: String,
+    pub report_grpc_port: u16,
+    /// Maximum time admitted FE workload leases may continue after drain starts.
+    pub frontend_drain_timeout: Duration,
+    /// Upper bound for terminal resource cleanup after graceful/deadline drain.
+    pub frontend_cleanup_timeout: Duration,
+    pub mysql_listener: ResolvedMysqlListenerSettings,
+    pub native_trust: Arc<NativeTrust>,
+    pub native_transport: FrontendNativeTransport,
+}
+
 /// Opens the frontend services once for an externally composed server.
 pub async fn open_frontend_application_for_server(
-    config: &FrontendServerConfig,
+    config: &FrontendApplicationOpenConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
@@ -419,13 +434,13 @@ pub struct FrontendManagementServer {
 }
 
 pub fn start_frontend_management_server(
-    config: &FrontendServerConfig,
+    config: &FrontendManagementConfig,
 ) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
     let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
-        config.backend_open.native_compatibility_id(),
+        config.native_compatibility_id,
     ));
     let convergence_reader =
         Arc::new(crate::metrics::LateBoundQueryLifecycleConvergenceReader::default());
@@ -436,8 +451,8 @@ pub fn start_frontend_management_server(
         dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
-        &config.report_bind_host,
-        config.metrics_http_port,
+        &config.bind_host,
+        config.http_port,
         Arc::clone(&metrics_registry),
         management_reader,
         management_island_reader,
@@ -489,7 +504,7 @@ impl FrontendManagementServer {
 }
 
 pub async fn serve_ready_frontend_session_factory<F>(
-    config: FrontendServerConfig,
+    config: FrontendServingConfig,
     host: &mut FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     shutdown: F,
@@ -668,6 +683,12 @@ async fn wait_for_frontend_listener_failure(
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct FrontendTestServerConfig {
+    state_store_input: Option<StateStoreHostInput>,
+}
+
+#[cfg(test)]
 async fn run_frontend_server_until_shutdown_with_ports<
     F,
     Host,
@@ -680,7 +701,7 @@ async fn run_frontend_server_until_shutdown_with_ports<
     ShutdownHost,
     ShutdownHostFuture,
 >(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     shutdown: F,
     open_host: OpenHost,
     extract_service: ExtractService,
@@ -692,7 +713,7 @@ where
     OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
-    Serve: FnOnce(FrontendServerConfig, Service, F) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, F) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
@@ -720,7 +741,7 @@ async fn run_frontend_server_with_signal_and_ports<
     ShutdownHost,
     ShutdownHostFuture,
 >(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     signal: S,
     open_host: OpenHost,
     extract_service: ExtractService,
@@ -733,7 +754,7 @@ where
     OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
-    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
@@ -763,7 +784,7 @@ fn combine_server_and_shutdown(
 
 #[cfg(test)]
 async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     service: Service,
     signal: S,
     serve: Serve,
@@ -771,7 +792,7 @@ async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
 where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let mut signal = Box::pin(signal);
@@ -836,7 +857,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -850,21 +870,19 @@ mod tests {
     use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
-        FrontendServerConfig, build_frontend_query_session_factory,
+        FrontendTestServerConfig, build_frontend_query_session_factory,
         run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
         shutdown_frontend_application_to_convergence,
     };
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
-    use crate::state_store::{
-        StateStoreProviderRegistry,
-        testing::{input as test_state_store_input, registry as test_state_store_registry},
+    use crate::state_store::testing::{
+        input as test_state_store_input, registry as test_state_store_registry,
     };
     use crate::{
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig,
     };
     use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
-    use novarocks_mysql_adapter::ResolvedMysqlListenerSettings;
     use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
     use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};
@@ -927,31 +945,9 @@ mod tests {
         }
     }
 
-    fn frontend_config() -> FrontendServerConfig {
-        FrontendServerConfig {
-            execution: FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
-                NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
-                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                builtin_function_catalog(),
-            ),
-            backend_open: frontend_backend_open_config(),
-            report_bind_host: "127.0.0.1".to_string(),
-            report_grpc_port: 0,
-            metrics_http_port: 0,
-            frontend_drain_timeout: Duration::from_secs(1),
-            frontend_cleanup_timeout: Duration::from_secs(1),
-            mysql_listener: ResolvedMysqlListenerSettings::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                "root",
-            ),
-            connector_control_role_factories: Vec::new(),
-            mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
+    fn frontend_config() -> FrontendTestServerConfig {
+        FrontendTestServerConfig {
             state_store_input: None,
-            state_store_provider_registry: StateStoreProviderRegistry::new(),
-            native_trust: test_native_trust(),
-            native_transport: FrontendNativeTransport::plaintext(),
         }
     }
 

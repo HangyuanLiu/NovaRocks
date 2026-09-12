@@ -57,9 +57,10 @@ pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{
-    FrontendServerConfig, build_frontend_query_session_factory,
-    open_frontend_application_for_server, serve_ready_frontend_session_factory,
-    shutdown_frontend_application_to_convergence, start_frontend_management_server,
+    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
+    build_frontend_query_session_factory, open_frontend_application_for_server,
+    serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
+    start_frontend_management_server,
 };
 pub use state_store::{
     RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,

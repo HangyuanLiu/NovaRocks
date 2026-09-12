@@ -21,16 +21,25 @@ use std::future::Future;
 use std::sync::Arc;
 
 use novarocks_frontend::{
-    FrontendApplicationError, FrontendServerConfig, open_frontend_application_for_server,
+    FrontendApplicationError, FrontendApplicationOpenConfig, FrontendManagementConfig,
+    FrontendServingConfig, open_frontend_application_for_server,
     serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
     start_frontend_management_server,
 };
 use tokio::runtime::Handle;
 
+#[derive(Clone)]
+pub struct FrontendRoleConfig {
+    pub application: FrontendApplicationOpenConfig,
+    pub management: FrontendManagementConfig,
+    pub serving: FrontendServingConfig,
+    pub mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
+}
+
 /// Runs one already-composed Frontend role until its process owner requests
 /// shutdown or a role-owned listener reports a failure.
 pub async fn run_until_shutdown<F>(
-    config: FrontendServerConfig,
+    config: FrontendRoleConfig,
     data_runtime: Handle,
     shutdown: F,
 ) -> Result<(), FrontendApplicationError>
@@ -38,17 +47,18 @@ where
     F: Future<Output = ()> + Send,
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.frontend_cleanup_timeout;
-    let mut management_server = start_frontend_management_server(&config)?;
-    let mut host = match open_frontend_application_for_server(&config, data_runtime).await {
-        Ok(host) => host,
-        Err(error) => {
-            let cleanup = management_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine(Err(error), cleanup);
-        }
-    };
+    let cleanup_timeout = config.serving.frontend_cleanup_timeout;
+    let mut management_server = start_frontend_management_server(&config.management)?;
+    let mut host =
+        match open_frontend_application_for_server(&config.application, data_runtime).await {
+            Ok(host) => host,
+            Err(error) => {
+                let cleanup = management_server
+                    .stop()
+                    .map_err(FrontendApplicationError::server);
+                return combine(Err(error), cleanup);
+            }
+        };
     if let Err(error) = management_server.install(&host) {
         let shutdown =
             shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
@@ -58,7 +68,7 @@ where
         return combine(Err(error), combine(shutdown, cleanup));
     }
     let serving = serve_ready_frontend_session_factory(
-        config,
+        config.serving,
         &mut host,
         mv_storage_observation,
         shutdown,

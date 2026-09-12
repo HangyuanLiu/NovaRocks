@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
 use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
+use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
 use novarocks_backend::BackendServerConfig;
@@ -34,8 +35,9 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
-    FrontendQueryControlTimeouts, FrontendServerConfig, TaskUpdateRetryPolicy,
+    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendApplicationOpenConfig,
+    FrontendExecutionConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
+    FrontendServingConfig, TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -454,7 +456,7 @@ pub fn compose_backend_server_config(
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.
-pub fn compose_frontend_server_config(
+pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
@@ -462,7 +464,7 @@ pub fn compose_frontend_server_config(
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     runtime: tokio::runtime::Handle,
-) -> anyhow::Result<FrontendServerConfig> {
+) -> anyhow::Result<FrontendRoleConfig> {
     let runtime_config = &config.runtime;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
@@ -642,22 +644,34 @@ pub fn compose_frontend_server_config(
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
-    Ok(FrontendServerConfig {
-        execution,
-        backend_open,
-        report_bind_host: config.server.host.clone(),
-        report_grpc_port: config.server.grpc_port,
-        metrics_http_port: config.server.http_port,
-        frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
-        frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
-        mysql_listener,
-        connector_control_role_factories: provider_manifest
-            .compose_control_factories(config, runtime)?,
+    Ok(FrontendRoleConfig {
+        application: FrontendApplicationOpenConfig {
+            execution,
+            backend_open,
+            connector_control_role_factories: provider_manifest
+                .compose_control_factories(config, runtime)?,
+            state_store_input,
+            state_store_provider_registry,
+            native_trust: std::sync::Arc::clone(native_trust.trust()),
+            native_transport: frontend_native_transport(native_trust.transport()),
+        },
+        management: FrontendManagementConfig {
+            bind_host: config.server.host.clone(),
+            http_port: config.server.http_port,
+            native_compatibility_id,
+        },
+        serving: FrontendServingConfig {
+            report_bind_host: config.server.host.clone(),
+            report_grpc_port: config.server.grpc_port,
+            frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
+            frontend_cleanup_timeout: Duration::from_millis(
+                config.server.frontend_cleanup_timeout_ms,
+            ),
+            mysql_listener,
+            native_trust: std::sync::Arc::clone(native_trust.trust()),
+            native_transport: frontend_native_transport(native_trust.transport()),
+        },
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
-        state_store_input,
-        state_store_provider_registry,
-        native_trust: std::sync::Arc::clone(native_trust.trust()),
-        native_transport: frontend_native_transport(native_trust.transport()),
     })
 }
 

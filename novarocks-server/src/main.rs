@@ -129,7 +129,7 @@ fn run_frontend(
     provider_manifest: Arc<ServerProviderManifest>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let frontend = composition::compose_frontend_server_config(
+    let frontend = composition::compose_frontend_role_config(
         &role.config,
         &role.native_trust,
         None,
@@ -194,7 +194,7 @@ async fn run_all_in_one(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
-    let frontend = composition::compose_frontend_server_config(
+    let frontend = composition::compose_frontend_role_config(
         &fe.config,
         &fe.native_trust,
         None,
