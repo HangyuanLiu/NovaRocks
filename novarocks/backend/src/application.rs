@@ -32,7 +32,7 @@ use novarocks_native_adapter::{
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
-use crate::task_execution::{QueryContextHost, ReleasedContextEvidence};
+use crate::task_execution::QueryContextHost;
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -48,6 +48,8 @@ use novarocks_execution_contract::task_execution::operation::{
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
+#[cfg(test)]
+use novarocks_worker::ReleasedContextEvidence;
 #[cfg(test)]
 use novarocks_worker::TaskStatusReporter;
 #[cfg(test)]

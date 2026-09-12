@@ -30,6 +30,8 @@
 //! domain's payload fails closed here instead of being misread one layer down.
 //! Nothing else in the backend may name a wire type to get at a payload.
 
+use std::sync::Arc;
+
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::descriptor::PhysicalFragmentPlan;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
@@ -38,15 +40,22 @@ use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::catalog::CatalogSet;
+use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain::{
-    WireCredential, encode_task_dynamic_filter_domain, stored_credential, stored_message,
+    WireContent, WireCredential, encode_task_dynamic_filter_domain, stored_credential,
+    stored_message,
 };
 use novarocks_task_codec::identity::encode_task_identity;
 
-use novarocks_worker::{HostRejection, TaskDynamicFilterRead};
+use novarocks_worker::{
+    HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation, TaskDynamicFilterRead,
+};
+
+const RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG: &[u8] =
+    b"novarocks.task_execution.release.runtime_filter_evidence.v1";
 
 /// The catalogs one establish asks this backend to materialize.
 ///
@@ -74,6 +83,53 @@ pub fn runtime_filter_install(
 ) -> Result<&proto::RuntimeFilterContribution, HostRejection> {
     stored_message::<proto::RuntimeFilterContribution>(payload)
         .ok_or_else(|| internal("runtime filter payload is not a participant contribution"))
+}
+
+/// Seals a typed runtime-filter contribution behind the Worker-owned release
+/// evidence handle.
+///
+/// The Worker retains only codec-owned content and the settled classification.
+/// This Backend adapter is the sole place that names the generated terminal
+/// telemetry, both while sealing it and while reconstructing a wire reply.
+pub fn sealed_runtime_filter_evidence(
+    telemetry: QueryTerminalProfileContributionTelemetry,
+) -> ReleasedContextEvidence {
+    let observation = if telemetry.available().is_some() {
+        RuntimeFilterReleaseObservation::Available
+    } else {
+        RuntimeFilterReleaseObservation::Unavailable
+    };
+    ReleasedContextEvidence::with_runtime_filter(
+        Arc::new(WireContent::new(
+            RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG,
+            telemetry.as_proto().clone(),
+        )),
+        observation,
+    )
+}
+
+/// Recovers the terminal telemetry that a release acknowledgement carries.
+///
+/// A malformed or foreign opaque handle is an internal role-composition error,
+/// not an empty contribution: substituting absence would contradict the
+/// Worker-owned observation marker that says a participant was sealed.
+pub fn release_runtime_filter_telemetry(
+    evidence: &ReleasedContextEvidence,
+) -> Result<Option<QueryTerminalProfileContributionTelemetry>, HostRejection> {
+    evidence
+        .runtime_filter()
+        .map(|payload| {
+            let raw = stored_message::<proto::QueryTerminalProfileContributionTelemetry>(
+                payload.as_ref(),
+            )
+            .ok_or_else(|| internal("release runtime-filter evidence is not terminal telemetry"))?;
+            QueryTerminalProfileContributionTelemetry::parse(raw.clone()).map_err(|error| {
+                internal(&format!(
+                    "release runtime-filter evidence violates the terminal contract: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 /// The execution options one establish freezes for every task in the context.
@@ -162,7 +218,7 @@ fn protocol(detail: &str) -> HostRejection {
 mod tests {
     use super::{
         catalog_bindings, credential_material, encode_dynamic_filter_read, fragment_plan,
-        runtime_filter_install,
+        release_runtime_filter_telemetry, runtime_filter_install,
     };
 
     use std::sync::Arc;
@@ -179,7 +235,9 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use novarocks_worker::TaskDynamicFilterRead;
+    use novarocks_worker::{
+        ReleasedContextEvidence, RuntimeFilterReleaseObservation, TaskDynamicFilterRead,
+    };
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
@@ -227,6 +285,24 @@ mod tests {
             "a task's filter envelope is not a participant install"
         );
         assert!(runtime_filter_install(contribution.as_ref()).is_ok());
+    }
+
+    #[test]
+    fn foreign_release_evidence_is_refused_rather_than_encoded_as_absent() {
+        // The Worker retains the content opaquely. If a role accidentally
+        // hands its release adapter another payload family, this must be loud:
+        // absence would contradict the retained `Unavailable` observation.
+        let evidence = ReleasedContextEvidence::with_runtime_filter(
+            wire(b"catalog", catalog::CatalogSet::default()),
+            RuntimeFilterReleaseObservation::Unavailable,
+        );
+
+        let rejection = release_runtime_filter_telemetry(&evidence)
+            .expect_err("only terminal telemetry may be encoded on a release");
+        assert_eq!(
+            rejection.category(),
+            novarocks_execution_contract::task_execution::status::TaskFailureCategory::Internal
+        );
     }
 
     #[test]

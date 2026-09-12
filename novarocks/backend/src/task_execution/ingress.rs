@@ -256,12 +256,15 @@ impl RegistryTaskExecutionIngress {
                 // it is what hands the shared facts back to the host and seals
                 // this evidence.
                 let evidence = self.registry.released_context_evidence(request.context());
+                let runtime_filter =
+                    super::shared_facts::release_runtime_filter_telemetry(&evidence)
+                        .map_err(rejection_status)?;
                 encode_item(&receipt, |ack| {
                     let mut encoded = encode_release_ack(
                         ack.context(),
                         ack.release(),
                         ack.state(),
-                        evidence.runtime_filter(),
+                        runtime_filter.as_ref(),
                     )?;
                     encoded.termination_cause =
                         ack.termination_cause().map(encode_abort_cause_field);
@@ -603,12 +606,11 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::host::{QueryContextHost, ReleasedContextEvidence};
     use super::super::registry::TaskExecutionRegistryConfig;
     use super::*;
     use novarocks_worker::{
-        HostRejection, ManualClock, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-        TaskStatusReporter, WorkerMonotonicClock,
+        HostRejection, ManualClock, QueryContextHost, ReleasedContextEvidence, RunnableTask,
+        SharedFactsRequest, TaskExecutionHost, TaskStatusReporter, WorkerMonotonicClock,
     };
 
     /// An execution side that accepts everything, so these cases fail only on

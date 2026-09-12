@@ -48,7 +48,6 @@ mod entry;
 mod execution_host;
 mod fault;
 mod feedback;
-mod host;
 pub(crate) mod ingress;
 mod marker;
 mod registry;
@@ -60,8 +59,6 @@ mod tests;
 pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
-pub(crate) use host::QueryContextHost;
-#[cfg(test)]
-pub(crate) use host::ReleasedContextEvidence;
 pub(crate) use ingress::RegistryTaskExecutionIngress;
+pub(crate) use novarocks_worker::QueryContextHost;
 pub(crate) use registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};

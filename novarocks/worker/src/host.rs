@@ -28,6 +28,7 @@ use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory,
 };
 
+use crate::RuntimeFilterReleaseObservation;
 use crate::TaskStatusReporter;
 
 /// The shared facts one establish installs, handed over as a single unit.
@@ -137,6 +138,119 @@ impl fmt::Display for HostRejection {
 }
 
 impl std::error::Error for HostRejection {}
+
+/// The opaque terminal evidence one query-context release sealed.
+///
+/// The Worker owns the lifetime of this fact: a context keeps it after shared
+/// facts are released so the transport adapter can include it in the matching
+/// release acknowledgement.  It deliberately does not name the generated
+/// message.  Only the role-local adapter that produced the content may recover
+/// and encode that representation.
+#[derive(Clone)]
+pub struct ReleasedContextEvidence {
+    runtime_filter: Option<Arc<dyn CodecOwnedContent>>,
+    runtime_filter_observation: RuntimeFilterReleaseObservation,
+}
+
+impl Default for ReleasedContextEvidence {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
+impl fmt::Debug for ReleasedContextEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ReleasedContextEvidence")
+            .field(
+                "runtime_filter_fingerprint",
+                &self
+                    .runtime_filter
+                    .as_ref()
+                    .map(|content| content.fingerprint()),
+            )
+            .field(
+                "runtime_filter_encoded_len",
+                &self
+                    .runtime_filter
+                    .as_ref()
+                    .map(|content| content.encoded_len()),
+            )
+            .field(
+                "runtime_filter_observation",
+                &self.runtime_filter_observation,
+            )
+            .finish()
+    }
+}
+
+impl ReleasedContextEvidence {
+    /// Evidence from a tear-down that found no participant to seal.
+    pub const fn none() -> Self {
+        Self {
+            runtime_filter: None,
+            runtime_filter_observation: RuntimeFilterReleaseObservation::Absent,
+        }
+    }
+
+    /// Sealed runtime-filter evidence and its Worker-owned classification.
+    ///
+    /// A caller may not attach an `Absent` classification to present content:
+    /// that would make the retained value and the lifecycle marker contradict
+    /// one another.
+    pub fn with_runtime_filter(
+        runtime_filter: Arc<dyn CodecOwnedContent>,
+        runtime_filter_observation: RuntimeFilterReleaseObservation,
+    ) -> Self {
+        assert!(
+            !matches!(
+                runtime_filter_observation,
+                RuntimeFilterReleaseObservation::Absent
+            ),
+            "present runtime-filter evidence must not be classified absent"
+        );
+        Self {
+            runtime_filter: Some(runtime_filter),
+            runtime_filter_observation,
+        }
+    }
+
+    pub fn runtime_filter(&self) -> Option<&Arc<dyn CodecOwnedContent>> {
+        self.runtime_filter.as_ref()
+    }
+
+    pub const fn runtime_filter_observation(&self) -> RuntimeFilterReleaseObservation {
+        self.runtime_filter_observation
+    }
+}
+
+/// The query-context side of execution.
+///
+/// `materialize` runs while the context is `Establishing`, outside the owner's
+/// lock and already racing the sequence-zero lease. Whatever it installs must
+/// be undone by `release`, because an establish that loses that race rolls
+/// back rather than reaching `Active` late.
+pub trait QueryContextHost: Send + Sync {
+    fn materialize(&self, request: SharedFactsRequest<'_>) -> Result<(), HostRejection>;
+
+    /// Undoes everything `materialize` installed. Called for a rollback and
+    /// for a normal release, so it must be idempotent.
+    ///
+    /// Returns the terminal evidence the tear-down sealed. A release is the
+    /// only point at which the runtime-filter observation is complete -- every
+    /// local task is a terminal record and nothing further will be observed --
+    /// so the seal happens here and its result is handed back rather than left
+    /// inside the host for a later reader to go looking for.
+    fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence;
+
+    /// Applies a shared-domain advance the owner already classified as
+    /// applicable.
+    fn advance_shared_domain(
+        &self,
+        context: QueryContextRef,
+        domain: &novarocks_execution_contract::task_execution::operation::QueryContextDomainUpdate,
+    ) -> Result<(), HostRejection>;
+}
 
 /// A submitted, runnable task.
 ///

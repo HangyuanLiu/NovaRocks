@@ -42,7 +42,7 @@ use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
 use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 
-use super::host::ReleasedContextEvidence;
+use novarocks_worker::ReleasedContextEvidence;
 use novarocks_worker::{
     InitialDomainKey, RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource,
 };

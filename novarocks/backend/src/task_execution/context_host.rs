@@ -71,9 +71,9 @@ use tracing::error;
 use super::credential_slot::QueryContextCredentialSlot;
 use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
-use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
+    sealed_runtime_filter_evidence,
 };
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
@@ -90,7 +90,10 @@ use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 use novarocks_native_adapter::BackendDataRuntime;
-use novarocks_worker::{HostRejection, SharedFactsRequest, TaskStatusReporter};
+use novarocks_worker::{
+    HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest,
+    TaskStatusReporter,
+};
 
 /// The mutable half of one context's installed facts.
 ///
@@ -898,7 +901,7 @@ fn seal_runtime_filter_evidence(
         .prepare_terminal_capture(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
     match capture_terminal_profile_contribution(Some(snapshot), true) {
         Ok(telemetry) => match QueryTerminalProfileContributionTelemetry::parse(telemetry) {
-            Ok(telemetry) => ReleasedContextEvidence::with_runtime_filter(telemetry),
+            Ok(telemetry) => sealed_runtime_filter_evidence(telemetry),
             Err(error) => {
                 // The projection produced a value this process cannot vouch
                 // for. Reporting it anyway would make the frontend the first
@@ -910,9 +913,7 @@ fn seal_runtime_filter_evidence(
                     "sealed runtime filter contribution does not satisfy the terminal contract; \
                      the release reports it as unavailable"
                 );
-                ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
-                    "CONTRIBUTION_INVALID",
-                ))
+                sealed_runtime_filter_evidence(runtime_filter_unavailable("CONTRIBUTION_INVALID"))
             }
         },
         Err(error) => {
@@ -925,7 +926,7 @@ fn seal_runtime_filter_evidence(
                 error = %error,
                 "runtime filter observation failed its correctness check at release"
             );
-            ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
+            sealed_runtime_filter_evidence(runtime_filter_unavailable(
                 "OBSERVATION_CORRECTNESS_FAILURE",
             ))
         }
@@ -1204,9 +1205,10 @@ mod tests {
         RuntimeFilterParticipantFactory,
     };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
-    use crate::task_execution::host::QueryContextHost;
+    use crate::task_execution::shared_facts::release_runtime_filter_telemetry;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::QueryContextHost;
     use novarocks_worker::{
         METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
         TaskStatusSource,
@@ -1679,8 +1681,8 @@ mod tests {
             .expect("a complete establish");
 
         let evidence = fixture.host.release(context);
-        let telemetry = evidence
-            .runtime_filter()
+        let telemetry = release_runtime_filter_telemetry(&evidence)
+            .expect("the sealed content has a Backend projection")
             .expect("a release that held a participant reports its observation");
         assert!(
             telemetry.available().is_some(),

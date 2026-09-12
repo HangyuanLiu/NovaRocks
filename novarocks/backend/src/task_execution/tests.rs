@@ -62,12 +62,12 @@ use novarocks_types::identity::{
 };
 use novarocks_types::{NativeCompatibilityId, UniqueId};
 use novarocks_worker::{
-    HostRejection, LeaseBounds, ManualClock, RunnableTask, SharedFactsRequest, TaskExecutionHost,
-    WorkerMonotonicClock,
+    HostRejection, LeaseBounds, ManualClock, QueryContextHost, ReleasedContextEvidence,
+    RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
 };
 
-use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
+use super::shared_facts::sealed_runtime_filter_evidence;
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::{
     ContextConvergenceCursorError, CursorObservation, METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute,
@@ -347,7 +347,7 @@ impl QueryContextHost for FakeContextHost {
         // retain whatever the host handed back and report it on the release
         // acknowledgement, and a host that always returned nothing would let
         // that hop pass while carrying nothing.
-        ReleasedContextEvidence::with_runtime_filter(fixture_runtime_filter_contribution())
+        sealed_runtime_filter_evidence(fixture_runtime_filter_contribution())
     }
 
     fn advance_shared_domain(
@@ -1743,10 +1743,15 @@ fn a_release_reports_the_evidence_the_host_sealed() {
             .registry
             .released_context_evidence(context)
             .runtime_filter()
-            .expect("the release reports what the host sealed")
-            .available()
             .is_some(),
         "the retained evidence must be the contribution the host handed back"
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .released_context_evidence(context)
+            .runtime_filter_observation(),
+        novarocks_worker::RuntimeFilterReleaseObservation::Available,
     );
 }
 

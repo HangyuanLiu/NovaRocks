@@ -60,7 +60,10 @@ pub use domain::{
     task_domain_reaches_execution, validate_task_domain_membership,
 };
 pub use drain::WorkerDrainState;
-pub use host::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+pub use host::{
+    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
+    TaskExecutionHost,
+};
 pub use inbound_capability::{InboundFrameAdmission, InboundFrameClaim, TaskInboundCapabilities};
 pub use ingress::{IngressRejection, authorize_inbound_frame};
 pub use lease::{InstalledLease, LeaseBounds, LeaseProgression, MonotonicInstant, RequestHorizon};

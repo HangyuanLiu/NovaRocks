@@ -78,24 +78,23 @@ use novarocks_worker::{
     AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
     ContextTransition, InstalledLease, LatchOutcome, LeaseBounds, LeaseProgression,
     MonotonicInstant, OperationAdmission, OperationWaitCaps, ProcessMonotonicClock,
-    QueryContextDomains, QueryContextEvent, RequestHorizon, RuntimeFilterReleaseObservation,
-    TaskProtocolEvent, WorkerMonotonicClock, classify_context_transition,
-    classify_operation_admission,
+    QueryContextDomains, QueryContextEvent, RequestHorizon, TaskProtocolEvent,
+    WorkerMonotonicClock, classify_context_transition, classify_operation_admission,
 };
 
 use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use super::host::{QueryContextHost, ReleasedContextEvidence};
 use super::marker;
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, InitialDomainKey, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt,
-    QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding,
-    RootResultRoute, RunnableTask, SharedFactsRequest, StatusAdvance, TaskDomains,
-    TaskExecutionHost, TaskStatusOwner, TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
-    WorkerAdmissionEpochAuthority, apply_planned_task_domain_updates, apply_task_domain_updates,
+    QueryContextHost, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
+    ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
+    StatusAdvance, TaskDomains, TaskExecutionHost, TaskStatusOwner, TaskStatusReporter,
+    TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
+    apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, initial_domain_keys, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
 };
@@ -1707,16 +1706,9 @@ impl TaskExecutionRegistry {
         request: &ReleaseQueryContext,
     ) -> ReleaseQueryContextOutcome {
         let receipt = self.apply_release_query_context(request);
-        let runtime_filter = match self
+        let runtime_filter = self
             .released_context_evidence(request.context())
-            .runtime_filter()
-        {
-            None => RuntimeFilterReleaseObservation::Absent,
-            Some(telemetry) if telemetry.available().is_some() => {
-                RuntimeFilterReleaseObservation::Available
-            }
-            Some(_) => RuntimeFilterReleaseObservation::Unavailable,
-        };
+            .runtime_filter_observation();
         if let Some(event) =
             TaskProtocolEvent::release_query_context(request.context(), &receipt, runtime_filter)
         {
