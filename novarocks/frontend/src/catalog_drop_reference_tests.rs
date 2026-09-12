@@ -32,27 +32,25 @@
 //!   transaction no longer reads MV prefixes, and the honest cost of the
 //!   downgrade: a real reference can slip past.
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
+use crate::mv::domain::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
+use crate::mv::domain::repository::MvRepository;
+use crate::mv::repository::StateStoreMvRepository;
+use crate::mv::repository::key::{dependency_by_upstream_key, target_lookup_key};
+use crate::state_store::testing as state_store_fixture;
 use bytes::Bytes;
-use common::state_store_fixture;
 use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_catalog_application::{
     CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort,
     CatalogApplicationService, CatalogCreateCommand, CatalogDesiredStateSource, CatalogDropCommand,
 };
 use novarocks_catalog_application::{CatalogAttachmentRepository, CatalogAttachmentVersioned};
-use novarocks_frontend::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
-use novarocks_frontend::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use novarocks_frontend::mv::domain::repository::MvRepository;
-use novarocks_frontend::mv::repository::StateStoreMvRepository;
-use novarocks_frontend::mv::repository::key::{dependency_by_upstream_key, target_lookup_key};
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorControlResolver, ConnectorError,
@@ -543,7 +541,7 @@ async fn attachment(
         .expect("read catalog attachment")
 }
 
-async fn shutdown(mut host: novarocks_frontend::state_store::StateStoreHost) {
+async fn shutdown(mut host: crate::state_store::StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");
@@ -555,8 +553,11 @@ async fn shutdown(mut host: novarocks_frontend::state_store::StateStoreHost) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_observed_materialized_view_reference_refuses_the_drop_as_an_operational_check() {
-    let host =
-        state_store_fixture::open(format!("catalog-drop-guard-refuse-{}", Uuid::now_v7())).await;
+    let host = state_store_fixture::open_persistent(format!(
+        "catalog-drop-guard-refuse-{}",
+        Uuid::now_v7()
+    ))
+    .await;
     let store = host.state_store().expect("test StateStore");
     let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await
@@ -630,8 +631,11 @@ async fn an_observed_materialized_view_reference_refuses_the_drop_as_an_operatio
 /// the two. Zero MV scans inside the delete's write transaction does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_entirely_wiped_accelerator_still_lets_the_catalog_drop() {
-    let host =
-        state_store_fixture::open(format!("catalog-drop-guard-wiped-{}", Uuid::now_v7())).await;
+    let host = state_store_fixture::open_persistent(format!(
+        "catalog-drop-guard-wiped-{}",
+        Uuid::now_v7()
+    ))
+    .await;
     let inner = host.state_store().expect("test StateStore");
     let accelerator_write_scans = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(WriteScanRecordingStore {
@@ -711,9 +715,11 @@ async fn an_entirely_wiped_accelerator_still_lets_the_catalog_drop() {
 /// paths refuse; it is not a wrong lake publication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreadable_accelerator_does_not_block_the_durable_delete() {
-    let host =
-        state_store_fixture::open(format!("catalog-drop-guard-unreadable-{}", Uuid::now_v7()))
-            .await;
+    let host = state_store_fixture::open_persistent(format!(
+        "catalog-drop-guard-unreadable-{}",
+        Uuid::now_v7()
+    ))
+    .await;
     let inner = host.state_store().expect("test StateStore");
     seed_target_reference(&inner, "catalog.analytics").await;
 
@@ -756,8 +762,11 @@ async fn an_unreadable_accelerator_does_not_block_the_durable_delete() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unreferenced_catalog_drops_and_retires_its_projection() {
-    let host =
-        state_store_fixture::open(format!("catalog-drop-guard-plain-{}", Uuid::now_v7())).await;
+    let host = state_store_fixture::open_persistent(format!(
+        "catalog-drop-guard-plain-{}",
+        Uuid::now_v7()
+    ))
+    .await;
     let store = host.state_store().expect("test StateStore");
     let repository = CatalogAttachmentRepository::open(Arc::clone(&store), host.run_policy())
         .await

@@ -38,23 +38,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::mv::domain::dependency::model::{
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+};
+use crate::mv::domain::persistence::definition::{
+    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
+};
+use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+use crate::mv::domain::repository::{
+    InitialMvRefreshConfiguration, MvProjectionRequest, MvPublishedProjection,
+    MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
+};
+use crate::mv::repository::StateStoreMvRepository;
 use async_trait::async_trait;
 use bytes::Bytes;
 use novarocks_catalog_application::{
     CatalogAttachment, CatalogAttachmentErrorKind, CatalogAttachmentRepository,
 };
-use novarocks_frontend::mv::domain::dependency::model::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use novarocks_frontend::mv::domain::persistence::definition::{
-    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
-};
-use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_frontend::mv::domain::repository::{
-    InitialMvRefreshConfiguration, MvProjectionRequest, MvPublishedProjection,
-    MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
-};
-use novarocks_frontend::mv::repository::StateStoreMvRepository;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };

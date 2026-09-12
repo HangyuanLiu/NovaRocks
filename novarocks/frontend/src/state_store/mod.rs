@@ -26,6 +26,10 @@ pub mod sweeper;
 #[cfg(test)]
 pub(crate) mod testing;
 
+#[cfg(test)]
+#[path = "consumer_failure_tests.rs"]
+mod consumer_failure_tests;
+
 pub use host::{StateStoreHost, StateStoreHostLifecycle};
 pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
 pub use provider::{

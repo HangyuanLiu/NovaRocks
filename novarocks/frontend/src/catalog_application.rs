@@ -339,6 +339,10 @@ pub fn publish_catalog_projection_metrics(snapshot: CatalogProjectionMetricsSnap
 }
 
 #[cfg(test)]
+#[path = "catalog_drop_reference_tests.rs"]
+mod drop_reference_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 

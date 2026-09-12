@@ -17,8 +17,8 @@
 
 pub mod application;
 pub(crate) mod capabilities;
-pub mod catalog_application;
-pub mod catalog_controller;
+mod catalog_application;
+mod catalog_controller;
 mod catalog_projection_metrics;
 mod catalog_prune;
 mod common;
@@ -26,7 +26,7 @@ pub(crate) mod connector;
 pub(crate) mod coordinator;
 mod dml;
 pub(crate) mod metrics;
-pub mod mv;
+mod mv;
 mod native;
 mod preparation_diagnostics;
 pub(crate) mod query;
