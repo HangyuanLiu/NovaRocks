@@ -23,14 +23,16 @@ use novarocks_worker::WorkerResultRetainedLimits;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
-use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
+use crate::rpc::server::BackendRpcService;
 use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
 };
-use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport, NativeRpcClient};
+use novarocks_native_adapter::{
+    BackendDataRuntime, BackendNativeTransport, NativeRpcClient, NativeRpcServerHandle,
+};
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
 use crate::task_execution::{
@@ -144,7 +146,7 @@ impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
     ready_marker: String,
-    grpc_server: BackendRpcServerHandle,
+    grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
     task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
     task_deadline_tick: TaskDeadlineTickTask,
@@ -803,7 +805,7 @@ impl BackendApplicationHost {
         // installed by the query-context host.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
-        let mut grpc_server = match BackendRpcServerHandle::start(
+        let mut grpc_server = match NativeRpcServerHandle::start(
             &bind_host,
             grpc_port,
             BackendRpcService::new(
@@ -822,6 +824,10 @@ impl BackendApplicationHost {
             ),
             native_trust,
             native_transport,
+            "backend",
+            "native-backend-grpc",
+            crate::metrics::record_backend_native_authentication_failure,
+            crate::metrics::record_backend_native_tls_handshake_failure,
         ) {
             Ok(server) => server,
             Err(error) => {

@@ -15,56 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Production Backend gRPC service and its instance-owned listener.
+//! Production Backend gRPC service and its domain handlers.
 //!
-//! The generated service is intentionally owned by `novarocks-backend`.  The
-//! core service remains the compatibility-neutral implementation while the
-//! closeout migrates individual execution adapters behind this backend entry
-//! point; no process-global listener state is used here.
+//! The generic generated listener, authenticated transport, and its lifecycle
+//! are owned by `novarocks-native-adapter`; this role owns its service facts.
 
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::task::{Context, Poll};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
 use crate::task_execution::{TaskExecutionRegistry, TaskInboundCapabilities};
-use axum::Router;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::IntoResponse;
-use hyper::server::conn::http2;
-use hyper::service::service_fn;
-use hyper_util::rt::{TokioExecutor, TokioIo};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_native_trust::{NativeIncomingAdapter, NativeServerAdmission, NativeTrust};
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_codec::membership::{
     BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
 };
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use novarocks_types::BackendProcessId;
-use tokio::net::TcpListener as TokioTcpListener;
-use tokio::sync::watch;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::body::boxed;
-use tonic::codegen::Service;
-use tonic::server::NamedService;
-use tower::ServiceExt;
 
 use crate::connector::catalog_manager::CatalogPruneResult;
 use crate::drain::BackendDrainState;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
-use novarocks_native_adapter::BackendNativeTransport;
-use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
-    NovaRocksGrpc, NovaRocksGrpcServer,
-};
-
-const GRPC_MAX_MESSAGE_BYTES: usize =
-    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
+use novarocks_native_adapter::generated::nova_rocks_grpc_server::NovaRocksGrpc;
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///
@@ -386,287 +361,5 @@ impl NovaRocksGrpc for BackendRpcService {
             .fetch_task_result(request.into_inner())
             .await?;
         Ok(tonic::Response::new(response))
-    }
-}
-
-/// A backend application owns exactly one native listener.  Unlike the legacy
-/// core listener, this handle has no global reservation or shutdown state.
-pub(crate) struct BackendRpcServerHandle {
-    bound_addr: SocketAddr,
-    shutdown_tx: Option<watch::Sender<bool>>,
-    failure_rx: mpsc::Receiver<String>,
-    join_handle: Option<JoinHandle<()>>,
-    stop_requested: Arc<AtomicBool>,
-}
-
-impl BackendRpcServerHandle {
-    pub(crate) fn start(
-        host: &str,
-        port: u16,
-        service: BackendRpcService,
-        native_trust: Arc<NativeTrust>,
-        native_transport: BackendNativeTransport,
-    ) -> Result<Self, String> {
-        let address = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolve native backend gRPC address {host}:{port}: {error}"))?
-            .next()
-            .ok_or_else(|| {
-                format!("resolve native backend gRPC address {host}:{port}: no address")
-            })?;
-        let listener = TcpListener::bind(address)
-            .map_err(|error| format!("bind native backend gRPC address {address}: {error}"))?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|error| format!("set native backend gRPC listener nonblocking: {error}"))?;
-        let bound_addr = listener
-            .local_addr()
-            .map_err(|error| format!("read native backend gRPC bound address: {error}"))?;
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let thread_stop_requested = Arc::clone(&stop_requested);
-        let join_handle = std::thread::Builder::new()
-            .name("native-backend-grpc".to_string())
-            .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .worker_threads(8)
-                        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-                        .build()
-                        .map_err(|error| format!("build native backend gRPC runtime: {error}"))?;
-                    runtime.block_on(async move {
-                        let listener = TokioTcpListener::from_std(listener).map_err(|error| {
-                            format!("create Tokio native backend gRPC listener: {error}")
-                        })?;
-                        let service = NovaRocksGrpcServer::new(service)
-                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                        let grpc_path = format!(
-                            "/{}/*rest",
-                            <NovaRocksGrpcServer<BackendRpcService> as NamedService>::NAME
-                        );
-                        let app = tower::ServiceExt::<
-                            axum::http::Request<axum::body::Body>,
-                        >::map_response(
-                            Router::new()
-                                .route_service(&grpc_path, AxumGrpcService::new(service))
-                                .fallback(grpc_unimplemented_fallback),
-                            |response: axum::http::Response<axum::body::Body>| {
-                                response.map(boxed)
-                            },
-                        );
-                        let app =
-                            BackendListenerAuthService::new(app, native_trust.server_admission());
-                        serve_native_listener(
-                            listener,
-                            app,
-                            native_transport.incoming_adapter(),
-                            shutdown_rx,
-                        )
-                        .await
-                    })
-                }));
-                if thread_stop_requested.load(Ordering::Acquire) {
-                    return;
-                }
-                let error = match outcome {
-                    Ok(Ok(())) => "native backend gRPC server exited unexpectedly".to_string(),
-                    Ok(Err(error)) => error,
-                    Err(payload) => payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| {
-                            payload
-                                .downcast_ref::<&str>()
-                                .map(|value| (*value).to_string())
-                        })
-                        .unwrap_or_else(|| "native backend gRPC server panicked".to_string()),
-                };
-                let _ = failure_tx.send(error);
-            })
-            .map_err(|error| format!("spawn native backend gRPC server: {error}"))?;
-        Ok(Self {
-            bound_addr,
-            shutdown_tx: Some(shutdown_tx),
-            failure_rx,
-            join_handle: Some(join_handle),
-            stop_requested,
-        })
-    }
-
-    pub(crate) const fn bound_addr(&self) -> SocketAddr {
-        self.bound_addr
-    }
-
-    pub(crate) fn poll_failure(&mut self) -> Result<Option<String>, String> {
-        match self.failure_rx.try_recv() {
-            Ok(error) => Ok(Some(error)),
-            Err(mpsc::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::TryRecvError::Disconnected) => Ok(None),
-        }
-    }
-
-    pub(crate) fn stop(&mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Release);
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-        if let Some(join_handle) = self.join_handle.take() {
-            join_handle
-                .join()
-                .map_err(|_| "native backend gRPC server thread panicked".to_string())?;
-        }
-        Ok(())
-    }
-}
-
-async fn serve_native_listener<S>(
-    listener: TokioTcpListener,
-    app: S,
-    incoming: NativeIncomingAdapter,
-    mut shutdown_rx: watch::Receiver<bool>,
-) -> Result<(), String>
-where
-    S: Service<
-            axum::http::Request<axum::body::Body>,
-            Response = axum::http::Response<tonic::body::BoxBody>,
-            Error = std::convert::Infallible,
-        > + Clone
-        + Send
-        + 'static,
-    S::Future: Send + 'static,
-{
-    loop {
-        tokio::select! {
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    return Ok(());
-                }
-            }
-            accepted = listener.accept() => {
-                let (stream, _) = accepted
-                    .map_err(|error| format!("accept native backend gRPC connection: {error}"))?;
-                let app = app.clone();
-                let incoming = incoming.clone();
-                tokio::spawn(async move {
-                    let stream = match incoming.accept(stream).await {
-                        Ok(stream) => stream,
-                        Err(_) => {
-                            crate::metrics::record_backend_native_tls_handshake_failure();
-                            return;
-                        }
-                    };
-                    let service = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                        let app = app.clone();
-                        async move {
-                            let response = app
-                                .oneshot(request.map(axum::body::Body::new))
-                                .await
-                                .expect("backend Native route service is infallible");
-                            Ok::<_, std::convert::Infallible>(response)
-                        }
-                    });
-                    let _ = http2::Builder::new(TokioExecutor::new())
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-        }
-    }
-}
-
-#[derive(Clone)]
-struct BackendListenerAuthService<S> {
-    admission: NativeServerAdmission,
-    inner: S,
-}
-
-impl<S> BackendListenerAuthService<S> {
-    fn new(inner: S, admission: NativeServerAdmission) -> Self {
-        Self { admission, inner }
-    }
-}
-
-impl<S, Body> Service<axum::http::Request<Body>> for BackendListenerAuthService<S>
-where
-    S: Service<axum::http::Request<Body>, Response = axum::http::Response<tonic::body::BoxBody>>
-        + Send,
-    S::Future: Send + 'static,
-    S::Error: Send + 'static,
-{
-    type Response = axum::http::Response<tonic::body::BoxBody>;
-    type Error = S::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
-
-    fn poll_ready(&mut self, context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(context)
-    }
-
-    fn call(&mut self, request: axum::http::Request<Body>) -> Self::Future {
-        if self.admission.admit_headers(request.headers()).is_err() {
-            crate::metrics::record_backend_native_authentication_failure();
-            return Box::pin(async {
-                Ok(
-                    tonic::Status::unauthenticated("native caller authentication failed")
-                        .into_http(),
-                )
-            });
-        }
-        Box::pin(self.inner.call(request))
-    }
-}
-
-impl Drop for BackendRpcServerHandle {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-async fn grpc_unimplemented_fallback() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        [
-            (tonic::Status::GRPC_STATUS, HeaderValue::from_static("12")),
-            (
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            ),
-        ],
-    )
-}
-
-#[derive(Clone)]
-struct AxumGrpcService<S> {
-    inner: S,
-}
-
-impl<S> AxumGrpcService<S> {
-    fn new(inner: S) -> Self {
-        Self { inner }
-    }
-}
-
-impl<S> Service<axum::http::Request<axum::body::Body>> for AxumGrpcService<S>
-where
-    S: Service<
-            axum::http::Request<tonic::body::BoxBody>,
-            Response = axum::http::Response<tonic::body::BoxBody>,
-            Error = std::convert::Infallible,
-        > + Clone,
-{
-    type Response = axum::http::Response<tonic::body::BoxBody>;
-    type Error = std::convert::Infallible;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, request: axum::http::Request<axum::body::Body>) -> Self::Future {
-        self.inner.call(request.map(boxed))
     }
 }

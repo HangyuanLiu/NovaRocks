@@ -20,6 +20,8 @@
 pub mod native_client;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
+pub mod native_server;
+pub use native_server::NativeRpcServerHandle;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
