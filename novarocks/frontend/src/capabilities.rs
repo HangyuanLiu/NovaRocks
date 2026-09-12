@@ -548,11 +548,13 @@ impl SessionCatalogPorts {
 
 pub fn session_catalog_resolver(
     ports: SessionCatalogPorts,
-) -> crate::query_execution::kernels::SessionCatalogResolver {
-    crate::query_execution::kernels::SessionCatalogResolver::new(
-        ports.catalog_service,
-        ports.catalog_application,
-        ports.connector_control,
+) -> novarocks_query_application::sql::catalog::SessionCatalogService {
+    Arc::new(
+        crate::query_execution::kernels::SessionCatalogResolver::new(
+            ports.catalog_service,
+            ports.catalog_application,
+            ports.connector_control,
+        ),
     )
 }
 

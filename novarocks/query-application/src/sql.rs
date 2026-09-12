@@ -36,6 +36,9 @@ pub mod session_admit;
 /// Typed DML statement-shape admission errors and their stable user-error descriptors.
 pub mod dml_admission;
 
+/// Read-only Catalog facts consumed by session SQL admission.
+pub mod catalog;
+
 /// Parser-admitted KILL statement execution over query and connection ports.
 pub mod kill;
 

@@ -34,7 +34,6 @@ use crate::query_execution::dml::delete::DeleteEngine;
 use crate::query_execution::dml::insert::InsertEngine;
 use crate::query_execution::dml::mutation::MutationEngine;
 use crate::query_execution::dml::truncate::TruncateEngine;
-use crate::query_execution::kernels::SessionCatalogResolver;
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::command::{
     MaintenanceCommandExecutor, MaintenanceReadCommandExecutor,
@@ -82,6 +81,7 @@ use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
     unnegotiated_query_statement,
 };
+use novarocks_query_application::sql::catalog::SessionCatalogService;
 use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
 use novarocks_query_application::sql::kill::execute_kill_statement;
 use novarocks_query_application::sql::session::{
@@ -385,7 +385,7 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
-    session_catalog_resolver: SessionCatalogResolver,
+    session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn CoreCommandRoute>,
     query_control: QueryControlService,
@@ -416,7 +416,7 @@ pub struct FrontendQueryService {
 impl FrontendQueryService {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        session_catalog_resolver: SessionCatalogResolver,
+        session_catalog_resolver: SessionCatalogService,
         query_compiler: FrontendQueryCompiler,
         catalog_command_executor: CatalogCommandExecutor,
         statistics_command_executor: StatisticsCommandExecutor,
@@ -730,8 +730,7 @@ impl FrontendQuerySession {
             || self
                 .service
                 .session_catalog_resolver
-                .database_exists(state.current_database())
-                .map_err(internal_error)?;
+                .database_exists(state.current_database())?;
         state.apply_resolved_catalog(catalog, current_database_exists);
         Ok(())
     }
@@ -1530,7 +1529,7 @@ struct DatabaseContext {
 }
 
 fn resolve_catalog_name(
-    resolver: &SessionCatalogResolver,
+    resolver: &SessionCatalogService,
     catalog: &str,
 ) -> Result<Option<String>, QueryServiceError> {
     let normalized =
@@ -1541,22 +1540,12 @@ fn resolve_catalog_name(
     // Session catalog context is an admission decision, not a local binding
     // lookup: a catalog whose durable attachment is absent is unknown, while one
     // this process has not materialized yet is unavailable.
-    resolver
-        .require_external_catalog_ready(&normalized)
-        .map_err(|error| {
-            let kind = match error.kind() {
-                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable => {
-                    QueryServiceErrorKind::Unavailable
-                }
-                _ => QueryServiceErrorKind::BadDatabase,
-            };
-            QueryServiceError::new(kind, error.to_string())
-        })?;
+    resolver.require_external_catalog_ready(&normalized)?;
     Ok(Some(normalized))
 }
 
 async fn resolve_database_context(
-    resolver: &SessionCatalogResolver,
+    resolver: &SessionCatalogService,
     current_catalog: Option<&str>,
     schema: &str,
     connector_blocking_io: &ConnectorBlockingIoSupervisor,
@@ -1591,10 +1580,7 @@ async fn resolve_database_context(
                     }
                 }
                 None => {
-                    if resolver
-                        .database_exists(&database)
-                        .map_err(|error| internal_error(error.to_string()))?
-                    {
+                    if resolver.database_exists(&database)? {
                         Ok(DatabaseContext {
                             catalog: None,
                             database,
@@ -1634,10 +1620,7 @@ async fn resolve_database_context(
                     }
                 }
                 None => {
-                    if resolver
-                        .database_exists(&database)
-                        .map_err(|error| internal_error(error.to_string()))?
-                    {
+                    if resolver.database_exists(&database)? {
                         Ok(DatabaseContext {
                             catalog: None,
                             database,
@@ -1659,18 +1642,17 @@ async fn resolve_database_context(
 }
 
 async fn external_namespace_exists(
-    resolver: &SessionCatalogResolver,
+    resolver: &SessionCatalogService,
     connector_blocking_io: &ConnectorBlockingIoSupervisor,
     catalog: String,
     database: String,
 ) -> Result<bool, QueryServiceError> {
     let resolver = resolver.clone();
     connector_blocking_io
-        .spawn_ordinary(move || resolver.iceberg_namespace_exists(&catalog, &database))
+        .spawn_ordinary(move || resolver.external_namespace_exists(&catalog, &database))
         .finish()
         .await
         .map_err(|error| internal_error(error.to_string()))?
-        .map_err(internal_error)
 }
 
 fn poisoned_state<T>(_error: std::sync::PoisonError<T>) -> QueryServiceError {
