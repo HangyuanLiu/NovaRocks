@@ -1360,10 +1360,27 @@ fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExec
         QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
             format!("query timed out after {timeout_ms} ms")
         }
+        QueryCancellationReason::ExecutionCancellationRequested => {
+            "Query execution cancellation was requested".to_string()
+        }
+        QueryCancellationReason::ExecutionOwnerDropped => {
+            "Query execution protocol owner was dropped".to_string()
+        }
         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => format!(
             "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
         ),
-        reason => format!("MySQL result delivery cancelled: {reason:?}"),
+        QueryCancellationReason::ExplicitKill { .. } => {
+            "Query execution was interrupted".to_string()
+        }
+        QueryCancellationReason::ExplicitKillConnection { .. } => {
+            "Query execution was interrupted because the connection was killed".to_string()
+        }
+        QueryCancellationReason::ClientDisconnected => {
+            "Query execution was interrupted because the client disconnected".to_string()
+        }
+        QueryCancellationReason::ServerShutdown => {
+            "Query execution was interrupted because the server is shutting down".to_string()
+        }
     };
     QueryExecutionError::new(QueryExecutionErrorKind::Cancelled, message)
 }
@@ -1612,6 +1629,15 @@ mod streaming_result_tests {
         });
         assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
         assert_eq!(error.to_string(), "query timed out after 1000 ms");
+    }
+
+    #[test]
+    fn explicit_kill_delivery_cancellation_keeps_the_statement_message() {
+        let error = cancelled_query_result_delivery(QueryCancellationReason::ExplicitKill {
+            requester_connection_id: 7,
+        });
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert_eq!(error.to_string(), "Query execution was interrupted");
     }
 
     #[test]
