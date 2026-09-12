@@ -31,8 +31,8 @@
 //! convention that has to be remembered during review:
 //!
 //! 1. **A `ProcessRuntime` family cannot have a persistent prefix.** The prefix
-//!    lives in the data of the `ExternalProjection` and `Accelerator` variants
-//!    only, so the illegal state is not representable — see
+//!    lives in the `Accelerator` variant only, so the illegal state is not
+//!    representable — see
 //!    [`ProcessRuntimeContract`].
 //! 2. **Only the manifest can mint a prefix.** [`PersistentKeyPrefix`] has a
 //!    private literal and a constructor visible only inside this module tree,
@@ -50,9 +50,8 @@ mod classification;
 mod manifest;
 
 pub use classification::{
-    AcceleratorContract, AcceleratorRebuildAuthority, AcceleratorResidence, BootstrapFailureScope,
-    ClonePolicy, DurabilityAdmission, ExternalProjectionContract, ExternalProjectionSource,
-    PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract, RebuildDeterminism,
-    SnapshotIdentity, StateFamilyClassification, WipeEntry,
+    AcceleratorContract, AcceleratorRebuildAuthority, AcceleratorResidence, ClonePolicy,
+    DurabilityAdmission, PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract,
+    RebuildDeterminism, StateFamilyClassification, WipeEntry,
 };
 pub use manifest::StateFamily;

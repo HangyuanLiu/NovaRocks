@@ -308,8 +308,8 @@ mod tests {
     use super::*;
     use crate::state_family::WipeEntry;
 
-    /// Eleven families: one `ExternalProjection` (catalog desired state), four
-    /// `Accelerator` (two of them in-process) and six `ProcessRuntime`.
+    /// Ten families: four `Accelerator` (two of them in-process) and six
+    /// `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
     /// the frontend still carried a durable membership record; backend
@@ -324,23 +324,17 @@ mod tests {
             "the manifest registers ten frontend state families"
         );
 
-        let mut external_projection = 0;
         let mut process_runtime = 0;
         let mut accelerator = 0;
         for family in StateFamily::ALL {
             // Exhaustive over the closed classification: a fourth variant makes
             // this match, and every other consumer, fail to compile.
             match family.classification() {
-                StateFamilyClassification::ExternalProjection(_) => external_projection += 1,
                 StateFamilyClassification::ProcessRuntime(_) => process_runtime += 1,
                 StateFamilyClassification::Accelerator(_) => accelerator += 1,
             }
         }
 
-        assert_eq!(
-            external_projection, 0,
-            "Catalog owns its desired state family"
-        );
         assert_eq!(
             accelerator, 4,
             "MV, GC observation, schema cache, statistics artifact cache"
@@ -451,9 +445,6 @@ mod tests {
     fn process_runtime_cannot_express_a_persistent_prefix() {
         fn prefix_of(classification: StateFamilyClassification) -> Option<&'static str> {
             match classification {
-                StateFamilyClassification::ExternalProjection(contract) => {
-                    Some(contract.persistent_prefix().as_str())
-                }
                 StateFamilyClassification::Accelerator(contract) => contract
                     .persistent_prefix()
                     .map(PersistentKeyPrefix::as_str),

@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The closed three-way classification every state family must declare.
+//! The closed two-way classification every state family must declare.
 //!
 //! The classification is not a label attached to a family after the fact; it
 //! decides whether the family may own a StateStore record at all.  That is why
-//! the persistent key prefix lives inside the two persistent variants' data
+//! the persistent key prefix lives inside the persistent accelerator variant's data
 //! instead of alongside the classification tag.
 
 use bytes::Bytes;
@@ -77,18 +77,12 @@ impl PersistentKeyPrefix {
     }
 }
 
-/// Exactly one classification per family, chosen from a closed set of three.
+/// Exactly one classification per family, chosen from a closed set of two.
 ///
 /// Consumers match this exhaustively, so a fourth classification cannot be
 /// introduced without every consumer being forced to decide what it means.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StateFamilyClassification {
-    /// Desired state that originates outside this frontend process — from
-    /// pre-deployment configuration, an external controller, or SQL acting as
-    /// the authority.  A restart must find it again; it is never rebuilt from
-    /// derived facts, which is why an `ExternalProjection` declares no rebuild
-    /// policy.
-    ExternalProjection(ExternalProjectionContract),
     /// State that belongs only to the current statement, the current attempt,
     /// or the current frontend incarnation.  It dies with its authority and
     /// must never outlive the process.
@@ -114,7 +108,6 @@ impl StateFamilyClassification {
     /// after the fact.
     pub const fn persistent_prefix(self) -> Option<PersistentKeyPrefix> {
         match self {
-            Self::ExternalProjection(contract) => Some(contract.persistent_prefix()),
             Self::ProcessRuntime(_) => None,
             Self::Accelerator(contract) => contract.persistent_prefix(),
         }
@@ -135,9 +128,6 @@ impl StateFamilyClassification {
     /// Whether records of this family survive a frontend restart.
     pub const fn retain_on_restart(self) -> bool {
         match self {
-            // An `ExternalProjection` *is* the desired state a restart has to
-            // find again.  Retention is structural, not a policy choice.
-            Self::ExternalProjection(_) => true,
             // A `ProcessRuntime` family's authority ends with the process, so
             // nothing it wrote can still be valid afterwards.
             Self::ProcessRuntime(_) => false,
@@ -148,7 +138,6 @@ impl StateFamilyClassification {
     /// What happens to this family when a deployment is cloned.
     pub const fn clone_policy(self) -> ClonePolicy {
         match self {
-            Self::ExternalProjection(contract) => contract.clone_policy(),
             // Nothing of a `ProcessRuntime` family survives the process, so a
             // clone has nothing to copy in the first place.
             Self::ProcessRuntime(_) => ClonePolicy::NotCloned,
@@ -164,7 +153,6 @@ impl StateFamilyClassification {
     /// migrate but a record this binary refuses to interpret.
     pub const fn record_version(self) -> Option<u8> {
         match self {
-            Self::ExternalProjection(contract) => Some(contract.record_version()),
             Self::ProcessRuntime(_) => None,
             Self::Accelerator(contract) => contract.record_version(),
         }
@@ -176,99 +164,6 @@ impl StateFamilyClassification {
 pub enum DurabilityAdmission {
     Permitted,
     Forbidden,
-}
-
-/// What an `ExternalProjection` family declares.
-///
-/// The prefix is mandatory rather than optional because both registered
-/// external projections are durable today.  The StateStore is not the general
-/// authority for desired state — for catalog attachments it is one selected
-/// source mode among several — but where a projection *is* carried in the
-/// store, the manifest owns the prefix it is carried under.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ExternalProjectionContract {
-    source: ExternalProjectionSource,
-    snapshot_identity: SnapshotIdentity,
-    bootstrap_failure_scope: BootstrapFailureScope,
-    prefix: PersistentKeyPrefix,
-    record_version: u8,
-    clone_policy: ClonePolicy,
-}
-
-impl ExternalProjectionContract {
-    pub(super) const fn new(
-        source: ExternalProjectionSource,
-        snapshot_identity: SnapshotIdentity,
-        bootstrap_failure_scope: BootstrapFailureScope,
-        prefix: PersistentKeyPrefix,
-        record_version: u8,
-        clone_policy: ClonePolicy,
-    ) -> Self {
-        Self {
-            source,
-            snapshot_identity,
-            bootstrap_failure_scope,
-            prefix,
-            record_version,
-            clone_policy,
-        }
-    }
-
-    pub const fn source(self) -> ExternalProjectionSource {
-        self.source
-    }
-
-    pub const fn snapshot_identity(self) -> SnapshotIdentity {
-        self.snapshot_identity
-    }
-
-    pub const fn bootstrap_failure_scope(self) -> BootstrapFailureScope {
-        self.bootstrap_failure_scope
-    }
-
-    pub const fn persistent_prefix(self) -> PersistentKeyPrefix {
-        self.prefix
-    }
-
-    pub const fn record_version(self) -> u8 {
-        self.record_version
-    }
-
-    pub const fn clone_policy(self) -> ClonePolicy {
-        self.clone_policy
-    }
-}
-
-/// Where an `ExternalProjection` family's desired state comes from.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExternalProjectionSource {
-    /// The deployment's selected catalog desired-state source mode.  Only the
-    /// dynamic StateStore mode is implemented, which is the sole reason this
-    /// family has a StateStore prefix; a future file or controller mode moves
-    /// the authority without changing the classification.
-    SelectedCatalogSourceMode,
-}
-
-/// How a reader decides it is looking at one coherent snapshot of the family
-/// rather than a partially observed one.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SnapshotIdentity {
-    /// The snapshot is a complete enumeration of the family's prefix.  Identity
-    /// is "every record the enumeration returned", so a partial enumeration is
-    /// not a smaller snapshot — it is a failure.
-    CompleteEnumeration,
-}
-
-/// The blast radius of a bootstrap failure for an `ExternalProjection`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BootstrapFailureScope {
-    /// Two distinct scopes on purpose.  Failing to enumerate the snapshot, or
-    /// to trust its integrity, fails the whole frontend bootstrap: an
-    /// incomplete enumeration is indistinguishable from a smaller desired
-    /// state, and silently accepting it would delete entries nobody asked to
-    /// remove.  Failing to materialize one *located* entry only marks that
-    /// entry unavailable, so one broken catalog cannot take the frontend down.
-    GlobalEnumerationPerEntryMaterialization,
 }
 
 /// What a `ProcessRuntime` family declares — and, more importantly, what it
