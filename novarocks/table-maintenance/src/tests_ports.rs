@@ -17,8 +17,8 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_table_maintenance::runtime::MaintenanceJobState;
-use novarocks_table_maintenance::{
+use super::runtime::MaintenanceJobState;
+use super::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
 };
 

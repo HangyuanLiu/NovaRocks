@@ -197,6 +197,10 @@ impl OptimizeSubmission {
 }
 
 #[cfg(test)]
+#[path = "tests_ports.rs"]
+mod port_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{MaintenanceActionOutcome, OptimizeSubmission, optimize_job_outcome_from_action};
 
