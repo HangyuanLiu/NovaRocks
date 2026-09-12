@@ -20,21 +20,313 @@
 use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
-use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_spi::connector::{
+    ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorTableObjectId, ConnectorWriteOperationId, ExternalMutationFinalization,
+    ExternalMutationOutcome,
+};
 use novarocks_table_maintenance::job_service::{CapturedOptimizeTarget, OptimizeTargetCapturePort};
+use novarocks_table_maintenance::product::TableMaintenanceProduct;
+use novarocks_table_maintenance::product::{
+    CleanupCandidate, CleanupOwnedRefFact, CleanupSession, CleanupTerminal,
+    DistributedRewriteSession, RewriteCommit, RewriteIntent, RewritePlanFacts, RewriteReceiptFacts,
+    TableMaintenanceEffectPort,
+};
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 use novarocks_table_maintenance::worker::{
     OptimizeJobAdmission, OptimizeJobAdmissionPort, OptimizeJobExecution, OptimizeJobExecutionPort,
     OptimizeJobScope,
 };
-use novarocks_table_maintenance::{MaintenanceActionOutcome, MaintenanceTargetRebind, OptimizeJob};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
+    OptimizeJob,
+};
 use novarocks_workload_control::{
     RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
 };
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
 
-use super::DistributedRewriteIntent;
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
+
+/// Frontend provider/native-query adapter for the neutral maintenance product.
+/// It keeps opaque connector sessions and fragment encoding here, while the
+/// product crate owns all target-gate, cohort and terminal business decisions.
+pub(crate) struct FrontendMaintenanceEffectPort<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+}
+
+impl<'a> FrontendMaintenanceEffectPort<'a> {
+    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
+    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        self.engine.reject_user_action_on_mv(target)
+    }
+
+    fn execute_metadata(
+        &self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        self.engine.execute_action(request)
+    }
+
+    fn begin_rewrite<'a>(
+        &'a self,
+        target: &MaintenanceTarget,
+        intent: RewriteIntent,
+    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
+        let intent = match intent {
+            RewriteIntent::DataFiles { rewrite_all } => {
+                DistributedRewriteIntent::DataFiles { rewrite_all }
+            }
+            RewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            } => DistributedRewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            },
+        };
+        let session = self.engine.plan_distributed_rewrite(
+            target,
+            ConnectorWriteOperationId::new(),
+            intent,
+        )?;
+        Ok(Box::new(FrontendDistributedRewriteSession {
+            engine: self.engine,
+            session,
+            committed_receipt: None,
+        }))
+    }
+
+    fn begin_cleanup<'a>(
+        &'a self,
+        target: &MaintenanceTarget,
+        older_than_ms: i64,
+    ) -> Result<Box<dyn CleanupSession + 'a>, String> {
+        let session = self.engine.plan_cleanup_maintenance(
+            target,
+            ConnectorCleanupOperationId::new(),
+            older_than_ms,
+        )?;
+        let raw_candidates = cleanup_candidates_first_page(self.engine, &session)?;
+        let candidates = raw_candidates
+            .iter()
+            .map(cleanup_candidate_fact)
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Box::new(FrontendCleanupSession {
+            engine: self.engine,
+            target: target.clone(),
+            older_than_ms,
+            session,
+            raw_candidates,
+            candidates,
+        }))
+    }
+}
+
+struct FrontendDistributedRewriteSession<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+    session: crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
+    committed_receipt: Option<novarocks_spi::connector::ConnectorWriteReceipt>,
+}
+
+impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
+    fn plan_facts(&self) -> RewritePlanFacts {
+        RewritePlanFacts {
+            noop: self.session.is_noop(),
+            cohort_count: self.session.plan().cohorts().len(),
+            input_bytes: self.session.plan().summary().input_bytes,
+        }
+    }
+
+    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), String> {
+        let cohort =
+            self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
+                format!("rewrite cohort ordinal {ordinal} is not in the frozen plan")
+            })?;
+        let prepared = self
+            .engine
+            .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())?;
+        let bundle = crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
+            prepared.encoding(),
+        )
+        .map_err(|error| format!("encode distributed rewrite fragments: {error}"))?;
+        let completion = prepared.finish(bundle)?;
+        self.engine
+            .accumulate_distributed_rewrite_group(&self.session, completion)
+    }
+
+    fn commit(&mut self) -> Result<RewriteCommit, String> {
+        match self.engine.commit_distributed_rewrite(&self.session)? {
+            ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => {
+                self.committed_receipt = Some(receipt);
+                Ok(RewriteCommit::KnownCommitted {
+                    finalization_failed: match finalization {
+                        ExternalMutationFinalization::Failed(error) => Some(error.to_string()),
+                        _ => None,
+                    },
+                })
+            }
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Ok(RewriteCommit::KnownUncommitted {
+                    failure: failure.to_string(),
+                })
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+                Ok(RewriteCommit::CommitUnknown {
+                    failure: failure.to_string(),
+                })
+            }
+        }
+    }
+
+    fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
+        let receipt = self.committed_receipt.as_ref().ok_or_else(|| {
+            "distributed rewrite has no committed receipt to finalize".to_string()
+        })?;
+        let receipt = self
+            .engine
+            .finalize_distributed_rewrite(&self.session, receipt)?;
+        let summary = receipt.summary();
+        Ok(RewriteReceiptFacts {
+            target_snapshot_id: summary.target_version,
+            input_data_files: summary.input_data_files,
+            input_delete_files: summary.input_delete_files,
+            output_data_files: summary.output_data_files,
+            output_delete_files: summary.output_delete_files,
+            output_rows: summary.output_rows,
+        })
+    }
+
+    fn abort(&mut self, _reason: String) -> Result<(), String> {
+        self.engine
+            .abort_distributed_rewrite(&self.session)
+            .map(|_| ())
+    }
+}
+
+struct FrontendCleanupSession<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+    target: MaintenanceTarget,
+    older_than_ms: i64,
+    session: crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+    raw_candidates: Vec<ConnectorCleanupCandidate>,
+    candidates: Vec<CleanupCandidate>,
+}
+
+impl CleanupSession for FrontendCleanupSession<'_> {
+    fn candidates(&self) -> &[CleanupCandidate] {
+        &self.candidates
+    }
+
+    fn select_owned_refs(&mut self, candidate_indexes: &[usize]) -> Result<(), String> {
+        let identities = candidate_indexes
+            .iter()
+            .map(|index| {
+                self.raw_candidates
+                    .get(*index)
+                    .and_then(ConnectorCleanupCandidate::owned_ref_identity)
+                    .ok_or_else(|| "owned-ref candidate has no valid exact identity".to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let selection = ConnectorCleanupOwnedRefSelection::try_new(identities)
+            .map_err(|error| format!("build mature owned-ref cleanup selection failed: {error}"))?;
+        self.session = self.engine.plan_selected_owned_ref_cleanup_maintenance(
+            &self.target,
+            ConnectorCleanupOperationId::new(),
+            self.older_than_ms,
+            selection,
+        )?;
+        Ok(())
+    }
+
+    fn execute(&mut self) -> Result<CleanupTerminal, String> {
+        let batches = self.session.plan_ref().summary().batch_count();
+        for ordinal in 0..batches {
+            let prepared = self.engine.prepare_cleanup_batch(&self.session, ordinal)?;
+            match self.engine.execute_cleanup_batch(&self.session, prepared)? {
+                crate::connector::cleanup_maintenance::CleanupBatchExecution::Receipt(receipt) => {
+                    if receipt.summary().unknown() != 0 {
+                        return Ok(CleanupTerminal::CommitUnknown {
+                            failure: "provider reported an unknown cleanup batch outcome"
+                                .to_string(),
+                        });
+                    }
+                }
+                crate::connector::cleanup_maintenance::CleanupBatchExecution::Uncertain(error) => {
+                    return Ok(CleanupTerminal::CommitUnknown {
+                        failure: error.to_string(),
+                    });
+                }
+            }
+        }
+        let locations = cleanup_candidate_locations(self.engine, &self.session)?;
+        match self.engine.finalize_cleanup_terminal(&self.session) {
+            Ok(()) => Ok(CleanupTerminal::KnownCommitted { locations }),
+            Err(error) => Ok(CleanupTerminal::KnownCommittedFinalizationFailed { failure: error }),
+        }
+    }
+}
+
+fn cleanup_candidate_fact(
+    candidate: &ConnectorCleanupCandidate,
+) -> Result<CleanupCandidate, String> {
+    match candidate {
+        ConnectorCleanupCandidate::Object { .. } => Ok(CleanupCandidate::Object),
+        ConnectorCleanupCandidate::OwnedRef {
+            table_uuid,
+            name,
+            head_snapshot_id,
+            provenance_version,
+            provenance_digest,
+            ..
+        } => Ok(CleanupCandidate::OwnedRef(CleanupOwnedRefFact {
+            table_uuid: *table_uuid,
+            ref_name: name.to_string(),
+            head_snapshot_id: *head_snapshot_id,
+            provenance_version: *provenance_version,
+            provenance_digest: *provenance_digest,
+        })),
+    }
+}
+
+fn cleanup_candidates_first_page(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<ConnectorCleanupCandidate>, String> {
+    let page = engine.read_cleanup_candidate_page(session, 0, 1024)?;
+    if page.candidates().is_empty() && !page.complete() {
+        return Err("cleanup discovery returned a non-terminal empty candidate page".to_string());
+    }
+    Ok(page.candidates().to_vec())
+}
+
+fn cleanup_candidate_locations(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<String>, String> {
+    let mut offset = 0_u64;
+    let mut locations = Vec::new();
+    loop {
+        let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
+        locations.extend(page.display_keys().iter().map(ToString::to_string));
+        if page.complete() {
+            return Ok(locations);
+        }
+        offset = offset
+            .checked_add(page.candidates().len() as u64)
+            .ok_or_else(|| "orphan cleanup candidate page offset overflow".to_string())?;
+    }
+}
 
 /// Frontend-only provider binding capture for a product-gated OPTIMIZE job.
 pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
@@ -134,28 +426,37 @@ impl Drop for FrontendOptimizeJobScope {
 
 pub(crate) struct FrontendOptimizeJobExecutionPort {
     engine: Weak<dyn TableMaintenanceEngine>,
+    product: Weak<TableMaintenanceProduct>,
 }
 
 impl FrontendOptimizeJobExecutionPort {
-    pub(crate) fn new(engine: Weak<dyn TableMaintenanceEngine>) -> Self {
-        Self { engine }
+    pub(crate) fn new(
+        engine: Weak<dyn TableMaintenanceEngine>,
+        product: Weak<TableMaintenanceProduct>,
+    ) -> Self {
+        Self { engine, product }
     }
 }
 
 impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
     fn is_available(&self) -> bool {
-        self.engine.strong_count() != 0
+        self.engine.strong_count() != 0 && self.product.strong_count() != 0
     }
 
     fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
-        self.engine.upgrade().map(|engine| {
-            Box::new(FrontendOptimizeJobExecution { engine }) as Box<dyn OptimizeJobExecution>
-        })
+        self.engine
+            .upgrade()
+            .zip(self.product.upgrade())
+            .map(|(engine, product)| {
+                Box::new(FrontendOptimizeJobExecution { engine, product })
+                    as Box<dyn OptimizeJobExecution>
+            })
     }
 }
 
 struct FrontendOptimizeJobExecution {
     engine: Arc<dyn TableMaintenanceEngine>,
+    product: Arc<TableMaintenanceProduct>,
 }
 
 impl OptimizeJobExecution for FrontendOptimizeJobExecution {
@@ -183,10 +484,10 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             format!("maintenance-job:{}", job.job_id),
             format!("maintenance-job:{}", job.job_id),
         );
-        super::execute_distributed_rewrite_terminal(
-            self.engine.as_ref(),
+        self.product.execute_rewrite_terminal(
+            &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
             &job.target,
-            DistributedRewriteIntent::DataFiles { rewrite_all: true },
+            RewriteIntent::DataFiles { rewrite_all: true },
         )
     }
 }

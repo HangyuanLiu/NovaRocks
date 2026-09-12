@@ -48,6 +48,7 @@ pub struct StatisticsJobRuntime {
     service: StatisticsJobService,
     wake: mpsc::Sender<()>,
     stop: watch::Sender<bool>,
+    admission: Mutex<()>,
     completion: Mutex<Option<oneshot::Receiver<()>>>,
     join: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -67,6 +68,14 @@ impl StatisticsJobService {
         self.repository.create(request, owner).await
     }
 
+    fn submit_now(
+        &self,
+        request: StatisticsJobCreate,
+        owner: WorkOwner,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.repository.create_now(request, owner)
+    }
+
     pub async fn list(&self) -> Result<Vec<StatisticsJob>, StatisticsRepositoryError> {
         self.repository.list().await
     }
@@ -77,6 +86,18 @@ impl StatisticsJobService {
         at_ms: i64,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         self.repository.request_cancel(job_id, at_ms).await
+    }
+
+    fn request_cancel_now(
+        &self,
+        job_id: StatisticsJobId,
+        at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.repository.request_cancel_now(job_id, at_ms)
+    }
+
+    fn request_stop_for_process_exit(&self, at_ms: i64) -> Result<(), StatisticsRepositoryError> {
+        self.repository.request_stop_for_process_exit(at_ms)
     }
 
     /// Executes one claimed job with the role-supplied Native attempt adapter.
@@ -141,6 +162,7 @@ impl StatisticsJobRuntime {
             service,
             wake,
             stop,
+            admission: Mutex::new(()),
             completion: Mutex::new(Some(completion)),
             join: Mutex::new(Some(join)),
         }
@@ -151,18 +173,24 @@ impl StatisticsJobRuntime {
         request: StatisticsJobCreate,
         owner: WorkOwner,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        let _admission = self.admission.lock().map_err(|_| {
+            StatisticsRepositoryError::new(
+                crate::StatisticsRepositoryErrorKind::Conflict,
+                "statistics worker admission lock poisoned",
+            )
+        })?;
         if *self.stop.borrow() {
             return Err(StatisticsRepositoryError::new(
                 crate::StatisticsRepositoryErrorKind::Conflict,
                 "statistics worker is stopping",
             ));
         }
-        let job = self.service.submit(request, owner).await?;
+        let job = self.service.submit_now(request, owner)?;
         if let Err(mpsc::error::TrySendError::Closed(_)) = self.wake.try_send(()) {
             // Submission must not leave a job that no live process runner can
             // own. The cancellation result is best effort only: the caller
             // still receives the authoritative admission failure.
-            let _ = self.service.request_cancel(job.id, now_ms()).await;
+            let _ = self.service.request_cancel_now(job.id, now_ms());
             return Err(StatisticsRepositoryError::new(
                 crate::StatisticsRepositoryErrorKind::Conflict,
                 "statistics worker is unavailable",
@@ -184,7 +212,11 @@ impl StatisticsJobRuntime {
     }
 
     pub fn request_stop_for_process_exit(&self) {
+        let Ok(_admission) = self.admission.lock() else {
+            return;
+        };
         let _ = self.stop.send(true);
+        let _ = self.service.request_stop_for_process_exit(now_ms());
     }
 
     pub async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {

@@ -306,6 +306,14 @@ impl StatisticsJobRepository {
         request: StatisticsJobCreate,
         owner: WorkOwner,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.create_now(request, owner)
+    }
+
+    pub(crate) fn create_now(
+        &self,
+        request: StatisticsJobCreate,
+        owner: WorkOwner,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         if state.active.len() >= MAX_ACTIVE_OR_QUEUED_STATISTICS_JOBS {
             return Err(StatisticsRepositoryError::new(
@@ -392,6 +400,14 @@ impl StatisticsJobRepository {
         id: StatisticsJobId,
         at_ms: i64,
     ) -> Result<StatisticsJob, StatisticsRepositoryError> {
+        self.request_cancel_now(id, at_ms)
+    }
+
+    pub(crate) fn request_cancel_now(
+        &self,
+        id: StatisticsJobId,
+        at_ms: i64,
+    ) -> Result<StatisticsJob, StatisticsRepositoryError> {
         let mut state = self.lock()?;
         let mut entry = state
             .active
@@ -430,6 +446,52 @@ impl StatisticsJobRepository {
         drop(state);
         self.changed.notify_waiters();
         Ok(job)
+    }
+
+    /// Closes admission to the process-local runner by requesting cancellation
+    /// of every active root. Queued jobs have no provider session or query
+    /// work, so they are terminally cancelled here; running jobs retain their
+    /// root until their executor reports actual convergence.
+    pub(crate) fn request_stop_for_process_exit(
+        &self,
+        at_ms: i64,
+    ) -> Result<(), StatisticsRepositoryError> {
+        let mut state = self.lock()?;
+        let mut queued = Vec::new();
+        let mut cancellation_requesters = Vec::new();
+        for (id, entry) in &mut state.active {
+            entry.job.cancel_requested = true;
+            entry.job.updated_at_ms = at_ms;
+            if entry.job.state == StatisticsJobState::Active(StatisticsJobPhase::Submitted) {
+                queued.push(*id);
+            } else if let Some(owner) = entry.owner.as_ref() {
+                cancellation_requesters.push(owner.cancellation_requester());
+            }
+        }
+        for id in queued {
+            let mut entry = state.active.remove(&id).expect("queued job exists");
+            entry.job.state = StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled);
+            entry.job.failure = Some(StatisticsFailure {
+                message: Arc::from("statistics job cancelled during process shutdown"),
+            });
+            entry.job.completed_at_ms = Some(at_ms);
+            entry.job.convergence = StatisticsConvergence {
+                collection_stopped: true,
+                execution_resources_released: true,
+                provider_session_closed: true,
+            };
+            if let Some(owner) = entry.owner.take() {
+                owner.complete();
+            }
+            state.terminal.push_back(entry);
+        }
+        Self::trim_terminal(&mut state);
+        drop(state);
+        for requester in cancellation_requesters {
+            let _ = requester.request(novarocks_workload_control::CancellationReason::Requested);
+        }
+        self.changed.notify_waiters();
+        Ok(())
     }
 
     pub async fn phase(
@@ -1223,6 +1285,109 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("shutdown worker");
+    }
+
+    #[tokio::test]
+    async fn process_stop_cancels_the_active_root_and_waits_for_convergence() {
+        let service = StatisticsJobService::new();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(BlockingExecutor {
+                started,
+                release: Mutex::new(release_rx),
+            }),
+            tokio::runtime::Handle::current(),
+        );
+
+        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background preparation started")
+        })
+        .await
+        .expect("observe preparation");
+
+        runtime.request_stop_for_process_exit();
+        release.send(()).expect("release preparation");
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown worker");
+
+        let terminal = service
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|job| job.id == submitted.id)
+            .expect("job remains retained");
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
+    }
+
+    #[tokio::test]
+    async fn process_stop_rejects_new_submission_without_creating_a_job() {
+        let service = StatisticsJobService::new();
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(RecordingExecutor {
+                publications: AtomicUsize::new(0),
+                finalization_fails: false,
+            }),
+            tokio::runtime::Handle::current(),
+        );
+
+        runtime.request_stop_for_process_exit();
+        let error = runtime
+            .submit(create(1), root())
+            .await
+            .expect_err("stopping worker rejects admission");
+        assert_eq!(error.kind(), StatisticsRepositoryErrorKind::Conflict);
+        assert!(service.list().await.expect("list").is_empty());
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown worker");
+    }
+
+    #[tokio::test]
+    async fn process_stop_converges_a_queued_root_without_dispatching_it() {
+        let service = StatisticsJobService::new();
+        let queued = service.submit(create(1), root()).await.expect("queue job");
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(RecordingExecutor {
+                publications: AtomicUsize::new(0),
+                finalization_fails: false,
+            }),
+            tokio::runtime::Handle::current(),
+        );
+
+        runtime.request_stop_for_process_exit();
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown worker");
+
+        let terminal = service
+            .list()
+            .await
+            .expect("list")
+            .into_iter()
+            .find(|job| job.id == queued.id)
+            .expect("queued job remains retained");
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
+        assert!(terminal.query_attempt_id.is_none());
     }
 
     #[tokio::test]
