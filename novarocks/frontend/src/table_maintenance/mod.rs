@@ -39,7 +39,7 @@ pub(crate) use self::admission::{
     is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
 };
 use self::result::{action_result, optimize_jobs_result};
-use self::worker::{OptimizeJobExecutor, OptimizeWorker};
+use self::worker::{FrontendOptimizeJobAdmissionPort, FrontendOptimizeJobExecutionPort};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::query_execution::maintenance::{
     MaintenanceRequestContext, MaintenanceStatementResult, TableMaintenanceEngine,
@@ -52,9 +52,10 @@ use novarocks_table_maintenance::gc_observation::{
 use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };
+use novarocks_table_maintenance::worker::OptimizeWorker;
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeJob,
-    OptimizeProcessRuntime, OptimizeSubmission,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeProcessRuntime,
+    OptimizeSubmission,
 };
 
 pub mod admission;
@@ -453,23 +454,6 @@ impl FrontendTableMaintenanceService {
     }
 }
 
-struct DirectOptimizeExecutor;
-
-impl OptimizeJobExecutor for DirectOptimizeExecutor {
-    fn execute(
-        &self,
-        _runtime: &Handle,
-        engine: &dyn TableMaintenanceEngine,
-        job: &OptimizeJob,
-    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
-        execute_distributed_rewrite_terminal(
-            engine,
-            &job.target,
-            DistributedRewriteIntent::DataFiles { rewrite_all: true },
-        )
-    }
-}
-
 /// Execute one current-process OPTIMIZE job through the frontend-owned native
 /// distributed rewrite path. The process runtime deliberately retains no
 /// recovery record, but a single attempt must still finish or abort its exact
@@ -693,13 +677,16 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .map_err(|error| format!("table maintenance worker lifecycle lock: {error}"))?;
         match &*lifecycle {
             WorkerLifecycle::NotStarted => {
-                *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start_with_executor(
+                *lifecycle = WorkerLifecycle::Started(OptimizeWorker::start(
                     &self.runtime,
                     Arc::clone(&self.optimize_runtime),
-                    Arc::downgrade(&engine),
-                    Arc::new(DirectOptimizeExecutor),
-                    self.root_admission.clone(),
-                )?);
+                    Arc::new(FrontendOptimizeJobAdmissionPort::new(
+                        self.root_admission.clone(),
+                    )),
+                    Arc::new(FrontendOptimizeJobExecutionPort::new(Arc::downgrade(
+                        &engine,
+                    ))),
+                ));
                 Ok(())
             }
             WorkerLifecycle::Started(_) => {

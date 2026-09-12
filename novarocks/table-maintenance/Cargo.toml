@@ -14,7 +14,7 @@ novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["v7"] }
 
 [dev-dependencies]
