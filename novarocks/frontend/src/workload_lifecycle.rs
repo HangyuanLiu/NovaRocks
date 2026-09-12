@@ -337,6 +337,20 @@ impl FrontendServingLifecycle {
         lifecycle
     }
 
+    /// Classifies a rejected statement against the authoritative FE serving
+    /// state, including an admission that raced with drain closure.
+    pub fn admission_error(&self) -> Option<FrontendAdmissionError> {
+        let inner = self
+            .shared
+            .inner
+            .lock()
+            .expect("frontend lifecycle lock poisoned");
+        match inner.state {
+            FrontendServingState::Ready => None,
+            state => Some(admission_error(state)),
+        }
+    }
+
     /// Publishes sanitized catalog bootstrap facts. The caller owns catalog
     /// materialization; this lifecycle merely owns aggregate observation.
     pub fn publish_catalog_bootstrap(

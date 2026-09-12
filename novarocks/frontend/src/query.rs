@@ -69,7 +69,8 @@ use novarocks_query_application::session::{
     QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
 };
 use novarocks_query_application::session_control::{
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
+    GovernedQueryStatementBeginError, QueryControlService, QuerySessionLease, SessionIdentity,
+    SessionToken, StatementToken,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_query_application::session_outcome::{
@@ -97,6 +98,7 @@ use novarocks_query_application::sql::{
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
+use novarocks_workload_control::WorkError;
 use novarocks_workload_control::{
     LocalResourceAuthority, RootAdmissionHandle, WorkClass, WorkRequest,
 };
@@ -535,6 +537,21 @@ struct FrontendQuerySession {
 }
 
 impl FrontendQuerySession {
+    fn governed_statement_begin_error(
+        &self,
+        error: GovernedQueryStatementBeginError,
+    ) -> QueryServiceError {
+        if matches!(
+            error,
+            GovernedQueryStatementBeginError::Admission(WorkError::Closed)
+        ) {
+            if let Some(admission) = self.service.serving_lifecycle.admission_error() {
+                return query_service_admission_error(admission);
+            }
+        }
+        governed_statement_begin_error(error)
+    }
+
     fn token(&self) -> Result<SessionToken, QueryServiceError> {
         self.lease
             .lock()
@@ -617,7 +634,7 @@ impl FrontendQuerySession {
                 None,
                 None,
             )
-            .map_err(governed_statement_begin_error)?;
+            .map_err(|error| self.governed_statement_begin_error(error))?;
         let result = match statement {
             ast::SessionStatement::Set(statement) => {
                 for assignment in &statement.assignments {
@@ -829,7 +846,7 @@ impl FrontendQuerySession {
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
             )
-            .map_err(governed_statement_begin_error)?;
+            .map_err(|error| self.governed_statement_begin_error(error))?;
         for assignment in &set.assignments {
             let ast::SetTarget::UserVariable(variable) = &assignment.target else {
                 if let Err(error) = self.apply_session_set_assignment_to_state(
@@ -998,7 +1015,7 @@ impl FrontendQuerySession {
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
             )
-            .map_err(governed_statement_begin_error)?;
+            .map_err(|error| self.governed_statement_begin_error(error))?;
         let prepared = match self
             .prepare_governed_query_operation(
                 &sql,
@@ -1118,7 +1135,7 @@ impl FrontendQuerySession {
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
             )
-            .map_err(governed_statement_begin_error)?;
+            .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
             statement.cancellation().clone(),
             statement.timeout_ms(),
