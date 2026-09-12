@@ -43,7 +43,7 @@ use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
 use super::{
-    activity::{CanonicalMvTarget, MvActivityGate, MvActivityOwner},
+    activity::{MvActivityGate, MvActivityOwner, canonical_mv_target},
     create,
     maintenance::MaintenanceCoordinatorConfig,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
@@ -282,7 +282,7 @@ impl FrontendMvService {
     ) -> Result<crate::mv::activity::MvActivityLease, MvApplicationError> {
         let mut gate_ticket = self
             .activity_gate
-            .request(CanonicalMvTarget::from_mv_target(target), owner)
+            .request(canonical_mv_target(target), owner)
             .map_err(|_| {
                 MvApplicationError::new(
                     crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
@@ -536,7 +536,7 @@ fn run_scheduled_refreshes(
             }
         };
         let mut ticket = match dependencies.activity_gate.request(
-            CanonicalMvTarget::from_mv_target(&request.target),
+            canonical_mv_target(&request.target),
             MvActivityOwner::ScheduledRefresh,
         ) {
             Ok(ticket) => ticket,

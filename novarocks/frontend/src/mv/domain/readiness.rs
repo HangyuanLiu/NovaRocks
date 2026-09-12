@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
-use crate::mv::activity::CanonicalMvTarget;
+use crate::mv::activity::{CanonicalMvTarget, canonical_mv_target};
 use crate::mv::domain::dependency::model::MvDependencyObjectRef;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
@@ -139,7 +139,7 @@ impl MvReadinessPort {
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        let canonical = CanonicalMvTarget::from_mv_target(target);
+        let canonical = canonical_mv_target(target);
         if let MvTargetReadiness::Unavailable(reason) = self.runtime.readiness(&canonical) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Unavailable,
@@ -176,8 +176,7 @@ impl MvReadinessPort {
                 !target.database.is_empty()
                     && !target.name.is_empty()
                     && !matches!(
-                        self.runtime
-                            .readiness(&CanonicalMvTarget::from_mv_target(&target)),
+                        self.runtime.readiness(&canonical_mv_target(&target)),
                         MvTargetReadiness::Unavailable(_)
                     )
             })
@@ -281,7 +280,7 @@ impl MvReadinessPort {
         target: &MvTarget,
         publication_id: novarocks_spi::connector::LakePublicationId,
     ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
-        let canonical = CanonicalMvTarget::from_mv_target(target);
+        let canonical = canonical_mv_target(target);
         if !self.runtime.begin(canonical.clone(), publication_id) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Conflict,

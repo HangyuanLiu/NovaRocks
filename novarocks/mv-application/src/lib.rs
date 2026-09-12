@@ -22,5 +22,6 @@
 //! proofs, query bindings, and physical execution stay at their respective
 //! boundaries.
 
+pub mod activity;
 pub mod candidate;
 pub mod process_runtime;
