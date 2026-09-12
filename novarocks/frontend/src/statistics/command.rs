@@ -152,6 +152,9 @@ fn statistics_string_result(
     names: &[&str],
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<StatementResult, String> {
+    if rows.iter().any(|row| row.len() != names.len()) {
+        return Err("statistics application returned malformed tabular result".to_owned());
+    }
     build_nullable_utf8_query_result(names, rows).map(StatementResult::Query)
 }
 
@@ -365,6 +368,19 @@ mod tests {
                     },
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn malformed_statistics_rows_keep_the_product_diagnostic() {
+        let error = super::statistics_string_result(
+            &["job_id", "state"],
+            vec![vec![Some("job-1".to_owned())]],
+        )
+        .expect_err("statistics rows must match their declared columns");
+        assert_eq!(
+            error,
+            "statistics application returned malformed tabular result"
         );
     }
 
