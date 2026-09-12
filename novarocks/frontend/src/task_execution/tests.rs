@@ -4227,6 +4227,10 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .turn()
         .expect("the original receipt closes the in-flight exact replay");
     assert_eq!(closed.acknowledgements, 1);
+    assert!(
+        round.execution().context_released(exact_context),
+        "a definitive actor Abort receipt is positive context closure evidence"
+    );
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
         OperationKind::AbortQueryContext,

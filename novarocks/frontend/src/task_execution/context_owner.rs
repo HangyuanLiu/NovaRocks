@@ -890,6 +890,19 @@ impl QueryContextOwner {
         Ok(())
     }
 
+    /// Records the definitive closure receipt for an actor-owned Abort.
+    ///
+    /// Actor Abort operations are settled by their own application authority,
+    /// rather than by this context owner's normal lifecycle request path. A
+    /// validated Worker receipt is nevertheless the same positive context
+    /// closure fact: retaining this owner afterwards would make attempt
+    /// convergence wait for a Release that the terminal context no longer
+    /// needs or accepts.
+    pub(crate) fn observe_actor_abort_closure(&mut self) {
+        self.state = QueryContextState::TerminalRetained;
+        self.released = true;
+    }
+
     /// How long this owner may sleep before its next renewal is due.
     pub fn renew_delay(&self, now: MonotonicInstant) -> Option<Duration> {
         self.renew_schedule.map(|schedule| schedule.delay_from(now))

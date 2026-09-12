@@ -419,6 +419,20 @@ impl FrontendExecutionRuntimeOwner {
                 }
             }
 
+            // The logical supervisor has already driven every query owner to
+            // its terminal boundary before workload teardown begins. Consume
+            // the matching role-owned control notifications now: they record
+            // that cancellation was delivered, but cannot manufacture task,
+            // context, or resource-release facts.
+            while let Some(control) = self
+                .workload
+                .as_ref()
+                .expect("failed workload shutdown returns the exact owner")
+                .next_control()
+            {
+                control.acknowledge();
+            }
+
             let wait = self
                 .workload
                 .as_ref()
@@ -2047,6 +2061,57 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("retry converges the exact retained owner graph");
+    }
+
+    #[tokio::test]
+    async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
+        let mut runtime = FrontendExecutionRuntimeOwner::try_new(
+            tokio::runtime::Handle::current(),
+            LogicalExecutionSupervisorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                LogicalExecutionRowsConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroU32::new(1).unwrap(),
+                    Duration::from_secs(1),
+                    MaxWait::new(Duration::from_millis(20)).unwrap(),
+                    ResultByteLimit::new(1024).unwrap(),
+                ),
+            ),
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+            QueryCpuExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .expect("execution runtime opens");
+        runtime.mark_ready().expect("workload authority ready");
+        let work = runtime
+            .root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("root work admitted");
+        work.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        work.owner.complete();
+        work.business.release();
+
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("terminal control notification cannot retain a completed root");
     }
 
     #[async_trait]
