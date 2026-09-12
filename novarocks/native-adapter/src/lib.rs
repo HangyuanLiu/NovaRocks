@@ -17,6 +17,12 @@
 
 //! Server-resolved Backend Native transport capability.
 
+pub mod native_codec;
+
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
+}
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -290,5 +296,13 @@ mod tests {
         assert_eq!(budget.max_active_tasks_per_backend(), 2);
         assert_eq!(budget.frontend_queue_residence(), Duration::from_secs(1));
         assert_eq!(budget.into_codec().max_batch_items(), 2);
+    }
+
+    #[test]
+    fn generated_native_stubs_reference_the_canonical_protocol_dtos() {
+        let generated = include_str!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
+        assert!(generated.contains("nova_rocks_grpc_client"));
+        assert!(generated.contains("nova_rocks_grpc_server"));
+        assert!(generated.contains("::novarocks_proto_models::novarocks::HeartbeatRequest"));
     }
 }

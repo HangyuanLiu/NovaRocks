@@ -53,13 +53,15 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tower::ServiceExt;
 
-use super::transport::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 use crate::connector::catalog_manager::CatalogPruneResult;
 use crate::drain::BackendDrainState;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 use novarocks_native_adapter::BackendNativeTransport;
+use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
+    NovaRocksGrpc, NovaRocksGrpcServer,
+};
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;

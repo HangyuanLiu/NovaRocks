@@ -28,7 +28,7 @@ use novarocks_proto_models::novarocks::{
 use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 
 use super::data_runtime::FrontendDataRuntime;
-use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;

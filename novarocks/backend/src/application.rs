@@ -1044,11 +1044,11 @@ mod tests {
         compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
-    use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};

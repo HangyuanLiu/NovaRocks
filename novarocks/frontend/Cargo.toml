@@ -3,7 +3,6 @@ name = "novarocks-frontend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [lints]
 workspace = true
@@ -73,7 +72,3 @@ novarocks-sql = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
-
-[build-dependencies]
-protoc-bin-vendored.workspace = true
-tonic-build.workspace = true

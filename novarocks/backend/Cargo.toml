@@ -3,7 +3,6 @@ name = "novarocks-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [lints]
 workspace = true
@@ -45,10 +44,6 @@ tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util"] }
 tracing.workspace = true
-
-[build-dependencies]
-protoc-bin-vendored.workspace = true
-tonic-build.workspace = true
 
 [dev-dependencies]
 novarocks-sql.workspace = true

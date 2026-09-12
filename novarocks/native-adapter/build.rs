@@ -35,19 +35,12 @@ fn main() {
             Path::new(IDL_DIR).join(file).display()
         );
     }
-
     let protoc = protoc_bin_vendored::protoc_bin_path().expect("vendored protoc path");
-    unsafe {
-        env::set_var("PROTOC", protoc);
-    }
-
-    // Native protobuf DTOs are generated exactly once by novarocks-proto-models.
-    // The backend owns its ingress and outbound Tonic transport stubs
-    // and refers to every request and response through canonical DTO modules.
+    unsafe { env::set_var("PROTOC", protoc) };
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
-        .codec_path("crate::rpc::codec::NativeProstCodec")
+        .codec_path("crate::native_codec::NativeProstCodec")
         .extern_path(".novarocks.common", "::novarocks_proto_models::common")
         .extern_path(".novarocks.expr", "::novarocks_proto_models::expr")
         .extern_path(".novarocks.filter", "::novarocks_proto_models::filter")
@@ -57,5 +50,5 @@ fn main() {
             &[PathBuf::from(IDL_DIR).join("service.proto")],
             &[PathBuf::from(IDL_DIR)],
         )
-        .expect("compile native backend Tonic transport stubs against protocol DTOs");
+        .expect("compile native Tonic transport stubs against protocol DTOs");
 }

@@ -2106,11 +2106,13 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status};
 
-    use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
     use crate::native::transport_supervisor::NativeTransportSupervisor;
     use crate::task_execution::ContextConvergenceIntake;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
+    use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
+        NovaRocksGrpc, NovaRocksGrpcServer,
+    };
     use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
 
     use super::*;

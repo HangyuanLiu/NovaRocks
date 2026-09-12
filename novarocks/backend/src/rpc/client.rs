@@ -36,8 +36,8 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tower::service_fn;
 
-use super::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
 use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;

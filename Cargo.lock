@@ -3618,13 +3618,11 @@ dependencies = [
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "protoc-bin-vendored",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tower 0.5.2",
  "tracing",
 ]
@@ -3897,7 +3895,6 @@ dependencies = [
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "protoc-bin-vendored",
  "regex",
  "serde",
  "serde_json",
@@ -3907,7 +3904,6 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tonic",
- "tonic-build",
  "tower 0.5.2",
  "tracing",
  "uuid",
@@ -3987,10 +3983,14 @@ name = "novarocks-native-adapter"
 version = "0.1.0"
 dependencies = [
  "novarocks-native-trust",
+ "novarocks-proto-models",
  "novarocks-task-codec",
  "novarocks-types",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
  "tokio",
  "tonic",
+ "tonic-build",
 ]
 
 [[package]]

@@ -21,15 +21,9 @@ use prost::Message;
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
 
-// Tonic codec for the Backend RPC surface.
-
 /// Native protobuf codec used by generated NovaRocks clients and servers.
-///
-/// It delegates to Prost unchanged. The pre-decode raw byte scan this codec
-/// used to run went with `StageFragmentsRequest`: it was keyed on that exact
-/// decoded type, so the retirement of the Stage RPC left it unreachable.
 #[derive(Debug, Clone)]
-pub(crate) struct NativeProstCodec<T, U> {
+pub struct NativeProstCodec<T, U> {
     marker: PhantomData<(T, U)>,
 }
 
@@ -61,7 +55,7 @@ where
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NativeProstEncoder<T> {
+pub struct NativeProstEncoder<T> {
     marker: PhantomData<T>,
     buffer_settings: BufferSettings,
 }
@@ -95,7 +89,7 @@ impl<T: Message> Encoder for NativeProstEncoder<T> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NativeProstDecoder<U> {
+pub struct NativeProstDecoder<U> {
     marker: PhantomData<U>,
     buffer_settings: BufferSettings,
 }
