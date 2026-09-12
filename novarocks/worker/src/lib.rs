@@ -28,6 +28,7 @@ mod admission;
 mod admission_epoch;
 mod clock;
 mod convergence;
+mod deadline;
 mod domain;
 mod drain;
 mod host;
@@ -55,6 +56,7 @@ pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };
+pub use deadline::{WorkerDeadlineAuthority, WorkerDeadlineSupervisor};
 pub use domain::{
     DomainPolicyRejection, InitialDomainKey, QueryContextDomains, TaskDomains,
     commit_task_domain_updates, initial_domain_keys, plan_task_domain_updates,

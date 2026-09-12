@@ -104,6 +104,12 @@ impl WorkerAdmissionEpochAuthority for TaskExecutionRegistry {
     }
 }
 
+impl novarocks_worker::WorkerDeadlineAuthority for TaskExecutionRegistry {
+    fn advance_deadlines(&self) {
+        let _ = TaskExecutionRegistry::advance_deadlines(self);
+    }
+}
+
 const REGISTRY_LOCK: &str = "task execution registry lock";
 
 /// How many times one settle drives termination before yielding.

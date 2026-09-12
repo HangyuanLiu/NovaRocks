@@ -1,9 +1,7 @@
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
-
-use tokio::sync::watch;
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
@@ -13,7 +11,8 @@ use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::{
-    WorkerAdmissionEpochAuthority, WorkerDrainState, WorkerResultRetainedLimits,
+    WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor, WorkerDrainState,
+    WorkerResultRetainedLimits,
 };
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
@@ -150,7 +149,7 @@ pub struct BackendApplicationHost {
     grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
     task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
-    task_deadline_tick: TaskDeadlineTickTask,
+    task_deadline_tick: WorkerDeadlineSupervisor,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
     drain: Arc<WorkerDrainState>,
@@ -282,83 +281,6 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
             TaskFailureCategory::Internal,
             UNROUTED_DETAIL,
         ))
-    }
-}
-
-/// The maintenance tick of the task protocol owner.
-///
-/// The owner never sleeps against a wall clock, so elapsed time becomes a
-/// decision only when something calls `advance_deadlines`. This is that
-/// something: without it no lease ever expires, no creation gate ever times
-/// out, and no retained record is ever reclaimed.
-struct TaskDeadlineTickTask {
-    stop: watch::Sender<bool>,
-    failure_rx: mpsc::Receiver<String>,
-    join: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl TaskDeadlineTickTask {
-    fn start(
-        runtime: &BackendDataRuntime,
-        registry: Arc<TaskExecutionRegistry>,
-        interval: Duration,
-    ) -> Self {
-        let (stop, mut stopped) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let join = runtime.handle().spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick of a Tokio interval completes immediately and
-            // there is nothing to sweep at composition time.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = stopped.changed() => return,
-                    _ = ticker.tick() => {}
-                }
-                let registry = Arc::clone(&registry);
-                // One sweep takes the owner's mutex, so it runs on the
-                // blocking pool rather than on a runtime worker.
-                if let Err(error) =
-                    tokio::task::spawn_blocking(move || registry.advance_deadlines()).await
-                {
-                    // Nothing else re-evaluates a deadline, so a dead sweep is
-                    // a supervision failure rather than a missed tick.
-                    let _ = failure_tx.send(format!(
-                        "task execution deadline sweep stopped running: {error}"
-                    ));
-                    return;
-                }
-            }
-        });
-        Self {
-            stop,
-            failure_rx,
-            join: Some(join),
-        }
-    }
-
-    fn poll_failure(&mut self) -> Option<String> {
-        self.failure_rx.try_recv().ok()
-    }
-
-    /// Asks the tick to return, then drops it.
-    ///
-    /// The abort is a backstop for a runtime that is already winding down: the
-    /// loop's only await points are the tick, the stop signal, and the join of
-    /// one sweep, and a sweep that has already started runs to completion on
-    /// the blocking pool, so nothing is left half applied.
-    fn stop(&mut self) {
-        let _ = self.stop.send(true);
-        if let Some(join) = self.join.take() {
-            join.abort();
-        }
-    }
-}
-
-impl Drop for TaskDeadlineTickTask {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -652,9 +574,10 @@ impl BackendApplicationHost {
             )?;
         // Started before the listener: the owner is reachable the moment its
         // RPCs are, and a deadline that elapses must already be decidable.
-        let task_deadline_tick = TaskDeadlineTickTask::start(
-            &readiness_runtime,
-            Arc::clone(&services.task_execution_registry),
+        let task_deadline_tick = WorkerDeadlineSupervisor::start(
+            readiness_runtime.handle(),
+            Arc::clone(&services.task_execution_registry)
+                as Arc<dyn novarocks_worker::WorkerDeadlineAuthority>,
             TASK_DEADLINE_TICK_INTERVAL,
         );
 
@@ -797,9 +720,8 @@ mod tests {
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
-        TaskDeadlineTickTask, TaskExecutionRegistryConfig, UnroutedQueryContextHost,
-        UnroutedTaskExecutionHost, combine_primary_and_shutdown,
-        compose_backend_application_services,
+        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
+        combine_primary_and_shutdown, compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
@@ -813,7 +735,7 @@ mod tests {
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
     use novarocks_worker::WorkerResultRetainedLimits;
-    use novarocks_worker::{ManualClock, WorkerMonotonicClock};
+    use novarocks_worker::{ManualClock, WorkerDeadlineSupervisor, WorkerMonotonicClock};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -909,9 +831,9 @@ mod tests {
             QueryContextState::TerminalRetained
         );
 
-        let mut tick = TaskDeadlineTickTask::start(
-            &test_data_runtime(),
-            Arc::clone(&registry),
+        let mut tick = WorkerDeadlineSupervisor::start(
+            test_data_runtime().handle(),
+            Arc::clone(&registry) as Arc<dyn novarocks_worker::WorkerDeadlineAuthority>,
             Duration::from_millis(5),
         );
         clock.advance(Duration::from_secs(600));
