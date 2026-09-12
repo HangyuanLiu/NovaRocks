@@ -15,22 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod mv_repository_definition;
+use super::tests_definition;
 
-use novarocks_frontend::mv::domain::repository::{MvRepository, ReplaceMvProjectionRequest};
+use crate::mv::domain::repository::{MvRepository, ReplaceMvProjectionRequest};
 
 #[tokio::test]
 async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
-    let (_temp, _host, repository) = mv_repository_definition::repository().await;
+    let (_host, repository) = tests_definition::repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
-            mv_repository_definition::projection_request(
-                "dependency",
-                b"dependency-object",
-                51,
-                "orders",
-            ),
+            tests_definition::projection_request("dependency", b"dependency-object", 51, "orders"),
         )
         .await
         .unwrap();
@@ -44,12 +39,8 @@ async fn dependency_indexes_are_replaced_only_with_the_root_projection_cas() {
         1
     );
 
-    let replacement = mv_repository_definition::projection_request(
-        "dependency",
-        b"dependency-object",
-        52,
-        "customers",
-    );
+    let replacement =
+        tests_definition::projection_request("dependency", b"dependency-object", 52, "customers");
     let replaced = repository
         .replace_projection(
             uuid::Uuid::now_v7(),

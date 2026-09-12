@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod mv_repository_definition;
+use super::tests_definition;
 
-use novarocks_frontend::mv::domain::repository::{
+use crate::mv::domain::repository::{
     DeleteMvProjectionRequest, MvRepository, MvRepositoryErrorKind, ReplaceMvProjectionRequest,
 };
-use novarocks_frontend::mv::domain::test_repository::InMemoryMvRepository;
+use crate::mv::domain::test_repository::InMemoryMvRepository;
 
 #[tokio::test]
 async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_delete() {
@@ -28,18 +28,13 @@ async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_del
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
-            mv_repository_definition::projection_request(
-                "orders_mv",
-                b"target-object",
-                61,
-                "orders",
-            ),
+            tests_definition::projection_request("orders_mv", b"target-object", 61, "orders"),
         )
         .await
         .expect("create projection through port");
     assert_eq!(
         repository
-            .find_by_target(&mv_repository_definition::target("orders_mv"))
+            .find_by_target(&tests_definition::target("orders_mv"))
             .await
             .unwrap(),
         Some(created.clone())
@@ -51,7 +46,7 @@ async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_del
             ReplaceMvProjectionRequest {
                 mv_id: created.definition.mv_id,
                 expected_version: created.version.clone(),
-                projection: mv_repository_definition::projection_request(
+                projection: tests_definition::projection_request(
                     "orders_mv",
                     b"target-object",
                     62,

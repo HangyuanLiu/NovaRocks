@@ -20,6 +20,16 @@ pub mod codec;
 pub mod key;
 mod operation;
 
+#[cfg(test)]
+#[path = "tests_definition.rs"]
+mod tests_definition;
+#[cfg(test)]
+#[path = "tests_dependency.rs"]
+mod tests_dependency;
+#[cfg(test)]
+#[path = "tests_port.rs"]
+mod tests_port;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

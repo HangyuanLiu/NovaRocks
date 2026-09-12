@@ -18,56 +18,36 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
-use novarocks_frontend::mv::domain::dependency::model::{
+use super::StateStoreMvRepository;
+use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks_frontend::mv::domain::persistence::definition::{
+use crate::mv::domain::persistence::definition::{
     CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
 };
-use novarocks_frontend::mv::domain::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_frontend::mv::domain::repository::{
+use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
+use crate::mv::domain::repository::{
     DeleteMvProjectionRequest, InitialMvRefreshConfiguration, MvProjectionRequest,
     MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
     ReplaceMvProjectionRequest,
 };
-use novarocks_frontend::mv::repository::StateStoreMvRepository;
+use crate::state_store::{StateStoreHost, testing as state_store_fixture};
+use bytes::Bytes;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
-#[path = "common/mod.rs"]
-mod common;
-use common::state_store_fixture::{
-    StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
-    StateStoreLimitOverrides, StateStoreProviderConfig, builtin_state_store_provider_registry,
-};
 
-pub(crate) async fn repository() -> (
-    tempfile::TempDir,
-    StateStoreHost,
-    Arc<StateStoreMvRepository>,
-) {
-    let temp = tempfile::tempdir().expect("temporary StateStore directory");
-    let cluster_id = format!("mv-accelerator-test-{}", temp.path().display());
-    let registry = builtin_state_store_provider_registry().expect("built-in StateStore providers");
+pub(crate) async fn repository() -> (StateStoreHost, Arc<StateStoreMvRepository>) {
+    let registry = state_store_fixture::persistent_registry();
     let host = StateStoreHost::open(
         &registry,
-        StateStoreHostConfig {
-            state_store: StateStoreAppConfig {
-                store: StateStoreConfig {
-                    cluster_id,
-                    limits: StateStoreLimitOverrides::default(),
-                    provider: StateStoreProviderConfig::Sqlite {
-                        path: temp.path().join("state-store.sqlite"),
-                    },
-                },
-                mysql_client: None,
-            },
-            foundationdb_client: None,
-        },
+        state_store_fixture::persistent_input(format!(
+            "mv-accelerator-test-{}",
+            uuid::Uuid::now_v7()
+        )),
         Instant::now() + Duration::from_secs(5),
     )
     .await
@@ -76,7 +56,7 @@ pub(crate) async fn repository() -> (
     let repository = StateStoreMvRepository::open(store, StateStoreRunPolicy::default())
         .await
         .expect("open MV Accelerator repository");
-    (temp, host, repository)
+    (host, repository)
 }
 
 pub(crate) fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
@@ -154,7 +134,7 @@ pub(crate) fn projection_request(
 
 #[tokio::test]
 async fn sqlite_reopen_retains_the_exact_lake_source_projection() {
-    let (_temp, host, repository) = repository().await;
+    let (host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -183,7 +163,7 @@ async fn sqlite_reopen_retains_the_exact_lake_source_projection() {
 
 #[tokio::test]
 async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
-    let (_temp, _host, repository) = repository().await;
+    let (_host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -243,7 +223,7 @@ async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
 
 #[tokio::test]
 async fn replacement_target_conflict_rolls_back_the_whole_projection() {
-    let (_temp, _host, repository) = repository().await;
+    let (_host, repository) = repository().await;
     let first = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -280,7 +260,7 @@ async fn replacement_target_conflict_rolls_back_the_whole_projection() {
 
 #[tokio::test]
 async fn delete_requires_exact_object_source_and_version() {
-    let (_temp, _host, repository) = repository().await;
+    let (_host, repository) = repository().await;
     let created = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -332,7 +312,7 @@ async fn delete_requires_exact_object_source_and_version() {
 
 #[tokio::test]
 async fn whole_family_wipe_allows_internal_id_reallocation() {
-    let (_temp, _host, repository) = repository().await;
+    let (_host, repository) = repository().await;
     let first = repository
         .create_projection(
             uuid::Uuid::now_v7(),
@@ -356,7 +336,7 @@ async fn whole_family_wipe_allows_internal_id_reallocation() {
 
 #[tokio::test]
 async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it() {
-    let (_temp, host, repository) = repository().await;
+    let (host, repository) = repository().await;
     let store = host.state_store().expect("StateStore");
     let key = Key::try_from(Bytes::from_static(
         b"novarocks/frontend/mv/accelerator/v1/unknown/future-record",
