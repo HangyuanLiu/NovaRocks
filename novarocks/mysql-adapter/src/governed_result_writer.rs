@@ -430,9 +430,19 @@ pub async fn write_governed_query_result_one<'writer, W: AsyncWrite + Unpin>(
 /// Writes one Query Application result without detaching its delivery and
 /// resource owners from the protocol operation which consumes them.
 pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
-    mut result: StreamingStatementResult,
+    result: StreamingStatementResult,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
+    match write_streaming_query_result_one(result, results).await? {
+        MysqlStatementWriteOutcome::Continue(results) => results.no_more_results().await,
+        MysqlStatementWriteOutcome::Terminated => Ok(()),
+    }
+}
+
+pub async fn write_streaming_query_result_one<'writer, W: AsyncWrite + Unpin>(
+    mut result: StreamingStatementResult,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<MysqlStatementWriteOutcome<'writer, W>> {
     let schema_delivery = match result.begin_schema() {
         Some(delivery) => delivery,
         None => {
@@ -474,7 +484,8 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                 let _ = result.fail();
                 return results
                     .error(ErrorKind::ER_UNKNOWN_ERROR, error.to_string().as_bytes())
-                    .await;
+                    .await
+                    .map(|_| MysqlStatementWriteOutcome::Terminated);
             }
             reason = cancellation.cancelled() => {
                 let error = cancelled_query_result_delivery(reason);
@@ -482,7 +493,8 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                 let _ = result.settle_cancellation();
                 return results
                     .error(ErrorKind::ER_QUERY_INTERRUPTED, error.to_string().as_bytes())
-                    .await;
+                    .await
+                    .map(|_| MysqlStatementWriteOutcome::Terminated);
             }
             reservation = &mut reservation => match reservation {
                 Ok(reservation) => reservation,
@@ -575,7 +587,7 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                 } else {
                     let _ = result.fail();
                 }
-                return finish_stream_error(writer, kind, &error).await;
+                return finish_stream_error_terminated(writer, kind, &error).await;
             }
         };
 
@@ -589,7 +601,7 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                             let error = invalid_query_result_delivery(error);
                             delivery.fail(error.clone());
                             let _ = result.fail();
-                            return finish_stream_error(
+                            return finish_stream_error_terminated(
                                 writer,
                                 ErrorKind::ER_UNKNOWN_ERROR,
                                 &error,
@@ -647,15 +659,19 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         } else {
                             let _ = result.fail();
                         }
-                        return finish_stream_error(writer, kind, &error).await;
+                        return finish_stream_error_terminated(writer, kind, &error).await;
                     }
                 };
                 let delivery = match delivery.begin_protocol_write(protocol_bytes) {
                     Ok(delivery) => delivery,
                     Err(error) => {
                         let _ = result.fail();
-                        return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                            .await;
+                        return finish_stream_error_terminated(
+                            writer,
+                            ErrorKind::ER_UNKNOWN_ERROR,
+                            &error,
+                        )
+                        .await;
                     }
                 };
                 let cancellation = result.cancellation();
@@ -705,7 +721,12 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                 }
                 if let Err(error) = delivery.complete() {
                     let _ = result.fail();
-                    return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error).await;
+                    return finish_stream_error_terminated(
+                        writer,
+                        ErrorKind::ER_UNKNOWN_ERROR,
+                        &error,
+                    )
+                    .await;
                 }
             }
             ResultDelivery::End(delivery) => {
@@ -738,7 +759,7 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         } else {
                             let _ = result.fail();
                         }
-                        return finish_stream_error(writer, kind, &error).await;
+                        return finish_stream_error_terminated(writer, kind, &error).await;
                     }
                 };
                 match result.seal_success_visibility() {
@@ -747,7 +768,7 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         let error = governed_cancelled_query_result_delivery(reason);
                         delivery.fail(error.clone());
                         let _ = result.settle_cancellation();
-                        return finish_stream_error(
+                        return finish_stream_error_terminated(
                             writer,
                             ErrorKind::ER_QUERY_INTERRUPTED,
                             &error,
@@ -760,17 +781,21 @@ pub async fn write_streaming_query_result<W: AsyncWrite + Unpin>(
                         );
                         delivery.fail(error.clone());
                         let _ = result.fail();
-                        return finish_stream_error(writer, ErrorKind::ER_UNKNOWN_ERROR, &error)
-                            .await;
+                        return finish_stream_error_terminated(
+                            writer,
+                            ErrorKind::ER_UNKNOWN_ERROR,
+                            &error,
+                        )
+                        .await;
                     }
                 }
-                let finished = crate::finish_streaming_result(writer, failure.clone()).await;
+                let finished = crate::finish_streaming_result_one(writer, failure.clone()).await;
                 match finished {
-                    Ok(()) => {
+                    Ok(writer) => {
                         drop(terminal_reservation);
                         delivery.complete();
                         let _ = result.complete();
-                        return Ok(());
+                        return Ok(MysqlStatementWriteOutcome::Continue(writer));
                     }
                     Err(crate::MysqlResultFinishError::Native(error)) => {
                         drop(terminal_reservation);

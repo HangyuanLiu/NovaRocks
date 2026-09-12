@@ -41,6 +41,7 @@ pub use error_mapping::error_kind_for_domain_code;
 pub use governed_result_writer::{
     MysqlStatementWriteOutcome, write_governed_query_result, write_governed_query_result_one,
     write_query_result, write_query_result_one, write_streaming_query_result,
+    write_streaming_query_result_one,
 };
 pub use listener::{
     serve_tcp_until_drain_then_shutdown, serve_tcp_until_shutdown,
