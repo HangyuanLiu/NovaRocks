@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::{MaxWait, ResultByteLimit};
+use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::{QueryExecutionClient, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
@@ -33,7 +34,6 @@ use novarocks_query_application::cpu::{
     QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
     QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
 };
-use novarocks_task_codec::TransportBudget;
 use novarocks_workload_control::{
     LocalResourceAuthority, ResourceConfig, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
     WorkloadObservationHandle, WorkloadShutdownError,
@@ -106,93 +106,6 @@ const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16
 const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Frontend-owned startup configuration for the Native Task transport.
-///
-/// Server composition supplies primitive deployment limits through this
-/// application boundary. The Frontend alone materializes the private wire
-/// codec budget consumed by its Native adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrontendTaskTransportBudget(TransportBudget);
-
-impl FrontendTaskTransportBudget {
-    pub const DEFAULT: Self = Self(TransportBudget::DEFAULT);
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each deployment limit is independently configurable"
-    )]
-    pub fn try_new(
-        max_batch_items: usize,
-        max_batch_encoded_bytes: usize,
-        max_descriptor_encoded_bytes: usize,
-        max_query_backend_queued_operations: usize,
-        max_query_backend_queued_bytes: usize,
-        max_backend_queued_operations: usize,
-        max_backend_queued_bytes: usize,
-        max_tasks_per_context: usize,
-        max_active_tasks_per_backend: usize,
-        frontend_queue_residence: Duration,
-    ) -> Option<Self> {
-        TransportBudget::new(
-            max_batch_items,
-            max_batch_encoded_bytes,
-            max_descriptor_encoded_bytes,
-            max_query_backend_queued_operations,
-            max_query_backend_queued_bytes,
-            max_backend_queued_operations,
-            max_backend_queued_bytes,
-            max_tasks_per_context,
-            max_active_tasks_per_backend,
-            frontend_queue_residence,
-        )
-        .map(Self)
-    }
-
-    pub const fn max_batch_items(self) -> usize {
-        self.0.max_batch_items()
-    }
-
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.0.max_batch_encoded_bytes()
-    }
-
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.0.max_descriptor_encoded_bytes()
-    }
-
-    pub const fn max_query_backend_queued_operations(self) -> usize {
-        self.0.max_query_backend_queued_operations()
-    }
-
-    pub const fn max_query_backend_queued_bytes(self) -> usize {
-        self.0.max_query_backend_queued_bytes()
-    }
-
-    pub const fn max_backend_queued_operations(self) -> usize {
-        self.0.max_backend_queued_operations()
-    }
-
-    pub const fn max_backend_queued_bytes(self) -> usize {
-        self.0.max_backend_queued_bytes()
-    }
-
-    pub const fn max_tasks_per_context(self) -> usize {
-        self.0.max_tasks_per_context()
-    }
-
-    pub const fn max_active_tasks_per_backend(self) -> usize {
-        self.0.max_active_tasks_per_backend()
-    }
-
-    pub const fn frontend_queue_residence(self) -> Duration {
-        self.0.frontend_queue_residence()
-    }
-
-    const fn into_codec(self) -> TransportBudget {
-        self.0
-    }
-}
 
 /// Largest root-result payload accepted by the Frontend Native adapter.
 pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =

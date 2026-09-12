@@ -35,8 +35,8 @@ use novarocks_execution::runtime::execution_runtime::{
 };
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
-    FrontendQueryControlTimeouts, FrontendServerConfig, FrontendTaskTransportBudget,
-    LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
+    FrontendQueryControlTimeouts, FrontendServerConfig, LakePublicationRuntimePolicy,
+    TaskUpdateRetryPolicy,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -45,6 +45,7 @@ use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
+use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
     LogicalExecutionSupervisorConfig,
@@ -1050,7 +1051,7 @@ mod tests {
         compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
     use novarocks_execution_contract::{MaxWait, OperationKind};
-    use novarocks_frontend::FrontendTaskTransportBudget;
+    use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_query_application::coordination::DispatchBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;

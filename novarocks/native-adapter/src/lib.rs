@@ -20,12 +20,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use novarocks_native_trust::{
     AutomaticTlsMaterial, NativeEndpointConnector, NativeIncomingAdapter, NativeTlsMaterial,
     NativeTrust,
 };
-use novarocks_task_codec::domain::ConfidentialTransport;
+use novarocks_task_codec::{TransportBudget, domain::ConfidentialTransport};
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
@@ -119,6 +120,93 @@ impl FrontendNativeTransport {
     }
 }
 
+/// Server-frozen deployment limits for the Frontend Native Task transport.
+///
+/// The adapter alone materializes the task-codec budget consumed by its wire
+/// ports. Frontend receives the validated value and never owns a second
+/// codec-budget conversion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrontendTaskTransportBudget(TransportBudget);
+
+impl FrontendTaskTransportBudget {
+    pub const DEFAULT: Self = Self(TransportBudget::DEFAULT);
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each deployment limit is independently configurable"
+    )]
+    pub fn try_new(
+        max_batch_items: usize,
+        max_batch_encoded_bytes: usize,
+        max_descriptor_encoded_bytes: usize,
+        max_query_backend_queued_operations: usize,
+        max_query_backend_queued_bytes: usize,
+        max_backend_queued_operations: usize,
+        max_backend_queued_bytes: usize,
+        max_tasks_per_context: usize,
+        max_active_tasks_per_backend: usize,
+        frontend_queue_residence: Duration,
+    ) -> Option<Self> {
+        TransportBudget::new(
+            max_batch_items,
+            max_batch_encoded_bytes,
+            max_descriptor_encoded_bytes,
+            max_query_backend_queued_operations,
+            max_query_backend_queued_bytes,
+            max_backend_queued_operations,
+            max_backend_queued_bytes,
+            max_tasks_per_context,
+            max_active_tasks_per_backend,
+            frontend_queue_residence,
+        )
+        .map(Self)
+    }
+
+    pub const fn max_batch_items(self) -> usize {
+        self.0.max_batch_items()
+    }
+
+    pub const fn max_batch_encoded_bytes(self) -> usize {
+        self.0.max_batch_encoded_bytes()
+    }
+
+    pub const fn max_descriptor_encoded_bytes(self) -> usize {
+        self.0.max_descriptor_encoded_bytes()
+    }
+
+    pub const fn max_query_backend_queued_operations(self) -> usize {
+        self.0.max_query_backend_queued_operations()
+    }
+
+    pub const fn max_query_backend_queued_bytes(self) -> usize {
+        self.0.max_query_backend_queued_bytes()
+    }
+
+    pub const fn max_backend_queued_operations(self) -> usize {
+        self.0.max_backend_queued_operations()
+    }
+
+    pub const fn max_backend_queued_bytes(self) -> usize {
+        self.0.max_backend_queued_bytes()
+    }
+
+    pub const fn max_tasks_per_context(self) -> usize {
+        self.0.max_tasks_per_context()
+    }
+
+    pub const fn max_active_tasks_per_backend(self) -> usize {
+        self.0.max_active_tasks_per_backend()
+    }
+
+    pub const fn frontend_queue_residence(self) -> Duration {
+        self.0.frontend_queue_residence()
+    }
+
+    pub const fn into_codec(self) -> TransportBudget {
+        self.0
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendDataRuntime {
     handle: Handle,
@@ -162,5 +250,41 @@ impl BackendDataRuntime {
     }
     pub fn channels(&self) -> &Arc<Mutex<HashMap<NativeEndpoint, Channel>>> {
         &self.channels
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::FrontendTaskTransportBudget;
+
+    #[test]
+    fn frontend_task_transport_budget_preserves_the_validated_codec_limits() {
+        let budget = FrontendTaskTransportBudget::try_new(
+            2,
+            1024,
+            512,
+            4,
+            4096,
+            4,
+            4096,
+            1,
+            2,
+            Duration::from_secs(1),
+        )
+        .expect("valid native transport budget");
+
+        assert_eq!(budget.max_batch_items(), 2);
+        assert_eq!(budget.max_batch_encoded_bytes(), 1024);
+        assert_eq!(budget.max_descriptor_encoded_bytes(), 512);
+        assert_eq!(budget.max_query_backend_queued_operations(), 4);
+        assert_eq!(budget.max_query_backend_queued_bytes(), 4096);
+        assert_eq!(budget.max_backend_queued_operations(), 4);
+        assert_eq!(budget.max_backend_queued_bytes(), 4096);
+        assert_eq!(budget.max_tasks_per_context(), 1);
+        assert_eq!(budget.max_active_tasks_per_backend(), 2);
+        assert_eq!(budget.frontend_queue_residence(), Duration::from_secs(1));
+        assert_eq!(budget.into_codec().max_batch_items(), 2);
     }
 }
