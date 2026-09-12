@@ -55,15 +55,31 @@ pub async fn write_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
 
 /// Writes the final OK response and settles its governed statement owner.
 pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
-    mut protocol: GovernedProtocolOwner,
+    protocol: GovernedProtocolOwner,
     results: QueryResultWriter<'_, W>,
 ) -> io::Result<()> {
+    match write_governed_terminal_ok_one(protocol, results).await? {
+        crate::governed_result_writer::MysqlStatementWriteOutcome::Continue(results) => {
+            results.no_more_results().await
+        }
+        crate::governed_result_writer::MysqlStatementWriteOutcome::Terminated => Ok(()),
+    }
+}
+
+pub async fn write_governed_terminal_ok_one<'writer, W: AsyncWrite + Unpin>(
+    mut protocol: GovernedProtocolOwner,
+    results: QueryResultWriter<'writer, W>,
+) -> io::Result<crate::governed_result_writer::MysqlStatementWriteOutcome<'writer, W>> {
     match protocol.seal_success_visibility() {
         GovernedStatementVisibilitySealOutcome::Sealed => {
-            match results.completed(OkResponse::default()).await {
-                Ok(()) => {
+            match results.complete_one(OkResponse::default()).await {
+                Ok(results) => {
                     let _ = protocol.complete();
-                    Ok(())
+                    Ok(
+                        crate::governed_result_writer::MysqlStatementWriteOutcome::Continue(
+                            results,
+                        ),
+                    )
                 }
                 Err(error) => {
                     let _ = protocol.client_disconnected();
@@ -79,6 +95,7 @@ pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
                     b"query cancelled before terminal OK",
                 )
                 .await
+                .map(|_| crate::governed_result_writer::MysqlStatementWriteOutcome::Terminated)
         }
         GovernedStatementVisibilitySealOutcome::Stale => {
             let _ = protocol.fail();
@@ -88,6 +105,7 @@ pub async fn write_governed_terminal_ok<W: AsyncWrite + Unpin>(
                     b"governed statement became stale before terminal OK",
                 )
                 .await
+                .map(|_| crate::governed_result_writer::MysqlStatementWriteOutcome::Terminated)
         }
     }
 }
