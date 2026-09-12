@@ -30,6 +30,7 @@ novarocks-query-application.workspace = true
 novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 novarocks-state-store-api.workspace = true
+novarocks-state-store-runtime.workspace = true
 novarocks-sql.workspace = true
 novarocks-state-store-sqlite.workspace = true
 novarocks-types.workspace = true

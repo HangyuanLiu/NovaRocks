@@ -4128,6 +4128,7 @@ dependencies = [
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
