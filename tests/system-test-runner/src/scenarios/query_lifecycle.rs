@@ -1,4 +1,5 @@
 use crate::actors::mysql as mysql_actor;
+use crate::actors::mysql_stream::MysqlStream;
 use crate::scenario::{Scenario, ScenarioContext};
 use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
@@ -7,8 +8,6 @@ use novarocks_cluster_harness::{
     QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot, ServerHandle,
 };
 use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::thread;
 use std::time::Duration;
 
@@ -92,7 +91,7 @@ impl Scenario for MysqlDisconnect {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let stream = send_raw_mysql_query(
+        let stream = MysqlStream::query(
             context.mysql_user(),
             context.mysql_port(),
             "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
@@ -102,9 +101,7 @@ impl Scenario for MysqlDisconnect {
         await_resource_activity(context, &baseline)?;
         context.action("observed in-flight distributed query resources");
 
-        stream
-            .shutdown(Shutdown::Both)
-            .context("close raw public MySQL client connection")?;
+        stream.shutdown()?;
         context.action("closed the raw public MySQL client connection");
 
         await_resource_convergence(context, &baseline)
@@ -123,24 +120,23 @@ impl Scenario for QueryTimeout {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let mut stream = connect_raw_mysql(
+        let mut stream = MysqlStream::connect(
             context.mysql_user(),
             context.mysql_port(),
             bounded_io_timeout(context, "open timeout MySQL client")?,
         )?;
         context.action("connected timeout client through public MySQL protocol");
-        send_query(&mut stream, "SET query_timeout = 1")?;
-        expect_ok_packet(&mut stream, "SET query_timeout")?;
+        stream.send_query("SET query_timeout = 1")?;
+        stream.expect_ok_packet("SET query_timeout")?;
         context.action("set query_timeout = 1 through the public MySQL protocol");
 
-        send_query(
-            &mut stream,
+        stream.send_query(
             "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
         )?;
         context.action("sent a blocking query expected to time out");
         await_resource_activity(context, &baseline)?;
         context.action("observed in-flight distributed query resources before timeout");
-        let error = read_timeout_query_error(&mut stream)?;
+        let error = stream.read_timeout_query_error()?;
         ensure!(
             error.contains("timed out") || error.contains("timeout"),
             "expected MySQL timeout error, got: {error}"
@@ -624,170 +620,4 @@ fn await_resource_convergence(
 
 fn bounded_io_timeout(context: &ScenarioContext, operation: &str) -> Result<Duration> {
     Ok(context.remaining(operation)?.min(IO_TIMEOUT_CAP))
-}
-
-fn connect_raw_mysql(user: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
-    const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
-    const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
-    const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
-    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
-    const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
-
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .with_context(|| format!("connect raw public MySQL client at {address}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .context("set raw MySQL read timeout")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .context("set raw MySQL write timeout")?;
-
-    let (_, handshake) = read_packet(&mut stream).context("read MySQL handshake")?;
-    ensure!(
-        handshake.first().copied() == Some(10),
-        "expected MySQL protocol v10 handshake, got payload={handshake:?}"
-    );
-
-    let client_flags = CLIENT_LONG_PASSWORD
-        | CLIENT_LONG_FLAG
-        | CLIENT_PROTOCOL_41
-        | CLIENT_TRANSACTIONS
-        | CLIENT_SECURE_CONNECTION
-        | CLIENT_PLUGIN_AUTH;
-    let mut response = Vec::with_capacity(user.len() + 64);
-    response.extend_from_slice(&client_flags.to_le_bytes());
-    response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
-    response.push(45);
-    response.extend_from_slice(&[0u8; 23]);
-    response.extend_from_slice(user.as_bytes());
-    response.push(0);
-    response.push(0);
-    response.extend_from_slice(b"mysql_native_password");
-    response.push(0);
-    write_packet(&mut stream, 1, &response).context("write MySQL handshake response")?;
-
-    let (_, auth_result) = read_packet(&mut stream).context("read MySQL authentication result")?;
-    if auth_result.first().copied() == Some(0xff) {
-        bail!(
-            "raw public MySQL authentication failed: {}",
-            mysql_error_text(&auth_result)?
-        );
-    }
-    ensure!(
-        auth_result.first().copied() == Some(0),
-        "unexpected raw MySQL authentication response: {auth_result:?}"
-    );
-    Ok(stream)
-}
-
-fn send_raw_mysql_query(user: &str, port: u16, sql: &str, timeout: Duration) -> Result<TcpStream> {
-    let mut stream = connect_raw_mysql(user, port, timeout)?;
-    send_query(&mut stream, sql)?;
-    Ok(stream)
-}
-
-fn send_query(stream: &mut TcpStream, sql: &str) -> Result<()> {
-    let mut payload = Vec::with_capacity(sql.len() + 1);
-    payload.push(0x03);
-    payload.extend_from_slice(sql.as_bytes());
-    write_packet(stream, 0, &payload).context("write MySQL COM_QUERY packet")
-}
-
-fn expect_ok_packet(stream: &mut TcpStream, operation: &str) -> Result<()> {
-    let (_, response) =
-        read_packet(stream).with_context(|| format!("read response for {operation}"))?;
-    if response.first().copied() == Some(0xff) {
-        bail!("{operation} failed: {}", mysql_error_text(&response)?);
-    }
-    ensure!(
-        response.first().copied() == Some(0),
-        "{operation} expected a MySQL OK packet, got payload={response:?}"
-    );
-    Ok(())
-}
-
-fn mysql_error_text(payload: &[u8]) -> Result<String> {
-    ensure!(
-        payload.first().copied() == Some(0xff),
-        "expected a MySQL error packet, got payload={payload:?}"
-    );
-    ensure!(
-        payload.len() >= 3,
-        "truncated MySQL error packet: {payload:?}"
-    );
-    let message_offset = if payload.get(3).copied() == Some(b'#') {
-        9
-    } else {
-        3
-    };
-    Ok(String::from_utf8_lossy(&payload[message_offset..]).into_owned())
-}
-
-/// Reads the terminal failure of the one-column timeout query.
-///
-/// The MySQL writer may make the schema visible before the deadline expires.
-/// That is a legitimate partial result-set prefix: the terminal packet must
-/// still be ERR, and no row or success EOF may follow the metadata. A timeout
-/// observed before schema start remains an ERR-first response.
-fn read_timeout_query_error(stream: &mut TcpStream) -> Result<String> {
-    let (_, first) = read_packet(stream).context("read timed query first response")?;
-    if first.first().copied() == Some(0xff) {
-        return mysql_error_text(&first);
-    }
-
-    ensure!(
-        first == [1],
-        "expected timed query to begin with one-column metadata or ERR, got payload={first:?}"
-    );
-    let (_, column) = read_packet(stream).context("read timed query column metadata")?;
-    ensure!(
-        !is_mysql_result_terminator(&column) && column.first().copied() != Some(0xff),
-        "expected timed query column definition, got payload={column:?}"
-    );
-    let (_, metadata_end) = read_packet(stream).context("read timed query metadata terminator")?;
-    ensure!(
-        is_mysql_result_terminator(&metadata_end),
-        "expected timed query metadata terminator, got payload={metadata_end:?}"
-    );
-    let (_, terminal) = read_packet(stream).context("read timed query terminal error")?;
-    mysql_error_text(&terminal)
-}
-
-fn is_mysql_result_terminator(payload: &[u8]) -> bool {
-    matches!(payload.first().copied(), Some(0xfe) if payload.len() < 9)
-        || payload.first().copied() == Some(0)
-}
-
-fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
-    let mut header = [0u8; 4];
-    stream
-        .read_exact(&mut header)
-        .context("read MySQL packet header")?;
-    let length =
-        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-    let mut payload = vec![0u8; length];
-    stream
-        .read_exact(&mut payload)
-        .context("read MySQL packet payload")?;
-    Ok((header[3], payload))
-}
-
-fn write_packet(stream: &mut TcpStream, sequence: u8, payload: &[u8]) -> Result<()> {
-    let length = u32::try_from(payload.len()).context("MySQL packet payload length fits u32")?;
-    ensure!(length <= 0x00ff_ffff, "MySQL packet payload is too large");
-    let header = [
-        (length & 0xff) as u8,
-        ((length >> 8) & 0xff) as u8,
-        ((length >> 16) & 0xff) as u8,
-        sequence,
-    ];
-    stream
-        .write_all(&header)
-        .context("write MySQL packet header")?;
-    stream
-        .write_all(payload)
-        .context("write MySQL packet payload")?;
-    stream.flush().context("flush MySQL packet")
 }
