@@ -79,33 +79,36 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         .fe
         .get("NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET")
         .cloned();
-    let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
-        binary: config.binary.clone(),
-        fe_binary: resolve_binary(
-            launch_config.binary_layout.frontend,
-            config.compatible_binary.as_ref(),
-            config.other_island_binary.as_ref(),
-        )?,
-        be_binaries: resolve_backend_binaries(
-            &launch_config.binary_layout.backends,
-            &config.binary,
-            config.compatible_binary.as_ref(),
-            config.other_island_binary.as_ref(),
-            config.cluster_size,
-        )?,
-        expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
-        base_config_path: config.base_config_path.clone(),
-        // Reports and the retained scenario evidence live at `scenario_root`.
-        // The harness may remove only this disposable child directory after a
-        // successful scenario, while a failure keeps it for log inspection.
-        runtime_root: scenario_root.join("runtime"),
-        cluster_size: config.cluster_size,
-        launch_profile: config.launch_profile,
-        startup_timeout: config.timeout,
-        child_environment: launch_config.child_environment,
-        config_overlay: launch_config.config_overlay,
-        native_trust_fixture: launch_config.native_trust_fixture,
-    })
+    let handle = CrossProcessServerHandle::launch_with_native_fault_proxies(
+        CrossProcessClusterOptions {
+            binary: config.binary.clone(),
+            fe_binary: resolve_binary(
+                launch_config.binary_layout.frontend,
+                config.compatible_binary.as_ref(),
+                config.other_island_binary.as_ref(),
+            )?,
+            be_binaries: resolve_backend_binaries(
+                &launch_config.binary_layout.backends,
+                &config.binary,
+                config.compatible_binary.as_ref(),
+                config.other_island_binary.as_ref(),
+                config.cluster_size,
+            )?,
+            expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
+            base_config_path: config.base_config_path.clone(),
+            // Reports and the retained scenario evidence live at `scenario_root`.
+            // The harness may remove only this disposable child directory after a
+            // successful scenario, while a failure keeps it for log inspection.
+            runtime_root: scenario_root.join("runtime"),
+            cluster_size: config.cluster_size,
+            launch_profile: config.launch_profile,
+            startup_timeout: config.timeout,
+            child_environment: launch_config.child_environment,
+            config_overlay: launch_config.config_overlay,
+            native_trust_fixture: launch_config.native_trust_fixture,
+        },
+        launch_config.native_fault_proxies,
+    )
     .with_context(|| format!("launch system scenario {}", scenario.name()));
     let handle = match handle {
         Ok(handle) => handle,

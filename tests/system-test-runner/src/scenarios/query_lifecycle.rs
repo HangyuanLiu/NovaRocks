@@ -5,9 +5,12 @@ use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
-    QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot, ServerHandle,
+    CrossProcessNativeFaultProxyConfig, QueryExecutionResourceSnapshot,
+    QueryLifecycleStructuredSnapshot, ServerHandle,
+    native_fault_proxy::{ProxyDirection, ProxyMode},
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -32,10 +35,173 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
         Box::new(NoEffectReadAfterBackendExit),
+        Box::new(LiveBackendPartition),
         Box::new(Nid2CreateConflict),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),
     ]
+}
+
+/// A live process that becomes unreachable is not a process exit.
+///
+/// The target is selected from the task protocol's own CreateTask marker, so
+/// the partition always applies to a backend the old attempt really uses.
+/// Pausing its advertised Native endpoint must revoke it for *future*
+/// admission without replacing its process identity. The old read is kept
+/// unread and must remain nonterminal until its path is restored; a new read
+/// then proves the revoked backend cannot contaminate a fresh attempt.
+struct LiveBackendPartition;
+
+impl Scenario for LiveBackendPartition {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/live-backend-partition"
+    }
+
+    fn launch_config(
+        &self,
+        _scenario_root: &std::path::Path,
+    ) -> Result<crate::scenario::ScenarioLaunchConfig> {
+        Ok(crate::scenario::ScenarioLaunchConfig {
+            native_fault_proxies: CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: (0..REQUIRED_BACKENDS)
+                    .map(|index| (index, 64 * 1024))
+                    .collect::<BTreeMap<_, _>>(),
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_snapshot(context)?;
+        let before_old_execution = latest_execution_id(context)?;
+        let create_counts = (0..context.handle().be_count())
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let old_read = start_partitioned_read(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("start the old live-partition read")?,
+        )?;
+        context.action(
+            "started an unread distributed read whose admitted backend will be partitioned",
+        );
+        await_resource_activity(context, &baseline)?;
+        let target = await_fresh_task_create(context, &create_counts)?;
+        let process_before = context.process_ids().backends[target];
+        let proxy = context
+            .handle()
+            .native_fault_proxy(target)
+            .with_context(|| format!("obtain Native fault proxy for admitted BE[{target}]"))?;
+        await_proxy_connection(context, &proxy, target)?;
+        context.action(format!(
+            "observed old attempt TaskCreate and a live Native connection on BE[{target}]"
+        ));
+
+        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Paused);
+        context.action(format!(
+            "paused both Native transport directions for admitted, still-running BE[{target}]"
+        ));
+        await_backend_revoked_for_future_admission(context, target, process_before)?;
+        context.action(format!(
+            "confirmed BE[{target}] retained process identity {process_before} while FE revoked it for future admission"
+        ));
+        match old_read.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(outcome) => bail!(
+                "old read became terminal while BE[{target}] remained partitioned: {outcome:?}"
+            ),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("old read actor disconnected while BE[{target}] remained partitioned")
+            }
+        }
+
+        let before_new_execution = latest_execution_id(context)?;
+        let mut independent = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            bounded_io_timeout(context, "connect independent post-partition read")?,
+        )?;
+        execute_baseline_query(&mut independent, "post-partition independent")?;
+        let independent_terminal =
+            await_terminal_snapshot(context, before_new_execution.as_deref())?;
+        let independent_participants = task_evidence::assert_query_completed_across_boundary(
+            context,
+            &independent_terminal,
+            "post-partition independent read",
+        )?;
+        ensure!(
+            !independent_participants.contains(&target),
+            "fresh read used revoked BE[{target}]: {independent_participants:?}"
+        );
+        context.action(format!(
+            "completed a new attempt on live participants {independent_participants:?}, excluding partitioned BE[{target}]"
+        ));
+
+        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
+        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
+        context.action(format!(
+            "restored both Native transport directions for BE[{target}]"
+        ));
+        let old_rows = old_read
+            .done
+            .recv_timeout(context.remaining("await restored old read")?)
+            .context("old read did not finish after Native transport restoration")??;
+        old_read
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("old live-partition read actor panicked"))??;
+        ensure!(
+            old_rows == vec![1, 1],
+            "restored old read returned unexpected rows: {old_rows:?}"
+        );
+        let old_terminal = await_terminal_snapshot(context, before_old_execution.as_deref())?;
+        ensure!(
+            old_terminal.attempt_id == 1,
+            "restored old read unexpectedly replaced its attempt: {}",
+            old_terminal.attempt_id
+        );
+        ensure!(
+            context.process_ids().backends[target] == process_before,
+            "BE[{target}] process identity changed during a live transport partition"
+        );
+        context.action(format!(
+            "restored old attempt completed without replacing BE[{target}] process identity"
+        ));
+        await_resource_convergence(context, &baseline)
+    }
+}
+
+struct PendingPartitionedRead {
+    thread: thread::JoinHandle<Result<()>>,
+    done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
+}
+
+fn start_partitioned_read(
+    user: &str,
+    port: u16,
+    connect_timeout: Duration,
+) -> Result<PendingPartitionedRead> {
+    let (done_tx, done) = mpsc::sync_channel(1);
+    let user = user.to_owned();
+    let thread = thread::Builder::new()
+        .name("live-backend-partition-read".to_string())
+        .spawn(move || -> Result<()> {
+            let mut connection =
+                mysql_actor::connect_for_cancellation(&user, port, connect_timeout)?;
+            let outcome = connection.query(NID2_FENCE_QUERY);
+            done_tx
+                .send(outcome)
+                .context("publish live-partition read result")
+        })
+        .context("start live-partition read actor")?;
+    Ok(PendingPartitionedRead { thread, done })
 }
 
 struct DistributedBaseline;
@@ -564,6 +730,57 @@ fn await_backend_exit(context: &mut ScenarioContext, target: usize) -> Result<()
             return Ok(());
         }
         let remaining = context.remaining(&format!("observe BE[{target}] process exit"))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_proxy_connection(
+    context: &ScenarioContext,
+    proxy: &novarocks_cluster_harness::native_fault_proxy::NativeFaultProxyControl,
+    target: usize,
+) -> Result<()> {
+    loop {
+        if proxy.active_connections() > 0 {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!(
+            "observe a live Native connection through BE[{target}] proxy"
+        ))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_backend_revoked_for_future_admission(
+    context: &mut ScenarioContext,
+    target: usize,
+    expected_pid: u32,
+) -> Result<()> {
+    let advertised_port = context.handle().native_be_endpoint(target)?.port();
+    loop {
+        let snapshot = resource_snapshot(context)?;
+        let backend = snapshot
+            .backends
+            .get(target)
+            .with_context(|| format!("resource snapshot omitted BE[{target}]"))?;
+        ensure!(
+            backend.process_running,
+            "BE[{target}] exited while its Native endpoint was partitioned"
+        );
+        ensure!(
+            context.process_ids().backends[target] == expected_pid,
+            "BE[{target}] process identity changed while awaiting transport revocation"
+        );
+        let still_eligible = context
+            .handle()
+            .frontend_backend_topology()?
+            .iter()
+            .any(|row| row.grpc_port == advertised_port && row.is_eligible_live());
+        if !still_eligible {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!(
+            "observe FE revoke partitioned BE[{target}] from future admission"
+        ))?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessServerHandle,
-    LaunchProfile, NativeTrustFixture, ServerHandle,
+    CrossProcessChildEnvironment, CrossProcessConfigOverlay, CrossProcessNativeFaultProxyConfig,
+    CrossProcessServerHandle, LaunchProfile, NativeTrustFixture, ServerHandle,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -78,6 +78,9 @@ pub struct ScenarioLaunchConfig {
     pub expected_eligible_backend_count: Option<usize>,
     pub child_environment: CrossProcessChildEnvironment,
     pub config_overlay: CrossProcessConfigOverlay,
+    /// Opt-in bounded Native TCP proxies keyed by BE index. Empty preserves
+    /// direct production endpoints for ordinary scenarios.
+    pub native_fault_proxies: CrossProcessNativeFaultProxyConfig,
     pub native_trust_fixture: NativeTrustFixture,
 }
 
