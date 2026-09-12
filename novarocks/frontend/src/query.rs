@@ -53,7 +53,7 @@ use novarocks_parser::{
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
-    ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
+    CommandContext, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
 };
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_string_query_result,
@@ -113,7 +113,7 @@ pub trait CoreCommandRoute: Send + Sync {
         &self,
         _statement: &ParsedStatement,
         _context: &RequestContext,
-        _query_options: QueryOptions,
+        _command_context: &CommandContext,
     ) -> Result<StatementResult, String> {
         Err("typed command route is unavailable".to_string())
     }
@@ -164,8 +164,12 @@ impl CoreCommandRoute for TypedCommandRoute {
         &self,
         statement: &ParsedStatement,
         context: &RequestContext,
-        query_options: QueryOptions,
+        command_context: &CommandContext,
     ) -> Result<StatementResult, String> {
+        command_context
+            .scope()
+            .check()
+            .map_err(|error| format!("typed command scope is no longer active: {error}"))?;
         match statement {
             ParsedStatement::ShowBackends(statement) => {
                 self.backend.execute(statement, context.execution().role())
@@ -186,15 +190,11 @@ impl CoreCommandRoute for TypedCommandRoute {
                 Ok(StatementResult::Ok)
             }
             ParsedStatement::Catalog(statement) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.catalog.execute_typed(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
@@ -204,28 +204,20 @@ impl CoreCommandRoute for TypedCommandRoute {
                 novarocks_parser::ast::IcebergTableAction::Reference(_)
             ) =>
             {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.iceberg_ref.execute(
                     statement,
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Iceberg(novarocks_parser::ast::IcebergStatement::AlterTable(
                 statement,
             )) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.catalog.execute_iceberg_typed(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Maintenance(
@@ -238,14 +230,10 @@ impl CoreCommandRoute for TypedCommandRoute {
             ParsedStatement::Maintenance(novarocks_parser::ast::MaintenanceStatement::Call(
                 statement,
             )) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 if let Some(result) = self.mv.try_execute_typed_call(
                     statement,
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )? {
                     return Ok(result);
                 }
@@ -254,57 +242,41 @@ impl CoreCommandRoute for TypedCommandRoute {
                     context.session().current_catalog(),
                     context.session().current_database(),
                     context.execution(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Maintenance(statement) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.maintenance.execute(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
                     context.execution(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::MaterializedView(statement) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.mv.execute(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                     context.execution(),
                 )
             }
             ParsedStatement::View(statement) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.view.execute(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Table(statement) => {
-                let connector_context = crate::connector::connector_request_context_for_query(
-                    Some(&query_options),
-                    context.execution().cancellation().clone(),
-                )?;
                 self.catalog.execute_table_typed(
                     statement,
                     context.session().current_catalog(),
                     context.session().current_database(),
-                    &connector_context,
+                    command_context.connector_context(),
                 )
             }
             ParsedStatement::Dml(_) => Err(
@@ -1220,6 +1192,16 @@ impl FrontendQuerySession {
                 _ => None,
             },
         );
+        let connector_context = match crate::connector::connector_request_context_for_query(
+            Some(&query_options),
+            cancellation.clone(),
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Ok(self.governed_typed_error(internal_error(error), statement));
+            }
+        };
+        let command_context = CommandContext::new(statement.scope().clone(), connector_context);
         let diagnostic_statement = statement.token();
         let execution_owner = statement
             .take_execution_owner()
@@ -1271,7 +1253,7 @@ impl FrontendQuerySession {
                         .map_err(RoutedExecutionError::User)
                         .and_then(|()| {
                             command_executor
-                                .execute_typed(&statement, &context, query_options)
+                                .execute_typed(&statement, &context, &command_context)
                                 .map_err(RoutedExecutionError::Engine)
                         })
                 } else if let ParsedStatement::Catalog(
@@ -1309,12 +1291,12 @@ impl FrontendQuerySession {
                                     .map_err(RoutedExecutionError::Engine)
                             }),
                         Err(_) => command_executor
-                            .execute_typed(&statement, &context, query_options)
+                            .execute_typed(&statement, &context, &command_context)
                             .map_err(RoutedExecutionError::Engine),
                     }
                 } else {
                     command_executor
-                        .execute_typed(&statement, &context, query_options)
+                        .execute_typed(&statement, &context, &command_context)
                         .map_err(RoutedExecutionError::Engine)
                 }
             };

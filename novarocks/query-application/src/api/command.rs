@@ -17,6 +17,7 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
+use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_workload_control::WorkScope;
 
 use super::ObjectPath;
@@ -29,18 +30,28 @@ pub type CommandFuture =
 /// A command consumer can attribute work to the statement and observe its
 /// cancellation state, but it never receives the statement's root owner. The
 /// SQL protocol retains that owner until it has a terminal protocol outcome.
+/// The connector context is frozen at the same admission boundary, so a
+/// consumer cannot rebuild provider requests with a default deadline or a
+/// detached cancellation source.
 pub struct CommandContext {
     scope: WorkScope,
+    connector_context: ConnectorRequestContext,
 }
 
 impl CommandContext {
-    #[allow(dead_code)]
-    pub(crate) const fn new(scope: WorkScope) -> Self {
-        Self { scope }
+    pub fn new(scope: WorkScope, connector_context: ConnectorRequestContext) -> Self {
+        Self {
+            scope,
+            connector_context,
+        }
     }
 
     pub fn scope(&self) -> &WorkScope {
         &self.scope
+    }
+
+    pub fn connector_context(&self) -> &ConnectorRequestContext {
+        &self.connector_context
     }
 }
 
@@ -351,11 +362,25 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
     use novarocks_workload_control::{
         ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
 
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn administrative_rows_require_one_value_per_column() {
@@ -381,9 +406,17 @@ mod tests {
             .unwrap();
 
         let expected_scope = root.owner.scope();
-        let context = CommandContext::new(expected_scope.clone());
+        let connector_context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            4_096,
+            4_096,
+        )
+        .unwrap();
+        let context = CommandContext::new(expected_scope.clone(), connector_context);
 
         assert_eq!(context.scope().id(), expected_scope.id());
         assert!(context.scope().check().is_ok());
+        assert!(!context.connector_context().cancellation().is_cancelled());
     }
 }
