@@ -23,6 +23,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use novarocks_state_store_api::{
     Direction, Key, KeyRange, Precondition, RangeRequest, StateRecord, StateStore, StateStoreError,
@@ -31,47 +32,35 @@ use novarocks_state_store_api::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::state_family::{ClonePolicy, PersistentKeyPrefix, StateFamily};
-use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
 use novarocks_state_store_runtime::{
-    DurableRecord, DurableRecordStore, EncodedRecord, RunFailure, StateStoreRunPolicy,
-    run_side_effect_free,
+    DurableRecord, DurableRecordStore, EncodedRecord, PersistentStateFamily, RunFailure,
+    StateStoreRunMetrics, StateStoreRunPolicy, run_side_effect_free,
 };
 
-/// This family's entry in the closed state family manifest.  Every declarative
-/// fact below is read from it, so the module holds no second copy of the family
-/// id, the record version, the prefix, or the retain/clone policy.
-const MANIFEST_ENTRY: StateFamily = StateFamily::GcOwnedRefObservation;
+/// Frozen StateStore identity owned by Table Maintenance.
+///
+/// The prefix deliberately retains its historic `frontend` namespace because
+/// deployed records already use these bytes; it does not imply Frontend owns
+/// the record model or its lifecycle.
+pub const GC_OWNED_REF_OBSERVATION_STATE_FAMILY: PersistentStateFamily = PersistentStateFamily::new(
+    "table-maintenance/gc-owned-ref-observation",
+    "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
+    7,
+);
 
-pub const GC_OWNED_REF_OBSERVATION_FAMILY: &str = MANIFEST_ENTRY.family_id();
-pub const GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION: u8 = match MANIFEST_ENTRY.record_version() {
-    Some(version) => version,
-    None => panic!("GC owned-ref observation is a durable accelerator family"),
-};
+pub const GC_OWNED_REF_OBSERVATION_FAMILY: &str = GC_OWNED_REF_OBSERVATION_STATE_FAMILY.owner_id();
+pub const GC_OWNED_REF_OBSERVATION_SCHEMA_VERSION: u8 =
+    GC_OWNED_REF_OBSERVATION_STATE_FAMILY.record_version();
 pub const GC_OWNED_REF_OBSERVATION_MAX_REF_NAME_BYTES: usize = 256;
 pub const GC_OWNED_REF_OBSERVATION_RECORD_ENCODED_LIMIT: usize = 4 * 1024;
 
-/// The prefix already ends in `/`, so the suffixes below are record paths alone.
-const GC_OWNED_REF_OBSERVATION_PREFIX: PersistentKeyPrefix =
-    match MANIFEST_ENTRY.persistent_prefix() {
-        Some(prefix) => prefix,
-        None => panic!("GC owned-ref observation is a durable accelerator family"),
-    };
-
-/// Thin accessor over this family's manifest entry.
-///
-/// It declares nothing of its own: the family id, record version, restart
-/// retention and clone policy all resolve to [`MANIFEST_ENTRY`].  What stays
-/// here is the *executable* clone wipe, which needs a live accelerator the
-/// manifest cannot hold — the manifest declares only that this family wipes on
-/// clone, not how to carry the wipe out.
+/// Product policy for this retained, clone-wiped safety accelerator.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GcOwnedRefObservationFamilyPolicy;
 
 impl GcOwnedRefObservationFamilyPolicy {
-    /// The manifest entry every fact below is read from.
-    pub const fn family(self) -> StateFamily {
-        MANIFEST_ENTRY
+    pub const fn family(self) -> PersistentStateFamily {
+        GC_OWNED_REF_OBSERVATION_STATE_FAMILY
     }
 
     pub const fn family_id(self) -> &'static str {
@@ -83,11 +72,11 @@ impl GcOwnedRefObservationFamilyPolicy {
     }
 
     pub const fn retain_on_restart(self) -> bool {
-        MANIFEST_ENTRY.retain_on_restart()
+        true
     }
 
     pub const fn wipe_on_clone(self) -> bool {
-        matches!(MANIFEST_ENTRY.clone_policy(), ClonePolicy::WipeAndRebuild)
+        true
     }
 
     pub async fn wipe_for_clone(
@@ -214,12 +203,39 @@ impl fmt::Display for GcOwnedRefObservationError {
 
 impl std::error::Error for GcOwnedRefObservationError {}
 
+/// Product-owned retry facts for GC safety-window persistence.
+#[derive(Debug, Default)]
+struct GcObservationMetrics {
+    retries: AtomicU64,
+    saturated_retries: AtomicU64,
+    deadlines: AtomicU64,
+    unresolved: AtomicU64,
+}
+
+impl StateStoreRunMetrics for GcObservationMetrics {
+    fn record_retry(&self) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_saturated_retry(&self) {
+        self.saturated_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_deadline(&self) {
+        self.deadlines.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_unresolved(&self) {
+        self.unresolved.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The sole durable owner for GC first-observation records.
 #[derive(Clone)]
 pub struct GcOwnedRefObservationAccelerator {
     store: Arc<dyn StateStore>,
     durable: DurableRecordStore,
-    metrics: Arc<StateStoreMetrics>,
+    metrics: Arc<GcObservationMetrics>,
     policy: StateStoreRunPolicy,
 }
 
@@ -228,7 +244,6 @@ impl fmt::Debug for GcOwnedRefObservationAccelerator {
         formatter
             .debug_struct("GcOwnedRefObservationAccelerator")
             .field("family", &GC_OWNED_REF_OBSERVATION_FAMILY)
-            .field("consumer", &self.metrics.consumer())
             .finish_non_exhaustive()
     }
 }
@@ -242,7 +257,7 @@ impl GcOwnedRefObservationAccelerator {
             // A business owner, not the storage provider. GC used to label its
             // counters with whatever provider happened to be underneath, which
             // said nothing about which workload was retrying.
-            metrics: Arc::new(StateStoreMetrics::new(StateStoreConsumer::GC_OBSERVATION)),
+            metrics: Arc::new(GcObservationMetrics::default()),
             durable: DurableRecordStore::new(Arc::clone(&store)),
             store,
             policy,
@@ -278,7 +293,7 @@ impl GcOwnedRefObservationAccelerator {
             self.store.as_ref(),
             self.metrics.as_ref(),
             self.policy,
-            "record frontend GC owned-ref observation",
+            "record table-maintenance GC owned-ref observation",
             move |transaction| {
                 let observation = observation.clone();
                 let durable = durable.clone();
@@ -292,7 +307,7 @@ impl GcOwnedRefObservationAccelerator {
         match result {
             Ok(success) => success.value,
             Err(failure) => Err(format_run_failure(
-                "record frontend GC owned-ref observation",
+                "record table-maintenance GC owned-ref observation",
                 failure,
             )),
         }
@@ -311,7 +326,7 @@ impl GcOwnedRefObservationAccelerator {
             self.store.as_ref(),
             self.metrics.as_ref(),
             self.policy,
-            "remove frontend GC owned-ref observation",
+            "remove table-maintenance GC owned-ref observation",
             move |transaction| {
                 let key = key.clone();
                 Box::pin(async move {
@@ -329,7 +344,7 @@ impl GcOwnedRefObservationAccelerator {
         match result {
             Ok(success) => success.value,
             Err(failure) => Err(format_run_failure(
-                "remove frontend GC owned-ref observation",
+                "remove table-maintenance GC owned-ref observation",
                 failure,
             )),
         }
@@ -340,9 +355,13 @@ impl GcOwnedRefObservationAccelerator {
     pub async fn wipe_family(&self) -> Result<u64, GcOwnedRefObservationError> {
         let mut deleted = 0_u64;
         loop {
-            let prefix = GC_OWNED_REF_OBSERVATION_PREFIX.key().map_err(|error| {
-                GcOwnedRefObservationError::store(format!("build GC wipe range failed: {error}"))
-            })?;
+            let prefix = GC_OWNED_REF_OBSERVATION_STATE_FAMILY
+                .key()
+                .map_err(|error| {
+                    GcOwnedRefObservationError::store(format!(
+                        "build GC wipe range failed: {error}"
+                    ))
+                })?;
             let range = KeyRange::for_prefix(prefix).map_err(|error| {
                 GcOwnedRefObservationError::store(format!("build GC wipe range failed: {error}"))
             })?;
@@ -351,7 +370,7 @@ impl GcOwnedRefObservationAccelerator {
                 self.store.as_ref(),
                 self.metrics.as_ref(),
                 self.policy,
-                "wipe frontend GC owned-ref observation family",
+                "wipe table-maintenance GC owned-ref observation family",
                 move |transaction| {
                     let range = range.clone();
                     Box::pin(async move {
@@ -378,7 +397,7 @@ impl GcOwnedRefObservationAccelerator {
                 Ok(success) => success.value?,
                 Err(failure) => {
                     return Err(format_run_failure(
-                        "wipe frontend GC owned-ref observation family",
+                        "wipe table-maintenance GC owned-ref observation family",
                         failure,
                     ));
                 }
@@ -563,7 +582,7 @@ fn observation_key(table_uuid: &Uuid, ref_name: &str) -> Result<Key, GcOwnedRefO
     GcOwnedRefObservation::validate_key(*table_uuid, ref_name).map_err(|error| {
         GcOwnedRefObservationError::corruption(format!("invalid GC owned-ref key: {error}"))
     })?;
-    GC_OWNED_REF_OBSERVATION_PREFIX
+    GC_OWNED_REF_OBSERVATION_STATE_FAMILY
         .key_with_suffix(&format!(
             "{}/{}",
             table_uuid,
@@ -622,7 +641,7 @@ mod tests {
     #[test]
     fn key_bytes_are_stable_under_the_registered_prefix() {
         assert_eq!(
-            GC_OWNED_REF_OBSERVATION_PREFIX
+            GC_OWNED_REF_OBSERVATION_STATE_FAMILY
                 .key()
                 .expect("family prefix")
                 .as_bytes(),
@@ -643,16 +662,16 @@ mod tests {
         );
     }
 
-    /// The record version is the manifest's, not a second literal, and it must
-    /// still be the `7` already written to deployed stores.
+    /// The record version comes from the product descriptor and must remain
+    /// the `7` already written to deployed stores.
     #[test]
     fn record_version_and_clone_policy_come_from_the_manifest() {
         let policy = GcOwnedRefObservationFamilyPolicy;
-        assert_eq!(policy.family(), StateFamily::GcOwnedRefObservation);
+        assert_eq!(policy.family(), GC_OWNED_REF_OBSERVATION_STATE_FAMILY);
         assert_eq!(policy.schema_version(), 7);
         assert_eq!(
             policy.family_id(),
-            "frontend/table-maintenance/gc-owned-ref-observation"
+            "table-maintenance/gc-owned-ref-observation"
         );
         assert!(policy.retain_on_restart());
         assert!(policy.wipe_on_clone());

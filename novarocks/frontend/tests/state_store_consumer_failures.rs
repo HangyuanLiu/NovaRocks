@@ -55,10 +55,6 @@ use novarocks_frontend::mv::domain::repository::{
     MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
-use novarocks_frontend::table_maintenance::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
-    GcOwnedRefObservationErrorKind,
-};
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
@@ -73,6 +69,10 @@ use novarocks_state_store_api::{
 };
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
+use novarocks_table_maintenance::gc_observation::{
+    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
+    GcOwnedRefObservationErrorKind,
+};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------

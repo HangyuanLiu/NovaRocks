@@ -42,9 +42,6 @@
 
 use bytes::Bytes;
 use novarocks_frontend::state_family::{DurabilityAdmission, StateFamily};
-use novarocks_frontend::table_maintenance::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
-};
 use novarocks_frontend::{
     application::{FrontendApplicationHost, FrontendExecutionConfig},
     state_store::StateStoreHostInput,
@@ -56,6 +53,9 @@ use novarocks_native_trust::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_state_store_api::{Direction, Key, KeyRange, RangeRequest, StateStore};
+use novarocks_table_maintenance::gc_observation::{
+    GC_OWNED_REF_OBSERVATION_STATE_FAMILY, GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -116,6 +116,9 @@ fn assert_keys_conform(keys: &[Vec<u8>], workload: &str) {
     let mut unattributed = Vec::new();
     let mut forbidden = Vec::new();
     for key in keys {
+        if key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes()) {
+            continue;
+        }
         match StateFamily::for_key(key) {
             None => unattributed.push(String::from_utf8_lossy(key).into_owned()),
             Some(family) => {
@@ -131,7 +134,7 @@ fn assert_keys_conform(keys: &[Vec<u8>], workload: &str) {
     assert!(
         unattributed.is_empty(),
         "after {workload}, these keys belong to no registered state family; \
-         a durable family was added without a manifest entry: {unattributed:?}"
+         a durable family was added without a composed owner descriptor: {unattributed:?}"
     );
     assert!(
         forbidden.is_empty(),
@@ -322,10 +325,10 @@ async fn durable_records_written_by_real_owners_all_attribute_to_the_manifest() 
     assert_keys_conform(&keys, "recording a GC owned-ref observation");
     assert_eq!(
         keys.iter()
-            .filter(|key| StateFamily::for_key(key) == Some(StateFamily::GcOwnedRefObservation))
+            .filter(|key| key.starts_with(GC_OWNED_REF_OBSERVATION_STATE_FAMILY.prefix().as_bytes()))
             .count(),
         keys.len(),
-        "a GC observation write touched a family other than its own"
+        "a GC observation write touched a family other than its product descriptor"
     );
 
     // Per-family wipe isolation: wiping this family clears exactly its own

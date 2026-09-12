@@ -8,7 +8,12 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+hex.workspace = true
 novarocks-query-application.workspace = true
+novarocks-state-store-api.workspace = true
+novarocks-state-store-runtime.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 uuid = { workspace = true, features = ["v7"] }
 

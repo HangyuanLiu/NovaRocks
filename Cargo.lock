@@ -4360,7 +4360,12 @@ dependencies = [
 name = "novarocks-table-maintenance"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "novarocks-query-application",
+ "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

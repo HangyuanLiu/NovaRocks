@@ -38,9 +38,6 @@ pub(crate) use self::admission::{
     ParsedMaintenanceAction, ParsedMaintenanceStatement, ParsedShowOptimize,
     is_typed_spark_maintenance_call, lower_typed_maintenance_statement, lower_typed_show_optimize,
 };
-use self::gc_observation::{
-    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
-};
 use self::result::{action_result, optimize_jobs_result};
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
@@ -49,6 +46,9 @@ use crate::query_execution::maintenance::{
     TableMaintenanceService,
 };
 use novarocks_table_maintenance::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
+use novarocks_table_maintenance::gc_observation::{
+    GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
+};
 use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };
@@ -58,7 +58,6 @@ use novarocks_table_maintenance::{
 };
 
 pub mod admission;
-pub mod gc_observation;
 pub mod result;
 pub mod worker;
 

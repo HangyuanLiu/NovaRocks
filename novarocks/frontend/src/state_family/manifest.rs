@@ -30,13 +30,9 @@ use novarocks_state_store_runtime::PersistentStateFamily;
 // derivable.  `prefix_literals_are_byte_stable` is the tripwire against an
 // edit that silently orphans existing records.
 //
-// The prefixes are deliberately not uniform. GC observation ends in `/`
-// because its owner appends a record path directly; MV has none because its
-// owner joins with `/` itself. Normalizing them would rewrite live keys, so
-// this manifest preserves each as frozen.
+// The MV prefix carries no trailing separator because its owner joins with
+// `/` itself. It is frozen because normalizing it would rewrite live keys.
 const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
-const GC_OWNED_REF_OBSERVATION_PREFIX: &str =
-    "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
 
 /// Every frontend state family, registered exactly once.
 ///
@@ -50,9 +46,6 @@ pub enum StateFamily {
     /// MV definitions, target and dependency indexes, and the aggregate
     /// published waterline.
     MvAccelerator,
-    /// The time at which one exact provider-proven owned-ref tuple was first
-    /// observed by GC.
-    GcOwnedRefObservation,
     /// Resolved connector table metadata, validated against the connector's
     /// current schema version.
     SchemaCache,
@@ -77,7 +70,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 9;
 
     /// Every registered family, in manifest order.
     ///
@@ -106,23 +99,6 @@ impl StateFamily {
                     RebuildDeterminism::UserVisibleIdentical,
                     true,
                     ClonePolicy::RevalidateSourceRevisionOrWipe,
-                ))
-            }
-            Self::GcOwnedRefObservation => {
-                StateFamilyClassification::Accelerator(AcceleratorContract::new(
-                    AcceleratorResidence::Durable {
-                        prefix: PersistentKeyPrefix::new(GC_OWNED_REF_OBSERVATION_PREFIX),
-                        record_version: 7,
-                    },
-                    AcceleratorRebuildAuthority::ProvenOwnedRefWithSafetyAgeWindow,
-                    // A rebuilt observation carries today's timestamp, not the
-                    // discarded one, so the safety window restarts.  That
-                    // defers deletion; it never authorizes an early one.
-                    RebuildDeterminism::ConservativeRestart,
-                    true,
-                    // A clone must not inherit a matured safety window it did
-                    // not observe.
-                    ClonePolicy::WipeAndRebuild,
                 ))
             }
             Self::SchemaCache => StateFamilyClassification::Accelerator(AcceleratorContract::new(
@@ -175,7 +151,6 @@ impl StateFamily {
     pub const fn family_id(self) -> &'static str {
         match self {
             Self::MvAccelerator => "frontend/mv/accelerator",
-            Self::GcOwnedRefObservation => "frontend/table-maintenance/gc-owned-ref-observation",
             Self::SchemaCache => "frontend/catalog/schema-cache",
             Self::StatisticsArtifactCache => "frontend/statistics/immutable-artifact-cache",
             Self::LocalViewRegistry => "frontend/view/local-registry",
@@ -264,8 +239,7 @@ impl StateFamily {
     /// and rejects a length that disagrees with [`StateFamily::COUNT`].
     const fn next_in_manifest(self) -> Option<Self> {
         match self {
-            Self::MvAccelerator => Some(Self::GcOwnedRefObservation),
-            Self::GcOwnedRefObservation => Some(Self::SchemaCache),
+            Self::MvAccelerator => Some(Self::SchemaCache),
             Self::SchemaCache => Some(Self::StatisticsArtifactCache),
             Self::StatisticsArtifactCache => Some(Self::LocalViewRegistry),
             Self::LocalViewRegistry => Some(Self::DmlRuntime),
@@ -308,7 +282,7 @@ mod tests {
     use super::*;
     use crate::state_family::WipeEntry;
 
-    /// Ten families: four `Accelerator` (two of them in-process) and six
+    /// Nine families: three `Accelerator` (two of them in-process) and six
     /// `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
@@ -336,8 +310,8 @@ mod tests {
         }
 
         assert_eq!(
-            accelerator, 4,
-            "MV, GC observation, schema cache, statistics artifact cache"
+            accelerator, 3,
+            "MV, schema cache, statistics artifact cache"
         );
         assert_eq!(
             process_runtime, 6,
@@ -378,13 +352,13 @@ mod tests {
                     .map(|prefix| (family, prefix.as_str()))
             })
             .collect();
-        assert_eq!(prefixes.len(), 2, "two Frontend families are durable today");
+        assert_eq!(prefixes.len(), 1, "one Frontend family is durable today");
 
         let distinct: BTreeSet<&str> = prefixes.iter().map(|(_, prefix)| *prefix).collect();
         assert_eq!(
             distinct.len(),
             prefixes.len(),
-            "two families must never share a prefix"
+            "Frontend durable families must never share a prefix"
         );
 
         for (left_family, left) in &prefixes {
@@ -408,16 +382,10 @@ mod tests {
     /// prefix has to be made twice, deliberately.
     #[test]
     fn prefix_literals_are_byte_stable() {
-        let expected: [(StateFamily, &[u8]); 2] = [
-            (
-                StateFamily::MvAccelerator,
-                b"novarocks/frontend/mv/accelerator/v1",
-            ),
-            (
-                StateFamily::GcOwnedRefObservation,
-                b"novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
-            ),
-        ];
+        let expected: [(StateFamily, &[u8]); 1] = [(
+            StateFamily::MvAccelerator,
+            b"novarocks/frontend/mv/accelerator/v1",
+        )];
 
         for (family, bytes) in expected {
             let prefix = family
@@ -543,17 +511,14 @@ mod tests {
                 }
             }
 
-            // Every accelerator states what a rebuild reproduces, so a wipe's
-            // cost is a recorded fact and not a guess made during an incident.
-            // GC observation is the one family whose rebuild is deliberately
-            // not identical: it restarts a safety window instead.
-            let expected_determinism = match family {
-                StateFamily::GcOwnedRefObservation => RebuildDeterminism::ConservativeRestart,
-                _ => RebuildDeterminism::UserVisibleIdentical,
-            };
-            assert_eq!(determinism, expected_determinism, "{}", family.family_id());
+            assert_eq!(
+                determinism,
+                RebuildDeterminism::UserVisibleIdentical,
+                "{}",
+                family.family_id()
+            );
         }
-        assert_eq!(accelerators, 4);
+        assert_eq!(accelerators, 3);
     }
 
     #[test]
@@ -605,21 +570,6 @@ mod tests {
                 .expect("mv sequence key")
                 .as_bytes(),
             b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
-        );
-
-        // gc observation: prefix ends in `/`, suffix is `<table uuid>/<hex ref>`.
-        assert_eq!(
-            StateFamily::GcOwnedRefObservation
-                .persistent_prefix()
-                .expect("durable family")
-                .key_with_suffix("019205ff-0000-7000-8000-000000000001/6d61696e")
-                .expect("gc observation key")
-                .as_bytes(),
-            concat!(
-                "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
-                "019205ff-0000-7000-8000-000000000001/6d61696e"
-            )
-            .as_bytes()
         );
     }
 
