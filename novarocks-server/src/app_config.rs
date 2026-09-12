@@ -31,6 +31,7 @@ use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
+    connector_blocking_io::ConnectorBlockingIoBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_query_application::coordination::{
@@ -1705,7 +1706,7 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> {
-    let budget = novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+    let budget = ConnectorBlockingIoBudget::try_new(
         runtime.connector_blocking_io_max_inflight,
         runtime.connector_split_blocking_io_max_inflight,
     )

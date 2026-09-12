@@ -630,7 +630,7 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
-    use crate::task_execution::blocking_io::ConnectorBlockingIoBudget;
+    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };

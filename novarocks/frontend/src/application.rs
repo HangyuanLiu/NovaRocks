@@ -23,7 +23,9 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::{MaxWait, ResultByteLimit};
-use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_native_adapter::{
+    FrontendTaskTransportBudget, connector_blocking_io::ConnectorBlockingIoBudget,
+};
 use novarocks_query_application::api::{QueryExecutionClient, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
@@ -40,7 +42,6 @@ use novarocks_workload_control::{
 };
 
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
-use crate::task_execution::ConnectorBlockingIoBudget;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;

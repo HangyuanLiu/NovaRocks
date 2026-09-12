@@ -52,7 +52,7 @@ use novarocks_types::identity::{
 };
 use novarocks_types::{AttemptId, NativeCompatibilityId, QueryId};
 
-use super::blocking_io::{ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor};
+use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::clock::{ManualClock, TaskProtocolClock};
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
@@ -77,6 +77,7 @@ use crate::query_execution::FragmentInstancePlacement;
 use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 
 const LEAF_FRAGMENT: FragmentId = 1;
 const MIDDLE_FRAGMENT: FragmentId = 2;

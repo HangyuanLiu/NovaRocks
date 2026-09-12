@@ -61,7 +61,6 @@ pub mod status_intake;
 #[cfg(test)]
 mod tests;
 
-pub use blocking_io::ConnectorBlockingIoBudget;
 pub use clock::{ManualClock, ProcessMonotonicClock, TaskProtocolClock};
 pub use completion::{
     ReadCompletionTracker, ReadVerdict, WriteCompletionTracker, WriteVerdict, accept_final_info,

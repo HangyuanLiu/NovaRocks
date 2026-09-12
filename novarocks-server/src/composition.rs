@@ -53,6 +53,7 @@ use novarocks_fs::{
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
     LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
@@ -585,7 +586,7 @@ pub fn compose_frontend_role_config(
         task_execution_budgets.transport,
     )
     .with_connector_blocking_io_budget(
-        novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+        ConnectorBlockingIoBudget::try_new(
             runtime_config.connector_blocking_io_max_inflight,
             runtime_config.connector_split_blocking_io_max_inflight,
         )
