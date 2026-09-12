@@ -33,6 +33,7 @@ mod ingress;
 mod lease;
 mod lifecycle;
 mod operation;
+mod reliable_transport;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -58,6 +59,11 @@ pub use lifecycle::{
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
 pub use operation::OperationWaitCaps;
+pub use reliable_transport::{
+    ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportFailureOutcome,
+    ReliableTransportPolicy, ReliableTransportResourceLimit, ReliableTransportSendOutcome,
+    ReliableTransportState, ReliableTransportStateError, ReliableTransportTick,
+};
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

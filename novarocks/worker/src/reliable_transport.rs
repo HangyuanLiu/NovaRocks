@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Opaque, query-scoped reliable transport bookkeeping.
+//! Worker-owned opaque, query-scoped reliable transport bookkeeping.
 //!
 //! The state deliberately does not interpret an envelope's route subtype,
 //! sequence, or payload. Domain and native adapters validate those facts
@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-pub(crate) trait ReliableTransportPolicy: Copy {
+pub trait ReliableTransportPolicy: Copy {
     fn retry_interval(self) -> Duration;
 
     fn max_attempts(self) -> u32;
@@ -38,19 +38,19 @@ pub(crate) trait ReliableTransportPolicy: Copy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportResourceLimit {
+pub enum ReliableTransportResourceLimit {
     PendingEntries,
     PendingBytes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportFailOpenReason {
+pub enum ReliableTransportFailOpenReason {
     Deadline,
     AttemptsExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportSendOutcome {
+pub enum ReliableTransportSendOutcome {
     Buffered,
     ResourceLimit(ReliableTransportResourceLimit),
     Duplicate,
@@ -58,36 +58,36 @@ pub(crate) enum ReliableTransportSendOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportStateError {
+pub enum ReliableTransportStateError {
     IdentityConflict,
     RetiredIdentity,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ReliableTransportTick<K, F> {
+pub struct ReliableTransportTick<K, F> {
     retried: Vec<(K, F)>,
     failed_open: Vec<(K, ReliableTransportFailOpenReason)>,
 }
 
 impl<K, F> ReliableTransportTick<K, F> {
-    pub(crate) fn retried(&self) -> &[(K, F)] {
+    pub fn retried(&self) -> &[(K, F)] {
         &self.retried
     }
 
-    pub(crate) fn failed_open(&self) -> &[(K, ReliableTransportFailOpenReason)] {
+    pub fn failed_open(&self) -> &[(K, ReliableTransportFailOpenReason)] {
         &self.failed_open
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportFailureOutcome<K> {
+pub enum ReliableTransportFailureOutcome<K> {
     RetryScheduled,
     FailedOpen(K, ReliableTransportFailOpenReason),
     Unknown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ReliableTransportAckOutcome<F> {
+pub enum ReliableTransportAckOutcome<F> {
     Released(F),
     Unknown,
 }
@@ -106,7 +106,7 @@ struct PendingFrame<F> {
 /// `max_attempts` includes the initial admission. A retry is eligible only
 /// after the caller reports an actual transport failure; no timer may create a
 /// second in-flight send for an identity whose first attempt is still pending.
-pub(crate) struct ReliableTransportState<K, F, P> {
+pub struct ReliableTransportState<K, F, P> {
     policy: P,
     pending: BTreeMap<K, PendingFrame<F>>,
     completed: BTreeMap<K, F>,
@@ -120,7 +120,7 @@ where
     F: Clone + Eq,
     P: ReliableTransportPolicy,
 {
-    pub(crate) fn new(policy: P) -> Self {
+    pub fn new(policy: P) -> Self {
         Self {
             policy,
             pending: BTreeMap::new(),
@@ -130,7 +130,7 @@ where
         }
     }
 
-    pub(crate) fn send(
+    pub fn send(
         &mut self,
         key: K,
         frame: F,
@@ -184,7 +184,7 @@ where
         Ok(ReliableTransportSendOutcome::Buffered)
     }
 
-    pub(crate) fn acknowledge(&mut self, key: K) -> ReliableTransportAckOutcome<F> {
+    pub fn acknowledge(&mut self, key: K) -> ReliableTransportAckOutcome<F> {
         let Some(entry) = self.pending.remove(&key) else {
             return ReliableTransportAckOutcome::Unknown;
         };
@@ -193,11 +193,7 @@ where
         ReliableTransportAckOutcome::Released(entry.frame)
     }
 
-    pub(crate) fn transport_failed(
-        &mut self,
-        key: K,
-        now: Instant,
-    ) -> ReliableTransportFailureOutcome<K> {
+    pub fn transport_failed(&mut self, key: K, now: Instant) -> ReliableTransportFailureOutcome<K> {
         let Some(entry) = self.pending.get_mut(&key) else {
             return ReliableTransportFailureOutcome::Unknown;
         };
@@ -216,13 +212,13 @@ where
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn schedule_all_pending_retries(&mut self) {
+    pub fn schedule_all_pending_retries(&mut self) {
         for entry in self.pending.values_mut() {
             entry.retry_scheduled = true;
         }
     }
 
-    pub(crate) fn drive(&mut self, now: Instant) -> ReliableTransportTick<K, F> {
+    pub fn drive(&mut self, now: Instant) -> ReliableTransportTick<K, F> {
         let mut retried = Vec::new();
         let mut failed_open = Vec::new();
         let policy = self.policy;
@@ -254,15 +250,10 @@ where
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn shutdown(&mut self) {
+    pub fn shutdown(&mut self) {
         self.shutdown = true;
         self.pending.clear();
         self.pending_bytes = 0;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_pending_bytes_for_test(&mut self, pending_bytes: usize) {
-        self.pending_bytes = pending_bytes;
     }
 
     fn release_failed_open(

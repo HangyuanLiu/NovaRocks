@@ -33,15 +33,15 @@ use prost::Message;
 use novarocks_proto_models::filter::RuntimeFilterEnvelopeResponse;
 
 use crate::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
-use crate::runtime_filter::reliable_transport::{
-    ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
-    ReliableTransportSendOutcome, ReliableTransportState,
-};
 use crate::runtime_filter::rpc::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
 use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
+use novarocks_worker::{
+    ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
+    ReliableTransportSendOutcome, ReliableTransportState,
+};
 
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;

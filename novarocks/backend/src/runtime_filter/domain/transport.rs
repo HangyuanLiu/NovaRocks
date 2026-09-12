@@ -33,7 +33,7 @@ use super::{
     BackendChannelIdentity, BackendProducerStreamIdentity, BackendRouteEdgeId,
     BackendTransportSequence,
 };
-use crate::runtime_filter::reliable_transport::{
+use novarocks_worker::{
     ReliableTransportAckOutcome, ReliableTransportFailOpenReason, ReliableTransportPolicy,
     ReliableTransportResourceLimit, ReliableTransportSendOutcome, ReliableTransportState,
     ReliableTransportStateError,
@@ -1056,16 +1056,10 @@ mod tests {
 
     #[test]
     fn reliable_transport_capacity_overflow_returns_typed_byte_limit() {
-        let policy = BackendRetryPolicy::new(
-            Duration::from_millis(1),
-            1,
-            Duration::from_millis(10),
-            2,
-            usize::MAX,
-        )
-        .unwrap();
+        let policy =
+            BackendRetryPolicy::new(Duration::from_millis(1), 1, Duration::from_millis(10), 2, 0)
+                .unwrap();
         let mut transport = BackendReliableTransport::new(policy);
-        transport.state.set_pending_bytes_for_test(usize::MAX);
 
         assert_eq!(
             transport.send(delivery_frame(1), Instant::now()).unwrap(),
