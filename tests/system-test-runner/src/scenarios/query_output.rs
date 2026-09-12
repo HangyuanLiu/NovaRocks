@@ -69,6 +69,11 @@ impl Scenario for SchemaOnce {
         ];
         assert_packet_sequence(&packets)?;
         ensure!(
+            packets[0].sequence() == 1,
+            "MySQL COM_QUERY response must begin at packet sequence 1, got {}",
+            packets[0].sequence()
+        );
+        ensure!(
             packets[0].payload() == [1],
             "expected exactly one result column, got payload={:?}",
             packets[0].payload()
