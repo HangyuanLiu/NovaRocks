@@ -27,54 +27,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::background::{MvBackgroundEngineErrorKind, MvMaintenanceFacts};
-pub(crate) use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+pub use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 pub(crate) use novarocks_mv_application::maintenance::{
     AutomaticMaintenanceAction, AutomaticMaintenanceRunner, MaintenanceActionKind,
-    MaintenanceAdmission, MaintenanceAttempt, MaintenanceEvaluation, MaintenanceExecutionReport,
-    MaintenanceSkipReason,
+    MaintenanceAdmission, MaintenanceAttempt, MaintenanceExecutionReport, MaintenanceSkipReason,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
-const DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS: i64 = 432_000_000;
-const DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP: u32 = 1;
-const DEFAULT_TARGET_FILE_SIZE_BYTES: i64 = 536_870_912;
-const MIN_POSITION_DELETE_INPUT_FILES: usize = 2;
-const SMALL_FILE_RATIO_NUMERATOR: i64 = 3;
-const SMALL_FILE_RATIO_DENOMINATOR: i64 = 4;
-const FAILURE_BACKOFF_BASE_MS: i64 = 60_000;
-const FAILURE_BACKOFF_MAX_MS: i64 = 1_800_000;
-
-#[derive(Clone, Debug, Default)]
-struct TableRuntimeState {
-    last_seen_snapshot_id: Option<i64>,
-    last_action_ms: BTreeMap<MaintenanceActionKind, i64>,
-    consecutive_failures: BTreeMap<MaintenanceActionKind, u32>,
-    next_attempt_after_ms: BTreeMap<MaintenanceActionKind, i64>,
-    circuit_broken: BTreeSet<MaintenanceActionKind>,
-}
-
 /// Process-local maintenance policy state.  It is intentionally non-durable:
 /// recovery re-evaluates current provider facts and durable action state.
 pub(crate) struct MaintenanceCoordinator {
-    config: MaintenanceCoordinatorConfig,
-    runtime: BTreeMap<i64, TableRuntimeState>,
+    policy: novarocks_mv_application::maintenance::MaintenancePolicyState,
     active: BTreeSet<i64>,
 }
 
 impl MaintenanceCoordinator {
     pub(crate) fn new(config: MaintenanceCoordinatorConfig) -> Self {
         Self {
-            config: MaintenanceCoordinatorConfig {
-                tick_interval_ms: config.tick_interval_ms.max(1),
-                max_concurrent: config.max_concurrent.max(1),
-                compaction_min_data_files: config.compaction_min_data_files.max(1),
-                dv_min_delete_files: config.dv_min_delete_files.max(1),
-                max_consecutive_failures: config.max_consecutive_failures.max(1),
-                ..config
-            },
-            runtime: BTreeMap::new(),
+            policy: novarocks_mv_application::maintenance::MaintenancePolicyState::new(config),
             active: BTreeSet::new(),
         }
     }
@@ -84,7 +56,7 @@ impl MaintenanceCoordinator {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn config(&self) -> &MaintenanceCoordinatorConfig {
-        &self.config
+        self.policy.config()
     }
 
     /// Admit work only after the caller has acquired the MV activity gate.
@@ -98,16 +70,16 @@ impl MaintenanceCoordinator {
         facts: &MvMaintenanceFacts,
         now_ms: i64,
     ) -> Result<MaintenanceAttempt, MaintenanceAdmission> {
-        if !self.config.enabled {
+        if !self.policy.config().enabled {
             return Err(MaintenanceAdmission::Disabled);
         }
         if self.active.contains(&mv_id) {
             return Err(MaintenanceAdmission::AlreadyActive);
         }
-        if self.active.len() >= self.config.max_concurrent {
+        if self.active.len() >= self.policy.config().max_concurrent {
             return Err(MaintenanceAdmission::AtCapacity);
         }
-        let evaluation = self.evaluate(mv_id, facts, now_ms);
+        let evaluation = self.policy.evaluate(mv_id, facts, now_ms);
         self.active.insert(mv_id);
         Ok(MaintenanceAttempt {
             mv_id,
@@ -195,17 +167,8 @@ impl MaintenanceCoordinator {
         report: &MaintenanceExecutionReport,
         now_ms: i64,
     ) {
-        for kind in &report.completed {
-            self.record_success(attempt.mv_id, *kind, now_ms);
-        }
-        for kind in &report.already_active {
-            self.record_success(attempt.mv_id, *kind, now_ms);
-        }
-        for (kind, error) in &report.failures {
-            self.record_failure(attempt.mv_id, *kind, *error, now_ms);
-        }
+        self.policy.finish(&attempt, report, now_ms);
         self.active.remove(&attempt.mv_id);
-        self.runtime_entry(attempt.mv_id).last_seen_snapshot_id = attempt.observed_snapshot_id;
     }
 
     #[cfg(test)]
@@ -234,266 +197,6 @@ impl MaintenanceCoordinator {
     fn active_count(&self) -> usize {
         self.active.len()
     }
-
-    fn runtime_entry(&mut self, mv_id: i64) -> &mut TableRuntimeState {
-        self.runtime.entry(mv_id).or_default()
-    }
-
-    fn record_success(&mut self, mv_id: i64, kind: MaintenanceActionKind, now_ms: i64) {
-        let state = self.runtime_entry(mv_id);
-        state.last_action_ms.insert(kind, now_ms);
-        state.consecutive_failures.remove(&kind);
-        state.next_attempt_after_ms.remove(&kind);
-        state.circuit_broken.remove(&kind);
-    }
-
-    fn record_failure(
-        &mut self,
-        mv_id: i64,
-        kind: MaintenanceActionKind,
-        error: MvBackgroundEngineErrorKind,
-        now_ms: i64,
-    ) {
-        let max_consecutive_failures = self.config.max_consecutive_failures;
-        let state = self.runtime_entry(mv_id);
-        match error {
-            MvBackgroundEngineErrorKind::TransientUnavailable => {
-                let attempts = state.consecutive_failures.entry(kind).or_insert(0);
-                *attempts = attempts.saturating_add(1);
-                if *attempts >= max_consecutive_failures {
-                    state.circuit_broken.insert(kind);
-                    state.next_attempt_after_ms.remove(&kind);
-                } else {
-                    state
-                        .next_attempt_after_ms
-                        .insert(kind, now_ms.saturating_add(failure_backoff_ms(*attempts)));
-                }
-            }
-            // A stopped frontend must neither fabricate a retry nor mark a
-            // possibly external-unknown attempt as successful.
-            MvBackgroundEngineErrorKind::ShutdownCancelled => {}
-            // Target loss/recovery is re-discovered by the next inventory
-            // scan; definition/corruption/invariant errors must not spin.
-            MvBackgroundEngineErrorKind::TargetGone
-            | MvBackgroundEngineErrorKind::TerminalFailure
-            | MvBackgroundEngineErrorKind::InvalidDefinition
-            | MvBackgroundEngineErrorKind::Corruption
-            | MvBackgroundEngineErrorKind::InvariantViolation => {
-                state.circuit_broken.insert(kind);
-            }
-        }
-    }
-
-    fn evaluate(
-        &mut self,
-        mv_id: i64,
-        facts: &MvMaintenanceFacts,
-        now_ms: i64,
-    ) -> MaintenanceEvaluation {
-        let policy = TablePolicy::resolve(&self.config, facts);
-        let state = self.runtime_entry(mv_id).clone();
-        evaluate_facts(facts, &policy, &state, &self.config, now_ms)
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TablePolicy {
-    enabled: bool,
-    expire_max_age_ms: i64,
-    expire_min_keep: u32,
-    target_file_size_bytes: i64,
-    compaction_min_data_files: i64,
-    dv_min_delete_files: i64,
-}
-
-impl TablePolicy {
-    /// Apply frontend-owned defaults and clamps on top of the typed policy
-    /// facts. An absent fact means the table declared nothing usable, so the
-    /// default applies; a declared fact is still clamped to a workable range.
-    fn resolve(config: &MaintenanceCoordinatorConfig, facts: &MvMaintenanceFacts) -> Self {
-        Self {
-            enabled: facts.maintenance_enabled.unwrap_or(true),
-            expire_max_age_ms: facts
-                .expire_max_snapshot_age_ms
-                .unwrap_or(DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS)
-                .max(1),
-            expire_min_keep: facts
-                .expire_min_snapshots_to_keep
-                .unwrap_or(DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP)
-                .max(1),
-            target_file_size_bytes: facts
-                .target_file_size_bytes
-                .unwrap_or(DEFAULT_TARGET_FILE_SIZE_BYTES)
-                .max(1),
-            compaction_min_data_files: config.compaction_min_data_files,
-            dv_min_delete_files: config.dv_min_delete_files,
-        }
-    }
-}
-
-fn evaluate_facts(
-    facts: &MvMaintenanceFacts,
-    policy: &TablePolicy,
-    state: &TableRuntimeState,
-    config: &MaintenanceCoordinatorConfig,
-    now_ms: i64,
-) -> MaintenanceEvaluation {
-    let mut evaluation = MaintenanceEvaluation::default();
-    if !policy.enabled {
-        for kind in [
-            MaintenanceActionKind::Expire,
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceActionKind::Optimize,
-        ] {
-            evaluation
-                .skips
-                .push((kind, MaintenanceSkipReason::Disabled));
-        }
-        return evaluation;
-    }
-
-    match admit(MaintenanceActionKind::Expire, state, config, now_ms)
-        .and_then(|()| plan_expire(facts, policy, now_ms))
-    {
-        Ok(action) => evaluation.actions.push(action),
-        Err(skip) => evaluation.skips.push((MaintenanceActionKind::Expire, skip)),
-    }
-
-    if facts.current_snapshot_id == state.last_seen_snapshot_id {
-        evaluation.skips.push((
-            MaintenanceActionKind::Optimize,
-            MaintenanceSkipReason::SnapshotUnchanged,
-        ));
-        evaluation.skips.push((
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceSkipReason::SnapshotUnchanged,
-        ));
-        return evaluation;
-    }
-
-    let optimize = admit(MaintenanceActionKind::Optimize, state, config, now_ms)
-        .and_then(|()| plan_optimize(facts, policy));
-    let optimize_planned = optimize.is_ok();
-    match optimize {
-        Ok(action) => evaluation.actions.push(action),
-        Err(skip) => evaluation
-            .skips
-            .push((MaintenanceActionKind::Optimize, skip)),
-    }
-    if optimize_planned {
-        evaluation.skips.push((
-            MaintenanceActionKind::RewritePositionDeletes,
-            MaintenanceSkipReason::SuppressedByOptimize,
-        ));
-    } else {
-        match admit(
-            MaintenanceActionKind::RewritePositionDeletes,
-            state,
-            config,
-            now_ms,
-        )
-        .and_then(|()| plan_rewrite_position_deletes(facts, policy))
-        {
-            Ok(action) => evaluation.actions.push(action),
-            Err(skip) => evaluation
-                .skips
-                .push((MaintenanceActionKind::RewritePositionDeletes, skip)),
-        }
-    }
-    evaluation
-}
-
-fn admit(
-    kind: MaintenanceActionKind,
-    state: &TableRuntimeState,
-    config: &MaintenanceCoordinatorConfig,
-    now_ms: i64,
-) -> Result<(), MaintenanceSkipReason> {
-    if state.circuit_broken.contains(&kind) {
-        return Err(MaintenanceSkipReason::CircuitBroken);
-    }
-    if state
-        .next_attempt_after_ms
-        .get(&kind)
-        .is_some_and(|next| *next > now_ms)
-    {
-        return Err(MaintenanceSkipReason::FailureBackoff);
-    }
-    if matches!(
-        kind,
-        MaintenanceActionKind::Optimize | MaintenanceActionKind::RewritePositionDeletes
-    ) && state
-        .last_action_ms
-        .get(&kind)
-        .is_some_and(|last| last.saturating_add(config.action_cooldown_ms) > now_ms)
-    {
-        return Err(MaintenanceSkipReason::Cooldown);
-    }
-    Ok(())
-}
-
-fn plan_expire(
-    facts: &MvMaintenanceFacts,
-    policy: &TablePolicy,
-    now_ms: i64,
-) -> Result<AutomaticMaintenanceAction, MaintenanceSkipReason> {
-    if facts.non_default_reference_count > 0 {
-        return Err(MaintenanceSkipReason::NonDefaultRefs);
-    }
-    if facts.downstream_floor_unknown {
-        return Err(MaintenanceSkipReason::DownstreamFloorUnknown);
-    }
-    if facts.snapshot_count <= policy.expire_min_keep as usize {
-        return Err(MaintenanceSkipReason::NothingToExpire);
-    }
-    let Some(oldest) = facts.oldest_snapshot_timestamp_ms else {
-        return Err(MaintenanceSkipReason::NothingToExpire);
-    };
-    let mut older_than_ms = now_ms.saturating_sub(policy.expire_max_age_ms);
-    if let Some(floor) = facts.downstream_floor_ts_ms {
-        older_than_ms = older_than_ms.min(floor);
-    }
-    if oldest >= older_than_ms {
-        return Err(MaintenanceSkipReason::NothingToExpire);
-    }
-    Ok(AutomaticMaintenanceAction::ExpireSnapshots {
-        older_than_ms,
-        retain_last: policy.expire_min_keep,
-    })
-}
-
-fn plan_optimize(
-    facts: &MvMaintenanceFacts,
-    policy: &TablePolicy,
-) -> Result<AutomaticMaintenanceAction, MaintenanceSkipReason> {
-    let (Some(files), Some(size)) = (facts.total_data_files, facts.total_files_size_bytes) else {
-        return Err(MaintenanceSkipReason::MissingSummaryStats);
-    };
-    let compactable = facts.max_compactable_data_files.unwrap_or(files).min(files);
-    if files <= 0 || compactable < policy.compaction_min_data_files {
-        return Err(MaintenanceSkipReason::BelowThreshold);
-    }
-    if size / files * SMALL_FILE_RATIO_DENOMINATOR
-        >= policy.target_file_size_bytes * SMALL_FILE_RATIO_NUMERATOR
-    {
-        return Err(MaintenanceSkipReason::BelowThreshold);
-    }
-    Ok(AutomaticMaintenanceAction::Optimize)
-}
-
-fn plan_rewrite_position_deletes(
-    facts: &MvMaintenanceFacts,
-    policy: &TablePolicy,
-) -> Result<AutomaticMaintenanceAction, MaintenanceSkipReason> {
-    let Some(delete_files) = facts.total_delete_files else {
-        return Err(MaintenanceSkipReason::MissingSummaryStats);
-    };
-    if delete_files < policy.dv_min_delete_files {
-        return Err(MaintenanceSkipReason::BelowThreshold);
-    }
-    Ok(AutomaticMaintenanceAction::RewritePositionDeletes {
-        min_input_files: MIN_POSITION_DELETE_INPUT_FILES,
-    })
 }
 
 fn expected_outcome(kind: MaintenanceActionKind, outcome: &MaintenanceActionOutcome) -> bool {
@@ -507,13 +210,6 @@ fn expected_outcome(kind: MaintenanceActionKind, outcome: &MaintenanceActionOutc
             MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
         )
     )
-}
-
-fn failure_backoff_ms(attempt: u32) -> i64 {
-    let shift = attempt.max(1).saturating_sub(1).min(62);
-    FAILURE_BACKOFF_BASE_MS
-        .saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
-        .min(FAILURE_BACKOFF_MAX_MS)
 }
 
 #[cfg(test)]
@@ -693,51 +389,6 @@ mod tests {
             NOW + 1,
         );
         assert!(report.is_noop());
-    }
-
-    #[test]
-    fn absent_typed_facts_fall_back_to_frontend_defaults() {
-        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &facts());
-        assert!(policy.enabled);
-        assert_eq!(policy.expire_max_age_ms, DEFAULT_EXPIRE_MAX_SNAPSHOT_AGE_MS);
-        assert_eq!(policy.expire_min_keep, DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP);
-        assert_eq!(
-            policy.target_file_size_bytes,
-            DEFAULT_TARGET_FILE_SIZE_BYTES
-        );
-    }
-
-    #[test]
-    fn declared_typed_facts_override_frontend_defaults() {
-        let mut current = facts();
-        current.maintenance_enabled = Some(true);
-        current.expire_max_snapshot_age_ms = Some(7_200_000);
-        current.expire_min_snapshots_to_keep = Some(5);
-        current.target_file_size_bytes = Some(64 * 1024 * 1024);
-        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &current);
-        assert!(policy.enabled);
-        assert_eq!(policy.expire_max_age_ms, 7_200_000);
-        assert_eq!(policy.expire_min_keep, 5);
-        assert_eq!(policy.target_file_size_bytes, 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn non_positive_typed_facts_are_clamped_to_one() {
-        let mut zero = facts();
-        zero.expire_max_snapshot_age_ms = Some(0);
-        zero.expire_min_snapshots_to_keep = Some(0);
-        zero.target_file_size_bytes = Some(0);
-        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &zero);
-        assert_eq!(policy.expire_max_age_ms, 1);
-        assert_eq!(policy.expire_min_keep, 1);
-        assert_eq!(policy.target_file_size_bytes, 1);
-
-        let mut negative = facts();
-        negative.expire_max_snapshot_age_ms = Some(-1);
-        negative.target_file_size_bytes = Some(-1);
-        let policy = TablePolicy::resolve(&MaintenanceCoordinatorConfig::default(), &negative);
-        assert_eq!(policy.expire_max_age_ms, 1);
-        assert_eq!(policy.target_file_size_bytes, 1);
     }
 
     #[test]
