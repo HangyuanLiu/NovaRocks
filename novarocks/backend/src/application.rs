@@ -12,7 +12,9 @@ use novarocks_proto_codec::membership::BackendProcessDescriptor;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
-use novarocks_worker::{WorkerDrainState, WorkerResultRetainedLimits};
+use novarocks_worker::{
+    WorkerAdmissionEpochAuthority, WorkerDrainState, WorkerResultRetainedLimits,
+};
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
@@ -25,7 +27,7 @@ use crate::task_execution::{
 };
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
-    backend_announce::BackendAnnounceSupervisor,
+    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
@@ -654,6 +656,8 @@ impl BackendApplicationHost {
         // installed by the query-context host.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
+        let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
+            services.task_execution_registry.clone();
         let mut grpc_server = match NativeRpcServerHandle::start(
             &bind_host,
             grpc_port,
@@ -664,12 +668,11 @@ impl BackendApplicationHost {
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
                 Arc::clone(&services.task_inbound_capabilities),
-                crate::rpc::server::BackendProcessFacts {
-                    process_id: services.backend_process_id,
-                    descriptor: process_descriptor.clone(),
-                    drain: Arc::clone(&services.drain),
-                    task_execution_registry: Arc::clone(&services.task_execution_registry),
-                },
+                BackendHeartbeatResponder::new(
+                    process_descriptor.clone(),
+                    Arc::clone(&services.drain),
+                    admission_epoch,
+                ),
             ),
             native_trust,
             native_transport.incoming_adapter(),

@@ -95,10 +95,16 @@ use novarocks_worker::{
     QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome, RootResultBinding,
     RootResultRoute, RunnableTask, SharedFactsRequest, StatusAdvance, TaskDomains,
     TaskExecutionHost, TaskStatusOwner, TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome,
-    apply_planned_task_domain_updates, apply_task_domain_updates,
+    WorkerAdmissionEpochAuthority, apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, initial_domain_keys, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
 };
+
+impl WorkerAdmissionEpochAuthority for TaskExecutionRegistry {
+    fn admission_epoch_capability(&self) -> novarocks_execution_contract::AdmissionEpochCapability {
+        self.admission_epoch_capability()
+    }
+}
 
 const REGISTRY_LOCK: &str = "task execution registry lock";
 

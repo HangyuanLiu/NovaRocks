@@ -24,22 +24,19 @@ use std::sync::Arc;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-use crate::task_execution::{TaskExecutionRegistry, TaskInboundCapabilities};
+use crate::task_execution::TaskInboundCapabilities;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
-use novarocks_proto_codec::membership::{
-    BackendProcessDescriptor, BackendProcessId as ProtocolBackendProcessId,
-};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
-use novarocks_types::BackendProcessId;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::connector::catalog_manager::CatalogPruneResult;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
-use novarocks_native_adapter::generated::nova_rocks_grpc_server::NovaRocksGrpc;
-use novarocks_worker::WorkerDrainState;
+use novarocks_native_adapter::{
+    backend_heartbeat::BackendHeartbeatResponder, generated::nova_rocks_grpc_server::NovaRocksGrpc,
+};
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///
@@ -64,30 +61,13 @@ pub(crate) trait CatalogReachabilityAuthority: Send + Sync + 'static {
     ) -> CatalogPruneResult;
 }
 
-/// Everything a heartbeat answers with.
-///
-/// A heartbeat is a question about this process, not about any query: which
-/// process is answering, what it immutably is, and whether it will still take
-/// new work. All three travel together because they are one answer, and
-/// because a reply that mixed one process's identity with another's drain
-/// state would be worse than no reply at all.
-#[derive(Clone)]
-pub(crate) struct BackendProcessFacts {
-    /// The identity minted by this process's composition root. A heartbeat
-    /// naming a different one is a stale peer talking to a replaced process.
-    pub(crate) process_id: BackendProcessId,
-    pub(crate) descriptor: BackendProcessDescriptor,
-    pub(crate) drain: Arc<WorkerDrainState>,
-    pub(crate) task_execution_registry: Arc<TaskExecutionRegistry>,
-}
-
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes them with `BackendDataPlane`.
 #[derive(Clone)]
 pub(crate) struct BackendRpcService {
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
-    process: BackendProcessFacts,
+    heartbeat: BackendHeartbeatResponder,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
@@ -99,12 +79,12 @@ impl BackendRpcService {
         runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
-        process: BackendProcessFacts,
+        heartbeat: BackendHeartbeatResponder,
     ) -> Self {
         Self {
             task_execution_ingress,
             catalog_reachability,
-            process,
+            heartbeat,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
                 task_inbound_capabilities,
@@ -258,38 +238,9 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::HeartbeatRequest>,
     ) -> Result<tonic::Response<proto::HeartbeatResponse>, tonic::Status> {
-        let expected_process_id = request.into_inner().expected_process_id.ok_or_else(|| {
-            tonic::Status::invalid_argument("heartbeat expected process id is required")
-        })?;
-        let expected_process_id = ProtocolBackendProcessId::parse(expected_process_id)
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
-            .domain()
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        if expected_process_id != self.process.process_id {
-            return Err(tonic::Status::failed_precondition(
-                "heartbeat expected backend process id does not match this backend",
-            ));
-        }
-        let num_cores = std::thread::available_parallelism()
-            .map(|count| count.get() as u32)
-            .unwrap_or(1);
-        Ok(tonic::Response::new(proto::HeartbeatResponse {
-            num_cores,
-            descriptor: Some(self.process.descriptor.as_proto().clone()),
-            reported_state: if self.process.drain.is_draining() {
-                proto::BackendReportedState::Draining as i32
-            } else {
-                proto::BackendReportedState::Running as i32
-            },
-            admission_epoch_capability: Some(proto::AdmissionEpochCapability {
-                value: self
-                    .process
-                    .task_execution_registry
-                    .admission_epoch_capability()
-                    .to_bytes()
-                    .to_vec(),
-            }),
-        }))
+        self.heartbeat
+            .respond(request.into_inner())
+            .map(tonic::Response::new)
     }
 
     async fn apply_task_operations(

@@ -18,6 +18,7 @@
 //! Server-resolved Native transport capabilities and protocol adapters.
 
 pub mod backend_announce;
+pub mod backend_heartbeat;
 pub mod connector_blocking_io;
 pub mod native_client;
 pub use native_client::NativeRpcClient;

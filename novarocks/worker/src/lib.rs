@@ -25,6 +25,7 @@
 use std::num::NonZeroUsize;
 
 mod admission;
+mod admission_epoch;
 mod clock;
 mod convergence;
 mod domain;
@@ -47,6 +48,7 @@ pub use admission::{
     AdmissionTicketRedemptionRejection, AdmissionTicketState, MAX_ADMISSION_RESERVATIONS,
     MAX_ADMISSION_TICKET_VALID_FOR,
 };
+pub use admission_epoch::WorkerAdmissionEpochAuthority;
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
@@ -65,6 +67,7 @@ pub use lifecycle::{
     RootDrainAction, TaskTransition, TerminationLatch, classify_context_transition,
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
+pub use novarocks_execution_contract::AdmissionEpochCapability;
 pub use observation::{
     ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
     TaskStatusSubscriptionPosition,
