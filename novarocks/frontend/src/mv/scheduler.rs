@@ -23,7 +23,7 @@
 //! [`FrontendMvScheduler::complete`]. Consequently queue coalescing, activity,
 //! retry, and error state are process-local and deterministic without sleeps.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeMap;
 
 use super::background::MvBackgroundEngine;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
@@ -33,9 +33,14 @@ use crate::mv::domain::repository::{
     MvPublishedProjection, MvPublishedWaterline, MvRepositoryError, MvTarget,
 };
 use novarocks_mv_application::{
-    maintenance::{MvBackgroundEngineError, MvBackgroundEngineErrorKind},
     scheduler::MvSchedulerConfig,
+    scheduler_runtime::{
+        MvRefreshDisposition, MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+    },
 };
+
+pub(crate) type ScheduledRefreshDisposition = MvRefreshDisposition;
+pub(crate) type ScheduledRefreshRuntimeDecision = MvRefreshRuntimeDecision;
 
 /// Why a refresh was made runnable.  A worker does not reinterpret this as a
 /// retry policy; it is purely observable scheduling state.
@@ -146,65 +151,9 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
     fn execute(&self, request: ScheduledRefreshRequest) -> ScheduledRefreshDisposition;
 }
 
-/// Terminal outcome projected from typed Core preparation/application and
-/// repository results.  No caller may infer one of these variants from an
-/// error message.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ScheduledRefreshDisposition {
-    Completed,
-    NoOp,
-    AlreadyActive,
-    TargetGone,
-    TransientUnavailable(String),
-    InvalidDefinition(String),
-    TerminalFailure(String),
-    Corruption(String),
-    InvariantViolation(String),
-    ShutdownCancelled,
-}
-
-impl ScheduledRefreshDisposition {
-    pub(crate) fn from_background_error(error: MvBackgroundEngineError) -> Self {
-        match error.kind() {
-            MvBackgroundEngineErrorKind::TargetGone => Self::TargetGone,
-            MvBackgroundEngineErrorKind::TransientUnavailable => {
-                Self::TransientUnavailable(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::InvalidDefinition => {
-                Self::InvalidDefinition(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::TerminalFailure => {
-                Self::TerminalFailure(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::Corruption => Self::Corruption(error.message().to_owned()),
-            MvBackgroundEngineErrorKind::InvariantViolation => {
-                Self::InvariantViolation(error.message().to_owned())
-            }
-            MvBackgroundEngineErrorKind::ShutdownCancelled => Self::ShutdownCancelled,
-        }
-    }
-}
-
-/// The process-local state transition implied by a terminal disposition.
-/// It is observable to the frontend crate for integration tests, but never
-/// writes scheduler state to the lake-derived Accelerator.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ScheduledRefreshRuntimeDecision {
-    Success,
-    TransientBackoff { error: String, retry_at_ms: i64 },
-    Blocked { error: String },
-    NoChange,
-}
-
 #[derive(Debug)]
 pub(crate) struct FrontendMvScheduler {
-    config: MvSchedulerConfig,
-    queue: VecDeque<ScheduledRefreshRequest>,
-    queued_mv_ids: BTreeSet<i64>,
-    running_mv_ids: BTreeSet<i64>,
-    failure_attempts: BTreeMap<i64, u32>,
-    retry_not_before_ms: BTreeMap<i64, i64>,
-    blocked_errors: BTreeMap<i64, String>,
+    runtime: MvRefreshSchedulerRuntime<i64, ScheduledRefreshRequest>,
     source_revisions:
         BTreeMap<i64, crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision>,
 }
@@ -212,13 +161,7 @@ pub(crate) struct FrontendMvScheduler {
 impl FrontendMvScheduler {
     pub(crate) fn new(config: MvSchedulerConfig) -> Self {
         Self {
-            config,
-            queue: VecDeque::new(),
-            queued_mv_ids: BTreeSet::new(),
-            running_mv_ids: BTreeSet::new(),
-            failure_attempts: BTreeMap::new(),
-            retry_not_before_ms: BTreeMap::new(),
-            blocked_errors: BTreeMap::new(),
+            runtime: MvRefreshSchedulerRuntime::new(config),
             source_revisions: BTreeMap::new(),
         }
     }
@@ -233,7 +176,7 @@ impl FrontendMvScheduler {
         engine: &dyn MvBackgroundEngine,
         now_ms: i64,
     ) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
-        if !self.config.enabled() {
+        if !self.runtime.enabled() {
             return Ok(Vec::new());
         }
 
@@ -241,45 +184,21 @@ impl FrontendMvScheduler {
             self.consider_definition(engine, projection.definition, now_ms);
         }
 
-        let capacity = self
-            .config
-            .max_concurrent_refreshes()
-            .max(1)
-            .saturating_sub(self.running_mv_ids.len());
-        let mut ready = Vec::with_capacity(capacity);
-        for _ in 0..capacity {
-            let Some(request) = self.queue.pop_front() else {
-                break;
-            };
-            self.queued_mv_ids.remove(&request.definition.mv_id);
-            if self.running_mv_ids.contains(&request.definition.mv_id) {
-                continue;
-            }
-            ready.push(request);
-        }
-        Ok(ready)
+        Ok(self.runtime.take_ready())
     }
 
     /// Record that a worker has obtained both its FIFO activity lease and a
     /// refresh permit.  A worker that cannot acquire either simply lets its
     /// request be considered again on the next poll, without holding capacity.
     pub(crate) fn mark_started(&mut self, mv_id: i64) -> bool {
-        if self.running_mv_ids.len() >= self.config.max_concurrent_refreshes().max(1)
-            || self.running_mv_ids.contains(&mv_id)
-        {
-            return false;
-        }
-        self.running_mv_ids.insert(mv_id)
+        self.runtime.mark_started(&mv_id)
     }
 
     /// Return a dispatched-but-not-started request to the tail of its
     /// coalesced queue.  Worker runtimes call this when the shared activity
     /// gate is busy; no scheduler capacity was acquired in that case.
     pub(crate) fn requeue(&mut self, request: ScheduledRefreshRequest) {
-        let mv_id = request.definition.mv_id;
-        if !self.running_mv_ids.contains(&mv_id) && self.queued_mv_ids.insert(mv_id) {
-            self.queue.push_back(request);
-        }
+        self.runtime.requeue(request.definition.mv_id, request);
     }
 
     /// Apply a typed terminal outcome and release the refresh concurrency slot.
@@ -291,10 +210,9 @@ impl FrontendMvScheduler {
         disposition: ScheduledRefreshDisposition,
         now_ms: i64,
     ) -> Result<ScheduledRefreshRuntimeDecision, MvRepositoryError> {
-        self.running_mv_ids.remove(&request.definition.mv_id);
-        let decision = self.runtime_decision(&request.definition, &disposition, now_ms);
-        self.apply_runtime_decision(&request.definition, &decision);
-        Ok(decision)
+        Ok(self
+            .runtime
+            .complete(&request.definition.mv_id, disposition, now_ms))
     }
 
     #[allow(
@@ -302,7 +220,7 @@ impl FrontendMvScheduler {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn pending_len(&self) -> usize {
-        self.queue.len()
+        self.runtime.pending_len()
     }
 
     #[allow(
@@ -310,7 +228,7 @@ impl FrontendMvScheduler {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn running_len(&self) -> usize {
-        self.running_mv_ids.len()
+        self.runtime.running_len()
     }
 
     fn consider_definition(
@@ -320,15 +238,7 @@ impl FrontendMvScheduler {
         now_ms: i64,
     ) {
         self.reset_runtime_state_if_source_changed(&definition);
-        if definition.refresh_paused
-            || self
-                .retry_not_before_ms
-                .get(&definition.mv_id)
-                .is_some_and(|retry_at_ms| now_ms < *retry_at_ms)
-            || self.blocked_errors.contains_key(&definition.mv_id)
-            || self.queued_mv_ids.contains(&definition.mv_id)
-            || self.running_mv_ids.contains(&definition.mv_id)
-        {
+        if definition.refresh_paused || self.runtime.is_suppressed(&definition.mv_id, now_ms) {
             return;
         }
 
@@ -398,12 +308,14 @@ impl FrontendMvScheduler {
                 return;
             }
         };
-        self.queue.push_back(ScheduledRefreshRequest {
-            definition: definition.clone(),
-            target,
-            reason,
-        });
-        self.queued_mv_ids.insert(definition.mv_id);
+        self.runtime.enqueue(
+            definition.mv_id,
+            ScheduledRefreshRequest {
+                definition: definition.clone(),
+                target,
+                reason,
+            },
+        );
     }
 
     fn record_runtime_disposition(
@@ -412,73 +324,7 @@ impl FrontendMvScheduler {
         disposition: ScheduledRefreshDisposition,
         now_ms: i64,
     ) {
-        let decision = self.runtime_decision(definition, &disposition, now_ms);
-        self.apply_runtime_decision(definition, &decision);
-    }
-
-    fn runtime_decision(
-        &mut self,
-        definition: &StoredMvDefinition,
-        disposition: &ScheduledRefreshDisposition,
-        now_ms: i64,
-    ) -> ScheduledRefreshRuntimeDecision {
-        match disposition {
-            ScheduledRefreshDisposition::Completed | ScheduledRefreshDisposition::NoOp => {
-                ScheduledRefreshRuntimeDecision::Success
-            }
-            ScheduledRefreshDisposition::TransientUnavailable(error) => {
-                let attempt = *self
-                    .failure_attempts
-                    .entry(definition.mv_id)
-                    .and_modify(|attempt| *attempt = attempt.saturating_add(1))
-                    .or_insert(1);
-                ScheduledRefreshRuntimeDecision::TransientBackoff {
-                    error: error.clone(),
-                    retry_at_ms: now_ms.saturating_add(backoff_ms(&self.config, attempt)),
-                }
-            }
-            ScheduledRefreshDisposition::InvalidDefinition(error)
-            | ScheduledRefreshDisposition::TerminalFailure(error)
-            | ScheduledRefreshDisposition::Corruption(error)
-            | ScheduledRefreshDisposition::InvariantViolation(error) => {
-                ScheduledRefreshRuntimeDecision::Blocked {
-                    error: error.clone(),
-                }
-            }
-            // A dropped target, a process-local activity gate, and shutdown
-            // are not scheduler failures and must not fabricate a backoff.
-            ScheduledRefreshDisposition::AlreadyActive
-            | ScheduledRefreshDisposition::TargetGone
-            | ScheduledRefreshDisposition::ShutdownCancelled => {
-                ScheduledRefreshRuntimeDecision::NoChange
-            }
-        }
-    }
-
-    fn apply_runtime_decision(
-        &mut self,
-        definition: &StoredMvDefinition,
-        decision: &ScheduledRefreshRuntimeDecision,
-    ) {
-        match decision {
-            ScheduledRefreshRuntimeDecision::Success => {
-                self.failure_attempts.remove(&definition.mv_id);
-                self.retry_not_before_ms.remove(&definition.mv_id);
-                self.blocked_errors.remove(&definition.mv_id);
-            }
-            ScheduledRefreshRuntimeDecision::TransientBackoff { error, retry_at_ms } => {
-                self.retry_not_before_ms
-                    .insert(definition.mv_id, *retry_at_ms);
-                self.blocked_errors.remove(&definition.mv_id);
-                debug_assert!(!error.is_empty());
-            }
-            ScheduledRefreshRuntimeDecision::Blocked { error } => {
-                self.failure_attempts.remove(&definition.mv_id);
-                self.retry_not_before_ms.remove(&definition.mv_id);
-                self.blocked_errors.insert(definition.mv_id, error.clone());
-            }
-            ScheduledRefreshRuntimeDecision::NoChange => {}
-        }
+        let _ = self.runtime.record(&definition.mv_id, disposition, now_ms);
     }
 
     fn reset_runtime_state_if_source_changed(&mut self, definition: &StoredMvDefinition) {
@@ -487,9 +333,7 @@ impl FrontendMvScheduler {
             .get(&definition.mv_id)
             .is_some_and(|source| source != &definition.source_revision);
         if source_changed {
-            self.failure_attempts.remove(&definition.mv_id);
-            self.retry_not_before_ms.remove(&definition.mv_id);
-            self.blocked_errors.remove(&definition.mv_id);
+            self.runtime.reset_after_source_change(&definition.mv_id);
         }
         self.source_revisions
             .insert(definition.mv_id, definition.source_revision.clone());
@@ -578,14 +422,6 @@ fn current_base_snapshots_match(
         && current
             .iter()
             .all(|(base, snapshot)| published.get(base).copied() == *snapshot)
-}
-
-fn backoff_ms(config: &MvSchedulerConfig, attempt: u32) -> i64 {
-    let base = config.failure_backoff_ms().max(1);
-    let maximum = config.max_failure_backoff_ms().max(base);
-    let shift = attempt.saturating_sub(1).min(62);
-    base.saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
-        .min(maximum)
 }
 
 #[cfg(test)]
@@ -770,13 +606,14 @@ mod tests {
         let mut scheduler = FrontendMvScheduler::new(config);
         let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
         let target = mv_target(&definition).expect("target");
-        scheduler.queue.push_back(ScheduledRefreshRequest {
-            definition: definition.clone(),
-            target: target.clone(),
-            reason: ScheduledRefreshReason::Interval,
-        });
-        scheduler.queued_mv_ids.insert(definition.mv_id);
-        assert!(scheduler.queued_mv_ids.contains(&definition.mv_id));
+        scheduler.runtime.enqueue(
+            definition.mv_id,
+            ScheduledRefreshRequest {
+                definition: definition.clone(),
+                target: target.clone(),
+                reason: ScheduledRefreshReason::Interval,
+            },
+        );
         assert_eq!(scheduler.pending_len(), 1);
         assert_eq!(target.display_name(), "iceberg.db.mv");
     }
@@ -787,17 +624,23 @@ mod tests {
         let mut scheduler = FrontendMvScheduler::new(config);
         let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
         assert!(matches!(
-            scheduler.runtime_decision(&definition, &ScheduledRefreshDisposition::Completed, 100),
+            scheduler.runtime.record(
+                &definition.mv_id,
+                ScheduledRefreshDisposition::Completed,
+                100
+            ),
             ScheduledRefreshRuntimeDecision::Success
         ));
         assert!(matches!(
-            scheduler.runtime_decision(&definition, &ScheduledRefreshDisposition::NoOp, 100),
+            scheduler
+                .runtime
+                .record(&definition.mv_id, ScheduledRefreshDisposition::NoOp, 100),
             ScheduledRefreshRuntimeDecision::Success
         ));
         assert_eq!(
-            scheduler.runtime_decision(
-                &definition,
-                &ScheduledRefreshDisposition::TransientUnavailable("offline".to_string()),
+            scheduler.runtime.record(
+                &definition.mv_id,
+                ScheduledRefreshDisposition::TransientUnavailable("offline".to_string()),
                 100,
             ),
             ScheduledRefreshRuntimeDecision::TransientBackoff {
@@ -812,7 +655,9 @@ mod tests {
             ScheduledRefreshDisposition::InvariantViolation("invariant".to_string()),
         ] {
             assert!(matches!(
-                scheduler.runtime_decision(&definition, &disposition, 100),
+                scheduler
+                    .runtime
+                    .record(&definition.mv_id, disposition, 100),
                 ScheduledRefreshRuntimeDecision::Blocked { .. }
             ));
         }
@@ -822,7 +667,9 @@ mod tests {
             ScheduledRefreshDisposition::ShutdownCancelled,
         ] {
             assert_eq!(
-                scheduler.runtime_decision(&definition, &disposition, 100),
+                scheduler
+                    .runtime
+                    .record(&definition.mv_id, disposition, 100),
                 ScheduledRefreshRuntimeDecision::NoChange
             );
         }
