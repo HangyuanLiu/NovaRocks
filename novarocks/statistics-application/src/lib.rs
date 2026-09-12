@@ -956,7 +956,7 @@ mod tests {
         fn prepare(
             &self,
             _job: &StatisticsJob,
-            _scope: &WorkScope,
+            scope: &WorkScope,
         ) -> Result<(), StatisticsAttemptError> {
             self.started
                 .send(())
@@ -966,7 +966,11 @@ mod tests {
                 .expect("release lock")
                 .recv()
                 .expect("test releases the background preparation");
-            Ok(())
+            scope.check().map_err(|error| {
+                StatisticsAttemptError::Cancelled(StatisticsFailure {
+                    message: Arc::from(error.to_string()),
+                })
+            })
         }
 
         fn collect(
@@ -1153,6 +1157,62 @@ mod tests {
             terminal.state,
             StatisticsJobState::Terminal(StatisticsJobConclusion::Succeeded)
         );
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("shutdown worker");
+    }
+
+    #[tokio::test]
+    async fn runtime_cancellation_reaches_an_active_attempt_root() {
+        let service = StatisticsJobService::new();
+        let (started, started_rx) = mpsc::channel();
+        let (release, release_rx) = mpsc::channel();
+        let runtime = StatisticsJobRuntime::start(
+            service.clone(),
+            Arc::new(BlockingExecutor {
+                started,
+                release: Mutex::new(release_rx),
+            }),
+            tokio::runtime::Handle::current(),
+        );
+
+        let submitted = runtime.submit(create(1), root()).await.expect("submit");
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("background preparation started")
+        })
+        .await
+        .expect("observe preparation");
+        runtime
+            .request_cancel(submitted.id, 2)
+            .await
+            .expect("request cancellation");
+        release.send(()).expect("release preparation");
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let job = service
+                    .list()
+                    .await
+                    .expect("list")
+                    .into_iter()
+                    .find(|job| job.id == submitted.id)
+                    .expect("job remains retained");
+                if job.state.is_terminal() {
+                    return job;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled background job reaches terminal");
+        assert_eq!(
+            terminal.state,
+            StatisticsJobState::Terminal(StatisticsJobConclusion::Cancelled)
+        );
+        assert!(terminal.convergence.is_complete());
         runtime
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
