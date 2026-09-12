@@ -73,7 +73,6 @@ use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_read::LogicalReadLauncher;
-use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -90,6 +89,7 @@ use crate::task_execution::intent::{
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::AttemptEstablishFacts;
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 /// One logical execution's Abort port. Every physical attempt installs one
 /// exact route and retains its registration through residual convergence.

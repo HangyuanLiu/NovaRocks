@@ -37,7 +37,7 @@ use novarocks_execution::runtime::execution_runtime::{
 use novarocks_frontend::{
     CatalogPruneConfig, ClusterBackendOpenConfig, FrontendApplicationOpenConfig,
     FrontendExecutionConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
-    FrontendServingConfig, TaskUpdateRetryPolicy,
+    FrontendServingConfig,
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
@@ -49,7 +49,7 @@ use novarocks_fs::{
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
-    LogicalExecutionSupervisorConfig,
+    LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
 };
 use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;

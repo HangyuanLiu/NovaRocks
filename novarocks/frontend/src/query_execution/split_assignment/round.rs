@@ -35,10 +35,10 @@ use novarocks_spi::connector::read_stack::{ConnectorSplitBatch, SplitSourceProfi
 use super::super::connector_domain::CatalogHandle;
 use super::driver::{
     AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
-    TaskUpdateRetryPolicy,
 };
 use super::transport::TaskUpdateTransport;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 /// How many splits one batch pulls from a source.
 ///

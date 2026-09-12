@@ -40,7 +40,6 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::lifecycle_plan::{
     AttemptCredentialLeaseCollector, QueryCredentialLeases,
 };
-use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::query_execution::split_assignment_round::{
     OpenRoundSplitSources, OpenedRoundSplitSource, RoundSplitAssignmentPlan,
     RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
@@ -50,6 +49,7 @@ use crate::task_execution::blocking_io::{
     ConnectorBlockingIoAdmission, ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor,
 };
 use novarocks_query_application::cancellation::QueryCancellationView;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 fn failed(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::Failed, message)

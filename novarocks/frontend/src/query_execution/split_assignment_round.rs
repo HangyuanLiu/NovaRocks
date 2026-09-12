@@ -35,14 +35,15 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
-    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError,
-    TaskUpdateRetryPolicy, TaskUpdateTransport, emit_split_source_close_marker,
+    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError, TaskUpdateTransport,
+    emit_split_source_close_marker,
 };
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::round::{TaskRound, TurnPump};
 use crate::task_execution::status_intake::StatusIntakeWake;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_sql::plan_read::FragmentId;
 
 /// How many splits one task may hold before the driver stops pulling for it.

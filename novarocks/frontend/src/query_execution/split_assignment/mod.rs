@@ -26,7 +26,6 @@ mod driver;
 mod round;
 mod transport;
 
-pub use driver::TaskUpdateRetryPolicy;
 pub(crate) use driver::{
     AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
     SplitSourceHandle,

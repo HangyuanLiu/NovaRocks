@@ -39,11 +39,11 @@ use novarocks_workload_control::{
     WorkloadConfig, WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
 };
 
-use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
 use crate::task_execution::ConnectorBlockingIoBudget;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_native_trust::NativeTrust;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};

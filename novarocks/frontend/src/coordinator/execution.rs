@@ -328,7 +328,7 @@ pub struct FrontendDistributedQueryCoordinator {
     /// frontend's contexts from a restarted frontend's. Minting it per process
     /// rather than per query is what makes that distinction meaningful.
     frontend_process_id: FrontendProcessId,
-    task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
 }
@@ -341,7 +341,7 @@ impl FrontendDistributedQueryCoordinator {
     pub fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
-        task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+        task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
@@ -437,7 +437,7 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
-                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
@@ -505,7 +505,7 @@ impl FrontendDistributedQueryCoordinator {
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
-                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),

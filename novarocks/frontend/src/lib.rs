@@ -55,7 +55,6 @@ pub use application::{
 pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 pub use mv::maintenance::MaintenanceCoordinatorConfig;
 pub use mv::scheduler::FrontendMvSchedulerConfig;
-pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{
     FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
     build_frontend_query_session_factory, open_frontend_application_for_server,
