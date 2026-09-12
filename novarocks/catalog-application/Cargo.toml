@@ -31,6 +31,7 @@ doctest = false
 test-support = []
 
 [dependencies]
+chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
 novarocks-spi.workspace = true
@@ -38,7 +39,9 @@ novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+toml.workspace = true
 tracing.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 

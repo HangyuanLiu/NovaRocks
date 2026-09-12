@@ -553,13 +553,15 @@ pub fn compose_frontend_role_config(
         runtime_config.connector_split_initial_dynamic_filter_wait_cap_ms,
     ))
     .with_catalog_materialization_config(
-        novarocks_frontend::catalog_application::frontend_port::CatalogMaterializationConfig::try_new(
+        novarocks_catalog_application::CatalogMaterializationConfig::try_new(
             Duration::from_millis(runtime_config.catalog_materialization_attempt_timeout_ms),
             Duration::from_millis(runtime_config.catalog_materialization_retry_initial_backoff_ms),
             Duration::from_millis(runtime_config.catalog_materialization_retry_max_backoff_ms),
             runtime_config.catalog_materialization_max_inflight,
         )
-        .map_err(|error| anyhow::anyhow!("construct catalog materialization configuration: {error}"))?,
+        .map_err(|error| {
+            anyhow::anyhow!("construct catalog materialization configuration: {error}")
+        })?,
     )
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
         pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,

@@ -25,11 +25,11 @@ use std::path::Path;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use super::desired_state::{
+use crate::desired_state::{
     CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSourceMode,
     CatalogLogicalConfig, CatalogSourceEntryIdentity,
 };
-use super::{CatalogApplicationError, CatalogApplicationErrorKind};
+use crate::{CatalogApplicationError, CatalogApplicationErrorKind};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
     ConnectorProviderId, CredentialConsumerRole, MAX_CATALOG_NON_SECRET_PROPERTIES,
@@ -329,7 +329,7 @@ z = "last"
         assert_eq!(first_entry.config(), second_entry.config());
         assert_eq!(first_entry.config().credential_bindings().len(), 3);
 
-        let dynamic_attachment = novarocks_catalog_application::CatalogAttachment {
+        let dynamic_attachment = crate::CatalogAttachment {
             attachment_id: Uuid::now_v7(),
             instance_id: first_entry.config().instance_id().clone(),
             provider_id: first_entry.config().provider_id().clone(),

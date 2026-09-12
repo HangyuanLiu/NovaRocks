@@ -67,7 +67,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::catalog_application::FrontendCatalogApplicationPort;
+use novarocks_catalog_application::CatalogApplicationService;
 use novarocks_catalog_application::CatalogAttachmentWakeupSignal;
 
 #[derive(Default)]
@@ -122,7 +122,7 @@ struct ScanRound {
 
 pub struct FrontendCatalogController {
     store: Arc<dyn StateStore>,
-    projection: Arc<FrontendCatalogApplicationPort>,
+    projection: Arc<CatalogApplicationService>,
     config: CatalogProjectionConfig,
     stopping: AtomicBool,
     /// Interrupts the worker's waits.
@@ -146,7 +146,7 @@ pub struct FrontendCatalogController {
 impl FrontendCatalogController {
     pub fn new(
         store: Arc<dyn StateStore>,
-        projection: Arc<FrontendCatalogApplicationPort>,
+        projection: Arc<CatalogApplicationService>,
         config: CatalogProjectionConfig,
     ) -> Result<Arc<Self>, String> {
         if config.page_size == 0 || config.page_size > store.limits().max_page_size {
@@ -478,16 +478,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::time::Instant as StdInstant;
 
-    use crate::catalog_application::desired_state::CatalogDesiredStateSource;
-    use crate::catalog_application::{
-        CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
-        CatalogApplicationPort, CatalogCreateCommand, CatalogDropCommand,
-        CatalogRuntimeObservation, CatalogRuntimePublisherSink,
-    };
     use crate::state_store::testing::{
         StateStoreAppConfig, StateStoreConfig, StateStoreHost, StateStoreHostConfig,
         StateStoreLimitOverrides, StateStoreProviderConfig, TEST_STATE_STORE_PROVIDER_ID,
         builtin_state_store_provider_registry,
+    };
+    use novarocks_catalog_application::CatalogRuntimePublisherSink;
+    use novarocks_catalog_application::{
+        CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind,
+        CatalogApplicationPort, CatalogCreateCommand, CatalogDesiredStateSource,
+        CatalogDropCommand, CatalogRuntimeObservation,
     };
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorProviderId};
     use novarocks_state_store_api::{
@@ -931,7 +931,7 @@ mod tests {
         repository: CatalogAttachmentRepository,
     ) -> (
         Arc<ConnectorControlHost>,
-        Arc<FrontendCatalogApplicationPort>,
+        Arc<CatalogApplicationService>,
         Arc<AtomicUsize>,
     ) {
         let materializations = Arc::new(AtomicUsize::new(0));
@@ -942,11 +942,12 @@ mod tests {
             })])
             .expect("control host"),
         );
-        let port = Arc::new(FrontendCatalogApplicationPort::new(
+        let port = Arc::new(CatalogApplicationService::new(
             CatalogDesiredStateSource::dynamic_state_store(repository),
             Arc::clone(&control),
             crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
+            Arc::new(crate::catalog_application::MvCatalogReferenceReader),
         ));
         (control, port, materializations)
     }
@@ -962,7 +963,7 @@ mod tests {
     }
 
     async fn wait_for_ready(
-        port: &FrontendCatalogApplicationPort,
+        port: &CatalogApplicationService,
         instance_id: &novarocks_spi::connector::ConnectorInstanceId,
     ) -> CatalogRuntimeObservation {
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -1096,11 +1097,12 @@ mod tests {
             ConnectorControlHost::with_role_factories(vec![Arc::new(UnavailableFactory)])
                 .expect("control host"),
         );
-        let port = Arc::new(FrontendCatalogApplicationPort::new(
+        let port = Arc::new(CatalogApplicationService::new(
             CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             control,
             crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
             tokio::runtime::Handle::current(),
+            Arc::new(crate::catalog_application::MvCatalogReferenceReader),
         ));
 
         assert_eq!(
@@ -1140,11 +1142,12 @@ mod tests {
             ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
-        let port = Arc::new(FrontendCatalogApplicationPort::new(
+        let port = Arc::new(CatalogApplicationService::new(
             CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             Arc::clone(&control),
             Arc::new(RejectingPublisher),
             tokio::runtime::Handle::current(),
+            Arc::new(crate::catalog_application::MvCatalogReferenceReader),
         ));
 
         assert_eq!(
@@ -1294,11 +1297,12 @@ mod tests {
             ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::default())])
                 .expect("control host"),
         );
-        let port = Arc::new(FrontendCatalogApplicationPort::new(
+        let port = Arc::new(CatalogApplicationService::new(
             CatalogDesiredStateSource::dynamic_state_store(repository.clone()),
             Arc::clone(&control),
             Arc::new(RejectingPublisher),
             tokio::runtime::Handle::current(),
+            Arc::new(crate::catalog_application::MvCatalogReferenceReader),
         ));
         let controller = FrontendCatalogController::new(
             Arc::clone(&store),

@@ -28,7 +28,6 @@ use std::time::Duration;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use tokio::runtime::Handle;
 
-use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
@@ -46,6 +45,7 @@ use crate::query_execution::maintenance::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
+use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};

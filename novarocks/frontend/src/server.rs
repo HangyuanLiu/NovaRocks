@@ -870,7 +870,6 @@ mod tests {
         run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
         shutdown_frontend_application_to_convergence,
     };
-    use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use crate::state_store::testing::{
         input as test_state_store_input, registry as test_state_store_registry,
     };
@@ -881,6 +880,7 @@ mod tests {
         },
         topology::ClusterBackendOpenConfig,
     };
+    use novarocks_catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
     use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
     use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;

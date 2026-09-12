@@ -28,9 +28,10 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::{CatalogApplicationPort, CatalogRuntimeProjection};
+use crate::catalog_application::CatalogRuntimeProjection;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::startup_restore::MvStartupRestore;
+use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 

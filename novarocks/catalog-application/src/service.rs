@@ -22,7 +22,7 @@
 //! materialize each located entry on its own. The two failure scopes that path
 //! produces are carried by the error type rather than by which call happened to
 //! propagate — see [`CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete`]
-//! for the global one and [`FrontendCatalogApplicationPort::materialize_entry`]
+//! for the global one and [`CatalogApplicationService::materialize_entry`]
 //! for the per-catalog one.
 //!
 //! Desired state is committed before a local control generation is registered.
@@ -35,21 +35,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::desired_state::{
-    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
-    CatalogDesiredStateSourceMode,
-};
-use super::{
+use crate::{
     CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
-    CatalogCreateCommand, CatalogDropCommand, CatalogRuntimeObservation,
-    CatalogRuntimePublisherSink,
-};
-use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
-use futures::future::BoxFuture;
-use novarocks_catalog_application::{
     CatalogAttachment, CatalogAttachmentError, CatalogAttachmentErrorKind,
-    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal, CatalogReferenceReader,
+    CatalogAttachmentRepository, CatalogAttachmentWakeupSignal, CatalogCreateCommand,
+    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
+    CatalogDesiredStateSourceMode, CatalogDropCommand, CatalogReferenceReader,
+    CatalogRuntimeObservation, CatalogRuntimePublisherSink,
 };
+#[cfg(test)]
+use futures::future::BoxFuture;
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
     ConnectorControlResolver, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
@@ -61,34 +56,7 @@ use novarocks_spi::connector::{
 use tokio::runtime::{Handle, RuntimeFlavor};
 use uuid::Uuid;
 
-use crate::connector::ConnectorControlHost;
-
-/// Frontend's read-only adapter for the MV accelerator observation.
-///
-/// Catalog owns desired-state mutation and passes its StateStore capability
-/// only to this narrow reader. The result remains best-effort by contract; it
-/// is not a cross-family serializability fence.
-struct MvCatalogReferenceReader;
-
-impl CatalogReferenceReader for MvCatalogReferenceReader {
-    fn observe_references<'a>(
-        &'a self,
-        store: &'a dyn novarocks_state_store_api::StateStore,
-        instance_id: &'a ConnectorInstanceId,
-        page_size: usize,
-    ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
-        Box::pin(async move {
-            crate::mv::repository::observe_catalog_references(
-                store,
-                instance_id.as_str(),
-                page_size,
-            )
-            .await
-            .map(|reference| reference.map(|reference| reference.describe()))
-            .map_err(|error| error.to_string())
-        })
-    }
-}
+use crate::ConnectorControlHost;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CatalogMaterializationConfig {
@@ -194,9 +162,9 @@ enum LocalProjection {
 
 /// Aggregate local materialization result for one exact desired-state snapshot.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct CatalogProjectionCounts {
-    pub(crate) ready: usize,
-    pub(crate) unavailable: usize,
+pub struct CatalogProjectionCounts {
+    pub ready: usize,
+    pub unavailable: usize,
 }
 
 impl LocalProjection {
@@ -225,7 +193,7 @@ impl LocalProjection {
 /// — a role that never serves external catalogs — which is a different thing
 /// from a source that exists and is failing.
 // Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
-pub struct FrontendCatalogApplicationPort {
+pub struct CatalogApplicationService {
     source: Option<CatalogDesiredStateSource>,
     control: Arc<ConnectorControlHost>,
     runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
@@ -237,11 +205,12 @@ pub struct FrontendCatalogApplicationPort {
     reference_reader: Arc<dyn CatalogReferenceReader>,
 }
 
-impl FrontendCatalogApplicationPort {
+impl CatalogApplicationService {
     pub fn unavailable(
         control: Arc<ConnectorControlHost>,
         runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
         runtime: Handle,
+        reference_reader: Arc<dyn CatalogReferenceReader>,
     ) -> Self {
         Self {
             source: None,
@@ -252,7 +221,7 @@ impl FrontendCatalogApplicationPort {
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(CatalogMaterializationConfig::default()),
-            reference_reader: Arc::new(MvCatalogReferenceReader),
+            reference_reader,
         }
     }
 
@@ -261,6 +230,7 @@ impl FrontendCatalogApplicationPort {
         control: Arc<ConnectorControlHost>,
         runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
         runtime: Handle,
+        reference_reader: Arc<dyn CatalogReferenceReader>,
     ) -> Self {
         Self::new_with_materialization_config(
             source,
@@ -268,6 +238,7 @@ impl FrontendCatalogApplicationPort {
             runtime_publisher,
             runtime,
             CatalogMaterializationConfig::default(),
+            reference_reader,
         )
     }
 
@@ -277,6 +248,7 @@ impl FrontendCatalogApplicationPort {
         runtime_publisher: Arc<dyn CatalogRuntimePublisherSink>,
         runtime: Handle,
         materialization_config: CatalogMaterializationConfig,
+        reference_reader: Arc<dyn CatalogReferenceReader>,
     ) -> Self {
         Self {
             source: Some(source),
@@ -287,7 +259,7 @@ impl FrontendCatalogApplicationPort {
             complete_reachable_catalogs: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             scheduler: ProjectionScheduler::new(materialization_config),
-            reference_reader: Arc::new(MvCatalogReferenceReader),
+            reference_reader,
         }
     }
 
@@ -307,14 +279,14 @@ impl FrontendCatalogApplicationPort {
     /// this frontend has no source at all. The reconciler that consumes it
     /// owns a periodic sweep either way, so `None` costs latency, never
     /// correctness.
-    pub(crate) fn attachment_wakeup_signal(&self) -> Option<CatalogAttachmentWakeupSignal> {
+    pub fn attachment_wakeup_signal(&self) -> Option<CatalogAttachmentWakeupSignal> {
         self.source.as_ref()?.attachment_wakeup_signal()
     }
 
     /// A complete desired-state projection plus every still-draining local
     /// control generation. `None` means this frontend has not completed a
     /// source enumeration, so pruning must skip the round.
-    pub(crate) fn reachable_catalog_handles(&self) -> Option<BTreeSet<CatalogHandle>> {
+    pub fn reachable_catalog_handles(&self) -> Option<BTreeSet<CatalogHandle>> {
         let mut reachable = self.complete_reachable_catalogs.lock().ok()?.clone()?;
         reachable.extend(self.control.reachable_catalog_handles().ok()?);
         Some(reachable)
@@ -528,11 +500,11 @@ impl FrontendCatalogApplicationPort {
     ///   an incomplete enumeration propagates and fails frontend bootstrap. It
     ///   cannot arrive here as a valid snapshot holding fewer catalogs, which
     ///   would retire the ones it lost.
-    /// * [`FrontendCatalogApplicationPort::materialize_entry`] returns `()`, so
+    /// * [`CatalogApplicationService::materialize_entry`] returns `()`, so
     ///   one catalog's provider failure cannot reach this function's `Result`
     ///   at all — it marks that catalog `Unavailable` and leaves the rest
     ///   serving.
-    pub(crate) async fn reconcile_with_page_size(
+    pub async fn reconcile_with_page_size(
         self: &Arc<Self>,
         page_size: usize,
         worker_count: usize,
@@ -546,7 +518,7 @@ impl FrontendCatalogApplicationPort {
     /// together with this process's materialization counts at the submission
     /// boundary. The source is enumerated exactly once; callers must not
     /// reread it merely to publish bootstrap observability.
-    pub(crate) async fn reconcile_snapshot_with_page_size(
+    pub async fn reconcile_snapshot_with_page_size(
         self: &Arc<Self>,
         page_size: usize,
         worker_count: usize,
@@ -995,7 +967,7 @@ impl FrontendCatalogApplicationPort {
     /// Stops all local admission before retiring existing leases. Durable
     /// attachments remain unchanged, so a later authoritative reconcile can
     /// construct fresh generations after a freshness outage.
-    pub(crate) fn unpublish_all(&self) {
+    pub fn unpublish_all(&self) {
         let attachments = self
             .projections
             .lock()
@@ -1027,7 +999,7 @@ impl FrontendCatalogApplicationPort {
         }
     }
 
-    pub(crate) fn projection_count(&self) -> usize {
+    pub fn projection_count(&self) -> usize {
         self.projections
             .lock()
             .map(|projections| {
@@ -1039,7 +1011,7 @@ impl FrontendCatalogApplicationPort {
             .unwrap_or_default()
     }
 
-    pub(crate) fn projection_counts(&self) -> CatalogProjectionCounts {
+    pub fn projection_counts(&self) -> CatalogProjectionCounts {
         self.projections
             .lock()
             .map(|projections| {
@@ -1088,7 +1060,7 @@ impl FrontendCatalogApplicationPort {
     }
 }
 
-impl CatalogApplicationPort for FrontendCatalogApplicationPort {
+impl CatalogApplicationPort for CatalogApplicationService {
     fn create_catalog(
         &self,
         command: CatalogCreateCommand,
@@ -1418,34 +1390,44 @@ fn materialization_error(
     CatalogApplicationError::new(kind, error.to_string())
 }
 
-fn mv_repository_error(error: CatalogApplicationError) -> MvRepositoryError {
-    let kind = match error.kind() {
-        // A source mode that forbids the operation refuses it permanently, so
-        // it is a request-level rejection rather than an outage to retry.
-        CatalogApplicationErrorKind::InvalidRequest
-        | CatalogApplicationErrorKind::UnsupportedSourceMode => {
-            MvRepositoryErrorKind::InvalidRequest
-        }
-        CatalogApplicationErrorKind::NotFound
-        | CatalogApplicationErrorKind::AlreadyExists
-        | CatalogApplicationErrorKind::Conflict => MvRepositoryErrorKind::Conflict,
-        // The source could not be read completely; a later attempt may succeed,
-        // and nothing about desired state was proven either way.
-        CatalogApplicationErrorKind::Unavailable
-        | CatalogApplicationErrorKind::DesiredStateEnumerationIncomplete => {
-            MvRepositoryErrorKind::Unavailable
-        }
-        CatalogApplicationErrorKind::Internal => MvRepositoryErrorKind::Corruption,
-    };
-    MvRepositoryError::new(kind, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
     use futures::FutureExt;
+
+    struct TestRuntimePublisher;
+
+    impl CatalogRuntimePublisherSink for TestRuntimePublisher {
+        fn publish_catalog_runtime(
+            &self,
+            _observation: CatalogRuntimeObservation,
+        ) -> Result<(), CatalogApplicationError> {
+            Ok(())
+        }
+
+        fn unpublish_catalog_runtime(
+            &self,
+            _instance_id: &ConnectorInstanceId,
+            _generation: u64,
+        ) -> Result<(), CatalogApplicationError> {
+            Ok(())
+        }
+    }
+
+    struct TestReferenceReader;
+
+    impl CatalogReferenceReader for TestReferenceReader {
+        fn observe_references<'a>(
+            &'a self,
+            _store: &'a dyn novarocks_state_store_api::StateStore,
+            _instance_id: &'a ConnectorInstanceId,
+            _page_size: usize,
+        ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
 
     struct FailingRoleFactory {
         disposition: ConnectorMaterializationRetryDisposition,
@@ -1513,14 +1495,15 @@ mod tests {
         .expect("desired-state entry")
     }
 
-    fn scheduler_port(factory: Arc<FailingRoleFactory>) -> Arc<FrontendCatalogApplicationPort> {
+    fn scheduler_port(factory: Arc<FailingRoleFactory>) -> Arc<CatalogApplicationService> {
         let control = Arc::new(
             ConnectorControlHost::with_role_factories(vec![factory]).expect("role factory host"),
         );
-        Arc::new(FrontendCatalogApplicationPort::unavailable(
+        Arc::new(CatalogApplicationService::unavailable(
             control,
-            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            Arc::new(TestRuntimePublisher),
             tokio::runtime::Handle::current(),
+            Arc::new(TestReferenceReader),
         ))
     }
 
@@ -1628,13 +1611,12 @@ mod tests {
                 .expect("incarnation")
                 + 1;
             async move {
-                let control =
-                    novarocks_catalog_application::test_support::test_control_binding_for(
-                        properties.handle().catalog_name().clone(),
-                        incarnation,
-                    )
-                    .with_catalog_properties(properties.as_catalog_properties().clone())
-                    .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                let control = crate::test_support::test_control_binding_for(
+                    properties.handle().catalog_name().clone(),
+                    incarnation,
+                )
+                .with_catalog_properties(properties.as_catalog_properties().clone())
+                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
                 novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                     properties,
                     Arc::new(control),
@@ -1668,10 +1650,11 @@ mod tests {
             })])
             .expect("role factory host"),
         );
-        let port = Arc::new(FrontendCatalogApplicationPort::unavailable(
+        let port = Arc::new(CatalogApplicationService::unavailable(
             Arc::clone(&control),
-            crate::catalog_application::CatalogRuntimeProjection::new().publisher(),
+            Arc::new(TestRuntimePublisher),
             tokio::runtime::Handle::current(),
+            Arc::new(TestReferenceReader),
         ));
         let entry = scheduler_entry("catalog.steady");
         let instance_id = entry.config().instance_id().clone();

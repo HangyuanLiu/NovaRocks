@@ -1759,7 +1759,7 @@ fn resolve_catalog_name(
         .require_external_catalog_ready(&normalized)
         .map_err(|error| {
             let kind = match error.kind() {
-                crate::catalog_application::CatalogApplicationErrorKind::Unavailable => {
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable => {
                     QueryServiceErrorKind::Unavailable
                 }
                 _ => QueryServiceErrorKind::BadDatabase,

@@ -685,7 +685,7 @@ pub(crate) fn execute_drop_catalog_statement(
     // dependency scan that fences it, both inside one serializable StateStore
     // transaction. Core must not pre-check dependencies outside that fence.
     application
-        .drop_catalog(crate::catalog_application::CatalogDropCommand {
+        .drop_catalog(novarocks_catalog_application::CatalogDropCommand {
             instance_id,
             if_exists,
         })

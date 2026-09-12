@@ -15,10 +15,10 @@ use novarocks_proto_codec::catalog::PruneCatalogsRequest;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::common::backend_topology::BackendTopologyService;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::{CatalogPruneDispatchOutcome, prune_catalogs};
+use novarocks_catalog_application::CatalogApplicationService;
 
 #[derive(Clone, Debug)]
 pub struct CatalogPruneConfig {
@@ -46,7 +46,7 @@ impl CatalogPruneConfig {
 
 /// A best-effort worker: no failed or late prune changes query correctness.
 pub(crate) struct FrontendCatalogPruneService {
-    catalogs: Arc<FrontendCatalogApplicationPort>,
+    catalogs: Arc<CatalogApplicationService>,
     topology: BackendTopologyService,
     data_runtime: FrontendDataRuntime,
     config: CatalogPruneConfig,
@@ -57,7 +57,7 @@ pub(crate) struct FrontendCatalogPruneService {
 
 impl FrontendCatalogPruneService {
     pub(crate) fn new(
-        catalogs: Arc<FrontendCatalogApplicationPort>,
+        catalogs: Arc<CatalogApplicationService>,
         topology: BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         config: CatalogPruneConfig,

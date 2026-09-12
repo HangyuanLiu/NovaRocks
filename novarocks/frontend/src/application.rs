@@ -50,13 +50,7 @@ use novarocks_state_store_api::{StateStore, StateStoreProviderId};
 use novarocks_state_store_runtime::{StateStoreRunPolicy, validate_persistent_state_families};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
-use crate::catalog_application::desired_state::{
-    CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
-};
-use crate::catalog_application::{
-    CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, FrontendCatalogApplicationPort,
-    frontend_port::CatalogMaterializationConfig,
-};
+use crate::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
@@ -84,6 +78,10 @@ use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingWorkloadSnapshotReader,
+};
+use novarocks_catalog_application::{
+    CatalogApplicationService, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
+    CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode, CatalogMaterializationConfig,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
@@ -479,7 +477,7 @@ pub struct FrontendApplicationHost {
     dml_service: Option<Arc<DmlService>>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
-    catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
+    catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
@@ -1051,12 +1049,13 @@ impl FrontendApplicationHost {
                 }
             };
         host.catalog_application_port = Some(Arc::new(
-            FrontendCatalogApplicationPort::new_with_materialization_config(
+            CatalogApplicationService::new_with_materialization_config(
                 catalog_source,
                 Arc::clone(&host.connector_control),
                 host.catalog_runtime_projection.publisher(),
                 tokio::runtime::Handle::current(),
                 execution.catalog_materialization,
+                Arc::new(MvCatalogReferenceReader),
             ),
         ));
         if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore {
@@ -1351,12 +1350,13 @@ impl FrontendApplicationHost {
 
     pub fn catalog_application_port(
         &self,
-    ) -> Arc<dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
         let application = Arc::clone(
             self.catalog_application_port
                 .as_ref()
                 .expect("catalog application port is installed before host open returns"),
-        ) as Arc<dyn crate::catalog_application::CatalogApplicationPort>;
+        )
+            as Arc<dyn novarocks_catalog_application::CatalogApplicationPort>;
         self.catalog_runtime_projection
             .bind_application(application)
     }
@@ -2150,11 +2150,11 @@ mod tests {
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance id");
         assert!(matches!(
-            crate::catalog_application::CatalogApplicationPort::admit_catalog(
+            novarocks_catalog_application::CatalogApplicationPort::admit_catalog(
                 host.catalog_application_port().as_ref(),
                 &instance_id,
             ),
-            crate::catalog_application::CatalogAdmission::Absent
+            novarocks_catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
     }

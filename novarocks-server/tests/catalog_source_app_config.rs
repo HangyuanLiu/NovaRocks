@@ -17,7 +17,7 @@
 
 use std::fs;
 
-use novarocks_frontend::catalog_application::{
+use novarocks_catalog_application::{
     CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
 };
 use novarocks_server::app_config::NovaRocksConfig;

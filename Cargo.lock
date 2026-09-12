@@ -3633,6 +3633,7 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "bytes",
+ "chrono",
  "futures",
  "hex",
  "novarocks-connector-starrocks",
@@ -3642,8 +3643,10 @@ dependencies = [
  "novarocks-state-store-testkit",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
  "tracing",
  "uuid",
 ]
@@ -4124,6 +4127,7 @@ dependencies = [
  "libc",
  "mysql",
  "novarocks-backend",
+ "novarocks-catalog-application",
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-connector-paimon",

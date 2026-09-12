@@ -23,7 +23,6 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::common::backend_topology::BackendTopologyService;
@@ -36,6 +35,7 @@ use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
+use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -624,17 +624,17 @@ impl SessionCatalogResolver {
     pub fn require_external_catalog_ready(
         &self,
         catalog_name: &str,
-    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+    ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
         let application = self.catalog_application.as_ref().ok_or_else(|| {
-            crate::catalog_application::CatalogApplicationError::new(
-                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+            novarocks_catalog_application::CatalogApplicationError::new(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable,
                 "external catalogs require a configured frontend catalog application",
             )
         })?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
             .map_err(|error| {
-                crate::catalog_application::CatalogApplicationError::new(
-                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                novarocks_catalog_application::CatalogApplicationError::new(
+                    novarocks_catalog_application::CatalogApplicationErrorKind::InvalidRequest,
                     format!("invalid catalog connector instance ID: {error}"),
                 )
             })?;

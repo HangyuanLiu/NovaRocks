@@ -37,18 +37,19 @@ use std::time::{Duration, Instant};
 
 use common::state_store_fixture;
 use novarocks_catalog_application::ConnectorControlHost;
+use novarocks_catalog_application::{
+    CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
+    CatalogDropCommand,
+};
+use novarocks_catalog_application::{
+    CatalogApplicationService, CatalogDesiredStateSource, CatalogDesiredStateSourceInput,
+    CatalogDesiredStateSourceMode, CatalogSqlMutationAdmission,
+};
 use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
 use novarocks_frontend::application::{
     FrontendApplicationErrorKind, FrontendApplicationHost, FrontendExecutionConfig,
 };
-use novarocks_frontend::catalog_application::desired_state::{
-    CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
-    CatalogSqlMutationAdmission,
-};
-use novarocks_frontend::catalog_application::{
-    CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
-    CatalogDropCommand, CatalogRuntimeProjection, FrontendCatalogApplicationPort,
-};
+use novarocks_frontend::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
 use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use novarocks_frontend::topology::ClusterBackendOpenConfig;
 use novarocks_native_adapter::FrontendNativeTransport;
@@ -391,31 +392,29 @@ fn create_command(name: &str) -> CatalogCreateCommand {
 fn port_with(
     source: CatalogDesiredStateSource,
     factory: SelectivelyFailingFactory,
-) -> (
-    Arc<ConnectorControlHost>,
-    Arc<FrontendCatalogApplicationPort>,
-) {
+) -> (Arc<ConnectorControlHost>, Arc<CatalogApplicationService>) {
     let control = Arc::new(
         ConnectorControlHost::with_role_factories(vec![Arc::new(factory)]).expect("control host"),
     );
-    let port = Arc::new(FrontendCatalogApplicationPort::new(
+    let port = Arc::new(CatalogApplicationService::new(
         source,
         Arc::clone(&control),
         CatalogRuntimeProjection::new().publisher(),
         tokio::runtime::Handle::current(),
+        Arc::new(MvCatalogReferenceReader),
     ));
     (control, port)
 }
 
 fn controller(
     store: Arc<dyn StateStore>,
-    port: &Arc<FrontendCatalogApplicationPort>,
+    port: &Arc<CatalogApplicationService>,
 ) -> Arc<FrontendCatalogController> {
     FrontendCatalogController::new(store, Arc::clone(port), CatalogProjectionConfig::default())
         .expect("catalog controller")
 }
 
-async fn ready_attachment_id(port: &FrontendCatalogApplicationPort, name: &str) -> Uuid {
+async fn ready_attachment_id(port: &CatalogApplicationService, name: &str) -> Uuid {
     for _ in 0..100 {
         if let CatalogAdmission::Ready(observation) = port.admit_catalog(&catalog(name)) {
             return observation.attachment_id;

@@ -20,6 +20,7 @@ novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true
 novarocks-failpoint.workspace = true
 novarocks-frontend.workspace = true
+novarocks-catalog-application.workspace = true
 novarocks-functions.workspace = true
 novarocks-fs.workspace = true
 novarocks-memory.workspace = true

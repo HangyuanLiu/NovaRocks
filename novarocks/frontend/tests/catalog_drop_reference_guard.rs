@@ -41,12 +41,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::state_store_fixture;
 use novarocks_catalog_application::ConnectorControlHost;
-use novarocks_catalog_application::{CatalogAttachmentRepository, CatalogAttachmentVersioned};
-use novarocks_frontend::catalog_application::desired_state::CatalogDesiredStateSource;
-use novarocks_frontend::catalog_application::{
-    CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort, CatalogCreateCommand,
-    CatalogDropCommand, CatalogRuntimeProjection, FrontendCatalogApplicationPort,
+use novarocks_catalog_application::{
+    CatalogAdmission, CatalogApplicationErrorKind, CatalogApplicationPort,
+    CatalogApplicationService, CatalogCreateCommand, CatalogDesiredStateSource, CatalogDropCommand,
 };
+use novarocks_catalog_application::{CatalogAttachmentRepository, CatalogAttachmentVersioned};
+use novarocks_frontend::catalog_application::{CatalogRuntimeProjection, MvCatalogReferenceReader};
 use novarocks_frontend::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
@@ -443,19 +443,17 @@ fn drop_command(name: &str) -> CatalogDropCommand {
 
 fn port_with(
     source: CatalogDesiredStateSource,
-) -> (
-    Arc<ConnectorControlHost>,
-    Arc<FrontendCatalogApplicationPort>,
-) {
+) -> (Arc<ConnectorControlHost>, Arc<CatalogApplicationService>) {
     let control = Arc::new(
         ConnectorControlHost::with_role_factories(vec![Arc::new(ReadyFactory::new())])
             .expect("control host"),
     );
-    let port = Arc::new(FrontendCatalogApplicationPort::new(
+    let port = Arc::new(CatalogApplicationService::new(
         source,
         Arc::clone(&control),
         CatalogRuntimeProjection::new().publisher(),
         tokio::runtime::Handle::current(),
+        Arc::new(MvCatalogReferenceReader),
     ));
     (control, port)
 }

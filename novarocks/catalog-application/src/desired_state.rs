@@ -58,11 +58,11 @@ use novarocks_spi::connector::{
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::{CatalogApplicationError, CatalogApplicationErrorKind};
-use novarocks_catalog_application::{
+use crate::{
     CATALOG_DESIRED_STATE_FAMILY, CatalogAttachment, CatalogAttachmentRepository,
     CatalogAttachmentWakeupSignal,
 };
+use crate::{CatalogApplicationError, CatalogApplicationErrorKind};
 
 /// Domain separator for the snapshot identity digest.
 const SNAPSHOT_IDENTITY_DOMAIN: &[u8] = b"novarocks/frontend/catalog/desired-state/snapshot/v3";
@@ -881,7 +881,7 @@ fn invalid_logical_config(detail: impl std::fmt::Display) -> CatalogApplicationE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_catalog_application::CatalogAttachment;
+    use crate::CatalogAttachment;
 
     fn config(name: &str, display: &str) -> CatalogLogicalConfig {
         CatalogLogicalConfig::try_new(

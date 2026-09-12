@@ -192,7 +192,7 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
 }
 
 impl ViewExecutionContext for ViewExecutionKernel {
@@ -206,7 +206,7 @@ impl ViewExecutionContext for ViewExecutionKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 }

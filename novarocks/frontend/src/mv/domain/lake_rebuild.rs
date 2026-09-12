@@ -142,7 +142,7 @@ pub struct LakeRebuildContext<'a> {
     /// lease to enumerate namespaces with.
     pub catalog_runtime_projection:
         Option<&'a Arc<crate::catalog_application::CatalogRuntimeProjection>>,
-    pub catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    pub catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn novarocks_spi::connector::ConnectorControlRegistry,
     pub mv_storage_observation: &'a dyn novarocks_spi::connector::MvStorageObservationPort,
     pub readiness: &'a MvReadinessPort,
@@ -412,7 +412,7 @@ fn validate_published_base_identity_map(
 /// Whether every catalog this lake MV package references is currently `Ready`
 /// on this frontend.
 fn package_catalogs_are_admitted(
-    application: Option<&dyn crate::catalog_application::CatalogApplicationPort>,
+    application: Option<&dyn novarocks_catalog_application::CatalogApplicationPort>,
     package: &MvLakePackageObservation,
 ) -> Result<bool, String> {
     let Some(application) = application else {
@@ -430,7 +430,7 @@ fn package_catalogs_are_admitted(
             .map_err(|error| format!("parse MV rebuild catalog `{catalog}`: {error}"))?;
         if !matches!(
             application.admit_catalog(&instance_id),
-            crate::catalog_application::CatalogAdmission::Ready(_)
+            novarocks_catalog_application::CatalogAdmission::Ready(_)
         ) {
             tracing::info!(
                 catalog = catalog.as_str(),
@@ -914,37 +914,37 @@ mod tests {
         );
     }
 
-    struct FixedAdmission(crate::catalog_application::CatalogAdmission);
+    struct FixedAdmission(novarocks_catalog_application::CatalogAdmission);
 
-    impl crate::catalog_application::CatalogApplicationPort for FixedAdmission {
+    impl novarocks_catalog_application::CatalogApplicationPort for FixedAdmission {
         fn create_catalog(
             &self,
-            _command: crate::catalog_application::CatalogCreateCommand,
+            _command: novarocks_catalog_application::CatalogCreateCommand,
         ) -> Result<
-            crate::catalog_application::CatalogRuntimeObservation,
-            crate::catalog_application::CatalogApplicationError,
+            novarocks_catalog_application::CatalogRuntimeObservation,
+            novarocks_catalog_application::CatalogApplicationError,
         > {
             unreachable!("lake rebuild never creates a catalog")
         }
 
         fn drop_catalog(
             &self,
-            _command: crate::catalog_application::CatalogDropCommand,
-        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+            _command: novarocks_catalog_application::CatalogDropCommand,
+        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
             unreachable!("lake rebuild never drops a catalog")
         }
 
         fn admit_catalog(
             &self,
             _instance_id: &ConnectorInstanceId,
-        ) -> crate::catalog_application::CatalogAdmission {
+        ) -> novarocks_catalog_application::CatalogAdmission {
             self.0.clone()
         }
     }
 
     fn application_with_admission(
-        admission: crate::catalog_application::CatalogAdmission,
-    ) -> Arc<dyn crate::catalog_application::CatalogApplicationPort> {
+        admission: novarocks_catalog_application::CatalogAdmission,
+    ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
         Arc::new(FixedAdmission(admission))
     }
 
@@ -958,17 +958,18 @@ mod tests {
         let package = sample_package(sample_publication());
 
         let absent =
-            application_with_admission(crate::catalog_application::CatalogAdmission::Absent);
+            application_with_admission(novarocks_catalog_application::CatalogAdmission::Absent);
         assert!(
             !package_catalogs_are_admitted(Some(absent.as_ref()), &package)
                 .expect("absent admission is decidable"),
             "an absent attachment must make the sweep skip the package"
         );
 
-        let unavailable =
-            application_with_admission(crate::catalog_application::CatalogAdmission::Unavailable {
+        let unavailable = application_with_admission(
+            novarocks_catalog_application::CatalogAdmission::Unavailable {
                 reason: "projection is stale".to_string(),
-            });
+            },
+        );
         assert!(
             !package_catalogs_are_admitted(Some(unavailable.as_ref()), &package)
                 .expect("unavailable admission is decidable"),
@@ -976,8 +977,8 @@ mod tests {
         );
 
         let ready =
-            application_with_admission(crate::catalog_application::CatalogAdmission::Ready(
-                crate::catalog_application::CatalogRuntimeObservation {
+            application_with_admission(novarocks_catalog_application::CatalogAdmission::Ready(
+                novarocks_catalog_application::CatalogRuntimeObservation {
                     attachment_id: uuid::Uuid::now_v7(),
                     instance_id: ConnectorInstanceId::parse("ice").expect("instance ID"),
                     provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")

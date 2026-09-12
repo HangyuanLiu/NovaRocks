@@ -36,8 +36,8 @@ use crate::catalog_application::statement::{
     execute_drop_database_statement, execute_drop_table_statement,
     execute_typed_create_table_statement,
 };
-use crate::catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use crate::mv::domain::readiness::MvReadinessPort;
+use novarocks_catalog_application::{CatalogApplicationPort, CatalogCreateCommand};
 use novarocks_parser::ast::{CatalogStatement, LiteralKind};
 use novarocks_query_application::api::ResultField as QueryResultColumn;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;

@@ -122,7 +122,7 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost>;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
     fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
     fn capture_dml_fallback_execution(
         &self,
@@ -144,7 +144,7 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
@@ -177,7 +177,7 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
