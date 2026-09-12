@@ -24,4 +24,5 @@
 
 pub mod activity;
 pub mod candidate;
+pub mod maintenance;
 pub mod process_runtime;
