@@ -22,7 +22,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use novarocks_frontend::FrontendStatisticsService;
 use novarocks_frontend::common::admitted_query_context::{RequestAdmission, RequestContext};
 use novarocks_frontend::common::backend_topology::BackendTopologySnapshot;
 use novarocks_frontend::dml::DmlService;
@@ -211,7 +210,7 @@ fn command() -> TruncateCommand {
 }
 
 fn service() -> DmlService {
-    DmlService::new(Arc::new(FrontendStatisticsService::new()))
+    DmlService::new()
 }
 
 #[test]

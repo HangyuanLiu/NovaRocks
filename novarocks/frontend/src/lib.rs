@@ -68,7 +68,6 @@ pub use state_store::{
     RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
     StateStoreRunPolicy, run_side_effect_free,
 };
-pub use statistics::FrontendStatisticsService;
 pub use system_catalog::SystemCatalogService;
 pub use topology::ClusterBackendOpenConfig;
 pub use view::FrontendViewService;

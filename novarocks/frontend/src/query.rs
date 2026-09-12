@@ -3056,7 +3056,7 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(41, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -3083,7 +3083,7 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(73, deadline, &cancellation);
@@ -3116,7 +3116,7 @@ mod tests {
         let engine = RecordingInsertEngine::default();
         let delete_engine = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let context = router_test_context(88, deadline, &cancellation);
@@ -3147,7 +3147,7 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(92, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -3178,7 +3178,7 @@ mod tests {
         let insert = RecordingInsertEngine::default();
         let delete = RecordingDeleteEngine::default();
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(93, Instant::now() + Duration::from_secs(30), &cancellation);
@@ -3205,7 +3205,7 @@ mod tests {
         let delete = RecordingDeleteEngine::default();
         let mutation = RejectingMutationEngine;
         let command = RecordingCoreCommand::default();
-        let dml = DmlService::new(Arc::new(crate::statistics::FrontendStatisticsService::new()));
+        let dml = DmlService::new();
         let cancellation = QueryCancellationSource::new();
         let context =
             router_test_context(95, Instant::now() + Duration::from_secs(30), &cancellation);

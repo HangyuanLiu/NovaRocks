@@ -73,7 +73,6 @@ use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
 };
-use crate::statistics::FrontendStatisticsService;
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, StatisticsApplicationService,
 };
@@ -468,7 +467,6 @@ pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
-    statistics_service: Option<Arc<FrontendStatisticsService>>,
     dml_service: Option<Arc<DmlService>>,
     statistics_application_service: Option<Arc<StatisticsApplicationService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
@@ -960,7 +958,6 @@ impl FrontendApplicationHost {
             connector_control,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
-            statistics_service: None,
             dml_service: None,
             statistics_application_service: None,
             statistics_application_port: None,
@@ -1209,9 +1206,7 @@ impl FrontendApplicationHost {
             }
             host.abandoned_attempt_sweeper = Some(sweeper);
         }
-        host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
-        let statistics = host.statistics_service();
-        host.dml_service = Some(Arc::new(DmlService::new(statistics)));
+        host.dml_service = Some(Arc::new(DmlService::new()));
         // Local views are process runtime state, so this service has nothing to
         // load and no store to fail against.
         host.view_service = Some(Arc::new(FrontendViewService::new()));
@@ -1314,13 +1309,6 @@ impl FrontendApplicationHost {
                 .as_ref()
                 .expect("frontend view service is installed before host open returns"),
         )
-    }
-
-    pub fn statistics_service(&self) -> Arc<FrontendStatisticsService> {
-        self.statistics_service
-            .as_ref()
-            .expect("frontend statistics service is installed before host open returns")
-            .clone()
     }
 
     pub fn dml_service(&self) -> Arc<DmlService> {
@@ -1862,7 +1850,6 @@ impl FrontendApplicationHost {
         self.topology.take();
         self.dml_service.take();
         self.table_maintenance_service.take();
-        self.statistics_service.take();
         // Process-local job services do not own StateStore job records. Release
         // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();

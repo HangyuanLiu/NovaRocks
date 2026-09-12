@@ -330,9 +330,6 @@ pub fn build_frontend_query_session_factory(
         query_execution.clone(),
         host.lake_publication_runtime_policy(),
     ));
-    host.dml_service()
-        .install_local_catalog(Arc::clone(&catalog_service));
-
     let query_service = Arc::new(crate::query::FrontendQueryService::new(
         session_catalog_resolver,
         query_compiler,
