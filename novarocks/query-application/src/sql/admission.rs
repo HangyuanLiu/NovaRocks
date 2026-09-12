@@ -25,11 +25,12 @@ use crate::engine_error::EngineError;
 use crate::session_error::{QueryServiceError, QueryServiceErrorKind};
 use novarocks_types::EngineErrorCode;
 
-/// Return the single executable SQL statement admitted without negotiated
-/// multi-statement support. Empty fragments and comments have no effect.
-pub fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
+/// Returns all executable SQL fragments from one COM_QUERY request. Empty
+/// fragments and comments have no effect. Callers must gate use of more than
+/// one fragment on the protocol capability negotiated for that connection.
+pub fn negotiated_query_statements(sql: &str) -> Result<Vec<&str>, QueryServiceError> {
     let mut cursor = SqlBatchCursor::new(sql);
-    let mut statement = None;
+    let mut statements = Vec::new();
     while let Some(fragment) = cursor.next_fragment()? {
         let trimmed = strip_leading_line_comments(fragment.trim());
         if trimmed.is_empty() {
@@ -42,14 +43,22 @@ pub fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServ
         if !is_statement {
             continue;
         }
-        if statement.replace(fragment).is_some() {
-            return Err(QueryServiceError::new(
-                QueryServiceErrorKind::Unsupported,
-                "multiple SQL statements require negotiated MySQL multi-statement support",
-            ));
-        }
+        statements.push(fragment);
     }
-    Ok(statement)
+    Ok(statements)
+}
+
+/// Return the single executable SQL statement admitted without negotiated
+/// multi-statement support. Empty fragments and comments have no effect.
+pub fn unnegotiated_query_statement(sql: &str) -> Result<Option<&str>, QueryServiceError> {
+    let mut statements = negotiated_query_statements(sql)?;
+    if statements.len() > 1 {
+        return Err(QueryServiceError::new(
+            QueryServiceErrorKind::Unsupported,
+            "multiple SQL statements require negotiated MySQL multi-statement support",
+        ));
+    }
+    Ok(statements.pop())
 }
 
 /// Parse the test-only SQL hook that forces a stable engine error.
@@ -165,6 +174,14 @@ mod tests {
         let error = unnegotiated_query_statement("SET query_timeout = 1; SELECT 1")
             .expect_err("must reject multiple statements");
         assert_eq!(error.kind(), QueryServiceErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn negotiated_admission_retains_each_executable_fragment_in_order() {
+        assert_eq!(
+            negotiated_query_statements("; SET query_timeout = 1; /* separator */ SELECT 1;"),
+            Ok(vec![" SET query_timeout = 1", " /* separator */ SELECT 1"])
+        );
     }
 
     #[test]

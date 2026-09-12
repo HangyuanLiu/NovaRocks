@@ -90,6 +90,17 @@ impl QuerySessionOpenRequest {
 pub trait QuerySession: Send + Sync + 'static {
     async fn init_database(&self, schema: &str) -> Result<(), QueryServiceError>;
 
+    /// Executes one protocol-framed SQL fragment. Query Application validates
+    /// it as exactly one statement; protocol adapters use this for negotiated
+    /// multi-statement requests so statement ordering remains application
+    /// owned.
+    async fn execute_statement(
+        &self,
+        sql: &str,
+    ) -> Result<QuerySessionStatement, QueryServiceError>;
+
+    /// Executes an unnegotiated COM_QUERY request. Implementations must reject
+    /// more than one executable SQL statement.
     async fn execute_batch(&self, sql: &str) -> Result<QuerySessionStatement, QueryServiceError>;
 
     fn cancel_current(&self, reason: QueryCancellationReason);

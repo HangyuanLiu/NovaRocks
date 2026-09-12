@@ -691,7 +691,7 @@ impl FrontendQuerySession {
             })
     }
 
-    async fn execute_statement(
+    async fn execute_one_statement(
         &self,
         statement: &str,
     ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
@@ -1612,6 +1612,14 @@ impl QuerySession for FrontendQuerySession {
             );
         };
         self.execute_statement(statement).await
+    }
+
+    async fn execute_statement(
+        &self,
+        statement: &str,
+    ) -> Result<novarocks_query_application::session::QuerySessionStatement, QueryServiceError>
+    {
+        self.execute_one_statement(statement).await
     }
 
     fn cancel_current(&self, reason: QueryCancellationReason) {

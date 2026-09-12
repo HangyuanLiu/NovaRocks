@@ -36,11 +36,12 @@ pub mod session_admit;
 /// Query-result scalar conversion used by SQL session user variables.
 pub mod user_variable;
 
-/// The application boundary accepts one already-framed SQL statement.
+/// The application boundary accepts one framed SQL statement.
 ///
-/// Protocol adapters own batch framing and multi-result negotiation. Once a
-/// fragment crosses that boundary, this function is the sole parser admission
-/// point and rejects a fragment that contains more than one statement.
+/// Query Application owns SQL batch framing and parser admission. Protocol
+/// adapters negotiate multi-result capability and ask the application to
+/// execute each admitted fragment in order; this function rejects a fragment
+/// that contains more than one statement.
 pub fn parse_single_statement(source: &str) -> Result<Statement, SqlStatementParseError> {
     parse_optional_single_statement(source)?
         .ok_or(SqlStatementParseError::ExpectedExactlyOne { actual: 0 })
