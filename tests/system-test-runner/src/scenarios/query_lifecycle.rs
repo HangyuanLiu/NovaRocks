@@ -31,6 +31,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedBaseline),
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
+        Box::new(NoEffectReadAfterBackendExit),
         Box::new(Nid2CreateConflict),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),
@@ -144,6 +145,91 @@ impl Scenario for QueryTimeout {
         context.action(format!("received expected MySQL timeout error: {error}"));
 
         await_resource_convergence(context, &baseline)
+    }
+}
+
+/// A read may replace its attempt only before it has made any result visible.
+///
+/// This case deliberately keeps the public MySQL stream unread until after the
+/// selected BE has exited. A fresh task-create marker is the admission witness:
+/// it identifies the process that accepted this exact in-flight attempt without
+/// guessing a scheduler placement. The slow expression is workload, not the
+/// oracle; the marker is what orders the kill after task admission.
+struct NoEffectReadAfterBackendExit;
+
+impl Scenario for NoEffectReadAfterBackendExit {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/no-effect-read-after-backend-exit"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_snapshot(context)?;
+        let before_execution = latest_execution_id(context)?;
+        let create_counts = (0..context.handle().be_count())
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut stream = MysqlStream::query(
+            context.mysql_user(),
+            context.mysql_port(),
+            NID2_FENCE_QUERY,
+            // The second attempt repeats the deliberate ten-second workload.
+            // A generic ten-second socket cap would therefore abort the public
+            // client before a healthy replacement can send its first row.
+            context.remaining("open no-effect recovery MySQL client")?,
+        )?;
+        context.action(
+            "sent an unread no-effect distributed read through a raw public MySQL connection",
+        );
+
+        let target = await_fresh_task_create(context, &create_counts)?;
+        context.action(format!(
+            "observed a fresh TaskCreate admission for the unread read on BE[{target}]"
+        ));
+        context
+            .handle()
+            .kill_be(target)
+            .with_context(|| format!("kill admitted BE[{target}] without restarting it"))?;
+        await_backend_exit(context, target)?;
+        context.action(format!(
+            "confirmed BE[{target}] exited while the public client had not read a result"
+        ));
+
+        assert_two_sleep_rows(&mut stream)?;
+        let terminal = await_terminal_snapshot(context, before_execution.as_deref())?;
+        ensure!(
+            terminal.attempt_id == 2,
+            "no-effect read after BE exit must complete on replacement attempt 2, got attempt {}",
+            terminal.attempt_id
+        );
+        let participants = task_evidence::assert_query_completed_across_boundary(
+            context,
+            &terminal,
+            "no-effect read after BE exit",
+        )?;
+        ensure!(
+            !participants.contains(&target),
+            "replacement attempt unexpectedly completed through exited BE[{target}]: {participants:?}"
+        );
+        context.action(format!(
+            "verified unread no-effect read completed as attempt=2 on remaining task participants {participants:?}"
+        ));
+
+        await_resource_convergence(context, &baseline)?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_until(target, deadline)
+            .with_context(|| format!("restore BE[{target}] after no-restart recovery assertion"))?;
+        context.action(format!(
+            "restored BE[{target}] only after the no-restart recovery assertion completed"
+        ));
+        Ok(())
     }
 }
 
@@ -441,6 +527,103 @@ fn await_token_scoped_marker(
         ))?;
         thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
     }
+}
+
+/// Finds the BE that admitted a task after this scenario captured its own log
+/// counts. The marker is emitted only after the backend has accepted the
+/// CreateTask operation, so a returned index is an actual participant rather
+/// than a scheduler prediction.
+fn await_fresh_task_create(
+    context: &mut ScenarioContext,
+    baseline_counts: &[usize],
+) -> Result<usize> {
+    loop {
+        for (index, baseline) in baseline_counts.iter().copied().enumerate() {
+            let current = context
+                .handle()
+                .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+                .with_context(|| format!("read TaskCreate evidence from BE[{index}]"))?;
+            if current > baseline {
+                return Ok(index);
+            }
+        }
+        let remaining =
+            context.remaining("observe a fresh TaskCreate admission for the unread read")?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_backend_exit(context: &mut ScenarioContext, target: usize) -> Result<()> {
+    loop {
+        let snapshot = resource_snapshot(context)?;
+        let backend = snapshot
+            .backends
+            .get(target)
+            .with_context(|| format!("resource snapshot omitted BE[{target}]"))?;
+        if !backend.process_running {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!("observe BE[{target}] process exit"))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+/// The delayed read returns two `sleep(10)` values. We intentionally begin
+/// reading only after the BE exit above, so this validates both result delivery
+/// and that no result became visible before recovery was required.
+fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
+    let packets = [
+        stream.read_packet("recovered read column count")?,
+        stream.read_packet("recovered read column definition")?,
+        stream.read_packet("recovered read metadata terminator")?,
+        stream.read_packet("recovered read first row")?,
+        stream.read_packet("recovered read second row")?,
+        stream.read_packet("recovered read terminal")?,
+    ];
+    for (offset, packet) in packets.iter().enumerate() {
+        ensure!(
+            packet.sequence() == offset as u8 + 1,
+            "recovered read packet {} had sequence {}, expected {}",
+            offset + 1,
+            packet.sequence(),
+            offset + 1
+        );
+        ensure!(
+            !packet.is_error(),
+            "recovered read packet {} was a MySQL error: {:?}",
+            offset + 1,
+            packet.payload()
+        );
+    }
+    ensure!(
+        packets[0].payload() == [1],
+        "recovered read expected one result column, got {:?}",
+        packets[0].payload()
+    );
+    ensure!(
+        !packets[1].is_result_terminator(),
+        "recovered read column definition was a terminator: {:?}",
+        packets[1].payload()
+    );
+    ensure!(
+        packets[2].is_result_terminator(),
+        "recovered read metadata did not terminate: {:?}",
+        packets[2].payload()
+    );
+    for (ordinal, packet) in packets[3..5].iter().enumerate() {
+        ensure!(
+            packet.payload() == [1, b'1'],
+            "recovered read row {} expected sleep result 1, got {:?}",
+            ordinal + 1,
+            packet.payload()
+        );
+    }
+    ensure!(
+        packets[5].is_result_terminator() && !packets[5].has_more_results(),
+        "recovered read did not end with one terminal success packet: {:?}",
+        packets[5].payload()
+    );
+    Ok(())
 }
 
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
