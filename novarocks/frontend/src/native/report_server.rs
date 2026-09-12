@@ -11,7 +11,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_proto_codec::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 
-use crate::coordinator::{
+use crate::query_execution::lifecycle_diagnostics::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
@@ -749,11 +749,11 @@ mod tests {
     use std::sync::Arc;
 
     use super::{FrontendReportServerHandle, lifecycle_convergence_debug_snapshot};
-    use crate::coordinator::{
+    use crate::metrics::FrontendProcessQueryCountersSnapshot;
+    use crate::query_execution::lifecycle_diagnostics::{
         QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
     };
-    use crate::metrics::FrontendProcessQueryCountersSnapshot;
     use crate::query_execution::runtime_filter_terminal_rollup::{
         RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
         RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalParticipant,
@@ -786,15 +786,16 @@ mod tests {
     impl QueryLifecycleConvergenceReader for EmptyConvergenceReader {
         fn latest_convergence_snapshot(
             &self,
-        ) -> Option<crate::coordinator::QueryLifecycleConvergenceSnapshot> {
+        ) -> Option<crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot>
+        {
             None
         }
     }
 
     fn debug_snapshot_with_runtime_filter(
         runtime_filter: RuntimeFilterTerminalRollupSnapshot,
-    ) -> crate::coordinator::QueryLifecycleConvergenceSnapshot {
-        crate::coordinator::QueryLifecycleConvergenceSnapshot {
+    ) -> crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+        crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
             execution_id: QueryExecutionId::new(
                 QueryId::new(51, 52),
                 AttemptId::new(1).expect("nonzero attempt"),

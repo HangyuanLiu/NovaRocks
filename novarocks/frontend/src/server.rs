@@ -610,7 +610,7 @@ fn start_early_management_server(
     let management_island_reader: Arc<dyn crate::topology::BackendIslandSnapshotReader> =
         island_reader.clone();
     let management_convergence_reader: Arc<
-        dyn crate::coordinator::QueryLifecycleConvergenceReader,
+        dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
         &config.report_bind_host,

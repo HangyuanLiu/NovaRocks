@@ -23,7 +23,9 @@ use std::thread::JoinHandle;
 use tokio::net::TcpListener as TokioTcpListener;
 use tokio::sync::watch;
 
-use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+use crate::query_execution::lifecycle_diagnostics::{
+    QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+};
 use crate::topology::BackendIslandSnapshotReader;
 use crate::workload_lifecycle::FrontendServingSnapshotReader;
 

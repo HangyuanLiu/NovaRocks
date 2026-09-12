@@ -25,10 +25,5 @@ mod scheduler;
 )]
 pub(crate) mod task_round;
 
-pub(crate) use crate::query_execution::lifecycle_diagnostics::{
-    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
-};
 pub use execution::FrontendDistributedQueryCoordinator;
 pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};

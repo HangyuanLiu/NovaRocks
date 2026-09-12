@@ -59,13 +59,14 @@ use crate::catalog_attachment::CatalogAttachmentRepository;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
-use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
+use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::dml::DmlService;
 use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
+use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{

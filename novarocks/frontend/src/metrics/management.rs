@@ -26,7 +26,7 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::coordinator::QueryLifecycleConvergenceReader;
+use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
 use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
@@ -275,7 +275,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{FrontendMetricsRegistry, frontend_management_router_with_readers};
-    use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+    use crate::query_execution::lifecycle_diagnostics::{
+        QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+    };
     use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
     use crate::workload_lifecycle::{
         FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
