@@ -43,14 +43,15 @@ use crate::mv::domain::repository::MvRepositoryError;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
+use novarocks_mv_application::maintenance::MaintenanceCoordinator;
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
 use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{
-    AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
-    MaintenanceCoordinatorConfig, MaintenanceExecutionReport,
+    AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinatorConfig,
+    MaintenanceExecutionReport,
 };
 
 /// Dependencies bound by the frontend host after Core has completed restore,

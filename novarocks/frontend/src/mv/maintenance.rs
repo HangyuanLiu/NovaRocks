@@ -36,10 +36,12 @@ use novarocks_table_maintenance::{
 
 /// Process-local maintenance policy state.  It is intentionally non-durable:
 /// recovery re-evaluates current provider facts and durable action state.
+#[cfg(test)]
 pub(crate) struct MaintenanceCoordinator {
     inner: novarocks_mv_application::maintenance::MaintenanceCoordinator,
 }
 
+#[cfg(test)]
 impl MaintenanceCoordinator {
     pub(crate) fn new(config: MaintenanceCoordinatorConfig) -> Self {
         Self {
