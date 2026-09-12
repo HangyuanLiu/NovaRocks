@@ -44,6 +44,19 @@ pub struct MvReadinessPort {
     handle: tokio::runtime::Handle,
 }
 
+/// Read-only inventory for query-local MV candidate discovery.
+///
+/// A query freezes and validates every returned lake publication before it can
+/// substitute a scan. It therefore must not inherit the refresh executor's
+/// process-local readiness state: that state controls effect-capable refresh
+/// and DDL consumers, not whether a retained candidate can be independently
+/// proven against its exact publication.
+#[derive(Clone)]
+pub(crate) struct MvCandidateReader {
+    repository: Arc<dyn MvRepository>,
+    handle: tokio::runtime::Handle,
+}
+
 /// RAII ownership of the one current-process publication for a target.
 ///
 /// It has no durable representation: process loss intentionally forgets it.
@@ -70,6 +83,14 @@ impl MvReadinessPort {
             repository,
             runtime,
             handle,
+        }
+    }
+
+    /// Construct the separate, read-only query candidate inventory.
+    pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
+        MvCandidateReader {
+            repository: Arc::clone(&self.repository),
+            handle: self.handle.clone(),
         }
     }
 
@@ -327,6 +348,22 @@ impl MvReadinessPort {
             self.repository
                 .wipe_projection_by_target(operation_id, target),
         )
+    }
+}
+
+impl MvCandidateReader {
+    /// Enumerate retained candidate descriptions without importing refresh
+    /// executor readiness. Every member remains optional until its exact lake
+    /// publication and every frozen input/output revision are verified.
+    pub(crate) fn list_candidate_projections(
+        &self,
+    ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| {
+                self.handle.block_on(self.repository.list_projections())
+            }),
+            Err(_) => self.handle.block_on(self.repository.list_projections()),
+        }
     }
 }
 

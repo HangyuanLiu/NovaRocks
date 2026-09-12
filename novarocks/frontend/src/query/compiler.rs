@@ -30,7 +30,7 @@ use crate::common::admitted_query_context::{
     QueryExecutionContext, RequestContext, StatementAdmissionContext,
 };
 use crate::connector::connector_planning_context_for_query;
-use crate::mv::domain::readiness::MvReadinessPort;
+use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
 use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::compiler::{
     TableLookupMode, freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
@@ -133,6 +133,7 @@ pub(crate) struct FrontendQueryCompiler {
     view: ViewExecutionKernel,
     system_tables: SystemTableQueryKernel,
     mv_readiness: Arc<MvReadinessPort>,
+    mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 }
 
@@ -247,6 +248,7 @@ impl FrontendQueryCompiler {
         view: ViewExecutionKernel,
         system_tables: SystemTableQueryKernel,
         mv_readiness: Arc<MvReadinessPort>,
+        mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     ) -> Self {
         Self {
@@ -255,6 +257,7 @@ impl FrontendQueryCompiler {
             view,
             system_tables,
             mv_readiness,
+            mv_candidate_reader,
             mv_storage_observation,
         }
     }
@@ -296,7 +299,7 @@ impl FrontendQueryCompiler {
                 } else {
                     Some(freeze_query_mv_rewrite_definition_index(
                         &self.query,
-                        self.mv_readiness.as_ref(),
+                        &self.mv_candidate_reader,
                         self.mv_storage_observation.as_ref(),
                     )?)
                 };
@@ -421,7 +424,7 @@ impl FrontendQueryCompiler {
         let mv_definitions = if allow_mv_rewrite_candidates {
             Some(freeze_query_mv_rewrite_definition_index(
                 &self.query,
-                self.mv_readiness.as_ref(),
+                &self.mv_candidate_reader,
                 self.mv_storage_observation.as_ref(),
             )?)
         } else {

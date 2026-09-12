@@ -77,13 +77,13 @@ pub fn query_catalog_service_snapshot(
 /// Freeze optional MV rewrite candidates through the request's exact Core
 /// ports.  Frontend chooses whether an unavailable repository means no
 /// candidates; it never gains connector-control access directly.
-pub fn freeze_query_mv_rewrite_definition_index(
+pub(crate) fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
-    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    candidate_reader: &crate::mv::domain::readiness::MvCandidateReader,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-        readiness,
+        candidate_reader,
         query_kernel.connector_control().as_ref(),
         storage_observation,
     )
@@ -2035,9 +2035,10 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     // MV inventory likewise supplies no candidates; required table bindings
     // still fail through their own preparation path.
     let mv_definitions = if allow_mv_rewrite_candidates {
+        let candidate_reader = mv_readiness.candidate_reader();
         Some(
             crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-                mv_readiness,
+                &candidate_reader,
                 query_kernel.connector_control().as_ref(),
                 mv_storage_observation,
             )?,
@@ -2134,9 +2135,10 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
 ) -> Result<QueryResult, TestQueryCompilerError> {
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let candidate_reader = mv_readiness.candidate_reader();
     let mv_definitions =
         crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            mv_readiness,
+            &candidate_reader,
             query_kernel.connector_control().as_ref(),
             mv_storage_observation,
         )?;

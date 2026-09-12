@@ -843,7 +843,7 @@ mod tests {
     // The readiness port drives the async repository from a synchronous
     // caller, so its tests need a multi-thread runtime to block on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn incomplete_catalog_quarantine_hides_retained_projection_from_consumers() {
+    async fn incomplete_catalog_quarantine_hides_retained_projection_from_readiness_consumers() {
         let repository = Arc::new(InMemoryMvRepository::default());
         let repository_port: Arc<dyn MvRepository> = repository;
         let readiness = MvReadinessPort::new(
@@ -873,6 +873,15 @@ mod tests {
                 .expect("list ready projections")
                 .is_empty(),
             "a retained StateStore row must not outlive incomplete lake discovery"
+        );
+        assert_eq!(
+            readiness
+                .candidate_reader()
+                .list_candidate_projections()
+                .expect("list query candidate projections")
+                .len(),
+            1,
+            "query candidate discovery retains the row for strict publication validation"
         );
     }
 

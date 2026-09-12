@@ -23,7 +23,7 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::mv::domain::readiness::MvReadinessPort;
+use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
@@ -33,12 +33,12 @@ use novarocks_sql::compiler::{
 
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
 /// remains request-local.
-pub fn freeze_mv_rewrite_definition_index_with_ports(
-    readiness: &MvReadinessPort,
+pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
+    candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = optional_candidate_inventory(readiness.list_ready_projections());
+    let definitions = optional_candidate_inventory(candidate_reader.list_candidate_projections());
 
     let report = novarocks_mv_application::candidate::inspect_candidates(
         definitions,

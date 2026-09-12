@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow::datatypes::DataType;
-use serde::Serialize;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::mv::domain::analysis::refresh_property::{
@@ -65,7 +64,8 @@ use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::capabilities::{RefreshCapabilities, RefreshIdentity};
 use crate::mv::domain::refresh::contract::ImvRefreshContract;
 use crate::mv::domain::refresh::definition::{
-    load_iceberg_mv_definition_by_target, parse_iceberg_table_refs, parse_mv_select_query,
+    load_iceberg_mv_definition_by_target, mv_definition_fingerprint, parse_iceberg_table_refs,
+    parse_mv_select_query,
 };
 #[cfg(test)]
 use crate::mv::domain::refresh::execution_policy::{
@@ -109,7 +109,6 @@ use crate::mv::domain::storage_observation::{
     MvLakePublication, MvSchemaValidationObservation, MvTargetCreationObservation,
     observe_lake_package,
 };
-use mv_schema::MvPartitionContract;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_parser::{Span, ast};
 use novarocks_query_application::engine_error::EngineError;
@@ -3884,77 +3883,20 @@ fn log_planned_iceberg_mv_affected_partitions(
     );
 }
 
-#[derive(Serialize)]
-struct RefreshDefinitionFingerprint<'a> {
-    mv_id: i64,
-    query_definition:
-        &'a novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
-    canonical_select_sql: String,
-    canonical_base_refs: BTreeSet<String>,
-    storage_engine: &'a str,
-    target_catalog: &'a Option<String>,
-    target_namespace: &'a Option<String>,
-    target_table: &'a Option<String>,
-    schema_contract: &'a Option<mv_schema::MvSchemaContract>,
-    partition_contract: &'a Option<MvPartitionContract>,
-}
-
-fn refresh_execution_definition_fingerprint(
-    mv_definition: &StoredMvDefinition,
-    _current_catalog: Option<&str>,
-    _current_database: &str,
-) -> Result<String, String> {
-    let canonical_select_sql =
-        novarocks_parser::printer::print_query(&canonicalize_iceberg_mv_select_query(
-            &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
-            Some(
-                mv_definition
-                    .query_definition
-                    .resolution
-                    .default_catalog
-                    .as_str(),
-            ),
-            &mv_definition.query_definition.resolution.default_database,
-        ));
-    let canonical_base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?
-        .into_iter()
-        .map(|base_ref| base_ref.fqn())
-        .collect::<BTreeSet<_>>();
-    let input = RefreshDefinitionFingerprint {
-        mv_id: mv_definition.mv_id,
-        query_definition: &mv_definition.query_definition,
-        canonical_select_sql,
-        canonical_base_refs,
-        storage_engine: &mv_definition.storage_engine,
-        target_catalog: &mv_definition.target_catalog,
-        target_namespace: &mv_definition.target_namespace,
-        target_table: &mv_definition.target_table,
-        schema_contract: &mv_definition.schema_contract,
-        partition_contract: &mv_definition.partition_spec,
-    };
-    let canonical = serde_json::to_vec(&input)
-        .map_err(|error| format!("encode MV refresh definition fingerprint failed: {error}"))?;
-    String::from_utf8(canonical).map_err(|error| {
-        format!("encode MV refresh definition fingerprint as UTF-8 failed: {error}")
-    })
-}
-
 fn build_refresh_state_baseline(
     mv_definition: &StoredMvDefinition,
     target: &crate::mv::domain::refresh::target_binding::MvTargetBinding,
-    current_catalog: Option<&str>,
-    current_database: &str,
+    _current_catalog: Option<&str>,
+    _current_database: &str,
 ) -> Result<RefreshStateBaseline, String> {
     Ok(RefreshStateBaseline::SnapshotBacked {
         previous_snapshot_ids: mv_definition.last_refresh_snapshots.clone(),
         previous_table_object_ids: mv_definition.last_refresh_table_object_ids.clone(),
         target_snapshot_id: target.current_snapshot_id(),
         target_table_uuid: target.table_uuid().to_string(),
-        definition_fingerprint: refresh_execution_definition_fingerprint(
-            mv_definition,
-            current_catalog,
-            current_database,
-        )?,
+        definition_fingerprint: mv_definition_fingerprint(
+            &mv_definition.query_definition.raw_query_source,
+        ),
     })
 }
 

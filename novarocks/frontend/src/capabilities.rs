@@ -137,12 +137,14 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.system_catalog,
         Arc::clone(&ports.mv_readiness),
     );
+    let mv_candidate_reader = ports.mv_readiness.candidate_reader();
     FrontendQueryCompiler::new(
         ports.functions,
         query,
         view,
         system_tables,
         ports.mv_readiness,
+        mv_candidate_reader,
         ports.mv_storage_observation,
     )
 }
