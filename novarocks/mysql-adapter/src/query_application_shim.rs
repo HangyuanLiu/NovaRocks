@@ -401,3 +401,130 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for QueryApplicationMysqlSh
         outcome
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    struct CancellationProbeFactory {
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl QuerySessionFactory for CancellationProbeFactory {
+        fn open_session(
+            &self,
+            _request: QuerySessionOpenRequest,
+        ) -> Result<Arc<dyn QuerySession>, QueryServiceError> {
+            Err(QueryServiceError::new(
+                QueryServiceErrorKind::Internal,
+                "test session factory must not open a session",
+            ))
+        }
+
+        fn cancel_all(&self, _reason: QueryCancellationReason) {
+            self.cancelled.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn rejecting_shim() -> QueryApplicationMysqlShim {
+        QueryApplicationMysqlShim::new(
+            "root".to_string(),
+            ClientConnectionToken::new(1, 1).expect("valid connection token"),
+            Arc::new(CancellationProbeFactory {
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }),
+            Arc::new(OnceLock::new()),
+            ClientDisconnectWatcher::inactive(),
+            "test".to_string(),
+        )
+    }
+
+    async fn authenticate(
+        shim: &QueryApplicationMysqlShim,
+        auth_plugin: &str,
+        user: &[u8],
+        auth: &[u8],
+    ) -> bool {
+        AsyncMysqlShim::<tokio::io::Sink>::authenticate(
+            shim,
+            auth_plugin,
+            user,
+            b"0123456789abcdefghij",
+            auth,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn adapter_rejects_unauthorized_handshakes_before_session_open() {
+        let shim = rejecting_shim();
+
+        assert!(!authenticate(&shim, "mysql_native_password", b"other", b"").await);
+        assert!(!authenticate(&shim, "mysql_native_password", b"ROOT", b"").await);
+        assert!(!authenticate(&shim, "mysql_native_password", b"root", b"secret").await);
+        assert!(!authenticate(&shim, "caching_sha2_password", b"root", b"").await);
+    }
+
+    #[tokio::test]
+    async fn immediate_protocol_shutdown_cancels_the_ready_session_factory() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn QuerySessionFactory> = Arc::new(CancellationProbeFactory {
+            cancelled: Arc::clone(&cancelled),
+        });
+        let settings = crate::ResolvedMysqlListenerSettings::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            "root",
+        );
+
+        serve_query_application_mysql_until_shutdown(
+            settings,
+            "test".to_string(),
+            factory,
+            Arc::new(MysqlClientConnectionRegistry::new()),
+            async {},
+            |_| {},
+        )
+        .await
+        .expect("ready protocol server should shut down cleanly");
+
+        assert!(cancelled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn immediate_protocol_shutdown_notifies_registered_connections() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let factory: Arc<dyn QuerySessionFactory> = Arc::new(CancellationProbeFactory {
+            cancelled: Arc::clone(&cancelled),
+        });
+        let connections = Arc::new(MysqlClientConnectionRegistry::new());
+        let mut registration = connections
+            .register()
+            .expect("register protocol connection");
+        let settings = crate::ResolvedMysqlListenerSettings::new(
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            "root",
+        );
+
+        serve_query_application_mysql_until_shutdown(
+            settings,
+            "test".to_string(),
+            factory,
+            Arc::clone(&connections),
+            async {},
+            |_| {},
+        )
+        .await
+        .expect("ready protocol server should shut down cleanly");
+
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert_eq!(
+            registration
+                .termination_receiver()
+                .try_recv()
+                .expect("shutdown must reach the registered connection"),
+            ClientConnectionTerminationReason::ServerShutdown
+        );
+    }
+}

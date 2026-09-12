@@ -23,3 +23,4 @@ tracing.workspace = true
 [dev-dependencies]
 novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-user-error.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }

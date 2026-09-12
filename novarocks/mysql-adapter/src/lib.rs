@@ -98,3 +98,40 @@ pub fn error_kind_for_query_service_error(kind: QueryServiceErrorKind) -> ErrorK
         QueryServiceErrorKind::FrontendDraining => ErrorKind::ER_SERVER_SHUTDOWN,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_service_error_mapping_uses_mysql_wire_kinds() {
+        assert_eq!(
+            error_kind_for_query_service_error(QueryServiceErrorKind::BadDatabase),
+            ErrorKind::ER_BAD_DB_ERROR
+        );
+        assert_eq!(
+            error_kind_for_query_service_error(QueryServiceErrorKind::Interrupted),
+            ErrorKind::ER_QUERY_INTERRUPTED
+        );
+        assert_eq!(
+            error_kind_for_query_service_error(QueryServiceErrorKind::Unavailable),
+            ErrorKind::ER_UNKNOWN_ERROR
+        );
+        assert_eq!(
+            error_kind_for_query_service_error(QueryServiceErrorKind::FrontendDraining),
+            ErrorKind::ER_SERVER_SHUTDOWN
+        );
+    }
+
+    #[test]
+    fn init_database_normalization_stays_in_the_protocol_adapter() {
+        assert_eq!(
+            normalize_init_database_schema("`iceberg_cat`.`ssb`"),
+            "iceberg_cat.ssb"
+        );
+        assert_eq!(
+            normalize_init_database_schema("iceberg_cat.ssb"),
+            "iceberg_cat.ssb"
+        );
+    }
+}

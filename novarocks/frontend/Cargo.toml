@@ -50,7 +50,6 @@ novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 novarocks-version.workspace = true
 novarocks-workload-control.workspace = true
-opensrv-mysql = { version = "0.7", default-features = false }
 prost.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }

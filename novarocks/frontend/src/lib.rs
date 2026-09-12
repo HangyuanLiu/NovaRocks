@@ -31,8 +31,6 @@ pub(crate) mod durable;
 pub mod maintenance;
 pub mod metrics;
 pub mod mv;
-#[cfg(test)]
-mod mysql;
 mod native;
 mod preparation_diagnostics;
 pub mod query;
