@@ -22,6 +22,8 @@
 //! fences exchange input, and accounts for its process-local time. It owns no
 //! transport model and has no dependency on a query application or frontend.
 
+use std::num::NonZeroUsize;
+
 mod admission;
 mod convergence;
 mod domain;
@@ -52,3 +54,38 @@ pub use lifecycle::{
     classify_operation_admission, classify_root_drain, classify_task_transition,
 };
 pub use operation::OperationWaitCaps;
+
+/// Positive, ordered joint retained-result limits owned by one worker process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkerResultRetainedLimits {
+    per_root: NonZeroUsize,
+    per_process: NonZeroUsize,
+}
+
+impl WorkerResultRetainedLimits {
+    pub fn try_new(per_root: usize, per_process: usize) -> Result<Self, String> {
+        let per_root = NonZeroUsize::new(per_root).ok_or_else(|| {
+            "per-root joint result retained-byte cap must be greater than 0".to_string()
+        })?;
+        let per_process = NonZeroUsize::new(per_process).ok_or_else(|| {
+            "per-process joint result retained-byte cap must be greater than 0".to_string()
+        })?;
+        if per_root > per_process {
+            return Err(format!(
+                "per-root joint result retained-byte cap {} must not exceed per-process cap {}",
+                per_root.get(),
+                per_process.get()
+            ));
+        }
+        Ok(Self {
+            per_root,
+            per_process,
+        })
+    }
+    pub fn per_root(self) -> NonZeroUsize {
+        self.per_root
+    }
+    pub fn per_process(self) -> NonZeroUsize {
+        self.per_process
+    }
+}

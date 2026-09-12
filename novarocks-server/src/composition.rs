@@ -425,7 +425,7 @@ pub fn compose_backend_server_config(
             runtime_config.write_commit_evidence_max_entries,
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
-        result_retained_limits: novarocks_backend::BackendResultRetainedLimits::try_new(
+        result_retained_limits: novarocks_worker::WorkerResultRetainedLimits::try_new(
             runtime_config.result_retained_bytes_per_root,
             runtime_config.result_retained_bytes_per_process,
         )

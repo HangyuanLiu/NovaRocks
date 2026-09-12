@@ -14,7 +14,7 @@ pub mod task_execution;
 
 pub use application::{
     BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-    BackendResultRetainedLimits, BackendServerConfig, run_backend_server_until_shutdown,
-    run_backend_server_until_signal,
+    BackendServerConfig, run_backend_server_until_shutdown, run_backend_server_until_signal,
 };
+pub use novarocks_worker::WorkerResultRetainedLimits as BackendResultRetainedLimits;
 pub use rpc::runtime::{BackendDataRuntime, BackendNativeTransport};

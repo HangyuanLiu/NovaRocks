@@ -1740,7 +1740,7 @@ fn validate_query_blocking_config(runtime: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
-    novarocks_backend::BackendResultRetainedLimits::try_new(
+    novarocks_worker::WorkerResultRetainedLimits::try_new(
         runtime.result_retained_bytes_per_root,
         runtime.result_retained_bytes_per_process,
     )

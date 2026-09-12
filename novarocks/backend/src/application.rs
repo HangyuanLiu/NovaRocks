@@ -1,7 +1,6 @@
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -19,6 +18,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
+use novarocks_worker::WorkerResultRetainedLimits as BackendResultRetainedLimits;
 
 use crate::BackendDataRuntime;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
@@ -99,46 +99,6 @@ pub struct BackendServerConfig {
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
-}
-
-/// Positive, ordered joint result-memory limits injected by Server composition.
-///
-/// During publication the limits cover the simultaneously live Arrow input and
-/// encoded output. After publication they cover the encoded retained backing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendResultRetainedLimits {
-    per_root: NonZeroUsize,
-    per_process: NonZeroUsize,
-}
-
-impl BackendResultRetainedLimits {
-    pub fn try_new(per_root: usize, per_process: usize) -> Result<Self, String> {
-        let per_root = NonZeroUsize::new(per_root).ok_or_else(|| {
-            "per-root joint result retained-byte cap must be greater than 0".to_string()
-        })?;
-        let per_process = NonZeroUsize::new(per_process).ok_or_else(|| {
-            "per-process joint result retained-byte cap must be greater than 0".to_string()
-        })?;
-        if per_root > per_process {
-            return Err(format!(
-                "per-root joint result retained-byte cap {} must not exceed per-process cap {}",
-                per_root.get(),
-                per_process.get()
-            ));
-        }
-        Ok(Self {
-            per_root,
-            per_process,
-        })
-    }
-
-    pub fn per_root(self) -> NonZeroUsize {
-        self.per_root
-    }
-
-    pub fn per_process(self) -> NonZeroUsize {
-        self.per_process
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
