@@ -40,6 +40,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
+use novarocks_statistics_application::StatisticsPublicationTerminal;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTableTarget {
     pub catalog: String,
@@ -524,15 +526,6 @@ pub struct StatisticsApplicationError {
     message: String,
     publication_terminal: Option<StatisticsPublicationTerminal>,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
-}
-
-/// Exact publication classification carried across the current attempt only.
-/// It is terminal diagnostics, never a request to recover or reconcile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsPublicationTerminal {
-    KnownUncommitted,
-    KnownCommittedFinalization,
-    CommitUnknown,
 }
 
 impl StatisticsApplicationError {

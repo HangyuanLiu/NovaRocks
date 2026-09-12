@@ -165,6 +165,17 @@ pub enum StatisticsPublicationFact {
     CommitUnknown,
 }
 
+/// Exact business terminal classification for a provider publication.
+///
+/// This is diagnostics for the product conclusion, never an authorization to
+/// retry or reconcile an external effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatisticsPublicationTerminal {
+    KnownUncommitted,
+    KnownCommittedFinalization,
+    CommitUnknown,
+}
+
 /// Actual runtime convergence must not be inferred from a business conclusion.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct StatisticsConvergence {
