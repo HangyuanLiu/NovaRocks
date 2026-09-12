@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Server-resolved Backend Native transport capability.
+//! Server-resolved Native transport capabilities and protocol adapters.
 
 pub mod native_client;
 pub use native_client::NativeRpcClient;

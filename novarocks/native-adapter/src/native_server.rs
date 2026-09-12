@@ -37,7 +37,6 @@ use tonic::codegen::Service;
 use tonic::server::NamedService;
 use tower::ServiceExt;
 
-use crate::BackendNativeTransport;
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
@@ -66,7 +65,7 @@ impl NativeRpcServerHandle {
         port: u16,
         service: S,
         native_trust: Arc<NativeTrust>,
-        native_transport: BackendNativeTransport,
+        incoming_adapter: NativeIncomingAdapter,
         role_label: &'static str,
         thread_name: &'static str,
         on_authentication_failure: F,
@@ -137,7 +136,7 @@ impl NativeRpcServerHandle {
                         serve_native_listener(
                             listener,
                             app,
-                            native_transport.incoming_adapter(),
+                            incoming_adapter,
                             shutdown_rx,
                             transport_handshake_failure,
                         )

@@ -823,7 +823,7 @@ impl BackendApplicationHost {
                 },
             ),
             native_trust,
-            native_transport,
+            native_transport.incoming_adapter(),
             "backend",
             "native-backend-grpc",
             crate::metrics::record_backend_native_authentication_failure,
