@@ -1342,6 +1342,40 @@ mod tests {
         drop(host);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_drain_refuses_new_governed_roots() {
+        let registry = test_state_store_registry();
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(test_state_store_input("server-drain-closes-root-admission")),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                "127.0.0.1",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+            ),
+            frontend_backend_open_config(),
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .expect("open frontend application host");
+        host.mark_ready().expect("mark frontend host ready");
+
+        host.begin_serving_drain(Duration::from_secs(1));
+        assert!(
+            host.workload_root_admission()
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .is_err(),
+            "serving drain must close the one governed root-admission authority"
+        );
+
+        host.shutdown().await.expect("shutdown drained host");
+    }
+
     #[tokio::test]
     async fn startup_failure_still_shuts_host() {
         let events = Arc::new(Mutex::new(Vec::new()));
