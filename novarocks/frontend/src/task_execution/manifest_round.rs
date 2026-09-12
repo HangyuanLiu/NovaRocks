@@ -459,6 +459,7 @@ fn task_protocol_failure(error: TaskExecutionError) -> NativeAttemptTerminal {
         ),
         TaskExecutionError::ParticipantUnobservable { .. }
         | TaskExecutionError::QueueResidenceExpired { .. }
+        | TaskExecutionError::PreReadyEstablishTransportUnknown { .. }
         | TaskExecutionError::ResultStream(_) => (
             AttemptFailureClass::RecoverableInfrastructure,
             QueryExecutionErrorKind::Failed,
@@ -515,5 +516,21 @@ mod tests {
             failure.error().kind(),
             QueryExecutionErrorKind::InvalidRequest
         );
+    }
+
+    #[test]
+    fn pre_ready_establish_unknown_preserves_whole_attempt_recovery() {
+        let terminal =
+            task_protocol_failure(TaskExecutionError::PreReadyEstablishTransportUnknown {
+                backend: novarocks_types::identity::BackendProcessId::new_v7(),
+            });
+        let NativeAttemptTerminal::Failed(failure) = terminal else {
+            panic!("transport uncertainty must terminate the old attempt");
+        };
+        assert_eq!(
+            failure.class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+        assert_eq!(failure.error().kind(), QueryExecutionErrorKind::Failed);
     }
 }

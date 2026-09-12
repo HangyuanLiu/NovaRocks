@@ -76,6 +76,11 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         waited: Duration,
     },
+    /// The first Establish request for this frozen backend process crossed
+    /// transport but its Worker outcome was lost. The attempt has not reached
+    /// ControlReady, so the whole-attempt recovery owner must observe whether
+    /// this exact process was replaced before deciding a successor schedule.
+    PreReadyEstablishTransportUnknown { backend: BackendProcessId },
     /// An acknowledgement named an operation this owner never sent, or named
     /// one that is already settled.
     UnknownOperation,
@@ -252,6 +257,10 @@ impl fmt::Display for TaskExecutionError {
             } => write!(
                 formatter,
                 "{kind} operation {operation_id} waited {waited:?} in the frontend queue and expired before transport acceptance"
+            ),
+            Self::PreReadyEstablishTransportUnknown { backend } => write!(
+                formatter,
+                "EstablishQueryContext for backend {backend} lost its Worker outcome before ControlReady"
             ),
             Self::UnknownOperation => {
                 formatter.write_str("acknowledgement names an operation this owner did not send")

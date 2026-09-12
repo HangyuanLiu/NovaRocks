@@ -550,6 +550,7 @@ impl ActorGateOwner {
             let Some(submission) = self.establish_submissions.remove(&operation_id) else {
                 return Ok(0);
             };
+            let backend = submission.request().context().backend_process_id();
             let late = submission
                 .transport_unknown()
                 .map_err(actor_establish_error)?;
@@ -557,7 +558,13 @@ impl ActorGateOwner {
                 .entry(operation_id)
                 .or_default()
                 .push_back(late);
-            return Ok(1);
+            // A pre-ControlReady transport-unknown result is not proof that
+            // the immutable Establish can safely be sent again. Repeating it
+            // here only consumes actor authorization while a replacement may
+            // still be announcing. Hand the typed infrastructure fact to the
+            // whole-attempt recovery owner; it alone observes the frozen
+            // topology and decides whether a successor is legal.
+            return Err(TaskExecutionError::PreReadyEstablishTransportUnknown { backend });
         };
         let active = self.establish_submissions.remove(&operation_id);
         let Some(mut late) = self.late_establish_settlements.remove(&operation_id) else {

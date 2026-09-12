@@ -301,6 +301,35 @@ pub fn trigger_path(root: &Path, backend_index: usize, kind: QueryLifecycleFault
     root.join(format!("be-{backend_index}.{}.trigger", kind.file_stem()))
 }
 
+/// Returns the short, token-scoped Unix socket name used by the debug-only
+/// establish-before-restart rendezvous.
+///
+/// The lifecycle-fault root is intentionally not used as the socket parent:
+/// worktree paths can exceed the platform Unix-socket pathname limit. The
+/// runner owns binding and unlinking this path, while the BE merely connects
+/// with the already validated lifecycle-fault token.
+pub fn restart_after_establish_rendezvous_socket_path(token: &str) -> Result<PathBuf, String> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("restart-after-establish rendezvous token is invalid".to_string());
+    }
+    // `temp_dir()` may itself be a long per-user macOS sandbox path. A Unix
+    // socket is addressed by its literal pathname, so use the conventional
+    // short shared temporary parent; the validated, runner-minted token keeps
+    // each rendezvous name unique.
+    let path = PathBuf::from("/tmp").join(format!("nr-rfo-{token}.sock"));
+    if path.to_string_lossy().len() > 100 {
+        return Err(format!(
+            "restart-after-establish rendezvous socket path is too long: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CleanupFaultKind {
     DeleteFailed,

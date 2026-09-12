@@ -675,7 +675,20 @@ impl TaskExecutionRegistry {
                 state.context_state(context),
                 ContextOperationKind::CreateTask,
             ) {
-                OperationAdmission::Admit => {}
+                OperationAdmission::Admit => {
+                    // A create can enter this method before an establish
+                    // reaches its runner-owned restart rendezvous, then wake
+                    // from the creation gate after that marker is published.
+                    // Check at the owner election linearization point, rather
+                    // than at RPC ingress, so no task becomes admitted in the
+                    // marker-to-process-loss interval.
+                    if super::fault::restart_after_establish_context_holds_task_creation(context) {
+                        drop(state);
+                        super::fault::wait_for_restart_after_establish_context(context);
+                        state = self.state.lock().expect(REGISTRY_LOCK);
+                        continue;
+                    }
+                }
                 OperationAdmission::WaitForCreationGate => {
                     if now.has_reached(deadline) {
                         return Err(Box::new(OperationReceipt::rejected(

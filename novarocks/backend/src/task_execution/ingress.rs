@@ -215,6 +215,12 @@ impl RegistryTaskExecutionIngress {
                         "runner-owned lease renewal refused so the lease expires",
                     ));
                 }
+                if matches!(&neutral, UpdateQueryContext::Establish(_)) {
+                    // Arm before the registry releases its creation gate. A
+                    // create may already be waiting there, and must observe
+                    // the runner-owned process-loss rendezvous when it wakes.
+                    fault::arm_restart_after_establish_context(context)?;
+                }
                 let receipt = self.registry.update_query_context(&neutral);
                 match &neutral {
                     UpdateQueryContext::Establish(_) => {

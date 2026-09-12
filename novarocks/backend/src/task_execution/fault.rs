@@ -75,6 +75,15 @@
     reason = "The tonic service boundary must preserve Status without changing its generated signature."
 )]
 
+#[cfg(debug_assertions)]
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    net::Shutdown,
+    os::unix::net::UnixStream,
+    sync::{Mutex, OnceLock},
+};
+
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
@@ -173,20 +182,20 @@ pub(super) fn task_execution_failure_injected(identity: TaskIdentity) -> Result<
 /// to be slower than 15 s -- a flake, not a failure.
 ///
 /// So a one-shot claim is the wrong shape here. The arming is matched without
-/// being consumed, and the replay is answered the way the first operation was:
-/// not at all. Only the `Accepted` establish parks a thread; a replay is
-/// refused immediately, so the hold cannot accumulate blocked threads however
-/// many times the frontend resends.
-pub(super) fn restart_after_establish_context(
+/// being consumed, and every establish delivery is withheld until the process
+/// is replaced. Returning an immediate deadline for an idempotent replay would
+/// let the frontend mint another establish authorization before the runner can
+/// complete the replacement, turning this process-loss rendezvous into an
+/// artificial authorization-budget failure.
+///
+/// The hold itself is armed immediately before the registry applies the
+/// establish. A create can already be waiting on the registry's creation gate;
+/// recording the hold only after the establish returns would let that waiter
+/// reserve a task in the narrow gate-open interval before this handler publishes
+/// its marker.
+pub(super) fn arm_restart_after_establish_context(
     context: QueryContextRef,
-    outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
-    if !matches!(
-        outcome,
-        OperationOutcome::Accepted | OperationOutcome::Idempotent
-    ) {
-        return Ok(());
-    }
     let execution = context.query_execution_id();
     let Some(scope) = match_persistent(
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
@@ -196,25 +205,141 @@ pub(super) fn restart_after_establish_context(
     else {
         return Ok(());
     };
-    if outcome == OperationOutcome::Idempotent {
-        // Loss, not a rejection: the establish really is applied here, and
-        // withholding its answer is what keeps the frontend replaying instead
-        // of concluding this backend is ready.
-        return Err(tonic::Status::deadline_exceeded(
-            "runner-owned establish rendezvous withholds the answer to a replayed establish",
-        ));
-    }
-    eprintln!(
-        "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED execution_id={}:{}:{} backend_index={} process_id={} token={}",
-        execution.query_id().high(),
-        execution.query_id().low(),
-        execution.attempt_id().get(),
-        scope.backend_index,
-        scope.process_id,
-        scope.token,
-    );
-    wait_for_runner_owned_restart(&scope);
+    restart_after_establish_rendezvous_arm(context, scope);
     Ok(())
+}
+
+pub(super) fn restart_after_establish_context(
+    context: QueryContextRef,
+    outcome: OperationOutcome,
+) -> Result<(), tonic::Status> {
+    if !matches!(
+        outcome,
+        OperationOutcome::Accepted | OperationOutcome::Idempotent
+    ) {
+        restart_after_establish_rendezvous_disarm(context);
+        return Ok(());
+    }
+    let execution = context.query_execution_id();
+    let Some(scope) = restart_after_establish_rendezvous_scope(context) else {
+        return Ok(());
+    };
+    if outcome == OperationOutcome::Accepted {
+        eprintln!(
+            "NOVAROCKS_TASK_ESTABLISH_CONTEXT_OBSERVED execution_id={}:{}:{} backend_index={} process_id={} token={}",
+            execution.query_id().high(),
+            execution.query_id().low(),
+            execution.attempt_id().get(),
+            scope.backend_index,
+            scope.process_id,
+            scope.token,
+        );
+    }
+    notify_runner_of_restart_after_establish(&scope)?;
+    wait_for_runner_owned_restart(&scope);
+    if outcome == OperationOutcome::Accepted {
+        restart_after_establish_rendezvous_disarm(context);
+    }
+    Ok(())
+}
+
+/// Holds task creation for an establish rendezvous that has already published
+/// its marker.
+///
+/// The establish RPC and task-create RPCs have distinct gRPC handlers. Parking
+/// only the former leaves a scheduler race in which a parallel create can be
+/// admitted after the marker but before the runner kills the process. That is
+/// a different failure boundary from the one this fault claims to construct:
+/// the context would become ControlReady before the process loss. The hold is
+/// scoped to the exact context and exists only while the accepted establish is
+/// parked, so it neither changes normal admission nor broadens the fault to
+/// other attempts.
+pub(super) fn restart_after_establish_context_holds_task_creation(
+    context: QueryContextRef,
+) -> bool {
+    restart_after_establish_rendezvous_is_held(context)
+}
+
+/// Waits for the exact runner-owned restart that holds this context's task
+/// creation. The scope was validated when the accepted establish armed the
+/// hold, so the registry can call this at its linearization point without
+/// re-reading fault configuration while it owns its lock.
+pub(super) fn wait_for_restart_after_establish_context(context: QueryContextRef) {
+    if let Some(scope) = restart_after_establish_rendezvous_scope(context) {
+        wait_for_runner_owned_restart(&scope);
+    }
+}
+
+/// A process-local guard for the narrow interval after a successful establish
+/// publishes the runner rendezvous marker. It is compiled only in debug
+/// builds, the only builds that accept runner fault arming.
+#[cfg(debug_assertions)]
+fn restart_after_establish_rendezvous_arm(
+    context: QueryContextRef,
+    scope: novarocks_failpoint::QueryLifecycleFaultScope,
+) {
+    restart_after_establish_rendezvous()
+        .lock()
+        .expect("restart-after-establish rendezvous lock poisoned")
+        .insert(context, scope);
+}
+
+#[cfg(not(debug_assertions))]
+fn restart_after_establish_rendezvous_arm(
+    _context: QueryContextRef,
+    _scope: novarocks_failpoint::QueryLifecycleFaultScope,
+) {
+}
+
+#[cfg(debug_assertions)]
+fn restart_after_establish_rendezvous_disarm(context: QueryContextRef) {
+    restart_after_establish_rendezvous()
+        .lock()
+        .expect("restart-after-establish rendezvous lock poisoned")
+        .remove(&context);
+}
+
+#[cfg(not(debug_assertions))]
+fn restart_after_establish_rendezvous_disarm(_context: QueryContextRef) {}
+
+#[cfg(debug_assertions)]
+fn restart_after_establish_rendezvous_is_held(context: QueryContextRef) -> bool {
+    restart_after_establish_rendezvous()
+        .lock()
+        .expect("restart-after-establish rendezvous lock poisoned")
+        .contains_key(&context)
+}
+
+#[cfg(not(debug_assertions))]
+fn restart_after_establish_rendezvous_is_held(_context: QueryContextRef) -> bool {
+    false
+}
+
+#[cfg(debug_assertions)]
+fn restart_after_establish_rendezvous_scope(
+    context: QueryContextRef,
+) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
+    restart_after_establish_rendezvous()
+        .lock()
+        .expect("restart-after-establish rendezvous lock poisoned")
+        .get(&context)
+        .cloned()
+}
+
+#[cfg(not(debug_assertions))]
+fn restart_after_establish_rendezvous_scope(
+    _context: QueryContextRef,
+) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
+    None
+}
+
+#[cfg(debug_assertions)]
+fn restart_after_establish_rendezvous()
+-> &'static Mutex<BTreeMap<QueryContextRef, novarocks_failpoint::QueryLifecycleFaultScope>> {
+    static HELD_CONTEXTS: OnceLock<
+        Mutex<BTreeMap<QueryContextRef, novarocks_failpoint::QueryLifecycleFaultScope>>,
+    > = OnceLock::new();
+    HELD_CONTEXTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Blocks until this process is replaced, this exact arming is released, or
@@ -254,6 +379,57 @@ fn wait_for_runner_owned_restart(scope: &novarocks_failpoint::QueryLifecycleFaul
 
 #[cfg(not(debug_assertions))]
 fn wait_for_runner_owned_restart(_scope: &novarocks_failpoint::QueryLifecycleFaultScope) {}
+
+/// Hands the accepted establish directly to the runner-owned process-loss
+/// action before leaving the RPC handler.
+///
+/// A log marker is proof, not synchronization: a polling harness can observe
+/// it after the frontend already spent its exact request's authorization
+/// budget. The socket is bound before the query begins. The BE writes its
+/// token and waits for EOF; the runner deliberately keeps the connection open
+/// until it has completed the restart action, whose first operation kills this
+/// process. EOF is therefore the runner's acknowledgement, without admitting
+/// another establish while the action is still pending.
+#[cfg(debug_assertions)]
+fn notify_runner_of_restart_after_establish(
+    scope: &novarocks_failpoint::QueryLifecycleFaultScope,
+) -> Result<(), tonic::Status> {
+    let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&scope.token)
+        .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
+    let mut stream = UnixStream::connect(&path).map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "restart-after-establish runner rendezvous is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    stream.write_all(scope.token.as_bytes()).map_err(|error| {
+        tonic::Status::internal(format!(
+            "write restart-after-establish rendezvous token: {error}"
+        ))
+    })?;
+    stream.shutdown(Shutdown::Write).map_err(|error| {
+        tonic::Status::internal(format!(
+            "close restart-after-establish rendezvous write side: {error}"
+        ))
+    })?;
+    let mut acknowledgement = [0_u8; 1];
+    match stream.read(&mut acknowledgement) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err(tonic::Status::internal(
+            "restart-after-establish runner returned an unexpected acknowledgement",
+        )),
+        Err(error) => Err(tonic::Status::internal(format!(
+            "wait for restart-after-establish runner action: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn notify_runner_of_restart_after_establish(
+    _scope: &novarocks_failpoint::QueryLifecycleFaultScope,
+) -> Result<(), tonic::Status> {
+    Ok(())
+}
 
 /// Drops the acknowledgement of one applied lease renewal.
 pub(super) fn lease_renewal_ack_dropped(
@@ -828,4 +1004,43 @@ fn claim_by_detail(
     _process_id: BackendProcessId,
 ) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
     Ok(None)
+}
+
+#[cfg(all(test, debug_assertions))]
+mod tests {
+    use super::*;
+    use novarocks_types::identity::{AttemptId, FrontendProcessId, QueryId};
+
+    fn context(query: i64) -> QueryContextRef {
+        QueryContextRef::new(
+            QueryExecutionId::new(
+                QueryId::new(query, query + 1),
+                AttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("nonzero query"),
+            FrontendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    #[test]
+    fn restart_after_establish_hold_is_exact_and_released_with_its_establish() {
+        let held = context(41);
+        let other = context(43);
+
+        assert!(!restart_after_establish_rendezvous_is_held(held));
+        let scope = novarocks_failpoint::QueryLifecycleFaultScope {
+            token: "test-token".to_owned(),
+            execution_id: held.query_execution_id(),
+            backend_index: 1,
+            process_id: held.backend_process_id(),
+        };
+        restart_after_establish_rendezvous_arm(held, scope.clone());
+        assert!(restart_after_establish_rendezvous_is_held(held));
+        assert!(!restart_after_establish_rendezvous_is_held(other));
+        assert_eq!(restart_after_establish_rendezvous_scope(held), Some(scope));
+
+        restart_after_establish_rendezvous_disarm(held);
+        assert!(!restart_after_establish_rendezvous_is_held(held));
+    }
 }
