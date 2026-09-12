@@ -75,10 +75,15 @@ use novarocks_query_application::protocol_delivery::{
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::session::QuerySessionOpenRequest;
 use novarocks_query_application::session_control::{
-    ConnectionKillAuthorization, GovernedStatementFinishOutcome, QueryCancelOutcome,
-    QueryControlService, QuerySessionLease, SessionIdentity, SessionToken, StatementToken,
+    ConnectionKillAuthorization, QueryCancelOutcome, QueryControlService, QuerySessionLease,
+    SessionIdentity, SessionToken, StatementToken,
 };
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
+use novarocks_query_application::session_outcome::{
+    cancellation_error, cancellation_requires_statement_fence, governed_cancellation_error,
+    governed_execution_error, governed_query_deadline, governed_query_execution_error,
+    governed_statement_begin_error, scalar_query_error,
+};
 use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, unnegotiated_query_statement,
 };
@@ -96,8 +101,7 @@ use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
 use novarocks_user_error::UserError;
 use novarocks_workload_control::{
-    CancellationReason as WorkCancellationReason, LocalResourceAuthority, RootAdmissionHandle,
-    WorkClass, WorkRequest,
+    LocalResourceAuthority, RootAdmissionHandle, WorkClass, WorkRequest,
 };
 
 pub(crate) mod compiler;
@@ -1947,74 +1951,6 @@ fn timeout_message_millis(timeout: Duration) -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-fn cancellation_error(reason: QueryCancellationReason) -> QueryServiceError {
-    let (kind, message) = match reason {
-        QueryCancellationReason::ExecutionCancellationRequested => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution cancellation was requested".to_string(),
-        ),
-        QueryCancellationReason::ExecutionOwnerDropped => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution protocol owner was dropped".to_string(),
-        ),
-        QueryCancellationReason::DeadlineExceeded { timeout_ms } => (
-            QueryServiceErrorKind::Timeout,
-            format!("query timed out after {timeout_ms} ms"),
-        ),
-        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => (
-            QueryServiceErrorKind::Interrupted,
-            format!(
-                "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
-            ),
-        ),
-        QueryCancellationReason::ExplicitKill { .. } => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted".to_string(),
-        ),
-        QueryCancellationReason::ExplicitKillConnection { .. } => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the connection was killed".to_string(),
-        ),
-        QueryCancellationReason::ClientDisconnected => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the client disconnected".to_string(),
-        ),
-        QueryCancellationReason::ServerShutdown => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the server is shutting down".to_string(),
-        ),
-    };
-    QueryServiceError::new(kind, message)
-}
-
-fn governed_execution_error(
-    error: QueryExecutionError,
-    completion: GovernedStatementFinishOutcome,
-) -> QueryServiceError {
-    match completion {
-        GovernedStatementFinishOutcome::Cancelled(reason) => governed_cancellation_error(reason),
-        GovernedStatementFinishOutcome::Completed | GovernedStatementFinishOutcome::Stale => {
-            governed_query_execution_error(error)
-        }
-        GovernedStatementFinishOutcome::ProtocolFailed => internal_error(format!(
-            "query protocol ownership failed while handling execution error: {error}"
-        )),
-    }
-}
-
-fn governed_query_execution_error(error: QueryExecutionError) -> QueryServiceError {
-    let kind = match error.kind() {
-        QueryExecutionErrorKind::Cancelled => QueryServiceErrorKind::Interrupted,
-        QueryExecutionErrorKind::DeadlineExceeded => QueryServiceErrorKind::Timeout,
-        QueryExecutionErrorKind::Rejected => QueryServiceErrorKind::Unavailable,
-        QueryExecutionErrorKind::InvalidRequest | QueryExecutionErrorKind::Failed => {
-            QueryServiceErrorKind::Internal
-        }
-        _ => QueryServiceErrorKind::Internal,
-    };
-    QueryServiceError::new(kind, error.to_string())
-}
-
 async fn consume_governed_scalar_stream(
     execution: &mut novarocks_query_application::api::ExecutionHandle,
     mut stream: novarocks_query_application::api::QueryResultStream,
@@ -2203,24 +2139,6 @@ async fn wait_for_eligible_query_topology_after(
     }
 }
 
-fn governed_query_deadline(
-    state: &SessionSqlState,
-) -> Result<(Option<Instant>, Option<u64>), QueryServiceError> {
-    let timeout_secs = state.execution_settings().query_timeout_secs();
-    let deadline = match timeout_secs {
-        Some(seconds) => Some(
-            Instant::now()
-                .checked_add(Duration::from_secs(seconds))
-                .ok_or_else(|| internal_error("query deadline exceeds monotonic clock range"))?,
-        ),
-        None => None,
-    };
-    Ok((
-        deadline,
-        timeout_secs.map(|seconds| seconds.saturating_mul(1_000)),
-    ))
-}
-
 /// Frontend's one-way projection from Query Application session state into
 /// the native query-options DTO consumed at the execution boundary.
 fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> QueryOptions {
@@ -2241,67 +2159,6 @@ fn query_options_from_session_settings(settings: &SessionExecutionSettings) -> Q
     // Session settings never enable spilling, so the Protocol validation
     // performed here cannot reject an internally constructed value.
     .expect("session settings must satisfy the native query-options contract")
-}
-
-fn governed_statement_begin_error(
-    error: novarocks_query_application::session_control::GovernedQueryStatementBeginError,
-) -> QueryServiceError {
-    QueryServiceError::new(
-        QueryServiceErrorKind::Unavailable,
-        format!("begin governed query statement failed: {error}"),
-    )
-}
-
-fn scalar_query_error(message: impl Into<String>) -> QueryServiceError {
-    QueryServiceError::new(QueryServiceErrorKind::InvalidValue, message.into())
-}
-
-fn governed_cancellation_error(reason: WorkCancellationReason) -> QueryServiceError {
-    let (kind, message) = match reason {
-        WorkCancellationReason::DeadlineExceeded => (
-            QueryServiceErrorKind::Timeout,
-            "query deadline exceeded".to_string(),
-        ),
-        WorkCancellationReason::FrontendDrainDeadlineExceeded => (
-            QueryServiceErrorKind::Interrupted,
-            "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded".to_string(),
-        ),
-        WorkCancellationReason::ExplicitKill { .. } => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted".to_string(),
-        ),
-        WorkCancellationReason::ExplicitKillConnection { .. } => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the connection was killed".to_string(),
-        ),
-        WorkCancellationReason::ClientDisconnected => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the client disconnected".to_string(),
-        ),
-        WorkCancellationReason::ServerShutdown => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution was interrupted because the server is shutting down".to_string(),
-        ),
-        WorkCancellationReason::Requested => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution cancellation was requested".to_string(),
-        ),
-        WorkCancellationReason::OwnerDropped => (
-            QueryServiceErrorKind::Interrupted,
-            "Query execution protocol owner was dropped".to_string(),
-        ),
-    };
-    QueryServiceError::new(kind, message)
-}
-
-/// Whether cancellation must release the current statement before the
-/// protocol may answer the client.
-///
-/// Only KILL QUERY preserves the same connection for another command. The
-/// disconnect and shutdown forms deliberately retain their bounded-return
-/// behavior because no successor statement may be admitted on that session.
-fn cancellation_requires_statement_fence(reason: &QueryCancellationReason) -> bool {
-    matches!(reason, QueryCancellationReason::ExplicitKill { .. })
 }
 
 #[cfg(test)]
@@ -2335,6 +2192,7 @@ mod tests {
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::schema::ColumnDef;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
+    use novarocks_workload_control::CancellationReason as WorkCancellationReason;
     use novarocks_workload_control::ResourceConfig;
 
     fn default_query_options() -> QueryOptions {

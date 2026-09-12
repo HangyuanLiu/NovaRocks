@@ -44,6 +44,9 @@ pub mod request_session;
 /// Query-session errors before protocol-specific encoding.
 pub mod session_error;
 
+/// Session-local deadline and terminal-error interpretation.
+pub mod session_outcome;
+
 /// Query-session admission requests independent of a wire protocol.
 pub mod session;
 
