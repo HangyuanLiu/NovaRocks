@@ -1495,6 +1495,7 @@ async fn run_subscription(
                                 }
                                 Err(next) => {
                                     set_state(&state, next);
+                                    intake.note_observation_incomplete();
                                     return;
                                 }
                             }
@@ -1508,6 +1509,7 @@ async fn run_subscription(
                                     "SubscribeTaskStatus stream rejected"
                                 );
                                 set_state(&state, SubscriptionState::Rejected);
+                                intake.note_observation_incomplete();
                                 return;
                             }
                             break;
@@ -1529,6 +1531,7 @@ async fn run_subscription(
                     "SubscribeTaskStatus subscription rejected"
                 );
                 set_state(&state, SubscriptionState::Rejected);
+                intake.note_observation_incomplete();
                 return;
             }
             Err(_) => {}
@@ -3570,9 +3573,14 @@ mod tests {
 
         assert_eq!(observed, Some(SubscriptionState::ProcessMismatch));
         assert!(observed.expect("a settled state").is_fatal());
-        assert_eq!(
-            fixture.intake.queued(),
-            0,
+        let mut runner = fixture.intake.try_enter().expect("the runner is available");
+        let (observation_incomplete, statuses) = runner.drain_statuses(8);
+        assert!(
+            observation_incomplete,
+            "a fatal status identity mismatch fences a pending success seal"
+        );
+        assert!(
+            statuses.is_empty(),
             "an event from a replaced process is never published"
         );
     }

@@ -197,6 +197,14 @@ impl StatusIntakeHandle {
     /// Reports that the status transport dropped while the backend process is
     /// intact.
     pub fn note_observation_loss(&self) {
+        self.note_observation_incomplete();
+    }
+
+    /// Reports an observation boundary that prevents a pending success seal
+    /// from treating task status as complete. This includes transport loss and
+    /// an identity-invalid status frame; the serial runner makes the final
+    /// fail-closed classification from its subscription state.
+    pub fn note_observation_incomplete(&self) {
         self.inner
             .queue
             .lock()
