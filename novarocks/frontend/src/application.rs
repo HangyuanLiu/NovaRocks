@@ -257,6 +257,11 @@ impl FrontendExecutionRuntimeOwner {
             frontend_process_id = %frontend_process_id,
             "frontend logical execution runtime initialized"
         );
+        if cfg!(debug_assertions)
+            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
+        {
+            eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
+        }
         let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime,

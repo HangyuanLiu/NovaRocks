@@ -356,13 +356,6 @@ impl FrontendDistributedQueryCoordinator {
             query_process_namespace = %query_namespace,
             "frontend query process namespace initialized"
         );
-        if cfg!(debug_assertions)
-            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
-        {
-            eprintln!(
-                "NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={query_namespace}"
-            );
-        }
         Ok(Self {
             backend_topology,
             #[cfg(test)]

@@ -4,9 +4,10 @@ use novarocks_cluster_harness::{
     LaunchProfile, NativeTrustFixture, ServerHandle,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ScenarioBinary {
@@ -94,6 +95,7 @@ pub struct ScenarioContext {
     launch_profile: LaunchProfile,
     uea1_workload_manifest: Option<PathBuf>,
     uea1_preparation_diagnostic_secret: Option<String>,
+    started_at: SystemTime,
 }
 
 /// A retained, secret-free record of one system scenario outcome.
@@ -108,10 +110,16 @@ struct ScenarioEvidence<'a> {
     schema_version: u32,
     scenario: &'a str,
     outcome: ScenarioEvidenceOutcome,
+    exit_code: i32,
+    started_unix_millis: u128,
+    ended_unix_millis: u128,
+    command: Vec<String>,
+    runner_native_build_identity: String,
     actions: &'a [String],
     runtime_dir: String,
     primary_binary: String,
     base_config_path: String,
+    base_config_sha256: String,
     cluster_size: usize,
     launch_profile: &'static str,
     process_launch_identities:
@@ -159,6 +167,7 @@ impl ScenarioContext {
             launch_profile,
             uea1_workload_manifest,
             uea1_preparation_diagnostic_secret,
+            started_at: SystemTime::now(),
         }
     }
 
@@ -290,14 +299,29 @@ impl ScenarioContext {
         let effective_launch_config_value =
             serde_json::from_slice(effective_launch_config.artifact_bytes())
                 .context("decode secret-free effective launch config for scenario evidence")?;
+        let config_bytes = fs::read(self.base_config_path()).with_context(|| {
+            format!(
+                "read base config for scenario evidence {}",
+                self.base_config_path().display()
+            )
+        })?;
         let evidence = ScenarioEvidence {
             schema_version: 1,
             scenario: self.name,
             outcome,
+            exit_code: match outcome {
+                ScenarioEvidenceOutcome::Passed => 0,
+                ScenarioEvidenceOutcome::Failed => 1,
+            },
+            started_unix_millis: unix_millis(self.started_at)?,
+            ended_unix_millis: unix_millis(SystemTime::now())?,
+            command: std::env::args().collect(),
+            runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
             actions: &self.actions,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
             base_config_path: self.base_config_path().display().to_string(),
+            base_config_sha256: format!("{:x}", Sha256::digest(config_bytes)),
             cluster_size: self.cluster_size,
             launch_profile: match self.launch_profile {
                 LaunchProfile::FaultScenario => "fault-scenario",
@@ -357,6 +381,13 @@ impl ScenarioContext {
             native_trust_fixture: launch_config.native_trust_fixture,
         })
     }
+}
+
+fn unix_millis(time: SystemTime) -> Result<u128> {
+    Ok(time
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_millis())
 }
 
 pub(crate) fn resolve_binary(
