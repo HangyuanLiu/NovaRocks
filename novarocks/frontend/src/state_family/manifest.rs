@@ -39,10 +39,13 @@ const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
 /// Retired families are absent by deletion, not by a tombstone entry: this
 /// binary has no reader for them, so registering them would be the compatibility
 /// surface the hard cut exists to remove.
+///
+/// Maintenance, statistics, and MV refresh process runtimes are likewise
+/// absent: their product crates own those lifetimes. They never had Frontend
+/// durable records, so this manifest must not retain a nominal ownership entry
+/// after their product owners became the only runtime authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StateFamily {
-    /// Cluster backend membership as an operator declared it, through
-    /// configuration seeds and SQL.
     /// MV definitions, target and dependency indexes, and the aggregate
     /// published waterline.
     MvAccelerator,
@@ -55,12 +58,6 @@ pub enum StateFamily {
     LocalViewRegistry,
     /// DML operations, side records and their coordination state.
     DmlRuntime,
-    /// Maintenance jobs, attempts, transactions and their indexes.
-    MaintenanceRuntime,
-    /// Statistics jobs, worker leases and cursors.
-    StatisticsJobRuntime,
-    /// MV refresh attempts, leases, scheduler backoff and cursors.
-    MvRefreshRuntime,
     /// Backend liveness, generation and fragment activity as this frontend
     /// observed it.
     BackendObservedRuntime,
@@ -70,7 +67,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 6;
 
     /// Every registered family, in manifest order.
     ///
@@ -126,18 +123,6 @@ impl StateFamily {
             Self::DmlRuntime => StateFamilyClassification::ProcessRuntime(
                 ProcessRuntimeContract::new(ProcessRuntimeAuthority::Statement),
             ),
-            Self::MaintenanceRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::Attempt),
-            ),
-            Self::StatisticsJobRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::Attempt),
-            ),
-            // Attempt records die with their attempt, but scheduler backoff and
-            // cursors outlive individual attempts, so the family as a whole is
-            // bounded by the incarnation.
-            Self::MvRefreshRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::FrontendIncarnation),
-            ),
             Self::BackendObservedRuntime => StateFamilyClassification::ProcessRuntime(
                 ProcessRuntimeContract::new(ProcessRuntimeAuthority::FrontendIncarnation),
             ),
@@ -155,9 +140,6 @@ impl StateFamily {
             Self::StatisticsArtifactCache => "frontend/statistics/immutable-artifact-cache",
             Self::LocalViewRegistry => "frontend/view/local-registry",
             Self::DmlRuntime => "frontend/dml/runtime",
-            Self::MaintenanceRuntime => "frontend/table-maintenance/runtime",
-            Self::StatisticsJobRuntime => "frontend/statistics/job-runtime",
-            Self::MvRefreshRuntime => "frontend/mv/refresh-runtime",
             Self::BackendObservedRuntime => "frontend/cluster-backends/observed-runtime",
         }
     }
@@ -243,10 +225,7 @@ impl StateFamily {
             Self::SchemaCache => Some(Self::StatisticsArtifactCache),
             Self::StatisticsArtifactCache => Some(Self::LocalViewRegistry),
             Self::LocalViewRegistry => Some(Self::DmlRuntime),
-            Self::DmlRuntime => Some(Self::MaintenanceRuntime),
-            Self::MaintenanceRuntime => Some(Self::StatisticsJobRuntime),
-            Self::StatisticsJobRuntime => Some(Self::MvRefreshRuntime),
-            Self::MvRefreshRuntime => Some(Self::BackendObservedRuntime),
+            Self::DmlRuntime => Some(Self::BackendObservedRuntime),
             Self::BackendObservedRuntime => None,
         }
     }
@@ -282,8 +261,8 @@ mod tests {
     use super::*;
     use crate::state_family::WipeEntry;
 
-    /// Nine families: three `Accelerator` (two of them in-process) and six
-    /// `ProcessRuntime`.
+    /// Six Frontend families: three `Accelerator` (two of them in-process) and
+    /// three `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
     /// the frontend still carried a durable membership record; backend
@@ -294,8 +273,8 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            9,
-            "the manifest registers nine frontend state families"
+            6,
+            "the manifest registers six frontend state families"
         );
 
         let mut process_runtime = 0;
@@ -313,10 +292,7 @@ mod tests {
             accelerator, 3,
             "MV, schema cache, statistics artifact cache"
         );
-        assert_eq!(
-            process_runtime, 6,
-            "local views, DML, maintenance, statistics jobs, MV refresh, backend observations"
-        );
+        assert_eq!(process_runtime, 3, "local views, DML, backend observations");
     }
 
     #[test]
@@ -529,25 +505,13 @@ mod tests {
                 authorities.push((family, contract.authority()));
             }
         }
-        assert_eq!(authorities.len(), 6);
+        assert_eq!(authorities.len(), 3);
 
         assert!(
             authorities.contains(&(StateFamily::DmlRuntime, ProcessRuntimeAuthority::Statement))
         );
         assert!(authorities.contains(&(
-            StateFamily::MaintenanceRuntime,
-            ProcessRuntimeAuthority::Attempt
-        )));
-        assert!(authorities.contains(&(
-            StateFamily::StatisticsJobRuntime,
-            ProcessRuntimeAuthority::Attempt
-        )));
-        assert!(authorities.contains(&(
             StateFamily::LocalViewRegistry,
-            ProcessRuntimeAuthority::FrontendIncarnation
-        )));
-        assert!(authorities.contains(&(
-            StateFamily::MvRefreshRuntime,
             ProcessRuntimeAuthority::FrontendIncarnation
         )));
         assert!(authorities.contains(&(
