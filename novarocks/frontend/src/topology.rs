@@ -43,7 +43,9 @@ use crate::common::backend_topology::{
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
-use novarocks_query_application::api::{QueryResult, build_utf8_query_result};
+use novarocks_query_application::api::{
+    BackendTopologyCommandPort, QueryResult, build_utf8_query_result,
+};
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
@@ -988,6 +990,9 @@ impl BackendTopologyPort for ClusterBackendService {
         }
         crate::common::backend_topology::record_successful_stage(backend_idx, fragment_count);
     }
+}
+
+impl BackendTopologyCommandPort for ClusterBackendService {
     fn show_backends(&self) -> Result<QueryResult, String> {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let state = self
@@ -1262,6 +1267,7 @@ mod tests {
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_query_application::api::BackendTopologyCommandPort;
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
     use std::net::SocketAddr;

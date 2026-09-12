@@ -296,29 +296,17 @@ pub(crate) fn statistics_command_executor(
 /// Leaf port for FE-owned backend membership commands.
 #[derive(Clone)]
 pub struct BackendCommandPorts {
-    topology: BackendTopologyService,
+    topology: Arc<dyn BackendTopologyCommandPort>,
 }
 
 impl BackendCommandPorts {
-    pub fn new(topology: BackendTopologyService) -> Self {
+    pub fn new(topology: Arc<dyn BackendTopologyCommandPort>) -> Self {
         Self { topology }
     }
 }
 
-struct FrontendBackendTopologyCommandPort {
-    topology: BackendTopologyService,
-}
-
-impl BackendTopologyCommandPort for FrontendBackendTopologyCommandPort {
-    fn show_backends(&self) -> Result<novarocks_query_application::api::QueryResult, String> {
-        self.topology.show_backends()
-    }
-}
-
 pub fn backend_command_executor(ports: BackendCommandPorts) -> BackendCommandExecutor {
-    BackendCommandExecutor::new(Arc::new(FrontendBackendTopologyCommandPort {
-        topology: ports.topology,
-    }))
+    BackendCommandExecutor::new(ports.topology)
 }
 
 /// Leaf ports for `ALTER ICEBERG REF`.

@@ -57,8 +57,6 @@ pub trait BackendTopologyPort: Send + Sync + 'static {
     /// remains separate from the batch boundary so service-only participants
     /// are visible to lifecycle accounting without inflating fragment counts.
     fn record_successful_stage(&self, backend_idx: usize, fragment_count: usize);
-
-    fn show_backends(&self) -> Result<novarocks_query_application::api::QueryResult, String>;
 }
 
 pub type BackendTopologyService = Arc<dyn BackendTopologyPort>;
@@ -436,10 +434,6 @@ impl BackendTopologyPort for NoopBackendTopologyPort {
     }
 
     fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
-
-    fn show_backends(&self) -> Result<novarocks_query_application::api::QueryResult, String> {
-        Err("backend topology port is not installed".to_string())
-    }
 }
 
 #[cfg(test)]

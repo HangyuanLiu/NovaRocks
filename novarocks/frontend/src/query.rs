@@ -2340,10 +2340,6 @@ mod tests {
         }
 
         fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
-
-        fn show_backends(&self) -> Result<QueryResult, String> {
-            unreachable!("test topology has no SHOW BACKENDS surface")
-        }
     }
 
     fn eligible_topology(revision: u64) -> BackendTopologySnapshot {

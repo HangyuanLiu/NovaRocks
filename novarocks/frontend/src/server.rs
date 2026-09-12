@@ -307,7 +307,7 @@ pub fn build_frontend_query_session_factory(
     let statistics_command_executor =
         core_capabilities::statistics_command_executor(statistics_application);
     let backend_command_executor = core_capabilities::backend_command_executor(
-        core_capabilities::BackendCommandPorts::new(topology.clone()),
+        core_capabilities::BackendCommandPorts::new(host.backend_topology_command_port()),
     );
     let view_command_executor =
         core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
