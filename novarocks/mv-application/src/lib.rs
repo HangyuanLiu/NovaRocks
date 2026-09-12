@@ -26,4 +26,5 @@ pub mod activity;
 pub mod candidate;
 pub mod maintenance;
 pub mod process_runtime;
+pub mod scheduler;
 pub mod state_family;

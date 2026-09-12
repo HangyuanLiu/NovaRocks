@@ -40,6 +40,7 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
 use novarocks_sql::compiler::SessionOptimizerSettings;
 
@@ -48,10 +49,7 @@ use super::{
     create,
     maintenance_worker::{FrontendMaintenanceWorker, FrontendMaintenanceWorkerDependencies},
     refresh,
-    scheduler::{
-        FrontendMvScheduler, FrontendMvSchedulerConfig, ScheduledRefreshDisposition,
-        ScheduledRefreshRequest,
-    },
+    scheduler::{FrontendMvScheduler, ScheduledRefreshDisposition, ScheduledRefreshRequest},
 };
 
 /// Frontend-owned application service for materialized-view statements.
@@ -63,7 +61,7 @@ pub struct FrontendMvService {
     refresh: refresh::FrontendMvRefreshDependencies,
     activity_gate: MvActivityGate,
     background: Mutex<Option<FrontendMvBackgroundRuntime>>,
-    scheduler_config: FrontendMvSchedulerConfig,
+    scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     execution_role: novarocks_types::ClusterRole,
@@ -89,7 +87,7 @@ impl FrontendMvService {
         >,
         execution_role: novarocks_types::ClusterRole,
         topology: BackendTopologyService,
-        scheduler_config: FrontendMvSchedulerConfig,
+        scheduler_config: MvSchedulerConfig,
         maintenance_config: MaintenanceCoordinatorConfig,
         table_maintenance_service: Arc<dyn TableMaintenanceService>,
         optimizer_query_mem_limit_bytes: u64,
@@ -341,7 +339,7 @@ struct RefreshWorkerDependencies {
     background_engine: Arc<dyn MvBackgroundEngine>,
     topology: BackendTopologyService,
     role: novarocks_types::ClusterRole,
-    scheduler_config: FrontendMvSchedulerConfig,
+    scheduler_config: MvSchedulerConfig,
     maintenance_config: MaintenanceCoordinatorConfig,
     table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
@@ -374,7 +372,8 @@ impl FrontendMvBackgroundRuntime {
         let (stop_tx, stop_rx) = mpsc::channel();
         let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
         let (maintenance_wakeup_tx, maintenance_wakeup_rx) = mpsc::sync_channel(1);
-        let interval = Duration::from_millis(dependencies.scheduler_config.tick_interval_ms.max(1));
+        let interval =
+            Duration::from_millis(dependencies.scheduler_config.tick_interval_ms().max(1));
         let maintenance_interval =
             Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
         let maintenance = Arc::new(FrontendMaintenanceWorker::new(

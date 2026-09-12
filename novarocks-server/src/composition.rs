@@ -40,7 +40,6 @@ use novarocks_frontend::{
         FrontendQueryControlTimeouts,
     },
     catalog_prune::CatalogPruneConfig,
-    mv::scheduler::FrontendMvSchedulerConfig,
     server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
@@ -52,6 +51,7 @@ use novarocks_fs::{
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
@@ -602,7 +602,7 @@ pub fn compose_frontend_role_config(
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
-        execution = execution.with_mv_scheduler_config(FrontendMvSchedulerConfig::new(
+        execution = execution.with_mv_scheduler_config(MvSchedulerConfig::new(
             standalone.mv_refresh_scheduler_enabled,
             standalone.mv_refresh_scheduler_interval_ms.max(1),
             standalone.mv_refresh_scheduler_max_concurrent.max(1),

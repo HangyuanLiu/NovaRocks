@@ -44,6 +44,7 @@ use crate::task_execution::ConnectorBlockingIoBudget;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogAttachmentRepository;
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_trust::NativeTrust;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
@@ -57,7 +58,6 @@ use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::connector::ConnectorControlHost;
 use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::dml::DmlService;
-use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
@@ -497,7 +497,7 @@ pub struct FrontendApplicationHost {
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
-    mv_scheduler_config: FrontendMvSchedulerConfig,
+    mv_scheduler_config: MvSchedulerConfig,
     mv_maintenance_config: MaintenanceCoordinatorConfig,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
@@ -590,7 +590,7 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    mv_scheduler: FrontendMvSchedulerConfig,
+    mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
     ///
@@ -654,7 +654,7 @@ impl FrontendExecutionConfig {
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
-            mv_scheduler: FrontendMvSchedulerConfig::default(),
+            mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
@@ -805,7 +805,7 @@ impl FrontendExecutionConfig {
         self.optimizer_query_mem_limit_bytes
     }
 
-    pub fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
+    pub fn with_mv_scheduler_config(mut self, config: MvSchedulerConfig) -> Self {
         self.mv_scheduler = config;
         self
     }
@@ -1441,7 +1441,7 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub(crate) fn mv_scheduler_config(&self) -> FrontendMvSchedulerConfig {
+    pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
         self.mv_scheduler_config.clone()
     }
 

@@ -32,46 +32,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::{
     MvPublishedProjection, MvPublishedWaterline, MvRepositoryError, MvTarget,
 };
-
-/// Existing standalone scheduler settings, now interpreted by the frontend.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FrontendMvSchedulerConfig {
-    pub(crate) enabled: bool,
-    pub(crate) tick_interval_ms: u64,
-    pub(crate) max_concurrent_refreshes: usize,
-    pub(crate) failure_backoff_ms: i64,
-    pub(crate) max_failure_backoff_ms: i64,
-}
-
-impl FrontendMvSchedulerConfig {
-    pub const fn new(
-        enabled: bool,
-        tick_interval_ms: u64,
-        max_concurrent_refreshes: usize,
-        failure_backoff_ms: i64,
-        max_failure_backoff_ms: i64,
-    ) -> Self {
-        Self {
-            enabled,
-            tick_interval_ms,
-            max_concurrent_refreshes,
-            failure_backoff_ms,
-            max_failure_backoff_ms,
-        }
-    }
-}
-
-impl Default for FrontendMvSchedulerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            tick_interval_ms: 30_000,
-            max_concurrent_refreshes: 1,
-            failure_backoff_ms: 60_000,
-            max_failure_backoff_ms: 1_800_000,
-        }
-    }
-}
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
 
 /// Why a refresh was made runnable.  A worker does not reinterpret this as a
 /// retry policy; it is purely observable scheduling state.
@@ -234,7 +195,7 @@ pub(crate) enum ScheduledRefreshRuntimeDecision {
 
 #[derive(Debug)]
 pub(crate) struct FrontendMvScheduler {
-    config: FrontendMvSchedulerConfig,
+    config: MvSchedulerConfig,
     queue: VecDeque<ScheduledRefreshRequest>,
     queued_mv_ids: BTreeSet<i64>,
     running_mv_ids: BTreeSet<i64>,
@@ -246,7 +207,7 @@ pub(crate) struct FrontendMvScheduler {
 }
 
 impl FrontendMvScheduler {
-    pub(crate) fn new(config: FrontendMvSchedulerConfig) -> Self {
+    pub(crate) fn new(config: MvSchedulerConfig) -> Self {
         Self {
             config,
             queue: VecDeque::new(),
@@ -269,7 +230,7 @@ impl FrontendMvScheduler {
         engine: &dyn MvBackgroundEngine,
         now_ms: i64,
     ) -> Result<Vec<ScheduledRefreshRequest>, MvRepositoryError> {
-        if !self.config.enabled {
+        if !self.config.enabled() {
             return Ok(Vec::new());
         }
 
@@ -279,7 +240,7 @@ impl FrontendMvScheduler {
 
         let capacity = self
             .config
-            .max_concurrent_refreshes
+            .max_concurrent_refreshes()
             .max(1)
             .saturating_sub(self.running_mv_ids.len());
         let mut ready = Vec::with_capacity(capacity);
@@ -300,7 +261,7 @@ impl FrontendMvScheduler {
     /// refresh permit.  A worker that cannot acquire either simply lets its
     /// request be considered again on the next poll, without holding capacity.
     pub(crate) fn mark_started(&mut self, mv_id: i64) -> bool {
-        if self.running_mv_ids.len() >= self.config.max_concurrent_refreshes.max(1)
+        if self.running_mv_ids.len() >= self.config.max_concurrent_refreshes().max(1)
             || self.running_mv_ids.contains(&mv_id)
         {
             return false;
@@ -616,9 +577,9 @@ fn current_base_snapshots_match(
             .all(|(base, snapshot)| published.get(base).copied() == *snapshot)
 }
 
-fn backoff_ms(config: &FrontendMvSchedulerConfig, attempt: u32) -> i64 {
-    let base = config.failure_backoff_ms.max(1);
-    let maximum = config.max_failure_backoff_ms.max(base);
+fn backoff_ms(config: &MvSchedulerConfig, attempt: u32) -> i64 {
+    let base = config.failure_backoff_ms().max(1);
+    let maximum = config.max_failure_backoff_ms().max(base);
     let shift = attempt.saturating_sub(1).min(62);
     base.saturating_mul(1_i64.checked_shl(shift).unwrap_or(i64::MAX))
         .min(maximum)
@@ -802,10 +763,7 @@ mod tests {
 
     #[test]
     fn coalescing_never_queues_the_same_mv_twice() {
-        let config = FrontendMvSchedulerConfig {
-            enabled: true,
-            ..Default::default()
-        };
+        let config = MvSchedulerConfig::new(true, 30_000, 1, 60_000, 1_800_000);
         let mut scheduler = FrontendMvScheduler::new(config);
         let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
         let target = mv_target(&definition).expect("target");
@@ -822,12 +780,7 @@ mod tests {
 
     #[test]
     fn every_typed_disposition_has_an_explicit_runtime_decision() {
-        let config = FrontendMvSchedulerConfig {
-            enabled: true,
-            failure_backoff_ms: 10,
-            max_failure_backoff_ms: 40,
-            ..Default::default()
-        };
+        let config = MvSchedulerConfig::new(true, 30_000, 1, 10, 40);
         let mut scheduler = FrontendMvScheduler::new(config);
         let definition = definition(MvDesiredRefreshPolicy::AsyncInterval);
         assert!(matches!(
