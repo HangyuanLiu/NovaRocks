@@ -587,6 +587,7 @@ impl Fixture {
             Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+            super::backend_task_execution_ports(),
         );
         Self {
             registry,

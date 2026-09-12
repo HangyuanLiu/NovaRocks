@@ -745,6 +745,7 @@ mod tests {
                 Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+                super::super::backend_task_execution_ports(),
             );
             Self {
                 ingress: RegistryTaskExecutionIngress::new(

@@ -24,6 +24,7 @@ use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
 use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+    backend_task_execution_ports,
 };
 use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
@@ -468,6 +469,7 @@ fn compose_backend_application_services(
         task_execution_registry_config,
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
+        backend_task_execution_ports(),
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),
@@ -886,6 +888,7 @@ mod tests {
             Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
+            crate::task_execution::backend_task_execution_ports(),
         );
         let context = QueryContextRef::new(
             QueryExecutionId::new(

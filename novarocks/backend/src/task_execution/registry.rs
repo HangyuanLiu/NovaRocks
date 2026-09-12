@@ -86,7 +86,6 @@ use super::entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use super::marker;
 use novarocks_worker::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, InitialDomainKey, METRIC_PUBLISH_MIN_INTERVAL, OperationReceipt,
@@ -270,6 +269,7 @@ pub struct TaskExecutionRegistry {
     clock: Arc<dyn WorkerMonotonicClock>,
     context_host: Arc<dyn QueryContextHost>,
     task_host: Arc<dyn TaskExecutionHost>,
+    ports: novarocks_worker::TaskExecutionPorts,
     admission_tickets: AdmissionTicketAuthority,
     state: Mutex<RegistryState>,
     gate: Condvar,
@@ -282,6 +282,7 @@ impl TaskExecutionRegistry {
         clock: Arc<dyn WorkerMonotonicClock>,
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
+        ports: novarocks_worker::TaskExecutionPorts,
     ) -> Arc<Self> {
         assert!(
             config.max_tasks_per_context <= TransportBudget::DEFAULT.max_tasks_per_context(),
@@ -292,6 +293,7 @@ impl TaskExecutionRegistry {
             clock,
             context_host,
             task_host,
+            ports,
             admission_tickets: AdmissionTicketAuthority::new(config.admission_tickets),
             state: Mutex::new(RegistryState::default()),
             gate: Condvar::new(),
@@ -304,12 +306,14 @@ impl TaskExecutionRegistry {
         config: TaskExecutionRegistryConfig,
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
+        ports: novarocks_worker::TaskExecutionPorts,
     ) -> Arc<Self> {
         Self::new(
             config,
             Arc::new(ProcessMonotonicClock::new()),
             context_host,
             task_host,
+            ports,
         )
     }
 
@@ -539,7 +543,7 @@ impl TaskExecutionRegistry {
         // registry state here could disagree with that answer, because the
         // lock is released by now.
         if let Some(event) = TaskProtocolEvent::create_task(request.identity(), &receipt) {
-            marker::emit(event);
+            self.ports.observe(event);
         }
         receipt
     }
@@ -693,7 +697,7 @@ impl TaskExecutionRegistry {
             );
         }
         self.counters.tasks_created.fetch_add(1, Ordering::Relaxed);
-        crate::metrics::record_task_execution_task_created();
+        self.ports.record_task_created();
         OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, receipt)
     }
 
@@ -1084,7 +1088,7 @@ impl TaskExecutionRegistry {
                 if let Some(event) =
                     TaskProtocolEvent::establish_query_context(establish.context(), &receipt)
                 {
-                    marker::emit(event);
+                    self.ports.observe(event);
                 }
                 receipt
             }
@@ -1098,7 +1102,7 @@ impl TaskExecutionRegistry {
                     renew.sequence(),
                     &receipt,
                 ) {
-                    marker::emit(event);
+                    self.ports.observe(event);
                 }
                 receipt
             }
@@ -1624,7 +1628,7 @@ impl TaskExecutionRegistry {
         // Cancellation revokes client-visible output at its own linearization
         // point. The fragment may already have finished producing and dropped
         // its runnable handle, so task retirement cannot be the only cleanup.
-        crate::runtime::result_buffer::discard_task(identity);
+        self.ports.discard_task(identity);
         runnable.cancel(request.reason());
         OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, status.current())
     }
@@ -1634,7 +1638,7 @@ impl TaskExecutionRegistry {
     pub fn abort_query_context(&self, request: &AbortQueryContext) -> QueryContextOutcome {
         let receipt = self.apply_abort_query_context(request);
         if let Some(event) = TaskProtocolEvent::abort_query_context(request.context(), &receipt) {
-            marker::emit(event);
+            self.ports.observe(event);
         }
         receipt
     }
@@ -1712,7 +1716,7 @@ impl TaskExecutionRegistry {
         if let Some(event) =
             TaskProtocolEvent::release_query_context(request.context(), &receipt, runtime_filter)
         {
-            marker::emit(event);
+            self.ports.observe(event);
         }
         receipt
     }
@@ -2052,7 +2056,8 @@ impl TaskExecutionRegistry {
                 now,
             ) {
                 self.counters.lease_expiries.fetch_add(1, Ordering::Relaxed);
-                marker::emit(TaskProtocolEvent::query_execution_lease_expired(context));
+                self.ports
+                    .observe(TaskProtocolEvent::query_execution_lease_expired(context));
                 count += 1;
             }
         }
@@ -2153,7 +2158,7 @@ impl TaskExecutionRegistry {
             // immediately, including output whose producer already finished
             // and no longer holds a fragment cancellation handle.
             for identity in task_identities {
-                crate::runtime::result_buffer::discard_task(identity);
+                self.ports.discard_task(identity);
             }
             self.admission_tickets.revoke_unredeemed(context, now);
             state.pending_termination.insert(context);
@@ -2278,16 +2283,17 @@ impl TaskExecutionRegistry {
                 retirements
             };
             for (identity, bytes, terminal_state) in retirements {
-                crate::runtime::result_buffer::retire_task_result(identity);
+                self.ports.retire_task_result(identity);
                 state.active_tasks = state.active_tasks.saturating_sub(1);
                 state.retained_tasks = state.retained_tasks.saturating_add(1);
                 state.retained_bytes = state.retained_bytes.saturating_add(bytes);
                 state.retired_task_order.push_back((context, identity));
-                marker::emit(TaskProtocolEvent::task_terminal_retained(
-                    identity,
-                    terminal_state,
-                    bytes,
-                ));
+                self.ports
+                    .observe(TaskProtocolEvent::task_terminal_retained(
+                        identity,
+                        terminal_state,
+                        bytes,
+                    ));
                 retired += 1;
             }
         }
@@ -2352,11 +2358,12 @@ impl TaskExecutionRegistry {
                     .contexts
                     .get(&context)
                     .expect("a completing context exists");
-                marker::emit(TaskProtocolEvent::context_termination_completed(
-                    context,
-                    entry.latch.cause(),
-                    entry.tasks.len(),
-                ));
+                self.ports
+                    .observe(TaskProtocolEvent::context_termination_completed(
+                        context,
+                        entry.latch.cause(),
+                        entry.tasks.len(),
+                    ));
             }
             self.retain_context_terminal_locked(state, context, now);
         }
@@ -2410,7 +2417,7 @@ impl TaskExecutionRegistry {
             )
         };
         for identity in task_identities {
-            crate::runtime::result_buffer::discard_task(identity);
+            self.ports.discard_task(identity);
         }
         self.admission_tickets.release_context(context, now);
 
@@ -2487,7 +2494,7 @@ impl TaskExecutionRegistry {
         context: QueryContextRef,
         identity: TaskIdentity,
     ) {
-        crate::runtime::result_buffer::discard_task(identity);
+        self.ports.discard_task(identity);
         let bytes = {
             let Some(entry) = state.contexts.get_mut(&context) else {
                 return;
@@ -2521,7 +2528,7 @@ impl TaskExecutionRegistry {
             entry.tasks.keys().copied().collect()
         };
         for identity in &identities {
-            crate::runtime::result_buffer::discard_task(*identity);
+            self.ports.discard_task(*identity);
             let bytes = state
                 .contexts
                 .get(&context)
