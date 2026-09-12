@@ -21,13 +21,13 @@ pub(crate) mod background_engine;
 pub mod command;
 mod create;
 pub mod domain;
-pub(crate) mod maintenance;
+pub mod maintenance;
 pub(crate) mod maintenance_worker;
 pub(crate) mod process_runtime;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
 pub mod repository;
-pub(crate) mod scheduler;
+pub mod scheduler;
 mod service;
 #[allow(dead_code)]
 pub(crate) mod startup_restore;

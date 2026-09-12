@@ -21,8 +21,7 @@ pub mod catalog_application;
 pub mod catalog_attachment;
 pub mod catalog_controller;
 mod catalog_projection_metrics;
-mod catalog_prune;
-pub use catalog_prune::CatalogPruneConfig;
+pub mod catalog_prune;
 pub mod common;
 pub mod connector;
 pub mod coordinator;
@@ -36,7 +35,7 @@ mod preparation_diagnostics;
 pub mod query;
 pub mod query_execution;
 pub mod runtime_filter;
-mod server;
+pub mod server;
 pub mod state_family;
 pub mod state_store;
 pub mod statistics;
@@ -44,33 +43,6 @@ pub mod statistics_jobs;
 pub mod system_catalog;
 pub mod table_maintenance;
 pub mod task_execution;
-mod topology;
+pub mod topology;
 pub mod view;
 pub mod workload_lifecycle;
-
-pub use application::{
-    FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig, FrontendQueryControlTimeouts,
-};
-pub use dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
-pub use mv::maintenance::MaintenanceCoordinatorConfig;
-pub use mv::scheduler::FrontendMvSchedulerConfig;
-pub use server::{
-    FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
-    build_frontend_query_session_factory, open_frontend_application_for_server,
-    serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
-    start_frontend_management_server,
-};
-pub use state_store::{
-    RunFailure, RunSuccess, StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
-    StateStoreRunPolicy, run_side_effect_free,
-};
-pub use system_catalog::SystemCatalogService;
-pub use topology::ClusterBackendOpenConfig;
-pub use view::FrontendViewService;
-pub use workload_lifecycle::{
-    FrontendAdmissionError, FrontendCatalogCounts, FrontendCatalogSnapshotIdentity,
-    FrontendCatalogSourceMode, FrontendServingLifecycle, FrontendServingSnapshot,
-    FrontendServingSnapshotReader, FrontendServingState, FrontendServingWorkloadSnapshotReader,
-    LateBoundFrontendServingSnapshotReader,
-};

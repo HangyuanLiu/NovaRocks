@@ -35,12 +35,17 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendApplicationOpenConfig,
-    FrontendExecutionConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
-    FrontendServingConfig,
+    application::{
+        FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
+        FrontendQueryControlTimeouts,
+    },
+    catalog_prune::CatalogPruneConfig,
+    mv::{maintenance::MaintenanceCoordinatorConfig, scheduler::FrontendMvSchedulerConfig},
+    server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
     state_store::{
         StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
     },
+    topology::ClusterBackendOpenConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -508,7 +513,7 @@ pub fn compose_frontend_role_config(
         decode_queue,
         abort_capacity,
     ) = compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
-    let logical_runtime = novarocks_frontend::FrontendLogicalExecutionRuntimeConfig::new(
+    let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         workload_resources,
@@ -594,33 +599,30 @@ pub fn compose_frontend_role_config(
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
-        execution =
-            execution.with_mv_scheduler_config(novarocks_frontend::FrontendMvSchedulerConfig::new(
-                standalone.mv_refresh_scheduler_enabled,
-                standalone.mv_refresh_scheduler_interval_ms.max(1),
-                standalone.mv_refresh_scheduler_max_concurrent.max(1),
-                failure_backoff_ms,
-                standalone
-                    .mv_refresh_scheduler_max_failure_backoff_ms
-                    .max(failure_backoff_ms),
-            ));
-        execution = execution.with_mv_maintenance_config(
-            novarocks_frontend::MaintenanceCoordinatorConfig::new(
-                standalone.iceberg_maintenance_enabled,
-                standalone.iceberg_maintenance_tick_interval_ms.max(1),
-                standalone.iceberg_maintenance_max_concurrent.max(1),
-                standalone
-                    .iceberg_maintenance_compaction_min_data_files
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-                standalone
-                    .iceberg_maintenance_dv_min_delete_files
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-                standalone.iceberg_maintenance_action_cooldown_ms,
-                standalone.iceberg_maintenance_max_consecutive_failures,
-            ),
-        );
+        execution = execution.with_mv_scheduler_config(FrontendMvSchedulerConfig::new(
+            standalone.mv_refresh_scheduler_enabled,
+            standalone.mv_refresh_scheduler_interval_ms.max(1),
+            standalone.mv_refresh_scheduler_max_concurrent.max(1),
+            failure_backoff_ms,
+            standalone
+                .mv_refresh_scheduler_max_failure_backoff_ms
+                .max(failure_backoff_ms),
+        ));
+        execution = execution.with_mv_maintenance_config(MaintenanceCoordinatorConfig::new(
+            standalone.iceberg_maintenance_enabled,
+            standalone.iceberg_maintenance_tick_interval_ms.max(1),
+            standalone.iceberg_maintenance_max_concurrent.max(1),
+            standalone
+                .iceberg_maintenance_compaction_min_data_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            standalone
+                .iceberg_maintenance_dv_min_delete_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            standalone.iceberg_maintenance_action_cooldown_ms,
+            standalone.iceberg_maintenance_max_consecutive_failures,
+        ));
     }
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,

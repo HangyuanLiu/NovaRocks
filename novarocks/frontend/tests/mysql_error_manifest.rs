@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use novarocks_frontend::DML_ERROR_CODE_DESCRIPTORS;
+use novarocks_frontend::dml::error::ERROR_CODE_DESCRIPTORS as DML_ERROR_CODE_DESCRIPTORS;
 use novarocks_parser::ERROR_CODE_DESCRIPTORS as PARSER_ERROR_CODE_DESCRIPTORS;
 use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
 use novarocks_sql::analyze_error::ERROR_CODE_DESCRIPTORS as ANALYZE_ERROR_CODE_DESCRIPTORS;

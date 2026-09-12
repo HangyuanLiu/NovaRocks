@@ -552,7 +552,7 @@ async fn attachment(
         .expect("read catalog attachment")
 }
 
-async fn shutdown(mut host: novarocks_frontend::StateStoreHost) {
+async fn shutdown(mut host: novarocks_frontend::state_store::StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");

@@ -40,7 +40,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_frontend::catalog_attachment::{
     CatalogAttachment, CatalogAttachmentErrorKind, CatalogAttachmentRepository,
 };
@@ -56,6 +55,7 @@ use novarocks_frontend::mv::domain::repository::{
     MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
+use novarocks_frontend::state_store::StateStoreRunPolicy;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
     GcOwnedRefObservationErrorKind,

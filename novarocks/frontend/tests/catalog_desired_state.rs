@@ -425,7 +425,7 @@ async fn ready_attachment_id(port: &FrontendCatalogApplicationPort, name: &str) 
     panic!("catalog `{name}` did not become Ready after scheduler materialization")
 }
 
-async fn shutdown(mut host: novarocks_frontend::StateStoreHost) {
+async fn shutdown(mut host: novarocks_frontend::state_store::StateStoreHost) {
     host.shutdown(Instant::now() + Duration::from_secs(5))
         .await
         .expect("state store shutdown");

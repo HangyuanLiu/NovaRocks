@@ -21,8 +21,12 @@ use novarocks_frontend::view::{
     ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-    FrontendApplicationHost, FrontendExecutionConfig,
+    application::{
+        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+        FrontendExecutionConfig,
+    },
+    state_store::StateStoreHostInput,
+    topology::ClusterBackendOpenConfig,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
@@ -66,7 +70,7 @@ fn execution_config() -> FrontendExecutionConfig {
 }
 
 async fn open_host(
-    input: Option<novarocks_frontend::StateStoreHostInput>,
+    input: Option<StateStoreHostInput>,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     let registry = state_store_fixture::registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
@@ -189,11 +193,11 @@ fn parse_query(sql: &str) -> Query {
     query.clone()
 }
 
-fn state_store_input() -> novarocks_frontend::StateStoreHostInput {
+fn state_store_input() -> StateStoreHostInput {
     state_store_fixture::input(format!("frontend-cluster-{}", Uuid::now_v7()))
 }
 
-fn sqlite_config(_temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
+fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
     state_store_input()
 }
 

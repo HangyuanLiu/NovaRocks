@@ -16,8 +16,12 @@
 // under the License.
 
 use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    application::{
+        FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+        FrontendExecutionConfig,
+    },
+    state_store::StateStoreHostInput,
+    topology::ClusterBackendOpenConfig,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
@@ -39,7 +43,7 @@ fn test_native_trust() -> std::sync::Arc<NativeTrust> {
     ))
 }
 
-fn state_store_input(temp: &TempDir) -> novarocks_frontend::StateStoreHostInput {
+fn state_store_input(temp: &TempDir) -> StateStoreHostInput {
     state_store_fixture::input(format!("frontend-mv-host-{}", temp.path().display()))
 }
 
@@ -57,8 +61,8 @@ fn execution_config() -> FrontendExecutionConfig {
 }
 
 async fn open_host(
-    input: Option<novarocks_frontend::StateStoreHostInput>,
-) -> Result<FrontendApplicationHost, novarocks_frontend::FrontendApplicationError> {
+    input: Option<StateStoreHostInput>,
+) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     let registry = state_store_fixture::registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         input,

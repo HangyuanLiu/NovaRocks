@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use novarocks_frontend::state_store::StateStoreProviderRegistration;
-use novarocks_frontend::{
-    StateStoreHost as FrontendStateStoreHost, StateStoreHostInput, StateStoreProviderRegistry,
+use novarocks_frontend::state_store::{
+    StateStoreHost as FrontendStateStoreHost, StateStoreHostInput, StateStoreProviderRegistration,
+    StateStoreProviderRegistry,
 };
 use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreLimits, StateStoreOpenRequest,
@@ -145,8 +145,10 @@ pub async fn open_with_input(input: StateStoreHostInput) -> FrontendStateStoreHo
 
 // Transitional test adapter. It converts legacy fixture literals directly to
 // provider-neutral `StateStoreHostInput`; it never opens a concrete provider.
-pub use novarocks_frontend::state_store::{StateStoreHostErrorKind, StateStoreHostLifecycle};
-pub use novarocks_frontend::{RunFailure, RunSuccess, StateStoreRunPolicy, run_side_effect_free};
+pub use novarocks_frontend::state_store::{
+    RunFailure, RunSuccess, StateStoreHostErrorKind, StateStoreHostLifecycle, StateStoreRunPolicy,
+    run_side_effect_free,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct StateStoreLimitOverrides {

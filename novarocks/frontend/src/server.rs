@@ -45,8 +45,8 @@ use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
 use crate::{
-    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    application::{FrontendApplicationError, FrontendApplicationHost, FrontendExecutionConfig},
+    topology::ClusterBackendOpenConfig,
 };
 
 #[cfg(test)]
@@ -875,8 +875,11 @@ mod tests {
         input as test_state_store_input, registry as test_state_store_registry,
     };
     use crate::{
-        ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-        FrontendApplicationHost, FrontendExecutionConfig,
+        application::{
+            FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+            FrontendExecutionConfig,
+        },
+        topology::ClusterBackendOpenConfig,
     };
     use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
     use novarocks_native_adapter::FrontendNativeTransport;

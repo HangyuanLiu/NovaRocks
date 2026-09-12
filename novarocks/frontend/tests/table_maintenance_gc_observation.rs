@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::state_store_fixture;
-use novarocks_frontend::StateStoreRunPolicy;
+use novarocks_frontend::state_store::StateStoreRunPolicy;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
 };

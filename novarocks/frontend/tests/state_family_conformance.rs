@@ -46,7 +46,9 @@ use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
 };
 use novarocks_frontend::{
-    ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
+    application::{FrontendApplicationHost, FrontendExecutionConfig},
+    state_store::StateStoreHostInput,
+    topology::ClusterBackendOpenConfig,
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
@@ -224,9 +226,7 @@ fn backend_config() -> ClusterBackendOpenConfig {
 /// backend membership, the MV accelerator, GC observations and the view
 /// registry - and each one gets its chance to write. The retired coordination
 /// family wrote its control record on exactly this path.
-async fn open_application(
-    input: novarocks_frontend::StateStoreHostInput,
-) -> FrontendApplicationHost {
+async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost {
     let registry = state_store_fixture::registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         Some(input),
