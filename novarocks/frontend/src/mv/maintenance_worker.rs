@@ -37,7 +37,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
-use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepositoryError;
@@ -45,6 +44,7 @@ use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
     OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
 };
+use novarocks_table_maintenance::MaintenanceTarget;
 
 use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
 use super::maintenance::{

@@ -20,8 +20,8 @@
 use novarocks_table_maintenance::runtime::ProcessRuntime;
 
 use super::activity::MaintenanceActivityPermit;
-use super::model::OptimizeJobOutcome;
-use crate::maintenance::MaintenanceTarget;
+use novarocks_table_maintenance::MaintenanceTarget;
+use novarocks_table_maintenance::OptimizeJobOutcome;
 
 pub type OptimizeProcessRuntime =
     ProcessRuntime<MaintenanceTarget, OptimizeJobOutcome, MaintenanceActivityPermit>;

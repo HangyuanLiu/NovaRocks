@@ -17,10 +17,10 @@
 
 use std::collections::BTreeMap;
 
-use novarocks_frontend::maintenance::MaintenanceTarget;
 use novarocks_frontend::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTargetRebind,
 };
+use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_table_maintenance::runtime::MaintenanceJobState;
 
 #[test]

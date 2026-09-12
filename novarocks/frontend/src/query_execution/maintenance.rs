@@ -34,7 +34,6 @@ use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
-use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
 use novarocks_query_application::api::QueryResult;
@@ -48,6 +47,7 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
 };
+use novarocks_table_maintenance::MaintenanceTarget;
 use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState};
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";

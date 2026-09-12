@@ -26,7 +26,7 @@ use std::sync::Arc;
 
 use novarocks_table_maintenance::activity::{TargetActivity, TargetActivityPermit, TargetBusy};
 
-use crate::maintenance::MaintenanceTarget;
+use novarocks_table_maintenance::MaintenanceTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MaintenanceActivityFamily {
@@ -138,7 +138,7 @@ impl fmt::Debug for MaintenanceActivityPermit {
 #[cfg(test)]
 mod tests {
     use super::{MaintenanceActivityFamily, TableMaintenanceActivity};
-    use crate::maintenance::MaintenanceTarget;
+    use novarocks_table_maintenance::MaintenanceTarget;
 
     fn target(table: &str) -> MaintenanceTarget {
         MaintenanceTarget {

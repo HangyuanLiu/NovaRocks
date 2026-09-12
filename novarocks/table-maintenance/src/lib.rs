@@ -24,3 +24,32 @@
 
 pub mod activity;
 pub mod runtime;
+
+/// Stable product identity of one external table-maintenance target.
+///
+/// The target contains no connector handle, snapshot, or session state. The
+/// caller captures and rebinds those provider facts around this durable
+/// process-local identity.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct MaintenanceTarget {
+    pub catalog: String,
+    pub namespace: String,
+    pub table: String,
+}
+
+/// Provider receipt facts retained by one OPTIMIZE job.
+///
+/// Optional counts mean that the provider did not prove the fact; they are not
+/// a known zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OptimizeJobOutcome {
+    pub target_snapshot_id: Option<i64>,
+    pub rewritten_data_files: i64,
+    pub deleted_data_files: i64,
+    pub added_data_files: Option<i64>,
+    pub added_delete_files: Option<i64>,
+    pub output_record_count: Option<i64>,
+}
+
+/// Current-process OPTIMIZE job state owned by the table-maintenance product.
+pub type OptimizeJob = runtime::JobRecord<MaintenanceTarget, OptimizeJobOutcome>;

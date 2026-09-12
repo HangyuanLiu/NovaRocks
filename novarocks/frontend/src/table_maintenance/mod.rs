@@ -46,7 +46,6 @@ use self::result::{action_result, optimize_jobs_result};
 use self::runtime::OptimizeProcessRuntime;
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
     MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
@@ -55,11 +54,11 @@ use crate::query_execution::maintenance::{
 use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };
+use novarocks_table_maintenance::{MaintenanceTarget, OptimizeJob};
 
 pub mod activity;
 pub mod admission;
 pub mod gc_observation;
-pub mod model;
 pub mod result;
 pub mod runtime;
 pub mod worker;
@@ -463,7 +462,7 @@ impl OptimizeJobExecutor for DirectOptimizeExecutor {
         &self,
         _runtime: &Handle,
         engine: &dyn TableMaintenanceEngine,
-        job: &model::OptimizeJob,
+        job: &OptimizeJob,
     ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
         execute_distributed_rewrite_terminal(
             engine,

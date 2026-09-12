@@ -21,13 +21,13 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
-use crate::maintenance::MaintenanceTarget;
 use crate::mv::domain::repository::MvTarget;
 use crate::query_execution::maintenance::TableMaintenanceEngine;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshAttemptIdentity, PreparedMvRefresh,
 };
 use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_table_maintenance::MaintenanceTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MvBackgroundEngineErrorKind {

@@ -25,7 +25,6 @@ pub mod common;
 pub mod connector;
 pub mod coordinator;
 pub mod dml;
-pub mod maintenance;
 pub mod metrics;
 pub mod mv;
 mod native;

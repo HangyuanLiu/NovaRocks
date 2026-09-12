@@ -23,7 +23,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 
-use super::model::{OptimizeJob, OptimizeJobOutcome};
+use novarocks_table_maintenance::{OptimizeJob, OptimizeJobOutcome};
 
 pub fn action_result(
     outcome: MaintenanceActionOutcome,

@@ -37,9 +37,9 @@ use crate::query_execution::maintenance::{
     MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
 };
 
-use super::model::OptimizeJob;
 use super::now_unix_millis;
 use super::runtime::OptimizeProcessRuntime;
+use novarocks_table_maintenance::OptimizeJob;
 use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
 
 /// Runner-owned test root for the STAT-2F cross-process maintenance race.
@@ -425,7 +425,7 @@ fn stat2f_test_paths(root: &std::path::Path, job_id: i64) -> Stat2fTestPaths {
 
 pub(crate) fn optimize_outcome(
     outcome: MaintenanceActionOutcome,
-) -> Result<super::model::OptimizeJobOutcome, String> {
+) -> Result<novarocks_table_maintenance::OptimizeJobOutcome, String> {
     let MaintenanceActionOutcome::RewriteDataFiles {
         target_snapshot_id,
         rewritten_data_files_count,
@@ -438,7 +438,7 @@ pub(crate) fn optimize_outcome(
     else {
         return Err("optimize worker expected a RewriteDataFiles outcome".to_string());
     };
-    Ok(super::model::OptimizeJobOutcome {
+    Ok(novarocks_table_maintenance::OptimizeJobOutcome {
         target_snapshot_id,
         rewritten_data_files: i64::from(rewritten_data_files_count),
         deleted_data_files: i64::from(removed_delete_files_count),
@@ -457,13 +457,13 @@ mod lifecycle_tests {
     use novarocks_spi::connector::ConnectorTableObjectId;
 
     use super::{OptimizeJobExecutor, OptimizeWorker, run_worker};
-    use crate::maintenance::MaintenanceTarget;
     use crate::query_execution::maintenance::{
         MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
         MaintenanceTargetRebind, TableMaintenanceEngine,
     };
-    use crate::table_maintenance::model::OptimizeJob;
     use crate::table_maintenance::runtime::OptimizeProcessRuntime;
+    use novarocks_table_maintenance::MaintenanceTarget;
+    use novarocks_table_maintenance::OptimizeJob;
     use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
     use novarocks_workload_control::{ResourceConfig, WorkloadConfig, WorkloadControl};
 

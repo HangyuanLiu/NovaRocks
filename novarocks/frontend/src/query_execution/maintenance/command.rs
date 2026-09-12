@@ -167,7 +167,7 @@ mod tests {
         fn submit_automatic_optimize(
             &self,
             _engine: &dyn TableMaintenanceEngine,
-            _target: crate::maintenance::MaintenanceTarget,
+            _target: novarocks_table_maintenance::MaintenanceTarget,
         ) -> Result<OptimizeSubmission, String> {
             Err("not used".to_string())
         }
