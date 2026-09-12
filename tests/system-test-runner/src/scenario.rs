@@ -7,6 +7,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,10 +115,13 @@ struct ScenarioEvidence<'a> {
     started_unix_millis: u128,
     ended_unix_millis: u128,
     command: Vec<String>,
+    source_revision: String,
+    source_dirty: bool,
     runner_native_build_identity: String,
     actions: &'a [String],
     runtime_dir: String,
     primary_binary: String,
+    primary_binary_sha256: String,
     base_config_path: String,
     base_config_sha256: String,
     cluster_size: usize,
@@ -305,8 +309,15 @@ impl ScenarioContext {
                 self.base_config_path().display()
             )
         })?;
+        let (source_revision, source_dirty) = source_checkout_identity()?;
+        let primary_binary_bytes = fs::read(self.primary_binary()).with_context(|| {
+            format!(
+                "read primary binary for scenario evidence {}",
+                self.primary_binary().display()
+            )
+        })?;
         let evidence = ScenarioEvidence {
-            schema_version: 1,
+            schema_version: 2,
             scenario: self.name,
             outcome,
             exit_code: match outcome {
@@ -316,10 +327,13 @@ impl ScenarioContext {
             started_unix_millis: unix_millis(self.started_at)?,
             ended_unix_millis: unix_millis(SystemTime::now())?,
             command: std::env::args().collect(),
+            source_revision,
+            source_dirty,
             runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
             actions: &self.actions,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
+            primary_binary_sha256: format!("{:x}", Sha256::digest(primary_binary_bytes)),
             base_config_path: self.base_config_path().display().to_string(),
             base_config_sha256: format!("{:x}", Sha256::digest(config_bytes)),
             cluster_size: self.cluster_size,
@@ -381,6 +395,35 @@ impl ScenarioContext {
             native_trust_fixture: launch_config.native_trust_fixture,
         })
     }
+}
+
+fn source_checkout_identity() -> Result<(String, bool)> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .context("locate workspace root for scenario evidence")?;
+    let revision = git_output(repository, &["rev-parse", "HEAD"])?;
+    let status = git_output(repository, &["status", "--porcelain=v1"])?;
+    Ok((revision, !status.is_empty()))
+}
+
+fn git_output(repository: &Path, arguments: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(repository)
+        .output()
+        .with_context(|| format!("run git {} for scenario evidence", arguments.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} for scenario evidence failed with status {}: {}",
+            arguments.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout)
+        .context("decode git output for scenario evidence")
+        .map(|value| value.trim().to_string())
 }
 
 fn unix_millis(time: SystemTime) -> Result<u128> {
