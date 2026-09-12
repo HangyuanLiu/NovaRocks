@@ -17,7 +17,7 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_workload_control::WorkOwner;
+use novarocks_workload_control::WorkScope;
 
 use super::ObjectPath;
 
@@ -25,18 +25,22 @@ pub type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'static>>;
 
 /// Governed command context transferred from the SQL application to a product.
+///
+/// A command consumer can attribute work to the statement and observe its
+/// cancellation state, but it never receives the statement's root owner. The
+/// SQL protocol retains that owner until it has a terminal protocol outcome.
 pub struct CommandContext {
-    owner: WorkOwner,
+    scope: WorkScope,
 }
 
 impl CommandContext {
     #[allow(dead_code)]
-    pub(crate) const fn new(owner: WorkOwner) -> Self {
-        Self { owner }
+    pub(crate) const fn new(scope: WorkScope) -> Self {
+        Self { scope }
     }
 
-    pub fn into_work_owner(self) -> WorkOwner {
-        self.owner
+    pub fn scope(&self) -> &WorkScope {
+        &self.scope
     }
 }
 
@@ -347,6 +351,10 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
     use super::*;
 
     #[test]
@@ -354,5 +362,28 @@ mod tests {
         let columns = vec![Arc::<str>::from("job"), Arc::<str>::from("state")];
         let rows = vec![vec![Some(Arc::<str>::from("one"))]];
         assert!(CommandRows::try_new(columns, rows).is_none());
+    }
+
+    #[test]
+    fn command_context_exposes_the_statement_scope() {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+
+        let expected_scope = root.owner.scope();
+        let context = CommandContext::new(expected_scope.clone());
+
+        assert_eq!(context.scope().id(), expected_scope.id());
+        assert!(context.scope().check().is_ok());
     }
 }
