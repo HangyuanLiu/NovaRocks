@@ -4009,15 +4009,18 @@ dependencies = [
  "hyper",
  "hyper-util",
  "novarocks-native-trust",
+ "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-task-codec",
  "novarocks-types",
+ "novarocks-worker",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "tokio",
  "tonic",
  "tonic-build",
  "tower 0.5.2",
+ "tracing",
 ]
 
 [[package]]

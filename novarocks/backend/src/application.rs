@@ -1,6 +1,5 @@
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -10,9 +9,6 @@ use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, Executio
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
-use novarocks_proto_codec::membership::{
-    BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
-};
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
@@ -28,7 +24,8 @@ use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
 };
 use novarocks_native_adapter::{
-    BackendDataRuntime, BackendNativeTransport, NativeRpcClient, NativeRpcServerHandle,
+    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
+    backend_announce::BackendAnnounceSupervisor,
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
@@ -54,7 +51,6 @@ use novarocks_worker::TaskStatusReporter;
 use novarocks_worker::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
-const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often the task protocol owner re-evaluates its own deadlines.
 ///
 /// Nothing in that protocol expires by itself: a lease expiry, a creation-gate
@@ -152,153 +148,7 @@ pub struct BackendApplicationHost {
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
     drain: Arc<WorkerDrainState>,
-    announce_task: BackendAnnounceTask,
-}
-
-struct BackendAnnounceTask {
-    stop: Arc<AtomicBool>,
-    wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    join: Option<std::thread::JoinHandle<()>>,
-    data_runtime: BackendDataRuntime,
-    frontend_endpoint: NativeEndpoint,
-    descriptor: BackendProcessDescriptor,
-}
-
-impl BackendAnnounceTask {
-    fn start(
-        data_runtime: BackendDataRuntime,
-        frontend_endpoint: NativeEndpoint,
-        descriptor: BackendProcessDescriptor,
-        drain: Arc<WorkerDrainState>,
-        interval: Duration,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let thread_stop = Arc::clone(&stop);
-        let thread_drain = drain;
-        let thread_wake = Arc::clone(&wake);
-        let thread_runtime = data_runtime.clone();
-        let thread_frontend_endpoint = frontend_endpoint.clone();
-        let thread_descriptor = descriptor.clone();
-        let join = std::thread::Builder::new()
-            .name("backend-announce".to_string())
-            .spawn(move || {
-                let client = NativeRpcClient::new_native_endpoint(
-                    thread_runtime,
-                    thread_frontend_endpoint,
-                );
-                let initial_backoff = initial_backoff.max(Duration::from_millis(1));
-                let max_backoff = max_backoff.max(initial_backoff);
-                let mut retry_delay = initial_backoff;
-                while !thread_stop.load(Ordering::Acquire) {
-                    let reported_state = if thread_drain.is_draining() {
-                        BackendReportedState::Draining
-                    } else {
-                        BackendReportedState::Running
-                    };
-                    let request = BackendAnnounceRequest::new(
-                        thread_descriptor.clone(),
-                        reported_state,
-                    )
-                        .expect("backend process descriptor remains validated");
-                    let next_delay = match client
-                        .blocking_announce_backend_with_timeout(
-                            request.as_proto().clone(),
-                            ANNOUNCE_RPC_TIMEOUT,
-                        )
-                        .and_then(|response| {
-                            BackendAnnounceResult::from_proto(response).map_err(|error| {
-                                format!("announce_backend response invalid: {error}")
-                            })
-                        })
-                    {
-                        Ok(BackendAnnounceResult::Accepted { lease_ttl_ms }) => {
-                            retry_delay = initial_backoff;
-                            interval.min(Duration::from_millis(lease_ttl_ms.saturating_div(3).max(1)))
-                        }
-                        Ok(BackendAnnounceResult::Rejected { reason, safe_detail }) => {
-                            tracing::error!(?reason, %safe_detail, "backend announce rejected by frontend");
-                            let delay = retry_delay;
-                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
-                            delay
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "backend announce attempt failed");
-                            let delay = retry_delay;
-                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
-                            delay
-                        }
-                    };
-                    let (pending, signal) = &*thread_wake;
-                    let mut pending = pending.lock().expect("backend announce wake lock");
-                    if !*pending && !thread_stop.load(Ordering::Acquire) {
-                        let (next, _) = signal
-                            .wait_timeout(pending, next_delay)
-                            .expect("backend announce wake wait");
-                        pending = next;
-                    }
-                    *pending = false;
-                }
-            })
-            .expect("spawn backend announce task");
-        Self {
-            stop,
-            wake,
-            join: Some(join),
-            data_runtime,
-            frontend_endpoint,
-            descriptor,
-        }
-    }
-
-    /// Reports the drain the process has already entered.
-    ///
-    /// The flag itself belongs to `WorkerDrainState`; the composition root
-    /// sets it before calling this, so the announce below and the heartbeat
-    /// this BE answers cannot disagree about the same process.
-    fn announce_drain(&self) {
-        let client = NativeRpcClient::new_native_endpoint(
-            self.data_runtime.clone(),
-            self.frontend_endpoint.clone(),
-        );
-        let request =
-            BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
-                .expect("backend process descriptor remains validated");
-        match client
-            .blocking_announce_backend_with_timeout(
-                request.as_proto().clone(),
-                ANNOUNCE_RPC_TIMEOUT,
-            )
-            .and_then(|response| {
-                BackendAnnounceResult::from_proto(response)
-                    .map_err(|error| format!("announce_backend response invalid: {error}"))
-            }) {
-            Ok(BackendAnnounceResult::Accepted { .. }) => {}
-            Ok(BackendAnnounceResult::Rejected {
-                reason,
-                safe_detail,
-            }) => {
-                tracing::error!(?reason, %safe_detail, "backend drain announce rejected by frontend");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "backend drain announce attempt failed");
-            }
-        }
-        let (pending, signal) = &*self.wake;
-        *pending.lock().expect("backend announce wake lock") = true;
-        signal.notify_one();
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let (_, signal) = &*self.wake;
-        signal.notify_one();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
+    announce_task: BackendAnnounceSupervisor,
 }
 
 impl fmt::Debug for BackendApplicationHost {
@@ -857,7 +707,7 @@ impl BackendApplicationHost {
             ));
         }
 
-        let announce_task = BackendAnnounceTask::start(
+        let announce_task = BackendAnnounceSupervisor::start(
             readiness_runtime,
             frontend_endpoint,
             process_descriptor.clone(),

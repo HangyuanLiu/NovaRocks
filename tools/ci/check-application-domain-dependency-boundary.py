@@ -31,6 +31,7 @@ EXECUTION = "novarocks-execution"
 WORKLOAD = "novarocks-workload-control"
 CATALOG = "novarocks-catalog-application"
 MYSQL_ADAPTER = "novarocks-mysql-adapter"
+NATIVE_ADAPTER = "novarocks-native-adapter"
 
 PRODUCTS = {
     "novarocks-mv-application",
@@ -147,6 +148,23 @@ def verify_mysql_adapter(metadata):
         )
 
 
+def verify_native_adapter(metadata):
+    if NATIVE_ADAPTER not in package_names(metadata):
+        return
+    closure = normal_closure(metadata, NATIVE_ADAPTER)
+    if WORKER not in closure:
+        fail(f"{NATIVE_ADAPTER} normal dependency closure must contain {WORKER}")
+    forbidden = sorted(
+        closure
+        & (PRODUCTS | ROLE_IMPLEMENTATIONS | {QUERY, "novarocks-server"})
+    )
+    if forbidden:
+        fail(
+            f"{NATIVE_ADAPTER} normal dependency closure contains forbidden owners: "
+            + ", ".join(forbidden)
+        )
+
+
 def load_metadata(arguments):
     if arguments.metadata_path is not None:
         return json.loads(arguments.metadata_path.read_text())
@@ -187,6 +205,7 @@ def main():
     verify_forbidden_closure(metadata, QUERY, QUERY_FORBIDDEN)
     verify_products(metadata)
     verify_mysql_adapter(metadata)
+    verify_native_adapter(metadata)
     if WORKLOAD not in normal_closure(metadata, QUERY):
         fail(f"{QUERY} normal dependency closure must contain {WORKLOAD}")
     print("application domain dependency boundary: PASS")
