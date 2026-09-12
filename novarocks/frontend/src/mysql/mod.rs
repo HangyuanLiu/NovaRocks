@@ -37,6 +37,8 @@ use novarocks_query_application::session::{QuerySession, QuerySessionOpenRequest
 #[cfg(test)]
 use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
 #[cfg(test)]
+use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
+#[cfg(test)]
 use opensrv_mysql::{AsyncMysqlShim, ErrorKind};
 #[cfg(test)]
 const ROOT_USER: &str = novarocks_mysql_adapter::DEFAULT_MYSQL_USER;
@@ -106,7 +108,7 @@ fn every_active_manifest_descriptor_has_exactly_one_adapter_wire_mapping() {
         .iter()
         .chain(ANALYZE_ERROR_CODE_DESCRIPTORS)
         .chain(crate::DML_ERROR_CODE_DESCRIPTORS)
-        .chain(crate::SESSION_ERROR_CODE_DESCRIPTORS)
+        .chain(SESSION_ERROR_CODE_DESCRIPTORS)
         .filter(|descriptor| descriptor.status == ErrorCodeStatus::Active)
         .map(|descriptor| descriptor.code.as_str())
         .collect::<BTreeSet<_>>();

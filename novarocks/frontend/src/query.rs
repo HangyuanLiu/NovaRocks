@@ -47,7 +47,6 @@ use crate::view::command::ViewCommandExecutor;
 use crate::workload_lifecycle::{
     FrontendAdmissionError, FrontendServingLifecycle, FrontendWorkloadKind, FrontendWorkloadLease,
 };
-use crate::{QuerySession, QuerySessionFactory};
 use arrow::array::StringArray;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -73,7 +72,9 @@ use novarocks_query_application::protocol_delivery::{
     GovernedImmediateStatementResult,
 };
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
-use novarocks_query_application::session::QuerySessionOpenRequest;
+use novarocks_query_application::session::{
+    QuerySession, QuerySessionFactory, QuerySessionOpenRequest,
+};
 use novarocks_query_application::session_control::{
     ConnectionKillAuthorization, QueryCancelOutcome, QueryControlService, QuerySessionLease,
     SessionIdentity, SessionToken, StatementToken,

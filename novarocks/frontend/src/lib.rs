@@ -62,10 +62,6 @@ pub use native::report_server::FrontendReportServerHandle;
 pub use novarocks_mysql_adapter::{
     MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings, resolve_mysql_listener_settings,
 };
-pub use novarocks_query_application::publication::LakePublicationRuntimePolicy;
-pub use novarocks_query_application::session::{QuerySession, QuerySessionFactory};
-pub use novarocks_query_application::sql::session::SessionExecutionSettings;
-pub use novarocks_query_application::sql::session_admit::SESSION_ERROR_CODE_DESCRIPTORS;
 pub use query::FrontendQueryService;
 pub use query_execution::split_assignment::TaskUpdateRetryPolicy;
 pub use server::{

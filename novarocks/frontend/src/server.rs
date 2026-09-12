@@ -29,12 +29,13 @@ use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
-use crate::{MysqlClientConnectionRegistry, QuerySessionFactory, ResolvedMysqlListenerSettings};
+use crate::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminationReason,
 };
+use novarocks_query_application::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_types::naming::DEFAULT_DATABASE;
