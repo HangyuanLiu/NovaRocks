@@ -9,3 +9,4 @@ workspace = true
 
 [dependencies]
 novarocks-query-application.workspace = true
+novarocks-table-maintenance.workspace = true

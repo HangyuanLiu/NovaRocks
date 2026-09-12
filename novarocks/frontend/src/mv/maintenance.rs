@@ -26,10 +26,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::background::{MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts};
+use super::background::{MvBackgroundEngineErrorKind, MvMaintenanceFacts};
 pub(crate) use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 pub(crate) use novarocks_mv_application::maintenance::{
-    AutomaticMaintenanceAction, MaintenanceActionKind, MaintenanceEvaluation, MaintenanceSkipReason,
+    AutomaticMaintenanceAction, AutomaticMaintenanceRunner, MaintenanceActionKind,
+    MaintenanceAdmission, MaintenanceAttempt, MaintenanceEvaluation, MaintenanceExecutionReport,
+    MaintenanceSkipReason,
 };
 use novarocks_table_maintenance::{
     MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
@@ -51,94 +53,6 @@ struct TableRuntimeState {
     consecutive_failures: BTreeMap<MaintenanceActionKind, u32>,
     next_attempt_after_ms: BTreeMap<MaintenanceActionKind, i64>,
     circuit_broken: BTreeSet<MaintenanceActionKind>,
-}
-
-/// A policy pass admitted by the frontend maintenance worker.  The caller
-/// owns the matching activity-gate lease for the whole lifetime of this value.
-#[derive(Clone, Debug)]
-pub(crate) struct MaintenanceAttempt {
-    mv_id: i64,
-    target: MaintenanceTarget,
-    evaluation: MaintenanceEvaluation,
-    observed_snapshot_id: Option<i64>,
-}
-
-impl MaintenanceAttempt {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn target(&self) -> &MaintenanceTarget {
-        &self.target
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn evaluation(&self) -> &MaintenanceEvaluation {
-        &self.evaluation
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MaintenanceAdmission {
-    Disabled,
-    AtCapacity,
-    AlreadyActive,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    Admitted,
-}
-
-/// Result of a policy evaluation plus its durable actions.  `NoOp` is still a
-/// complete attempt: it proves that the current provider facts were evaluated
-/// while holding the MV gate, rather than treating absent actions as a retry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MaintenanceExecutionReport {
-    pub(crate) evaluation: MaintenanceEvaluation,
-    pub(crate) completed: Vec<MaintenanceActionKind>,
-    pub(crate) already_active: Vec<MaintenanceActionKind>,
-    pub(crate) failures: Vec<(MaintenanceActionKind, MvBackgroundEngineErrorKind)>,
-}
-
-impl MaintenanceExecutionReport {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn is_noop(&self) -> bool {
-        self.evaluation.actions.is_empty()
-    }
-}
-
-/// The only automatic-maintenance side-effect boundary.  Each method names a
-/// durable lifecycle on purpose: implementations must not route any automatic
-/// action through `TableMaintenanceEngine::execute_action`.
-pub(crate) trait AutomaticMaintenanceRunner {
-    /// Create, plan, execute and reconcile the existing durable metadata
-    /// operation for `ExpireSnapshots`.
-    fn expire_snapshots_durably(
-        &mut self,
-        request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
-
-    /// Create, stage, commit/finalize or retain the existing durable
-    /// distributed-rewrite operation for position deletes.
-    fn rewrite_position_deletes_durably(
-        &mut self,
-        request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
-
-    /// Create, claim, execute and terminally persist the existing durable
-    /// optimize job before this method returns.  Submission alone is not a
-    /// completed automatic optimize attempt.
-    fn optimize_durably(
-        &mut self,
-        target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, MvBackgroundEngineError>;
 }
 
 /// Process-local maintenance policy state.  It is intentionally non-durable:
@@ -605,6 +519,7 @@ fn failure_backoff_ms(attempt: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_mv_application::maintenance::MvBackgroundEngineError;
 
     const NOW: i64 = 1_000_000_000;
 

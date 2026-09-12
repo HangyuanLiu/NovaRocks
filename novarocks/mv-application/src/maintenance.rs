@@ -19,6 +19,10 @@
 
 use std::fmt;
 
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+};
+
 /// Product policy configuration for process-local automatic MV maintenance.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceCoordinatorConfig {
@@ -115,6 +119,69 @@ pub enum MaintenanceSkipReason {
 pub struct MaintenanceEvaluation {
     pub actions: Vec<AutomaticMaintenanceAction>,
     pub skips: Vec<(MaintenanceActionKind, MaintenanceSkipReason)>,
+}
+
+/// A policy pass admitted while the caller holds the matching MV activity
+/// lease. The product owns the policy result; the host owns the lease itself.
+#[derive(Clone, Debug)]
+pub struct MaintenanceAttempt {
+    pub mv_id: i64,
+    pub target: MaintenanceTarget,
+    pub evaluation: MaintenanceEvaluation,
+    pub observed_snapshot_id: Option<i64>,
+}
+
+impl MaintenanceAttempt {
+    pub fn target(&self) -> &MaintenanceTarget {
+        &self.target
+    }
+
+    pub fn evaluation(&self) -> &MaintenanceEvaluation {
+        &self.evaluation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MaintenanceAdmission {
+    Disabled,
+    AtCapacity,
+    AlreadyActive,
+    Admitted,
+}
+
+/// Result of a policy evaluation plus durable operation outcomes. A no-op is
+/// a completed policy pass, not a request to retry absent actions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceExecutionReport {
+    pub evaluation: MaintenanceEvaluation,
+    pub completed: Vec<MaintenanceActionKind>,
+    pub already_active: Vec<MaintenanceActionKind>,
+    pub failures: Vec<(MaintenanceActionKind, MvBackgroundEngineErrorKind)>,
+}
+
+impl MaintenanceExecutionReport {
+    pub fn is_noop(&self) -> bool {
+        self.evaluation.actions.is_empty()
+    }
+}
+
+/// The only automatic-maintenance effect boundary. Host adapters must invoke
+/// existing durable table-maintenance routes, never a provider shortcut.
+pub trait AutomaticMaintenanceRunner {
+    fn expire_snapshots_durably(
+        &mut self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
+
+    fn rewrite_position_deletes_durably(
+        &mut self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError>;
+
+    fn optimize_durably(
+        &mut self,
+        target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, MvBackgroundEngineError>;
 }
 
 /// Product classification of a failed background capability invocation.
