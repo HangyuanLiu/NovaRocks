@@ -78,7 +78,8 @@ use novarocks_proto_codec::connector_read::{
 };
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
+    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
+    ConnectorStorageResolver, read_stack::ConnectorSession,
 };
 use novarocks_task_codec::domain::{WireContent, stored_message};
 use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
@@ -86,7 +87,6 @@ use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{IngressRejection, authorize_inbound_frame};
 use tracing::debug;
 
-use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
 use crate::fragment::decode::plan::context::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
     TypedScanRuntime,
@@ -1616,8 +1616,9 @@ mod tests {
         common, connector_read as connector_dto, novarocks as proto, plan,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorStorageResolver,
-        ResolvedVendedS3Access, StorageAccessRequest,
+        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
+        ConnectorExecutionWriteBinding, ConnectorStorageResolver, ResolvedVendedS3Access,
+        StorageAccessRequest,
     };
     use novarocks_task_codec::descriptor::WireFragmentPlan;
     use novarocks_types::UniqueId;
@@ -1626,7 +1627,6 @@ mod tests {
     };
     use novarocks_worker::IngressRejection;
 
-    use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
     use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::host::{HostRejection, RunnableTask, TaskExecutionHost};

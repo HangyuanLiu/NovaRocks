@@ -1061,6 +1061,7 @@ pub(crate) mod test_support {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
+    use novarocks_spi::connector::ConnectorExecutionReadBinding;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 
     pub(crate) fn encoded_payload(
@@ -1190,8 +1191,8 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn installed_read_execution() -> crate::connector::ConnectorExecutionReadBinding {
-        crate::connector::ConnectorExecutionReadBinding::new(
+    pub(crate) fn installed_read_execution() -> ConnectorExecutionReadBinding {
+        ConnectorExecutionReadBinding::new(
             std::sync::Arc::new(FixtureFactory),
             std::sync::Arc::new(fixture_codec()),
         )

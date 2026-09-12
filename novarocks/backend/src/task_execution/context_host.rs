@@ -61,7 +61,9 @@ use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContribution
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::ConnectorMaterializationErrorClass;
-use novarocks_spi::connector::{CatalogProperties, ConnectorStorageResolver};
+use novarocks_spi::connector::{
+    CatalogProperties, ConnectorExecutionRoleBinding, ConnectorStorageResolver,
+};
 use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::QueryExecutionId;
 use tracing::error;
@@ -74,7 +76,6 @@ use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
 };
 use super::status::TaskStatusReporter;
-use crate::connector::ConnectorExecutionRoleBinding;
 use crate::connector::catalog_manager::{
     CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
 };
@@ -2502,9 +2503,10 @@ use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;
 
-use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
 use crate::task_execution::execution_host::TaskQueryContextFacts;
-use novarocks_spi::connector::CatalogHandle;
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
+};
 
 impl TaskQueryContextFacts for NativeQueryContextHost {
     fn query_options(

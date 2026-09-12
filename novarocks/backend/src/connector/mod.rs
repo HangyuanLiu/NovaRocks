@@ -21,7 +21,3 @@ pub mod typed_runtime;
 pub(crate) mod write_data_plane;
 #[cfg(test)]
 pub(crate) mod write_test_support;
-
-pub(crate) use novarocks_spi::connector::{
-    ConnectorExecutionReadBinding, ConnectorExecutionRoleBinding, ConnectorExecutionWriteBinding,
-};

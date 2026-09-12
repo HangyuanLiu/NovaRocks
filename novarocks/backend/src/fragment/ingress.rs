@@ -27,6 +27,8 @@ use std::fmt;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use novarocks_spi::connector::ConnectorExecutionReadBinding;
+
 /// A split received by this backend after the exact binding codec recovered
 /// its provider-private SPI payload. Scheduling retains only sequence and
 /// plan-node metadata; duplicate suppression never compares payload bytes.
@@ -68,7 +70,7 @@ impl novarocks_execution::connector::ScheduledSplitFacts for ReceivedReadSplit {
 /// a split that arrives mid-decode cannot resolve against a binding set that a
 /// later refusal is still allowed to roll back.
 pub(crate) struct TypedReadAttemptContext {
-    entries: Mutex<BTreeMap<i32, crate::connector::ConnectorExecutionReadBinding>>,
+    entries: Mutex<BTreeMap<i32, ConnectorExecutionReadBinding>>,
     published: AtomicBool,
 }
 
@@ -83,7 +85,7 @@ impl TypedReadAttemptContext {
     pub(crate) fn register(
         &self,
         plan_node_id: i32,
-        execution: crate::connector::ConnectorExecutionReadBinding,
+        execution: ConnectorExecutionReadBinding,
     ) -> Result<(), String> {
         let mut entries = self
             .entries
@@ -101,10 +103,7 @@ impl TypedReadAttemptContext {
         self.published.store(true, Ordering::Release);
     }
 
-    pub(crate) fn resolve(
-        &self,
-        plan_node_id: i32,
-    ) -> Option<crate::connector::ConnectorExecutionReadBinding> {
+    pub(crate) fn resolve(&self, plan_node_id: i32) -> Option<ConnectorExecutionReadBinding> {
         if !self.published.load(Ordering::Acquire) {
             return None;
         }
