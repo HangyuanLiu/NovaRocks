@@ -87,7 +87,7 @@ use novarocks_query_application::sql::admission::{
     admin_raise_engine_error, requires_lake_publication_deadline, typed_statement_work_class,
     unnegotiated_query_statement,
 };
-use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
+use novarocks_query_application::sql::dml_admission::validate_table_statement_admission;
 use novarocks_query_application::sql::session::{
     SessionExecutionSettings, SessionSetAssignmentOutcome, SessionSqlState,
     admit_session_set_assignment as admit_query_application_session_set_assignment,
@@ -348,45 +348,6 @@ fn dml_statement_result(
             RoutedExecutionError::Engine(error.to_string())
         }
     })
-}
-
-fn table_statement_admission_error(
-    statement: &novarocks_parser::ast::TableStatement,
-    source: &str,
-) -> Option<UserError> {
-    use novarocks_parser::ast::{TablePartition, TableStatement};
-
-    let TableStatement::Create(statement) = statement;
-    let unsupported = |span, message| {
-        DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(source, span, message)
-    };
-    if statement.temporary || statement.external {
-        return Some(unsupported(
-            statement.span,
-            "CREATE TABLE does not support TEMPORARY or EXTERNAL tables".to_string(),
-        ));
-    }
-    if let Some(engine) = &statement.engine
-        && !engine.value.eq_ignore_ascii_case("iceberg")
-    {
-        return Some(unsupported(
-            engine.span,
-            format!("CREATE TABLE does not support ENGINE = {}", engine.value),
-        ));
-    }
-    if let Some(TablePartition::LegacyRange(partition)) = &statement.partition {
-        return Some(unsupported(
-            partition.span,
-            "CREATE TABLE does not support legacy RANGE partition definitions".to_string(),
-        ));
-    }
-    if !statement.order_by.is_empty() {
-        return Some(unsupported(
-            statement.span,
-            "CREATE TABLE does not support ORDER BY".to_string(),
-        ));
-    }
-    None
 }
 
 #[expect(
@@ -1334,13 +1295,13 @@ impl FrontendQuerySession {
                         &query_options,
                     )
                 } else if let ParsedStatement::Table(table_statement) = &statement {
-                    if let Some(error) = table_statement_admission_error(table_statement, &sql) {
-                        Err(RoutedExecutionError::User(error))
-                    } else {
-                        command_executor
-                            .execute_typed(&statement, &context, query_options)
-                            .map_err(RoutedExecutionError::Engine)
-                    }
+                    validate_table_statement_admission(table_statement, &sql)
+                        .map_err(RoutedExecutionError::User)
+                        .and_then(|()| {
+                            command_executor
+                                .execute_typed(&statement, &context, query_options)
+                                .map_err(RoutedExecutionError::Engine)
+                        })
                 } else if let ParsedStatement::Catalog(
                     novarocks_parser::ast::CatalogStatement::TruncateTable(statement),
                 ) = &statement

@@ -21,7 +21,10 @@
 //! execution path, or publication owner. They therefore belong to SQL
 //! admission rather than to a particular DML implementation.
 
-use novarocks_parser::Span;
+use novarocks_parser::{
+    Span,
+    ast::{TablePartition, TableStatement},
+};
 use novarocks_user_error::{
     ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
 };
@@ -99,9 +102,54 @@ impl DmlAdmissionError {
     }
 }
 
+/// Reject unsupported `CREATE TABLE` forms before SQL routing selects a
+/// catalog product or Connector request context.
+///
+/// The Catalog application still validates its own lowered request as a
+/// defensive boundary. This parser-level check owns the user-visible SQL
+/// admission result and keeps the product route from deciding syntax support.
+pub fn validate_table_statement_admission(
+    statement: &TableStatement,
+    source: &str,
+) -> Result<(), UserError> {
+    let TableStatement::Create(statement) = statement;
+    let unsupported = |span, message| {
+        DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(source, span, message)
+    };
+    if statement.temporary || statement.external {
+        return Err(unsupported(
+            statement.span,
+            "CREATE TABLE does not support TEMPORARY or EXTERNAL tables".to_owned(),
+        ));
+    }
+    if let Some(engine) = &statement.engine
+        && !engine.value.eq_ignore_ascii_case("iceberg")
+    {
+        return Err(unsupported(
+            engine.span,
+            format!("CREATE TABLE does not support ENGINE = {}", engine.value),
+        ));
+    }
+    if let Some(TablePartition::LegacyRange(partition)) = &statement.partition {
+        return Err(unsupported(
+            partition.span,
+            "CREATE TABLE does not support legacy RANGE partition definitions".to_owned(),
+        ));
+    }
+    if !statement.order_by.is_empty() {
+        return Err(unsupported(
+            statement.span,
+            "CREATE TABLE does not support ORDER BY".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DML_ADMISSION_ERROR_CODE_DESCRIPTORS;
+    use super::{DML_ADMISSION_ERROR_CODE_DESCRIPTORS, validate_table_statement_admission};
+    use crate::sql::parse_single_statement;
+    use novarocks_parser::ast::Statement;
 
     #[test]
     fn manifest_contains_every_dml_statement_shape_code() {
@@ -111,5 +159,49 @@ mod tests {
                 .iter()
                 .all(|descriptor| descriptor.code.as_str().starts_with("sql.admit."))
         );
+    }
+
+    #[test]
+    fn create_table_shape_admission_rejects_unsupported_forms_before_routing() {
+        for (sql, expected_message) in [
+            (
+                "CREATE TEMPORARY TABLE rejected_table (id INT)",
+                "CREATE TABLE does not support TEMPORARY or EXTERNAL tables",
+            ),
+            (
+                "CREATE TABLE rejected_table (id INT) ENGINE = olap",
+                "CREATE TABLE does not support ENGINE = olap",
+            ),
+            (
+                "CREATE TABLE rejected_table (id INT) ORDER BY (id)",
+                "CREATE TABLE does not support ORDER BY",
+            ),
+            (
+                "CREATE TABLE rejected_table (d DATE) PARTITION BY RANGE (d) (PARTITION p1 VALUES [('2024-01-01'), ('2024-02-01')))",
+                "CREATE TABLE does not support legacy RANGE partition definitions",
+            ),
+        ] {
+            let Statement::Table(statement) = parse_single_statement(sql).expect("parse table")
+            else {
+                panic!("expected CREATE TABLE statement");
+            };
+            let error = validate_table_statement_admission(&statement, sql)
+                .expect_err("unsupported form must be rejected at admission");
+            assert_eq!(
+                error.code().as_str(),
+                "sql.admit.create_table_unsupported_form"
+            );
+            assert_eq!(error.message(), expected_message);
+            assert_eq!(error.location().map(|location| location.line()), Some(1));
+        }
+    }
+
+    #[test]
+    fn create_table_shape_admission_accepts_iceberg_form() {
+        let sql = "CREATE TABLE accepted_table (id INT) ENGINE = iceberg";
+        let Statement::Table(statement) = parse_single_statement(sql).expect("parse table") else {
+            panic!("expected CREATE TABLE statement");
+        };
+        validate_table_statement_admission(&statement, sql).expect("admission accepts Iceberg");
     }
 }
