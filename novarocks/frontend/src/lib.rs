@@ -23,7 +23,7 @@ mod catalog_projection_metrics;
 pub mod catalog_prune;
 pub mod common;
 pub mod connector;
-pub mod coordinator;
+pub(crate) mod coordinator;
 pub mod dml;
 pub mod metrics;
 pub mod mv;

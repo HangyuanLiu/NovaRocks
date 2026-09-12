@@ -25,5 +25,4 @@ mod scheduler;
 )]
 pub(crate) mod task_round;
 
-pub use execution::FrontendDistributedQueryCoordinator;
-pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+pub(crate) use execution::FrontendDistributedQueryCoordinator;

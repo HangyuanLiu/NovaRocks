@@ -335,11 +335,7 @@ pub struct FrontendDistributedQueryCoordinator {
 }
 
 impl FrontendDistributedQueryCoordinator {
-    #[expect(
-        private_interfaces,
-        reason = "The public composition entrypoint receives the frontend-owned native runtime."
-    )]
-    pub fn new(
+    pub(crate) fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
