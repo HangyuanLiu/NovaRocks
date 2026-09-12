@@ -3603,6 +3603,7 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3978,6 +3979,17 @@ dependencies = [
  "opensrv-mysql",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "novarocks-native-adapter"
+version = "0.1.0"
+dependencies = [
+ "novarocks-native-trust",
+ "novarocks-task-codec",
+ "novarocks-types",
+ "tokio",
+ "tonic",
 ]
 
 [[package]]
