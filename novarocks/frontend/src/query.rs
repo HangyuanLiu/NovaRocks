@@ -28,7 +28,6 @@ use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
 use crate::query_execution::PreparedQueryOperation;
-use crate::query_execution::backend_command::BackendCommandExecutor;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::dml::delete::DeleteEngine;
@@ -53,7 +52,8 @@ use novarocks_parser::{
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_proto_models::novarocks;
 use novarocks_query_application::api::{
-    CommandContext, ExecutionOutput, QueryExecutionError, QueryExecutionErrorKind, ResultDelivery,
+    BackendCommandExecutor, CommandContext, ExecutionOutput, QueryExecutionError,
+    QueryExecutionErrorKind, ResultDelivery,
 };
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_string_query_result,
@@ -171,8 +171,10 @@ impl CoreCommandRoute for TypedCommandRoute {
             .check()
             .map_err(|error| format!("typed command scope is no longer active: {error}"))?;
         match statement {
-            ParsedStatement::ShowBackends(statement) => {
-                self.backend.execute(statement, context.execution().role())
+            ParsedStatement::ShowBackends(_) => {
+                self.backend
+                    .show_backends(context.execution().role())
+                    .map(StatementResult::Query)
             }
             ParsedStatement::Statistics(statement) => self.statistics.execute(
                 statement,

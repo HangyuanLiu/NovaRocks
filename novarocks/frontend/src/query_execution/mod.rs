@@ -20,7 +20,6 @@ pub mod artifact;
 /// Frontend-owned native submission mapper.
 pub mod assembly;
 pub(crate) mod attempt_initialization;
-pub mod backend_command;
 pub mod completion;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 #[allow(

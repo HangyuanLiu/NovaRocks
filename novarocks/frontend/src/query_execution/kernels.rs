@@ -573,22 +573,6 @@ impl_kernel_catalog_admission!(MvExecutionKernel);
 impl_kernel_catalog_admission!(ViewExecutionKernel);
 impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 
-/// FE-owned backend membership is intentionally a separate command capability.
-#[derive(Clone)]
-pub struct BackendManagementKernel {
-    topology: BackendTopologyService,
-}
-
-impl BackendManagementKernel {
-    pub fn new(topology: BackendTopologyService) -> Self {
-        Self { topology }
-    }
-
-    pub(crate) fn topology(&self) -> &BackendTopologyService {
-        &self.topology
-    }
-}
-
 /// Session catalog admission and namespace lookup.
 ///
 /// This is deliberately not part of generic command dispatch: `USE` and

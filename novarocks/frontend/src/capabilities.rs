@@ -36,7 +36,6 @@ use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::repository::MvRepository;
-use crate::query_execution::backend_command;
 use crate::query_execution::dml::{add_files, ctas, delete, insert, mutation, truncate};
 use crate::query_execution::kernels as domain;
 use crate::query_execution::maintenance::command as maintenance_command;
@@ -47,6 +46,7 @@ use crate::query_execution::maintenance::{
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
 use novarocks_catalog_application::CatalogApplicationPort;
+use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
@@ -305,12 +305,20 @@ impl BackendCommandPorts {
     }
 }
 
-pub fn backend_command_executor(
-    ports: BackendCommandPorts,
-) -> backend_command::BackendCommandExecutor {
-    backend_command::BackendCommandExecutor::new(domain::BackendManagementKernel::new(
-        ports.topology,
-    ))
+struct FrontendBackendTopologyCommandPort {
+    topology: BackendTopologyService,
+}
+
+impl BackendTopologyCommandPort for FrontendBackendTopologyCommandPort {
+    fn show_backends(&self) -> Result<novarocks_query_application::api::QueryResult, String> {
+        self.topology.show_backends()
+    }
+}
+
+pub fn backend_command_executor(ports: BackendCommandPorts) -> BackendCommandExecutor {
+    BackendCommandExecutor::new(Arc::new(FrontendBackendTopologyCommandPort {
+        topology: ports.topology,
+    }))
 }
 
 /// Leaf ports for `ALTER ICEBERG REF`.
