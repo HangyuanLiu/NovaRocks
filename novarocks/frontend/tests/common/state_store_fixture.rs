@@ -145,9 +145,9 @@ pub async fn open_with_input(input: StateStoreHostInput) -> FrontendStateStoreHo
 
 // Transitional test adapter. It converts legacy fixture literals directly to
 // provider-neutral `StateStoreHostInput`; it never opens a concrete provider.
-pub use novarocks_frontend::state_store::{
-    RunFailure, RunSuccess, StateStoreHostErrorKind, StateStoreHostLifecycle, StateStoreRunPolicy,
-    run_side_effect_free,
+pub use novarocks_frontend::state_store::{StateStoreHostErrorKind, StateStoreHostLifecycle};
+pub use novarocks_state_store_runtime::{
+    RunFailure, RunSuccess, StateStoreRunPolicy, run_side_effect_free,
 };
 
 #[derive(Clone, Debug, Default)]

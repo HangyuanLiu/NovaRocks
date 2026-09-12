@@ -18,10 +18,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use super::policy::StateStoreRunPolicy;
 use novarocks_state_store_api::{
     StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderFactory, StateStoreProviderId,
 };
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 

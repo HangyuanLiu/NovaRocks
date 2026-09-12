@@ -55,7 +55,6 @@ use novarocks_frontend::mv::domain::repository::{
     MvPublishedWaterline, MvRepository, MvRepositoryErrorKind, MvTarget,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
-use novarocks_frontend::state_store::StateStoreRunPolicy;
 use novarocks_frontend::table_maintenance::gc_observation::{
     GcOwnedRefObservation, GcOwnedRefObservationAccelerator, GcOwnedRefObservationDecision,
     GcOwnedRefObservationErrorKind,
@@ -72,6 +71,7 @@ use novarocks_state_store_api::{
     RangeRequest, ReadTransaction, StateRecord, StateStore, StateStoreError, StateStoreErrorKind,
     StateStoreLimits, StoreIdentity, Value, WriteAttempt, WriteTransaction,
 };
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
 use uuid::Uuid;
 

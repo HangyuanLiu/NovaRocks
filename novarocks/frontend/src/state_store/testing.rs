@@ -28,8 +28,9 @@ use novarocks_state_store_api::{
 };
 use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
 
-use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreRunPolicy};
+use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError};
 use super::{StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("frontend-unit-test");

@@ -20,9 +20,7 @@
 mod host;
 pub mod host_error;
 pub mod metrics;
-pub mod policy;
 pub mod provider;
-pub mod runner;
 pub mod sweeper;
 
 #[cfg(test)]
@@ -30,9 +28,7 @@ pub(crate) mod testing;
 
 pub use host::{StateStoreHost, StateStoreHostLifecycle};
 pub use host_error::{StateStoreHostError, StateStoreHostErrorKind};
-pub use policy::{StateStoreRunPolicy, StateStoreRunPolicyError};
 pub use provider::{
     StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
 };
-pub use runner::{RunFailure, RunSuccess, run_side_effect_free};
 pub use sweeper::{AbandonedAttemptSweeper, DEFAULT_SWEEP_INTERVAL};

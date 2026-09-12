@@ -18,11 +18,11 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::policy::StateStoreRunPolicy;
 use novarocks_state_store_api::{
     StateStore, StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderId,
     StateStoreProviderInstance, StateStoreProviderLifecycle,
 };
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use super::host_error::{StateStoreHostError, StateStoreHostErrorKind};
 use super::provider::{StateStoreHostInput, StateStoreProviderRegistry};

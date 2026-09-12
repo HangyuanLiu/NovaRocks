@@ -46,6 +46,7 @@ use novarocks_native_trust::NativeTrust;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
 use crate::catalog_application::desired_state::{
@@ -1476,7 +1477,7 @@ impl FrontendApplicationHost {
     /// Falls back to the built-in default when no store is configured, so a
     /// consumer built without durable storage still has a coherent policy
     /// rather than an absent one.
-    pub fn run_policy(&self) -> crate::state_store::StateStoreRunPolicy {
+    pub fn run_policy(&self) -> StateStoreRunPolicy {
         self.state_store_host
             .as_ref()
             .map(StateStoreHost::run_policy)
@@ -1487,9 +1488,7 @@ impl FrontendApplicationHost {
     ///
     /// Durable consumers take the pair, so none of them can be constructed
     /// holding storage without an agreed retry budget for it.
-    pub fn durable(
-        &self,
-    ) -> Option<(Arc<dyn StateStore>, crate::state_store::StateStoreRunPolicy)> {
+    pub fn durable(&self) -> Option<(Arc<dyn StateStore>, StateStoreRunPolicy)> {
         self.state_store_host
             .as_ref()
             .and_then(StateStoreHost::durable)

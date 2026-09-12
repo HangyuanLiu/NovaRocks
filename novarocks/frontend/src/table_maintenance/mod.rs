@@ -30,17 +30,9 @@ use novarocks_spi::connector::{
     ConnectorWriteOperationId, ExternalMutationFinalization, ExternalMutationOutcome,
 };
 use novarocks_state_store_api::StateStore;
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_workload_control::RootAdmissionHandle;
 use tokio::runtime::Handle;
-
-use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
-use crate::maintenance::MaintenanceTarget;
-use crate::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-    MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
-    TableMaintenanceService,
-};
-use crate::state_store::StateStoreRunPolicy;
 
 use self::activity::{MaintenanceActivityFamily, TableMaintenanceActivity};
 pub(crate) use self::admission::{
@@ -53,6 +45,13 @@ use self::gc_observation::{
 use self::result::{action_result, optimize_jobs_result};
 use self::runtime::OptimizeProcessRuntime;
 use self::worker::{OptimizeJobExecutor, OptimizeWorker};
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
+use crate::maintenance::MaintenanceTarget;
+use crate::query_execution::maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
+    MaintenanceStatementResult, OptimizeSubmission, TableMaintenanceEngine,
+    TableMaintenanceService,
+};
 use novarocks_table_maintenance::runtime::{
     RuntimeErrorKind as OptimizeRuntimeErrorKind, TerminalError as OptimizeTerminalError,
 };

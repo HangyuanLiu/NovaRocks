@@ -32,12 +32,12 @@ use novarocks_frontend::mv::domain::repository::{
     ReplaceMvProjectionRequest,
 };
 use novarocks_frontend::mv::repository::StateStoreMvRepository;
-use novarocks_frontend::state_store::StateStoreRunPolicy;
 use novarocks_query_application::persisted_query_definition::{
     PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, Value};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 #[path = "common/mod.rs"]
 mod common;
 use common::state_store_fixture::{

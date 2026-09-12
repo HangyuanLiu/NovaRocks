@@ -20,7 +20,6 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
-use crate::state_store::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
@@ -31,6 +30,7 @@ use novarocks_state_store_api::{
     AttemptOutcome, Direction, KeyRange, Precondition, RangeRequest, StateRecord, StateStore,
     StateStoreError, StateStoreErrorKind, VersionToken,
 };
+use novarocks_state_store_runtime::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 use uuid::Uuid;
 
 use crate::durable::{DurableRecordError, DurableRecordStore};
