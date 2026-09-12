@@ -17,6 +17,8 @@
 
 //! Bounded, item-isolated candidate discovery.
 
+use novarocks_query_application::api::{ExactObjectBinding, MvCandidateFactInput, MvPublicationId};
+
 /// Maximum retained diagnostic bytes for one optional candidate.
 pub const MAX_CANDIDATE_DIAGNOSTIC_BYTES: usize = 4096;
 
@@ -52,6 +54,55 @@ impl CandidateDiagnostic {
 pub struct CandidateReadReport<T> {
     accepted: Vec<T>,
     diagnostics: Vec<CandidateDiagnostic>,
+}
+
+/// Product-owned immutable evidence for one published MV candidate.  A
+/// reader may construct it only with exact query bindings that already carry
+/// stable semantic revisions; it has no API for substituting a Current read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCandidatePublication {
+    publication_id: MvPublicationId,
+    definition_fingerprint: [u8; 32],
+    definition_provenance: String,
+    inputs: Vec<ExactObjectBinding>,
+    output: ExactObjectBinding,
+}
+
+impl VerifiedCandidatePublication {
+    pub fn try_new(
+        publication_id: MvPublicationId,
+        definition_fingerprint: [u8; 32],
+        definition_provenance: impl Into<String>,
+        inputs: Vec<ExactObjectBinding>,
+        output: ExactObjectBinding,
+    ) -> Option<Self> {
+        let definition_provenance = definition_provenance.into();
+        MvCandidateFactInput::try_new(
+            publication_id,
+            definition_fingerprint,
+            &definition_provenance,
+            &inputs,
+            &output,
+        )?;
+        Some(Self {
+            publication_id,
+            definition_fingerprint,
+            definition_provenance,
+            inputs,
+            output,
+        })
+    }
+
+    pub fn as_query_fact(&self) -> MvCandidateFactInput<'_> {
+        MvCandidateFactInput::try_new(
+            self.publication_id,
+            self.definition_fingerprint,
+            &self.definition_provenance,
+            &self.inputs,
+            &self.output,
+        )
+        .expect("verified candidate publication keeps its query fact valid")
+    }
 }
 
 impl<T> CandidateReadReport<T> {
