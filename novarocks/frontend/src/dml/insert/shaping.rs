@@ -268,3 +268,175 @@ fn format_timestamp_nanos(value: i64) -> String {
 fn bytes_to_latin1(bytes: &[u8]) -> String {
     bytes.iter().copied().map(char::from).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use arrow::datatypes::Field;
+
+    fn column(
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+        write_default: Option<ColumnDefault>,
+    ) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable,
+            write_default,
+            logical_type: None,
+        }
+    }
+
+    #[test]
+    fn reorders_explicit_columns_and_fills_missing_nullable_with_null() {
+        let target = vec![
+            column("a", DataType::Int64, true, None),
+            column("b", DataType::Int64, false, None),
+        ];
+        let rows = reorder_insert_rows(&[vec![InsertValue::Int(7)]], &["b".to_string()], &target)
+            .expect("reorder rows");
+        assert_eq!(rows, vec![vec![InsertValue::Null, InsertValue::Int(7)]]);
+    }
+
+    #[test]
+    fn rejects_duplicate_insert_columns() {
+        let target = vec![column("a", DataType::Int64, true, None)];
+        let error = reorder_insert_rows(
+            &[vec![InsertValue::Int(1), InsertValue::Int(2)]],
+            &["a".to_string(), "a".to_string()],
+            &target,
+        )
+        .unwrap_err();
+        assert!(error.contains("duplicate INSERT column"), "{error}");
+    }
+
+    #[test]
+    fn rejects_unknown_insert_column() {
+        let target = vec![column("a", DataType::Int64, true, None)];
+        let error = reorder_insert_rows(
+            &[vec![InsertValue::Int(1)]],
+            &["missing".to_string()],
+            &target,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown INSERT column"), "{error}");
+    }
+
+    #[test]
+    fn rejects_missing_required_column() {
+        let target = vec![
+            column("required", DataType::Int64, false, None),
+            column("provided", DataType::Int64, false, None),
+        ];
+        let error = reorder_insert_rows(
+            &[vec![InsertValue::Int(1)]],
+            &["provided".to_string()],
+            &target,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("omits required column `required`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn preserves_array_map_struct_literals() {
+        let values = vec![
+            InsertValue::Array(vec![InsertValue::Int(1), InsertValue::Null]),
+            InsertValue::Map(vec![(
+                InsertValue::String("key".to_string()),
+                InsertValue::Float(5.5),
+            )]),
+            InsertValue::Struct(vec![
+                InsertValue::Int(100),
+                InsertValue::String("abc".to_string()),
+            ]),
+        ];
+        let target = vec![
+            column(
+                "arr",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+                None,
+            ),
+            column(
+                "map",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "entries",
+                        DataType::Struct(
+                            vec![
+                                Arc::new(Field::new("key", DataType::Utf8, false)),
+                                Arc::new(Field::new("value", DataType::Float64, true)),
+                            ]
+                            .into(),
+                        ),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+                None,
+            ),
+            column(
+                "row",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("id", DataType::Int64, false)),
+                        Arc::new(Field::new("name", DataType::Utf8, true)),
+                    ]
+                    .into(),
+                ),
+                true,
+                None,
+            ),
+        ];
+        assert_eq!(
+            reorder_insert_rows(std::slice::from_ref(&values), &[], &target)
+                .expect("preserve values"),
+            vec![values]
+        );
+    }
+
+    #[test]
+    fn applies_write_defaults() {
+        let target = vec![
+            column("a", DataType::Int64, false, Some(ColumnDefault::Int64(99))),
+            column("b", DataType::Int64, false, None),
+        ];
+        let reordered =
+            reorder_insert_rows(&[vec![InsertValue::Int(7)]], &["b".to_string()], &target)
+                .expect("apply row default");
+        assert_eq!(
+            reordered,
+            vec![vec![InsertValue::Int(99), InsertValue::Int(7)]]
+        );
+    }
+
+    #[test]
+    fn supports_largeint_and_integral_float_array_inputs() {
+        let values = vec![
+            InsertValue::String("-170141183460469231731687303715884105728".to_string()),
+            InsertValue::Array(vec![InsertValue::Float(1.0), InsertValue::Float(2.0)]),
+        ];
+        let target = vec![
+            column("large", DataType::FixedSizeBinary(16), false, None),
+            column(
+                "arr",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+                None,
+            ),
+        ];
+        assert_eq!(
+            reorder_insert_rows(std::slice::from_ref(&values), &[], &target)
+                .expect("preserve inputs"),
+            vec![values]
+        );
+    }
+}

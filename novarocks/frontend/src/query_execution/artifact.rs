@@ -35,8 +35,8 @@ pub(crate) use task_manifest_binding::{
 };
 
 pub use native_submission::{
-    NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentFacts,
-    NativeSubmissionFragmentRole, NativeSubmissionKey,
+    NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentRole,
+    NativeSubmissionKey,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,11 +52,13 @@ use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBa
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
+use crate::query_execution::preparation::runtime_filter_view::{
+    RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView,
+};
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::catalog::CatalogSet;

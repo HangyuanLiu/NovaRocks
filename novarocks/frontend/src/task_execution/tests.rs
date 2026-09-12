@@ -73,8 +73,8 @@ use super::split_domain::{assignment_targets, delivery_action};
 use super::status_intake::{
     CountingWake, StatusEvent, StatusIntake, StatusIntakeAdmission, StatusIntakeWake,
 };
-use crate::query_execution::FragmentInstancePlacement;
 use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
+use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
 use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;

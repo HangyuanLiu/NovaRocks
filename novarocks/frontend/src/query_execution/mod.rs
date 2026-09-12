@@ -45,32 +45,11 @@ pub mod native_fragment;
 pub(crate) mod outcome;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
-pub(crate) mod rewrite_group_read;
-pub use completion::{
-    PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
-    PreparedLogicalRead, PreparedQueryCompletion, PreparedQueryOperation,
-};
-pub use outcome::WriteExecutionOutcome;
+pub mod post_compile;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
 pub mod preparation;
-pub use preparation::runtime_filter_view::{
-    RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
-    RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,
-    RuntimeFilterBindingRoleFacts, RuntimeFilterCompletionRequirement,
-    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
-    RuntimeFilterCoverageFacts, RuntimeFilterDeploymentBindingFacts,
-    RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
-    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterFragmentEdgeFacts,
-    RuntimeFilterFrontierEdgeFacts, RuntimeFilterJoinProgressFacts,
-    RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity,
-    RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
-    RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts, RuntimeFilterProducerTarget,
-    RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget, RuntimeFilterSortDirection,
-    RuntimeFilterValidatedPlacementFacts,
-};
-pub use schedule::FragmentInstancePlacement;
-pub mod post_compile;
 pub(crate) mod profile;
+pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;

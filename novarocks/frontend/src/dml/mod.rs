@@ -29,10 +29,5 @@ pub mod runner;
 pub mod service;
 pub mod truncate;
 
-pub use error::{DmlError, DmlErrorKind};
-pub use insert::{InsertCommand, InsertCommandSource, convert_insert_command, reorder_insert_rows};
-pub use runner::{
-    CoordinatedWriteReport, WriteExecutor, WriteTarget, WriteTransactionOutcome,
-    WriteTransactionSpec,
-};
-pub use service::DmlService;
+pub(crate) use error::DmlError;
+pub(crate) use service::DmlService;

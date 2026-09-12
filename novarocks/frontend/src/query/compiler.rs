@@ -39,6 +39,9 @@ use crate::query_execution::compiler::{
 use crate::query_execution::completion::{
     PreReadyRetryBoundary, PreparedDistributedAttempt, PreparedDistributedAttemptFactory,
 };
+use crate::query_execution::completion::{
+    PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedQueryOperation,
+};
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::kernels::{
     QueryPreparationKernel, SystemTableQueryKernel, ViewExecutionKernel,
@@ -48,7 +51,6 @@ use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
 use crate::query_execution::post_compile::PostCompileIntent;
-use crate::query_execution::{PreparedQueryDistributedOperation, PreparedQueryOperation};
 use crate::view::ViewRequestContext;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_proto_codec::lifecycle::QueryOptions;

@@ -433,3 +433,137 @@ fn cast_data_type_is_decimal(data_type: &ast::TypeName) -> bool {
         "decimal" | "decimal32" | "decimal64" | "decimal128" | "dec" | "numeric"
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::query_execution::dml::insert::{InsertOverwriteMode, InsertValue};
+
+    fn parse_insert(sql: &str) -> Insert {
+        let statements = novarocks_parser::parse(sql).expect("statement should parse");
+        let [ast::Statement::Dml(ast::DmlStatement::Insert(statement))] = statements.as_slice()
+        else {
+            panic!("statement should be SQLP-5 INSERT");
+        };
+        statement.clone()
+    }
+
+    fn convert_insert(sql: &str) -> Result<InsertCommand, String> {
+        convert_insert_command(&parse_insert(sql))
+    }
+
+    #[test]
+    fn values_become_literal_rows() {
+        let command =
+            convert_insert("INSERT INTO db.t VALUES (1, 'a'), (2, NULL)").expect("convert command");
+        assert_eq!(command.target.parts, vec!["db", "t"]);
+        assert_eq!(
+            command.source,
+            InsertCommandSource::Values(vec![
+                vec![InsertValue::Int(1), InsertValue::String("a".to_string())],
+                vec![InsertValue::Int(2), InsertValue::Null],
+            ])
+        );
+    }
+
+    #[test]
+    fn select_without_from_becomes_literal_row() {
+        let command = convert_insert("INSERT INTO t SELECT 40 + 2, 'x'").expect("convert command");
+        assert_eq!(
+            command.source,
+            InsertCommandSource::SelectLiteralRow(vec![
+                InsertValue::Int(42),
+                InsertValue::String("x".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn select_with_from_uses_query_pipeline() {
+        let command = convert_insert("INSERT INTO t SELECT id FROM src").expect("convert command");
+        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
+    }
+
+    #[test]
+    fn non_constant_projection_uses_query_pipeline() {
+        let command = convert_insert("INSERT INTO t SELECT value + 1").expect("convert command");
+        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
+    }
+
+    #[test]
+    fn non_literal_values_function_uses_query_pipeline() {
+        let command = convert_insert("INSERT INTO t VALUES (to_bitmap(11), hll_hash(5))")
+            .expect("convert command");
+        assert!(matches!(command.source, InsertCommandSource::FromQuery(_)));
+    }
+
+    #[test]
+    fn parse_json_values_fold_to_packed_variant_literal() {
+        let command = convert_insert(r#"INSERT INTO t VALUES (1, parse_json('{"a":1}'))"#)
+            .expect("convert command");
+        let InsertCommandSource::Values(rows) = command.source else {
+            panic!("constant parse_json must stay on the literal VALUES path");
+        };
+        let InsertValue::String(packed) = &rows[0][1] else {
+            panic!("parse_json must produce packed variant bytes");
+        };
+        assert!(
+            packed.chars().all(|ch| u32::from(ch) <= 0xff),
+            "packed variant must preserve every byte through the Latin-1 bridge"
+        );
+        let unpacked = packed.chars().map(|ch| ch as u8).collect::<Vec<_>>();
+        let expected =
+            crate::query_execution::dml::insert::encode_insert_variant_json(r#"{"a":1}"#)
+                .expect("encode expected variant");
+        assert_eq!(unpacked, expected);
+    }
+
+    #[test]
+    fn union_all_flattens_in_source_order() {
+        let command =
+            convert_insert("INSERT INTO t SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3")
+                .expect("convert command");
+        let InsertCommandSource::Values(rows) = command.source else {
+            panic!("expected UNION ALL literals to normalize into one VALUES source");
+        };
+        assert_eq!(
+            rows,
+            vec![
+                vec![InsertValue::Int(1)],
+                vec![InsertValue::Int(2)],
+                vec![InsertValue::Int(3)],
+            ]
+        );
+    }
+
+    #[test]
+    fn union_distinct_is_rejected() {
+        let error = convert_insert("INSERT INTO t SELECT 1 UNION SELECT 2").unwrap_err();
+        assert!(error.contains("requires UNION ALL"), "{error}");
+    }
+
+    #[test]
+    fn typed_dynamic_overwrite_uses_partition_field() {
+        let command = convert_insert("INSERT OVERWRITE PARTITIONS TABLE db.t VALUES (1)")
+            .expect("convert dynamic overwrite");
+        assert_eq!(command.target.parts, vec!["db", "t"]);
+        assert_eq!(
+            command.overwrite_mode,
+            InsertOverwriteMode::DynamicPartitions
+        );
+    }
+
+    #[test]
+    fn typed_insert_target_preserves_object_name_components() {
+        let statement = parse_insert("INSERT INTO db.t SELECT remote('localhost')");
+        assert_eq!(
+            statement
+                .target
+                .parts
+                .iter()
+                .map(|part| part.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["db", "t"]
+        );
+    }
+}

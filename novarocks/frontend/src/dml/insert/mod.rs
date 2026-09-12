@@ -34,7 +34,7 @@ use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
 use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
-pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
+pub use command::{InsertCommandSource, convert_insert_command};
 pub use shaping::reorder_insert_rows;
 
 use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};

@@ -33,7 +33,7 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
-use crate::query_execution::FragmentInstancePlacement;
+use crate::query_execution::schedule::FragmentInstancePlacement;
 
 /// Why a task-status subscription can no longer represent its frozen
 /// participant. Identity violations are not transport uncertainty and must

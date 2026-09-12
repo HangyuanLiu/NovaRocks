@@ -29,8 +29,8 @@ use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::query_execution::completion::{PreparedQueryCompletion, PreparedQueryOperation};
 use crate::query_execution::preparation::{PreparedFragmentHandoff, PreparedFragmentSet};
-use crate::query_execution::{PreparedQueryCompletion, PreparedQueryOperation};
 use novarocks_sql::compiler::{SqlPlanCostFacts, SqlPlanCostUnknownReason, SqlPlanCostValue};
 use novarocks_sql::plan_read::DistributedPlan;
 use novarocks_sql::planning::query_execution::SealedPreparationPlan;
@@ -285,7 +285,7 @@ impl PreparedDistributedQueryAssembly {
     pub(crate) fn finish_logical_read(
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<crate::query_execution::PreparedLogicalRead, String> {
+    ) -> Result<crate::query_execution::completion::PreparedLogicalRead, String> {
         let (finalized, query_options, intent, _execution) =
             self.finalize_execution(native_attachment)?;
         if intent != crate::query_execution::contract::DistributedQueryIntent::Result {
@@ -297,11 +297,13 @@ impl PreparedDistributedQueryAssembly {
         let options = Arc::new(
             crate::query_execution::contract::ResolvedQueryOptions::from_upstream(query_options),
         );
-        Ok(crate::query_execution::PreparedLogicalRead::new(
-            description,
-            attempt_template,
-            options,
-        ))
+        Ok(
+            crate::query_execution::completion::PreparedLogicalRead::new(
+                description,
+                attempt_template,
+                options,
+            ),
+        )
     }
 
     fn finalize_execution(
@@ -401,7 +403,7 @@ impl PreparedDistributedQueryAssembly {
     ) -> Result<PreparedQueryOperation, String> {
         let request = self.finish(native_attachment)?;
         Ok(PreparedQueryOperation::Distributed(
-            crate::query_execution::PreparedQueryDistributedOperation::new(
+            crate::query_execution::completion::PreparedDistributedQuery::new(
                 request,
                 completion,
                 logical_reservation,

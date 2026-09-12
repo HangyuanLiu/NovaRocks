@@ -76,7 +76,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     .expect("destination");
     let mut per_exch_num_senders = BTreeMap::new();
     per_exch_num_senders.insert(42, 2);
-    let placement = crate::query_execution::FragmentInstancePlacement {
+    let placement = crate::query_execution::schedule::FragmentInstancePlacement {
         fragment_id: 0,
         instance_index: 5,
         finst_id: novarocks_types::UniqueId::new(1, 2),

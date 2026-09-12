@@ -17,12 +17,11 @@
 
 use std::sync::Arc;
 
+use crate::query_execution::completion::{PreparedImmediateQuery, PreparedQueryCompletion};
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
-#[cfg(test)]
-use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion};
 use novarocks_parser::ast::Query;
 use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;

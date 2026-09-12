@@ -27,7 +27,7 @@ use crate::common::backend_topology::{BackendTopologyService, BackendTopologySna
 use crate::dml::DmlService;
 use crate::mv::command::MvCommandExecutor;
 use crate::query::compiler::{FrontendQueryCompiler, FrontendQueryCompilerError};
-use crate::query_execution::PreparedQueryOperation;
+use crate::query_execution::completion::PreparedQueryOperation;
 use crate::query_execution::dml::add_files::AddFilesEngine;
 use crate::query_execution::dml::ctas::CtasEngine;
 use crate::query_execution::dml::delete::DeleteEngine;
