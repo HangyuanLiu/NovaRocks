@@ -59,7 +59,7 @@ pub use result_encoding::mysql_column_for_result_field;
 pub use result_value::MysqlResultValue;
 pub use result_writer::{
     MysqlBatchWriteError, MysqlResultFinishError, MysqlResultStartError, finish_result,
-    finish_result_error, finish_result_one, finish_streaming_result,
+    finish_result_error, finish_result_one, finish_streaming_result, finish_streaming_result_one,
     mysql_columns_for_result_fields, start_cancellable_result, start_streaming_result,
     write_cancellable_batch, write_record_batches, write_record_batches_one, write_streaming_batch,
 };

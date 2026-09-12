@@ -156,9 +156,24 @@ pub enum MysqlResultFinishError {
 /// ahead of the MySQL success EOF write.
 pub async fn finish_streaming_result<W: AsyncWrite + Unpin>(
     writer: opensrv_mysql::RowWriter<'_, '_, W>,
-    mut failure: ResultFailureView,
+    failure: ResultFailureView,
 ) -> Result<(), MysqlResultFinishError> {
-    let finish = writer.finish();
+    match finish_streaming_result_one(writer, failure).await {
+        Ok(results) => results
+            .no_more_results()
+            .await
+            .map_err(MysqlResultFinishError::Io),
+        Err(error) => Err(error),
+    }
+}
+
+/// Finishes one streaming result while retaining the connection writer for a
+/// negotiated following result.
+pub async fn finish_streaming_result_one<'writer, W: AsyncWrite + Unpin>(
+    writer: opensrv_mysql::RowWriter<'writer, '_, W>,
+    mut failure: ResultFailureView,
+) -> Result<QueryResultWriter<'writer, W>, MysqlResultFinishError> {
+    let finish = writer.finish_one();
     tokio::pin!(finish);
     tokio::select! {
         biased;
