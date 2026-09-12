@@ -161,7 +161,7 @@ pub fn build_frontend_query_session_factory(
         core_capabilities::MvRefreshProviderActivationPorts::new(
             Arc::clone(&function_catalog),
             Arc::clone(&catalog_service),
-            Some(Arc::clone(&catalog_application)),
+            Arc::clone(&catalog_application),
             Arc::clone(&connector_control),
             Arc::clone(&typed_connector_control),
             Arc::clone(&unified_statistics),

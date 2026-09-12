@@ -574,7 +574,11 @@ pub fn bind_catalog_runtime_projection(
 pub(crate) struct MvRefreshProviderActivationPorts {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
-    catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+    /// A durable MV refresh resolves an externally attached target while it
+    /// recreates its write binding.  Unlike generic SQL kernels, this product
+    /// activation has no meaningful no-catalog mode, so composition must
+    /// supply the authority rather than defer absence to a request path.
+    catalog_application: Arc<dyn CatalogApplicationPort>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
     unified_statistics: Arc<UnifiedStatisticsResolver>,
@@ -591,7 +595,7 @@ impl MvRefreshProviderActivationPorts {
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
-        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        catalog_application: Arc<dyn CatalogApplicationPort>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
         unified_statistics: Arc<UnifiedStatisticsResolver>,
@@ -628,7 +632,7 @@ pub(crate) fn mv_refresh_provider_activation(
     let query_kernel = domain::QueryPreparationKernel::new(
         Arc::clone(&ports.functions),
         Arc::clone(&ports.catalog_service),
-        ports.catalog_application.clone(),
+        Some(Arc::clone(&ports.catalog_application)),
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.typed_connector_control),
         ports.unified_statistics,
@@ -639,7 +643,7 @@ pub(crate) fn mv_refresh_provider_activation(
     let mv_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
         ports.functions,
         ports.catalog_service,
-        ports.catalog_application,
+        Some(ports.catalog_application),
         ports.connector_control,
         ports.mv_repository,
         ports.mv_readiness,
