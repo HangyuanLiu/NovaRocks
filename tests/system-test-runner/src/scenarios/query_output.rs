@@ -26,7 +26,11 @@ const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const TWO_ROW_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(SchemaOnce), Box::new(NegotiatedMultiResult)]
+    vec![
+        Box::new(SchemaOnce),
+        Box::new(NonNegotiatedMultiStatement),
+        Box::new(NegotiatedMultiResult),
+    ]
 }
 
 /// A public MySQL result must have exactly one schema prefix, then its rows,
@@ -39,6 +43,43 @@ struct SchemaOnce;
 /// The first result must carry SERVER_MORE_RESULTS_EXISTS, while the final
 /// result owns the single terminal success packet without that status bit.
 struct NegotiatedMultiResult;
+
+/// A client that did not negotiate both multi-statement and multi-result
+/// capabilities remains on the strict single-statement protocol path.
+struct NonNegotiatedMultiStatement;
+
+impl Scenario for NonNegotiatedMultiStatement {
+    fn name(&self) -> &'static str {
+        "query-output/non-negotiated-multi-statement"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = context
+            .handle()
+            .query_execution_resource_snapshot()?
+            .context("cross-process harness did not expose the query-resource oracle")?;
+        let timeout = context
+            .remaining("open non-negotiated raw MySQL client")?
+            .min(IO_TIMEOUT_CAP);
+        let mut stream = MysqlStream::connect(context.mysql_user(), context.mysql_port(), timeout)?;
+        stream.send_query("SET query_timeout = 60; SELECT 1")?;
+        let response = stream.read_packet("non-negotiated multi-statement rejection")?;
+        ensure!(
+            response.is_error(),
+            "unnegotiated multi-statement query must be rejected before any result, got payload={:?}",
+            response.payload()
+        );
+        context.action("verified unnegotiated multi-statement COM_QUERY is rejected");
+        let deadline = context.deadline();
+        context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, deadline)
+            .context("await non-negotiated multi-statement resource convergence")?;
+        context.action("verified rejected multi-statement resources converged");
+        Ok(())
+    }
+}
 
 impl Scenario for NegotiatedMultiResult {
     fn name(&self) -> &'static str {
