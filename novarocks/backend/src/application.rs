@@ -23,7 +23,6 @@ use novarocks_worker::WorkerResultRetainedLimits;
 use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
-use crate::rpc::client::BackendRpcClient;
 use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
 use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
@@ -31,7 +30,7 @@ use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
 };
-use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
+use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport, NativeRpcClient};
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
 use crate::task_execution::{
@@ -185,7 +184,7 @@ impl BackendAnnounceTask {
         let join = std::thread::Builder::new()
             .name("backend-announce".to_string())
             .spawn(move || {
-                let client = BackendRpcClient::new_native_endpoint(
+                let client = NativeRpcClient::new_native_endpoint(
                     thread_runtime,
                     thread_frontend_endpoint,
                 );
@@ -203,10 +202,17 @@ impl BackendAnnounceTask {
                         reported_state,
                     )
                         .expect("backend process descriptor remains validated");
-                    let next_delay = match client.blocking_announce_backend_with_timeout(
-                        request.as_proto().clone(),
-                        ANNOUNCE_RPC_TIMEOUT,
-                    ) {
+                    let next_delay = match client
+                        .blocking_announce_backend_with_timeout(
+                            request.as_proto().clone(),
+                            ANNOUNCE_RPC_TIMEOUT,
+                        )
+                        .and_then(|response| {
+                            BackendAnnounceResult::from_proto(response).map_err(|error| {
+                                format!("announce_backend response invalid: {error}")
+                            })
+                        })
+                    {
                         Ok(BackendAnnounceResult::Accepted { lease_ttl_ms }) => {
                             retry_delay = initial_backoff;
                             interval.min(Duration::from_millis(lease_ttl_ms.saturating_div(3).max(1)))
@@ -252,17 +258,22 @@ impl BackendAnnounceTask {
     /// sets it before calling this, so the announce below and the heartbeat
     /// this BE answers cannot disagree about the same process.
     fn announce_drain(&self) {
-        let client = BackendRpcClient::new_native_endpoint(
+        let client = NativeRpcClient::new_native_endpoint(
             self.data_runtime.clone(),
             self.frontend_endpoint.clone(),
         );
         let request =
             BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
                 .expect("backend process descriptor remains validated");
-        match client.blocking_announce_backend_with_timeout(
-            request.as_proto().clone(),
-            ANNOUNCE_RPC_TIMEOUT,
-        ) {
+        match client
+            .blocking_announce_backend_with_timeout(
+                request.as_proto().clone(),
+                ANNOUNCE_RPC_TIMEOUT,
+            )
+            .and_then(|response| {
+                BackendAnnounceResult::from_proto(response)
+                    .map_err(|error| format!("announce_backend response invalid: {error}"))
+            }) {
             Ok(BackendAnnounceResult::Accepted { .. }) => {}
             Ok(BackendAnnounceResult::Rejected {
                 reason,

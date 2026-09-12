@@ -17,6 +17,8 @@
 
 //! Server-resolved Backend Native transport capability.
 
+pub mod native_client;
+pub use native_client::NativeRpcClient;
 pub mod native_codec;
 
 pub mod generated {

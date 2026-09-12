@@ -32,7 +32,6 @@ use prost::Message;
 
 use novarocks_proto_models::filter::RuntimeFilterEnvelopeResponse;
 
-use crate::rpc::client::BackendRpcClient;
 use crate::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
 use crate::runtime_filter::reliable_transport::{
     ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
@@ -42,7 +41,7 @@ use crate::runtime_filter::rpc::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
-use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
 
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;
@@ -232,8 +231,10 @@ impl BackendRuntimeFilterEnvelopeUnaryClient for LiveRuntimeFilterEnvelopeUnaryC
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
         deadline: Duration,
     ) -> Result<BackendRuntimeFilterUnaryAck, BackendRuntimeFilterUnaryError> {
-        let client = BackendRpcClient::new_runtime_endpoint(self.runtime.clone(), route.endpoint())
-            .map_err(BackendRuntimeFilterUnaryError::transport)?;
+        let client = NativeRpcClient::new_native_endpoint(
+            self.runtime.clone(),
+            route.endpoint().native_endpoint().clone(),
+        );
         let response = client
             .transmit_runtime_filter_envelope_async(
                 encode_runtime_filter_envelope(envelope.as_ref()),

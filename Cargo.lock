@@ -3982,6 +3982,7 @@ dependencies = [
 name = "novarocks-native-adapter"
 version = "0.1.0"
 dependencies = [
+ "hyper-util",
  "novarocks-native-trust",
  "novarocks-proto-models",
  "novarocks-task-codec",
@@ -3991,6 +3992,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tonic-build",
+ "tower 0.5.2",
 ]
 
 [[package]]

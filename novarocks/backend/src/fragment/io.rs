@@ -5,8 +5,7 @@ use novarocks_execution::runtime::fragment::io::{
     FragmentIoErrorKind, FragmentIoOperation,
 };
 
-use crate::rpc::client::BackendRpcClient;
-use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
 
 pub(crate) fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,
@@ -42,7 +41,7 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
                 format!("invalid gRPC exchange destination port: {error}"),
             )
         })?;
-        let client = BackendRpcClient::new_host_port(
+        let client = NativeRpcClient::new_host_port(
             self.runtime.clone(),
             frame.destination.host().to_string(),
             port,

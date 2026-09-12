@@ -15,19 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-owned outbound RPC transport.
-//!
-//! This is deliberately role-private: it provides only BE-to-BE data-plane
-//! calls and the BE-to-FE membership announce.  It shares no transport facade
-//! with Frontend or Core.
+//! Native outbound RPC transport over the Server-resolved backend capability.
 
 use std::io;
 use std::time::Duration;
 
 use hyper_util::rt::TokioIo;
-use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_native_trust::{NativeClientAuthInterceptor, NativeTrust};
-use novarocks_proto_codec::membership::BackendAnnounceResult;
 use novarocks_proto_models::{filter, novarocks as proto};
 use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::UniqueId;
@@ -36,8 +30,8 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 use tower::service_fn;
 
-use novarocks_native_adapter::BackendDataRuntime;
-use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use crate::BackendDataRuntime;
+use crate::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -45,30 +39,17 @@ const GRPC_MAX_MESSAGE_BYTES: usize =
 type AuthenticatedNovaRocksGrpcClient =
     NovaRocksGrpcClient<InterceptedService<Channel, NativeClientAuthInterceptor>>;
 
-pub(crate) struct BackendRpcClient {
+pub struct NativeRpcClient {
     runtime: BackendDataRuntime,
     endpoint: NativeEndpoint,
 }
 
-impl BackendRpcClient {
-    pub(crate) fn new_native_endpoint(
-        runtime: BackendDataRuntime,
-        endpoint: NativeEndpoint,
-    ) -> Self {
+impl NativeRpcClient {
+    pub fn new_native_endpoint(runtime: BackendDataRuntime, endpoint: NativeEndpoint) -> Self {
         Self { runtime, endpoint }
     }
 
-    pub(crate) fn new_runtime_endpoint(
-        runtime: BackendDataRuntime,
-        endpoint: &RuntimeEndpoint,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            runtime,
-            endpoint: endpoint.native_endpoint().clone(),
-        })
-    }
-
-    pub(crate) fn new_host_port(
+    pub fn new_host_port(
         runtime: BackendDataRuntime,
         host: String,
         port: u16,
@@ -108,7 +89,7 @@ impl BackendRpcClient {
         .map_err(|error| format!("{operation} channel acquisition failed: {error}"))
     }
 
-    pub(crate) async fn transmit_runtime_filter_envelope_async(
+    pub async fn transmit_runtime_filter_envelope_async(
         &self,
         request: filter::RuntimeFilterEnvelope,
         deadline: Duration,
@@ -135,11 +116,11 @@ impl BackendRpcClient {
         .map_err(|error| format!("transmit_runtime_filter_envelope rpc failed: {error}"))
     }
 
-    pub(crate) fn blocking_announce_backend_with_timeout(
+    pub fn blocking_announce_backend_with_timeout(
         &self,
         request: proto::AnnounceBackendRequest,
         timeout: Duration,
-    ) -> Result<BackendAnnounceResult, String> {
+    ) -> Result<proto::AnnounceBackendResponse, String> {
         self.runtime.block_on(async {
             let deadline_at = tokio::time::Instant::now() + timeout;
             let mut client = self
@@ -158,8 +139,7 @@ impl BackendRpcClient {
                 .map_err(|_| "announce_backend deadline exceeded during unary RPC".to_string())?
                 .map_err(|error| format!("announce_backend rpc failed: {error}"))?
                 .into_inner();
-            BackendAnnounceResult::from_proto(response)
-                .map_err(|error| format!("announce_backend response invalid: {error}"))
+            Ok(response)
         })
     }
 
@@ -167,7 +147,7 @@ impl BackendRpcClient {
         clippy::too_many_arguments,
         reason = "The frozen native boundary keeps independently validated inputs explicit."
     )]
-    pub(crate) fn exchange_unary(
+    pub fn exchange_unary(
         &self,
         finst_id: UniqueId,
         node_id: i32,
