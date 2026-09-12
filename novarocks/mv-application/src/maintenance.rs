@@ -19,6 +19,54 @@
 
 use std::fmt;
 
+/// Product policy configuration for process-local automatic MV maintenance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaintenanceCoordinatorConfig {
+    pub enabled: bool,
+    pub tick_interval_ms: u64,
+    pub max_concurrent: usize,
+    pub compaction_min_data_files: i64,
+    pub dv_min_delete_files: i64,
+    pub action_cooldown_ms: i64,
+    pub max_consecutive_failures: u32,
+}
+
+impl MaintenanceCoordinatorConfig {
+    pub const fn new(
+        enabled: bool,
+        tick_interval_ms: u64,
+        max_concurrent: usize,
+        compaction_min_data_files: i64,
+        dv_min_delete_files: i64,
+        action_cooldown_ms: i64,
+        max_consecutive_failures: u32,
+    ) -> Self {
+        Self {
+            enabled,
+            tick_interval_ms,
+            max_concurrent,
+            compaction_min_data_files,
+            dv_min_delete_files,
+            action_cooldown_ms,
+            max_consecutive_failures,
+        }
+    }
+}
+
+impl Default for MaintenanceCoordinatorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tick_interval_ms: 60_000,
+            max_concurrent: 1,
+            compaction_min_data_files: 100,
+            dv_min_delete_files: 10,
+            action_cooldown_ms: 3_600_000,
+            max_consecutive_failures: 4,
+        }
+    }
+}
+
 /// Product classification of a failed background capability invocation.
 ///
 /// The Frontend adapter supplies this classification; product policy consumes
