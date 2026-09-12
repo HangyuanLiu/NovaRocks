@@ -18,7 +18,7 @@
 //! Query-application SQL admission that is independent of a product route.
 
 use super::{
-    SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
+    SqlBatchCursor, parse_optional_single_statement, query_service_parse_error,
     strip_leading_line_comments,
 };
 use crate::engine_error::EngineError;
@@ -86,7 +86,7 @@ pub fn negotiated_query_statements(sql: &str) -> Result<Vec<&str>, QueryServiceE
         }
         let is_statement = admin_raise_engine_error(trimmed)?.is_some()
             || parse_optional_single_statement(trimmed)
-                .map_err(|error| parse_error(error, trimmed))?
+                .map_err(|error| query_service_parse_error(error, trimmed))?
                 .is_some();
         if !is_statement {
             continue;
@@ -186,18 +186,6 @@ pub fn admin_raise_engine_error(sql: &str) -> Result<Option<QueryServiceError>, 
         QueryServiceErrorKind::Unsupported,
         error.to_bracketed_user_message(),
     )))
-}
-
-fn parse_error(error: SqlStatementParseError, source: &str) -> QueryServiceError {
-    match error {
-        SqlStatementParseError::Parser(error) => {
-            QueryServiceError::from_user_error(error.to_user_error(source))
-        }
-        SqlStatementParseError::ExpectedExactlyOne { .. } => QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "command admission requires exactly one statement",
-        ),
-    }
 }
 
 #[cfg(test)]

@@ -96,7 +96,7 @@ use novarocks_query_application::sql::session::{
 use novarocks_query_application::sql::session_admit::SessionAdmitError;
 use novarocks_query_application::sql::user_variable::query_result_to_user_variable_literal;
 use novarocks_query_application::sql::{
-    SqlStatementParseError, parse_single_statement, strip_leading_line_comments,
+    parse_single_statement, query_service_parse_error, strip_leading_line_comments,
 };
 use novarocks_types::ClusterRole;
 use novarocks_types::naming::normalize_identifier;
@@ -573,18 +573,6 @@ fn query_service_admission_error(error: FrontendAdmissionError) -> QueryServiceE
     }
 }
 
-fn query_application_parse_error(error: SqlStatementParseError, source: &str) -> QueryServiceError {
-    match error {
-        SqlStatementParseError::Parser(error) => {
-            QueryServiceError::from_user_error(error.to_user_error(source))
-        }
-        SqlStatementParseError::ExpectedExactlyOne { .. } => QueryServiceError::new(
-            QueryServiceErrorKind::Parse,
-            "command admission requires exactly one statement",
-        ),
-    }
-}
-
 struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
@@ -628,7 +616,7 @@ impl FrontendQuerySession {
             return Err(error);
         }
         let parsed_statement = parse_single_statement(trimmed)
-            .map_err(|error| query_application_parse_error(error, trimmed))?;
+            .map_err(|error| query_service_parse_error(error, trimmed))?;
         let result = match parsed_statement {
             ParsedStatement::Session(ast::SessionStatement::Set(statement))
                 if statement

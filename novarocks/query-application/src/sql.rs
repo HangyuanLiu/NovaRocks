@@ -85,6 +85,20 @@ impl fmt::Display for SqlStatementParseError {
 
 impl std::error::Error for SqlStatementParseError {}
 
+/// Projects parser admission failures into the protocol-neutral query-service
+/// error vocabulary before any product route or protocol adapter is selected.
+pub fn query_service_parse_error(error: SqlStatementParseError, source: &str) -> QueryServiceError {
+    match error {
+        SqlStatementParseError::Parser(error) => {
+            QueryServiceError::from_user_error(error.to_user_error(source))
+        }
+        SqlStatementParseError::ExpectedExactlyOne { .. } => QueryServiceError::new(
+            QueryServiceErrorKind::Parse,
+            "command admission requires exactly one statement",
+        ),
+    }
+}
+
 /// Cursor over semicolon-delimited SQL protocol fragments.
 ///
 /// This is protocol-neutral framing: it preserves quote and comment state but
@@ -210,8 +224,10 @@ pub fn strip_leading_line_comments(sql: &str) -> &str {
 mod tests {
     use super::{
         SqlBatchCursor, SqlStatementParseError, parse_optional_single_statement,
-        parse_single_statement, split_sql_statements, strip_leading_line_comments,
+        parse_single_statement, query_service_parse_error, split_sql_statements,
+        strip_leading_line_comments,
     };
+    use crate::session_error::QueryServiceErrorKind;
 
     #[test]
     fn accepts_one_parser_statement() {
@@ -228,6 +244,19 @@ mod tests {
             parse_single_statement("SELECT 1; SELECT 2"),
             Err(SqlStatementParseError::ExpectedExactlyOne { actual: 2 })
         ));
+    }
+
+    #[test]
+    fn parser_admission_projection_keeps_the_parse_error_vocabulary() {
+        let error = query_service_parse_error(
+            SqlStatementParseError::ExpectedExactlyOne { actual: 2 },
+            "SELECT 1; SELECT 2",
+        );
+        assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
+        assert_eq!(
+            error.message(),
+            "command admission requires exactly one statement"
+        );
     }
 
     #[test]
