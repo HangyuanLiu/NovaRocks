@@ -23,7 +23,7 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
-use novarocks_backend::BackendServerConfig;
+use novarocks_backend::application::BackendServerConfig;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
