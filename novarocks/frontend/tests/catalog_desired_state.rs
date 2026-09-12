@@ -49,8 +49,9 @@ use novarocks_frontend::catalog_controller::{CatalogProjectionConfig, FrontendCa
 use novarocks_frontend::connector::ConnectorControlHost;
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig, FrontendNativeTransport,
+    FrontendExecutionConfig,
 };
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };

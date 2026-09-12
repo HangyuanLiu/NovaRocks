@@ -65,7 +65,6 @@ use crate::mv::maintenance::MaintenanceCoordinatorConfig;
 use crate::mv::scheduler::FrontendMvSchedulerConfig;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::native::transport::FrontendNativeTransport;
 use crate::query_execution::logical_read::LogicalReadLauncher;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{
@@ -83,6 +82,7 @@ use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle,
 };
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::query_control::QueryApplicationControl;
 
@@ -2037,10 +2037,10 @@ mod tests {
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, FrontendNativeTransport,
-        LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit,
-        test_native_trust,
+        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, LogicalExecutionRowsConfig,
+        LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit, test_native_trust,
     };
+    use novarocks_native_adapter::FrontendNativeTransport;
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,

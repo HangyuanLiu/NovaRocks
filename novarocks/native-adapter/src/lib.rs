@@ -64,6 +64,61 @@ impl BackendNativeTransport {
     }
 }
 
+/// Server-materialized transport capability consumed by the Frontend role.
+///
+/// It contains no source configuration or filesystem path. The Server builds
+/// it before role startup and Frontend uses it for every Native dial and the
+/// report listener's incoming stream.
+#[derive(Clone)]
+pub enum FrontendNativeTransport {
+    Plaintext,
+    Automatic(AutomaticTlsMaterial),
+    Pem(NativeTlsMaterial),
+}
+
+impl FrontendNativeTransport {
+    pub fn plaintext() -> Self {
+        Self::Plaintext
+    }
+
+    pub fn automatic(material: AutomaticTlsMaterial) -> Self {
+        Self::Automatic(material)
+    }
+
+    pub fn pem(material: NativeTlsMaterial) -> Self {
+        Self::Pem(material)
+    }
+
+    /// Whether this concrete role-local Native transport encrypts the wire.
+    /// Confidential query-attempt lease material is admitted only through this
+    /// capability, never through an untrusted protobuf claim.
+    pub const fn permits_confidential_credential_leases(&self) -> bool {
+        matches!(self, Self::Automatic(_) | Self::Pem(_))
+    }
+
+    pub fn connector_for(
+        &self,
+        endpoint: NativeEndpoint,
+    ) -> Result<NativeEndpointConnector, String> {
+        match self {
+            Self::Plaintext => Ok(NativeEndpointConnector::plaintext(endpoint)),
+            Self::Automatic(material) => NativeEndpointConnector::automatic(endpoint, material)
+                .map_err(|error| {
+                    format!("construct automatic Native TLS connector failed: {error}")
+                }),
+            Self::Pem(material) => Ok(NativeEndpointConnector::pem(endpoint, material)),
+        }
+    }
+
+    pub fn incoming_adapter(&self) -> NativeIncomingAdapter {
+        match self {
+            Self::Plaintext => NativeIncomingAdapter::plaintext(),
+            Self::Automatic(material) => NativeIncomingAdapter::automatic(material),
+            Self::Pem(material) => NativeIncomingAdapter::pem(material),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct BackendDataRuntime {
     handle: Handle,

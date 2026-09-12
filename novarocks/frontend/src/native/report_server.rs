@@ -33,7 +33,7 @@ use crate::query_execution::runtime_filter_terminal_rollup::{
 };
 
 use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use super::transport::FrontendNativeTransport;
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{BoxedNativeIo, NativeServerAdmission, NativeTrust};
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
@@ -800,9 +800,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use super::{
-        FrontendNativeTransport, FrontendReportServerHandle, lifecycle_convergence_debug_snapshot,
-    };
+    use super::{FrontendReportServerHandle, lifecycle_convergence_debug_snapshot};
     use crate::coordinator::{
         QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
@@ -815,6 +813,7 @@ mod tests {
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
     use crate::topology::ClusterBackendService;
+    use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };

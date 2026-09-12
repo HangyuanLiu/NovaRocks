@@ -864,14 +864,16 @@ fn backend_native_transport(
 
 fn frontend_native_transport(
     transport: &NativeTrustTransport,
-) -> novarocks_frontend::FrontendNativeTransport {
+) -> novarocks_native_adapter::FrontendNativeTransport {
     match transport {
-        NativeTrustTransport::Plaintext => novarocks_frontend::FrontendNativeTransport::plaintext(),
+        NativeTrustTransport::Plaintext => {
+            novarocks_native_adapter::FrontendNativeTransport::plaintext()
+        }
         NativeTrustTransport::Automatic(material) => {
-            novarocks_frontend::FrontendNativeTransport::automatic(material.clone())
+            novarocks_native_adapter::FrontendNativeTransport::automatic(material.clone())
         }
         NativeTrustTransport::Pem(material) => {
-            novarocks_frontend::FrontendNativeTransport::pem(material.clone())
+            novarocks_native_adapter::FrontendNativeTransport::pem(material.clone())
         }
     }
 }

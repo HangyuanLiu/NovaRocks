@@ -47,8 +47,8 @@ use novarocks_frontend::table_maintenance::gc_observation::{
 };
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationHost, FrontendExecutionConfig,
-    FrontendNativeTransport,
 };
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };

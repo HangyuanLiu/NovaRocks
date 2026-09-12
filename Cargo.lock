@@ -3872,6 +3872,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-mv-application",
  "novarocks-mysql-adapter",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-plan-codec",

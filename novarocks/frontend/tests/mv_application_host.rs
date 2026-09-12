@@ -17,8 +17,9 @@
 
 use novarocks_frontend::{
     ClusterBackendOpenConfig, FrontendApplicationErrorKind, FrontendApplicationHost,
-    FrontendExecutionConfig, FrontendNativeTransport,
+    FrontendExecutionConfig,
 };
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
     DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
 };

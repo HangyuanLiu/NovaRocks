@@ -25,12 +25,12 @@ use tokio::runtime::Handle;
 use tracing::info;
 
 use crate::capabilities as core_capabilities;
-use crate::native::transport::FrontendNativeTransport;
 use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
 use crate::{MysqlClientConnectionRegistry, QuerySessionFactory, ResolvedMysqlListenerSettings};
+use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::client_connection::{
     ClientConnectionControlPort, ClientConnectionTerminationReason,
@@ -996,7 +996,6 @@ mod tests {
     };
     use crate::ResolvedMysqlListenerSettings;
     use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
-    use crate::native::transport::FrontendNativeTransport;
     use crate::state_store::{
         StateStoreProviderRegistry,
         testing::{input as test_state_store_input, registry as test_state_store_registry},
@@ -1005,6 +1004,7 @@ mod tests {
         ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
         FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
     };
+    use novarocks_native_adapter::FrontendNativeTransport;
     use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
     use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};
     use novarocks_query_application::session_error::QueryServiceErrorKind;

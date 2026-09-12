@@ -42,6 +42,7 @@ novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-mv-application.workspace = true
 novarocks-mysql-adapter.workspace = true
+novarocks-native-adapter.workspace = true
 novarocks-statistics-application.workspace = true
 novarocks-table-maintenance.workspace = true
 novarocks-sql.workspace = true
