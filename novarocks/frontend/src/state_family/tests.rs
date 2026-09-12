@@ -40,13 +40,13 @@
 //! Naming the gaps matters: a scan that silently covered less than the
 //! statement surface would look exactly like one that covered all of it.
 
-use bytes::Bytes;
-use novarocks_frontend::state_family::{DurabilityAdmission, StateFamily};
-use novarocks_frontend::{
+use super::{DurabilityAdmission, StateFamily};
+use crate::{
     application::{FrontendApplicationHost, FrontendExecutionConfig},
-    state_store::StateStoreHostInput,
+    state_store::{StateStoreHost, StateStoreHostInput, testing as state_store_fixture},
     topology::ClusterBackendOpenConfig,
 };
+use bytes::Bytes;
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_native_trust::{
@@ -58,11 +58,8 @@ use novarocks_table_maintenance::gc_observation::{
     GC_OWNED_REF_OBSERVATION_STATE_FAMILY, GcOwnedRefObservation, GcOwnedRefObservationAccelerator,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-mod common;
-use common::state_store_fixture;
 
 /// Prefixes this series retired. They are asserted absent by value rather than
 /// by manifest lookup: the manifest no longer knows these families exist, so
@@ -233,7 +230,7 @@ fn backend_config() -> ClusterBackendOpenConfig {
 /// registry - and each one gets its chance to write. The retired coordination
 /// family wrote its control record on exactly this path.
 async fn open_application(input: StateStoreHostInput) -> FrontendApplicationHost {
-    let registry = state_store_fixture::registry();
+    let registry = state_store_fixture::persistent_registry();
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
         Some(input),
         &registry,
@@ -265,7 +262,7 @@ async fn opening_the_whole_frontend_writes_no_durable_record_at_all() {
     // `\0novarocks/cp/v1/control`, so this assertion is what the coordination
     // retirement bought. A scan-for-strays assertion here would have passed
     // trivially against an empty store and proven nothing.
-    let input = state_store_fixture::input("state-family-conformance-application");
+    let input = state_store_fixture::persistent_input("state-family-conformance-application");
     let mut host = open_application(input.clone()).await;
     let store = host.state_store().expect("configured StateStore");
     let keys = scan_all_keys(&store).await;
@@ -300,7 +297,14 @@ async fn opening_the_whole_frontend_writes_no_durable_record_at_all() {
 async fn durable_records_written_by_real_owners_match_their_product_descriptor() {
     // The scan is only evidence if something actually wrote. Drive a real
     // owner's write path, then attribute every resulting key.
-    let mut host = state_store_fixture::open("state-family-conformance-writes").await;
+    let registry = state_store_fixture::persistent_registry();
+    let mut host = StateStoreHost::open(
+        &registry,
+        state_store_fixture::persistent_input("state-family-conformance-writes"),
+        Instant::now() + Duration::from_secs(5),
+    )
+    .await
+    .expect("open frontend StateStore host");
     let store = host.state_store().expect("configured StateStore");
 
     let accelerator = GcOwnedRefObservationAccelerator::open(Arc::clone(&store), host.run_policy())

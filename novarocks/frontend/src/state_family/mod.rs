@@ -41,9 +41,12 @@
 mod classification;
 mod manifest;
 
-pub use classification::{
+#[cfg(test)]
+mod tests;
+
+use classification::{
     AcceleratorContract, AcceleratorRebuildAuthority, AcceleratorResidence, ClonePolicy,
     DurabilityAdmission, PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract,
     RebuildDeterminism, StateFamilyClassification, WipeEntry,
 };
-pub use manifest::StateFamily;
+use manifest::StateFamily;

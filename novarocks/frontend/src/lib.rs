@@ -33,7 +33,7 @@ pub(crate) mod query;
 mod query_execution;
 pub(crate) mod runtime_filter;
 pub mod server;
-pub mod state_family;
+mod state_family;
 pub mod state_store;
 pub(crate) mod statistics;
 pub(crate) mod statistics_jobs;
