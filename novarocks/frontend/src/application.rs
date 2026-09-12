@@ -1374,9 +1374,9 @@ impl FrontendApplicationHost {
         self.serving_lifecycle.begin_drain(timeout);
     }
 
-    /// Requests the drain-deadline cancellation through the sole governed
-    /// workload authority. The legacy lifecycle bridge remains responsible
-    /// only for statement paths not yet converted to governed roots.
+    /// Requests drain-deadline cancellation through the sole governed
+    /// workload authority. The serving lifecycle observes the transition but
+    /// never owns a business root or cancellation bridge.
     pub fn cancel_governed_work_at_drain_deadline(&self) -> usize {
         self.execution_runtime_owner
             .cancel_active_roots_at_drain_deadline()
