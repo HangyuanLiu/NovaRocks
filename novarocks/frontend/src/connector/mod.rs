@@ -47,7 +47,6 @@ pub(crate) use application::{
     context_for_planning_lease_typed, install_frontend_connector_resources, metadata_binding_typed,
     metadata_load_connector_table_with_planning_lease_typed,
 };
-pub(crate) use novarocks_catalog_application::{ConnectorControlHost, ConnectorWriteStackLease};
 pub use unified_statistics::UnifiedStatisticsResolver;
 
 #[cfg(test)]

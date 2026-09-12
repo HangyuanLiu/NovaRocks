@@ -671,7 +671,7 @@ mod tests {
             ),
             None,
             Arc::clone(&connector_control),
-            std::sync::Arc::new(crate::connector::ConnectorControlHost::new()),
+            std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),

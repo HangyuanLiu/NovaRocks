@@ -103,7 +103,7 @@ impl QueryExecutionService {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
-        write_stack: crate::connector::ConnectorWriteStackLease,
+        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
         table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorDistributedRewriteSession, DistributedQueryError> {

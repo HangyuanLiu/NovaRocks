@@ -111,7 +111,7 @@ fn prepare_scan_bindings_with_controls(
 /// Fixture options carrying a typed control registry, mirroring how the
 /// composition root hands one to production preparation.
 fn fixture_scan_preparation_options(
-    typed: Arc<crate::connector::ConnectorControlHost>,
+    typed: Arc<novarocks_catalog_application::ConnectorControlHost>,
 ) -> super::ScanPreparationOptions {
     super::ScanPreparationOptions::single_backend_fixture().with_typed_connector_control(
         typed,
@@ -133,14 +133,14 @@ fn fixture_scan_preparation_options(
 fn fixture_control_role_host(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> Arc<crate::connector::ConnectorControlHost> {
+) -> Arc<novarocks_catalog_application::ConnectorControlHost> {
     fixture_control_role_host_with_foreign_provider(plan, controls, false)
 }
 
 fn foreign_fixture_control_role_host(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
-) -> Arc<crate::connector::ConnectorControlHost> {
+) -> Arc<novarocks_catalog_application::ConnectorControlHost> {
     fixture_control_role_host_with_foreign_provider(plan, controls, true)
 }
 
@@ -148,10 +148,10 @@ fn fixture_control_role_host_with_foreign_provider(
     plan: &DistributedPlan,
     controls: &crate::connector::FixtureControlResolver,
     foreign_provider: bool,
-) -> Arc<crate::connector::ConnectorControlHost> {
+) -> Arc<novarocks_catalog_application::ConnectorControlHost> {
     use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
 
-    let registry = Arc::new(crate::connector::ConnectorControlHost::new());
+    let registry = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
     let mut facts = Vec::new();
     for fragment in plan.fragments() {
         fn collect(node: &DistributedNode, facts: &mut Vec<SqlScanPreparationFacts>) {

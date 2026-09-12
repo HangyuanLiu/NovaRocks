@@ -57,7 +57,7 @@ pub(crate) struct StatisticsAttemptExecutionPorts {
     /// The composition root's single typed control registry. A collection is
     /// an ordinary typed read, so it resolves its relation through the same
     /// installed generation every statement does.
-    typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     backend_topology: BackendTopologyService,
     query_execution: QueryExecutionService,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -68,7 +68,7 @@ impl StatisticsAttemptExecutionPorts {
     pub(crate) fn new(
         execution_role: novarocks_types::ClusterRole,
         connector_control: Arc<dyn ConnectorControlRegistry>,
-        typed_connector_control: Arc<crate::connector::ConnectorControlHost>,
+        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         backend_topology: BackendTopologyService,
         query_execution: QueryExecutionService,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,

@@ -53,8 +53,8 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
-use crate::connector::ConnectorWriteStackLease;
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
+use novarocks_catalog_application::ConnectorWriteStackLease;
 use novarocks_plan_codec::SealedWriteTargets;
 
 /// What a session has already decided. Recorded so a second, different

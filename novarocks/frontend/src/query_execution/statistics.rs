@@ -277,14 +277,14 @@ impl PreparedStatisticsCollectionRequest {
 /// program into an ordinary distributed query.
 pub struct StatisticsPlanningServices<'a> {
     controls: &'a dyn ConnectorControlResolver,
-    typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
     functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
 }
 
 impl<'a> StatisticsPlanningServices<'a> {
     pub fn new(
         controls: &'a dyn ConnectorControlResolver,
-        typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+        typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
         functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
     ) -> Self {
         Self {

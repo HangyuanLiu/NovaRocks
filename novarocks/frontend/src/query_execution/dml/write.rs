@@ -16,7 +16,7 @@ pub(crate) fn execute_bound_distributed_write_request(
 }
 
 pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     Ok(

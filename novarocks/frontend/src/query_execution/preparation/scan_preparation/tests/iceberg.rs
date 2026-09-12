@@ -349,7 +349,7 @@ fn a_scan_whose_catalog_handle_does_not_resolve_fails_closed() {
     let controls = crate::connector::FixtureControlResolver::new(connectors.clone());
     let query_bindings = fixture_query_table_bindings(&plan, &controls);
     // An empty role host stands for "this catalog handle was never installed".
-    let empty = Arc::new(crate::connector::ConnectorControlHost::new());
+    let empty = Arc::new(novarocks_catalog_application::ConnectorControlHost::new());
     let error = expect_preparation_error(
         super::super::prepare_scan_bindings(
             &plan,

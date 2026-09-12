@@ -55,7 +55,6 @@ use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessName
 use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
-use crate::connector::ConnectorControlHost;
 use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::dml::DmlService;
 use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
@@ -78,6 +77,7 @@ use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingWorkloadSnapshotReader,
 };
+use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_catalog_application::{
     CatalogApplicationService, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
     CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode, CatalogMaterializationConfig,

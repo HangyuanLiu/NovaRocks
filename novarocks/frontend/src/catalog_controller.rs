@@ -497,7 +497,7 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::*;
-    use crate::connector::ConnectorControlHost;
+    use novarocks_catalog_application::ConnectorControlHost;
     use novarocks_catalog_application::{CatalogAttachment, CatalogAttachmentRepository};
 
     /// Mints a distinct control generation per materialization, like a real
