@@ -486,7 +486,6 @@ pub struct FrontendApplicationHost {
     view_service: Option<Arc<dyn crate::view::ViewService>>,
     table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
-    mv_application_service: Option<Arc<dyn crate::mv::domain::application::MvApplicationService>>,
     mv_service: Option<Arc<FrontendMvService>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
@@ -986,7 +985,6 @@ impl FrontendApplicationHost {
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
-            mv_application_service: None,
             mv_service: None,
             state_store_host: None,
             query_execution: None,
@@ -1435,16 +1433,6 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_application_service(
-        &self,
-    ) -> Arc<dyn crate::mv::domain::application::MvApplicationService> {
-        Arc::clone(
-            self.mv_application_service
-                .as_ref()
-                .expect("frontend MV application service is installed before host open returns"),
-        )
-    }
-
     pub fn mv_service(&self) -> Arc<FrontendMvService> {
         Arc::clone(
             self.mv_service
@@ -1465,12 +1453,9 @@ impl FrontendApplicationHost {
         &mut self,
         service: Arc<FrontendMvService>,
     ) -> Result<(), String> {
-        if self.mv_application_service.is_some() || self.mv_service.is_some() {
+        if self.mv_service.is_some() {
             return Err("frontend MV service is already installed".to_string());
         }
-        let application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
-            Arc::clone(&service) as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-        self.mv_application_service = Some(application);
         self.mv_service = Some(service);
         Ok(())
     }
@@ -1940,7 +1925,6 @@ impl FrontendApplicationHost {
         }
         self.catalog_application_port.take();
         self.view_service.take();
-        self.mv_application_service.take();
         self.mv_service.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {

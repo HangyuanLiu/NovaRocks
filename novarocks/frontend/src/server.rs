@@ -207,7 +207,9 @@ pub fn build_frontend_query_session_factory(
     ));
     host.install_mv_service(Arc::clone(&mv_service))
         .map_err(FrontendApplicationError::server)?;
-    let mv_application = host.mv_application_service();
+    let mv_application_service = Arc::clone(&mv_service);
+    let mv_application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
+        mv_application_service;
 
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
