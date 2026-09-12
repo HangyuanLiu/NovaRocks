@@ -27,7 +27,7 @@ pub use exchange_edge::{
 };
 pub use exchange_receiver::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
-    UnavailableExchangeReceiverPort,
+    ExecutionRuntimeExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
 pub use result::{
     FragmentResultSession, FragmentResultWriter, ResultAbort, ResultPresentation, ResultProjection,

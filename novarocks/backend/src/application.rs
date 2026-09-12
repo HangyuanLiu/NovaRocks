@@ -18,7 +18,6 @@ use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::{WorkerDrainState, WorkerResultRetainedLimits};
 
-use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::rpc::server::BackendRpcService;
@@ -38,7 +37,9 @@ use crate::task_execution::{
     TaskExecutionHost, TaskStatusReporter,
 };
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
-use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
+};
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
@@ -544,7 +545,7 @@ fn compose_backend_application_services(
     let backend_process_id = BackendProcessId::new_v7();
     let drain = Arc::new(WorkerDrainState::new());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
-        BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
+        ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
     let execution_role_binding_factories = Arc::new(
         crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new(
