@@ -1357,6 +1357,9 @@ fn failed_query_result_delivery(message: impl Into<String>) -> QueryExecutionErr
 
 fn cancelled_query_result_delivery(reason: QueryCancellationReason) -> QueryExecutionError {
     let message = match reason {
+        QueryCancellationReason::DeadlineExceeded { timeout_ms } => {
+            format!("query timed out after {timeout_ms} ms")
+        }
         QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms } => format!(
             "FRONTEND_DRAIN_DEADLINE_EXCEEDED: frontend drain deadline exceeded after {timeout_ms} ms"
         ),
@@ -1600,6 +1603,15 @@ mod streaming_result_tests {
             .settlement(),
             ProtocolWriteSettlement::Cancellation
         );
+    }
+
+    #[test]
+    fn deadline_delivery_cancellation_keeps_the_statement_timeout_message() {
+        let error = cancelled_query_result_delivery(QueryCancellationReason::DeadlineExceeded {
+            timeout_ms: 1_000,
+        });
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        assert_eq!(error.to_string(), "query timed out after 1000 ms");
     }
 
     #[test]
