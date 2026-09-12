@@ -476,7 +476,6 @@ pub struct FrontendApplicationHost {
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
     dml_service: Option<Arc<DmlService>>,
-    statistics_job_service: Option<Arc<StatisticsJobService>>,
     statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
@@ -979,7 +978,6 @@ impl FrontendApplicationHost {
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
             dml_service: None,
-            statistics_job_service: None,
             statistics_application_port: None,
             catalog_application_port: None,
             abandoned_attempt_sweeper: None,
@@ -1291,9 +1289,9 @@ impl FrontendApplicationHost {
         }
         let statistics_connector_control = Arc::clone(&host.connector_control)
             as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
-        let statistics_job_service = Arc::new(StatisticsJobService::new());
+        let statistics_job_service = StatisticsJobService::new();
         let statistics_application_port = Arc::new(FrontendStatisticsApplicationPort::new(
-            statistics_job_service.as_ref().clone(),
+            statistics_job_service,
             Arc::new(
                 crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
                     Arc::clone(&statistics_connector_control),
@@ -1319,7 +1317,6 @@ impl FrontendApplicationHost {
             ),
             tokio::runtime::Handle::current(),
         ));
-        host.statistics_job_service = Some(statistics_job_service);
         host.statistics_application_port = Some(statistics_application_port);
 
         Ok(host)
@@ -1338,14 +1335,6 @@ impl FrontendApplicationHost {
             self.dml_service
                 .as_ref()
                 .expect("frontend DML service is installed before host open returns"),
-        )
-    }
-
-    pub fn statistics_job_service(&self) -> Arc<StatisticsJobService> {
-        Arc::clone(
-            self.statistics_job_service
-                .as_ref()
-                .expect("statistics job service is installed before host open returns"),
         )
     }
 
@@ -1900,7 +1889,6 @@ impl FrontendApplicationHost {
         // Process-local job services do not own StateStore job records. Release
         // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();
-        self.statistics_job_service.take();
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.
