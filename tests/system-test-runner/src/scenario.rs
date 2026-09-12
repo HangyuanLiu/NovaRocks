@@ -117,7 +117,12 @@ struct ScenarioEvidence<'a> {
     command: Vec<String>,
     source_revision: String,
     source_dirty: bool,
+    source_tree_sha256: String,
     runner_native_build_identity: String,
+    runner_executable: String,
+    runner_executable_sha256: String,
+    cargo_lock_sha256: String,
+    platform: ScenarioPlatformIdentity,
     actions: &'a [String],
     runtime_dir: String,
     primary_binary: String,
@@ -132,6 +137,13 @@ struct ScenarioEvidence<'a> {
     effective_launch_config_semantics_sha256: String,
     effective_launch_config: serde_json::Value,
     diagnostics: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ScenarioPlatformIdentity {
+    os: &'static str,
+    architecture: &'static str,
+    logical_cpu_count: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -309,15 +321,11 @@ impl ScenarioContext {
                 self.base_config_path().display()
             )
         })?;
-        let (source_revision, source_dirty) = source_checkout_identity()?;
-        let primary_binary_bytes = fs::read(self.primary_binary()).with_context(|| {
-            format!(
-                "read primary binary for scenario evidence {}",
-                self.primary_binary().display()
-            )
-        })?;
+        let source = source_checkout_identity()?;
+        let repository = workspace_root()?;
+        let (runner_executable, runner_executable_sha256) = runner_executable_identity()?;
         let evidence = ScenarioEvidence {
-            schema_version: 2,
+            schema_version: 3,
             scenario: self.name,
             outcome,
             exit_code: match outcome {
@@ -327,13 +335,18 @@ impl ScenarioContext {
             started_unix_millis: unix_millis(self.started_at)?,
             ended_unix_millis: unix_millis(SystemTime::now())?,
             command: std::env::args().collect(),
-            source_revision,
-            source_dirty,
+            source_revision: source.revision,
+            source_dirty: source.dirty,
+            source_tree_sha256: source.tree_sha256,
             runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
+            runner_executable,
+            runner_executable_sha256,
+            cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
+            platform: scenario_platform_identity()?,
             actions: &self.actions,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
-            primary_binary_sha256: format!("{:x}", Sha256::digest(primary_binary_bytes)),
+            primary_binary_sha256: sha256_file(self.primary_binary())?,
             base_config_path: self.base_config_path().display().to_string(),
             base_config_sha256: format!("{:x}", Sha256::digest(config_bytes)),
             cluster_size: self.cluster_size,
@@ -397,17 +410,40 @@ impl ScenarioContext {
     }
 }
 
-fn source_checkout_identity() -> Result<(String, bool)> {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+struct SourceCheckoutIdentity {
+    revision: String,
+    dirty: bool,
+    tree_sha256: String,
+}
+
+fn workspace_root() -> Result<&'static Path> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
-        .context("locate workspace root for scenario evidence")?;
+        .context("locate workspace root for scenario evidence")
+}
+
+fn source_checkout_identity() -> Result<SourceCheckoutIdentity> {
+    let repository = workspace_root()?;
     let revision = git_output(repository, &["rev-parse", "HEAD"])?;
     let status = git_output(repository, &["status", "--porcelain=v1"])?;
-    Ok((revision, !status.is_empty()))
+    let tracked = git_output_bytes(repository, &["ls-files", "-s"])?;
+    let diff = git_output_bytes(repository, &["diff", "--binary", "HEAD"])?;
+    let staged = git_output_bytes(repository, &["diff", "--binary", "--cached"])?;
+    Ok(SourceCheckoutIdentity {
+        tree_sha256: source_tree_sha256(&revision, &status, &tracked, &diff, &staged),
+        revision,
+        dirty: !status.is_empty(),
+    })
 }
 
 fn git_output(repository: &Path, arguments: &[&str]) -> Result<String> {
+    String::from_utf8(git_output_bytes(repository, arguments)?)
+        .context("decode git output for scenario evidence")
+        .map(|value| value.trim().to_string())
+}
+
+fn git_output_bytes(repository: &Path, arguments: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")
         .args(arguments)
         .current_dir(repository)
@@ -421,9 +457,73 @@ fn git_output(repository: &Path, arguments: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    String::from_utf8(output.stdout)
-        .context("decode git output for scenario evidence")
-        .map(|value| value.trim().to_string())
+    Ok(output.stdout)
+}
+
+fn source_tree_sha256(
+    revision: &str,
+    status: &str,
+    tracked: &[u8],
+    diff: &[u8],
+    staged: &[u8],
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [
+        revision.as_bytes(),
+        status.as_bytes(),
+        tracked,
+        diff,
+        staged,
+    ] {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {} for SHA256", path.display()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+fn runner_executable_identity() -> Result<(String, String)> {
+    let executable = std::env::current_exe().context("resolve system-test runner executable")?;
+    let canonical = fs::canonicalize(&executable).with_context(|| {
+        format!(
+            "resolve system-test runner executable {}",
+            executable.display()
+        )
+    })?;
+    Ok((canonical.display().to_string(), sha256_file(&canonical)?))
+}
+
+fn scenario_platform_identity() -> Result<ScenarioPlatformIdentity> {
+    Ok(ScenarioPlatformIdentity {
+        os: std::env::consts::OS,
+        architecture: std::env::consts::ARCH,
+        logical_cpu_count: std::thread::available_parallelism()
+            .context("read logical CPU count for scenario evidence")?
+            .get(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_tree_sha256;
+
+    #[test]
+    fn source_tree_identity_changes_with_each_git_input() {
+        let baseline = source_tree_sha256("revision", "", b"tracked", b"diff", b"staged");
+        for changed in [
+            source_tree_sha256("other-revision", "", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", " M file", b"tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"other-tracked", b"diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"other-diff", b"staged"),
+            source_tree_sha256("revision", "", b"tracked", b"diff", b"other-staged"),
+        ] {
+            assert_ne!(baseline, changed);
+        }
+    }
 }
 
 fn unix_millis(time: SystemTime) -> Result<u128> {
