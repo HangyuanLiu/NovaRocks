@@ -15,19 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Product-owner integration checks reached through frontend re-exports.
+//! Product-owner integration checks compiled in the Frontend integration target.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use novarocks_frontend::statistics_jobs::model::{
-    StatisticsColumns, StatisticsFailure, StatisticsJobConclusion, StatisticsJobCreate,
-    StatisticsJobPhase, StatisticsJobState, StatisticsPublicationFact, StatisticsTarget,
-};
-use novarocks_frontend::statistics_jobs::repository::StatisticsJobRepository;
-use novarocks_frontend::statistics_jobs::worker::{
-    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsPublicationOutcome,
-    StatisticsWorker,
+use novarocks_statistics_application::{
+    StatisticsAttemptError, StatisticsAttemptExecutor, StatisticsColumns, StatisticsFailure,
+    StatisticsJob, StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobPhase,
+    StatisticsJobRepository, StatisticsJobState, StatisticsPublicationFact,
+    StatisticsPublicationOutcome, StatisticsTarget, StatisticsWorker,
 };
 use novarocks_workload_control::{
     ResourceConfig, WorkClass, WorkOwner, WorkRequest, WorkScope, WorkloadConfig, WorkloadControl,
@@ -71,21 +68,21 @@ struct PublishExecutor {
 impl StatisticsAttemptExecutor for PublishExecutor {
     fn prepare(
         &self,
-        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _job: &StatisticsJob,
         scope: &WorkScope,
     ) -> Result<(), StatisticsAttemptError> {
         scope.check().map_err(failed)
     }
     fn collect(
         &self,
-        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _job: &StatisticsJob,
         scope: &WorkScope,
     ) -> Result<(), StatisticsAttemptError> {
         scope.check().map_err(failed)
     }
     fn publish(
         &self,
-        _job: &novarocks_frontend::statistics_jobs::model::StatisticsJob,
+        _job: &StatisticsJob,
         scope: &WorkScope,
     ) -> Result<StatisticsPublicationOutcome, StatisticsAttemptError> {
         scope.check().map_err(failed)?;

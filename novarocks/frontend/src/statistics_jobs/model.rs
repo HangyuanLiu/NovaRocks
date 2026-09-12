@@ -9,25 +9,18 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the Apache License is distributed on an
+// software distributed under the License is distributed on an
 // "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend input adapters for the statistics application model.
+//! Frontend SQL-name adapter for statistics commands.
 //!
-//! The statistics job state machine is owned by
-//! `novarocks_statistics_application`. This module preserves only the
-//! frontend parsed-name shape and re-exports that product model; it owns no
-//! job state or identity minting.
-
-pub use novarocks_statistics_application::{
-    StatisticsColumns, StatisticsConvergence, StatisticsFailure, StatisticsJob,
-    StatisticsJobConclusion, StatisticsJobCreate, StatisticsJobId, StatisticsJobPhase,
-    StatisticsJobState, StatisticsLogicalExecutionId, StatisticsPublicationFact,
-    StatisticsPublicationId, StatisticsQueryAttemptId, StatisticsTarget,
-};
+//! The statistics job state machine, identities, repository, and worker are
+//! owned by `novarocks_statistics_application`. This module intentionally
+//! retains only the parsed SQL target shape used before the product request is
+//! constructed.
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsJobTarget {
