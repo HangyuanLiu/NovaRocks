@@ -31,6 +31,29 @@ pub struct MysqlStream {
     stream: TcpStream,
 }
 
+pub struct MysqlPacket {
+    sequence: u8,
+    payload: Vec<u8>,
+}
+
+impl MysqlPacket {
+    pub const fn sequence(&self) -> u8 {
+        self.sequence
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.payload.first().copied() == Some(0xff)
+    }
+
+    pub fn is_result_terminator(&self) -> bool {
+        is_mysql_result_terminator(&self.payload)
+    }
+}
+
 impl MysqlStream {
     pub fn connect(user: &str, port: u16, timeout: Duration) -> Result<Self> {
         const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
@@ -50,7 +73,7 @@ impl MysqlStream {
             .set_write_timeout(Some(timeout))
             .context("set raw MySQL write timeout")?;
 
-        let (_, handshake) = read_packet(&mut stream).context("read MySQL handshake")?;
+        let (_, handshake) = read_wire_packet(&mut stream).context("read MySQL handshake")?;
         ensure!(
             handshake.first().copied() == Some(10),
             "expected MySQL protocol v10 handshake, got payload={handshake:?}"
@@ -75,7 +98,7 @@ impl MysqlStream {
         write_packet(&mut stream, 1, &response).context("write MySQL handshake response")?;
 
         let (_, auth_result) =
-            read_packet(&mut stream).context("read MySQL authentication result")?;
+            read_wire_packet(&mut stream).context("read MySQL authentication result")?;
         if auth_result.first().copied() == Some(0xff) {
             bail!(
                 "raw public MySQL authentication failed: {}",
@@ -103,7 +126,7 @@ impl MysqlStream {
     }
 
     pub fn expect_ok_packet(&mut self, operation: &str) -> Result<()> {
-        let (_, response) = read_packet(&mut self.stream)
+        let (_, response) = read_wire_packet(&mut self.stream)
             .with_context(|| format!("read response for {operation}"))?;
         if response.first().copied() == Some(0xff) {
             bail!("{operation} failed: {}", mysql_error_text(&response)?);
@@ -115,36 +138,43 @@ impl MysqlStream {
         Ok(())
     }
 
+    /// Reads exactly one server response packet. Protocol scenarios own the
+    /// packet sequence and response framing checks above this raw boundary.
+    pub fn read_packet(&mut self, operation: &str) -> Result<MysqlPacket> {
+        let (sequence, payload) =
+            read_wire_packet(&mut self.stream).with_context(|| format!("read {operation}"))?;
+        Ok(MysqlPacket { sequence, payload })
+    }
+
     /// Reads the terminal failure of a one-column query after a possible
     /// metadata prefix. A protocol error may occur before schema start, or
     /// after the schema was made visible, but rows and success EOF are never
     /// accepted on this path.
     pub fn read_timeout_query_error(&mut self) -> Result<String> {
-        let (_, first) =
-            read_packet(&mut self.stream).context("read timed query first response")?;
-        if first.first().copied() == Some(0xff) {
-            return mysql_error_text(&first);
+        let first = self.read_packet("timed query first response")?;
+        if first.is_error() {
+            return mysql_error_text(first.payload());
         }
 
         ensure!(
-            first == [1],
-            "expected timed query to begin with one-column metadata or ERR, got payload={first:?}"
+            first.payload() == [1],
+            "expected timed query to begin with one-column metadata or ERR, got payload={:?}",
+            first.payload()
         );
-        let (_, column) =
-            read_packet(&mut self.stream).context("read timed query column metadata")?;
+        let column = self.read_packet("timed query column metadata")?;
         ensure!(
-            !is_mysql_result_terminator(&column) && column.first().copied() != Some(0xff),
-            "expected timed query column definition, got payload={column:?}"
+            !column.is_result_terminator() && !column.is_error(),
+            "expected timed query column definition, got payload={:?}",
+            column.payload()
         );
-        let (_, metadata_end) =
-            read_packet(&mut self.stream).context("read timed query metadata terminator")?;
+        let metadata_end = self.read_packet("timed query metadata terminator")?;
         ensure!(
-            is_mysql_result_terminator(&metadata_end),
-            "expected timed query metadata terminator, got payload={metadata_end:?}"
+            metadata_end.is_result_terminator(),
+            "expected timed query metadata terminator, got payload={:?}",
+            metadata_end.payload()
         );
-        let (_, terminal) =
-            read_packet(&mut self.stream).context("read timed query terminal error")?;
-        mysql_error_text(&terminal)
+        let terminal = self.read_packet("timed query terminal error")?;
+        mysql_error_text(terminal.payload())
     }
 
     pub fn shutdown(self) -> Result<()> {
@@ -176,7 +206,7 @@ fn is_mysql_result_terminator(payload: &[u8]) -> bool {
         || payload.first().copied() == Some(0)
 }
 
-fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
+fn read_wire_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)

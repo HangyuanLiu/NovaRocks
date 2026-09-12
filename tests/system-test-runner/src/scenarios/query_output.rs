@@ -1,0 +1,131 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::actors::mysql_stream::{MysqlPacket, MysqlStream};
+use crate::scenario::{Scenario, ScenarioContext};
+use anyhow::{Context, Result, ensure};
+use novarocks_cluster_harness::ServerHandle;
+use std::time::Duration;
+
+const REQUIRED_BACKENDS: usize = 3;
+const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
+const TWO_ROW_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
+
+pub fn scenarios() -> Vec<Box<dyn Scenario>> {
+    vec![Box::new(SchemaOnce)]
+}
+
+/// A public MySQL result must have exactly one schema prefix, then its rows,
+/// then one terminal success packet. The raw actor is intentional: a normal
+/// client library drains these packets before a scenario can prove their wire
+/// order or detect an accidental second schema prefix.
+struct SchemaOnce;
+
+impl Scenario for SchemaOnce {
+    fn name(&self) -> &'static str {
+        "query-output/schema-once"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = context
+            .handle()
+            .query_execution_resource_snapshot()?
+            .context("cross-process harness did not expose the query-resource oracle")?;
+        context.action("captured query-output resource baseline");
+
+        let timeout = context
+            .remaining("open raw MySQL query-output client")?
+            .min(IO_TIMEOUT_CAP);
+        let mut stream = MysqlStream::query(
+            context.mysql_user(),
+            context.mysql_port(),
+            TWO_ROW_QUERY,
+            timeout,
+        )?;
+        context.action("sent one-column two-row query through raw public MySQL stream");
+
+        let packets = [
+            stream.read_packet("result column count")?,
+            stream.read_packet("result column definition")?,
+            stream.read_packet("result metadata terminator")?,
+            stream.read_packet("first result row")?,
+            stream.read_packet("second result row")?,
+            stream.read_packet("result terminal")?,
+        ];
+        assert_packet_sequence(&packets)?;
+        ensure!(
+            packets[0].payload() == [1],
+            "expected exactly one result column, got payload={:?}",
+            packets[0].payload()
+        );
+        ensure_normal_packet(&packets[1], "single column definition")?;
+        ensure!(
+            packets[2].is_result_terminator(),
+            "expected one metadata terminator, got payload={:?}",
+            packets[2].payload()
+        );
+        ensure_normal_packet(&packets[3], "first result row")?;
+        ensure_normal_packet(&packets[4], "second result row")?;
+        ensure!(
+            packets[5].is_result_terminator(),
+            "expected one success terminal packet, got payload={:?}",
+            packets[5].payload()
+        );
+        context.action("verified one schema prefix, two rows, and one terminal success packet");
+
+        let deadline = context.deadline();
+        context
+            .handle()
+            .await_query_execution_resource_convergence(&baseline, deadline)
+            .context("await query-output resource convergence")?;
+        context.action("verified query-output resources converged after terminal packet");
+        Ok(())
+    }
+}
+
+fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
+    let actual = context.handle().be_count();
+    ensure!(
+        actual == REQUIRED_BACKENDS,
+        "{} requires native 1FE+3BE, but the runner launched 1FE+{actual}BE",
+        context.name()
+    );
+    context.action("verified native 1FE+3BE topology");
+    Ok(())
+}
+
+fn ensure_normal_packet(packet: &MysqlPacket, label: &str) -> Result<()> {
+    ensure!(
+        !packet.is_error() && !packet.is_result_terminator(),
+        "expected {label}, got payload={:?}",
+        packet.payload()
+    );
+    Ok(())
+}
+
+fn assert_packet_sequence(packets: &[MysqlPacket]) -> Result<()> {
+    for pair in packets.windows(2) {
+        ensure!(
+            pair[1].sequence() == pair[0].sequence().wrapping_add(1),
+            "MySQL result packet sequence is not contiguous: {} then {}",
+            pair[0].sequence(),
+            pair[1].sequence()
+        );
+    }
+    Ok(())
+}
