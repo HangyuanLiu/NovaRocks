@@ -21,14 +21,358 @@
 //! receives already-lowered children and has no Backend runtime, task-context,
 //! Connector, or runtime-filter authority.
 
-use novarocks_execution::exec::chunk::{ChunkSchemaRef, SlotLayout};
+use std::sync::Arc;
+
+use arrow::array::{Array, ArrayRef};
+use arrow::compute::concat;
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
+use novarocks_execution::exec::chunk::{
+    Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema, SlotLayout,
+};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, cast_array_to_target};
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use novarocks_execution::exec::node::limit::LimitNode;
+use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
+use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
-use novarocks_proto_models::plan;
+use novarocks_proto_models::{common as proto_common, expr, plan};
+use novarocks_types::SlotId;
 
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
+use crate::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
+use crate::fragment_layout::decode_output_layout;
+
+pub fn decode_zero_input_expression(
+    e: &expr::Expr,
+    path: FieldPath,
+    arena: &mut ExprArena,
+) -> Result<ExprId, NativeFragmentDecodeError> {
+    decode_expr_at(e, path, arena, &NativeExpressionInputLayout::default())
+        .map_err(|e| NativeFragmentDecodeError::from(e.into_protocol()))
+}
+
+/// Lowers a zero-input Native `ValuesNode` into an immutable Execution chunk.
+pub fn lower_values_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    values: &plan::ValuesNode,
+    path: FieldPath,
+    physical_output_path: FieldPath,
+    _children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let columns = if values.columns.is_empty() {
+        &physical.output_columns
+    } else {
+        &values.columns
+    };
+    let columns_path = if values.columns.is_empty() {
+        physical_output_path
+    } else {
+        path.clone().field("columns")
+    };
+    let output_layout =
+        decode_output_layout(columns, columns_path).map_err(NativeFragmentDecodeError::from)?;
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    let chunk = materialize_values_chunk(
+        &values.rows,
+        columns,
+        output_schema.clone(),
+        arena,
+        path.clone(),
+    )?;
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Values(ValuesNode {
+                chunk,
+                node_id: node.node_id,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+/// Materializes immutable values using only the native wire expression decoder.
+pub fn materialize_values_chunk(
+    rows: &[plan::ExprList],
+    columns: &[proto_common::OutputColumn],
+    output_schema: ChunkSchemaRef,
+    arena: &mut ExprArena,
+    path: FieldPath,
+) -> Result<Chunk, NativeFragmentDecodeError> {
+    if columns.is_empty() {
+        return NativeFragmentDecodeError::map_invalid(
+            path.field("rows"),
+            empty_chunk_with_row_count(rows.len().max(1)),
+        );
+    }
+    if rows.is_empty() {
+        let batch = RecordBatch::new_empty(output_schema.arrow_schema_ref());
+        return NativeFragmentDecodeError::map_invalid(
+            path.field("rows"),
+            Chunk::try_new_with_chunk_schema(batch, output_schema),
+        );
+    }
+    let column_count = columns.len();
+    if output_schema.slots().len() != column_count {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("columns"),
+            format!(
+                "ValuesNode output schema width mismatch: columns={}, schema_slots={}",
+                column_count,
+                output_schema.slots().len()
+            ),
+        ));
+    }
+    let target_types = output_schema
+        .slots()
+        .iter()
+        .map(|slot| slot.data_type().clone())
+        .collect::<Vec<_>>();
+    let mut arrays_by_column = vec![Vec::<ArrayRef>::with_capacity(rows.len()); column_count];
+    let one_row = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("rows"),
+        empty_chunk_with_row_count(1),
+    )?;
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row.values.len() != column_count {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone().field("rows").index(row_idx).field("values"),
+                format!(
+                    "ValuesNode row {row_idx} width mismatch: expected {column_count}, got {}",
+                    row.values.len()
+                ),
+            ));
+        }
+        for (col_idx, expr) in row.values.iter().enumerate() {
+            let expr_path = path
+                .clone()
+                .field("rows")
+                .index(row_idx)
+                .field("values")
+                .index(col_idx);
+            let expr_id = decode_zero_input_expression(expr, expr_path.clone(), arena)?;
+            let array = arena
+                .eval(expr_id, &one_row)
+                .map_err(|err| NativeFragmentDecodeError::invalid_value(expr_path.clone(), err))?;
+            if array.len() != 1 {
+                return Err(NativeFragmentDecodeError::inconsistent(
+                    expr_path.clone(),
+                    format!(
+                        "ValuesNode row {row_idx} column {col_idx} evaluated to {} rows, expected 1",
+                        array.len()
+                    ),
+                ));
+            }
+            let array = NativeFragmentDecodeError::map_invalid(
+                expr_path,
+                normalize_values_array(row_idx, col_idx, array, &target_types[col_idx]),
+            )?;
+            arrays_by_column[col_idx].push(array);
+        }
+    }
+
+    let columns = arrays_by_column
+        .into_iter()
+        .enumerate()
+        .map(|(col_idx, parts)| {
+            let refs = parts
+                .iter()
+                .map(|part| part.as_ref() as &dyn Array)
+                .collect::<Vec<_>>();
+            concat(&refs).map_err(|err| format!("ValuesNode column {col_idx} concat failed: {err}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| NativeFragmentDecodeError::invalid_value(path.clone().field("rows"), err))?;
+    NativeFragmentDecodeError::map_invalid(
+        path.field("rows"),
+        Chunk::try_new_with_columns(output_schema, columns),
+    )
+}
+
+/// Lowers a Native `GenerateSeriesNode` whose synthetic input is a Values chunk.
+pub fn lower_generate_series_node(
+    node: &plan::DistributedNode,
+    generate_series: &plan::GenerateSeriesNode,
+    path: FieldPath,
+    _children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    if generate_series.step == 0 {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("step"),
+            "GenerateSeriesNode step must not be zero",
+        ));
+    }
+    let param_slots = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("output_column_id"),
+        generate_series_param_slots(generate_series.output_column_id),
+    )?;
+    let param_columns = vec![
+        bigint_output_column(param_slots[0].as_u32(), "generate_series_start", false),
+        bigint_output_column(param_slots[1].as_u32(), "generate_series_end", false),
+        bigint_output_column(param_slots[2].as_u32(), "generate_series_step", false),
+    ];
+    let input_schema = int64_chunk_schema(
+        &[
+            (param_slots[0], "generate_series_start"),
+            (param_slots[1], "generate_series_end"),
+            (param_slots[2], "generate_series_step"),
+        ],
+        path.clone().field("output_column_id"),
+    )?;
+    let rows = vec![plan::ExprList {
+        values: vec![
+            int64_literal_expr(generate_series.start),
+            int64_literal_expr(generate_series.end),
+            int64_literal_expr(generate_series.step),
+        ],
+    }];
+    let input_chunk =
+        materialize_values_chunk(&rows, &param_columns, input_schema, arena, path.clone())?;
+
+    let output_columns = [bigint_output_column(
+        generate_series.output_column_id,
+        if generate_series.column_name.is_empty() {
+            "generate_series"
+        } else {
+            &generate_series.column_name
+        },
+        false,
+    )];
+    let output_slot = SlotId::new(generate_series.output_column_id);
+    let layout = SlotLayout::for_slots([output_slot]);
+    let output_schema = int64_chunk_schema(
+        &[(output_slot, output_columns[0].name.as_str())],
+        path.clone().field("output_column_id"),
+    )?;
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::TableFunction(TableFunctionNode {
+                input: Box::new(ExecNode {
+                    kind: ExecNodeKind::Values(ValuesNode {
+                        chunk: input_chunk,
+                        node_id: node.node_id,
+                    }),
+                }),
+                node_id: node.node_id,
+                function_name: "generate_series".to_string(),
+                param_slots: param_slots.to_vec(),
+                outer_slots: Vec::new(),
+                fn_result_slots: vec![SlotId::new(generate_series.output_column_id)],
+                fn_result_required: true,
+                is_left_join: false,
+                param_types: vec![DataType::Int64, DataType::Int64, DataType::Int64],
+                ret_types: vec![DataType::Int64],
+                output_chunk_schema: output_schema.clone(),
+                output_slot_sources: vec![TableFunctionOutputSlot::Result { index: 0 }],
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn normalize_values_array(
+    row_idx: usize,
+    col_idx: usize,
+    array: ArrayRef,
+    target_type: &DataType,
+) -> Result<ArrayRef, String> {
+    if array.data_type() == target_type || matches!(target_type, DataType::Null) {
+        return Ok(array);
+    }
+    cast_array_to_target(&array, target_type).map_err(|err| {
+        format!(
+            "ValuesNode row {row_idx} column {col_idx} cast from {:?} to {:?} failed: {err}",
+            array.data_type(),
+            target_type
+        )
+    })
+}
+
+fn empty_chunk_with_row_count(row_count: usize) -> Result<Chunk, String> {
+    let schema = Arc::new(Schema::empty());
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    let batch = RecordBatch::try_new_with_options(schema, Vec::new(), &options)
+        .map_err(|err| format!("build empty values input chunk failed: {err}"))?;
+    Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::empty()))
+}
+
+fn int64_chunk_schema(
+    slots: &[(SlotId, &str)],
+    source_path: FieldPath,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
+    let slots = slots
+        .iter()
+        .map(|(slot_id, name)| {
+            ChunkSlotSchema::try_new_with_field(
+                *slot_id,
+                Field::new(*name, DataType::Int64, false),
+                None,
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let slots = NativeFragmentDecodeError::map_invalid(source_path.clone(), slots)?;
+    NativeFragmentDecodeError::map_invalid(source_path, ChunkSchema::try_new(slots)).map(Arc::new)
+}
+
+fn generate_series_param_slots(output_column_id: u32) -> Result<[SlotId; 3], String> {
+    let mut slot = u32::MAX;
+    let mut slots = Vec::with_capacity(3);
+    while slots.len() < 3 {
+        if slot != output_column_id {
+            slots.push(SlotId::new(slot));
+        }
+        slot = slot
+            .checked_sub(1)
+            .ok_or_else(|| "GenerateSeriesNode could not allocate internal slots".to_string())?;
+    }
+    Ok([slots[0], slots[1], slots[2]])
+}
+
+fn bigint_output_column(column_id: u32, name: &str, nullable: bool) -> proto_common::OutputColumn {
+    proto_common::OutputColumn {
+        column_id,
+        name: name.to_string(),
+        r#type: Some(bigint_type_desc()),
+        nullable,
+        is_internal: false,
+    }
+}
+
+fn bigint_type_desc() -> proto_common::TypeDesc {
+    proto_common::TypeDesc {
+        kind: Some(proto_common::type_desc::Kind::Scalar(
+            proto_common::ScalarType {
+                r#type: proto_common::PrimitiveType::Bigint as i32,
+                len: None,
+                precision: None,
+                scale: None,
+                time_unit: None,
+                time_zone: None,
+            },
+        )),
+    }
+}
+
+fn int64_literal_expr(value: i64) -> expr::Expr {
+    expr::Expr {
+        r#type: Some(bigint_type_desc()),
+        nullable: false,
+        kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+            value: Some(proto_common::LiteralValue {
+                value: Some(proto_common::literal_value::Value::IntValue(value)),
+            }),
+        })),
+    }
+}
 
 /// One fully lowered physical node and its immutable output contract.
 #[derive(Clone, Debug)]
@@ -538,5 +882,185 @@ mod tests {
                 .to_string(),
             "plan_fragment.root.payload.physical.assert_one_row.group_key_column_ids[0]"
         );
+    }
+}
+
+#[cfg(test)]
+mod values_and_generate_series_tests {
+    use arrow::array::{Array, Int64Array};
+    use arrow::datatypes::DataType;
+    use novarocks_plan_codec::encode_native_type as encode_type;
+
+    use super::*;
+
+    fn type_desc(data_type: &DataType) -> proto_common::TypeDesc {
+        encode_type(data_type).expect("encode type")
+    }
+
+    fn output_column(
+        column_id: u32,
+        name: &str,
+        data_type: DataType,
+        nullable: bool,
+    ) -> proto_common::OutputColumn {
+        proto_common::OutputColumn {
+            column_id,
+            name: name.to_string(),
+            r#type: Some(type_desc(&data_type)),
+            nullable,
+            is_internal: false,
+        }
+    }
+
+    fn int_literal(value: i64) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Int64)),
+            nullable: false,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(proto_common::LiteralValue {
+                    value: Some(proto_common::literal_value::Value::IntValue(value)),
+                }),
+            })),
+        }
+    }
+
+    fn null_literal() -> expr::Expr {
+        expr::Expr {
+            r#type: Some(type_desc(&DataType::Null)),
+            nullable: true,
+            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
+                value: Some(proto_common::LiteralValue {
+                    value: Some(proto_common::literal_value::Value::NullValue(true)),
+                }),
+            })),
+        }
+    }
+
+    fn node(node_id: i32) -> plan::DistributedNode {
+        plan::DistributedNode {
+            node_id,
+            limit: -1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn values_materialize_through_adapter_owned_zero_input_decoder() {
+        let columns = vec![output_column(1, "id", DataType::Int64, true)];
+        let physical = plan::PlanNode {
+            output_columns: columns.clone(),
+            ..Default::default()
+        };
+        let values = plan::ValuesNode {
+            rows: vec![
+                plan::ExprList {
+                    values: vec![int_literal(10)],
+                },
+                plan::ExprList {
+                    values: vec![null_literal()],
+                },
+            ],
+            columns: columns.clone(),
+        };
+        let mut arena = ExprArena::default();
+        let lowered = lower_values_node(
+            &node(10),
+            &physical,
+            &values,
+            FieldPath::root("plan_fragment").field("values"),
+            FieldPath::root("plan_fragment").field("output_columns"),
+            Vec::new(),
+            &mut arena,
+        )
+        .expect("lower values");
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 2);
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+        let column = values
+            .chunk
+            .column_by_slot_id(SlotId::new(1))
+            .expect("id column");
+        assert_eq!(column.data_type(), &DataType::Int64);
+        let column = column.as_any().downcast_ref::<Int64Array>().expect("int64");
+        assert_eq!(column.value(0), 10);
+        assert!(column.is_null(1));
+    }
+
+    #[test]
+    fn zero_column_values_keep_seed_row_semantics() {
+        let physical = plan::PlanNode::default();
+        let values = plan::ValuesNode {
+            rows: Vec::new(),
+            columns: Vec::new(),
+        };
+        let mut arena = ExprArena::default();
+        let lowered = lower_values_node(
+            &node(10),
+            &physical,
+            &values,
+            FieldPath::root("plan_fragment").field("values"),
+            FieldPath::root("plan_fragment").field("output_columns"),
+            Vec::new(),
+            &mut arena,
+        )
+        .expect("lower empty zero-column values");
+        let ExecNodeKind::Values(values) = lowered.node.kind else {
+            panic!("expected Values");
+        };
+        assert_eq!(values.chunk.len(), 1);
+        assert!(lowered.layout.order().is_empty());
+        assert!(lowered.output_schema.slot_ids().is_empty());
+    }
+
+    #[test]
+    fn generate_series_uses_adapter_owned_synthetic_values() {
+        let mut arena = ExprArena::default();
+        let lowered = lower_generate_series_node(
+            &node(20),
+            &plan::GenerateSeriesNode {
+                start: 1,
+                end: 5,
+                step: 2,
+                column_name: "x".to_string(),
+                alias: None,
+                output_column_id: 9,
+            },
+            FieldPath::root("plan_fragment").field("generate_series"),
+            Vec::new(),
+            &mut arena,
+        )
+        .expect("lower generate series");
+        let ExecNodeKind::TableFunction(table_function) = lowered.node.kind else {
+            panic!("expected TableFunction");
+        };
+        assert_eq!(table_function.function_name, "generate_series");
+        assert_eq!(lowered.layout.order(), &[SlotId::new(9)]);
+        let ExecNodeKind::Values(input) = table_function.input.kind else {
+            panic!("expected synthetic Values input");
+        };
+        for (slot, expected) in table_function.param_slots.iter().zip([1, 5, 2]) {
+            let column = input
+                .chunk
+                .column_by_slot_id(*slot)
+                .expect("parameter column");
+            let values = column.as_any().downcast_ref::<Int64Array>().expect("int64");
+            assert_eq!(values.value(0), expected);
+        }
+
+        let err = lower_generate_series_node(
+            &node(20),
+            &plan::GenerateSeriesNode {
+                step: 0,
+                output_column_id: 9,
+                ..Default::default()
+            },
+            FieldPath::root("plan_fragment").field("generate_series"),
+            Vec::new(),
+            &mut arena,
+        )
+        .expect_err("zero step must fail");
+        assert!(err.to_string().contains("step must not be zero"));
     }
 }

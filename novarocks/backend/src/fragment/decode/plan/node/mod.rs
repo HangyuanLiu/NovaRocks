@@ -22,7 +22,6 @@ mod change_event_expand;
 mod common;
 mod exchange;
 mod filter;
-mod generate_series;
 mod hash_join;
 mod nestloop_join;
 mod project;
@@ -34,7 +33,6 @@ mod table_function;
 mod table_write;
 mod topn;
 mod unpivot;
-mod values;
 mod window;
 
 use self::common::*;
@@ -63,7 +61,8 @@ use novarocks_execution::exec::node::runtime_filter::{
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
-    NativeLoweredPlanNode, lower_assert_one_row_node, lower_limit_node, parse_distributed_limit,
+    NativeLoweredPlanNode, lower_assert_one_row_node, lower_generate_series_node, lower_limit_node,
+    lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1542,7 +1541,7 @@ fn lower_physical_node(
         )
     })?;
     match kind {
-        plan::plan_node::Kind::Values(values) => values::lower_values_node(
+        plan::plan_node::Kind::Values(values) => lower_values_node(
             node,
             physical,
             values,
@@ -1550,7 +1549,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Project(project) => project::lower_project_node(
             node,
@@ -1664,16 +1662,13 @@ fn lower_physical_node(
         plan::plan_node::Kind::Repeat(repeat) => {
             repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }
-        plan::plan_node::Kind::GenerateSeries(generate_series) => {
-            generate_series::lower_generate_series_node(
-                node,
-                generate_series,
-                path.clone().field("generate_series"),
-                children,
-                arena,
-                ctx,
-            )
-        }
+        plan::plan_node::Kind::GenerateSeries(generate_series) => lower_generate_series_node(
+            node,
+            generate_series,
+            path.clone().field("generate_series"),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::TableFunction(table_function) => {
             table_function::lower_table_function_node(
                 node,
