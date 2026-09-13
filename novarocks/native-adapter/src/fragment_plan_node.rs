@@ -33,6 +33,7 @@ use novarocks_execution::exec::chunk::{
 };
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, cast_array_to_target};
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
+use novarocks_execution::exec::node::filter::FilterNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::repeat::RepeatNode;
@@ -731,6 +732,36 @@ fn normalize_set_op_inputs_by_position(
         }).collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         Ok(ExecNode { kind: ExecNodeKind::Project(ProjectNode { input: Box::new(child.node), node_id, is_subordinate: true, exprs, expr_slot_ids: output_slots.clone(), expr_slot_schemas: Some(output_slot_schemas.clone()), output_indices: None, output_chunk_schema: output_schema.clone() }) })
     }).collect()
+}
+
+pub fn lower_filter_node(
+    node: &plan::DistributedNode,
+    filter: &plan::FilterNode,
+    path: FieldPath,
+    mut children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let child = children.pop().expect("validated FilterNode child");
+    let predicate = filter.predicate.as_ref().ok_or_else(|| {
+        NativeFragmentDecodeError::missing(
+            path.clone().field("predicate"),
+            "native FilterNode requires predicate",
+        )
+    })?;
+    let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
+    let predicate = decode_expr_at(predicate, path.field("predicate"), arena, &input)
+        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Filter(FilterNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                predicate,
+            }),
+        },
+        layout: child.layout,
+        output_schema: child.output_schema,
+    })
 }
 
 /// Validates a Native `RedistributeNode` while preserving its immutable child program.

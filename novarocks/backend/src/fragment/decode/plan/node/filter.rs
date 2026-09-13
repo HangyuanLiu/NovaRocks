@@ -17,51 +17,14 @@
 
 //! Fragment filter-node decoding.
 
-use super::{DecodedNode, NativePlanDecodeContext};
-use novarocks_execution::exec::expr::ExprArena;
-use novarocks_execution::exec::node::filter::FilterNode;
-use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
-use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::plan;
-
-pub(super) fn lower_filter_node(
-    node: &plan::DistributedNode,
-    filter: &plan::FilterNode,
-    path: FieldPath,
-    mut children: Vec<DecodedNode>,
-    arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    let child = children.pop().expect("child");
-    let predicate = filter.predicate.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            path.clone().field("predicate"),
-            "native FilterNode requires predicate",
-        )
-    })?;
-    let predicate =
-        ctx.decode_expression(predicate, path.field("predicate"), arena, &child.layout)?;
-    Ok(DecodedNode {
-        node: ExecNode {
-            kind: ExecNodeKind::Filter(FilterNode {
-                input: Box::new(child.node),
-                node_id: node.node_id,
-                predicate,
-            }),
-        },
-        layout: child.layout,
-        output_schema: child.output_schema,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use arrow::datatypes::DataType;
 
+    use super::super::DecodedNode;
     use super::super::{NativePlanDecodeContext, decode_node};
-    use super::*;
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;

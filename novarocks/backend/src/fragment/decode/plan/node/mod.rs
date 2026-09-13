@@ -21,6 +21,7 @@ mod aggregate;
 mod change_event_expand;
 mod common;
 mod exchange;
+#[cfg(test)]
 mod filter;
 mod hash_join;
 mod nestloop_join;
@@ -58,9 +59,9 @@ use novarocks_execution::exec::node::runtime_filter::{
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
-    NativeLoweredPlanNode, lower_assert_one_row_node, lower_generate_series_node, lower_limit_node,
-    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_values_node,
-    parse_distributed_limit,
+    NativeLoweredPlanNode, lower_assert_one_row_node, lower_filter_node,
+    lower_generate_series_node, lower_limit_node, lower_redistribute_node, lower_repeat_node,
+    lower_set_op_node, lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1566,14 +1567,9 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
-        plan::plan_node::Kind::Filter(filter) => filter::lower_filter_node(
-            node,
-            filter,
-            path.clone().field("filter"),
-            children,
-            arena,
-            ctx,
-        ),
+        plan::plan_node::Kind::Filter(filter) => {
+            lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
+        }
         plan::plan_node::Kind::Limit(limit) => lower_limit_node(
             node,
             limit,
