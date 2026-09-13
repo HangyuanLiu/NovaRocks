@@ -83,6 +83,21 @@ pub fn decode_instance_params_with_query_options(
     decode_instance_params_impl(src, Some(query_options))
 }
 
+/// Decodes one native scan-range payload outside a complete instance request.
+///
+/// This is used by role-local fixtures which construct otherwise validated
+/// fragment inputs. Production submission decoding uses
+/// [`decode_instance_params`] so the map key and range index remain in the
+/// protocol error path.
+pub fn decode_scan_range_params(
+    src: &proto::ScanRangeParams,
+) -> Result<ScanRangeParams, ProtocolError> {
+    decode_scan_range_params_at(
+        src,
+        FieldPath::root("instance_params").field("per_node_scan_ranges"),
+    )
+}
+
 fn decode_instance_params_impl(
     src: &proto::InstanceParams,
     context_query_options: Option<QueryOptions>,

@@ -33,6 +33,8 @@ use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentI
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_native_adapter::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
+#[cfg(test)]
+use novarocks_native_adapter::fragment_instance::decode_scan_range_params;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
@@ -665,7 +667,7 @@ impl NativePlanDecodeContext {
     ) -> Self {
         let ranges = ranges
             .iter()
-            .map(crate::fragment::decode::plan::instance::decode_scan_range_params)
+            .map(decode_scan_range_params)
             .collect::<Result<Vec<_>, _>>()
             .expect("decode test scan ranges");
         self.raw_scan_ranges
