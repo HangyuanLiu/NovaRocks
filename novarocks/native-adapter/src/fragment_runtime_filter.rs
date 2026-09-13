@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment-owned runtime-filter contract DTO decoding.
+//! Native fragment runtime-filter contract projection.
 
 use std::collections::BTreeSet;
 
@@ -23,7 +23,7 @@ use novarocks_execution::exec::fragment::program::{RuntimeFilterContract, Runtim
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
-pub(crate) fn decode_runtime_filter_contract(
+pub fn decode_runtime_filter_contract(
     fragment: &plan::PlanFragment,
 ) -> Result<RuntimeFilterContract, ProtocolError> {
     let path = FieldPath::root("plan_fragment").field("runtime_filter_bindings");
