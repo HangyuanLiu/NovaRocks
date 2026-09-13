@@ -33,12 +33,9 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::fragment::decode::envelope::{require_root, require_sink};
 use crate::fragment::decode::exchange::decode_exchange_contracts;
 use crate::fragment::decode::instance::NativeFragmentInstanceInput;
 use crate::fragment::decode::runtime_filter::decode_runtime_filter_contract;
-use crate::fragment::decode::scan_contract::decode_scan_source_contracts;
-use crate::fragment::decode::sink_assignment::decode_fragment_sink_assignment;
 use crate::fragment::decode::submission_validation::{
     validate_fragment_expressions, validate_node_required_fields,
 };
@@ -48,6 +45,9 @@ use super::error::NativeFragmentDecodeError;
 use super::node::decode_node_with_runtime_filters;
 use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
 use super::sink::decode_fragment_sink_program_with_context;
+use novarocks_native_adapter::fragment_submission::{
+    decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
+};
 
 pub(crate) struct DecodedNativeFragment {
     submission: FragmentSubmission,
