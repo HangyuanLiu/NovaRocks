@@ -69,9 +69,6 @@ use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
 };
-use crate::statistics_jobs::service::{
-    FrontendStatisticsApplicationPort, RootAdmissionStatisticsJobSource,
-};
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
@@ -86,7 +83,6 @@ use novarocks_catalog_application::{
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_query_application::query_control::QueryApplicationControl;
-use novarocks_statistics_application::StatisticsJobService;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -500,7 +496,6 @@ pub struct FrontendApplicationHost {
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
     dml_service: Option<Arc<DmlService>>,
-    statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
     catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
@@ -1008,7 +1003,6 @@ impl FrontendApplicationHost {
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
             dml_service: None,
-            statistics_application_port: None,
             catalog_application_port: None,
             abandoned_attempt_sweeper: None,
             catalog_controller: None,
@@ -1295,38 +1289,6 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
-        let statistics_connector_control = Arc::clone(&host.connector_control)
-            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
-        let statistics_job_service = StatisticsJobService::new();
-        let statistics_application_port = Arc::new(FrontendStatisticsApplicationPort::new(
-            statistics_job_service,
-            Arc::new(
-                crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
-                    Arc::clone(&statistics_connector_control),
-                ),
-            ),
-            Arc::new(RootAdmissionStatisticsJobSource::new(
-                host.workload_root_admission(),
-            )),
-            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
-                &statistics_connector_control,
-            )),
-            crate::capabilities::statistics_three_phase_attempt_executor(
-                crate::capabilities::StatisticsAttemptExecutorPorts::new(
-                    host.execution_role(),
-                    statistics_connector_control,
-                    host.typed_connector_control(),
-                    host.backend_topology_port(),
-                    host.query_execution_service(),
-                    host.function_catalog(),
-                    host.lake_publication_runtime_policy()
-                        .max_attempt_duration(),
-                ),
-            ),
-            tokio::runtime::Handle::current(),
-        ));
-        host.statistics_application_port = Some(statistics_application_port);
-
         Ok(host)
     }
 
@@ -1343,14 +1305,6 @@ impl FrontendApplicationHost {
             self.dml_service
                 .as_ref()
                 .expect("frontend DML service is installed before host open returns"),
-        )
-    }
-
-    pub fn statistics_application_port(&self) -> Arc<FrontendStatisticsApplicationPort> {
-        Arc::clone(
-            self.statistics_application_port
-                .as_ref()
-                .expect("statistics application port is installed before host open returns"),
         )
     }
 
@@ -1703,9 +1657,6 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
-        if let Some(port) = self.statistics_application_port.as_ref() {
-            port.request_worker_stop_for_process_exit();
-        }
         if let Some(topology) = self.topology.as_ref() {
             if let Err(error) = topology.request_heartbeat_stop_for_process_exit() {
                 tracing::error!(
@@ -1777,24 +1728,7 @@ impl FrontendApplicationHost {
     async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
-        // Role products stop their MV worker before Server releases this Host.
-        // This Host still owns only the services it constructed directly.
-        let statistics_worker_error = match self.statistics_application_port.as_ref() {
-            Some(port) => port
-                .shutdown_worker_until(deadline)
-                .await
-                .err()
-                .map(|error| format!("shutdown statistics analyze worker failed: {error}")),
-            None => None,
-        };
-        let preserve_background_owners = statistics_worker_error.is_some();
-        let mut primary_error = statistics_worker_error;
-        if preserve_background_owners {
-            // The Statistics product still owns request/topology/StateStore
-            // references. Preserve that owner so a caller sees the explicit
-            // shutdown failure rather than pretending teardown completed.
-            return Err(primary_error.expect("the statistics shutdown error is retained"));
-        }
+        let mut primary_error: Option<String> = None;
         if let Err(error) = self.execution_runtime_owner.shutdown_until(deadline).await {
             if !self.execution_runtime_owner.is_shutdown_complete() {
                 return match primary_error {
@@ -1824,9 +1758,6 @@ impl FrontendApplicationHost {
         }
         self.topology.take();
         self.dml_service.take();
-        // Process-local job services do not own StateStore job records. Release
-        // their workers before closing the host's remaining durable owners.
-        self.statistics_application_port.take();
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.

@@ -198,15 +198,6 @@ fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
 }
 
 #[tokio::test]
-async fn host_exposes_one_statistics_application_port_identity() {
-    let mut host = open_host(Some(state_store_input())).await.expect("host");
-    let first = host.statistics_application_port();
-    let second = host.statistics_application_port();
-    assert!(Arc::ptr_eq(&first, &second));
-    host.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
 async fn host_exposes_one_dml_service_identity() {
     let mut host = open_host(Some(state_store_input())).await.expect("host");
     let first = host.dml_service();

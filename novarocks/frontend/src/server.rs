@@ -180,6 +180,14 @@ impl FrontendRoleProducts {
         &self,
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
+        self.statistics_application
+            .shutdown_worker_until(deadline)
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "shutdown statistics analyze worker failed: {error}"
+                ))
+            })?;
         self.mv_service
             .shutdown_background_workers_until(deadline)
             .await
@@ -199,6 +207,8 @@ impl FrontendRoleProducts {
     }
 
     fn request_background_stop_for_process_exit(&self) {
+        self.statistics_application
+            .request_worker_stop_for_process_exit();
         self.mv_service.request_background_stop_for_process_exit();
         self.maintenance_service.request_shutdown_for_process_exit();
     }
@@ -246,7 +256,6 @@ async fn build_frontend_role_products(
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
     let view_service = host.view_service();
-    let statistics_application = host.statistics_application_port();
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
         Arc::new(
             crate::table_maintenance::FrontendTableMaintenanceService::open(
@@ -339,6 +348,39 @@ async fn build_frontend_role_products(
             topology: topology.clone(),
             runtime_policy: host.lake_publication_runtime_policy(),
         }),
+    );
+    let statistics_connector_control = Arc::clone(&connector_control)
+        as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
+    let statistics_application = Arc::new(
+        crate::statistics_jobs::service::FrontendStatisticsApplicationPort::new(
+            novarocks_statistics_application::StatisticsJobService::new(),
+            Arc::new(
+                crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
+                    Arc::clone(&statistics_connector_control),
+                ),
+            ),
+            Arc::new(
+                crate::statistics_jobs::service::RootAdmissionStatisticsJobSource::new(
+                    host.workload_root_admission(),
+                ),
+            ),
+            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
+                &statistics_connector_control,
+            )),
+            core_capabilities::statistics_three_phase_attempt_executor(
+                core_capabilities::StatisticsAttemptExecutorPorts::new(
+                    role,
+                    statistics_connector_control,
+                    Arc::clone(&typed_connector_control),
+                    topology.clone(),
+                    query_execution.clone(),
+                    Arc::clone(&function_catalog),
+                    host.lake_publication_runtime_policy()
+                        .max_attempt_duration(),
+                ),
+            ),
+            Handle::current(),
+        ),
     );
     Ok(FrontendRoleProducts {
         catalog_service,
@@ -531,8 +573,8 @@ async fn build_frontend_query_session_factory(
     Ok((session_factory, products))
 }
 
-/// Drives the product-owned MV runtime to convergence before the Host releases
-/// the coordinator, topology, or StateStore it reaches through immutable ports.
+/// Drives the product-owned runtimes to convergence before the Host releases
+/// the coordinator, topology, or StateStore they reach through immutable ports.
 async fn shutdown_frontend_role_products_to_convergence(
     products: &FrontendRoleProducts,
     attempt_timeout: Duration,
