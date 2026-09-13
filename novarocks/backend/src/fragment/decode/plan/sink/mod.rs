@@ -23,10 +23,7 @@ use novarocks_execution::exec::fragment::sink::{
     DataStreamSinkBranchProgram, FragmentSinkProgram, MultiCastDataStreamSinkProgram,
     SplitDataStreamSinkProgram, build_change_stream_split_predicate,
 };
-use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
-use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
-use novarocks_proto_models::novarocks as native_proto;
 use novarocks_proto_models::{common, expr, plan};
 use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
@@ -131,85 +128,6 @@ pub(crate) fn decode_fragment_sink_program_with_context(
         )
         .map(FragmentSinkProgram::SplitDataStream)
         .map_err(|error| error.into_native(path.field("change_stream_router"))),
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(crate) fn decode_fragment_sink_assignment(
-    sink: &plan::DataSink,
-    instance: &native_proto::InstanceParams,
-) -> Result<FragmentSinkAssignment, NativeFragmentDecodeError> {
-    let path = FieldPath::root("plan_fragment").field("sink");
-    let kind = sink.kind.as_ref().ok_or_else(|| {
-        NativeFragmentDecodeError::missing(
-            path.clone().field("kind"),
-            "native PlanFragment sink requires kind",
-        )
-    })?;
-    match kind {
-        plan::data_sink::Kind::DataStream(_) => Ok(FragmentSinkAssignment::StreamDestinations {
-            destinations: decode_instance_destinations(&instance.destinations)?,
-            sender_id: None,
-        }),
-        plan::data_sink::Kind::MultiCastDataStream(grouped) => {
-            let groups = grouped
-                .destinations
-                .iter()
-                .enumerate()
-                .map(|(index, group)| {
-                    decode_stream_destination_list(
-                        group,
-                        path.clone()
-                            .field("multi_cast_data_stream")
-                            .field("destinations")
-                            .index(index),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(FragmentSinkAssignment::DestinationGroups {
-                groups,
-                sender_id: None,
-            })
-        }
-        plan::data_sink::Kind::ChangeStreamRouter(router) => {
-            let groups = router
-                .routes
-                .iter()
-                .enumerate()
-                .map(|(index, branch)| {
-                    let group_path = path
-                        .clone()
-                        .field("change_stream_router")
-                        .field("routes")
-                        .index(index)
-                        .field("destinations");
-                    let group = branch.destinations.as_ref().ok_or_else(|| {
-                        NativeFragmentDecodeError::missing(
-                            group_path.clone(),
-                            "native change-stream branch requires destinations",
-                        )
-                    })?;
-                    decode_stream_destination_list(group, group_path)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(FragmentSinkAssignment::DestinationGroups {
-                groups,
-                sender_id: None,
-            })
-        }
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => {
-            if instance.destinations.is_empty() {
-                Ok(FragmentSinkAssignment::None)
-            } else {
-                Ok(FragmentSinkAssignment::StreamDestinations {
-                    destinations: decode_instance_destinations(&instance.destinations)?,
-                    sender_id: None,
-                })
-            }
-        }
     }
 }
 
@@ -629,92 +547,6 @@ fn decode_route_id(value: &[u8]) -> Result<[u8; 32], String> {
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-fn decode_stream_destination_list(
-    group: &plan::StreamDestinationList,
-    path: FieldPath,
-) -> Result<Vec<FragmentDestination>, NativeFragmentDecodeError> {
-    group
-        .destinations
-        .iter()
-        .enumerate()
-        .map(|(index, destination)| {
-            let destination_path = path.clone().field("destinations").index(index);
-            let finst_id = destination.finst_id.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    destination_path.clone().field("finst_id"),
-                    "native stream destination requires finst_id",
-                )
-            })?;
-            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    destination_path.clone().field("source_finst_id"),
-                    "native stream destination requires source_finst_id",
-                )
-            })?;
-            Ok(FragmentDestination::new(
-                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
-                RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
-                    NativeFragmentDecodeError::invalid_value(
-                        destination_path.field("endpoint"),
-                        error,
-                    )
-                })?,
-                novarocks_types::UniqueId::new(source_finst_id.hi, source_finst_id.lo),
-                destination.sender_ordinal,
-                destination.sender_count,
-            )
-            .map_err(|detail| NativeFragmentDecodeError::invalid_value(destination_path, detail))?)
-        })
-        .collect()
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-fn decode_instance_destinations(
-    destinations: &[native_proto::Destination],
-) -> Result<Vec<FragmentDestination>, NativeFragmentDecodeError> {
-    destinations
-        .iter()
-        .enumerate()
-        .map(|(index, destination)| {
-            let destination_path = FieldPath::root("instance_params")
-                .field("destinations")
-                .index(index);
-            let finst_id = destination.finst_id.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    destination_path.clone().field("finst_id"),
-                    "native Destination requires finst_id",
-                )
-            })?;
-            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    destination_path.clone().field("source_finst_id"),
-                    "native Destination requires source_finst_id",
-                )
-            })?;
-            Ok(FragmentDestination::new(
-                novarocks_types::UniqueId::new(finst_id.hi, finst_id.lo),
-                RuntimeEndpoint::parse(&destination.endpoint).map_err(|error| {
-                    NativeFragmentDecodeError::invalid_value(
-                        destination_path.field("endpoint"),
-                        error,
-                    )
-                })?,
-                novarocks_types::UniqueId::new(source_finst_id.hi, source_finst_id.lo),
-                destination.sender_ordinal,
-                destination.sender_count,
-            )
-            .map_err(|detail| NativeFragmentDecodeError::invalid_value(destination_path, detail))?)
-        })
-        .collect()
-}
-
 fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, String> {
     match plan::PartitionKind::try_from(kind)
         .map_err(|_| format!("unknown native PartitionKind value {kind}"))?
@@ -730,15 +562,14 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 
 #[cfg(test)]
 mod tests {
-    use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
     use novarocks_proto_codec::ProtocolErrorKind;
-    use novarocks_proto_models::{common, novarocks as proto, plan};
+    use novarocks_proto_models::{common, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
     use prost::Message;
 
     use super::{
-        decode_fragment_sink_assignment, decode_fragment_sink_program,
-        decode_fragment_sink_program_with_context, decode_row_mutation_effect,
+        decode_fragment_sink_program, decode_fragment_sink_program_with_context,
+        decode_row_mutation_effect,
     };
     use crate::fragment::decode::plan::context::NativePlanDecodeContext;
     use crate::fragment::decode::plan::layout::Layout;
@@ -765,93 +596,6 @@ mod tests {
             decode_row_mutation_effect(99),
             Err("unknown native RowMutationEffect value 99".to_string())
         );
-    }
-
-    #[test]
-    fn result_sink_without_destinations_has_no_assignment() {
-        let assignment = decode_fragment_sink_assignment(
-            &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::Result(true)),
-            },
-            &proto::InstanceParams::default(),
-        )
-        .expect("result sink assignment decodes");
-
-        assert!(matches!(assignment, FragmentSinkAssignment::None));
-    }
-
-    #[test]
-    fn stream_destination_missing_id_preserves_wire_error() {
-        let error = decode_fragment_sink_assignment(
-            &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(
-                    plan::DataStreamSink::default(),
-                )),
-            },
-            &proto::InstanceParams {
-                destinations: vec![proto::Destination::default()],
-                ..Default::default()
-            },
-        )
-        .expect_err("destination id is required");
-
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at instance_params.destinations[0].finst_id (missing field): native Destination requires finst_id"
-        );
-    }
-
-    fn plan_destination(id: i64) -> plan::StreamDestination {
-        plan::StreamDestination {
-            finst_id: Some(common::UniqueId { hi: 1, lo: id }),
-            endpoint: "127.0.0.1:8060".to_string(),
-            source_finst_id: Some(common::UniqueId { hi: 9, lo: 10 }),
-            sender_ordinal: 0,
-            sender_count: 1,
-        }
-    }
-
-    fn instance_destination(id: i64) -> proto::Destination {
-        proto::Destination {
-            finst_id: Some(common::UniqueId { hi: 2, lo: id }),
-            endpoint: "127.0.0.1:8061".to_string(),
-            source_finst_id: Some(common::UniqueId { hi: 9, lo: 10 }),
-            sender_ordinal: 0,
-            sender_count: 1,
-        }
-    }
-
-    fn assert_single_destination_group(assignment: FragmentSinkAssignment, expected_lo: i64) {
-        let FragmentSinkAssignment::DestinationGroups { groups, sender_id } = assignment else {
-            panic!("expected destination groups");
-        };
-        assert_eq!(sender_id, None);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].len(), 1);
-        assert_eq!(groups[0][0].finst_id().low(), expected_lo);
-    }
-
-    #[test]
-    fn multicast_assignment_ignores_redundant_flat_instance_destinations() {
-        let sink = plan::DataSink {
-            kind: Some(plan::data_sink::Kind::MultiCastDataStream(
-                plan::MultiCastDataStreamSink {
-                    sinks: Vec::new(),
-                    destinations: vec![plan::StreamDestinationList {
-                        destinations: vec![plan_destination(11)],
-                    }],
-                },
-            )),
-        };
-        let instance = proto::InstanceParams {
-            destinations: vec![instance_destination(99)],
-            ..Default::default()
-        };
-
-        let assignment = decode_fragment_sink_assignment(&sink, &instance)
-            .expect("redundant flat destinations must remain wire compatible");
-
-        assert_single_destination_group(assignment, 11);
     }
 
     #[test]
@@ -1042,31 +786,6 @@ mod tests {
             protocol.detail(),
             "native CHANGE_STREAM_ROUTER_SINK partition ordinal 1 is out of range"
         );
-    }
-
-    #[test]
-    fn router_assignment_ignores_redundant_flat_instance_destinations() {
-        let sink = plan::DataSink {
-            kind: Some(plan::data_sink::Kind::ChangeStreamRouter(
-                plan::ChangeStreamRouterSink {
-                    routes: vec![plan::ChangeStreamBranchRoute {
-                        destinations: Some(plan::StreamDestinationList {
-                            destinations: vec![plan_destination(12)],
-                        }),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                },
-            )),
-        };
-        let instance = proto::InstanceParams {
-            destinations: vec![instance_destination(98)],
-            ..Default::default()
-        };
-
-        let assignment = decode_fragment_sink_assignment(&sink, &instance)
-            .expect("redundant flat destinations must remain wire compatible");
-        assert_single_destination_group(assignment, 12);
     }
 
     #[test]
