@@ -18,7 +18,7 @@
 use novarocks_native_trust::NativeTrust;
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(test)]
 use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
@@ -135,12 +135,64 @@ struct FrontendRoleProducts {
     view_service: Arc<dyn crate::view::ViewService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
     maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
+    maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
     mv_service: Arc<crate::mv::FrontendMvService>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     exchange_port: u16,
+}
+
+impl FrontendRoleProducts {
+    /// Starts the two product-owned background domains only after the complete
+    /// immutable role graph exists. SQL/session assembly never starts either
+    /// worker as a side effect.
+    fn start_background_workers(&self) -> Result<(), FrontendApplicationError> {
+        self.maintenance_service
+            .start(Arc::clone(&self.maintenance_engine))
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "start table maintenance service failed: {error}"
+                ))
+            })?;
+        self.mv_service
+            .start_background_workers(core_capabilities::mv_background_bindings(
+                core_capabilities::MvBackgroundPorts::new(
+                    Arc::clone(&self.function_catalog),
+                    Arc::clone(&self.catalog_service),
+                    Some(Arc::clone(&self.catalog_application)),
+                    Arc::clone(&self.connector_control),
+                    Arc::clone(&self.mv_repository),
+                    Arc::clone(&self.mv_readiness),
+                    Arc::clone(&self.mv_storage_observation),
+                ),
+                Arc::clone(&self.maintenance_engine),
+            ))
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "start frontend MV background workers failed: {error}"
+                ))
+            })
+    }
+
+    async fn shutdown_background_workers_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), FrontendApplicationError> {
+        self.mv_service
+            .shutdown_background_workers_until(deadline)
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend MV background workers failed: {error}"
+                ))
+            })
+    }
+
+    fn request_background_stop_for_process_exit(&self) {
+        self.mv_service.request_background_stop_for_process_exit();
+    }
 }
 
 /// Opens the frontend services once for an externally composed server.
@@ -166,7 +218,7 @@ pub async fn open_frontend_application_for_server(
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
 fn build_frontend_role_products(
-    host: &mut FrontendApplicationHost,
+    host: &FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<FrontendRoleProducts, FrontendApplicationError> {
@@ -235,8 +287,6 @@ fn build_frontend_role_products(
             .max_attempt_duration(),
         host.workload_root_admission(),
     ));
-    host.install_mv_service(Arc::clone(&mv_service))
-        .map_err(FrontendApplicationError::server)?;
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
@@ -266,34 +316,6 @@ fn build_frontend_role_products(
             runtime_policy: host.lake_publication_runtime_policy(),
         }),
     );
-    if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
-        // The application Host owns this worker lifecycle. Its caller drives
-        // the same owner through the shared bounded shutdown path.
-        return Err(FrontendApplicationError::server(format!(
-            "start table maintenance service failed: {error}"
-        )));
-    }
-    if let Err(error) =
-        mv_service.start_background_workers(core_capabilities::mv_background_bindings(
-            core_capabilities::MvBackgroundPorts::new(
-                Arc::clone(&function_catalog),
-                Arc::clone(&catalog_service),
-                Some(Arc::clone(&catalog_application)),
-                Arc::clone(&connector_control),
-                Arc::clone(&mv_repository),
-                Arc::clone(&mv_readiness),
-                Arc::clone(&mv_storage_observation),
-            ),
-            Arc::clone(&maintenance_engine),
-        ))
-    {
-        // Do not start a private blocking join here. Returning preserves the
-        // exact worker owner for the Host's deadline-aware cleanup.
-        return Err(FrontendApplicationError::server(format!(
-            "start frontend MV background workers failed: {error}"
-        )));
-    }
-
     Ok(FrontendRoleProducts {
         catalog_service,
         unified_statistics,
@@ -308,6 +330,7 @@ fn build_frontend_role_products(
         view_service,
         statistics_application,
         maintenance_service,
+        maintenance_engine,
         mv_readiness,
         mv_candidate_reader,
         mv_service,
@@ -465,20 +488,57 @@ fn build_frontend_query_session_factory_from_role_products(
 }
 
 #[cfg(test)]
-pub fn build_frontend_query_session_factory(
-    host: &mut FrontendApplicationHost,
+fn build_frontend_query_session_factory(
+    host: &FrontendApplicationHost,
     system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
-) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
     let products = build_frontend_role_products(host, exchange_port, mv_storage_observation)?;
-    build_frontend_query_session_factory_from_role_products(
+    products.start_background_workers()?;
+    let session_factory = build_frontend_query_session_factory_from_role_products(
         host,
         &products,
         system_catalog,
         client_connection_control,
-    )
+    )?;
+    Ok((session_factory, products))
+}
+
+/// Drives the product-owned MV runtime to convergence before the Host releases
+/// the coordinator, topology, or StateStore it reaches through immutable ports.
+async fn shutdown_frontend_role_products_to_convergence(
+    products: &FrontendRoleProducts,
+    attempt_timeout: Duration,
+) -> Result<(), FrontendApplicationError> {
+    let first_error = match products
+        .shutdown_background_workers_until(Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        error = %first_error,
+        ?attempt_timeout,
+        "frontend role-product shutdown did not converge; retaining the exact MV owner for one final pass"
+    );
+    match products
+        .shutdown_background_workers_until(Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => Err(first_error),
+        Err(final_error) => {
+            tracing::error!(
+                error = %final_error,
+                ?attempt_timeout,
+                "frontend role products remained unconverged; committing the runner to process exit"
+            );
+            products.request_background_stop_for_process_exit();
+            Err(first_error.with_cleanup_context(final_error))
+        }
+    }
 }
 
 /// Drives the exact Frontend owner graph to convergence before the production
@@ -633,6 +693,20 @@ where
             return combine_server_and_shutdown(Err(error), stop_result);
         }
     };
+    if let Err(error) = products.start_background_workers() {
+        let product_shutdown = shutdown_frontend_role_products_to_convergence(
+            &products,
+            config.frontend_cleanup_timeout,
+        )
+        .await;
+        let stop_result = report_server
+            .stop()
+            .map_err(FrontendApplicationError::server);
+        return combine_server_and_shutdown(
+            combine_server_and_shutdown(Err(error), product_shutdown),
+            stop_result,
+        );
+    }
     let session_factory = match build_frontend_query_session_factory_from_role_products(
         host,
         &products,
@@ -641,12 +715,17 @@ where
     ) {
         Ok(factory) => factory,
         Err(error) => {
+            let product_shutdown = shutdown_frontend_role_products_to_convergence(
+                &products,
+                config.frontend_cleanup_timeout,
+            )
+            .await;
             let stop_result = report_server
                 .stop()
                 .map_err(FrontendApplicationError::server);
             return combine_server_and_shutdown(
-                combine_server_and_shutdown(Err(error), stop_result),
-                Ok(()),
+                combine_server_and_shutdown(Err(error), product_shutdown),
+                stop_result,
             );
         }
     };
@@ -662,10 +741,16 @@ where
         config.frontend_cleanup_timeout,
     )
     .await;
+    let product_shutdown =
+        shutdown_frontend_role_products_to_convergence(&products, config.frontend_cleanup_timeout)
+            .await;
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(server_result, stop_result)
+    combine_server_and_shutdown(
+        combine_server_and_shutdown(server_result, product_shutdown),
+        stop_result,
+    )
 }
 
 async fn run_mysql_with_listener_supervision<F>(
@@ -978,6 +1063,7 @@ mod tests {
         FrontendTestServerConfig, build_frontend_query_session_factory,
         run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
         shutdown_frontend_application_to_convergence,
+        shutdown_frontend_role_products_to_convergence,
     };
     use crate::state_store::testing::{
         input as test_state_store_input, registry as test_state_store_registry,
@@ -1164,7 +1250,7 @@ mod tests {
         .await
         .expect("open catalog attachment repository");
 
-        let session_factory = build_frontend_query_session_factory(
+        let (session_factory, products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
@@ -1240,6 +1326,9 @@ mod tests {
         session.close();
         drop(session);
         drop(session_factory);
+        shutdown_frontend_role_products_to_convergence(&products, Duration::from_secs(1))
+            .await
+            .expect("shutdown frontend role products");
         host.shutdown().await.expect("host shutdown");
     }
 
@@ -1314,7 +1403,7 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let session_factory = build_frontend_query_session_factory(
+        let (session_factory, products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
@@ -1337,6 +1426,9 @@ mod tests {
         session.close();
         drop(session);
         drop(session_factory);
+        shutdown_frontend_role_products_to_convergence(&products, Duration::from_secs(1))
+            .await
+            .expect("shutdown frontend role products");
         host.shutdown()
             .await
             .expect("shutdown frontend application host");

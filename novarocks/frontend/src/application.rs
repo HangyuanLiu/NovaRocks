@@ -60,7 +60,7 @@ use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogControll
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::coordinator::FrontendDistributedQueryCoordinator;
 use crate::dml::DmlService;
-use crate::mv::{FrontendMvService, repository::StateStoreMvRepository};
+use crate::mv::repository::StateStoreMvRepository;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
@@ -512,7 +512,6 @@ pub struct FrontendApplicationHost {
     view_service: Option<Arc<dyn crate::view::ViewService>>,
     table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
-    mv_service: Option<Arc<FrontendMvService>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
     logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
@@ -1020,7 +1019,6 @@ impl FrontendApplicationHost {
             view_service: None,
             table_maintenance_service: None,
             mv_repository: None,
-            mv_service: None,
             state_store_host: None,
             query_execution: None,
             logical_read_launcher: None,
@@ -1468,31 +1466,12 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_service(&self) -> Arc<FrontendMvService> {
-        Arc::clone(
-            self.mv_service
-                .as_ref()
-                .expect("frontend MV service is installed before host open returns"),
-        )
-    }
-
     pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
         self.mv_scheduler_config.clone()
     }
 
     pub(crate) fn mv_maintenance_config(&self) -> MaintenanceCoordinatorConfig {
         self.mv_maintenance_config.clone()
-    }
-
-    pub(crate) fn install_mv_service(
-        &mut self,
-        service: Arc<FrontendMvService>,
-    ) -> Result<(), String> {
-        if self.mv_service.is_some() {
-            return Err("frontend MV service is already installed".to_string());
-        }
-        self.mv_service = Some(service);
-        Ok(())
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -1755,9 +1734,6 @@ impl FrontendApplicationHost {
     /// has exhausted its bounded convergence attempts and committed to exit.
     pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
-        if let Some(service) = self.mv_service.as_ref() {
-            service.request_background_stop_for_process_exit();
-        }
         if let Some(port) = self.statistics_application_port.as_ref() {
             port.request_worker_stop_for_process_exit();
         }
@@ -1835,16 +1811,8 @@ impl FrontendApplicationHost {
     async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
-        // The worker owns durable attempt activity and must stop before the
-        // coordinator/topology/StateStore it depends on are released.
-        let mv_worker_error = match self.mv_service.as_ref() {
-            Some(service) => service
-                .shutdown_background_workers_until(deadline)
-                .await
-                .err()
-                .map(|error| format!("shutdown frontend MV background workers failed: {error}")),
-            None => None,
-        };
+        // Role products stop their MV worker before Server releases this Host.
+        // This Host still owns only the services it constructed directly.
         let statistics_worker_error = match self.statistics_application_port.as_ref() {
             Some(port) => port
                 .shutdown_worker_until(deadline)
@@ -1853,22 +1821,13 @@ impl FrontendApplicationHost {
                 .map(|error| format!("shutdown statistics analyze worker failed: {error}")),
             None => None,
         };
-        let preserve_background_owners =
-            mv_worker_error.is_some() || statistics_worker_error.is_some();
-        let mut primary_error = mv_worker_error;
-        if let Some(statistics_worker_error) = statistics_worker_error {
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {statistics_worker_error}"));
-            } else {
-                primary_error = Some(statistics_worker_error);
-            }
-        }
+        let preserve_background_owners = statistics_worker_error.is_some();
+        let mut primary_error = statistics_worker_error;
         if preserve_background_owners {
-            // Background workers still own request/topology/StateStore references.
-            // Preserve those owners so a caller sees the explicit shutdown
-            // failure rather than pretending teardown completed. Query intake
-            // is already closed; a later call resumes this same owner graph.
-            return Err(primary_error.expect("the MV shutdown error is retained"));
+            // The Statistics product still owns request/topology/StateStore
+            // references. Preserve that owner so a caller sees the explicit
+            // shutdown failure rather than pretending teardown completed.
+            return Err(primary_error.expect("the statistics shutdown error is retained"));
         }
         if let Err(error) = self.execution_runtime_owner.shutdown_until(deadline).await {
             if !self.execution_runtime_owner.is_shutdown_complete() {
@@ -1968,7 +1927,6 @@ impl FrontendApplicationHost {
         }
         self.catalog_application_port.take();
         self.view_service.take();
-        self.mv_service.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {
