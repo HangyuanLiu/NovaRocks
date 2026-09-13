@@ -804,22 +804,6 @@ fn concurrent_exact_creates_produce_one_acknowledgement() {
 }
 
 #[test]
-fn a_lost_acknowledgement_replay_confirms_without_restarting() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    let request = fixture.create_request(identity, 5);
-
-    let first = fixture.registry.create_task(&request);
-    assert_eq!(first.outcome(), OperationOutcome::Accepted);
-    let replay = fixture.registry.create_task(&request);
-    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
-    assert_eq!(replay.acknowledgement(), first.acknowledgement());
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
-}
-
-#[test]
 fn a_conflicting_descriptor_fails_closed() {
     let fixture = Fixture::new();
     fixture.establish(1);
