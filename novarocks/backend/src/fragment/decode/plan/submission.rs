@@ -39,10 +39,10 @@ use super::context::NativePlanDecodeContext;
 use super::error::NativeFragmentDecodeError;
 use super::node::decode_node_with_runtime_filters;
 use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
-use super::sink::decode_fragment_sink_program_with_context;
 use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
 use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
 use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
+use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
 use novarocks_native_adapter::fragment_submission::{
     decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
     validate_scan_range_nodes,
@@ -113,8 +113,7 @@ pub(crate) fn decode_fragment_submission(
     ledger.finish()?;
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
-    let sink_program =
-        decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
+    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let plan = novarocks_execution::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)

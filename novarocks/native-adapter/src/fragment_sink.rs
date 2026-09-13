@@ -15,8 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment-native proto sink lowering.
+//! Native fragment proto sink lowering.
+//!
+//! This module validates native sink wire shape and projects it into immutable
+//! Execution sink programs.  The caller supplies the already-decoded root
+//! layout solely to resolve native partition expressions; no Backend context,
+//! task state, Connector I/O, or fragment lifecycle is consulted here.
 
+use novarocks_execution::exec::chunk::SlotLayout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::exec::fragment::sink::{
@@ -29,25 +35,12 @@ use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_types::SlotId;
 
-use super::context::NativePlanDecodeContext;
-use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
-use novarocks_execution::exec::chunk::SlotLayout as Layout;
+use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
+use crate::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
 
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(crate) fn decode_fragment_sink_program(
+pub fn decode_fragment_sink_program(
     fragment: &plan::PlanFragment,
-    layout: &Layout,
-) -> Result<FragmentSinkProgram, NativeFragmentDecodeError> {
-    decode_fragment_sink_program_with_context(fragment, layout, None)
-}
-
-pub(crate) fn decode_fragment_sink_program_with_context(
-    fragment: &plan::PlanFragment,
-    layout: &Layout,
-    ctx: Option<&NativePlanDecodeContext>,
+    layout: &SlotLayout,
 ) -> Result<FragmentSinkProgram, NativeFragmentDecodeError> {
     let path = FieldPath::root("plan_fragment").field("sink");
     let sink = fragment.sink.as_ref().ok_or_else(|| {
@@ -85,7 +78,6 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                 &mut partition_arena,
                 layout,
                 "native DATA_STREAM_SINK",
-                ctx,
             )
             .map_err(|error| error.into_native(path.clone().field("data_stream")))?;
             branch
@@ -103,7 +95,6 @@ pub(crate) fn decode_fragment_sink_program_with_context(
                         &mut partition_arena,
                         layout,
                         &format!("native MULTI_CAST_DATA_STREAM_SINK sink[{index}]"),
-                        ctx,
                     )
                     .map_err(|error| {
                         error.into_native(
@@ -124,7 +115,6 @@ pub(crate) fn decode_fragment_sink_program_with_context(
             &fragment.output_exprs,
             &fragment.output_columns,
             layout,
-            ctx,
         )
         .map(FragmentSinkProgram::SplitDataStream)
         .map_err(|error| error.into_native(path.field("change_stream_router"))),
@@ -134,9 +124,8 @@ pub(crate) fn decode_fragment_sink_program_with_context(
 fn decode_data_stream_branch(
     stream: &plan::DataStreamSink,
     partition_arena: &mut ExprArena,
-    layout: &Layout,
+    layout: &SlotLayout,
     context: &str,
-    ctx: Option<&NativePlanDecodeContext>,
 ) -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
     (|| -> Result<DataStreamSinkBranchProgram, NativeFragmentLeafDecodeError> {
         let partition = stream.output_partition.as_ref().ok_or_else(|| {
@@ -160,7 +149,6 @@ fn decode_data_stream_branch(
                         expression,
                         partition_arena,
                         layout,
-                        ctx,
                         FieldPath::root("plan_fragment")
                             .field("sink")
                             .field("output_partition")
@@ -280,8 +268,7 @@ fn decode_change_stream_router_program(
     router: &plan::ChangeStreamRouterSink,
     output_exprs: &[expr::Expr],
     output_columns: &[common::OutputColumn],
-    layout: &Layout,
-    context: Option<&NativePlanDecodeContext>,
+    layout: &SlotLayout,
 ) -> Result<SplitDataStreamSinkProgram, NativeFragmentLeafDecodeError> {
     let effect_slot_id = SlotId::try_from(output_slot_id_for_ordinal(
         output_columns,
@@ -326,7 +313,6 @@ fn decode_change_stream_router_program(
                             expression,
                             &mut partition_arena,
                             layout,
-                            context,
                             FieldPath::root("plan_fragment")
                                 .field("sink")
                                 .field("change_stream_router")
@@ -424,17 +410,12 @@ fn decode_change_stream_router_program(
 fn decode_sink_expression(
     expression: &expr::Expr,
     arena: &mut ExprArena,
-    layout: &Layout,
-    context: Option<&NativePlanDecodeContext>,
+    layout: &SlotLayout,
     path: FieldPath,
 ) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
-    let context = context.ok_or_else(|| {
-        NativeFragmentDecodeError::unsupported(
-            path.clone(),
-            "native sink expression requires the backend decode context",
-        )
-    })?;
-    context.decode_expression(expression, path, arena, layout)
+    let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
+    decode_expr_at(expression, path, arena, &input)
+        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
 }
 
 fn branch_partition_from_native(
@@ -508,21 +489,30 @@ fn decode_router_output_slots(
     output_columns: &[common::OutputColumn],
     field: &'static str,
 ) -> Result<Vec<SlotId>, NativeFragmentLeafDecodeError> {
-    {
-        let mut seen = std::collections::HashSet::new();
-        ordinals
+    let mut seen = std::collections::HashSet::new();
+    ordinals
         .iter()
-        .enumerate().map(|(index, ordinal)| {
+        .enumerate()
+        .map(|(index, ordinal)| {
             let raw_slot_id = output_slot_id_for_ordinal(output_columns, *ordinal, field)
                 .map_err(|error| error.append_index(index))?;
-            let slot_id = SlotId::try_from(raw_slot_id).map_err(|error| NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, field, error).append_index(index))?;
+            let slot_id = SlotId::try_from(raw_slot_id).map_err(|error| {
+                NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, field, error)
+                    .append_index(index)
+            })?;
             if !seen.insert(slot_id) {
-                return Err(NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InconsistentFields, field, format!("native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: {slot_id}")).append_index(index));
+                return Err(NativeFragmentLeafDecodeError::at_field(
+                    ProtocolErrorKind::InconsistentFields,
+                    field,
+                    format!(
+                        "native ICEBERG_CHANGE_STREAM_ROUTER_SINK duplicate output slot id: {slot_id}"
+                    ),
+                )
+                .append_index(index));
             }
             Ok(slot_id)
         })
         .collect()
-    }
 }
 
 fn decode_row_mutation_effect(value: i32) -> Result<ConnectorRowMutationEffect, String> {
@@ -562,17 +552,13 @@ fn decode_stream_partition_type(kind: i32) -> Result<DataStreamPartitionType, St
 
 #[cfg(test)]
 mod tests {
+    use novarocks_execution::exec::chunk::SlotLayout;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::{common, plan};
     use novarocks_spi::connector::ConnectorRowMutationEffect;
     use prost::Message;
 
-    use super::{
-        decode_fragment_sink_program, decode_fragment_sink_program_with_context,
-        decode_row_mutation_effect,
-    };
-    use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-    use novarocks_execution::exec::chunk::SlotLayout as Layout;
+    use super::{decode_fragment_sink_program, decode_row_mutation_effect};
 
     #[test]
     fn row_mutation_effect_decoding_rejects_unspecified_and_unknown_values() {
@@ -609,7 +595,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+        let error = decode_fragment_sink_program(&fragment, &SlotLayout::default())
             .expect_err("missing stream partition must fail");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
@@ -635,7 +621,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+        let error = decode_fragment_sink_program(&fragment, &SlotLayout::default())
             .expect_err("invalid output column must fail");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
@@ -661,7 +647,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+        let error = decode_fragment_sink_program(&fragment, &SlotLayout::default())
             .expect_err("duplicate output column must fail");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
@@ -688,12 +674,8 @@ mod tests {
             ..Default::default()
         };
 
-        let error = decode_fragment_sink_program_with_context(
-            &fragment,
-            &Layout::default(),
-            Some(&NativePlanDecodeContext::default()),
-        )
-        .expect_err("the retired connector write sink must fail closed");
+        let error = decode_fragment_sink_program(&fragment, &SlotLayout::default())
+            .expect_err("the retired connector write sink must fail closed");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(protocol.path().to_string(), "plan_fragment.sink.kind");
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
@@ -727,7 +709,7 @@ mod tests {
                 input_ordinals: vec![0],
                 ..Default::default()
             }),
-            &Layout::default(),
+            &SlotLayout::default(),
         )
         .expect_err("unspecified branch effect must fail");
         let protocol = error.protocol().expect("typed protocol error");
@@ -748,7 +730,7 @@ mod tests {
                 input_ordinals: vec![1],
                 ..Default::default()
             }),
-            &Layout::default(),
+            &SlotLayout::default(),
         )
         .expect_err("out-of-range branch output ordinal must fail");
         let protocol = error.protocol().expect("typed protocol error");
@@ -773,7 +755,7 @@ mod tests {
                 output_partition_ordinals: vec![1],
                 ..Default::default()
             }),
-            &Layout::default(),
+            &SlotLayout::default(),
         )
         .expect_err("out-of-range partition ordinal must fail");
         let protocol = error.protocol().expect("typed protocol error");
@@ -797,7 +779,7 @@ mod tests {
                 input_ordinals: vec![0, 0],
                 ..Default::default()
             }),
-            &Layout::default(),
+            &SlotLayout::default(),
         )
         .expect_err("duplicate router output slots must be rejected during decode");
         let protocol = error.protocol().expect("typed protocol error");
@@ -826,7 +808,7 @@ mod tests {
                 write_target_ordinal: 3,
                 ..Default::default()
             }),
-            &Layout::default(),
+            &SlotLayout::default(),
         )
         .expect_err("a write target outside the sealed set must fail");
         let protocol = error.protocol().expect("typed protocol error");
@@ -880,7 +862,7 @@ mod tests {
             ..Default::default()
         };
 
-        let error = decode_fragment_sink_program(&fragment, &Layout::default())
+        let error = decode_fragment_sink_program(&fragment, &SlotLayout::default())
             .expect_err("a repeated write target must fail");
         let protocol = error.protocol().expect("typed protocol error");
         assert_eq!(
