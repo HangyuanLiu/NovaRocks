@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use novarocks_types::UniqueId;
 
-use super::data_plane_handlers;
-use super::data_plane_handlers::{ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed_legacy};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+use novarocks_native_adapter::exchange_data_plane::{
+    ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery, handle_transmit_chunk,
+};
 use novarocks_proto_models as proto;
 use novarocks_worker::{InboundFrameClaim, TaskInboundCapabilities};
 use std::sync::Arc;
@@ -109,11 +110,7 @@ impl BackendDataPlane {
             .iter()
             .map(Arc::as_ref)
             .collect();
-        data_plane_handlers::handle_transmit_chunk(
-            self.exchange_receiver_port.as_ref(),
-            &authorities,
-            request,
-        )
+        handle_transmit_chunk(self.exchange_receiver_port.as_ref(), &authorities, request)
     }
 
     pub fn fetch_result(

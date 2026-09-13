@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-//! Synchronous data-plane handlers delegated by the Backend RPC service.
+//! Native exchange wire projection and route settlement.
 
 use std::fmt;
 

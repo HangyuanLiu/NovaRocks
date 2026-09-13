@@ -1409,7 +1409,7 @@ mod tests {
     };
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
 
-    use crate::rpc::data_plane_handlers::ExchangeRouteQuery;
+    use novarocks_native_adapter::exchange_data_plane::ExchangeRouteQuery;
 
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_worker::ProcessMonotonicClock;
