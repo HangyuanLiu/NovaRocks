@@ -31,6 +31,7 @@ pub mod fragment_sink;
 pub mod fragment_submission;
 pub mod fragment_validation;
 pub mod fragment_variant_path;
+pub mod management_http;
 pub mod native_client;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;

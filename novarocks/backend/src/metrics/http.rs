@@ -15,20 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashMap;
-use std::net::{SocketAddr, TcpListener};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
-use std::thread::JoinHandle;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::{Router, routing::get};
+use novarocks_native_adapter::management_http::RoleMetricsRenderer;
 use once_cell::sync::Lazy;
 use prometheus::{Encoder, IntCounter, IntGaugeVec, Opts, Registry, TextEncoder};
-use tokio::net::TcpListener as TokioTcpListener;
-use tokio::sync::watch;
 
 /// Explicitly-owned Backend metric registry.  It is intentionally separate
 /// from Prometheus' process-global registry so an all-in-one process cannot
@@ -74,111 +65,6 @@ impl BackendMetricsRegistry {
 
     fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.registry.gather()
-    }
-}
-
-/// Dedicated HTTP listener for Backend management metrics.
-pub struct MetricsHttpServer {
-    shutdown_tx: Option<watch::Sender<bool>>,
-    failure_rx: mpsc::Receiver<String>,
-    join_handle: Option<JoinHandle<()>>,
-    stop_requested: Arc<AtomicBool>,
-}
-
-impl MetricsHttpServer {
-    pub fn start(
-        host: &str,
-        port: u16,
-        metrics: Arc<BackendMetricsRegistry>,
-    ) -> Result<Self, String> {
-        let bind_addr = parse_metrics_bind_addr(host, port)
-            .map_err(|error| format!("parse metrics HTTP bind address failed: {error}"))?;
-        let listener = TcpListener::bind(bind_addr).map_err(|error| {
-            format!("bind metrics HTTP listener on {bind_addr} failed: {error}")
-        })?;
-        listener.set_nonblocking(true).map_err(|error| {
-            format!("configure metrics HTTP listener on {bind_addr} failed: {error}")
-        })?;
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let thread_stop_requested = Arc::clone(&stop_requested);
-        let join_handle = std::thread::Builder::new()
-            .name("backend-management-http".to_string())
-            .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| {
-                            format!("build backend management HTTP runtime: {error}")
-                        })?;
-                    runtime.block_on(async move {
-                        let listener = TokioTcpListener::from_std(listener).map_err(|error| {
-                            format!("create Tokio backend management HTTP listener: {error}")
-                        })?;
-                        let app = Router::new()
-                            .route("/metrics", get(handle_metrics))
-                            .with_state(metrics);
-                        axum::serve(listener, app)
-                            .with_graceful_shutdown(async move {
-                                while !*shutdown_rx.borrow() {
-                                    if shutdown_rx.changed().await.is_err() {
-                                        break;
-                                    }
-                                }
-                            })
-                            .await
-                            .map_err(|error| {
-                                format!("backend management HTTP serve future failed: {error}")
-                            })
-                    })
-                }));
-                if thread_stop_requested.load(Ordering::Acquire) {
-                    return;
-                }
-                let error = match outcome {
-                    Ok(Ok(())) => "backend management HTTP server exited unexpectedly".to_string(),
-                    Ok(Err(error)) => error,
-                    Err(payload) => payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| {
-                            payload
-                                .downcast_ref::<&str>()
-                                .map(|value| (*value).to_string())
-                        })
-                        .unwrap_or_else(|| "backend management HTTP server panicked".to_string()),
-                };
-                let _ = failure_tx.send(error);
-            })
-            .map_err(|error| format!("spawn backend management HTTP server: {error}"))?;
-        Ok(Self {
-            shutdown_tx: Some(shutdown_tx),
-            failure_rx,
-            join_handle: Some(join_handle),
-            stop_requested,
-        })
-    }
-
-    pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
-        match self.failure_rx.try_recv() {
-            Ok(error) => Ok(Some(error)),
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
-        }
-    }
-
-    pub fn stop(mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Release);
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-        if let Some(join_handle) = self.join_handle.take() {
-            join_handle
-                .join()
-                .map_err(|_| "metrics HTTP server thread panicked".to_string())?;
-        }
-        Ok(())
     }
 }
 
@@ -417,51 +303,12 @@ pub(crate) fn record_backend_native_tls_handshake_failure() {
     }
 }
 
-fn parse_metrics_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let bare = if host.starts_with('[') && host.ends_with(']') {
-        &host[1..host.len() - 1]
-    } else {
-        host
-    };
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    let formatted = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    formatted
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("parse metrics bind addr '{formatted}' failed: {error}"))
-}
-
 /// Publish a scalar snapshot after its owner has released its own lock. The
 /// metrics layer deliberately holds no execution resource references.
 pub fn publish_backend_query_execution_resource(resource: &'static str, value: usize) {
     BACKEND_QUERY_EXECUTION_RESOURCES
         .with_label_values(&[resource])
         .set(value as i64);
-}
-
-async fn handle_metrics(
-    State(metrics): State<Arc<BackendMetricsRegistry>>,
-    Query(params): Query<HashMap<String, String>>,
-) -> Response {
-    if params
-        .get("type")
-        .is_some_and(|value| value.eq_ignore_ascii_case("json"))
-    {
-        return match render_metrics_json(&metrics) {
-            Ok(body) => ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
-            Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
-        };
-    }
-
-    match render_metrics(&metrics) {
-        Ok(body) => ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response(),
-        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
-    }
 }
 
 /// Renders only the metric families registered by this Backend role.
@@ -534,6 +381,16 @@ pub(crate) fn render_metrics_json(metrics: &BackendMetricsRegistry) -> Result<St
     serde_json::to_string(&rows).map_err(|e| format!("encode metrics json failed: {e}"))
 }
 
+impl RoleMetricsRenderer for BackendMetricsRegistry {
+    fn render_prometheus(&self) -> Result<String, String> {
+        render_metrics(self)
+    }
+
+    fn render_json(&self) -> Result<String, String> {
+        render_metrics_json(self)
+    }
+}
+
 fn refresh_backend_gauges() {
     Lazy::force(&BACKEND_QUERY_EXECUTION_RESOURCES);
     ensure_backend_metric_label_families();
@@ -556,29 +413,11 @@ fn ensure_backend_metric_label_families() {
 }
 #[cfg(test)]
 mod tests {
-    use std::sync::Barrier;
+    use std::sync::{Arc, Barrier};
 
     use prometheus::{IntGauge, Opts, Registry};
 
     use super::*;
-
-    #[test]
-    fn metrics_bind_addr_accepts_ipv4_and_ipv6_literals() {
-        assert_eq!(
-            parse_metrics_bind_addr("127.0.0.1", 9070).expect("parse IPv4"),
-            "127.0.0.1:9070"
-                .parse::<SocketAddr>()
-                .expect("IPv4 address")
-        );
-        assert_eq!(
-            parse_metrics_bind_addr("::1", 9070).expect("parse bare IPv6"),
-            "[::1]:9070".parse::<SocketAddr>().expect("IPv6 address")
-        );
-        assert_eq!(
-            parse_metrics_bind_addr("[::]", 9070).expect("parse bracketed IPv6"),
-            "[::]:9070".parse::<SocketAddr>().expect("IPv6 wildcard")
-        );
-    }
 
     #[test]
     fn role_registry_excludes_foreign_registry_families() {
