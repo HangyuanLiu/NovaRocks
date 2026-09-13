@@ -28,6 +28,8 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_types::UniqueId;
 
+use crate::RuntimeFilterContractError;
+
 use super::domain::{
     BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendFrontendFeedbackSink,
     BackendIngressDedupe, BackendIngressResult, BackendMaterializedDeliverySink,
@@ -42,6 +44,8 @@ use super::participant_ingress::{
     DeliveryIngressFrame, DeliveryIngressRoute, ProducerIngressCommand, ProducerIngressRoute,
     dispatch_delivery_frame, dispatch_producer_failure, dispatch_producer_frame,
 };
+
+const MAX_DELIVERY_IDENTITIES_PER_CHANNEL: usize = 16_384;
 
 /// One sealed runtime-filter participant's local domain state.
 ///
@@ -59,6 +63,69 @@ pub struct WorkerRuntimeFilterParticipant {
 }
 
 impl WorkerRuntimeFilterParticipant {
+    /// Builds the complete local state for one already-decoded sealed install.
+    ///
+    /// The native adapter supplies neither session maps nor lifecycle state:
+    /// those are derived once from the Worker-owned installation authority.
+    pub fn from_install(
+        install: BackendParticipantInstall,
+    ) -> Result<Self, RuntimeFilterContractError> {
+        let participant = install.participant();
+        let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
+        observation.record(BackendRuntimeFilterEvent::DeploymentInstalled { participant });
+        let events: Arc<dyn BackendRuntimeFilterEventObserver> = observation.clone();
+        let mut producer_sessions = BTreeMap::new();
+        let mut consumer_sessions = BTreeMap::new();
+        for channel in install.channels().values() {
+            let session = Arc::new(
+                BackendRuntimeFilterSession::from_channel_install(
+                    participant,
+                    channel.clone(),
+                    Arc::clone(&events),
+                )
+                .map_err(|error| RuntimeFilterContractError::invalid_contract(error.to_string()))?,
+            );
+            for binding_id in channel.producers().keys() {
+                if producer_sessions
+                    .insert(*binding_id, Arc::clone(&session))
+                    .is_some()
+                {
+                    return Err(RuntimeFilterContractError::invalid_contract(
+                        "runtime filter producer binding is installed by multiple channels",
+                    ));
+                }
+            }
+            for binding_id in channel.consumers().keys() {
+                if consumer_sessions
+                    .insert(*binding_id, Arc::clone(&session))
+                    .is_some()
+                {
+                    return Err(RuntimeFilterContractError::invalid_contract(
+                        "runtime filter consumer binding is installed by multiple channels",
+                    ));
+                }
+            }
+        }
+        let query_id = participant.query_id();
+        let memory = MemTracker::new_root(format!(
+            "runtime_filter_participant_{:x}_{:x}_{}",
+            query_id.high(),
+            query_id.low(),
+            participant.deployment_epoch()
+        ));
+        Ok(Self::new(
+            install,
+            observation,
+            producer_sessions,
+            consumer_sessions,
+            Arc::new(BackendIngressDedupe::new(
+                MAX_DELIVERY_IDENTITIES_PER_CHANNEL,
+            )),
+            Arc::new(AtomicBool::new(false)),
+            memory,
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         install: BackendParticipantInstall,
@@ -82,6 +149,10 @@ impl WorkerRuntimeFilterParticipant {
 
     pub const fn participant(&self) -> super::domain::BackendParticipantIdentity {
         self.install.participant()
+    }
+
+    pub fn observation_emitter(&self) -> Arc<RuntimeFilterObservationEmitter> {
+        Arc::clone(&self.observation)
     }
 
     pub fn is_cancelled(&self) -> bool {

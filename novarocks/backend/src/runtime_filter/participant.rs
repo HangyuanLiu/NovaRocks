@@ -23,10 +23,9 @@
 //! by this participant.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterContractViolation, RuntimeFilterContractViolationKind, RuntimeFilterSessionRef,
 };
@@ -48,11 +47,11 @@ use crate::runtime_filter::transport::{
 };
 use novarocks_native_adapter::BackendDataRuntime;
 use novarocks_worker::runtime_filter::domain::{
-    BackendChannelIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink, BackendIngressDedupe,
-    BackendIngressResult, BackendMaterializedDelivery, BackendMaterializedDeliverySink,
-    BackendParticipantInstall, BackendRouteDecision, BackendRoutingError,
-    BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession,
-    BackendTransportEventIdentity, BackendTransportEventKind, BackendTransportFailOpenReason,
+    BackendChannelIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink, BackendIngressResult,
+    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendParticipantInstall,
+    BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
+    BackendRuntimeFilterEventObserver, BackendTransportEventIdentity, BackendTransportEventKind,
+    BackendTransportFailOpenReason,
 };
 use novarocks_worker::runtime_filter::execution_session::RuntimeFilterParticipantOutbound;
 use novarocks_worker::runtime_filter::observation::{
@@ -68,8 +67,6 @@ use novarocks_worker::{
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
 const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: runtime filter ack ingress is not supported";
 const DELIVERY_REJECTION: &str = "runtime filter ingress rejected [artifact-delivery]: delivery violates the installed artifact contract";
-const MAX_DELIVERY_IDENTITIES_PER_CHANNEL: usize = 16_384;
-
 /// Backend-private factory injected into the lifecycle registry. The entry
 /// owns the attempt lifetime; it cannot recover a participant by query id.
 pub(crate) trait RuntimeFilterParticipantFactory: Send + Sync + 'static {
@@ -110,49 +107,9 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
                 "runtime filter install does not match the query execution attempt",
             ));
         }
-        let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
-        observation.record(BackendRuntimeFilterEvent::DeploymentInstalled {
-            participant: install.participant(),
-        });
-        let events: Arc<dyn BackendRuntimeFilterEventObserver> = observation.clone();
-        let mut producers = BTreeMap::new();
-        let mut consumers = BTreeMap::new();
-        for channel in install.channels().values() {
-            let session = Arc::new(
-                BackendRuntimeFilterSession::from_channel_install(
-                    install.participant(),
-                    channel.clone(),
-                    Arc::clone(&events),
-                )
-                .map_err(|error| RuntimeFilterContractError::invalid_contract(error.to_string()))?,
-            );
-            for binding_id in channel.producers().keys() {
-                if producers
-                    .insert(*binding_id, Arc::clone(&session))
-                    .is_some()
-                {
-                    return Err(RuntimeFilterContractError::invalid_contract(
-                        "runtime filter producer binding is installed by multiple channels",
-                    ));
-                }
-            }
-            for binding_id in channel.consumers().keys() {
-                if consumers
-                    .insert(*binding_id, Arc::clone(&session))
-                    .is_some()
-                {
-                    return Err(RuntimeFilterContractError::invalid_contract(
-                        "runtime filter consumer binding is installed by multiple channels",
-                    ));
-                }
-            }
-        }
-        let memory = MemTracker::new_root(format!(
-            "runtime_filter_participant_{:x}_{:x}_{}",
-            query_id.high(),
-            query_id.low(),
-            execution_id.attempt_id().get()
-        ));
+        let state = Arc::new(WorkerRuntimeFilterParticipant::from_install(
+            install.clone(),
+        )?);
         let transport_policy = BackendRuntimeFilterRetryPolicy::new(
             lifecycle.transport_retry_interval,
             lifecycle.transport_max_attempts,
@@ -168,11 +125,8 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
         RuntimeFilterParticipant::from_installed(
             execution_id,
             install,
-            observation,
+            state,
             transport_policy,
-            producers,
-            consumers,
-            memory,
             GrpcRuntimeFilterEnvelopeSink::new(self.runtime.clone()),
         )
     }
@@ -200,37 +154,17 @@ impl RuntimeFilterParticipant {
     fn from_installed(
         execution_id: QueryExecutionId,
         install: BackendParticipantInstall,
-        observation: Arc<RuntimeFilterObservationEmitter>,
+        state: Arc<WorkerRuntimeFilterParticipant>,
         transport_policy: BackendRuntimeFilterRetryPolicy,
-        producer_sessions: BTreeMap<
-            novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-            Arc<BackendRuntimeFilterSession>,
-        >,
-        consumer_sessions: BTreeMap<
-            novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-            Arc<BackendRuntimeFilterSession>,
-        >,
-        memory: Arc<MemTracker>,
         transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
     ) -> Result<Arc<Self>, RuntimeFilterContractError> {
         let outbound = Arc::new(BackendParticipantOutbound::new(
             install.clone(),
             transport_policy,
             transport_sink,
-            Arc::clone(&observation),
+            state.observation_emitter(),
         ));
         let sink = Arc::clone(&outbound) as Arc<dyn BackendMaterializedDeliverySink>;
-        let state = Arc::new(WorkerRuntimeFilterParticipant::new(
-            install,
-            observation,
-            producer_sessions,
-            consumer_sessions,
-            Arc::new(BackendIngressDedupe::new(
-                MAX_DELIVERY_IDENTITIES_PER_CHANNEL,
-            )),
-            Arc::new(AtomicBool::new(false)),
-            memory,
-        ));
         state.set_materialized_delivery_sink(sink);
         Ok(Arc::new(Self {
             execution_id,
@@ -889,10 +823,12 @@ fn outbound_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContractViola
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
+    use novarocks_execution::runtime::mem_tracker::MemTracker;
     use novarocks_execution::runtime_filter::{
         LogicalVersion, RuntimeFilterBindOutcome, RuntimeFilterChannelId,
         RuntimeFilterConsumerContract, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
@@ -913,13 +849,50 @@ mod tests {
     use novarocks_worker::runtime_filter::codec::artifact as artifact_codec;
     use novarocks_worker::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
-        BackendMaterializationOwner, BackendMaterializationPolicy,
+        BackendIngressDedupe, BackendMaterializationOwner, BackendMaterializationPolicy,
         BackendOutboundMaterializationGroup, BackendParticipantIdentity,
         BackendProducerOpenMetadata, BackendRemoteRoute, BackendRouteEdgeId, BackendRouteEndpoint,
         BackendRoutePeer, BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge,
-        BackendRoutingShard,
+        BackendRoutingShard, BackendRuntimeFilterSession,
     };
     use novarocks_worker::runtime_filter::fixture::BackendRuntimeFilterFixture;
+
+    impl RuntimeFilterParticipant {
+        #[allow(clippy::too_many_arguments)]
+        fn from_test_parts(
+            execution_id: QueryExecutionId,
+            install: BackendParticipantInstall,
+            observation: Arc<RuntimeFilterObservationEmitter>,
+            transport_policy: BackendRuntimeFilterRetryPolicy,
+            producer_sessions: BTreeMap<
+                novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+                Arc<BackendRuntimeFilterSession>,
+            >,
+            consumer_sessions: BTreeMap<
+                novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+                Arc<BackendRuntimeFilterSession>,
+            >,
+            memory: Arc<MemTracker>,
+            transport_sink: Arc<dyn BackendRuntimeFilterEnvelopeSink>,
+        ) -> Result<Arc<Self>, RuntimeFilterContractError> {
+            let state = Arc::new(WorkerRuntimeFilterParticipant::new(
+                install.clone(),
+                observation,
+                producer_sessions,
+                consumer_sessions,
+                Arc::new(BackendIngressDedupe::new(16_384)),
+                Arc::new(AtomicBool::new(false)),
+                memory,
+            ));
+            Self::from_installed(
+                execution_id,
+                install,
+                state,
+                transport_policy,
+                transport_sink,
+            )
+        }
+    }
 
     struct ForwardingSink {
         target: Arc<RuntimeFilterParticipant>,
@@ -1074,7 +1047,7 @@ mod tests {
             )
             .expect("FinalDomain Backend session"),
         );
-        let participant = RuntimeFilterParticipant::from_installed(
+        let participant = RuntimeFilterParticipant::from_test_parts(
             execution_id(),
             install,
             observation,
@@ -1567,7 +1540,7 @@ mod tests {
             )
             .expect("target session"),
         );
-        let target = RuntimeFilterParticipant::from_installed(
+        let target = RuntimeFilterParticipant::from_test_parts(
             execution_id(),
             target_install,
             target_observation,
@@ -1588,7 +1561,7 @@ mod tests {
             )
             .expect("source session"),
         );
-        let source = RuntimeFilterParticipant::from_installed(
+        let source = RuntimeFilterParticipant::from_test_parts(
             execution_id(),
             source_install,
             source_observation,
@@ -1753,7 +1726,7 @@ mod tests {
             AttemptId::new(identity.deployment_epoch()).expect("deployment epoch"),
         )
         .expect("execution id");
-        let participant = RuntimeFilterParticipant::from_installed(
+        let participant = RuntimeFilterParticipant::from_test_parts(
             execution_id,
             install,
             observation,
@@ -1893,7 +1866,7 @@ mod tests {
             )
             .expect("target session"),
         );
-        let target = RuntimeFilterParticipant::from_installed(
+        let target = RuntimeFilterParticipant::from_test_parts(
             execution_id(),
             target_install,
             target_observation,
