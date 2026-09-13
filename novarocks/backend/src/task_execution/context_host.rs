@@ -604,7 +604,10 @@ impl NativeQueryContextHost {
                     || !installed.is_released(),
                     move |properties| {
                         factories
-                            .bind(properties)
+                            .bind(
+                                properties,
+                                crate::config::debug_emit_catalog_materialization_marker(),
+                            )
                             .map_err(CatalogManagerError::from_materialization)
                     },
                 )

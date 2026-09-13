@@ -72,6 +72,7 @@ impl ConnectorExecutionRoleBindingFactorySet {
     pub fn bind(
         &self,
         properties: &CatalogProperties,
+        emit_materialization_marker: bool,
     ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
         let normalized =
             NormalizedCatalogProperties::try_new(properties.clone()).map_err(|detail| {
@@ -89,7 +90,7 @@ impl ConnectorExecutionRoleBindingFactorySet {
             ));
         };
         let binding = factory.bind(&normalized)?;
-        if crate::config::debug_emit_catalog_materialization_marker() {
+        if emit_materialization_marker {
             println!(
                 "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",
                 properties.handle()
