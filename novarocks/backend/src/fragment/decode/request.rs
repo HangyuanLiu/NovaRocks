@@ -33,8 +33,10 @@ use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
 use crate::fragment::ingress::NativeFragmentIngressError;
 
-use super::instance::{decode_instance_params, decode_instance_params_with_query_options};
 use super::plan::submission::decode_fragment_submission;
+use novarocks_native_adapter::fragment_instance::{
+    decode_instance_params, decode_instance_params_with_query_options,
+};
 
 pub(crate) struct NativeFragmentRequest {
     execution_id: QueryExecutionId,
@@ -84,7 +86,8 @@ impl NativeFragmentRequest {
         typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let instance = decode_instance_params(&instance_params)?;
+        let instance = decode_instance_params(&instance_params)
+            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
         let decoded = decode_fragment_submission(
             &fragment,
             instance,
@@ -126,7 +129,8 @@ impl NativeFragmentRequest {
         typed_scan_runtime: Option<crate::fragment::decode::plan::context::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let instance = decode_instance_params_with_query_options(&instance_params, query_options)?;
+        let instance = decode_instance_params_with_query_options(&instance_params, query_options)
+            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
         let decoded = decode_fragment_submission(
             &fragment,
             instance,

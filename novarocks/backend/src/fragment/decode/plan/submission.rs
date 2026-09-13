@@ -33,7 +33,6 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::fragment::decode::instance::NativeFragmentInstanceInput;
 use crate::fragment::decode::submission_validation::{
     validate_fragment_expressions, validate_node_required_fields,
 };
@@ -43,6 +42,7 @@ use super::error::NativeFragmentDecodeError;
 use super::node::decode_node_with_runtime_filters;
 use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
 use super::sink::decode_fragment_sink_program_with_context;
+use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
 use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
 use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
 use novarocks_native_adapter::fragment_submission::{
@@ -194,8 +194,8 @@ mod tests {
     use novarocks_types::UniqueId;
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
-    use crate::fragment::decode::instance::decode_instance_params;
     use crate::fragment::decode::request::NativeFragmentRequest;
+    use novarocks_native_adapter::fragment_instance::decode_instance_params;
     use novarocks_plan_codec::encode_native_type as encode_type;
 
     struct NeverCancelled;

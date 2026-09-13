@@ -18,7 +18,6 @@
 //! Native fragment request and plan decoding.
 
 pub(crate) mod expression;
-pub(crate) mod instance;
 pub(crate) mod plan;
 pub(crate) mod request;
 pub(crate) mod submission_validation;

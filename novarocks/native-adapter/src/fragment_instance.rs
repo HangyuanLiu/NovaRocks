@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment-owned decoding for the `InstanceParams` wire portion of a native
-//! fragment submission.
+//! Native `InstanceParams` projection for fragment submission.
 
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
@@ -26,114 +25,115 @@ use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_native_adapter::query_options::decode_query_options;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_proto_models::{common, novarocks as proto};
-use novarocks_types::QueryId;
-use novarocks_types::UniqueId;
+use novarocks_proto_models::novarocks as proto;
+use novarocks_types::{QueryId, UniqueId};
 
-use crate::fragment::ingress::NativeFragmentIngressError;
+use crate::query_options::decode_query_options;
 
-/// Backend-decoded execution values from `InstanceParams`.
+/// Immutable Execution facts decoded from one native `InstanceParams` payload.
 #[derive(Debug)]
-pub(crate) struct NativeFragmentInstanceInput {
-    pub(crate) query_id: QueryId,
-    pub(crate) fragment_instance_id: FragmentInstanceId,
-    pub(crate) backend_num: BackendNum,
-    pub(crate) query_options: QueryOptions,
-    pub(crate) pipeline_dop: NonZeroUsize,
-    pub(crate) raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
-    pub(crate) exchange_inputs: ExchangeInputAssignments,
-    pub(crate) typed_result_sink: bool,
+pub struct NativeFragmentInstanceInput {
+    pub query_id: QueryId,
+    pub fragment_instance_id: FragmentInstanceId,
+    pub backend_num: BackendNum,
+    pub query_options: QueryOptions,
+    pub pipeline_dop: NonZeroUsize,
+    pub raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    pub exchange_inputs: ExchangeInputAssignments,
+    pub typed_result_sink: bool,
 }
 
-impl NativeFragmentInstanceInput {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        query_id: QueryId,
-        fragment_instance_id: FragmentInstanceId,
-        backend_num: BackendNum,
-        query_options: QueryOptions,
-        pipeline_dop: NonZeroUsize,
-        raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
-        exchange_inputs: ExchangeInputAssignments,
-        typed_result_sink: bool,
-    ) -> Self {
-        Self {
-            query_id,
-            fragment_instance_id,
-            backend_num,
-            query_options,
-            pipeline_dop,
-            raw_scan_ranges,
-            exchange_inputs,
-            typed_result_sink,
-        }
+#[allow(clippy::too_many_arguments)]
+fn input(
+    query_id: QueryId,
+    fragment_instance_id: FragmentInstanceId,
+    backend_num: BackendNum,
+    query_options: QueryOptions,
+    pipeline_dop: NonZeroUsize,
+    raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    exchange_inputs: ExchangeInputAssignments,
+    typed_result_sink: bool,
+) -> NativeFragmentInstanceInput {
+    NativeFragmentInstanceInput {
+        query_id,
+        fragment_instance_id,
+        backend_num,
+        query_options,
+        pipeline_dop,
+        raw_scan_ranges,
+        exchange_inputs,
+        typed_result_sink,
     }
 }
 
-pub(crate) fn decode_instance_params(
+pub fn decode_instance_params(
     src: &proto::InstanceParams,
-) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
+) -> Result<NativeFragmentInstanceInput, ProtocolError> {
     decode_instance_params_impl(src, None)
 }
 
-/// Decodes task-local instance facts while taking query-wide execution options
-/// from the already established query context.
-///
-/// The wire copy remains required because its pipeline DOP is also projected
-/// into the task descriptor and must be checked there. It is not reconstructed
-/// into another query-options authority on this path.
-pub(crate) fn decode_instance_params_with_query_options(
+/// Decodes task-local wire facts while using query-wide options already frozen
+/// by the owning query context.
+pub fn decode_instance_params_with_query_options(
     src: &proto::InstanceParams,
     query_options: QueryOptions,
-) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
+) -> Result<NativeFragmentInstanceInput, ProtocolError> {
     decode_instance_params_impl(src, Some(query_options))
 }
 
 fn decode_instance_params_impl(
     src: &proto::InstanceParams,
     context_query_options: Option<QueryOptions>,
-) -> Result<NativeFragmentInstanceInput, NativeFragmentIngressError> {
+) -> Result<NativeFragmentInstanceInput, ProtocolError> {
     let path = FieldPath::root("instance_params");
     let query_id = src.query_id.as_ref().ok_or_else(|| {
-        missing(
+        error(
             path.clone().field("query_id"),
+            ProtocolErrorKind::MissingField,
             "native InstanceParams requires query_id",
         )
     })?;
     let fragment_instance_id = src.fragment_instance_id.as_ref().ok_or_else(|| {
-        missing(
+        error(
             path.clone().field("fragment_instance_id"),
+            ProtocolErrorKind::MissingField,
             "native InstanceParams requires fragment_instance_id",
         )
     })?;
     if src.backend_num < 0 {
-        return Err(out_of_range(
+        return Err(error(
             path.clone().field("backend_num"),
+            ProtocolErrorKind::OutOfRange,
             format!("backend_num must be non-negative, got {}", src.backend_num),
         ));
     }
-    let backend_num = BackendNum::try_new(src.backend_num)
-        .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
+    let backend_num = BackendNum::try_new(src.backend_num).map_err(|detail| {
+        error(
+            path.clone().field("backend_num"),
+            ProtocolErrorKind::InvalidValue,
+            detail.to_string(),
+        )
+    })?;
     let wire_query_options = src.query_options.as_ref().ok_or_else(|| {
-        missing(
+        error(
             path.clone().field("query_options"),
+            ProtocolErrorKind::MissingField,
             "native InstanceParams requires query_options with explicit pipeline_dop",
         )
     })?;
     let query_options = match context_query_options {
         Some(query_options) => query_options,
-        None => decode_query_options(wire_query_options)
-            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?,
+        None => decode_query_options(wire_query_options)?,
     };
     let pipeline_dop = usize::try_from(wire_query_options.pipeline_dop)
         .ok()
         .and_then(NonZeroUsize::new)
         .ok_or_else(|| {
-            out_of_range(
+            error(
                 path.clone().field("query_options").field("pipeline_dop"),
+                ProtocolErrorKind::OutOfRange,
                 format!(
                     "pipeline_dop must be explicitly positive, got {}",
                     wire_query_options.pipeline_dop
@@ -169,10 +169,11 @@ fn decode_instance_params_impl(
             .ok()
             .and_then(NonZeroUsize::new)
             .ok_or_else(|| {
-                out_of_range(
+                error(
                     path.clone()
                         .field("per_exch_num_senders")
                         .map_key(raw_node_id.to_string()),
+                    ProtocolErrorKind::OutOfRange,
                     format!("sender count must be positive, got {sender_count}"),
                 )
             })?;
@@ -181,9 +182,12 @@ fn decode_instance_params_impl(
             ExchangeInputAssignment::new(count),
         );
     }
-    Ok(NativeFragmentInstanceInput::new(
-        query_id_from_native(query_id),
-        FragmentInstanceId::new(unique_id_from_native(fragment_instance_id)),
+    Ok(input(
+        QueryId::new(query_id.hi, query_id.lo),
+        FragmentInstanceId::new(UniqueId::new(
+            fragment_instance_id.hi,
+            fragment_instance_id.lo,
+        )),
         backend_num,
         query_options,
         pipeline_dop,
@@ -196,48 +200,27 @@ fn decode_instance_params_impl(
 fn decode_scan_range_params_at(
     src: &proto::ScanRangeParams,
     path: FieldPath,
-) -> Result<ScanRangeParams, NativeFragmentIngressError> {
+) -> Result<ScanRangeParams, ProtocolError> {
     let range = src.range.as_ref().ok_or_else(|| {
-        missing(
+        error(
             path.clone().field("range"),
+            ProtocolErrorKind::MissingField,
             "native ScanRangeParams requires range",
         )
     })?;
     range.kind.as_ref().ok_or_else(|| {
-        missing(
+        error(
             path.clone().field("range").field("kind"),
+            ProtocolErrorKind::MissingField,
             "native ScanRange requires kind",
         )
     })?;
-    ScanRangeParams::parse(src.clone()).map_err(|error| invalid_value(path, error.detail()))
+    ScanRangeParams::parse(src.clone())
+        .map_err(|parse_error| error(path, ProtocolErrorKind::InvalidValue, parse_error.detail()))
 }
 
-fn protocol_error(
-    path: FieldPath,
-    kind: ProtocolErrorKind,
-    detail: impl Into<String>,
-) -> NativeFragmentIngressError {
-    NativeFragmentIngressError::new(ProtocolError::new(path, kind, detail.into()).to_string())
-}
-
-fn missing(path: FieldPath, detail: impl Into<String>) -> NativeFragmentIngressError {
-    protocol_error(path, ProtocolErrorKind::MissingField, detail)
-}
-
-fn invalid_value(path: FieldPath, detail: impl Into<String>) -> NativeFragmentIngressError {
-    protocol_error(path, ProtocolErrorKind::InvalidValue, detail)
-}
-
-fn out_of_range(path: FieldPath, detail: impl Into<String>) -> NativeFragmentIngressError {
-    protocol_error(path, ProtocolErrorKind::OutOfRange, detail)
-}
-
-fn unique_id_from_native(src: &common::UniqueId) -> UniqueId {
-    UniqueId::new(src.hi, src.lo)
-}
-
-fn query_id_from_native(src: &common::UniqueId) -> QueryId {
-    QueryId::new(src.hi, src.lo)
+fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(path, kind, detail)
 }
 
 #[cfg(test)]
