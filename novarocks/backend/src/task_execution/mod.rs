@@ -43,7 +43,6 @@
 
 mod completion;
 mod context_host;
-mod credential_slot;
 mod execution_host;
 mod feedback;
 pub(crate) mod ingress;

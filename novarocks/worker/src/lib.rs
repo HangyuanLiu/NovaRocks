@@ -30,6 +30,7 @@ mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
 mod convergence;
+mod credential_slot;
 mod deadline;
 mod domain;
 mod drain;
@@ -86,6 +87,7 @@ pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
 pub use convergence::{
     TaskConvergence, TaskConvergenceAdvance, TaskConvergenceRejection, TaskConvergenceSnapshot,
 };
+pub use credential_slot::QueryContextCredentialSlot;
 pub use deadline::{WorkerDeadlineAuthority, WorkerDeadlineSupervisor};
 pub use domain::{
     DomainPolicyRejection, InitialDomainKey, QueryContextDomains, TaskDomains,

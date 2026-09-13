@@ -68,7 +68,6 @@ use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::QueryExecutionId;
 use tracing::error;
 
-use super::credential_slot::QueryContextCredentialSlot;
 use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
 use super::shared_facts::{
@@ -89,8 +88,8 @@ use novarocks_native_adapter::{
 use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
 use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
-    ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextHost,
-    ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
+    ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
+    QueryContextHost, ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
 use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
@@ -490,7 +489,7 @@ impl NativeQueryContextHost {
         // Credentials first: a catalog runtime is the thing most likely to need
         // scoped storage access, so the authority has to exist before the
         // binding that may reach for it.
-        installed.credentials.install(material)?;
+        installed.credentials.install(material.leases())?;
         self.still_establishing(installed)?;
 
         {
@@ -838,7 +837,7 @@ impl QueryContextHost for NativeQueryContextHost {
                 // this rotation as the exact next epoch, and this backend mints
                 // nothing: there is no prepare, no commit, and no catalog call.
                 let material = credential_material(update)?;
-                installed.credentials.install(material)
+                installed.credentials.install(material.leases())
             }
         }
     }
