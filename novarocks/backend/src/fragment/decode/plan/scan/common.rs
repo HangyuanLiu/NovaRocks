@@ -377,33 +377,6 @@ pub(super) fn output_column_data_type(
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(super) fn scan_batch_size(
-    query_options: Option<&novarocks_execution::runtime::query_options::QueryOptions>,
-) -> Result<usize, NativeFragmentLeafDecodeError> {
-    let Some(value) = query_options.and_then(|opts| opts.batch_size()) else {
-        return Ok(4096);
-    };
-    let batch_size = usize::try_from(value).map_err(|_| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::OutOfRange,
-            "batch_size",
-            format!("native ScanNode query_options.batch_size must be positive, got {value}"),
-        )
-    })?;
-    if batch_size == 0 {
-        return Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::OutOfRange,
-            "batch_size",
-            "native ScanNode query_options.batch_size must be positive",
-        ));
-    }
-    Ok(batch_size)
-}
-
 pub(super) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
@@ -446,56 +419,5 @@ pub(super) fn parse_scan_limit(limit: i64) -> Result<Option<usize>, NativeFragme
         ))
     } else {
         Ok(Some(limit as usize))
-    }
-}
-
-/// Loads the object-store configuration that was installed on this BE at
-/// startup. Native fragment payloads must not carry credentials or endpoint
-/// configuration because every BE receives the same deployment configuration.
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(super) fn reject_native_connector_cloud_properties(
-    cloud_properties: &HashMap<String, String>,
-) -> Result<(), NativeFragmentLeafDecodeError> {
-    if cloud_properties.is_empty() {
-        Ok(())
-    } else {
-        Err(NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::InvalidValue,
-            "cloud_properties",
-            "native connector scans must use the BE startup connector configuration; cloud_properties are not accepted",
-        ))
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(super) fn table_location_map(table: &plan::IcebergTableInfo) -> HashMap<i64, String> {
-    let mut locations = HashMap::new();
-    if !table.location.is_empty() {
-        locations.insert(i64::from(table.schema_id), table.location.clone());
-    }
-    locations
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::reject_native_connector_cloud_properties;
-
-    #[test]
-    fn native_connector_scan_rejects_plan_object_store_properties() {
-        let error = reject_native_connector_cloud_properties(&HashMap::from([(
-            "aws.s3.access_key".to_string(),
-            "not-for-the-plan".to_string(),
-        )]))
-        .expect_err("native connector scan must reject plan-side configuration");
-
-        assert!(error.contains("startup connector configuration"));
     }
 }
