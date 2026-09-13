@@ -50,6 +50,8 @@ mod task_protocol_event;
 mod task_registry;
 mod task_registry_config;
 mod task_registry_entry;
+#[cfg(test)]
+mod task_registry_tests;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
