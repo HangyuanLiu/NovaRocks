@@ -23,6 +23,7 @@ novarocks-worker.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+bytes.workspace = true
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true

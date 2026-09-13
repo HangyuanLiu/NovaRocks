@@ -30,9 +30,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
+use bytes::Bytes;
 use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
-use novarocks_execution_contract::task_execution::identity::QueryContextRef;
+use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
+use novarocks_execution_contract::task_execution::operation::ResultByteLimit;
 use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{
@@ -53,6 +56,175 @@ pub type TaskStatusEventStream =
 
 /// The acknowledgement body carried by one task-operation receipt.
 pub type TaskOperationReceiptAck = proto::task_operation_receipt::Ack;
+
+/// A validated root-result read passed from the Native wire adapter to the
+/// role-local result owner.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskResultReadRequest {
+    identity: TaskIdentity,
+    max_wait: Duration,
+    acknowledged_packet_sequence: Option<i64>,
+    max_result_bytes: ResultByteLimit,
+}
+
+impl TaskResultReadRequest {
+    fn new(
+        identity: TaskIdentity,
+        max_wait: Duration,
+        acknowledged_packet_sequence: Option<i64>,
+        max_result_bytes: ResultByteLimit,
+    ) -> Self {
+        Self {
+            identity,
+            max_wait,
+            acknowledged_packet_sequence,
+            max_result_bytes,
+        }
+    }
+
+    /// The exact task identity whose root-result responsibility is queried.
+    pub const fn identity(self) -> TaskIdentity {
+        self.identity
+    }
+
+    /// The bounded wait accepted by the Native request.
+    pub const fn max_wait(self) -> Duration {
+        self.max_wait
+    }
+
+    /// The packet acknowledged by this read, if any.
+    pub const fn acknowledged_packet_sequence(self) -> Option<i64> {
+        self.acknowledged_packet_sequence
+    }
+
+    /// The already validated payload ceiling for this response.
+    pub const fn max_result_bytes(self) -> ResultByteLimit {
+        self.max_result_bytes
+    }
+}
+
+/// One role-local result-buffer observation, before Native response encoding.
+#[derive(Debug)]
+pub enum TaskResultRead {
+    /// One retained payload packet, including the retained EOS packet.
+    Ready {
+        packet_sequence: i64,
+        end_of_stream: bool,
+        payload: Bytes,
+    },
+    /// The exact acknowledged EOS was consumed or replayed.
+    EndOfStream { packet_sequence: i64 },
+    /// No result is ready before the accepted read bound.
+    NotReady,
+    /// A settled, in-band failure or refusal from the role-local owner.
+    Error { detail: String },
+}
+
+/// A role-local invariant failure while answering a validated result read.
+#[derive(Debug)]
+pub struct TaskResultReadError {
+    detail: String,
+}
+
+impl TaskResultReadError {
+    /// Builds an error whose detail is safe for the Native transport boundary.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    /// The safe detail exposed as an internal Native status.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
+/// Role-local authority over root-result routing, buffering, and drain facts.
+#[tonic::async_trait]
+pub trait TaskResultReader: Send + Sync {
+    /// Reads one exact root-result packet after Native wire validation.
+    async fn read_task_result(
+        &self,
+        request: TaskResultReadRequest,
+    ) -> Result<TaskResultRead, TaskResultReadError>;
+}
+
+/// Decodes, delegates, and encodes one Native root-result read.
+pub async fn fetch_task_result(
+    reader: &dyn TaskResultReader,
+    request: proto::FetchTaskResultRequest,
+) -> Result<proto::FetchResultResponse, tonic::Status> {
+    use proto::fetch_result_response::Status as FetchStatus;
+
+    let (identity, max_wait, acknowledged, max_result_bytes) =
+        novarocks_task_codec::operation::decode_fetch_task_result(
+            &request,
+            novarocks_proto_codec::FieldPath::root("fetch_task_result"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let acknowledged_packet_sequence = acknowledged
+        .map(|sequence| {
+            i64::try_from(sequence.get()).map_err(|_| {
+                tonic::Status::invalid_argument(format!(
+                    "acknowledged result packet sequence {} exceeds the wire response range",
+                    sequence.get()
+                ))
+            })
+        })
+        .transpose()?;
+    let read = reader
+        .read_task_result(TaskResultReadRequest::new(
+            identity,
+            max_wait,
+            acknowledged_packet_sequence,
+            max_result_bytes,
+        ))
+        .await
+        .map_err(|error| tonic::Status::internal(error.detail().to_owned()))?;
+    Ok(match read {
+        TaskResultRead::Ready {
+            packet_sequence,
+            end_of_stream,
+            payload,
+        } => task_result_response(
+            FetchStatus::Ready,
+            String::new(),
+            packet_sequence,
+            end_of_stream,
+            payload,
+        ),
+        TaskResultRead::EndOfStream { packet_sequence } => task_result_response(
+            FetchStatus::Eof,
+            String::new(),
+            packet_sequence,
+            true,
+            Bytes::new(),
+        ),
+        TaskResultRead::NotReady => {
+            task_result_response(FetchStatus::NotReady, String::new(), 0, false, Bytes::new())
+        }
+        TaskResultRead::Error { detail } => {
+            task_result_response(FetchStatus::Error, detail, 0, false, Bytes::new())
+        }
+    })
+}
+
+fn task_result_response(
+    status: proto::fetch_result_response::Status,
+    message: String,
+    packet_sequence: i64,
+    end_of_stream: bool,
+    result_arrow_ipc: Bytes,
+) -> proto::FetchResultResponse {
+    proto::FetchResultResponse {
+        status: status as i32,
+        message,
+        packet_seq: packet_sequence,
+        eos: end_of_stream,
+        result_arrow_ipc,
+    }
+}
 
 /// Maps a role-owner rejection onto the status code of a wire read that has no
 /// in-band outcome field.
@@ -272,4 +444,90 @@ pub trait TaskExecutionIngress: Send + Sync {
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status>;
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::{
+        Bytes, TaskResultRead, TaskResultReadError, TaskResultReadRequest, TaskResultReader,
+        fetch_task_result, proto, task_result_response,
+    };
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_task_codec::operation::{
+        MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+    };
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
+    use proto::fetch_result_response::Status as FetchStatus;
+
+    #[test]
+    fn maximum_legal_root_result_fits_the_actual_grpc_response_envelope() {
+        let payload_bytes = usize::try_from(MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES)
+            .expect("the Native result ceiling fits usize");
+        let response = task_result_response(
+            FetchStatus::Ready,
+            String::new(),
+            i64::MAX,
+            true,
+            Bytes::from(vec![0_u8; payload_bytes]),
+        );
+        let encoded_bytes = response.encoded_len();
+        assert!(
+            encoded_bytes <= NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
+            "the maximum legal payload produces a {encoded_bytes}-byte response above the {}-byte decode ceiling",
+            NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
+        );
+    }
+
+    #[test]
+    fn root_result_reader_output_is_encoded_without_a_backend_type() {
+        struct ReadyReader;
+
+        #[tonic::async_trait]
+        impl TaskResultReader for ReadyReader {
+            async fn read_task_result(
+                &self,
+                request: TaskResultReadRequest,
+            ) -> Result<TaskResultRead, TaskResultReadError> {
+                assert_eq!(request.max_wait(), std::time::Duration::from_millis(17));
+                assert_eq!(request.acknowledged_packet_sequence(), Some(3));
+                assert_eq!(request.max_result_bytes().get(), 4096);
+                Ok(TaskResultRead::Ready {
+                    packet_sequence: 4,
+                    end_of_stream: false,
+                    payload: Bytes::from_static(b"result"),
+                })
+            }
+        }
+
+        let identity = TaskIdentity::new(
+            QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(2).expect("attempt id"))
+                .expect("execution id"),
+            StageId::new(3).expect("stage id"),
+            TaskId::new(4).expect("task id"),
+            BackendProcessId::new_v7(),
+        );
+        let response = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("task result adapter runtime")
+            .block_on(fetch_task_result(
+                &ReadyReader,
+                proto::FetchTaskResultRequest {
+                    root_task: Some(novarocks_task_codec::identity::encode_task_identity(
+                        identity,
+                    )),
+                    max_wait_millis: 17,
+                    acknowledged_packet_sequence: Some(3),
+                    max_result_bytes: 4096,
+                },
+            ))
+            .expect("a valid role result is encoded");
+        assert_eq!(response.status, FetchStatus::Ready as i32);
+        assert_eq!(response.packet_seq, 4);
+        assert!(!response.eos);
+        assert_eq!(response.result_arrow_ipc, Bytes::from_static(b"result"));
+    }
 }

@@ -66,7 +66,9 @@ use novarocks_worker::{
     RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
 };
 
+use super::ingress::RegistryTaskExecutionIngress;
 use super::shared_facts::sealed_runtime_filter_evidence;
+use novarocks_native_adapter::task_protocol::TaskExecutionIngress;
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::TaskExecutionRegistry;
 use novarocks_worker::TaskExecutionRegistryConfig;
@@ -2586,14 +2588,14 @@ fn a_dynamic_filter_read_returns_what_the_task_advertised() {
 
 /// Polls the root result plane the way the RPC boundary does.
 fn poll_root_result(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
     poll_root_result_after(registry, identity, None)
 }
 
 fn poll_root_result_after(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
     acknowledged_packet_sequence: Option<u64>,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
@@ -2606,7 +2608,7 @@ fn poll_root_result_after(
 }
 
 fn poll_root_result_after_with_limit(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
     acknowledged_packet_sequence: Option<u64>,
     max_result_bytes: u64,
@@ -2615,8 +2617,13 @@ fn poll_root_result_after_with_limit(
         .enable_time()
         .build()
         .expect("root result test runtime")
-        .block_on(crate::rpc::data_plane::fetch_task_result(
-            registry,
+        .block_on(TaskExecutionIngress::fetch_task_result(
+            RegistryTaskExecutionIngress::new(
+                Arc::clone(registry),
+                NativeCompatibilityId::new([0x71; 32]),
+                novarocks_task_codec::domain::ConfidentialTransport::Plaintext,
+            )
+            .as_ref(),
             novarocks_proto_models::novarocks::FetchTaskResultRequest {
                 root_task: Some(novarocks_task_codec::identity::encode_task_identity(
                     identity,

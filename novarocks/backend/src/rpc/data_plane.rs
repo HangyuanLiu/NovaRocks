@@ -10,20 +10,13 @@ use novarocks_types::UniqueId;
 
 use super::data_plane_handlers;
 use super::data_plane_handlers::{ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery};
-use crate::runtime::result_buffer::{
-    TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed, wait_fetch_typed_legacy,
-};
-use crate::task_execution::TaskExecutionRegistry;
+use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed_legacy};
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, UnavailableExchangeReceiverPort,
 };
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models as proto;
-use novarocks_task_codec::operation::decode_fetch_task_result;
-use novarocks_worker::{
-    InboundFrameClaim, RootResultRoute, StatusAdvance, TaskInboundCapabilities,
-};
+use novarocks_worker::{InboundFrameClaim, TaskInboundCapabilities};
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -183,151 +176,6 @@ impl BackendDataPlane {
     }
 }
 
-/// Serves one root result poll addressed by an exact task identity.
-///
-/// The wire form this replaces addressed a fragment instance, which is a key
-/// any participant of any attempt could name. This one is fenced three ways
-/// before a buffer is touched — exact task, exact backend process, and result
-/// responsibility — and all three refusals are reported in band, because
-/// `FetchResultResponse` has an error status and a refusal must not arrive
-/// looking like an empty answer.
-///
-/// The end-of-stream packet remains retained like every data packet. Only a
-/// later exact acknowledgement releases it and completes the root's output
-/// responsibility; a lost EOS response is therefore replayed byte-for-byte
-/// without publishing a completion the frontend has not observed.
-pub async fn fetch_task_result(
-    registry: &TaskExecutionRegistry,
-    request: proto::novarocks::FetchTaskResultRequest,
-) -> Result<proto::novarocks::FetchResultResponse, tonic::Status> {
-    use proto::novarocks::fetch_result_response::Status as FetchStatus;
-
-    let (identity, max_wait, acknowledged, max_result_bytes) =
-        decode_fetch_task_result(&request, FieldPath::root("fetch_task_result"))
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    let acknowledged = acknowledged
-        .map(|sequence| {
-            i64::try_from(sequence.get()).map_err(|_| {
-                tonic::Status::invalid_argument(format!(
-                    "acknowledged result packet sequence {} exceeds the wire response range",
-                    sequence.get()
-                ))
-            })
-        })
-        .transpose()?;
-    let route = registry.root_result_route(identity);
-    let binding = match route {
-        RootResultRoute::Serve(binding) => binding,
-        RootResultRoute::TerminalResultOwner(_)
-            if replays_task_terminal_ack(identity, acknowledged) =>
-        {
-            let sequence = acknowledged.expect("an exact terminal replay carries its sequence");
-            emit_typed_fetch_marker(
-                FetchMarkerIdentity::Task(identity),
-                FetchStatus::Eof,
-                sequence,
-                true,
-                0,
-            );
-            return Ok(fetch_response(
-                FetchStatus::Eof,
-                String::new(),
-                sequence,
-                true,
-                Vec::new(),
-            ));
-        }
-        route => {
-            let detail = route
-                .refusal_detail()
-                .expect("only a served route has no refusal detail");
-            // A refusal fails the frontend's read, and the frontend sees only this
-            // text. Recording it here is what attributes it to a backend process
-            // and to the route that produced it: a coordinator log alone cannot
-            // say which of this backend's task states the poll landed in.
-            tracing::warn!(
-                task = %identity,
-                route = ?route,
-                "root result poll refused"
-            );
-            emit_typed_fetch_marker(
-                FetchMarkerIdentity::Task(identity),
-                FetchStatus::Error,
-                0,
-                false,
-                0,
-            );
-            return Ok(fetch_response(
-                FetchStatus::Error,
-                detail,
-                0,
-                false,
-                Vec::new(),
-            ));
-        }
-    };
-    Ok(
-        match wait_fetch_task_typed(identity, acknowledged, max_wait, max_result_bytes).await {
-            TryFetchTypedResult::Ready(result) => {
-                emit_typed_fetch_marker(
-                    FetchMarkerIdentity::Task(identity),
-                    FetchStatus::Ready,
-                    result.packet_seq,
-                    result.eos,
-                    result.payload.len(),
-                );
-                fetch_response(
-                    FetchStatus::Ready,
-                    String::new(),
-                    result.packet_seq,
-                    result.eos,
-                    result.payload,
-                )
-            }
-            TryFetchTypedResult::EndAcknowledged => {
-                let advance = binding.note_result_stream_drained();
-                if matches!(
-                    advance,
-                    StatusAdvance::Illegal { .. }
-                        | StatusAdvance::Rejected(_)
-                        | StatusAdvance::VersionExhausted
-                ) {
-                    return Err(tonic::Status::internal(format!(
-                        "root task {identity} could not record its acknowledged result drain: {advance:?}"
-                    )));
-                }
-                emit_typed_fetch_marker(
-                    FetchMarkerIdentity::Task(identity),
-                    FetchStatus::Eof,
-                    acknowledged.expect("an acknowledged end carries its packet sequence"),
-                    true,
-                    0,
-                );
-                fetch_response(
-                    FetchStatus::Eof,
-                    String::new(),
-                    acknowledged.expect("an acknowledged end carries its packet sequence"),
-                    true,
-                    Vec::new(),
-                )
-            }
-            TryFetchTypedResult::NotReady => {
-                fetch_response(FetchStatus::NotReady, String::new(), 0, false, Vec::new())
-            }
-            TryFetchTypedResult::Error(error) => {
-                emit_typed_fetch_marker(
-                    FetchMarkerIdentity::Task(identity),
-                    FetchStatus::Error,
-                    0,
-                    false,
-                    0,
-                );
-                fetch_response(FetchStatus::Error, error.message, 0, false, Vec::new())
-            }
-        },
-    )
-}
-
 fn fetch_response(
     status: proto::novarocks::fetch_result_response::Status,
     message: String,
@@ -365,6 +213,24 @@ fn emit_typed_fetch_marker(
             typed_fetch_marker(identity, status, packet_seq, eos, payload_bytes)
         );
     }
+}
+
+/// Emits the role-local task-result diagnostic after the result owner has
+/// settled the read, while Native Adapter owns the wire response itself.
+pub(crate) fn emit_task_fetch_marker(
+    identity: TaskIdentity,
+    status: proto::novarocks::fetch_result_response::Status,
+    packet_seq: i64,
+    eos: bool,
+    payload_bytes: usize,
+) {
+    emit_typed_fetch_marker(
+        FetchMarkerIdentity::Task(identity),
+        status,
+        packet_seq,
+        eos,
+        payload_bytes,
+    );
 }
 
 fn should_emit_typed_fetch_marker(
@@ -413,16 +279,8 @@ fn typed_fetch_marker(
 
 #[cfg(test)]
 mod tests {
-    use prost::Message;
-
-    use super::{
-        FetchMarkerIdentity, fetch_response, proto, should_emit_typed_fetch_marker,
-        typed_fetch_marker,
-    };
+    use super::{FetchMarkerIdentity, proto, should_emit_typed_fetch_marker, typed_fetch_marker};
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
-    use novarocks_task_codec::operation::{
-        MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES, NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
-    };
     use novarocks_types::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId, UniqueId,
     };
@@ -478,24 +336,5 @@ mod tests {
             0,
             false
         ));
-    }
-
-    #[test]
-    fn maximum_legal_root_result_fits_the_actual_grpc_response_envelope() {
-        let payload_bytes = usize::try_from(MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES)
-            .expect("the Native result ceiling fits usize");
-        let response = fetch_response(
-            FetchStatus::Ready,
-            String::new(),
-            i64::MAX,
-            true,
-            vec![0_u8; payload_bytes],
-        );
-        let encoded_bytes = response.encoded_len();
-        assert!(
-            encoded_bytes <= NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES,
-            "the maximum legal payload produces a {encoded_bytes}-byte response above the {}-byte decode ceiling",
-            NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES
-        );
     }
 }

@@ -70,10 +70,12 @@ use novarocks_types::NativeCompatibilityId;
 use super::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
 use novarocks_native_adapter::task_protocol::{
-    TaskExecutionIngress, TaskOperationReceiptAck as ReceiptAck, TaskStatusEventStream,
-    encode_operation_receipt, host_rejection_status, task_status_event_stream,
+    TaskExecutionIngress, TaskOperationReceiptAck as ReceiptAck, TaskResultRead,
+    TaskResultReadError, TaskResultReadRequest, TaskResultReader, TaskStatusEventStream,
+    encode_operation_receipt, fetch_task_result, host_rejection_status, task_status_event_stream,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
+use novarocks_worker::{RootResultRoute, StatusAdvance};
 
 /// The wire adapter of one backend's task protocol owner.
 pub(crate) struct RegistryTaskExecutionIngress {
@@ -276,6 +278,100 @@ impl RegistryTaskExecutionIngress {
 }
 
 #[tonic::async_trait]
+impl TaskResultReader for RegistryTaskExecutionIngress {
+    async fn read_task_result(
+        &self,
+        request: TaskResultReadRequest,
+    ) -> Result<TaskResultRead, TaskResultReadError> {
+        use crate::rpc::data_plane::emit_task_fetch_marker;
+        use crate::runtime::result_buffer::{
+            TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
+        };
+        use proto::fetch_result_response::Status as FetchStatus;
+
+        let identity = request.identity();
+        let acknowledged = request.acknowledged_packet_sequence();
+        let route = self.registry.root_result_route(identity);
+        let binding = match route {
+            RootResultRoute::Serve(binding) => binding,
+            RootResultRoute::TerminalResultOwner(_)
+                if replays_task_terminal_ack(identity, acknowledged) =>
+            {
+                let packet_sequence =
+                    acknowledged.expect("an exact terminal replay carries its sequence");
+                emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                return Ok(TaskResultRead::EndOfStream { packet_sequence });
+            }
+            route => {
+                let detail = route
+                    .refusal_detail()
+                    .expect("only a served route has no refusal detail");
+                // A refusal fails the frontend's read, and the frontend sees only this
+                // text. Recording it here is what attributes it to a backend process
+                // and to the route that produced it: a coordinator log alone cannot
+                // say which of this backend's task states the poll landed in.
+                tracing::warn!(
+                    task = %identity,
+                    route = ?route,
+                    "root result poll refused"
+                );
+                emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                return Ok(TaskResultRead::Error { detail });
+            }
+        };
+        Ok(
+            match wait_fetch_task_typed(
+                identity,
+                acknowledged,
+                request.max_wait(),
+                request.max_result_bytes(),
+            )
+            .await
+            {
+                TryFetchTypedResult::Ready(result) => {
+                    emit_task_fetch_marker(
+                        identity,
+                        FetchStatus::Ready,
+                        result.packet_seq,
+                        result.eos,
+                        result.payload.len(),
+                    );
+                    TaskResultRead::Ready {
+                        packet_sequence: result.packet_seq,
+                        end_of_stream: result.eos,
+                        payload: result.payload,
+                    }
+                }
+                TryFetchTypedResult::EndAcknowledged => {
+                    let advance = binding.note_result_stream_drained();
+                    if matches!(
+                        advance,
+                        StatusAdvance::Illegal { .. }
+                            | StatusAdvance::Rejected(_)
+                            | StatusAdvance::VersionExhausted
+                    ) {
+                        return Err(TaskResultReadError::new(format!(
+                            "root task {identity} could not record its acknowledged result drain: {advance:?}"
+                        )));
+                    }
+                    let packet_sequence =
+                        acknowledged.expect("an acknowledged end carries its packet sequence");
+                    emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                    TaskResultRead::EndOfStream { packet_sequence }
+                }
+                TryFetchTypedResult::NotReady => TaskResultRead::NotReady,
+                TryFetchTypedResult::Error(error) => {
+                    emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                    TaskResultRead::Error {
+                        detail: error.message,
+                    }
+                }
+            },
+        )
+    }
+}
+
+#[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
         &self,
@@ -399,10 +495,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
-        // The semantics live with the result plane, beside the buffer they
-        // read. Two implementations of one RPC drift, and the one that drifts
-        // is always the one nobody is looking at.
-        crate::rpc::data_plane::fetch_task_result(&self.registry, request).await
+        fetch_task_result(self, request).await
     }
 }
 
