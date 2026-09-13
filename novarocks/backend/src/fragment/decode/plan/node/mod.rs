@@ -30,6 +30,7 @@ mod nestloop_join;
 mod project;
 #[cfg(test)]
 mod sort;
+#[cfg(test)]
 mod table_function;
 mod table_write;
 #[cfg(test)]
@@ -66,7 +67,7 @@ use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
     lower_filter_node, lower_generate_series_node, lower_limit_node, lower_project_node,
     lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_sort_node,
-    lower_topn_node, lower_values_node, parse_distributed_limit,
+    lower_table_function_node, lower_topn_node, lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1665,16 +1666,13 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::TableFunction(table_function) => {
-            table_function::lower_table_function_node(
-                node,
-                table_function,
-                path.clone().field("table_function"),
-                children,
-                arena,
-                ctx,
-            )
-        }
+        plan::plan_node::Kind::TableFunction(table_function) => lower_table_function_node(
+            node,
+            table_function,
+            path.clone().field("table_function"),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::Decode(_) => Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("decode"),
             "native physical node kind Decode is unsupported",
