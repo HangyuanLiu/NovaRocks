@@ -41,10 +41,10 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
-use crate::runtime_filter::rpc::{
+use crate::task_execution::NativeQueryContextHost;
+use novarocks_native_adapter::runtime_filter_rpc::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
-use crate::task_execution::NativeQueryContextHost;
 use novarocks_worker::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 
 const NO_OWNER_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: no runtime-filter participant owner on this backend holds this query execution attempt";

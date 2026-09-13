@@ -2651,8 +2651,8 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         // The one decoder that turns a wire envelope into a backend one lives
         // in the runtime-filter transport. Reusing it is what keeps this from
         // becoming a second authority over the same wire shape.
-        let response = crate::runtime_filter::rpc::handle_runtime_filter_envelope(
-            participant as Arc<dyn crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress>,
+        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope(
+            participant as Arc<dyn novarocks_native_adapter::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress>,
             envelope,
         )
         .map_err(|status| protocol(&format!("task dynamic filter was refused: {status}")))?;

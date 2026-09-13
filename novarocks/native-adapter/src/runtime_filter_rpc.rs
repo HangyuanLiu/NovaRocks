@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Native Runtime Filter envelope codec and ingress adapter.
+
 use std::sync::Arc;
 
 use novarocks_execution::runtime_filter::{
@@ -35,51 +37,47 @@ use novarocks_worker::runtime_filter::domain::{
 /// The RPC adapter's typed, Backend-owned ingress boundary. The query
 /// lifecycle registry owns the later install/routing authorization; this port
 /// only receives a wire-valid envelope and reports its exact ACK disposition.
-pub(crate) trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
+pub trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
     fn accept(&self, envelope: BackendNativeRuntimeFilterEnvelope) -> BackendIngressResult;
 }
 
 /// Runtime-filter coordinates as they exist on the native wire before a
 /// participant resolves them against an installed route graph.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum BackendNativeRouteIdentity {
+pub enum BackendNativeRouteIdentity {
     Contribution(BackendNativeContributionRouteIdentity),
     Delivery(BackendNativeDeliveryRouteIdentity),
     ProducerInstance(BackendNativeProducerInstanceRouteIdentity),
 }
 
 impl BackendNativeRouteIdentity {
-    pub(crate) const fn contribution(identity: BackendNativeContributionRouteIdentity) -> Self {
+    pub const fn contribution(identity: BackendNativeContributionRouteIdentity) -> Self {
         Self::Contribution(identity)
     }
 
-    pub(crate) const fn delivery(identity: BackendNativeDeliveryRouteIdentity) -> Self {
+    pub const fn delivery(identity: BackendNativeDeliveryRouteIdentity) -> Self {
         Self::Delivery(identity)
     }
 
-    pub(crate) const fn producer_instance(
-        identity: BackendNativeProducerInstanceRouteIdentity,
-    ) -> Self {
+    pub const fn producer_instance(identity: BackendNativeProducerInstanceRouteIdentity) -> Self {
         Self::ProducerInstance(identity)
     }
 
-    pub(crate) const fn as_contribution(&self) -> Option<BackendNativeContributionRouteIdentity> {
+    pub const fn as_contribution(&self) -> Option<BackendNativeContributionRouteIdentity> {
         match self {
             Self::Contribution(identity) => Some(*identity),
             _ => None,
         }
     }
 
-    pub(crate) const fn as_delivery(&self) -> Option<BackendNativeDeliveryRouteIdentity> {
+    pub const fn as_delivery(&self) -> Option<BackendNativeDeliveryRouteIdentity> {
         match self {
             Self::Delivery(identity) => Some(*identity),
             _ => None,
         }
     }
 
-    pub(crate) const fn as_producer_instance(
-        &self,
-    ) -> Option<BackendNativeProducerInstanceRouteIdentity> {
+    pub const fn as_producer_instance(&self) -> Option<BackendNativeProducerInstanceRouteIdentity> {
         match self {
             Self::ProducerInstance(identity) => Some(*identity),
             _ => None,
@@ -88,7 +86,7 @@ impl BackendNativeRouteIdentity {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendNativeContributionRouteIdentity {
+pub struct BackendNativeContributionRouteIdentity {
     producer_binding_id: RuntimeFilterBindingId,
     fragment_instance_id: UniqueId,
     partition_id: PartitionId,
@@ -96,7 +94,7 @@ pub(crate) struct BackendNativeContributionRouteIdentity {
 }
 
 impl BackendNativeContributionRouteIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         producer_binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
         partition_id: PartitionId,
@@ -110,31 +108,31 @@ impl BackendNativeContributionRouteIdentity {
         }
     }
 
-    pub(crate) const fn producer_binding_id(self) -> RuntimeFilterBindingId {
+    pub const fn producer_binding_id(self) -> RuntimeFilterBindingId {
         self.producer_binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn partition_id(self) -> PartitionId {
+    pub const fn partition_id(self) -> PartitionId {
         self.partition_id
     }
 
-    pub(crate) const fn sequence(self) -> BackendTransportSequence {
+    pub const fn sequence(self) -> BackendTransportSequence {
         self.sequence
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendNativeDeliveryRouteIdentity {
+pub struct BackendNativeDeliveryRouteIdentity {
     route_edge_id: BackendRouteEdgeId,
     sequence: BackendTransportSequence,
 }
 
 impl BackendNativeDeliveryRouteIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         route_edge_id: BackendRouteEdgeId,
         sequence: BackendTransportSequence,
     ) -> Self {
@@ -144,23 +142,23 @@ impl BackendNativeDeliveryRouteIdentity {
         }
     }
 
-    pub(crate) const fn route_edge_id(self) -> BackendRouteEdgeId {
+    pub const fn route_edge_id(self) -> BackendRouteEdgeId {
         self.route_edge_id
     }
 
-    pub(crate) const fn sequence(self) -> BackendTransportSequence {
+    pub const fn sequence(self) -> BackendTransportSequence {
         self.sequence
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendNativeProducerInstanceRouteIdentity {
+pub struct BackendNativeProducerInstanceRouteIdentity {
     producer_binding_id: RuntimeFilterBindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl BackendNativeProducerInstanceRouteIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         producer_binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
     ) -> Self {
@@ -170,11 +168,11 @@ impl BackendNativeProducerInstanceRouteIdentity {
         }
     }
 
-    pub(crate) const fn producer_binding_id(self) -> RuntimeFilterBindingId {
+    pub const fn producer_binding_id(self) -> RuntimeFilterBindingId {
         self.producer_binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
@@ -183,7 +181,7 @@ impl BackendNativeProducerInstanceRouteIdentity {
 /// authorization, so delivery routes do not invent a consumer binding absent
 /// from the frozen protobuf shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendNativeRuntimeFilterEnvelope {
+pub struct BackendNativeRuntimeFilterEnvelope {
     kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     participant: BackendParticipantIdentity,
     channel_id: RuntimeFilterChannelId,
@@ -200,7 +198,7 @@ pub(crate) struct BackendNativeRuntimeFilterEnvelope {
 )]
 impl BackendNativeRuntimeFilterEnvelope {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
         participant: BackendParticipantIdentity,
         channel_id: RuntimeFilterChannelId,
@@ -235,45 +233,43 @@ impl BackendNativeRuntimeFilterEnvelope {
         })
     }
 
-    pub(crate) const fn kind(
-        &self,
-    ) -> novarocks_worker::runtime_filter::domain::BackendEnvelopeKind {
+    pub const fn kind(&self) -> novarocks_worker::runtime_filter::domain::BackendEnvelopeKind {
         self.kind
     }
 
-    pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
+    pub const fn participant(&self) -> BackendParticipantIdentity {
         self.participant
     }
 
-    pub(crate) const fn query_id(&self) -> UniqueId {
+    pub const fn query_id(&self) -> UniqueId {
         self.participant.query_id()
     }
 
-    pub(crate) const fn deployment_epoch(&self) -> u64 {
+    pub const fn deployment_epoch(&self) -> u64 {
         self.participant.deployment_epoch()
     }
 
-    pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
+    pub const fn channel_id(&self) -> RuntimeFilterChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn route_identity(&self) -> &BackendNativeRouteIdentity {
+    pub const fn route_identity(&self) -> &BackendNativeRouteIdentity {
         &self.route_identity
     }
 
-    pub(crate) const fn producer_open(&self) -> Option<BackendProducerOpenMetadata> {
+    pub const fn producer_open(&self) -> Option<BackendProducerOpenMetadata> {
         self.producer_open
     }
 
-    pub(crate) const fn accept_status(&self) -> Option<BackendAcceptStatus> {
+    pub const fn accept_status(&self) -> Option<BackendAcceptStatus> {
         self.accept_status
     }
 
-    pub(crate) const fn schema_digest(&self) -> &[u8; 32] {
+    pub const fn schema_digest(&self) -> &[u8; 32] {
         &self.schema_digest
     }
 
-    pub(crate) fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &[u8] {
         self.payload.as_ref()
     }
 }
@@ -356,7 +352,7 @@ fn validate_native_presence(
     Ok(())
 }
 
-pub(crate) fn encode_runtime_filter_envelope(
+pub fn encode_runtime_filter_envelope(
     envelope: &BackendNativeRuntimeFilterEnvelope,
 ) -> proto::filter::RuntimeFilterEnvelope {
     proto::filter::RuntimeFilterEnvelope {
@@ -413,7 +409,7 @@ pub(crate) fn decode_runtime_filter_envelope_response(
     clippy::result_large_err,
     reason = "The native transport adapter returns tonic status directly."
 )]
-pub(crate) fn handle_runtime_filter_envelope(
+pub fn handle_runtime_filter_envelope(
     ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     request: proto::filter::RuntimeFilterEnvelope,
 ) -> Result<proto::filter::RuntimeFilterEnvelopeResponse, tonic::Status> {

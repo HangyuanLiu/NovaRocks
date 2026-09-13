@@ -28,7 +28,9 @@ pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
 pub mod runtime_filter_install;
 pub mod runtime_filter_membership;
+pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
+pub mod runtime_filter_transport;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

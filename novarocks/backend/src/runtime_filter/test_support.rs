@@ -64,13 +64,15 @@ pub(crate) fn participant_execution_id() -> novarocks_proto_codec::lifecycle::Qu
 /// One delivery envelope addressed to `participant_for_test`'s attempt.
 pub(crate) fn delivery_envelope_for_test(
     kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
-) -> super::rpc::BackendNativeRuntimeFilterEnvelope {
-    use super::rpc::{BackendNativeDeliveryRouteIdentity, BackendNativeRouteIdentity};
+) -> novarocks_native_adapter::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope {
     use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
+    use novarocks_native_adapter::runtime_filter_rpc::{
+        BackendNativeDeliveryRouteIdentity, BackendNativeRouteIdentity,
+    };
     use novarocks_worker::runtime_filter::domain::{BackendRouteEdgeId, BackendTransportSequence};
 
     let execution_id = participant_execution_id();
-    super::rpc::BackendNativeRuntimeFilterEnvelope::new(
+    novarocks_native_adapter::runtime_filter_rpc::BackendNativeRuntimeFilterEnvelope::new(
         kind,
         BackendParticipantIdentity::new(
             UniqueId::new(

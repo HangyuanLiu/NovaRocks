@@ -33,19 +33,21 @@ use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason}
 use novarocks_types::UniqueId;
 use prost::Message;
 
-use crate::runtime_filter::rpc::{
-    BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
-    BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
-    BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
-};
-use crate::runtime_filter::transport::{
-    BackendNativeRuntimeFilterTransportEnvelope, BackendRuntimeFilterEnvelopeSink,
-    BackendRuntimeFilterRetryPolicy, BackendRuntimeFilterSinkCompletion,
-    BackendRuntimeFilterSinkSubmitOutcome, BackendRuntimeFilterTransportFailureReason,
-    GrpcRuntimeFilterEnvelopeSink,
-};
 use novarocks_native_adapter::{
-    BackendDataRuntime, runtime_filter_install::DecodedRuntimeFilterContribution,
+    BackendDataRuntime,
+    runtime_filter_install::DecodedRuntimeFilterContribution,
+    runtime_filter_rpc::{
+        BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
+        BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
+        BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
+        encode_runtime_filter_envelope,
+    },
+    runtime_filter_transport::{
+        BackendNativeRuntimeFilterTransportEnvelope, BackendRuntimeFilterEnvelopeSink,
+        BackendRuntimeFilterRetryPolicy, BackendRuntimeFilterSinkCompletion,
+        BackendRuntimeFilterSinkSubmitOutcome, BackendRuntimeFilterTransportFailureReason,
+        GrpcRuntimeFilterEnvelopeSink,
+    },
 };
 use novarocks_worker::runtime_filter::domain::{
     BackendChannelIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink, BackendIngressResult,
@@ -615,8 +617,7 @@ impl BackendParticipantOutbound {
             ),
             route.edge_id(),
         );
-        let bytes =
-            crate::runtime_filter::rpc::encode_runtime_filter_envelope(&envelope).encoded_len();
+        let bytes = encode_runtime_filter_envelope(&envelope).encoded_len();
         let route_identity = *envelope.route_identity();
         let Ok(envelope) = BackendNativeRuntimeFilterTransportEnvelope::new(
             Arc::new(envelope),
@@ -843,7 +844,7 @@ mod tests {
     use novarocks_types::QueryId;
 
     use super::*;
-    use crate::runtime_filter::transport::{
+    use novarocks_native_adapter::runtime_filter_transport::{
         BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
     };
     use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};

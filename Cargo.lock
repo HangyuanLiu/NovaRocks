@@ -4006,14 +4006,17 @@ name = "novarocks-native-adapter"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "axum 0.7.9",
  "hyper",
  "hyper-util",
  "novarocks-execution",
+ "novarocks-failpoint",
  "novarocks-native-trust",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
+ "novarocks-secret",
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-worker",

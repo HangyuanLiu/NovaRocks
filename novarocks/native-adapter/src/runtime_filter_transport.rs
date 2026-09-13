@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend gRPC sender for runtime-filter envelopes.
+//! Native gRPC sender for runtime-filter envelopes.
 //!
 //! The sender owns only bounded unary delivery. Route authority belongs to the
-//! Backend participant domain and canonical contribution/artifact semantics
+//! Worker participant domain and canonical contribution/artifact semantics
 //! remain outside this module.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,11 +32,11 @@ use prost::Message;
 
 use novarocks_proto_models::filter::RuntimeFilterEnvelopeResponse;
 
-use crate::runtime_filter::rpc::{
+use crate::runtime_filter_rpc::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
-use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
+use crate::{BackendDataRuntime, NativeRpcClient};
 use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
 use novarocks_worker::{
     ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
@@ -46,8 +46,39 @@ use novarocks_worker::{
 const LIVE_REQUEST_CAPACITY: usize = 1024;
 const LIVE_COMPLETION_CAPACITY: usize = 1024;
 
+#[cfg(test)]
+fn test_backend_data_runtime() -> BackendDataRuntime {
+    use novarocks_native_trust::{
+        DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+    };
+    use novarocks_secret::SecretValue;
+
+    static TEST_RUNTIME: std::sync::LazyLock<(tokio::runtime::Runtime, BackendDataRuntime)> =
+        std::sync::LazyLock::new(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .expect("build Native Adapter test data runtime");
+            let trust = Arc::new(NativeTrust::new(
+                DeploymentId::parse("native-adapter-test").expect("valid deployment"),
+                ValidatedSharedSecret::new(SecretValue::new("0123456789abcdef0123456789abcdef"))
+                    .expect("valid secret"),
+                NativeCallerSubject::parse("be@127.0.0.1:9070").expect("valid subject"),
+                NativeTransportMode::Disabled,
+            ));
+            let adapter = BackendDataRuntime::new(
+                runtime.handle().clone(),
+                trust,
+                crate::BackendNativeTransport::Plaintext,
+            );
+            (runtime, adapter)
+        });
+    TEST_RUNTIME.1.clone()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRuntimeFilterUnaryAck {
+pub struct BackendRuntimeFilterUnaryAck {
     identity: BackendNativeRouteIdentity,
     status: BackendAcceptStatus,
 }
@@ -70,7 +101,7 @@ impl BackendRuntimeFilterUnaryAck {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRuntimeFilterUnaryError {
+pub enum BackendRuntimeFilterUnaryError {
     Transport(String),
     Contract(String),
 }
@@ -87,7 +118,7 @@ impl BackendRuntimeFilterUnaryError {
 
 /// Frozen per-query policy for native runtime-filter unary delivery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRuntimeFilterRetryPolicy {
+pub struct BackendRuntimeFilterRetryPolicy {
     retry_interval: Duration,
     max_attempts: u32,
     deadline: Duration,
@@ -96,7 +127,7 @@ pub(crate) struct BackendRuntimeFilterRetryPolicy {
 }
 
 impl BackendRuntimeFilterRetryPolicy {
-    pub(crate) fn new(
+    pub fn new(
         retry_interval: Duration,
         max_attempts: u32,
         deadline: Duration,
@@ -146,20 +177,20 @@ impl ReliableTransportPolicy for BackendRuntimeFilterRetryPolicy {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct BackendNativeRuntimeFilterTransportEnvelope {
+pub struct BackendNativeRuntimeFilterTransportEnvelope {
     envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
     policy: BackendRuntimeFilterRetryPolicy,
 }
 
 impl BackendNativeRuntimeFilterTransportEnvelope {
-    pub(crate) fn new(
+    pub fn new(
         envelope: Arc<BackendNativeRuntimeFilterEnvelope>,
         policy: BackendRuntimeFilterRetryPolicy,
     ) -> Result<Self, BackendRuntimeFilterUnaryError> {
         Ok(Self { envelope, policy })
     }
 
-    pub(crate) fn into_parts(
+    pub fn into_parts(
         self,
     ) -> (
         Arc<BackendNativeRuntimeFilterEnvelope>,
@@ -170,14 +201,14 @@ impl BackendNativeRuntimeFilterTransportEnvelope {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRuntimeFilterSinkSubmitOutcome {
+pub enum BackendRuntimeFilterSinkSubmitOutcome {
     Submitted,
     QueueFull,
     Shutdown,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRuntimeFilterSinkCompletion {
+pub enum BackendRuntimeFilterSinkCompletion {
     Ack(BackendNativeRouteIdentity, BackendAcceptStatus),
     Retried(BackendNativeRouteIdentity),
     TransportFailure(
@@ -188,7 +219,7 @@ pub(crate) enum BackendRuntimeFilterSinkCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRuntimeFilterTransportFailureReason {
+pub enum BackendRuntimeFilterTransportFailureReason {
     Deadline,
     AttemptsExhausted,
     ContractRejected,
@@ -197,7 +228,7 @@ pub(crate) enum BackendRuntimeFilterTransportFailureReason {
 /// Backend-native sink contract. It deliberately does not expose the old Core
 /// router transport types; the Backend reliable transport integrates through
 /// this port once it owns the physical route session.
-pub(crate) trait BackendRuntimeFilterEnvelopeSink: Send + Sync {
+pub trait BackendRuntimeFilterEnvelopeSink: Send + Sync {
     fn try_send(
         &self,
         route: BackendRemoteRoute,
@@ -210,7 +241,7 @@ pub(crate) trait BackendRuntimeFilterEnvelopeSink: Send + Sync {
 }
 
 #[async_trait::async_trait]
-pub(crate) trait BackendRuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static {
+pub trait BackendRuntimeFilterEnvelopeUnaryClient: Send + Sync + 'static {
     async fn transmit(
         &self,
         route: BackendRemoteRoute,
@@ -280,7 +311,7 @@ struct SinkRequest {
     envelope: BackendNativeRuntimeFilterTransportEnvelope,
 }
 
-pub(crate) struct GrpcRuntimeFilterEnvelopeSink {
+pub struct GrpcRuntimeFilterEnvelopeSink {
     requests: mpsc::Sender<SinkRequest>,
     completions: Mutex<mpsc::Receiver<BackendRuntimeFilterSinkCompletion>>,
     shutdown: Arc<AtomicBool>,
@@ -293,7 +324,7 @@ pub(crate) struct GrpcRuntimeFilterEnvelopeSink {
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl GrpcRuntimeFilterEnvelopeSink {
-    pub(crate) fn new(runtime: BackendDataRuntime) -> Arc<Self> {
+    pub fn new(runtime: BackendDataRuntime) -> Arc<Self> {
         Self::new_with_client_and_capacities(
             runtime.clone(),
             Arc::new(LiveRuntimeFilterEnvelopeUnaryClient {
@@ -314,7 +345,7 @@ impl GrpcRuntimeFilterEnvelopeSink {
             return Err("runtime filter sink capacities must be nonzero".to_string());
         }
         Ok(Self::new_with_client_and_capacities(
-            crate::rpc::runtime::test_backend_data_runtime(),
+            test_backend_data_runtime(),
             client,
             request_capacity,
             completion_capacity,
@@ -605,9 +636,8 @@ const fn failure_reason(
 mod tests {
     use super::{
         BackendRuntimeFilterEnvelopeSink, GrpcRuntimeFilterEnvelopeSink,
-        decode_runtime_filter_unary_ack,
+        decode_runtime_filter_unary_ack, test_backend_data_runtime,
     };
-    use crate::rpc::runtime::test_backend_data_runtime;
     use novarocks_proto_models::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
         RuntimeFilterEnvelopeResponse, RuntimeFilterRouteIdentity,

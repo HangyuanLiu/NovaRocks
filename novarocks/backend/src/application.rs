@@ -21,7 +21,6 @@ use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::rpc::server::BackendRpcService;
 use crate::rpc::task_execution::TaskExecutionIngress;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
-use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
 use crate::task_execution::{
     RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
     backend_task_execution_ports,
@@ -30,6 +29,7 @@ use novarocks_native_adapter::{
     BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
     backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
     backend_readiness::wait_for_backend_native_endpoint_ready,
+    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress,
 };
 // Only the refusing hosts below name these, and they exist for one test.
 #[cfg(test)]
