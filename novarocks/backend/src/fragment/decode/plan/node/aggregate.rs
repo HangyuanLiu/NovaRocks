@@ -23,7 +23,6 @@ use arrow::datatypes::{DataType, Field, Fields};
 
 use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
@@ -34,6 +33,7 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_functions::{
     AggregateOverloadIdentity, AggregateStateFormatIdentity, ResolvedAggregateSignature,
 };
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;

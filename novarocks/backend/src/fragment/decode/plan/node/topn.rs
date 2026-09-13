@@ -20,10 +20,10 @@
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
 use super::sort::{lower_sort_items_with_context, parse_sort_topn_type};
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::SortNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 

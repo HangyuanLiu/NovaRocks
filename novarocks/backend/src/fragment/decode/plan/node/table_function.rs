@@ -23,13 +23,13 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, expr, plan};
 use novarocks_types::SlotId;

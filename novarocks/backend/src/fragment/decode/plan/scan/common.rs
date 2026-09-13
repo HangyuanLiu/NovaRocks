@@ -20,7 +20,6 @@
 use arrow::datatypes::DataType;
 
 use super::super::context::NativePlanDecodeContext;
-use super::super::error::NativeFragmentLeafDecodeError;
 use crate::connector::batch_transform::ConnectorBatchTransform;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
@@ -28,6 +27,7 @@ use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
+use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;

@@ -21,11 +21,13 @@ use super::common::{
     build_slot_projection, parse_distributed_limit, parse_optional_nonnegative_i64,
 };
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
@@ -211,12 +213,12 @@ fn lower_sort_items_with_decoder(
 
 pub(super) fn parse_sort_topn_type(
     value: Option<i32>,
-) -> Result<SortTopNType, crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError> {
+) -> Result<SortTopNType, NativeFragmentLeafDecodeError> {
     let Some(value) = value else {
         return Ok(SortTopNType::RowNumber);
     };
     match plan::SortTopNType::try_from(value).map_err(|_| {
-        crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError::at_field(
+        NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidEnum,
             "topn_type",
             format!("SortNode unknown topn_type {value}"),

@@ -44,7 +44,6 @@ use novarocks_execution::runtime_filter as execution;
 use std::collections::BTreeMap;
 
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use crate::fragment::decode::plan::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
     NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
@@ -64,6 +63,7 @@ use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -2080,9 +2080,7 @@ mod tests {
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."
     )]
-    fn decode_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         decode_node(
             node,
             &mut ExprArena::default(),

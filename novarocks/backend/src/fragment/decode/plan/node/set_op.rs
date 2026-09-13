@@ -18,7 +18,6 @@
 //! Fragment set-operation decoding.
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
@@ -26,6 +25,7 @@ use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
 use novarocks_execution::exec::node::union_all::UnionAllNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_plan_codec::native_type::decode_type;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, plan};

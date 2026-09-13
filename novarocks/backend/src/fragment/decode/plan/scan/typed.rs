@@ -47,12 +47,12 @@ use crate::connector::typed_runtime::{
 };
 
 use super::super::context::NativePlanDecodeContext;
-use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::node::DecodedNode;
 use super::common::{
     ConnectorVariantPathTransform, lower_scan_predicate, parse_scan_limit,
     validate_variant_path_read_slots,
 };
+use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
 pub(super) fn lower_typed_connector_scan(

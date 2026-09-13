@@ -25,12 +25,12 @@ use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common as proto_common, plan};
 

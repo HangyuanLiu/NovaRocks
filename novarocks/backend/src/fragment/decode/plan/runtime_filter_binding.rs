@@ -21,9 +21,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 

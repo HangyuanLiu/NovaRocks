@@ -23,11 +23,13 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field};
 
 use super::DecodedNode;
-use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::node::repeat::RepeatNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
@@ -37,7 +39,7 @@ pub(super) fn lower_repeat_node(
     repeat: &plan::RepeatNode,
     path: FieldPath,
     mut children: Vec<DecodedNode>,
-) -> Result<DecodedNode, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let repeat_times = repeat.grouping_ids.len();
@@ -224,6 +226,7 @@ mod tests {
     use super::super::tests::{lower, physical_node, two_col_values_node};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::plan;
 
@@ -245,9 +248,7 @@ mod tests {
         )
     }
 
-    fn decode_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         let mut arena = ExprArena::default();
         super::super::decode_node(
             node,

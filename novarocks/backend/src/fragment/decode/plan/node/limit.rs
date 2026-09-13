@@ -19,9 +19,11 @@
 
 use super::DecodedNode;
 use super::common::{merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64};
-use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
@@ -31,7 +33,7 @@ pub(super) fn lower_limit_node(
     path: FieldPath,
     node_path: FieldPath,
     mut children: Vec<DecodedNode>,
-) -> Result<DecodedNode, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let payload_limit = parse_optional_nonnegative_i64(limit_node.limit, "LimitNode.limit")
         .map_err(|error| {
@@ -40,10 +42,7 @@ pub(super) fn lower_limit_node(
         })?;
     let outer_limit = parse_distributed_limit(node.limit, "LimitNode DistributedNode.limit")
         .map_err(|error| {
-            crate::fragment::decode::plan::error::NativeFragmentDecodeError::out_of_range(
-                node_path.field("limit"),
-                error,
-            )
+            NativeFragmentDecodeError::out_of_range(node_path.field("limit"), error)
         })?;
     let limit = merge_limits("LimitNode", payload_limit, outer_limit).map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
@@ -77,6 +76,7 @@ pub(super) fn lower_limit_node(
 mod tests {
     use super::super::tests::{one_col_values_node, physical_node};
     use novarocks_execution::exec::expr::ExprArena;
+    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::plan;
 
@@ -92,9 +92,7 @@ mod tests {
         )
     }
 
-    fn decode_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         let mut arena = ExprArena::default();
         super::super::decode_node(
             node,

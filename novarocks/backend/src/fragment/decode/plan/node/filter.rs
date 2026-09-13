@@ -21,6 +21,7 @@ use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::filter::FilterNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -31,10 +32,10 @@ pub(super) fn lower_filter_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let predicate = filter.predicate.as_ref().ok_or_else(|| {
-        crate::fragment::decode::plan::error::NativeFragmentDecodeError::missing(
+        NativeFragmentDecodeError::missing(
             path.clone().field("predicate"),
             "native FilterNode requires predicate",
         )

@@ -77,8 +77,8 @@ use crate::connector::write_data_plane::{
     RootCommitFragmentCarrierValidator,
 };
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 
 fn decode_writer_multiplex_schema(
     wire: Option<&plan::WriterMultiplexSchema>,
@@ -1176,7 +1176,7 @@ mod tests {
         test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle,
         writer_multiplex_schema, writer_node,
     };
-    use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
+    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 
     const CHILD_COLUMN_ID: u32 = 1;
 

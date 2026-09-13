@@ -19,9 +19,11 @@
 
 use super::DecodedNode;
 use super::common::parse_optional_nonnegative_i64;
-use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
@@ -30,7 +32,7 @@ pub(super) fn lower_assert_one_row_node(
     assert: &plan::AssertOneRowNode,
     path: FieldPath,
     mut children: Vec<DecodedNode>,
-) -> Result<DecodedNode, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
         let child = children.pop().expect("child");
         let desired_num_rows = parse_optional_nonnegative_i64(
@@ -164,13 +166,12 @@ mod tests {
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::assert::AssertNumRowsMode;
+    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::plan;
     use novarocks_types::SlotId;
 
-    fn decode_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         let mut arena = ExprArena::default();
         super::super::decode_node(
             node,

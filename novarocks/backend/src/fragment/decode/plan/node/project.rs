@@ -21,7 +21,6 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{
     ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
@@ -29,6 +28,9 @@ use novarocks_execution::exec::chunk::{
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
@@ -40,7 +42,7 @@ pub(super) fn lower_project_node(
     mut children: Vec<DecodedNode>,
     arena: &mut ExprArena,
     ctx: &NativePlanDecodeContext,
-) -> Result<DecodedNode, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let child = children.pop().expect("child");
     let project_outputs = project_output_plan(project, &child.layout, path.clone())?;
     let layout = project_outputs.layout.clone();
@@ -52,13 +54,13 @@ pub(super) fn lower_project_node(
         .iter()
         .map(|idx| {
             let item = project.items.get(*idx).ok_or_else(|| {
-                crate::fragment::decode::plan::error::NativeFragmentDecodeError::missing(
+                NativeFragmentDecodeError::missing(
                     path.clone().field("items").index(*idx),
                     "native ProjectNode item is missing",
                 )
             })?;
             let expr = item.expr.as_ref().ok_or_else(|| {
-                crate::fragment::decode::plan::error::NativeFragmentDecodeError::missing(
+                NativeFragmentDecodeError::missing(
                     path.clone().field("items").index(*idx).field("expr"),
                     "native ProjectNode item requires expr",
                 )
@@ -70,8 +72,7 @@ pub(super) fn lower_project_node(
                 &child.layout,
             )
         })
-        .collect::<Result<Vec<_>, crate::fragment::decode::plan::error::NativeFragmentDecodeError>>(
-        )?;
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let expr_slot_ids = project_outputs.computed_slot_ids;
 
     Ok(DecodedNode {
@@ -105,7 +106,7 @@ fn project_output_plan(
     project: &plan::ProjectNode,
     input_layout: &Layout,
     path: FieldPath,
-) -> Result<ProjectOutputPlan, crate::fragment::decode::plan::error::NativeFragmentDecodeError> {
+) -> Result<ProjectOutputPlan, NativeFragmentDecodeError> {
     let decoded = (|| -> Result<ProjectOutputPlan, NativeFragmentLeafDecodeError> {
         let item_outputs = project
             .items
@@ -420,9 +421,7 @@ mod tests {
         decode_node(node, &mut arena, &NativePlanDecodeContext::default()).expect("lower node")
     }
 
-    fn lower_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn lower_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         let mut arena = ExprArena::default();
         decode_node(node, &mut arena, &NativePlanDecodeContext::default())
             .expect_err("invalid Project node must fail")

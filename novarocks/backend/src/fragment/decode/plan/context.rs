@@ -45,10 +45,10 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::QueryId;
 
-use crate::fragment::decode::plan::error::{
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
+use novarocks_native_adapter::fragment_error::{
     NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
 };
-use novarocks_execution::exec::chunk::SlotLayout as Layout;
 
 /// Adapts connector reservations to the exact fragment tracker created by
 /// native task admission. The adapter exists during pure plan decode, but it
