@@ -28,11 +28,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterBindOutcome, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
-    RuntimeFilterExecutionContract, RuntimeFilterFinalDomainCompletionHandle,
-    RuntimeFilterFinalDomainOpenRequest, RuntimeFilterProducer, RuntimeFilterProducerOpenRequest,
-    RuntimeFilterSession, RuntimeFilterSessionRef, RuntimeFilterSnapshot,
-    RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest,
+    RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
+    RuntimeFilterExecutionContract, RuntimeFilterProducerOpenRequest, RuntimeFilterSessionRef,
+    RuntimeFilterSnapshot,
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
@@ -61,7 +59,9 @@ use novarocks_worker::runtime_filter::domain::{
     BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
     BackendTransportEventKind, BackendTransportFailOpenReason,
 };
-use novarocks_worker::runtime_filter::final_domain::WorkerRuntimeFilterFinalDomainCompletion;
+use novarocks_worker::runtime_filter::execution_session::{
+    RuntimeFilterParticipantOutbound, WorkerRuntimeFilterExecutionSession,
+};
 use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot,
 };
@@ -274,15 +274,16 @@ impl RuntimeFilterParticipant {
         if !required {
             return Ok(None);
         }
-        Ok(Some(Arc::new(BackendRuntimeFilterExecutionContext {
+        let outbound: Arc<dyn RuntimeFilterParticipantOutbound> = self.outbound.clone();
+        Ok(Some(Arc::new(WorkerRuntimeFilterExecutionSession::new(
             fragment_instance_id,
-            producers: self.producer_sessions.clone(),
-            consumers: self.consumer_sessions.clone(),
-            participant: self.install.participant(),
-            observation: Arc::clone(&self.observation),
-            outbound: Arc::clone(&self.outbound),
-            cancelled: Arc::clone(&self.cancelled),
-        }) as RuntimeFilterSessionRef))
+            self.install.participant(),
+            self.producer_sessions.clone(),
+            self.consumer_sessions.clone(),
+            outbound,
+            Arc::clone(&self.observation),
+            Arc::clone(&self.cancelled),
+        )) as RuntimeFilterSessionRef))
     }
 
     pub(crate) fn dispatch_envelope(
@@ -876,127 +877,6 @@ impl BackendRuntimeFilterEnvelopeIngress for RuntimeFilterParticipant {
     }
 }
 
-struct BackendParticipantRuntimeFilterProducer {
-    local: novarocks_execution::runtime_filter::RuntimeFilterProducerHandle,
-    outbound: Arc<BackendParticipantOutbound>,
-    binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-    channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
-    fragment_instance_id: UniqueId,
-    local_partition_count: u32,
-    observation: Arc<RuntimeFilterObservationEmitter>,
-}
-
-impl RuntimeFilterProducer for BackendParticipantRuntimeFilterProducer {
-    fn max_contribution_bytes(&self) -> usize {
-        self.local.max_contribution_bytes()
-    }
-
-    fn submit(
-        &self,
-        partition: novarocks_execution::runtime_filter::PartitionId,
-        sequence: novarocks_execution::runtime_filter::ProducerSequence,
-        contribution: novarocks_execution::runtime_filter::RuntimeFilterContribution,
-    ) -> Result<
-        novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
-        RuntimeFilterContractViolation,
-    > {
-        let stream = BackendProducerStreamIdentity::new(
-            BackendChannelIdentity::new(
-                self.outbound.install.participant(),
-                self.binding_id,
-                self.channel_id,
-            ),
-            self.fragment_instance_id,
-            partition,
-        );
-        let outcome = match self.local.submit(partition, sequence, contribution.clone()) {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.observation.record(
-                    if error.kind() == RuntimeFilterContractViolationKind::ResourceLimit {
-                        BackendRuntimeFilterEvent::ContributionResourceLimitRejected {
-                            stream,
-                            sequence: sequence.get(),
-                        }
-                    } else {
-                        BackendRuntimeFilterEvent::ContributionConflictRejected {
-                            stream,
-                            sequence: sequence.get(),
-                        }
-                    },
-                );
-                return Err(error);
-            }
-        };
-        let event = match outcome {
-            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate => {
-                BackendRuntimeFilterEvent::ContributionDuplicateIgnored {
-                    stream,
-                    sequence: sequence.get(),
-                }
-            }
-            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale => {
-                BackendRuntimeFilterEvent::ContributionStaleIgnored {
-                    stream,
-                    sequence: sequence.get(),
-                }
-            }
-            _ => BackendRuntimeFilterEvent::ContributionAccepted {
-                stream,
-                sequence: sequence.get(),
-            },
-        };
-        self.observation.record(event);
-        self.outbound.forward_producer_contribution(
-            self.channel_id,
-            self.binding_id,
-            self.fragment_instance_id,
-            partition,
-            sequence,
-            self.local_partition_count,
-            contribution,
-        )?;
-        Ok(outcome)
-    }
-
-    fn close_partition(
-        &self,
-        partition: novarocks_execution::runtime_filter::PartitionId,
-        terminal: novarocks_execution::runtime_filter::ProducerSequence,
-    ) -> Result<
-        novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
-        RuntimeFilterContractViolation,
-    > {
-        let outcome = self.local.close_partition(partition, terminal)?;
-        self.outbound.forward_producer_close(
-            self.channel_id,
-            self.binding_id,
-            self.fragment_instance_id,
-            partition,
-            terminal,
-            self.local_partition_count,
-        )?;
-        Ok(outcome)
-    }
-
-    fn fail(
-        &self,
-        reason: novarocks_execution::runtime_filter::RuntimeFilterProducerFailure,
-    ) -> Result<
-        novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
-        RuntimeFilterContractViolation,
-    > {
-        let outcome = self.local.fail(reason)?;
-        self.outbound.forward_producer_failure(
-            self.channel_id,
-            self.binding_id,
-            self.fragment_instance_id,
-            reason,
-        )?;
-        Ok(outcome)
-    }
-}
-
 struct BackendParticipantOutbound {
     install: BackendParticipantInstall,
     transport_policy: BackendRuntimeFilterRetryPolicy,
@@ -1361,154 +1241,72 @@ impl BackendParticipantOutbound {
     }
 }
 
+impl RuntimeFilterParticipantOutbound for BackendParticipantOutbound {
+    fn forward_producer_contribution(
+        &self,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+        fragment_instance_id: UniqueId,
+        partition: novarocks_execution::runtime_filter::PartitionId,
+        sequence: novarocks_execution::runtime_filter::ProducerSequence,
+        local_partition_count: u32,
+        contribution: novarocks_execution::runtime_filter::RuntimeFilterContribution,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        BackendParticipantOutbound::forward_producer_contribution(
+            self,
+            channel_id,
+            binding_id,
+            fragment_instance_id,
+            partition,
+            sequence,
+            local_partition_count,
+            contribution,
+        )
+    }
+
+    fn forward_producer_close(
+        &self,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+        fragment_instance_id: UniqueId,
+        partition: novarocks_execution::runtime_filter::PartitionId,
+        sequence: novarocks_execution::runtime_filter::ProducerSequence,
+        local_partition_count: u32,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        BackendParticipantOutbound::forward_producer_close(
+            self,
+            channel_id,
+            binding_id,
+            fragment_instance_id,
+            partition,
+            sequence,
+            local_partition_count,
+        )
+    }
+
+    fn forward_producer_failure(
+        &self,
+        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
+        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
+        fragment_instance_id: UniqueId,
+        reason: novarocks_execution::runtime_filter::RuntimeFilterProducerFailure,
+    ) -> Result<(), RuntimeFilterContractViolation> {
+        BackendParticipantOutbound::forward_producer_failure(
+            self,
+            channel_id,
+            binding_id,
+            fragment_instance_id,
+            reason,
+        )
+    }
+}
+
 impl BackendMaterializedDeliverySink for BackendParticipantOutbound {
     fn dispatch(
         &self,
         delivery: BackendMaterializedDelivery,
     ) -> Result<(), RuntimeFilterContractViolation> {
         self.dispatch_materialized(delivery)
-    }
-}
-
-struct BackendRuntimeFilterExecutionContext {
-    fragment_instance_id: UniqueId,
-    participant: novarocks_worker::runtime_filter::domain::BackendParticipantIdentity,
-    producers: BTreeMap<
-        novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        Arc<BackendRuntimeFilterSession>,
-    >,
-    consumers: BTreeMap<
-        novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        Arc<BackendRuntimeFilterSession>,
-    >,
-    outbound: Arc<BackendParticipantOutbound>,
-    observation: Arc<RuntimeFilterObservationEmitter>,
-    cancelled: Arc<AtomicBool>,
-}
-
-impl RuntimeFilterSession for BackendRuntimeFilterExecutionContext {
-    fn open_producer(
-        &self,
-        request: RuntimeFilterProducerOpenRequest,
-    ) -> Result<
-        RuntimeFilterBindOutcome<novarocks_execution::runtime_filter::RuntimeFilterProducerHandle>,
-        RuntimeFilterContractViolation,
-    > {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Ok(RuntimeFilterBindOutcome::Unavailable(
-                novarocks_execution::runtime_filter::UnavailableReason::RouteUnavailable,
-            ));
-        }
-        let binding_id = request.contract().binding_id();
-        let session = self.producers.get(&binding_id).ok_or_else(|| {
-            violation(
-                RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                "producer binding is not installed for this Backend fragment",
-            )
-        })?;
-        let local_partition_count = request.local_partition_count();
-        match session.open_producer(self.fragment_instance_id, request)? {
-            RuntimeFilterBindOutcome::Bound(local) => {
-                self.observation.register_producer_instance(
-                    BackendChannelIdentity::new(
-                        self.participant,
-                        binding_id,
-                        session.channel().channel_id(),
-                    ),
-                    self.fragment_instance_id,
-                    local_partition_count,
-                );
-                Ok(RuntimeFilterBindOutcome::Bound(Arc::new(
-                    BackendParticipantRuntimeFilterProducer {
-                        local,
-                        outbound: Arc::clone(&self.outbound),
-                        binding_id,
-                        channel_id: session.channel().channel_id(),
-                        fragment_instance_id: self.fragment_instance_id,
-                        local_partition_count,
-                        observation: Arc::clone(&self.observation),
-                    },
-                )))
-            }
-            RuntimeFilterBindOutcome::Unavailable(reason) => {
-                Ok(RuntimeFilterBindOutcome::Unavailable(reason))
-            }
-        }
-    }
-
-    fn subscribe(
-        &self,
-        request: RuntimeFilterSubscriptionRequest,
-    ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterSubscriptionHandle>,
-        RuntimeFilterContractViolation,
-    > {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Ok(RuntimeFilterBindOutcome::Unavailable(
-                novarocks_execution::runtime_filter::UnavailableReason::RouteUnavailable,
-            ));
-        }
-        let binding_id = request.contract().binding_id();
-        let session = self.consumers.get(&binding_id).ok_or_else(|| {
-            violation(
-                RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                "consumer binding is not installed for this Backend fragment",
-            )
-        })?;
-        session.subscribe(self.fragment_instance_id, request)
-    }
-
-    fn open_final_domain_completion(
-        &self,
-        request: RuntimeFilterFinalDomainOpenRequest,
-    ) -> Result<
-        RuntimeFilterBindOutcome<RuntimeFilterFinalDomainCompletionHandle>,
-        RuntimeFilterContractViolation,
-    > {
-        if self.cancelled.load(Ordering::Acquire) {
-            return Ok(RuntimeFilterBindOutcome::Unavailable(
-                novarocks_execution::runtime_filter::UnavailableReason::RouteUnavailable,
-            ));
-        }
-        let contract = request.contract().clone();
-        if contract.kind()
-            != novarocks_execution::runtime_filter::RuntimeFilterProducerKind::FinalDomain
-        {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::RoleMismatch,
-                "final-domain completion request does not carry a FinalDomain producer contract",
-            ));
-        }
-        let RuntimeFilterExecutionContract::Membership(schema) = contract.contract() else {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain completion requires a membership execution contract",
-            ));
-        };
-        let session = self.producers.get(&contract.binding_id()).ok_or_else(|| {
-            violation(
-                RuntimeFilterContractViolationKind::UnauthorizedBinding,
-                "FinalDomain producer binding is not installed for this Backend fragment",
-            )
-        })?;
-        let producer = match self.open_producer(RuntimeFilterProducerOpenRequest::new(
-            contract.clone(),
-            request.local_partition_count(),
-        ))? {
-            RuntimeFilterBindOutcome::Bound(producer) => producer,
-            RuntimeFilterBindOutcome::Unavailable(reason) => {
-                return Ok(RuntimeFilterBindOutcome::Unavailable(reason));
-            }
-        };
-        Ok(RuntimeFilterBindOutcome::Bound(Arc::new(
-            WorkerRuntimeFilterFinalDomainCompletion::new(
-                producer,
-                schema.data_type().clone(),
-                schema.digest(),
-                session.policy().max_contribution_bytes(),
-                request.local_partition_count(),
-            ),
-        )))
     }
 }
 
