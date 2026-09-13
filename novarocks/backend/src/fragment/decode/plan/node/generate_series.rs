@@ -304,7 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_uses_backend_expression_decoder_for_synthetic_values() {
+    fn generate_series_uses_native_expression_decoder_for_synthetic_values() {
         let node = physical_node(
             20,
             plan::plan_node::Kind::GenerateSeries(plan::GenerateSeriesNode {
