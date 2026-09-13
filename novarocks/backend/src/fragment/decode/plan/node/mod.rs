@@ -26,6 +26,7 @@ mod exchange;
 mod filter;
 mod hash_join;
 mod nestloop_join;
+#[cfg(test)]
 mod project;
 mod sort;
 mod table_function;
@@ -62,9 +63,9 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
-    lower_filter_node, lower_generate_series_node, lower_limit_node, lower_redistribute_node,
-    lower_repeat_node, lower_set_op_node, lower_topn_node, lower_values_node,
-    parse_distributed_limit,
+    lower_filter_node, lower_generate_series_node, lower_limit_node, lower_project_node,
+    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_topn_node,
+    lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1552,13 +1553,12 @@ fn lower_physical_node(
             children,
             arena,
         ),
-        plan::plan_node::Kind::Project(project) => project::lower_project_node(
+        plan::plan_node::Kind::Project(project) => lower_project_node(
             node,
             project,
             path.clone().field("project"),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Unpivot(unpivot) => unpivot::lower_unpivot_node(
             node,
