@@ -27,6 +27,7 @@ hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync"] }
+tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport"] }
 tower = { workspace = true, features = ["util"] }
 tracing.workspace = true

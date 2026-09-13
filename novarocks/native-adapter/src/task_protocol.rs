@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native task protocol RPC boundary.
+//! Native task-protocol RPC boundary.
 //!
-//! This is the only place the task protocol's wire messages meet the backend's
-//! own owner. The RPC service stays thin: it hands a decoded request to this
-//! port and encodes what comes back, so nothing above it interprets a wire
-//! shape and nothing below it names one.
+//! This is the adapter-owned contract between generated Native gRPC handlers
+//! and a role-local task owner. The RPC service stays thin: it hands a wire
+//! request to this port and encodes what comes back, so nothing above it
+//! interprets a wire shape and nothing below it names one.
 //!
 //! Five entry points, matching the five RPCs: one batched mutation, one status
 //! subscription, two typed observation reads, and the root result data plane.
@@ -32,10 +32,10 @@ use tokio_stream::Stream;
 
 /// Server-side status event stream of one logical query-by-backend
 /// subscription.
-pub(crate) type TaskStatusEventStream =
+pub type TaskStatusEventStream =
     Pin<Box<dyn Stream<Item = Result<proto::TaskStatusStreamEvent, tonic::Status>> + Send>>;
 
-/// The backend's task protocol port.
+/// The Native task-protocol ingress port.
 ///
 /// Every method takes the wire request and returns the wire response, because
 /// this is the wire boundary. A `tonic::Status` here means the request could
@@ -43,7 +43,7 @@ pub(crate) type TaskStatusEventStream =
 /// back as a typed receipt or outcome inside a successful response, which is
 /// what lets a frontend classify it without reading an error message.
 #[tonic::async_trait]
-pub(crate) trait TaskExecutionIngress: Send + Sync {
+pub trait TaskExecutionIngress: Send + Sync {
     /// Applies a per-backend batch, one receipt per item in request order.
     ///
     /// A batch gives its items no atomicity and no shared verdict: a partial

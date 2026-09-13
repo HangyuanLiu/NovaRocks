@@ -76,7 +76,7 @@ use tokio_stream::Stream;
 
 use super::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
-use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
+use novarocks_native_adapter::task_protocol::{TaskExecutionIngress, TaskStatusEventStream};
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::{

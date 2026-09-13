@@ -23,7 +23,6 @@
 use std::sync::Arc;
 
 use crate::rpc::data_plane::BackendDataPlane;
-use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
@@ -33,6 +32,7 @@ use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder,
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
+    task_protocol::{TaskExecutionIngress, TaskStatusEventStream},
 };
 use novarocks_worker::{CatalogPruneResult, TaskInboundCapabilities};
 
