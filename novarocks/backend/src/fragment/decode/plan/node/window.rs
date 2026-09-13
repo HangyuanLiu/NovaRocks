@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::aggregate::decode_resolved_aggregate_signature;
-use super::{DecodedNode, NativePlanDecodeContext, sort};
+use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
@@ -34,6 +34,7 @@ use novarocks_execution::exec::node::analytic::{
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::lower_sort_items_for_layout;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
@@ -279,13 +280,12 @@ fn sort_window_group_input(
             nulls_first: true,
         });
     }
-    order_by.extend(sort::lower_sort_items_with_context(
+    order_by.extend(lower_sort_items_for_layout(
         &format!("WindowNode group {group_idx} sort"),
         &first.order_by,
         path.field("order_by"),
         arena,
         &input.layout,
-        ctx,
     )?);
 
     Ok(DecodedNode {

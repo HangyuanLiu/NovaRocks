@@ -739,6 +739,185 @@ fn normalize_set_op_inputs_by_position(
     }).collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
+pub fn lower_sort_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    sort: &plan::SortNode,
+    path: FieldPath,
+    physical_output_path: FieldPath,
+    mut children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let child = children.pop().expect("validated SortNode child");
+    let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
+    let (output_columns, output_columns_path) = if sort.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
+    } else {
+        (&sort.output_columns, path.clone().field("output_columns"))
+    };
+    let order_by = lower_sort_items(
+        "SortNode",
+        &sort.items,
+        path.clone().field("items"),
+        arena,
+        &input,
+    )?;
+    let limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_distributed_limit(node.limit, "SortNode DistributedNode.limit"),
+    )?;
+    let offset = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("offset"),
+        parse_optional_nonnegative_i64(sort.offset, "SortNode.offset"),
+    )?
+    .unwrap_or(0);
+    let topn_type = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("topn_type"),
+        parse_sort_topn_type(sort.topn_type),
+    )?;
+    let partition_exprs = sort
+        .analytic_partition_by
+        .iter()
+        .enumerate()
+        .map(|(idx, expr)| {
+            let expr = decode_expr_at(
+                expr,
+                path.clone().field("analytic_partition_by").index(idx),
+                arena,
+                &input,
+            )
+            .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
+            Ok(SortExpression {
+                expr,
+                asc: true,
+                nulls_first: true,
+            })
+        })
+        .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
+    let partition_limit = sort.partition_limit.map(|value| value as usize);
+    let use_top_n = partition_limit.is_some();
+    if use_top_n && topn_type != SortTopNType::RowNumber && offset != 0 {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("offset"),
+            format!(
+                "SortNode node_id={} topn_type {:?} requires offset=0, got {}",
+                node.node_id, topn_type, offset
+            ),
+        ));
+    }
+    let sort_node = ExecNode {
+        kind: ExecNodeKind::Sort(SortNode {
+            input: Box::new(child.node),
+            node_id: node.node_id,
+            use_top_n,
+            order_by,
+            limit,
+            offset,
+            topn_type,
+            max_buffered_rows: None,
+            max_buffered_bytes: None,
+            partition_exprs,
+            partition_limit,
+        }),
+    };
+    let sorted = NativeLoweredPlanNode {
+        node: sort_node,
+        layout: child.layout.clone(),
+        output_schema: child.output_schema.clone(),
+    };
+    if output_columns.is_empty() {
+        return Ok(sorted);
+    }
+
+    let output_layout = decode_output_layout(output_columns, output_columns_path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    if layout.order() == child.layout.order() {
+        return Ok(NativeLoweredPlanNode {
+            node: sorted.node,
+            layout,
+            output_schema,
+        });
+    }
+
+    build_slot_projection(
+        "SortNode",
+        sorted,
+        output_columns,
+        output_columns_path,
+        node.node_id,
+        arena,
+    )
+}
+
+fn parse_sort_topn_type(value: Option<i32>) -> Result<SortTopNType, NativeFragmentLeafDecodeError> {
+    let Some(value) = value else {
+        return Ok(SortTopNType::RowNumber);
+    };
+    match plan::SortTopNType::try_from(value).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "topn_type",
+            format!("SortNode unknown topn_type {value}"),
+        )
+    })? {
+        plan::SortTopNType::SortTopnTypeUnspecified | plan::SortTopNType::SortTopnTypeRowNumber => {
+            Ok(SortTopNType::RowNumber)
+        }
+        plan::SortTopNType::SortTopnTypeRank => Ok(SortTopNType::Rank),
+        plan::SortTopNType::SortTopnTypeDenseRank => Ok(SortTopNType::DenseRank),
+    }
+}
+
+fn build_slot_projection(
+    label: &str,
+    input: NativeLoweredPlanNode,
+    output_columns: &[proto_common::OutputColumn],
+    path: FieldPath,
+    node_id: i32,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let output_layout = decode_output_layout(output_columns, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    let expr_slot_schemas = output_layout.slot_schemas().to_vec();
+    let mut exprs = Vec::with_capacity(layout.order().len());
+    for slot in layout.order().iter().copied() {
+        if !input.layout.contains_slot(slot) {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{label} output column id {} has no input slot",
+                    slot.as_u32()
+                ),
+            ));
+        }
+        exprs.push(arena.push(ExprNode::SlotId(slot)));
+    }
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(input.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(expr_slot_schemas),
+                output_indices: None,
+                output_chunk_schema: output_schema.clone(),
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
 pub fn lower_project_node(
     node: &plan::DistributedNode,
     project: &plan::ProjectNode,
@@ -1154,6 +1333,17 @@ fn lower_sort_items(
             })
         })
         .collect()
+}
+
+pub fn lower_sort_items_for_layout(
+    node_kind: &str,
+    items: &[expr::SortItem],
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input_layout: &SlotLayout,
+) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
+    let input = NativeExpressionInputLayout::from_slot_ids(input_layout.order().iter().copied());
+    lower_sort_items(node_kind, items, path, arena, &input)
 }
 
 #[expect(

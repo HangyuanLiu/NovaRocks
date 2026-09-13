@@ -28,6 +28,7 @@ mod hash_join;
 mod nestloop_join;
 #[cfg(test)]
 mod project;
+#[cfg(test)]
 mod sort;
 mod table_function;
 mod table_write;
@@ -64,8 +65,8 @@ use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
     lower_filter_node, lower_generate_series_node, lower_limit_node, lower_project_node,
-    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_topn_node,
-    lower_values_node, parse_distributed_limit,
+    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_sort_node,
+    lower_topn_node, lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1580,7 +1581,7 @@ fn lower_physical_node(
             node_path,
             children,
         ),
-        plan::plan_node::Kind::Sort(sort) => sort::lower_sort_node(
+        plan::plan_node::Kind::Sort(sort) => lower_sort_node(
             node,
             physical,
             sort,
@@ -1588,7 +1589,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
             lower_topn_node(node, topn, path.clone().field("topn"), children, arena)

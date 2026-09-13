@@ -17,7 +17,7 @@
 
 //! Fragment exchange-node decoding.
 
-use super::{DecodedNode, NativePlanDecodeContext, sort};
+use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
@@ -25,7 +25,9 @@ use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_plan_node::parse_optional_nonnegative_i64;
+use novarocks_native_adapter::fragment_plan_node::{
+    lower_sort_items_for_layout, parse_optional_nonnegative_i64,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -134,7 +136,7 @@ pub(super) fn lower_exchange_receiver(
             }
         }
         plan::exchange_flavor::Kind::TopnSplit(topn) => {
-            let order_by = sort::lower_sort_items_with_context(
+            let order_by = lower_sort_items_for_layout(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
                 path.clone()
@@ -143,7 +145,6 @@ pub(super) fn lower_exchange_receiver(
                     .field("items"),
                 arena,
                 &lowered.layout,
-                ctx,
             )?;
             let limit = NativeFragmentDecodeError::map_invalid(
                 path.clone()
