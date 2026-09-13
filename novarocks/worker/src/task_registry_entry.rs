@@ -26,6 +26,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use crate::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
 use novarocks_execution_contract::task_execution::identity::{
@@ -40,12 +41,9 @@ use novarocks_execution_contract::task_execution::status::{
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
-use novarocks_worker::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
 
-use novarocks_worker::ReleasedContextEvidence;
-use novarocks_worker::{
-    InitialDomainKey, RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource,
-};
+use crate::ReleasedContextEvidence;
+use crate::{InitialDomainKey, RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource};
 
 /// The comparable, secret-free identity of one establish request.
 ///

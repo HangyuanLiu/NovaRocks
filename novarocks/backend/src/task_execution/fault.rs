@@ -270,6 +270,19 @@ pub(super) fn wait_for_restart_after_establish_context(context: QueryContextRef)
     }
 }
 
+/// Native fault adapter for the Worker task-creation gate.
+pub(crate) struct RestartAfterEstablishTaskCreationGate;
+
+impl novarocks_worker::TaskCreationGate for RestartAfterEstablishTaskCreationGate {
+    fn holds_task_creation(&self, context: QueryContextRef) -> bool {
+        restart_after_establish_context_holds_task_creation(context)
+    }
+
+    fn wait_for_task_creation_release(&self, context: QueryContextRef) {
+        wait_for_restart_after_establish_context(context);
+    }
+}
+
 /// A process-local guard for the narrow interval after a successful establish
 /// publishes the runner rendezvous marker. It is compiled only in debug
 /// builds, the only builds that accept runner fault arming.

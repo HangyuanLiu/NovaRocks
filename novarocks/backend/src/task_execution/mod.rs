@@ -44,14 +44,12 @@
 mod completion;
 mod context_host;
 mod credential_slot;
-mod entry;
 mod execution_host;
 mod fault;
 mod feedback;
 pub(crate) mod ingress;
 mod marker;
 mod ports;
-mod registry;
 pub(crate) mod shared_facts;
 
 #[cfg(test)]
@@ -60,8 +58,9 @@ mod tests;
 pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
+pub(crate) use fault::RestartAfterEstablishTaskCreationGate;
 pub(crate) use ingress::RegistryTaskExecutionIngress;
 pub(crate) use novarocks_worker::QueryContextHost;
+pub(crate) use novarocks_worker::TaskExecutionRegistry;
 pub(crate) use novarocks_worker::TaskExecutionRegistryConfig;
 pub(crate) use ports::backend_task_execution_ports;
-pub(crate) use registry::TaskExecutionRegistry;

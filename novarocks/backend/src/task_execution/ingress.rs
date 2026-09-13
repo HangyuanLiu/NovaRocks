@@ -74,8 +74,8 @@ use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
 use novarocks_types::NativeCompatibilityId;
 use tokio_stream::Stream;
 
+use super::TaskExecutionRegistry;
 use super::fault;
-use super::registry::TaskExecutionRegistry;
 use super::shared_facts::encode_dynamic_filter_read;
 use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
 use novarocks_worker::OperationReceipt;
@@ -99,6 +99,11 @@ impl RegistryTaskExecutionIngress {
         native_compatibility_id: NativeCompatibilityId,
         native_transport_confidentiality: ConfidentialTransport,
     ) -> Arc<Self> {
+        assert!(
+            registry.config().max_tasks_per_context
+                <= TransportBudget::DEFAULT.max_tasks_per_context(),
+            "task registry context bound exceeds the native transport contract"
+        );
         Arc::new(Self {
             registry,
             native_compatibility_id,

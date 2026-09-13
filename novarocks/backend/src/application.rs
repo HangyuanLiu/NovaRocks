@@ -390,11 +390,12 @@ fn compose_backend_application_services(
         Arc::clone(&execution_runtime),
         Arc::clone(&task_completion_supervisor),
     ));
-    let task_execution_registry = TaskExecutionRegistry::with_process_clock(
+    let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
         task_execution_registry_config,
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
         execution_host,
         backend_task_execution_ports(),
+        Arc::new(crate::task_execution::RestartAfterEstablishTaskCreationGate),
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),

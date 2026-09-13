@@ -43,10 +43,13 @@ mod operation;
 mod receipt;
 mod reliable_transport;
 mod status;
+mod task_creation_gate;
 mod task_domain_execution;
 mod task_execution_ports;
 mod task_protocol_event;
+mod task_registry;
 mod task_registry_config;
+mod task_registry_entry;
 
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
@@ -103,6 +106,7 @@ pub use status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };
+pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_domain_execution::{
     DomainExecutionRejection, apply_planned_task_domain_updates, apply_task_domain_updates,
     commit_task_domain_execution_updates, plan_task_domain_execution_updates,
@@ -112,6 +116,7 @@ pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
+pub use task_registry::{DeadlineSweep, RegistryCounters, TaskExecutionRegistry};
 pub use task_registry_config::TaskExecutionRegistryConfig;
 
 /// Positive, ordered joint retained-result limits owned by one worker process.

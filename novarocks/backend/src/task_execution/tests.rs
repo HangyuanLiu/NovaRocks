@@ -66,9 +66,9 @@ use novarocks_worker::{
     RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
 };
 
-use super::registry::TaskExecutionRegistry;
 use super::shared_facts::sealed_runtime_filter_evidence;
 use novarocks_worker::OperationReceipt;
+use novarocks_worker::TaskExecutionRegistry;
 use novarocks_worker::TaskExecutionRegistryConfig;
 use novarocks_worker::{
     ContextConvergenceCursorError, CursorObservation, METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute,

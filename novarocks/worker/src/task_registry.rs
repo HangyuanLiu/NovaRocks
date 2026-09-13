@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The backend-local owner of the task protocol.
+//! The Worker-local owner of the task protocol.
 //!
 //! Everything the protocol calls a decision happens here, under one lock, at
 //! one linearization point per operation: the establish creation gate, the
@@ -50,7 +50,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
-use novarocks_execution::exec::fragment::program::FragmentSinkKind;
+use crate::{
+    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketProgression,
+    AdmissionTicketRedemptionRejection, ContextOperationKind, ContextTransition, InstalledLease,
+    LatchOutcome, LeaseProgression, MonotonicInstant, OperationAdmission, ProcessMonotonicClock,
+    QueryContextDomains, QueryContextEvent, TaskCreationGate, TaskProtocolEvent,
+    WorkerMonotonicClock, classify_context_transition, classify_operation_admission,
+};
+use novarocks_execution_contract::FragmentSinkKind;
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceReceipt, QueryContextConvergenceState, QueryContextConvergenceVersion,
 };
@@ -70,21 +77,13 @@ use novarocks_execution_contract::task_execution::status::{
     AbortCause, TaskFailureCategory, TaskOutputFacts, TaskState, TerminationDetail,
 };
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
-use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::QueryExecutionId;
-use novarocks_worker::{
-    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketProgression,
-    AdmissionTicketRedemptionRejection, ContextOperationKind, ContextTransition, InstalledLease,
-    LatchOutcome, LeaseProgression, MonotonicInstant, OperationAdmission, ProcessMonotonicClock,
-    QueryContextDomains, QueryContextEvent, TaskProtocolEvent, WorkerMonotonicClock,
-    classify_context_transition, classify_operation_admission,
-};
 
-use super::entry::{
+use crate::task_registry_entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
 };
-use novarocks_worker::{
+use crate::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
     FinalTaskInfoOutcome, InitialDomainKey, OperationReceipt, QueryContextHost,
     QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
@@ -102,7 +101,7 @@ impl WorkerAdmissionEpochAuthority for TaskExecutionRegistry {
     }
 }
 
-impl novarocks_worker::WorkerDeadlineAuthority for TaskExecutionRegistry {
+impl crate::WorkerDeadlineAuthority for TaskExecutionRegistry {
     fn advance_deadlines(&self) {
         let _ = TaskExecutionRegistry::advance_deadlines(self);
     }
@@ -210,13 +209,14 @@ impl RegistryState {
     }
 }
 
-/// The backend-local owner of query contexts, tasks, status, and retention.
+/// The Worker-local owner of query contexts, tasks, status, and retention.
 pub struct TaskExecutionRegistry {
     config: TaskExecutionRegistryConfig,
     clock: Arc<dyn WorkerMonotonicClock>,
     context_host: Arc<dyn QueryContextHost>,
     task_host: Arc<dyn TaskExecutionHost>,
-    ports: novarocks_worker::TaskExecutionPorts,
+    ports: crate::TaskExecutionPorts,
+    task_creation_gate: Arc<dyn TaskCreationGate>,
     admission_tickets: AdmissionTicketAuthority,
     state: Mutex<RegistryState>,
     gate: Condvar,
@@ -229,18 +229,34 @@ impl TaskExecutionRegistry {
         clock: Arc<dyn WorkerMonotonicClock>,
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
-        ports: novarocks_worker::TaskExecutionPorts,
+        ports: crate::TaskExecutionPorts,
     ) -> Arc<Self> {
-        assert!(
-            config.max_tasks_per_context <= TransportBudget::DEFAULT.max_tasks_per_context(),
-            "task registry context bound exceeds the transport contract"
-        );
+        Self::new_with_task_creation_gate(
+            config,
+            clock,
+            context_host,
+            task_host,
+            ports,
+            Arc::new(crate::NoopTaskCreationGate),
+        )
+    }
+
+    /// Builds a Worker registry with one outer adapter gate for create admission.
+    pub fn new_with_task_creation_gate(
+        config: TaskExecutionRegistryConfig,
+        clock: Arc<dyn WorkerMonotonicClock>,
+        context_host: Arc<dyn QueryContextHost>,
+        task_host: Arc<dyn TaskExecutionHost>,
+        ports: crate::TaskExecutionPorts,
+        task_creation_gate: Arc<dyn TaskCreationGate>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             config,
             clock,
             context_host,
             task_host,
             ports,
+            task_creation_gate,
             admission_tickets: AdmissionTicketAuthority::new(config.admission_tickets),
             state: Mutex::new(RegistryState::default()),
             gate: Condvar::new(),
@@ -253,7 +269,7 @@ impl TaskExecutionRegistry {
         config: TaskExecutionRegistryConfig,
         context_host: Arc<dyn QueryContextHost>,
         task_host: Arc<dyn TaskExecutionHost>,
-        ports: novarocks_worker::TaskExecutionPorts,
+        ports: crate::TaskExecutionPorts,
     ) -> Arc<Self> {
         Self::new(
             config,
@@ -261,6 +277,24 @@ impl TaskExecutionRegistry {
             context_host,
             task_host,
             ports,
+        )
+    }
+
+    /// Builds the production Worker owner with its process clock and adapter gate.
+    pub fn with_process_clock_and_task_creation_gate(
+        config: TaskExecutionRegistryConfig,
+        context_host: Arc<dyn QueryContextHost>,
+        task_host: Arc<dyn TaskExecutionHost>,
+        ports: crate::TaskExecutionPorts,
+        task_creation_gate: Arc<dyn TaskCreationGate>,
+    ) -> Arc<Self> {
+        Self::new_with_task_creation_gate(
+            config,
+            Arc::new(ProcessMonotonicClock::new()),
+            context_host,
+            task_host,
+            ports,
+            task_creation_gate,
         )
     }
 
@@ -682,9 +716,10 @@ impl TaskExecutionRegistry {
                     // Check at the owner election linearization point, rather
                     // than at RPC ingress, so no task becomes admitted in the
                     // marker-to-process-loss interval.
-                    if super::fault::restart_after_establish_context_holds_task_creation(context) {
+                    if self.task_creation_gate.holds_task_creation(context) {
                         drop(state);
-                        super::fault::wait_for_restart_after_establish_context(context);
+                        self.task_creation_gate
+                            .wait_for_task_creation_release(context);
                         state = self.state.lock().expect(REGISTRY_LOCK);
                         continue;
                     }
