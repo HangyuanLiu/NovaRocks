@@ -33,6 +33,9 @@ use novarocks_execution::exec::chunk::{
 };
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode, cast_array_to_target};
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
+use novarocks_execution::exec::node::change_event_expand::{
+    ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
+};
 use novarocks_execution::exec::node::filter::FilterNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::project::ProjectNode;
@@ -45,6 +48,7 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_plan_codec::native_type::decode_type;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{common as proto_common, expr, plan};
+use novarocks_spi::connector::ConnectorRowMutationEffect;
 use novarocks_types::SlotId;
 
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
@@ -762,6 +766,154 @@ pub fn lower_filter_node(
         layout: child.layout,
         output_schema: child.output_schema,
     })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The frozen native boundary keeps independently validated inputs explicit."
+)]
+pub fn lower_change_event_expand_node(
+    node: &plan::DistributedNode,
+    physical: &plan::PlanNode,
+    expand: &plan::ChangeEventExpandNode,
+    path: FieldPath,
+    physical_output_path: FieldPath,
+    mut children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let child = children
+        .pop()
+        .expect("validated ChangeEventExpandNode child");
+    let (output_columns, output_columns_path) = if expand.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
+    } else {
+        (&expand.output_columns, path.clone().field("output_columns"))
+    };
+    let output_layout = decode_output_layout(output_columns, output_columns_path)
+        .map_err(NativeFragmentDecodeError::from)?;
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    let output_schema = output_layout.chunk_schema();
+    let output_slot_ids = layout.order().to_vec();
+    let output_set = output_slot_ids.iter().copied().collect::<HashSet<_>>();
+    let effect_slot_id = SlotId::new(expand.effect_column_id);
+    if !output_set.contains(&effect_slot_id) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("effect_column_id"),
+            format!(
+                "ChangeEventExpandNode effect_column_id {} is not in outputs",
+                expand.effect_column_id
+            ),
+        ));
+    }
+    let effect_field = output_schema.slot(effect_slot_id).ok_or_else(|| {
+        NativeFragmentDecodeError::inconsistent(
+            path.clone().field("effect_column_id"),
+            format!(
+                "ChangeEventExpandNode effect_column_id {} missing from output schema",
+                expand.effect_column_id
+            ),
+        )
+    })?;
+    if effect_field.data_type() != &DataType::Int8 {
+        return Err(NativeFragmentDecodeError::invalid_value(
+            path.clone().field("effect_column_id"),
+            format!(
+                "ChangeEventExpandNode effect_column_id {} must be Int8, got {:?}",
+                expand.effect_column_id,
+                effect_field.data_type()
+            ),
+        ));
+    }
+
+    let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
+    let mut events = Vec::with_capacity(expand.events.len());
+    for (event_idx, event) in expand.events.iter().enumerate() {
+        let event_path = path.clone().field("events").index(event_idx);
+        let effect = change_event_effect(event.effect, event_path.clone().field("effect"))?;
+        let predicate = event
+            .predicate
+            .as_ref()
+            .map(|expr| {
+                decode_expr_at(expr, event_path.clone().field("predicate"), arena, &input)
+                    .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
+            })
+            .transpose()?;
+        let assignments = event
+            .assignments
+            .iter()
+            .enumerate()
+            .map(|(assign_idx, assignment)| {
+                let slot_id = SlotId::new(assignment.output_column_id);
+                if !output_set.contains(&slot_id) {
+                    return Err(NativeFragmentDecodeError::inconsistent(event_path.clone().field("assignments").index(assign_idx).field("output_column_id"), format!(
+                        "ChangeEventExpandNode event {event_idx} assignment {assign_idx} output column {} is not in outputs",
+                        assignment.output_column_id
+                    )));
+                }
+                let expr = assignment
+                    .expr
+                    .as_ref()
+                    .map(|expr| {
+                        decode_expr_at(
+                            expr,
+                            event_path
+                                .clone()
+                                .field("assignments")
+                                .index(assign_idx)
+                                .field("expr"),
+                            arena,
+                            &input,
+                        )
+                        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
+                    })
+                    .transpose()?;
+                Ok(ChangeEventRuntimeOutputExpr {
+                    output_slot_id: slot_id,
+                    expr,
+                })
+            })
+            .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
+        events.push(ChangeEventRuntimeSpec {
+            predicate,
+            effect,
+            assignments,
+        });
+    }
+
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::ChangeEventExpand(ChangeEventExpandNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                events,
+                output_slot_ids,
+                output_chunk_schema: output_schema.clone(),
+                effect_slot_id,
+            }),
+        },
+        layout,
+        output_schema,
+    })
+}
+
+fn change_event_effect(
+    value: i32,
+    path: FieldPath,
+) -> Result<ConnectorRowMutationEffect, NativeFragmentDecodeError> {
+    match plan::RowMutationEffect::try_from(value).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone(),
+            format!("unknown row mutation effect {value}"),
+        )
+    })? {
+        plan::RowMutationEffect::Delete => Ok(ConnectorRowMutationEffect::Delete),
+        plan::RowMutationEffect::Replace => Ok(ConnectorRowMutationEffect::Replace),
+        plan::RowMutationEffect::Insert => Ok(ConnectorRowMutationEffect::Insert),
+        plan::RowMutationEffect::Unspecified => Err(NativeFragmentDecodeError::invalid_enum(
+            path,
+            "row mutation effect is unspecified",
+        )),
+    }
 }
 
 /// Validates a Native `RedistributeNode` while preserving its immutable child program.
