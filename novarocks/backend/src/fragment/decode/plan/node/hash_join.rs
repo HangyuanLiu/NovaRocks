@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use super::{DecodedNode, NativePlanDecodeContext};
+use super::DecodedNode;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::node::join::{
@@ -29,6 +29,7 @@ use novarocks_execution::exec::node::join::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_plan_node::{
     concat_slot_layouts, join_output_chunk_schema, proto_join_type,
 };
@@ -50,7 +51,6 @@ pub(super) fn lower_hash_join_node(
     physical_output_path: FieldPath,
     children: Vec<DecodedNode>,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut it = children.into_iter();
     let left = it.next().expect("left");
@@ -98,14 +98,18 @@ pub(super) fn lower_hash_join_node(
                 format!("HashJoinNode eq_conditions[{idx}] right missing"),
             )
         })?;
-        let probe_key = ctx.decode_expression(
+        let probe_key = decode_expr_for_slot_layout(
             left_expr,
             cond_path.clone().field("left"),
             arena,
             &left.layout,
         )?;
-        let build_key =
-            ctx.decode_expression(right_expr, cond_path.field("right"), arena, &right.layout)?;
+        let build_key = decode_expr_for_slot_layout(
+            right_expr,
+            cond_path.field("right"),
+            arena,
+            &right.layout,
+        )?;
         if right_semi_physical_right_probe {
             probe_keys.push(build_key);
             build_keys.push(probe_key);
@@ -134,7 +138,7 @@ pub(super) fn lower_hash_join_node(
         .other_condition
         .as_ref()
         .map(|expr| {
-            ctx.decode_expression(
+            decode_expr_for_slot_layout(
                 expr,
                 path.clone().field("other_condition"),
                 arena,

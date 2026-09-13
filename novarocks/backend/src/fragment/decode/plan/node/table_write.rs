@@ -78,6 +78,8 @@ use crate::connector::write_data_plane::{
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
 use novarocks_native_adapter::fragment_plan_node::decode_unpivot_constant;
 
 fn decode_writer_multiplex_schema(
@@ -744,7 +746,7 @@ pub(super) fn lower_table_writer_node(
         ));
     }
     let projected_input_layout =
-        ctx.decode_output_layout(&writer.target_schema, path.clone().field("target_schema"))?;
+        decode_fragment_output_layout(&writer.target_schema, path.clone().field("target_schema"))?;
     let expected_slot_ids = (0..writer.target_schema.len())
         .map(|ordinal| {
             ordinal
@@ -791,7 +793,7 @@ pub(super) fn lower_table_writer_node(
     }
     let mut exprs = Vec::with_capacity(writer.output_exprs.len());
     for (index, expression) in writer.output_exprs.iter().enumerate() {
-        exprs.push(ctx.decode_expression(
+        exprs.push(decode_expr_for_slot_layout(
             expression,
             path.clone().field("output_exprs").index(index),
             &mut projection_arena,

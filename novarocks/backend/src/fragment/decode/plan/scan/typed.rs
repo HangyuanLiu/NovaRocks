@@ -132,7 +132,7 @@ pub(super) fn lower_typed_connector_scan(
             )
         })?;
 
-    let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
+    let predicate = lower_scan_predicate(scan, arena, &layout)?;
     // `slot_ids[i]` names page channel `i`, and a page channel exists for each
     // assignment, so both lanes are handed the connector's read column list
     // rather than the node's output schema. Whatever separates the two is the

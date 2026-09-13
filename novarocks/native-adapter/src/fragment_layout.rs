@@ -30,6 +30,8 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 
+use crate::fragment_error::NativeFragmentDecodeError;
+
 pub fn chunk_schema_from_output_columns(
     columns: &[common::OutputColumn],
     path: FieldPath,
@@ -122,6 +124,13 @@ pub fn decode_output_layout(
         chunk_schema,
         slots,
     ))
+}
+
+pub fn decode_fragment_output_layout(
+    columns: &[common::OutputColumn],
+    path: FieldPath,
+) -> Result<NativeOutputLayout, NativeFragmentDecodeError> {
+    decode_output_layout(columns, path).map_err(NativeFragmentDecodeError::from)
 }
 
 pub fn decode_exchange_contracts(

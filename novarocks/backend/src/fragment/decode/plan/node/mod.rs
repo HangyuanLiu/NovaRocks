@@ -63,6 +63,7 @@ use novarocks_execution::exec::node::runtime_filter::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
     lower_filter_node, lower_generate_series_node, lower_limit_node, lower_nest_loop_join_node,
@@ -222,7 +223,6 @@ fn decode_node_inner(
             &mut children,
             arena,
             path.clone().field("runtime_filter_binding_ids"),
-            ctx,
         )?;
     }
 
@@ -274,14 +274,7 @@ fn decode_node_inner(
         }
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(
-            node,
-            &consumer_bindings,
-            &mut lowered,
-            arena,
-            path.clone(),
-            ctx,
-        )?;
+        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
     let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
@@ -405,7 +398,6 @@ fn attach_direct_input_consumers(
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
     path: FieldPath,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<(), NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<RuntimeFilterConsumerBinding>>::new();
     for binding in bindings {
@@ -441,7 +433,7 @@ fn attach_direct_input_consumers(
             )
         })?;
         let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena, ctx)?;
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
         grouped
             .entry(*index)
             .or_default()
@@ -470,7 +462,6 @@ fn attach_leaf_consumers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<(), NativeFragmentDecodeError> {
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
@@ -513,13 +504,8 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id = lower_binding_expression(
-                binding,
-                &lowered.layout,
-                &lowered.output_schema,
-                arena,
-                ctx,
-            )?;
+            let expr_id =
+                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -1154,7 +1140,6 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
@@ -1164,7 +1149,7 @@ fn lower_binding_expression(
         schema,
         expression_path.clone(),
     )?;
-    ctx.decode_expression(&binding.expression, expression_path, arena, layout)
+    decode_expr_for_slot_layout(&binding.expression, expression_path, arena, layout)
 }
 
 fn validate_column_refs_exact(
@@ -1633,7 +1618,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,

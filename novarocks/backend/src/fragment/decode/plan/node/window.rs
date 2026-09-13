@@ -34,6 +34,8 @@ use novarocks_execution::exec::node::analytic::{
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
 use novarocks_native_adapter::fragment_plan_node::lower_sort_items_for_layout;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{expr, plan};
@@ -75,7 +77,7 @@ pub(super) fn lower_window_node(
             "WindowNode output_columns missing",
         ));
     }
-    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let output_layout = decode_fragment_output_layout(output_columns, output_columns_path)?;
     let final_layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
     let final_output_schema = output_layout.chunk_schema();
 
@@ -107,7 +109,6 @@ pub(super) fn lower_window_node(
                 path.clone().field("window_exprs").index(first_idx),
                 current,
                 arena,
-                ctx,
             )?;
             next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
                 NativeFragmentDecodeError::out_of_range(
@@ -136,7 +137,7 @@ pub(super) fn lower_window_node(
             .iter()
             .enumerate()
             .map(|(idx, expr)| {
-                ctx.decode_expression(
+                decode_expr_for_slot_layout(
                     expr,
                     path.clone()
                         .field("window_exprs")
@@ -165,7 +166,7 @@ pub(super) fn lower_window_node(
                         format!("WindowNode group {group_idx} order_by[{idx}] expr missing"),
                     )
                 })?;
-                ctx.decode_expression(expr, item_path.field("expr"), arena, &current.layout)
+                decode_expr_for_slot_layout(expr, item_path.field("expr"), arena, &current.layout)
             })
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let frame = first
@@ -264,11 +265,10 @@ fn sort_window_group_input(
     path: FieldPath,
     input: DecodedNode,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
     for (idx, expr) in first.partition_by.iter().enumerate() {
-        let expr = ctx.decode_expression(
+        let expr = decode_expr_for_slot_layout(
             expr,
             path.clone().field("partition_by").index(idx),
             arena,
@@ -455,7 +455,7 @@ fn lower_window_function(
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            ctx.decode_expression(
+            decode_expr_for_slot_layout(
                 arg,
                 path.clone().field("args").index(idx),
                 arena,
@@ -481,7 +481,7 @@ fn lower_window_function(
                     format!("window aggregate {name} function_order_by[{idx}] expr missing"),
                 )
             })?;
-            ctx.decode_expression(order_expr, item_path.field("expr"), arena, input_layout)
+            decode_expr_for_slot_layout(order_expr, item_path.field("expr"), arena, input_layout)
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let aggregate_binding = if is_aggregate_window_kind(&kind) {

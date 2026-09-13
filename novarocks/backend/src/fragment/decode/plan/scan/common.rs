@@ -19,7 +19,6 @@
 
 use arrow::datatypes::DataType;
 
-use super::super::context::NativePlanDecodeContext;
 use crate::connector::batch_transform::ConnectorBatchTransform;
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
@@ -28,6 +27,7 @@ use novarocks_execution::exec::variant_read::{
     ParquetSlotKind, VariantPathSpec, convert_variant_columns, materialize_variant_path_columns,
 };
 use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
@@ -143,25 +143,23 @@ pub(super) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,
     layout: &Layout,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<Option<ExprId>, NativeFragmentLeafDecodeError> {
     let mut predicate = None;
     for (idx, expr) in scan.predicates.iter().enumerate() {
-        let expr_id = ctx
-            .decode_expression(
-                expr,
-                FieldPath::root("scan").field("predicates").index(idx),
-                arena,
-                layout,
+        let expr_id = decode_expr_for_slot_layout(
+            expr,
+            FieldPath::root("scan").field("predicates").index(idx),
+            arena,
+            layout,
+        )
+        .map_err(|err| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::InvalidValue,
+                "predicates",
+                format!("ScanNode predicate {idx}: {err}"),
             )
-            .map_err(|err| {
-                NativeFragmentLeafDecodeError::at_field(
-                    ProtocolErrorKind::InvalidValue,
-                    "predicates",
-                    format!("ScanNode predicate {idx}: {err}"),
-                )
-                .append_index(idx)
-            })?;
+            .append_index(idx)
+        })?;
         predicate = Some(match predicate {
             Some(prev) => arena.push_typed(ExprNode::And(prev, expr_id), DataType::Boolean),
             None => expr_id,

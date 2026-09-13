@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::exchange::ExchangeKey;
@@ -32,12 +31,9 @@ use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
-use novarocks_native_adapter::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
 #[cfg(test)]
 use novarocks_native_adapter::fragment_instance::decode_scan_range_params;
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
-use novarocks_proto_models::{common, expr};
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
     ConnectorExecutionWriteBinding, ConnectorRequestResources, ConnectorResourceCheckpoint,
@@ -45,10 +41,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::QueryId;
 
-use novarocks_execution::exec::chunk::SlotLayout as Layout;
-use novarocks_native_adapter::fragment_error::{
-    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
-};
+use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
 /// Adapts connector reservations to the exact fragment tracker created by
 /// native task admission. The adapter exists during pure plan decode, but it
@@ -506,30 +499,6 @@ impl NativePlanDecodeContext {
 
     pub(crate) fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {
         self.typed_scan_runtime.as_ref()
-    }
-
-    pub(crate) fn decode_output_layout(
-        &self,
-        columns: &[common::OutputColumn],
-        path: FieldPath,
-    ) -> Result<
-        novarocks_native_adapter::fragment_layout::NativeOutputLayout,
-        NativeFragmentDecodeError,
-    > {
-        novarocks_native_adapter::fragment_layout::decode_output_layout(columns, path)
-            .map_err(NativeFragmentDecodeError::from)
-    }
-
-    pub(crate) fn decode_expression(
-        &self,
-        expression: &expr::Expr,
-        path: FieldPath,
-        arena: &mut ExprArena,
-        layout: &Layout,
-    ) -> Result<ExprId, NativeFragmentDecodeError> {
-        let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
-        decode_expr_at(expression, path, arena, &input)
-            .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
     }
 
     pub(crate) fn capture_scan_ranges(&self, node_id: i32, ranges: BoundScanRanges) {

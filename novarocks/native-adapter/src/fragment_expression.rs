@@ -20,12 +20,14 @@
 use arrow::datatypes::DataType;
 
 use self::error::NativeExpressionDecodeError;
-use novarocks_execution::exec::chunk::ChunkFieldSchema;
+use novarocks_execution::exec::chunk::{ChunkFieldSchema, SlotLayout};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_plan_codec::native_type::{decode_field_type, decode_type};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::expr;
 use novarocks_types::SlotId;
+
+use crate::fragment_error::NativeFragmentDecodeError;
 
 mod binary;
 mod case;
@@ -211,6 +213,17 @@ pub fn decode_expr_at(
     }?;
     set_proto_field_schema(e, arena, id);
     Ok(id)
+}
+
+pub fn decode_expr_for_slot_layout(
+    e: &expr::Expr,
+    path: FieldPath,
+    arena: &mut ExprArena,
+    layout: &SlotLayout,
+) -> Result<ExprId, NativeFragmentDecodeError> {
+    let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
+    decode_expr_at(e, path, arena, &input)
+        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
 }
 
 fn decode_expr_type_at(
