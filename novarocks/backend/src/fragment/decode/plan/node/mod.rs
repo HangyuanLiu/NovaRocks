@@ -25,7 +25,6 @@ mod exchange;
 mod filter;
 mod generate_series;
 mod hash_join;
-mod limit;
 mod nestloop_join;
 mod project;
 mod redistribute;
@@ -64,15 +63,13 @@ use novarocks_execution::exec::node::runtime_filter::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::{
+    NativeLoweredPlanNode, lower_limit_node, parse_distributed_limit,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
-#[derive(Clone, Debug)]
-pub(crate) struct DecodedNode {
-    pub(crate) node: ExecNode,
-    pub(crate) layout: Layout,
-    pub(crate) output_schema: ChunkSchemaRef,
-}
+pub(crate) type DecodedNode = NativeLoweredPlanNode;
 #[allow(
     dead_code,
     reason = "Retained for target-specific native integration and regression coverage."
@@ -1582,7 +1579,7 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
-        plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(
+        plan::plan_node::Kind::Limit(limit) => lower_limit_node(
             node,
             limit,
             path.clone().field("limit"),

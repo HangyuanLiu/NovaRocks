@@ -157,45 +157,6 @@ pub(crate) fn proto_join_type(
     }
 }
 
-pub(crate) fn parse_optional_nonnegative_i64(
-    value: Option<i64>,
-    label: &str,
-) -> Result<Option<usize>, String> {
-    value
-        .map(|value| {
-            if value < 0 {
-                Err(format!("{label} must be >= 0, got {value}"))
-            } else {
-                Ok(value as usize)
-            }
-        })
-        .transpose()
-}
-
-pub(crate) fn parse_distributed_limit(value: i64, label: &str) -> Result<Option<usize>, String> {
-    if value == -1 {
-        Ok(None)
-    } else if value < 0 {
-        Err(format!("{label} must be -1 or >= 0, got {value}"))
-    } else {
-        Ok(Some(value as usize))
-    }
-}
-
-pub(crate) fn merge_limits(
-    node_kind: &str,
-    payload_limit: Option<usize>,
-    outer_limit: Option<usize>,
-) -> Result<Option<usize>, String> {
-    match (payload_limit, outer_limit) {
-        (Some(left), Some(right)) if left != right => Err(format!(
-            "{node_kind} payload limit {left} conflicts with DistributedNode.limit {right}"
-        )),
-        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
-        (None, None) => Ok(None),
-    }
-}
-
 pub(super) fn build_slot_projection(
     label: &str,
     input: DecodedNode,

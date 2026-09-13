@@ -17,7 +17,6 @@
 
 //! Fragment exchange-node decoding.
 
-use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
@@ -26,6 +25,7 @@ use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::parse_optional_nonnegative_i64;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 

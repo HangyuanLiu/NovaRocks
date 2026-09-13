@@ -18,12 +18,12 @@
 //! Fragment assert-node decoding.
 
 use super::DecodedNode;
-use super::common::parse_optional_nonnegative_i64;
 use novarocks_execution::exec::node::assert::{AssertNumRowsMode, AssertNumRowsNode, Assertion};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::{
     NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
 };
+use novarocks_native_adapter::fragment_plan_node::parse_optional_nonnegative_i64;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
