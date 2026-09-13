@@ -75,9 +75,6 @@ use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
     sealed_runtime_filter_evidence,
 };
-use crate::connector::catalog_manager::{
-    CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
-};
 use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
 use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 use crate::runtime_filter::install_decode::{
@@ -91,8 +88,9 @@ use crate::runtime_filter::terminal_contribution::{
 };
 use novarocks_native_adapter::BackendDataRuntime;
 use novarocks_worker::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest,
-    TaskStatusReporter,
+    CatalogManager, CatalogManagerError, CatalogPruneResult,
+    ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextHost,
+    ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
 
 /// The mutable half of one context's installed facts.
@@ -657,7 +655,7 @@ impl crate::rpc::server::CatalogReachabilityAuthority for NativeQueryContextHost
     fn prune_unreachable_catalogs(
         &self,
         reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
-    ) -> crate::connector::catalog_manager::CatalogPruneResult {
+    ) -> CatalogPruneResult {
         let result = self.catalog_manager.prune_unreachable(&reachable);
         self.publish_catalog_lease_metrics();
         result
@@ -1195,9 +1193,6 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
 
-    use crate::connector::catalog_manager::{
-        CatalogManager, ConnectorExecutionRoleBindingFactorySet,
-    };
     use crate::rpc::runtime::test_backend_data_runtime;
     use crate::runtime_filter::error::{
         RuntimeFilterContractError, RuntimeFilterContractErrorCode,
@@ -1210,8 +1205,10 @@ mod tests {
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use crate::task_execution::shared_facts::release_runtime_filter_telemetry;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
-    use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::QueryContextHost;
+    use novarocks_worker::{
+        CatalogManager, ConnectorExecutionRoleBindingFactorySet, ProcessMonotonicClock,
+    };
     use novarocks_worker::{
         METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
         TaskStatusSource,

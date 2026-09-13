@@ -26,6 +26,7 @@ use std::num::NonZeroUsize;
 
 mod admission;
 mod admission_epoch;
+mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
 mod convergence;
@@ -54,6 +55,10 @@ pub use admission::{
     MAX_ADMISSION_TICKET_VALID_FOR,
 };
 pub use admission_epoch::WorkerAdmissionEpochAuthority;
+pub use catalog_manager::{
+    CatalogLeaseSnapshot, CatalogManager, CatalogManagerError, CatalogPruneResult,
+    ConnectorExecutionRoleBindingFactorySet,
+};
 pub use catalog_manager_config::{CatalogManagerConfig, DEFAULT_MAX_RETAINED_CATALOGS};
 pub use clock::{ManualClock, ProcessMonotonicClock, WorkerMonotonicClock};
 pub use convergence::{

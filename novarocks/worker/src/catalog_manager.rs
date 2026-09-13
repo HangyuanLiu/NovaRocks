@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-local catalog materialization and retention state.
+//! Worker-owned catalog materialization and retention state.
 //!
 //! This module deliberately has no RPC, provider discovery, or query-lifecycle
 //! ownership.  Its caller supplies the immutable `CatalogProperties` frozen by
@@ -28,6 +28,7 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::CatalogManagerConfig;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties, ConnectorProviderId};
 use novarocks_spi::connector::{
     ConnectorExecutionRoleBinding, ConnectorExecutionRoleBindingFactory,
@@ -35,7 +36,6 @@ use novarocks_spi::connector::{
     ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
 };
 use novarocks_types::QueryExecutionId;
-use novarocks_worker::CatalogManagerConfig;
 
 /// Startup-sealed execution-role factories keyed by the closed catalog family.
 /// Each selected factory constructs the entire immutable BE capability binding
@@ -875,7 +875,7 @@ mod tests {
         CatalogManager, CatalogManagerError, CatalogPruneResult,
         ConnectorExecutionRoleBindingFactorySet, remove_ready_candidate_if_current,
     };
-    use novarocks_worker::CatalogManagerConfig;
+    use crate::CatalogManagerConfig;
 
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, value), AttemptId::new(1).expect("attempt"))

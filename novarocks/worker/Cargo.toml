@@ -12,6 +12,7 @@ doctest = false
 
 [dependencies]
 novarocks-execution-contract.workspace = true
+novarocks-spi.workspace = true
 novarocks-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 uuid = { workspace = true, features = ["v4"] }

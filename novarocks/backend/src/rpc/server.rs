@@ -29,14 +29,13 @@ use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::connector::catalog_manager::CatalogPruneResult;
 use crate::runtime_filter::rpc::{
     BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope,
 };
 use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder, generated::nova_rocks_grpc_server::NovaRocksGrpc,
 };
-use novarocks_worker::TaskInboundCapabilities;
+use novarocks_worker::{CatalogPruneResult, TaskInboundCapabilities};
 
 /// What a rejected catalog prune is allowed to say on the wire.
 ///

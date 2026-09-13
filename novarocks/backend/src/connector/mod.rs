@@ -16,7 +16,6 @@
 // under the License.
 
 pub(crate) mod batch_transform;
-pub mod catalog_manager;
 pub mod typed_runtime;
 pub(crate) mod write_data_plane;
 #[cfg(test)]

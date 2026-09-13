@@ -4454,6 +4454,7 @@ name = "novarocks-worker"
 version = "0.1.0"
 dependencies = [
  "novarocks-execution-contract",
+ "novarocks-spi",
  "novarocks-types",
  "tokio",
  "tracing",

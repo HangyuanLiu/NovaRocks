@@ -11,8 +11,9 @@ use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::{
-    CatalogManagerConfig, WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor,
-    WorkerDrainState, WorkerResultRetainedLimits,
+    CatalogManager, CatalogManagerConfig, ConnectorExecutionRoleBindingFactorySet,
+    WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor, WorkerDrainState,
+    WorkerResultRetainedLimits,
 };
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
@@ -327,7 +328,7 @@ fn compose_backend_application_services(
         ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
     let execution_role_binding_factories = Arc::new(
-        crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new(
+        ConnectorExecutionRoleBindingFactorySet::try_new(
             execution_role_binding_factories.iter().cloned(),
         )
         .map_err(|error| {
@@ -339,15 +340,14 @@ fn compose_backend_application_services(
     );
     // One catalog manager per process: a catalog lease belongs to the process,
     // and two managers would be two authorities over the same leases.
-    let catalog_manager = Arc::new(
-        crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
-            .map_err(|error| {
-                BackendApplicationError::new(
-                    BackendApplicationErrorKind::Configuration,
-                    format!("compose backend catalog manager: {error}"),
-                )
-            })?,
-    );
+    let catalog_manager = Arc::new(CatalogManager::try_new(catalog_manager_config).map_err(
+        |error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("compose backend catalog manager: {error}"),
+            )
+        },
+    )?);
     crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
         .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
