@@ -34,7 +34,7 @@ mod query_execution;
 pub(crate) mod runtime_filter;
 pub mod server;
 mod state_family;
-pub mod state_store;
+pub(crate) mod state_store;
 pub(crate) mod statistics;
 pub(crate) mod statistics_jobs;
 mod system_catalog;
