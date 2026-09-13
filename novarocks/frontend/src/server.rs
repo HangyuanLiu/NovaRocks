@@ -115,6 +115,34 @@ pub struct FrontendServingConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
+/// Immutable Frontend role products constructed before SQL session assembly.
+///
+/// The Server composition creates this graph after the Native report endpoint
+/// has a concrete port and before it opens MySQL admission.  Query-session
+/// assembly consumes these products; it does not start maintenance or MV
+/// workers as a side effect of creating a client-facing factory.
+struct FrontendRoleProducts {
+    catalog_service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
+    unified_statistics: Arc<crate::connector::UnifiedStatisticsResolver>,
+    catalog_application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
+    query_execution: crate::query_execution::service::QueryExecutionService,
+    topology: crate::common::backend_topology::BackendTopologyService,
+    role: novarocks_types::ClusterRole,
+    mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+    view_service: Arc<dyn crate::view::ViewService>,
+    statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
+    maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
+    mv_service: Arc<crate::mv::FrontendMvService>,
+    maintenance_ports: core_capabilities::MaintenanceCommandPorts,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    exchange_port: u16,
+}
+
 /// Opens the frontend services once for an externally composed server.
 pub async fn open_frontend_application_for_server(
     config: &FrontendApplicationOpenConfig,
@@ -137,13 +165,11 @@ pub async fn open_frontend_application_for_server(
 /// session factory.  Every Core value constructed here is a closed domain
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
-pub fn build_frontend_query_session_factory(
+fn build_frontend_role_products(
     host: &mut FrontendApplicationHost,
-    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    client_connection_control: Arc<dyn ClientConnectionControlPort>,
-) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+) -> Result<FrontendRoleProducts, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
     let unified_statistics = Arc::new(crate::connector::UnifiedStatisticsResolver::default());
@@ -211,10 +237,6 @@ pub fn build_frontend_query_session_factory(
     ));
     host.install_mv_service(Arc::clone(&mv_service))
         .map_err(FrontendApplicationError::server)?;
-    let mv_application_service = Arc::clone(&mv_service);
-    let mv_application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
-        mv_application_service;
-
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
@@ -271,6 +293,61 @@ pub fn build_frontend_query_session_factory(
             "start frontend MV background workers failed: {error}"
         )));
     }
+
+    Ok(FrontendRoleProducts {
+        catalog_service,
+        unified_statistics,
+        catalog_application,
+        function_catalog,
+        connector_control,
+        typed_connector_control,
+        query_execution,
+        topology,
+        role,
+        mv_repository,
+        view_service,
+        statistics_application,
+        maintenance_service,
+        mv_readiness,
+        mv_candidate_reader,
+        mv_service,
+        maintenance_ports,
+        mv_storage_observation,
+        exchange_port,
+    })
+}
+
+/// Assemble SQL/session adapters from an already-started, immutable role
+/// product graph. This intentionally has no worker-start or product-lifecycle
+/// side effect.
+fn build_frontend_query_session_factory_from_role_products(
+    host: &FrontendApplicationHost,
+    products: &FrontendRoleProducts,
+    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
+) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+    let catalog_service = Arc::clone(&products.catalog_service);
+    let unified_statistics = Arc::clone(&products.unified_statistics);
+    let catalog_application = Arc::clone(&products.catalog_application);
+    let function_catalog = Arc::clone(&products.function_catalog);
+    let connector_control = Arc::clone(&products.connector_control);
+    let typed_connector_control = Arc::clone(&products.typed_connector_control);
+    let query_execution = products.query_execution.clone();
+    let topology = products.topology.clone();
+    let role = products.role;
+    let mv_repository = Arc::clone(&products.mv_repository);
+    let view_service = Arc::clone(&products.view_service);
+    let statistics_application = Arc::clone(&products.statistics_application);
+    let maintenance_service = Arc::clone(&products.maintenance_service);
+    let mv_readiness = Arc::clone(&products.mv_readiness);
+    let mv_candidate_reader = products.mv_candidate_reader.clone();
+    let mv_service = Arc::clone(&products.mv_service);
+    let mv_application_service = Arc::clone(&mv_service);
+    let mv_application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
+        mv_application_service;
+    let maintenance_ports = products.maintenance_ports.clone();
+    let mv_storage_observation = Arc::clone(&products.mv_storage_observation);
+    let exchange_port = products.exchange_port;
 
     let query_compiler =
         core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
@@ -385,6 +462,23 @@ pub fn build_frontend_query_session_factory(
     ));
     host.mark_ready()?;
     Ok(query_service)
+}
+
+#[cfg(test)]
+pub fn build_frontend_query_session_factory(
+    host: &mut FrontendApplicationHost,
+    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    exchange_port: u16,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
+) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+    let products = build_frontend_role_products(host, exchange_port, mv_storage_observation)?;
+    build_frontend_query_session_factory_from_role_products(
+        host,
+        &products,
+        system_catalog,
+        client_connection_control,
+    )
 }
 
 /// Drives the exact Frontend owner graph to convergence before the production
@@ -530,11 +624,19 @@ where
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
     let client_connection_control: Arc<dyn ClientConnectionControlPort> =
         client_connections.clone();
-    let session_factory = match build_frontend_query_session_factory(
+    let products = match build_frontend_role_products(host, exchange_port, mv_storage_observation) {
+        Ok(products) => products,
+        Err(error) => {
+            let stop_result = report_server
+                .stop()
+                .map_err(FrontendApplicationError::server);
+            return combine_server_and_shutdown(Err(error), stop_result);
+        }
+    };
+    let session_factory = match build_frontend_query_session_factory_from_role_products(
         host,
+        &products,
         system_catalog,
-        exchange_port,
-        mv_storage_observation,
         client_connection_control,
     ) {
         Ok(factory) => factory,
