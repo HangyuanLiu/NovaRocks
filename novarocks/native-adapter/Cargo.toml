@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 novarocks-native-trust.workspace = true
 novarocks-execution.workspace = true
+novarocks-execution-contract.workspace = true
 novarocks-failpoint = { workspace = true, features = ["typed"] }
 novarocks-plan-codec.workspace = true
 novarocks-proto-codec.workspace = true

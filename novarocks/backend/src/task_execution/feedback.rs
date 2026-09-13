@@ -56,7 +56,7 @@ use novarocks_worker::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 
-use super::fault;
+use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::TaskStatusReporter;
 
 /// Publishes one query context's terminal logical feedback through one task.

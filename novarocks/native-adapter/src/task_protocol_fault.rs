@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Runner-owned perturbation of the task protocol's RPC boundary.
+//! Runner-owned perturbation at the Native task-protocol boundary.
 //!
 //! Most faults here drop an acknowledgement the backend already earned: the
 //! operation linearized, its receipt exists, and only the answer is lost. That
@@ -91,7 +91,7 @@ use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
 /// Drops the acknowledgement of one applied `EstablishQueryContext`.
-pub(super) fn establish_context_ack_dropped(
+pub fn establish_context_ack_dropped(
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -112,7 +112,7 @@ pub(super) fn establish_context_ack_dropped(
 /// reaches the client through the attempt's termination cause, and a message
 /// that read like a real execution error would make an injected failure
 /// indistinguishable from a genuine one in a test log.
-pub(super) const TASK_EXECUTION_FAILURE_DETAIL: &str =
+pub const TASK_EXECUTION_FAILURE_DETAIL: &str =
     "runner-owned task execution failure injected after the task started";
 
 /// Fails one admitted task's local execution.
@@ -127,7 +127,7 @@ pub(super) const TASK_EXECUTION_FAILURE_DETAIL: &str =
 /// It fires once per arming, so a second task of the same attempt runs
 /// untouched and its termination is caused by the first one's failure rather
 /// than by another injection.
-pub(super) fn task_execution_failure_injected(identity: TaskIdentity) -> Result<bool, String> {
+pub fn task_execution_failure_injected(identity: TaskIdentity) -> Result<bool, String> {
     let execution = identity.query_execution_id();
     let Some(scope) = claim_by_detail(
         QueryLifecycleFaultKind::TaskExecutionFailure,
@@ -193,9 +193,7 @@ pub(super) fn task_execution_failure_injected(identity: TaskIdentity) -> Result<
 /// recording the hold only after the establish returns would let that waiter
 /// reserve a task in the narrow gate-open interval before this handler publishes
 /// its marker.
-pub(super) fn arm_restart_after_establish_context(
-    context: QueryContextRef,
-) -> Result<(), tonic::Status> {
+pub fn arm_restart_after_establish_context(context: QueryContextRef) -> Result<(), tonic::Status> {
     let execution = context.query_execution_id();
     let Some(scope) = match_persistent(
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
@@ -209,7 +207,7 @@ pub(super) fn arm_restart_after_establish_context(
     Ok(())
 }
 
-pub(super) fn restart_after_establish_context(
+pub fn restart_after_establish_context(
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -254,9 +252,7 @@ pub(super) fn restart_after_establish_context(
 /// scoped to the exact context and exists only while the accepted establish is
 /// parked, so it neither changes normal admission nor broadens the fault to
 /// other attempts.
-pub(super) fn restart_after_establish_context_holds_task_creation(
-    context: QueryContextRef,
-) -> bool {
+pub fn restart_after_establish_context_holds_task_creation(context: QueryContextRef) -> bool {
     restart_after_establish_rendezvous_is_held(context)
 }
 
@@ -264,14 +260,14 @@ pub(super) fn restart_after_establish_context_holds_task_creation(
 /// creation. The scope was validated when the accepted establish armed the
 /// hold, so the registry can call this at its linearization point without
 /// re-reading fault configuration while it owns its lock.
-pub(super) fn wait_for_restart_after_establish_context(context: QueryContextRef) {
+pub fn wait_for_restart_after_establish_context(context: QueryContextRef) {
     if let Some(scope) = restart_after_establish_rendezvous_scope(context) {
         wait_for_runner_owned_restart(&scope);
     }
 }
 
 /// Native fault adapter for the Worker task-creation gate.
-pub(crate) struct RestartAfterEstablishTaskCreationGate;
+pub struct RestartAfterEstablishTaskCreationGate;
 
 impl novarocks_worker::TaskCreationGate for RestartAfterEstablishTaskCreationGate {
     fn holds_task_creation(&self, context: QueryContextRef) -> bool {
@@ -445,7 +441,7 @@ fn notify_runner_of_restart_after_establish(
 }
 
 /// Drops the acknowledgement of one applied lease renewal.
-pub(super) fn lease_renewal_ack_dropped(
+pub fn lease_renewal_ack_dropped(
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -469,7 +465,7 @@ pub(super) fn lease_renewal_ack_dropped(
 /// what makes the backend stand its tasks down, and the arming is therefore
 /// matched without being consumed -- consuming it would let the second renewal
 /// through and keep the lease alive.
-pub(super) fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::Status> {
+pub fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::Status> {
     let Some(scope) = match_persistent(
         QueryLifecycleFaultKind::LeaseRenewalStop,
         context.query_execution_id(),
@@ -507,7 +503,7 @@ pub(super) fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, to
 /// Only a terminal, non-empty delivery claims it. A malformed, refused or
 /// non-terminal one must leave the token for the real terminal
 /// acknowledgement, which is the case's actual subject.
-pub(super) fn task_update_terminal_ack_dropped(
+pub fn task_update_terminal_ack_dropped(
     identity: TaskIdentity,
     outcome: OperationOutcome,
     terminal_nonempty: bool,
@@ -537,7 +533,7 @@ pub(super) fn task_update_terminal_ack_dropped(
     ))
 }
 
-pub(super) fn create_task_ack_dropped(
+pub fn create_task_ack_dropped(
     identity: TaskIdentity,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -598,7 +594,7 @@ const CREATE_CONFLICT_AFTER_APPLY_DETAIL: &str =
 /// rejection carries no acknowledgement body, so leaving the applied one
 /// attached would be a wire value no owner can produce, and the frontend would
 /// refuse it for its shape instead of for its verdict.
-pub(super) fn create_task_conflict_after_apply(
+pub fn create_task_conflict_after_apply(
     identity: TaskIdentity,
     outcome: OperationOutcome,
     encoded: &mut proto::TaskOperationReceipt,
@@ -652,7 +648,7 @@ pub(super) fn create_task_conflict_after_apply(
 ///
 /// Claimed only once the applied acknowledgement is present, so a malformed or
 /// refused create leaves the arming for the create that really admitted a task.
-pub(super) fn create_task_receipt_foreign_task(
+pub fn create_task_receipt_foreign_task(
     identity: TaskIdentity,
     outcome: OperationOutcome,
     encoded: &mut proto::TaskOperationReceipt,
@@ -714,7 +710,7 @@ pub(super) fn create_task_receipt_foreign_task(
 /// the subscription down -- which is a different perturbation entirely, and one
 /// `task_status_subscription_dropped` already owns. A fault that cannot be
 /// claimed must not silently become that other fault.
-pub(super) fn task_status_foreign_process(
+pub fn task_status_foreign_process(
     identity: TaskIdentity,
     encoded: &mut proto::TaskStatusStreamEvent,
 ) {
@@ -783,7 +779,7 @@ fn wire_status_identity(
 /// The digest is the frontend's fence: `admit_terminal` refuses a publication
 /// whose digest is not the contract it declared. Corrupting it therefore has
 /// to fail the query closed rather than prune on a domain nobody declared.
-pub(super) fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
+pub fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
     claim_feedback_perturbation(
         QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT",
@@ -797,7 +793,7 @@ pub(super) fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
 /// one is the fail-*open* half of the pair: an unavailable channel is a
 /// statement the frontend admits, and the split source then enumerates
 /// unpruned. Correctness may not move; only the pruning optimization may.
-pub(super) fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
+pub fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
     claim_feedback_perturbation(
         QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE",
@@ -823,7 +819,7 @@ pub(super) fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
 /// belongs to, and the deployment epoch is exactly that fact. The fence it
 /// meets is the first check in `admit_terminal`, ahead of the pruning winner,
 /// so the query must fail closed with the winner untouched.
-pub(super) fn forge_feedback_foreign_attempt(carrier: TaskIdentity) -> bool {
+pub fn forge_feedback_foreign_attempt(carrier: TaskIdentity) -> bool {
     claim_feedback_perturbation(
         QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT",
@@ -878,9 +874,7 @@ fn claim_feedback_perturbation(
 /// that opened it. Nothing was consumed — the per-task cursors are read-only —
 /// so the frontend's resubscription sees exactly what this stream would have
 /// carried.
-pub(super) fn task_status_subscription_dropped(
-    context: QueryContextRef,
-) -> Result<bool, tonic::Status> {
+pub fn task_status_subscription_dropped(context: QueryContextRef) -> Result<bool, tonic::Status> {
     let execution = context.query_execution_id();
     let Some(scope) = claim(
         QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,

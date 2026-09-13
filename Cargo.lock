@@ -4011,6 +4011,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "novarocks-execution",
+ "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-native-trust",
  "novarocks-plan-codec",
