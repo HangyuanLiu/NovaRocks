@@ -90,8 +90,7 @@ impl FrontendCatalogPruneService {
     }
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
-        self.stopping.store(true, Ordering::Release);
-        self.wake.notify_one();
+        self.request_stop_for_process_exit();
         let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
         if let Some(mut handle) = handle {
             if tokio::time::timeout(timeout, &mut handle).await.is_err() {
@@ -99,6 +98,13 @@ impl FrontendCatalogPruneService {
                 let _ = handle.await;
             }
         }
+    }
+
+    /// Wakes a sleeping best-effort worker when the enclosing role has
+    /// committed to process exit. Joining remains owned by bounded shutdown.
+    pub(crate) fn request_stop_for_process_exit(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     async fn run(&self) {

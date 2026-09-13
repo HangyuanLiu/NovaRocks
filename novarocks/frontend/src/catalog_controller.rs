@@ -216,8 +216,7 @@ impl FrontendCatalogController {
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        self.stopping.store(true, Ordering::Release);
-        self.stop.send_replace(true);
+        self.request_stop_for_process_exit();
         let handle = self
             .worker
             .lock()
@@ -234,6 +233,14 @@ impl FrontendCatalogController {
         self.projection.unpublish_all();
         self.publish_metrics();
         Ok(())
+    }
+
+    /// Makes the controller stop accepting more reconciliation work when the
+    /// enclosing role has committed to process exit. Joining remains owned by
+    /// the bounded lifecycle path.
+    pub(crate) fn request_stop_for_process_exit(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.stop.send_replace(true);
     }
 
     pub fn metrics_snapshot(&self) -> crate::catalog_application::CatalogProjectionMetricsSnapshot {

@@ -506,16 +506,110 @@ impl FrontendExecutionRuntimeOwner {
     }
 }
 
-pub struct FrontendApplicationHost {
+/// The catalog-specific mutable role state that is transferred to the
+/// completed Frontend role graph before SQL admission opens.
+///
+/// Bootstrap installs this owner while the Host still owns reverse cleanup.
+/// Once Server has assembled every other role product, the owner moves as one
+/// value into that graph.  The query catalog projection deliberately remains
+/// outside: it is query-side state bound through the publisher port below.
+pub(crate) struct FrontendCatalogRoleRuntime {
     connector_control: Arc<ConnectorControlHost>,
+    application: Arc<CatalogApplicationService>,
+    controller: Option<Arc<FrontendCatalogController>>,
+    prune: Option<Arc<FrontendCatalogPruneService>>,
+}
+
+impl FrontendCatalogRoleRuntime {
+    fn new(
+        connector_control: Arc<ConnectorControlHost>,
+        application: Arc<CatalogApplicationService>,
+    ) -> Self {
+        Self {
+            connector_control,
+            application,
+            controller: None,
+            prune: None,
+        }
+    }
+
+    pub(crate) fn catalog_application_port(
+        &self,
+    ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
+        Arc::clone(&self.application)
+            as Arc<dyn novarocks_catalog_application::CatalogApplicationPort>
+    }
+
+    pub(crate) fn connector_control_registry(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
+        Arc::clone(&self.connector_control)
+            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+    }
+
+    pub(crate) fn typed_connector_control(&self) -> Arc<ConnectorControlHost> {
+        Arc::clone(&self.connector_control)
+    }
+
+    pub(crate) async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        let had_catalog_controller = self.controller.is_some();
+        let catalog_controller_error = match self.controller.as_ref() {
+            Some(controller) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Some(
+                        "frontend cleanup deadline elapsed before catalog controller shutdown"
+                            .to_string(),
+                    )
+                } else {
+                    tokio::time::timeout(remaining, controller.shutdown())
+                        .await
+                        .map_err(|_| {
+                            "frontend cleanup deadline elapsed shutting down catalog controller"
+                                .to_string()
+                        })
+                        .and_then(|result| result)
+                        .err()
+                }
+            }
+            None => None,
+        };
+        if had_catalog_controller && catalog_controller_error.is_none() {
+            self.controller.take();
+        }
+        // The controller owns the durable desired-state projection. The prune
+        // worker is best effort and may be asleep between rounds, so it must
+        // not consume the whole shared cleanup deadline before the controller
+        // gets a chance to stop and unpublish that projection.
+        if let Some(prune) = self.prune.take() {
+            prune
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        if let Some(error) = catalog_controller_error {
+            Err(format!("shutdown catalog controller failed: {error}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn request_stop_for_process_exit(&self) {
+        if let Some(controller) = self.controller.as_ref() {
+            controller.request_stop_for_process_exit();
+        }
+        if let Some(prune) = self.prune.as_ref() {
+            prune.request_stop_for_process_exit();
+        }
+    }
+}
+
+pub struct FrontendApplicationHost {
+    catalog_role_runtime: Option<FrontendCatalogRoleRuntime>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
-    catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
-    catalog_controller: Option<Arc<FrontendCatalogController>>,
-    catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_runtime: FrontendQueryRuntimeConfig,
@@ -1005,13 +1099,10 @@ impl FrontendApplicationHost {
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
-            connector_control,
+            catalog_role_runtime: None,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
-            catalog_application_port: None,
             abandoned_attempt_sweeper: None,
-            catalog_controller: None,
-            catalog_prune: None,
             mv_repository: None,
             state_store_host: None,
             query_runtime: FrontendQueryRuntimeConfig {
@@ -1081,15 +1172,18 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-        host.catalog_application_port = Some(Arc::new(
-            CatalogApplicationService::new_with_materialization_config(
+        let catalog_application =
+            Arc::new(CatalogApplicationService::new_with_materialization_config(
                 catalog_source,
-                Arc::clone(&host.connector_control),
+                Arc::clone(&connector_control),
                 host.catalog_runtime_projection.publisher(),
                 tokio::runtime::Handle::current(),
                 execution.catalog_materialization,
                 Arc::new(MvCatalogReferenceReader),
-            ),
+            ));
+        host.catalog_role_runtime = Some(FrontendCatalogRoleRuntime::new(
+            connector_control,
+            catalog_application,
         ));
         if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore {
             let store = host
@@ -1097,11 +1191,7 @@ impl FrontendApplicationHost {
                 .expect("dynamic catalog source required a StateStore above");
             let controller = match FrontendCatalogController::new(
                 store,
-                Arc::clone(
-                    host.catalog_application_port
-                        .as_ref()
-                        .expect("catalog application port is installed"),
-                ),
+                Arc::clone(&host.catalog_role_runtime().application),
                 execution.catalog_projection.clone(),
             ) {
                 Ok(controller) => controller,
@@ -1122,11 +1212,7 @@ impl FrontendApplicationHost {
                     ))
                     .await);
             }
-            let counts = host
-                .catalog_application_port
-                .as_ref()
-                .expect("catalog application port is installed")
-                .projection_counts();
+            let counts = host.catalog_role_runtime().application.projection_counts();
             host.serving_lifecycle.publish_catalog_bootstrap(
                 FrontendCatalogSourceMode::DynamicStateStore,
                 true,
@@ -1145,13 +1231,9 @@ impl FrontendApplicationHost {
                     ))
                     .await);
             }
-            host.catalog_controller = Some(controller);
+            host.catalog_role_runtime_mut().controller = Some(controller);
         } else if catalog_source_mode == CatalogDesiredStateSourceMode::StaticFile {
-            let projection = Arc::clone(
-                host.catalog_application_port
-                    .as_ref()
-                    .expect("catalog application port is installed"),
-            );
+            let projection = Arc::clone(&host.catalog_role_runtime().application);
             match projection
                 .reconcile_snapshot_with_page_size(
                     execution.catalog_projection.page_size,
@@ -1201,11 +1283,7 @@ impl FrontendApplicationHost {
             }
         }
         let catalog_prune = FrontendCatalogPruneService::new(
-            Arc::clone(
-                host.catalog_application_port
-                    .as_ref()
-                    .expect("catalog application is installed"),
-            ),
+            Arc::clone(&host.catalog_role_runtime().application),
             host.backend_topology_port(),
             host.data_runtime.clone(),
             execution.catalog_prune.clone(),
@@ -1218,7 +1296,7 @@ impl FrontendApplicationHost {
                 ))
                 .await);
         }
-        host.catalog_prune = Some(catalog_prune);
+        host.catalog_role_runtime_mut().prune = Some(catalog_prune);
 
         // Abandoned write attempts hold a capacity slot and a row of provider
         // evidence until someone hands them back. The attempt contract makes
@@ -1278,14 +1356,34 @@ impl FrontendApplicationHost {
     pub fn catalog_application_port(
         &self,
     ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
-        let application = Arc::clone(
-            self.catalog_application_port
-                .as_ref()
-                .expect("catalog application port is installed before host open returns"),
-        )
-            as Arc<dyn novarocks_catalog_application::CatalogApplicationPort>;
+        let application = self.catalog_role_runtime().catalog_application_port();
         self.catalog_runtime_projection
             .bind_application(application)
+    }
+
+    fn catalog_role_runtime(&self) -> &FrontendCatalogRoleRuntime {
+        self.catalog_role_runtime
+            .as_ref()
+            .expect("catalog role runtime is installed before host open returns")
+    }
+
+    fn catalog_role_runtime_mut(&mut self) -> &mut FrontendCatalogRoleRuntime {
+        self.catalog_role_runtime
+            .as_mut()
+            .expect("catalog role runtime is installed before host open returns")
+    }
+
+    /// Transfers the complete catalog lifecycle owner only after Server has
+    /// built every fallible role product. Until this point, Host cleanup keeps
+    /// the same owner for startup rollback.
+    pub(crate) fn take_catalog_role_runtime(
+        &mut self,
+    ) -> Result<FrontendCatalogRoleRuntime, FrontendApplicationError> {
+        self.catalog_role_runtime.take().ok_or_else(|| {
+            FrontendApplicationError::server(
+                "frontend catalog role runtime was already transferred or was never installed",
+            )
+        })
     }
 
     /// The publication set Core binds its query catalog registry to.
@@ -1412,14 +1510,13 @@ impl FrontendApplicationHost {
     pub fn connector_control_registry(
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
-        Arc::clone(&self.connector_control)
-            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+        self.catalog_role_runtime().connector_control_registry()
     }
 
     /// Typed-read planning is carried by the same complete control host
     /// generation as generic planning. There is no parallel registry.
     pub fn typed_connector_control(&self) -> Arc<ConnectorControlHost> {
-        Arc::clone(&self.connector_control)
+        self.catalog_role_runtime().typed_connector_control()
     }
 
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
@@ -1714,50 +1811,22 @@ impl FrontendApplicationHost {
         if let Some(sweeper) = self.abandoned_attempt_sweeper.take() {
             sweeper.shutdown().await;
         }
-        let had_catalog_controller = self.catalog_controller.is_some();
-        let catalog_controller_error = match self.catalog_controller.as_ref() {
-            Some(controller) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Some(
-                        "frontend cleanup deadline elapsed before catalog controller shutdown"
-                            .to_string(),
-                    )
-                } else {
-                    tokio::time::timeout(remaining, controller.shutdown())
-                        .await
-                        .map_err(|_| {
-                            "frontend cleanup deadline elapsed shutting down catalog controller"
-                                .to_string()
-                        })
-                        .and_then(|result| result)
-                        .err()
-                }
-            }
+        let catalog_runtime_error = match self.catalog_role_runtime.as_mut() {
+            Some(runtime) => runtime.shutdown_until(deadline).await.err(),
             None => None,
         };
-        if had_catalog_controller && catalog_controller_error.is_none() {
-            self.catalog_controller.take();
+        if catalog_runtime_error.is_none() {
+            self.catalog_role_runtime.take();
         }
-        // The controller owns the durable desired-state projection. The prune
-        // worker is best effort and may be asleep between rounds, so it must
-        // not consume the whole shared cleanup deadline before the controller
-        // gets a chance to stop and unpublish that projection.
-        if let Some(prune) = self.catalog_prune.take() {
-            prune
-                .shutdown(deadline.saturating_duration_since(Instant::now()))
-                .await;
-        }
-        if let Some(catalog_controller_error) = catalog_controller_error {
-            let error = format!("shutdown catalog controller failed: {catalog_controller_error}");
+        if let Some(catalog_runtime_error) = catalog_runtime_error {
+            let error = catalog_runtime_error;
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {error}"));
             } else {
                 primary_error = Some(error);
             }
-            return Err(primary_error.expect("catalog controller shutdown error is retained"));
+            return Err(primary_error.expect("catalog role runtime shutdown error is retained"));
         }
-        self.catalog_application_port.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {

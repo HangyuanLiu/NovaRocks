@@ -45,7 +45,10 @@ use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
 use crate::{
-    application::{FrontendApplicationError, FrontendApplicationHost, FrontendExecutionConfig},
+    application::{
+        FrontendApplicationError, FrontendApplicationHost, FrontendCatalogRoleRuntime,
+        FrontendExecutionConfig,
+    },
     topology::ClusterBackendOpenConfig,
 };
 
@@ -122,6 +125,10 @@ pub struct FrontendServingConfig {
 /// assembly consumes these products; it does not start maintenance or MV
 /// workers as a side effect of creating a client-facing factory.
 struct FrontendRoleProducts {
+    /// The complete catalog lifecycle moves here only after all fallible
+    /// product construction has succeeded, so Host retains it for startup
+    /// rollback and role products retain it for serving shutdown.
+    catalog_runtime: FrontendCatalogRoleRuntime,
     catalog_service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
     unified_statistics: Arc<crate::connector::UnifiedStatisticsResolver>,
     catalog_application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
@@ -180,33 +187,45 @@ impl FrontendRoleProducts {
     }
 
     async fn shutdown_background_workers_until(
-        &self,
+        &mut self,
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
-        self.statistics_application
+        let mut first_error = None;
+        if let Err(error) = self
+            .statistics_application
             .shutdown_worker_until(deadline)
             .await
-            .map_err(|error| {
-                FrontendApplicationError::server(format!(
-                    "shutdown statistics analyze worker failed: {error}"
-                ))
-            })?;
-        self.mv_service
+        {
+            first_error = Some(FrontendApplicationError::server(format!(
+                "shutdown statistics analyze worker failed: {error}"
+            )));
+        }
+        if let Err(error) = self
+            .mv_service
             .shutdown_background_workers_until(deadline)
             .await
-            .map_err(|error| {
+        {
+            first_error.get_or_insert_with(|| {
                 FrontendApplicationError::server(format!(
                     "shutdown frontend MV background workers failed: {error}"
                 ))
-            })?;
-        self.maintenance_service
-            .shutdown_until(deadline)
-            .await
-            .map_err(|error| {
+            });
+        }
+        if let Err(error) = self.maintenance_service.shutdown_until(deadline).await {
+            first_error.get_or_insert_with(|| {
                 FrontendApplicationError::server(format!(
                     "shutdown frontend table-maintenance service failed: {error}"
                 ))
-            })
+            });
+        }
+        if let Err(error) = self.catalog_runtime.shutdown_until(deadline).await {
+            first_error.get_or_insert_with(|| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend catalog role runtime failed: {error}"
+                ))
+            });
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     fn request_background_stop_for_process_exit(&self) {
@@ -214,6 +233,7 @@ impl FrontendRoleProducts {
             .request_worker_stop_for_process_exit();
         self.mv_service.request_background_stop_for_process_exit();
         self.maintenance_service.request_shutdown_for_process_exit();
+        self.catalog_runtime.request_stop_for_process_exit();
     }
 }
 
@@ -240,7 +260,7 @@ pub async fn open_frontend_application_for_server(
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
 async fn build_frontend_role_products(
-    host: &FrontendApplicationHost,
+    host: &mut FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
 ) -> Result<FrontendRoleProducts, FrontendApplicationError> {
@@ -390,7 +410,12 @@ async fn build_frontend_role_products(
             Handle::current(),
         ),
     );
+    // No fallible product construction follows this transfer.  Keeping it at
+    // the tail means an earlier failure still reaches Host's exact reverse
+    // cleanup path, while a serving role has one catalog shutdown owner.
+    let catalog_runtime = host.take_catalog_role_runtime()?;
     Ok(FrontendRoleProducts {
+        catalog_runtime,
         catalog_service,
         unified_statistics,
         catalog_application,
@@ -566,7 +591,7 @@ fn build_frontend_query_session_factory_from_role_products(
 
 #[cfg(test)]
 async fn build_frontend_query_session_factory(
-    host: &FrontendApplicationHost,
+    host: &mut FrontendApplicationHost,
     system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -587,7 +612,7 @@ async fn build_frontend_query_session_factory(
 /// Drives the product-owned runtimes to convergence before the Host releases
 /// the coordinator, topology, or StateStore they reach through immutable ports.
 async fn shutdown_frontend_role_products_to_convergence(
-    products: &FrontendRoleProducts,
+    products: &mut FrontendRoleProducts,
     attempt_timeout: Duration,
 ) -> Result<(), FrontendApplicationError> {
     let first_error = match products
@@ -762,7 +787,7 @@ where
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
     let client_connection_control: Arc<dyn ClientConnectionControlPort> =
         client_connections.clone();
-    let products =
+    let mut products =
         match build_frontend_role_products(host, exchange_port, mv_storage_observation).await {
             Ok(products) => products,
             Err(error) => {
@@ -774,7 +799,7 @@ where
         };
     if let Err(error) = products.start_background_workers() {
         let product_shutdown = shutdown_frontend_role_products_to_convergence(
-            &products,
+            &mut products,
             config.frontend_cleanup_timeout,
         )
         .await;
@@ -795,7 +820,7 @@ where
         Ok(factory) => factory,
         Err(error) => {
             let product_shutdown = shutdown_frontend_role_products_to_convergence(
-                &products,
+                &mut products,
                 config.frontend_cleanup_timeout,
             )
             .await;
@@ -820,9 +845,11 @@ where
         config.frontend_cleanup_timeout,
     )
     .await;
-    let product_shutdown =
-        shutdown_frontend_role_products_to_convergence(&products, config.frontend_cleanup_timeout)
-            .await;
+    let product_shutdown = shutdown_frontend_role_products_to_convergence(
+        &mut products,
+        config.frontend_cleanup_timeout,
+    )
+    .await;
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
@@ -1329,7 +1356,7 @@ mod tests {
         .await
         .expect("open catalog attachment repository");
 
-        let (session_factory, products) = build_frontend_query_session_factory(
+        let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
@@ -1360,7 +1387,7 @@ mod tests {
         assert_eq!(created.attachment.provider_id.as_str(), "iceberg");
         assert_eq!(created.attachment.display_name, "warehouse");
         assert!(matches!(
-            host.catalog_application_port().admit_catalog(&instance_id),
+            products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Ready(_)
         ));
         let result = session
@@ -1383,7 +1410,7 @@ mod tests {
             "DROP CATALOG must remove the durable attachment"
         );
         assert!(matches!(
-            host.catalog_application_port().admit_catalog(&instance_id),
+            products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Absent
         ));
         let result = session
@@ -1406,7 +1433,7 @@ mod tests {
         session.close();
         drop(session);
         drop(session_factory);
-        shutdown_frontend_role_products_to_convergence(&products, Duration::from_secs(1))
+        shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
             .await
             .expect("shutdown frontend role products");
         host.shutdown().await.expect("host shutdown");
@@ -1483,7 +1510,7 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let (session_factory, products) = build_frontend_query_session_factory(
+        let (session_factory, mut products) = build_frontend_query_session_factory(
             &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
@@ -1507,7 +1534,7 @@ mod tests {
         session.close();
         drop(session);
         drop(session_factory);
-        shutdown_frontend_role_products_to_convergence(&products, Duration::from_secs(1))
+        shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
             .await
             .expect("shutdown frontend role products");
         host.shutdown()
