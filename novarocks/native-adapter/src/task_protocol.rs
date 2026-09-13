@@ -34,13 +34,18 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
-use novarocks_execution_contract::task_execution::operation::ResultByteLimit;
+use novarocks_execution_contract::task_execution::identity::{
+    QueryContextRef, TaskIdentity, TaskOperationId,
+};
+use novarocks_execution_contract::task_execution::operation::{
+    FetchTaskDynamicFilters, GetFinalTaskInfo, OperationOutcome, ResultByteLimit,
+};
 use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{
-    encode_context_convergence_event, encode_operation_outcome, encode_receipt,
-    encode_status_event, encode_task_gone_event,
+    decode_fetch_dynamic_filters, decode_get_final_task_info, encode_context_convergence_event,
+    encode_operation_outcome, encode_receipt, encode_status_event, encode_task_gone_event,
 };
 use novarocks_task_codec::status::encode_final_task_info;
 use novarocks_task_codec::{
@@ -50,8 +55,9 @@ use tokio_stream::Stream;
 
 use crate::task_protocol_fault;
 use novarocks_worker::{
-    ContextConvergenceCursorError, FinalTaskInfoOutcome, HostRejection, OperationReceipt,
-    TaskDynamicFilterRead, TaskStatusEvent, TaskStatusSource, TaskStatusSubscriptionPosition,
+    ContextConvergenceCursorError, DynamicFilterReadOutcome, FinalTaskInfoOutcome, HostRejection,
+    OperationReceipt, TaskDynamicFilterRead, TaskStatusEvent, TaskStatusSource,
+    TaskStatusSubscriptionPosition,
 };
 
 /// Server-side status event stream of one logical query-by-backend
@@ -153,6 +159,65 @@ pub trait TaskResultReader: Send + Sync {
         &self,
         request: TaskResultReadRequest,
     ) -> Result<TaskResultRead, TaskResultReadError>;
+}
+
+/// Role-local authority over task observation facts after Native request
+/// validation. These reads never mutate registry state or renew a lease.
+pub trait TaskObservationReader: Send + Sync {
+    /// Reads a task's dynamic-filter advertisement from the role-local owner.
+    fn read_task_dynamic_filters(
+        &self,
+        request: &FetchTaskDynamicFilters,
+    ) -> DynamicFilterReadOutcome;
+
+    /// Reads a task's terminal diagnostic information from the role-local owner.
+    fn read_final_task_info(&self, request: &GetFinalTaskInfo) -> FinalTaskInfoOutcome;
+}
+
+/// Decodes, delegates, classifies, and encodes one dynamic-filter observation.
+pub fn fetch_task_dynamic_filters(
+    reader: &dyn TaskObservationReader,
+    request: proto::FetchTaskDynamicFiltersRequest,
+) -> Result<proto::FetchTaskDynamicFiltersResponse, tonic::Status> {
+    // An observation read carries no envelope on the wire, so this Native
+    // boundary mints its non-replayable operation identity after validation.
+    let read = decode_fetch_dynamic_filters(
+        &request,
+        TaskOperationId::new_v7(),
+        FieldPath::root("fetch_task_dynamic_filters"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let identity = read.identity();
+    let receipt = reader.read_task_dynamic_filters(&read);
+    // `Accepted` carries a version newer than the caller acknowledged and
+    // `Idempotent` says it is already current. This response has no outcome
+    // field, so every other receipt is a refusal, not an empty answer.
+    if !matches!(
+        receipt.outcome(),
+        OperationOutcome::Accepted | OperationOutcome::Idempotent
+    ) {
+        return Err(tonic::Status::failed_precondition(
+            receipt.detail().map_or("", SafeDetail::as_str).to_owned(),
+        ));
+    }
+    encode_dynamic_filter_read(identity, receipt.acknowledgement()).map_err(host_rejection_status)
+}
+
+/// Decodes, delegates, and encodes one final-task observation without
+/// reclassifying the role owner's receipt.
+pub fn get_final_task_info(
+    reader: &dyn TaskObservationReader,
+    request: proto::GetFinalTaskInfoRequest,
+) -> Result<proto::GetFinalTaskInfoResponse, tonic::Status> {
+    let read = decode_get_final_task_info(
+        &request,
+        TaskOperationId::new_v7(),
+        FieldPath::root("get_final_task_info"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    Ok(encode_final_task_info_response(
+        &reader.read_final_task_info(&read),
+    ))
 }
 
 /// Decodes, delegates, and encodes one Native root-result read.

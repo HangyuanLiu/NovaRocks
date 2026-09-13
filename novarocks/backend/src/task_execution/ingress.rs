@@ -46,11 +46,9 @@
 
 use std::sync::Arc;
 
-use novarocks_execution_contract::task_execution::identity::TaskOperationId;
 use novarocks_execution_contract::task_execution::operation::{
     OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
-use novarocks_execution_contract::task_execution::status::SafeDetail;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
@@ -59,20 +57,19 @@ use novarocks_task_codec::domain::{
 };
 use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, decode_context_aware_subscribe_task_status,
-    decode_fetch_dynamic_filters, decode_get_final_task_info, decode_operation_batch,
-    encode_abort_cause_field, encode_create_task_ack, encode_query_context_ack,
-    encode_query_context_admission_ticket_ack, encode_receipt, encode_release_ack,
-    encode_update_task_ack,
+    decode_operation_batch, encode_abort_cause_field, encode_create_task_ack,
+    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
+    encode_release_ack, encode_update_task_ack,
 };
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
 use super::TaskExecutionRegistry;
 use novarocks_native_adapter::task_protocol::{
-    TaskExecutionIngress, TaskOperationReceiptAck as ReceiptAck, TaskResultRead,
-    TaskResultReadError, TaskResultReadRequest, TaskResultReader, TaskStatusEventStream,
-    encode_dynamic_filter_read, encode_final_task_info_response, encode_operation_receipt,
-    fetch_task_result, host_rejection_status, task_status_event_stream,
+    TaskExecutionIngress, TaskObservationReader, TaskOperationReceiptAck as ReceiptAck,
+    TaskResultRead, TaskResultReadError, TaskResultReadRequest, TaskResultReader,
+    TaskStatusEventStream, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
+    get_final_task_info, host_rejection_status, task_status_event_stream,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance};
@@ -371,6 +368,22 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
     }
 }
 
+impl TaskObservationReader for RegistryTaskExecutionIngress {
+    fn read_task_dynamic_filters(
+        &self,
+        request: &novarocks_execution_contract::task_execution::operation::FetchTaskDynamicFilters,
+    ) -> novarocks_worker::DynamicFilterReadOutcome {
+        self.registry.fetch_task_dynamic_filters(request)
+    }
+
+    fn read_final_task_info(
+        &self,
+        request: &novarocks_execution_contract::task_execution::operation::GetFinalTaskInfo,
+    ) -> novarocks_worker::FinalTaskInfoOutcome {
+        self.registry.get_final_task_info(request)
+    }
+}
+
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
@@ -435,48 +448,14 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::FetchTaskDynamicFiltersRequest,
     ) -> Result<proto::FetchTaskDynamicFiltersResponse, tonic::Status> {
-        // An observation read carries no envelope on the wire, so its
-        // operation identity is minted here and never replayed.
-        let read = decode_fetch_dynamic_filters(
-            &request,
-            TaskOperationId::new_v7(),
-            FieldPath::root("fetch_task_dynamic_filters"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let identity = read.identity();
-        let receipt = self.registry.fetch_task_dynamic_filters(&read);
-        // `Accepted` carries a version newer than the caller acknowledged and
-        // `Idempotent` says it is already current; both are settled answers,
-        // with or without a payload. This response has no outcome field, so
-        // anything else is a refusal that must not be dressed as an empty
-        // answer.
-        if !matches!(
-            receipt.outcome(),
-            OperationOutcome::Accepted | OperationOutcome::Idempotent
-        ) {
-            return Err(tonic::Status::failed_precondition(
-                receipt.detail().map_or("", SafeDetail::as_str).to_owned(),
-            ));
-        }
-        // A settled read with nothing advertised answers version zero, which
-        // is this field family's "nothing": `DomainVersion` is nonzero, so it
-        // cannot collide with a version a task published.
-        encode_dynamic_filter_read(identity, receipt.acknowledgement())
-            .map_err(host_rejection_status)
+        fetch_task_dynamic_filters(self, request)
     }
 
     fn get_final_task_info(
         &self,
         request: proto::GetFinalTaskInfoRequest,
     ) -> Result<proto::GetFinalTaskInfoResponse, tonic::Status> {
-        let read = decode_get_final_task_info(
-            &request,
-            TaskOperationId::new_v7(),
-            FieldPath::root("get_final_task_info"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let receipt = self.registry.get_final_task_info(&read);
-        Ok(encode_final_task_info_response(&receipt))
+        get_final_task_info(self, request)
     }
 
     async fn fetch_task_result(
@@ -508,7 +487,7 @@ mod tests {
         CodecOwnedContent, ContentFingerprint, DomainVersion,
     };
     use novarocks_execution_contract::task_execution::identity::{
-        AdmissionTicketId, QueryContextRef, TaskIdentity,
+        AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
     };
     use novarocks_execution_contract::task_execution::operation::{
         QueryContextDomainUpdate, TaskDomainUpdate,
