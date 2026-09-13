@@ -48,19 +48,17 @@ use crate::runtime_filter::transport::{
 };
 use novarocks_native_adapter::BackendDataRuntime;
 use novarocks_worker::runtime_filter::domain::{
-    BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendEnvelopeKind,
-    BackendFrontendFeedbackSink, BackendIngressDedupe, BackendIngressResult,
-    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendParticipantInstall,
-    BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
-    BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
-    BackendTransportEventKind, BackendTransportFailOpenReason,
+    BackendChannelIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink, BackendIngressDedupe,
+    BackendIngressResult, BackendMaterializedDelivery, BackendMaterializedDeliverySink,
+    BackendParticipantInstall, BackendRouteDecision, BackendRoutingError,
+    BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession,
+    BackendTransportEventIdentity, BackendTransportEventKind, BackendTransportFailOpenReason,
 };
-use novarocks_worker::runtime_filter::execution_session::{
-    RuntimeFilterParticipantOutbound, WorkerRuntimeFilterExecutionSession,
-};
+use novarocks_worker::runtime_filter::execution_session::RuntimeFilterParticipantOutbound;
 use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot,
 };
+use novarocks_worker::runtime_filter::participant::WorkerRuntimeFilterParticipant;
 use novarocks_worker::runtime_filter::participant_ingress;
 use novarocks_worker::{
     RuntimeFilterContractError, RuntimeFilterContractErrorCode,
@@ -183,20 +181,8 @@ impl RuntimeFilterParticipantFactory for BackendRuntimeFilterParticipantFactory 
 /// One sealed Backend participant for exactly one query execution attempt.
 pub(crate) struct RuntimeFilterParticipant {
     execution_id: QueryExecutionId,
-    install: BackendParticipantInstall,
-    observation: Arc<RuntimeFilterObservationEmitter>,
-    producer_sessions: BTreeMap<
-        novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        Arc<BackendRuntimeFilterSession>,
-    >,
-    consumer_sessions: BTreeMap<
-        novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        Arc<BackendRuntimeFilterSession>,
-    >,
+    state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
-    delivery_dedupe: Arc<BackendIngressDedupe>,
-    cancelled: Arc<AtomicBool>,
-    _memory: Arc<MemTracker>,
     close_hook: RuntimeFilterParticipantCloseHook,
 }
 
@@ -234,21 +220,22 @@ impl RuntimeFilterParticipant {
             Arc::clone(&observation),
         ));
         let sink = Arc::clone(&outbound) as Arc<dyn BackendMaterializedDeliverySink>;
-        for session in producer_sessions.values() {
-            session.set_materialized_delivery_sink(Arc::clone(&sink));
-        }
-        Ok(Arc::new(Self {
-            execution_id,
+        let state = Arc::new(WorkerRuntimeFilterParticipant::new(
             install,
             observation,
             producer_sessions,
             consumer_sessions,
-            outbound,
-            delivery_dedupe: Arc::new(BackendIngressDedupe::new(
+            Arc::new(BackendIngressDedupe::new(
                 MAX_DELIVERY_IDENTITIES_PER_CHANNEL,
             )),
-            cancelled: Arc::new(AtomicBool::new(false)),
-            _memory: memory,
+            Arc::new(AtomicBool::new(false)),
+            memory,
+        ));
+        state.set_materialized_delivery_sink(sink);
+        Ok(Arc::new(Self {
+            execution_id,
+            state,
+            outbound,
             close_hook: Arc::new(|_, _| Ok(())),
         }))
     }
@@ -269,15 +256,10 @@ impl RuntimeFilterParticipant {
             return Ok(None);
         }
         let outbound: Arc<dyn RuntimeFilterParticipantOutbound> = self.outbound.clone();
-        Ok(Some(Arc::new(WorkerRuntimeFilterExecutionSession::new(
-            fragment_instance_id,
-            self.install.participant(),
-            self.producer_sessions.clone(),
-            self.consumer_sessions.clone(),
-            outbound,
-            Arc::clone(&self.observation),
-            Arc::clone(&self.cancelled),
-        )) as RuntimeFilterSessionRef))
+        Ok(Some(
+            self.state
+                .session_for_fragment(fragment_instance_id, outbound),
+        ))
     }
 
     pub(crate) fn dispatch_envelope(
@@ -288,9 +270,9 @@ impl RuntimeFilterParticipant {
             self.execution_id.query_id().high(),
             self.execution_id.query_id().low(),
         );
-        if self.cancelled.load(Ordering::Acquire)
+        if self.state.is_cancelled()
             || envelope.query_id() != query_id
-            || envelope.deployment_epoch() != self.install.participant().deployment_epoch()
+            || envelope.deployment_epoch() != self.state.participant().deployment_epoch()
         {
             return rejected(QUERY_UNAVAILABLE_REJECTION);
         }
@@ -315,10 +297,7 @@ impl RuntimeFilterParticipant {
         let Some(identity) = envelope.route_identity().as_delivery() else {
             return rejected(DELIVERY_REJECTION);
         };
-        participant_ingress::dispatch_delivery_frame(
-            &self.install,
-            &self.consumer_sessions,
-            &self.delivery_dedupe,
+        self.state.dispatch_delivery(
             participant_ingress::DeliveryIngressRoute::new(
                 envelope.channel_id(),
                 identity.route_edge_id(),
@@ -366,13 +345,7 @@ impl RuntimeFilterParticipant {
             }
             _ => unreachable!("caller selects producer envelope kinds"),
         };
-        participant_ingress::dispatch_producer_frame(
-            &self.install,
-            &self.producer_sessions,
-            &self.observation,
-            route,
-            command,
-        )
+        self.state.dispatch_producer(route, command)
     }
 
     fn dispatch_producer_failure(
@@ -384,9 +357,7 @@ impl RuntimeFilterParticipant {
                 "runtime filter ingress rejected [route-identity]: producer-instance route identity is required",
             );
         };
-        participant_ingress::dispatch_producer_failure(
-            &self.install,
-            &self.producer_sessions,
+        self.state.dispatch_producer_failure(
             envelope.channel_id(),
             identity.producer_binding_id(),
             identity.fragment_instance_id(),
@@ -397,10 +368,7 @@ impl RuntimeFilterParticipant {
         &self,
         reason: QueryTerminationReason,
     ) -> Result<(), RuntimeFilterContractError> {
-        self.cancelled.store(true, Ordering::Release);
-        for session in self.producer_sessions.values() {
-            session.clear_frontend_feedback_sink();
-        }
+        self.state.close();
         (self.close_hook)(self, reason)
     }
 
@@ -408,9 +376,7 @@ impl RuntimeFilterParticipant {
     /// A participant never owns that queue, so lifecycle retirement cannot form
     /// a query-retention cycle through a background feedback publisher.
     pub(crate) fn set_frontend_feedback_sink(&self, sink: Weak<dyn BackendFrontendFeedbackSink>) {
-        for session in self.producer_sessions.values() {
-            session.set_frontend_feedback_sink(sink.clone());
-        }
+        self.state.set_frontend_feedback_sink(sink);
     }
 
     #[allow(
@@ -418,7 +384,7 @@ impl RuntimeFilterParticipant {
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
     pub(crate) fn capture_runtime_filter_observation(&self) -> RuntimeFilterObservationSnapshot {
-        self.observation.capture()
+        self.state.capture_observation()
     }
 
     /// Drains sender-side completions, records the required terminal facts, and
@@ -429,10 +395,9 @@ impl RuntimeFilterParticipant {
         reason: QueryTerminationReason,
     ) -> RuntimeFilterObservationSnapshot {
         self.outbound.drain_transport_completions();
-        if reason != QueryTerminationReason::QueryTerminationCoordinatorFinalize {
-            return self.observation.cancel_open_channels_and_seal();
-        }
-        self.observation.seal()
+        self.state.prepare_terminal_capture(
+            reason == QueryTerminationReason::QueryTerminationCoordinatorFinalize,
+        )
     }
 
     pub(crate) fn record_row_effect(
@@ -440,17 +405,7 @@ impl RuntimeFilterParticipant {
         fragment_instance_id: UniqueId,
         effect: novarocks_execution::runtime_filter::RuntimeFilterRowEffect,
     ) {
-        let Some(identity) = self.consumer_identity(effect.binding_id(), fragment_instance_id)
-        else {
-            return;
-        };
-        self.observation
-            .record(BackendRuntimeFilterEvent::ConsumerRowsEvaluated {
-                identity,
-                logical_version: effect.logical_version(),
-                input_rows: effect.input_rows(),
-                output_rows: effect.output_rows(),
-            });
+        self.state.record_row_effect(fragment_instance_id, effect);
     }
 
     pub(crate) fn record_scan_unit_outcome(
@@ -458,49 +413,8 @@ impl RuntimeFilterParticipant {
         fragment_instance_id: UniqueId,
         outcome: novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitOutcome,
     ) {
-        let Some(identity) = self.consumer_identity(outcome.binding_id(), fragment_instance_id)
-        else {
-            return;
-        };
-        match outcome.evaluation() {
-            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::Evaluated {
-                decision,
-                logical_version,
-            } => self.observation.record(
-                BackendRuntimeFilterEvent::ConsumerScanUnitEvaluated {
-                    identity,
-                    logical_version,
-                    decision,
-                },
-            ),
-            novarocks_execution::runtime_filter::scan_domain::RuntimeFilterScanUnitEvaluation::NotEvaluated {
-                reason,
-                observed_version,
-            } => self.observation.record(
-                BackendRuntimeFilterEvent::ConsumerScanUnitNotEvaluated {
-                    identity,
-                    observed_version,
-                    reason,
-                },
-            ),
-        }
-    }
-
-    fn consumer_identity(
-        &self,
-        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        fragment_instance_id: UniqueId,
-    ) -> Option<BackendConsumerSubscriptionIdentity> {
-        let session = self.consumer_sessions.get(&binding_id)?;
-        Some(BackendConsumerSubscriptionIdentity::new(
-            BackendChannelIdentity::new(
-                self.install.participant(),
-                binding_id,
-                session.channel().channel_id(),
-            ),
-            binding_id,
-            fragment_instance_id,
-        ))
+        self.state
+            .record_scan_unit_outcome(fragment_instance_id, outcome);
     }
 
     #[cfg(test)]
@@ -510,14 +424,8 @@ impl RuntimeFilterParticipant {
     ) -> Arc<Self> {
         Arc::new(Self {
             execution_id: self.execution_id,
-            install: self.install.clone(),
-            observation: Arc::clone(&self.observation),
-            producer_sessions: self.producer_sessions.clone(),
-            consumer_sessions: self.consumer_sessions.clone(),
+            state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
-            delivery_dedupe: Arc::clone(&self.delivery_dedupe),
-            cancelled: Arc::clone(&self.cancelled),
-            _memory: Arc::clone(&self._memory),
             close_hook,
         })
     }
@@ -1320,11 +1228,12 @@ mod tests {
         );
 
         let late_channel = BackendChannelIdentity::new(
-            participant.install.participant(),
+            participant.outbound.install.participant(),
             producer.binding_id(),
             producer.channel_id(),
         );
         participant
+            .outbound
             .observation
             .record(BackendRuntimeFilterEvent::ChannelCancelled {
                 channel: late_channel,
@@ -1344,11 +1253,12 @@ mod tests {
     fn terminal_prepare_preserves_completed_channel_during_cancellation() {
         let (participant, producer, _) = final_domain_participant(1024);
         let channel = BackendChannelIdentity::new(
-            participant.install.participant(),
+            participant.outbound.install.participant(),
             producer.binding_id(),
             producer.channel_id(),
         );
         participant
+            .outbound
             .observation
             .record(BackendRuntimeFilterEvent::ChannelCompleted {
                 channel,

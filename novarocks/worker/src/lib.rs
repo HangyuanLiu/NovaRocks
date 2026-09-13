@@ -65,6 +65,7 @@ pub mod runtime_filter {
     pub mod fixture;
     pub mod materializer;
     pub mod observation;
+    pub mod participant;
     pub mod participant_ingress;
 }
 
