@@ -190,6 +190,18 @@ mod tests {
         }
     }
 
+    fn column_ref(column_id: u32) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+            nullable: false,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
+        }
+    }
+
     fn values_noop_fragment() -> plan::PlanFragment {
         let columns = vec![output_column(1)];
         plan::PlanFragment {
@@ -315,6 +327,33 @@ mod tests {
             submission.program().plan().root.kind,
             ExecNodeKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn data_stream_hash_sink_resolves_partition_expression_from_root_layout() {
+        let mut fragment = values_noop_fragment();
+        fragment.sink = Some(plan::DataSink {
+            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                dest_node_id: 17,
+                output_partition: Some(plan::DataPartition {
+                    kind: plan::PartitionKind::Hash as i32,
+                    exprs: vec![column_ref(1)],
+                }),
+                output_columns: vec![1],
+                ..Default::default()
+            })),
+        });
+
+        let decoded = decode(
+            &fragment,
+            &instance_params(UniqueId::new(23, 24), UniqueId::new(25, 26)),
+        )
+        .expect("hash sink expression must resolve through the decoded root layout");
+        let (submission, _) = decoded.into_parts();
+        assert_eq!(
+            submission.program().sink().kind(),
+            FragmentSinkKind::DataStream
+        );
     }
 
     #[test]
