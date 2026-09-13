@@ -32,6 +32,7 @@ pub mod runtime_filter_participant;
 pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
 pub mod runtime_filter_transport;
+pub mod runtime_filter_typed_scan;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

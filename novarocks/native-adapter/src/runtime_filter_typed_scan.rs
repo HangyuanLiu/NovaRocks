@@ -34,7 +34,7 @@ use novarocks_worker::runtime_filter::typed_scan::{
     TypedScanFilterBindings, typed_scan_dynamic_filter,
 };
 
-pub(crate) fn scan_dynamic_filter_spi(
+pub fn scan_dynamic_filter_spi(
     wire_scan: &ConnectorTableScanSource,
     scan: &DecodedConnectorReadScan,
     session: Option<&RuntimeFilterSessionRef>,

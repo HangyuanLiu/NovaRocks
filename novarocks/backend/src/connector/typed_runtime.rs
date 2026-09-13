@@ -48,7 +48,6 @@ use std::time::{Duration, Instant};
 
 use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
-use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter_spi;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
     TaskAttemptSplitQueues,
@@ -62,6 +61,7 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
+use novarocks_native_adapter::runtime_filter_typed_scan::scan_dynamic_filter_spi;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
     CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
