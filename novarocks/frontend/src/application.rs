@@ -65,7 +65,6 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::query_execution::logical_read::LogicalReadLauncher;
-use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
@@ -73,7 +72,6 @@ use crate::query_execution::native_execution_adapter::{
 use crate::statistics_jobs::service::{
     FrontendStatisticsApplicationPort, RootAdmissionStatisticsJobSource,
 };
-use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
 use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
@@ -510,7 +508,6 @@ pub struct FrontendApplicationHost {
     catalog_controller: Option<Arc<FrontendCatalogController>>,
     catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
     view_service: Option<Arc<dyn crate::view::ViewService>>,
-    table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
@@ -1017,7 +1014,6 @@ impl FrontendApplicationHost {
             catalog_controller: None,
             catalog_prune: None,
             view_service: None,
-            table_maintenance_service: None,
             mv_repository: None,
             state_store_host: None,
             query_execution: None,
@@ -1260,25 +1256,6 @@ impl FrontendApplicationHost {
         // Local views are process runtime state, so this service has nothing to
         // load and no store to fail against.
         host.view_service = Some(Arc::new(FrontendViewService::new()));
-        let table_maintenance_open = FrontendTableMaintenanceService::open(
-            host.durable(),
-            tokio::runtime::Handle::current(),
-            host.workload_root_admission(),
-        )
-        .await
-        .map(|service| {
-            service.with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
-        });
-        match table_maintenance_open {
-            Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
-            Err(error) => {
-                let error = FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
-                    error,
-                );
-                return Err(host.cleanup_open_error(error).await);
-            }
-        }
         // The coordinator owns the immutable execution and connector-control
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
@@ -1448,14 +1425,6 @@ impl FrontendApplicationHost {
             )));
         }
         Ok(())
-    }
-
-    pub fn table_maintenance_service(&self) -> Arc<dyn TableMaintenanceService> {
-        Arc::clone(
-            self.table_maintenance_service
-                .as_ref()
-                .expect("frontend table-maintenance service is installed before host open returns"),
-        )
     }
 
     pub fn mv_repository(&self) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
@@ -1737,9 +1706,6 @@ impl FrontendApplicationHost {
         if let Some(port) = self.statistics_application_port.as_ref() {
             port.request_worker_stop_for_process_exit();
         }
-        if let Some(service) = self.table_maintenance_service.as_ref() {
-            service.request_shutdown_for_process_exit();
-        }
         if let Some(topology) = self.topology.as_ref() {
             if let Err(error) = topology.request_heartbeat_stop_for_process_exit() {
                 tracing::error!(
@@ -1844,20 +1810,6 @@ impl FrontendApplicationHost {
         }
         self.query_execution.take();
         self.coordinator.take();
-        let table_maintenance_error = match self.table_maintenance_service.as_ref() {
-            Some(service) => service.shutdown_until(deadline).await.err().map(|error| {
-                format!("shutdown frontend table-maintenance service failed: {error}")
-            }),
-            None => None,
-        };
-        if let Some(table_maintenance_error) = table_maintenance_error {
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {table_maintenance_error}"));
-            } else {
-                primary_error = Some(table_maintenance_error);
-            }
-            return Err(primary_error.expect("table-maintenance shutdown error is retained"));
-        }
         let heartbeat_error = match self.topology.as_ref() {
             Some(topology) => topology.stop_heartbeat_manager_until(deadline).await.err(),
             None => None,
@@ -1872,7 +1824,6 @@ impl FrontendApplicationHost {
         }
         self.topology.take();
         self.dml_service.take();
-        self.table_maintenance_service.take();
         // Process-local job services do not own StateStore job records. Release
         // their workers before closing the host's remaining durable owners.
         self.statistics_application_port.take();

@@ -187,11 +187,20 @@ impl FrontendRoleProducts {
                 FrontendApplicationError::server(format!(
                     "shutdown frontend MV background workers failed: {error}"
                 ))
+            })?;
+        self.maintenance_service
+            .shutdown_until(deadline)
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend table-maintenance service failed: {error}"
+                ))
             })
     }
 
     fn request_background_stop_for_process_exit(&self) {
         self.mv_service.request_background_stop_for_process_exit();
+        self.maintenance_service.request_shutdown_for_process_exit();
     }
 }
 
@@ -217,7 +226,7 @@ pub async fn open_frontend_application_for_server(
 /// session factory.  Every Core value constructed here is a closed domain
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
-fn build_frontend_role_products(
+async fn build_frontend_role_products(
     host: &FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -238,7 +247,22 @@ fn build_frontend_role_products(
     let mv_repository = host.mv_repository();
     let view_service = host.view_service();
     let statistics_application = host.statistics_application_port();
-    let maintenance_service = host.table_maintenance_service();
+    let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
+        Arc::new(
+            crate::table_maintenance::FrontendTableMaintenanceService::open(
+                host.durable(),
+                Handle::current(),
+                host.workload_root_admission(),
+            )
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
+                    error,
+                )
+            })?
+            .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy()),
+        );
 
     core_capabilities::bind_catalog_runtime_projection(
         catalog_projection.as_ref(),
@@ -281,7 +305,7 @@ fn build_frontend_role_products(
         topology.clone(),
         host.mv_scheduler_config(),
         host.mv_maintenance_config(),
-        host.table_maintenance_service(),
+        Arc::clone(&maintenance_service),
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy()
             .max_attempt_duration(),
@@ -488,14 +512,15 @@ fn build_frontend_query_session_factory_from_role_products(
 }
 
 #[cfg(test)]
-fn build_frontend_query_session_factory(
+async fn build_frontend_query_session_factory(
     host: &FrontendApplicationHost,
     system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     client_connection_control: Arc<dyn ClientConnectionControlPort>,
 ) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
-    let products = build_frontend_role_products(host, exchange_port, mv_storage_observation)?;
+    let products =
+        build_frontend_role_products(host, exchange_port, mv_storage_observation).await?;
     products.start_background_workers()?;
     let session_factory = build_frontend_query_session_factory_from_role_products(
         host,
@@ -684,15 +709,16 @@ where
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
     let client_connection_control: Arc<dyn ClientConnectionControlPort> =
         client_connections.clone();
-    let products = match build_frontend_role_products(host, exchange_port, mv_storage_observation) {
-        Ok(products) => products,
-        Err(error) => {
-            let stop_result = report_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), stop_result);
-        }
-    };
+    let products =
+        match build_frontend_role_products(host, exchange_port, mv_storage_observation).await {
+            Ok(products) => products,
+            Err(error) => {
+                let stop_result = report_server
+                    .stop()
+                    .map_err(FrontendApplicationError::server);
+                return combine_server_and_shutdown(Err(error), stop_result);
+            }
+        };
     if let Err(error) = products.start_background_workers() {
         let product_shutdown = shutdown_frontend_role_products_to_convergence(
             &products,
@@ -1257,6 +1283,7 @@ mod tests {
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),
         )
+        .await
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
@@ -1410,6 +1437,7 @@ mod tests {
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),
         )
+        .await
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
