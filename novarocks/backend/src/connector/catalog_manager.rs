@@ -35,13 +35,7 @@ use novarocks_spi::connector::{
     ConnectorMaterializationRetryDisposition, NormalizedCatalogProperties,
 };
 use novarocks_types::QueryExecutionId;
-
-/// The bounded number of unleased materialized catalogs retained by default.
-pub const DEFAULT_MAX_RETAINED_CATALOGS: usize = 64;
-pub const DEFAULT_MAX_FAILED_CATALOGS: usize = 64;
-const DEFAULT_FAILED_RETENTION: Duration = Duration::from_secs(60);
-const DEFAULT_TRANSIENT_RETRY_COOLDOWN: Duration = Duration::from_secs(1);
-const DEFAULT_PROVIDER_MAX_CONCURRENT_BINDS: usize = 4;
+use novarocks_worker::CatalogManagerConfig;
 
 /// Startup-sealed execution-role factories keyed by the closed catalog family.
 /// Each selected factory constructs the entire immutable BE capability binding
@@ -97,30 +91,6 @@ impl ConnectorExecutionRoleBindingFactorySet {
             );
         }
         Ok(binding)
-    }
-}
-
-/// Catalog-manager configuration that is independent of any provider runtime.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CatalogManagerConfig {
-    pub max_retained_catalogs: usize,
-    pub max_failed_catalogs: usize,
-    pub failed_retention: Duration,
-    pub transient_retry_cooldown: Duration,
-    pub provider_max_concurrent_binds: usize,
-    pub provider_min_bind_interval: Duration,
-}
-
-impl Default for CatalogManagerConfig {
-    fn default() -> Self {
-        Self {
-            max_retained_catalogs: DEFAULT_MAX_RETAINED_CATALOGS,
-            max_failed_catalogs: DEFAULT_MAX_FAILED_CATALOGS,
-            failed_retention: DEFAULT_FAILED_RETENTION,
-            transient_retry_cooldown: DEFAULT_TRANSIENT_RETRY_COOLDOWN,
-            provider_max_concurrent_binds: DEFAULT_PROVIDER_MAX_CONCURRENT_BINDS,
-            provider_min_bind_interval: Duration::ZERO,
-        }
     }
 }
 
@@ -902,9 +872,10 @@ mod tests {
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 
     use super::{
-        CatalogManager, CatalogManagerConfig, CatalogManagerError, CatalogPruneResult,
+        CatalogManager, CatalogManagerError, CatalogPruneResult,
         ConnectorExecutionRoleBindingFactorySet, remove_ready_candidate_if_current,
     };
+    use novarocks_worker::CatalogManagerConfig;
 
     fn query(value: i64) -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, value), AttemptId::new(1).expect("attempt"))

@@ -440,22 +440,20 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        catalog_manager_config:
-            novarocks_backend::connector::catalog_manager::CatalogManagerConfig {
-                max_retained_catalogs:
-                    novarocks_backend::connector::catalog_manager::DEFAULT_MAX_RETAINED_CATALOGS,
-                max_failed_catalogs: runtime_config.catalog_bind_max_failed,
-                failed_retention: Duration::from_millis(
-                    runtime_config.catalog_bind_failed_retention_ms,
-                ),
-                transient_retry_cooldown: Duration::from_millis(
-                    runtime_config.catalog_bind_transient_retry_cooldown_ms,
-                ),
-                provider_max_concurrent_binds: runtime_config.catalog_bind_provider_max_concurrent,
-                provider_min_bind_interval: Duration::from_millis(
-                    runtime_config.catalog_bind_provider_min_interval_ms,
-                ),
-            },
+        catalog_manager_config: novarocks_worker::CatalogManagerConfig {
+            max_retained_catalogs: novarocks_worker::DEFAULT_MAX_RETAINED_CATALOGS,
+            max_failed_catalogs: runtime_config.catalog_bind_max_failed,
+            failed_retention: Duration::from_millis(
+                runtime_config.catalog_bind_failed_retention_ms,
+            ),
+            transient_retry_cooldown: Duration::from_millis(
+                runtime_config.catalog_bind_transient_retry_cooldown_ms,
+            ),
+            provider_max_concurrent_binds: runtime_config.catalog_bind_provider_max_concurrent,
+            provider_min_bind_interval: Duration::from_millis(
+                runtime_config.catalog_bind_provider_min_interval_ms,
+            ),
+        },
         execution_role_binding_factories: provider_manifest
             .compose_execution_factories(config, runtime)?,
     })

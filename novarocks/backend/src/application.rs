@@ -11,8 +11,8 @@ use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::{
-    WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor, WorkerDrainState,
-    WorkerResultRetainedLimits,
+    CatalogManagerConfig, WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor,
+    WorkerDrainState, WorkerResultRetainedLimits,
 };
 
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
@@ -95,7 +95,7 @@ pub struct BackendServerConfig {
     pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
-    pub catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    pub catalog_manager_config: CatalogManagerConfig,
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
@@ -305,7 +305,7 @@ fn compose_backend_application_services(
     native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
-    catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let BackendExecutionRuntimeInput {
@@ -737,7 +737,7 @@ mod tests {
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
-    use novarocks_worker::WorkerResultRetainedLimits;
+    use novarocks_worker::{CatalogManagerConfig, WorkerResultRetainedLimits};
     use novarocks_worker::{ManualClock, WorkerDeadlineSupervisor, WorkerMonotonicClock};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -901,8 +901,7 @@ mod tests {
             )
             .expect("valid test result retained-byte limits"),
             execution_runtime_config: execution_runtime_config(),
-            catalog_manager_config:
-                crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
         }
     }
@@ -954,7 +953,7 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            CatalogManagerConfig::default(),
             &[],
         )
         .expect("compose backend application services");
