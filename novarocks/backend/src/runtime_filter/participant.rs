@@ -28,14 +28,11 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
-    RuntimeFilterExecutionContract, RuntimeFilterProducerOpenRequest, RuntimeFilterSessionRef,
-    RuntimeFilterSnapshot,
+    RuntimeFilterContractViolation, RuntimeFilterContractViolationKind, RuntimeFilterSessionRef,
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
 use prost::Message;
-use sha2::{Digest, Sha256};
 
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::rpc::{
@@ -51,10 +48,9 @@ use crate::runtime_filter::transport::{
 };
 use novarocks_native_adapter::BackendDataRuntime;
 use novarocks_worker::runtime_filter::domain::{
-    BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendDeliveryAdmission,
-    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink,
-    BackendIngressDedupe, BackendIngressResult, BackendMaterializedDelivery,
-    BackendMaterializedDeliverySink, BackendParticipantInstall, BackendProducerStreamIdentity,
+    BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendEnvelopeKind,
+    BackendFrontendFeedbackSink, BackendIngressDedupe, BackendIngressResult,
+    BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendParticipantInstall,
     BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
     BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
     BackendTransportEventKind, BackendTransportFailOpenReason,
@@ -68,10 +64,7 @@ use novarocks_worker::runtime_filter::observation::{
 use novarocks_worker::runtime_filter::participant_ingress;
 use novarocks_worker::{
     RuntimeFilterContractError, RuntimeFilterContractErrorCode,
-    runtime_filter::{
-        artifact_query::BackendRuntimeFilterArtifactQuery,
-        codec::{artifact as artifact_codec, producer as producer_codec},
-    },
+    runtime_filter::codec::producer as producer_codec,
 };
 
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
@@ -322,205 +315,21 @@ impl RuntimeFilterParticipant {
         let Some(identity) = envelope.route_identity().as_delivery() else {
             return rejected(DELIVERY_REJECTION);
         };
-        let route_edge_id = identity.route_edge_id();
-        if self
-            .install
-            .routing()
-            .authorize_delivery(envelope.channel_id(), route_edge_id, envelope.kind())
-            .is_err()
-        {
-            return rejected(
-                "runtime filter ingress rejected [artifact-delivery]: route is not authorized for this delivery",
-            );
-        }
-        let Some((binding_id, session)) =
-            self.consumer_sessions
-                .iter()
-                .find_map(|(binding_id, session)| {
-                    session
-                        .channel()
-                        .consumers()
-                        .get(binding_id)
-                        .filter(|consumer| consumer.route_edge_ids().contains(&route_edge_id))
-                        .map(|_| (*binding_id, Arc::clone(session)))
-                })
-        else {
-            return rejected(
-                "runtime filter ingress rejected [artifact-delivery]: no installed consumer owns this route",
-            );
-        };
-        if session.channel().channel_id() != envelope.channel_id() {
-            return rejected(
-                "runtime filter ingress rejected [artifact-delivery]: route resolves to a different channel",
-            );
-        }
-        let Some(consumer) = session.channel().consumers().get(&binding_id) else {
-            return rejected(
-                "runtime filter ingress rejected [artifact-delivery]: consumer install disappeared",
-            );
-        };
-        let outcome = match envelope.kind() {
-            BackendEnvelopeKind::Artifact | BackendEnvelopeKind::FinalArtifact => {
-                let placeholder = match execution_placeholder_membership_schema() {
-                    Ok(schema) => schema,
-                    Err(()) => return rejected(DELIVERY_REJECTION),
-                };
-                let (schema, order_contract, contract_digest) = match consumer.contract().contract()
-                {
-                    RuntimeFilterExecutionContract::Membership(schema) => {
-                        (schema, None, schema.digest())
-                    }
-                    RuntimeFilterExecutionContract::Ordered(order) => {
-                        let Some(key) = order.keys().first() else {
-                            return rejected(DELIVERY_REJECTION);
-                        };
-                        let _ = key;
-                        // The schema field is not consulted for an ordered Range
-                        // artifact; its contract digest is checked through
-                        // `order_contract` by the strict NRFA decoder.
-                        (&placeholder, Some(order.as_ref()), order.digest())
-                    }
-                };
-                let bundle = artifact_codec::decode_artifact_bundle(
-                    envelope.payload(),
-                    envelope.schema_digest(),
-                    artifact_codec::ArtifactDecodeExpectation {
-                        profile: consumer.profile(),
-                        schema,
-                        order_contract,
-                    },
-                    session.channel().max_artifact_bytes(),
-                );
-                let Ok(bundle) = bundle else {
-                    return rejected(
-                        "runtime filter ingress rejected [artifact-delivery]: artifact frame violates the installed profile or contract",
-                    );
-                };
-                let Some((_, _artifact)) = bundle.artifacts().first() else {
-                    return rejected(
-                        "runtime filter ingress rejected [artifact-delivery]: artifact frame contains no physical artifact",
-                    );
-                };
-                let query = match consumer.contract().contract() {
-                    RuntimeFilterExecutionContract::Membership(schema) => {
-                        BackendRuntimeFilterArtifactQuery::membership(
-                            &bundle,
-                            schema.data_type().clone(),
-                            schema.null_semantics(),
-                        )
-                    }
-                    RuntimeFilterExecutionContract::Ordered(order) => {
-                        BackendRuntimeFilterArtifactQuery::ordered(&bundle, Arc::clone(order))
-                    }
-                };
-                let Ok(query) = query else {
-                    return rejected(
-                        "runtime filter ingress rejected [artifact-delivery]: artifact does not provide the installed evaluator",
-                    );
-                };
-                novarocks_execution::runtime_filter::SnapshotAcquireOutcome::Published(Arc::new(
-                    RuntimeFilterSnapshot::new(
-                        binding_id,
-                        bundle.version(),
-                        contract_digest,
-                        Arc::new(query),
-                    ),
-                ))
-            }
-            BackendEnvelopeKind::Unavailable => {
-                let Ok(reason) = artifact_codec::decode_unavailable(
-                    envelope.payload(),
-                    envelope.schema_digest(),
-                    consumer.profile(),
-                    session.channel().max_artifact_bytes(),
-                ) else {
-                    return rejected(
-                        "runtime filter ingress rejected [artifact-delivery]: unavailable frame violates the installed profile",
-                    );
-                };
-                novarocks_execution::runtime_filter::SnapshotAcquireOutcome::Unavailable(reason)
-            }
-            BackendEnvelopeKind::DegradedLogical => {
-                if producer_codec::decode_producer_failure(envelope.payload()).is_err() {
-                    return rejected(
-                        "runtime filter ingress rejected [artifact-delivery]: degraded frame is malformed",
-                    );
-                }
-                novarocks_execution::runtime_filter::SnapshotAcquireOutcome::Unavailable(
-                    novarocks_execution::runtime_filter::UnavailableReason::ProducerFailed,
-                )
-            }
-            BackendEnvelopeKind::CompletedWithoutArtifact => {
-                novarocks_execution::runtime_filter::SnapshotAcquireOutcome::Unavailable(
-                    novarocks_execution::runtime_filter::UnavailableReason::IncompleteCoverage,
-                )
-            }
-            _ => {
-                return rejected(
-                    "runtime filter ingress rejected [artifact-delivery]: envelope kind is not a delivery",
-                );
-            }
-        };
-        let terminal = match envelope.kind() {
-            BackendEnvelopeKind::FinalArtifact => {
-                Some(novarocks_execution::runtime_filter::LiveTerminal::Completed)
-            }
-            BackendEnvelopeKind::CompletedWithoutArtifact => {
-                Some(novarocks_execution::runtime_filter::LiveTerminal::CompletedWithoutArtifact)
-            }
-            _ => None,
-        };
-        let version = match &outcome {
-            novarocks_execution::runtime_filter::SnapshotAcquireOutcome::Published(snapshot) => {
-                Some(snapshot.logical_version())
-            }
-            _ => None,
-        };
-        let channel = BackendChannelIdentity::new(
-            self.install.participant(),
-            binding_id,
-            envelope.channel_id(),
-        );
-        let route = BackendDeliveryRouteIdentity::new(channel, route_edge_id, identity.sequence());
-        let (exact_digest, content_digest) = delivery_digests(&envelope);
-        match self.delivery_dedupe.reserve_delivery(
-            route,
-            version,
-            envelope.kind() == BackendEnvelopeKind::FinalArtifact,
-            exact_digest,
-            content_digest,
-        ) {
-            BackendDeliveryAdmission::Fresh => {}
-            BackendDeliveryAdmission::Duplicate => return BackendIngressResult::duplicate(),
-            BackendDeliveryAdmission::Conflict => {
-                return rejected(
-                    "runtime filter ingress rejected [artifact-delivery]: replay content conflicts with an admitted delivery",
-                );
-            }
-            BackendDeliveryAdmission::ResourceLimit => {
-                return rejected(
-                    "runtime filter ingress rejected [artifact-delivery]: delivery replay identity limit exceeded",
-                );
-            }
-        }
-        match session.publish_materialized(route_edge_id, outcome, terminal) {
-            Ok(()) => {
-                self.delivery_dedupe.commit_delivery(
-                    route,
-                    version,
-                    envelope.kind() == BackendEnvelopeKind::FinalArtifact,
-                    exact_digest,
-                    content_digest,
-                );
-                BackendIngressResult::accepted()
-            }
-            Err(_) => {
-                self.delivery_dedupe.abort_delivery(route, version);
-                rejected(
-                    "runtime filter ingress rejected [artifact-delivery]: subscription publication rejected the delivery",
-                )
-            }
-        }
+        participant_ingress::dispatch_delivery_frame(
+            &self.install,
+            &self.consumer_sessions,
+            &self.delivery_dedupe,
+            participant_ingress::DeliveryIngressRoute::new(
+                envelope.channel_id(),
+                identity.route_edge_id(),
+                identity.sequence(),
+            ),
+            participant_ingress::DeliveryIngressFrame::new(
+                envelope.kind(),
+                *envelope.schema_digest(),
+                envelope.payload(),
+            ),
+        )
     }
 
     fn dispatch_producer_envelope(
@@ -1157,32 +966,6 @@ fn rejected(reason: &'static str) -> BackendIngressResult {
     BackendIngressResult::rejected(reason).expect("runtime-filter rejection reason is non-empty")
 }
 
-fn delivery_digests(envelope: &BackendNativeRuntimeFilterEnvelope) -> ([u8; 32], [u8; 32]) {
-    let mut content = Sha256::new();
-    content.update(envelope.schema_digest());
-    content.update(envelope.payload());
-    let content_digest: [u8; 32] = content.finalize().into();
-
-    let mut exact = Sha256::new();
-    exact.update([delivery_kind_tag(envelope.kind())]);
-    exact.update(content_digest);
-    (exact.finalize().into(), content_digest)
-}
-
-fn delivery_kind_tag(kind: BackendEnvelopeKind) -> u8 {
-    match kind {
-        BackendEnvelopeKind::Artifact => 1,
-        BackendEnvelopeKind::FinalArtifact => 2,
-        BackendEnvelopeKind::Unavailable => 3,
-        BackendEnvelopeKind::CompletedWithoutArtifact => 4,
-        BackendEnvelopeKind::DegradedLogical => 5,
-        BackendEnvelopeKind::Contribution => 6,
-        BackendEnvelopeKind::ProducerClosed => 7,
-        BackendEnvelopeKind::ProducerUnavailable => 8,
-        BackendEnvelopeKind::Ack => 9,
-    }
-}
-
 fn violation(
     kind: RuntimeFilterContractViolationKind,
     detail: impl Into<Arc<str>>,
@@ -1192,15 +975,6 @@ fn violation(
 
 fn outbound_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContractViolation {
     violation(RuntimeFilterContractViolationKind::ContractMismatch, detail)
-}
-
-fn execution_placeholder_membership_schema()
--> Result<novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema, ()> {
-    novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema::new(
-        &arrow::datatypes::DataType::Boolean,
-        novarocks_execution::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
-    )
-    .map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -1216,8 +990,9 @@ mod tests {
         RuntimeFilterConsumerContract, RuntimeFilterExecutionContract, RuntimeFilterFinalDomain,
         RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
         RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterProducerContract,
-        RuntimeFilterProducerFailure, RuntimeFilterSubscriptionHandle,
-        RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome, UnavailableReason, contribution,
+        RuntimeFilterProducerFailure, RuntimeFilterProducerOpenRequest,
+        RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest, SnapshotAcquireOutcome,
+        UnavailableReason, contribution,
     };
     use novarocks_proto_codec::lifecycle::AttemptId;
     use novarocks_types::QueryId;
@@ -1227,6 +1002,7 @@ mod tests {
         BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
     };
     use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
+    use novarocks_worker::runtime_filter::codec::artifact as artifact_codec;
     use novarocks_worker::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
         BackendMaterializationOwner, BackendMaterializationPolicy,
