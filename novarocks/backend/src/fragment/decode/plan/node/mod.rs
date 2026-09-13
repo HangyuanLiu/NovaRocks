@@ -26,7 +26,6 @@ mod hash_join;
 mod nestloop_join;
 mod project;
 mod redistribute;
-mod repeat;
 mod set_op;
 mod sort;
 mod table_function;
@@ -62,7 +61,7 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_generate_series_node, lower_limit_node,
-    lower_values_node, parse_distributed_limit,
+    lower_repeat_node, lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1660,7 +1659,7 @@ fn lower_physical_node(
             ctx,
         ),
         plan::plan_node::Kind::Repeat(repeat) => {
-            repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
+            lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }
         plan::plan_node::Kind::GenerateSeries(generate_series) => lower_generate_series_node(
             node,
@@ -2009,24 +2008,6 @@ mod tests {
             plan::plan_node::Kind::Values(plan::ValuesNode {
                 rows: vec![plan::ExprList {
                     values: vec![int_literal(value)],
-                }],
-                columns: columns.clone(),
-            }),
-            columns,
-            Vec::new(),
-        )
-    }
-
-    pub(super) fn two_col_values_node(node_id: i32) -> plan::DistributedNode {
-        let columns = vec![
-            output_column(1, "a", DataType::Int64),
-            output_column(2, "b", DataType::Int64),
-        ];
-        physical_node(
-            node_id,
-            plan::plan_node::Kind::Values(plan::ValuesNode {
-                rows: vec![plan::ExprList {
-                    values: vec![int_literal(10), int_literal(20)],
                 }],
                 columns: columns.clone(),
             }),
