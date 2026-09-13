@@ -154,7 +154,7 @@ fn unique_id(src: &novarocks_proto_models::common::UniqueId) -> UniqueId {
 #[cfg(test)]
 mod tests {
     use super::decode_destinations;
-    use crate::fragment::decode::query_options::decode_query_options;
+    use novarocks_native_adapter::query_options::decode_query_options;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_models::novarocks as native_proto;
 

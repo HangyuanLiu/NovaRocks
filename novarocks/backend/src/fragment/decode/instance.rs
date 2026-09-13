@@ -26,13 +26,13 @@ use novarocks_execution::runtime::fragment::{
     BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_native_adapter::query_options::decode_query_options;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, novarocks as proto};
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
-use super::query_options::decode_query_options;
 use crate::fragment::ingress::NativeFragmentIngressError;
 
 /// Backend-decoded execution values from `InstanceParams`.

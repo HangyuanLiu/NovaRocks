@@ -23,7 +23,6 @@ pub(crate) mod expression;
 pub(crate) mod instance;
 pub(crate) mod layout;
 pub(crate) mod plan;
-pub(crate) mod query_options;
 pub(crate) mod request;
 pub(crate) mod runtime_filter;
 pub(crate) mod scan_contract;

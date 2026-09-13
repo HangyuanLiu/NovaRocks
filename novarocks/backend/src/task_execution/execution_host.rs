@@ -96,8 +96,8 @@ use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
 use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
-use super::shared_facts::fragment_plan;
 use novarocks_native_adapter::task_protocol_fault as fault;
+use novarocks_native_adapter::task_shared_facts::fragment_plan;
 use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost, TaskStatusReporter};
 
 /// Everything one query context contributes to preparing and running a task.

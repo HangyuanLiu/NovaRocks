@@ -48,7 +48,6 @@ mod feedback;
 pub(crate) mod ingress;
 mod marker;
 mod ports;
-pub(crate) mod shared_facts;
 
 #[cfg(test)]
 mod tests;

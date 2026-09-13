@@ -253,8 +253,10 @@ impl RegistryTaskExecutionIngress {
                 // this evidence.
                 let evidence = self.registry.released_context_evidence(request.context());
                 let runtime_filter =
-                    super::shared_facts::release_runtime_filter_telemetry(&evidence)
-                        .map_err(host_rejection_status)?;
+                    novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry(
+                        &evidence,
+                    )
+                    .map_err(host_rejection_status)?;
                 encode_operation_receipt(&receipt, |ack| {
                     let mut encoded = encode_release_ack(
                         ack.context(),

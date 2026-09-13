@@ -67,8 +67,8 @@ use novarocks_worker::{
 };
 
 use super::ingress::RegistryTaskExecutionIngress;
-use super::shared_facts::sealed_runtime_filter_evidence;
 use novarocks_native_adapter::task_protocol::TaskExecutionIngress;
+use novarocks_native_adapter::task_shared_facts::sealed_runtime_filter_evidence;
 use novarocks_worker::OperationReceipt;
 use novarocks_worker::TaskExecutionRegistry;
 use novarocks_worker::TaskExecutionRegistryConfig;

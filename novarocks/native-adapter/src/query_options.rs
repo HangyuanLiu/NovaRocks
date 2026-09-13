@@ -1,7 +1,21 @@
-//! Fragment-owned reconstruction of execution query options from native wire values.
-//!
-//! Protocol validates the generated lifecycle value. Backend then performs the
-//! owner-local, fail-closed conversion to its execution runtime representation.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Native wire reconstruction of execution query options.
 
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{QueryCacheOptions, QueryOptions};
@@ -9,14 +23,12 @@ use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
 
-pub(crate) fn decode_query_options(
-    src: &novarocks::QueryOptions,
-) -> Result<QueryOptions, ProtocolError> {
+pub fn decode_query_options(src: &novarocks::QueryOptions) -> Result<QueryOptions, ProtocolError> {
     let path = FieldPath::root("instance_params").field("query_options");
     decode_query_options_at(src, path)
 }
 
-pub(crate) fn decode_query_options_at(
+pub fn decode_query_options_at(
     src: &novarocks::QueryOptions,
     path: FieldPath,
 ) -> Result<QueryOptions, ProtocolError> {
@@ -151,7 +163,6 @@ mod tests {
             ..Default::default()
         })
         .expect("valid query options");
-
         assert_eq!(decoded.runtime_filter_scan_wait_time_ms(), Some(0));
         assert_eq!(decoded.runtime_filter_wait_timeout_ms(), Some(0));
         assert_eq!(decoded.group_concat_max_len(), Some(0));
@@ -166,7 +177,6 @@ mod tests {
             ..Default::default()
         })
         .expect_err("spill options are required");
-
         assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),

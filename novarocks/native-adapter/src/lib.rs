@@ -26,6 +26,7 @@ pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
+pub mod query_options;
 pub mod runtime_filter_install;
 pub mod runtime_filter_membership;
 pub mod runtime_filter_participant;
@@ -35,6 +36,7 @@ pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
 pub mod task_protocol;
 pub mod task_protocol_fault;
+pub mod task_shared_facts;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));
