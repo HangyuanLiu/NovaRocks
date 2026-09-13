@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Execution-neutral queries over Backend-retained artifacts.
+//! Execution-neutral queries over Worker-retained artifacts.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,18 +28,18 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 
+use crate::runtime_filter::artifact::{
+    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, PhysicalArtifact, RangeResidentData,
+    ResidentMembershipIndex,
+};
 use crate::runtime_filter::codec::leaf::{
     ArtifactCodecError, MembershipProbe, indexed_membership_contains,
     indexed_membership_range_may_match,
 };
-use novarocks_worker::runtime_filter::artifact::{
-    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, PhysicalArtifact, RangeResidentData,
-    ResidentMembershipIndex,
-};
 
 /// Immutable adapter over one Backend artifact bundle. It has no Arrow batch,
 /// scan-unit fact, reader, provider, outcome, or Effect API.
-pub(crate) enum BackendRuntimeFilterArtifactQuery {
+pub enum BackendRuntimeFilterArtifactQuery {
     Membership {
         artifact: Arc<PhysicalArtifact>,
         data_type: DataType,
@@ -52,7 +52,7 @@ pub(crate) enum BackendRuntimeFilterArtifactQuery {
 }
 
 impl BackendRuntimeFilterArtifactQuery {
-    pub(crate) fn membership(
+    pub fn membership(
         bundle: &ArtifactBundle,
         data_type: DataType,
         null_semantics: RuntimeFilterNullSemantics,
@@ -91,7 +91,7 @@ impl BackendRuntimeFilterArtifactQuery {
         })
     }
 
-    pub(crate) fn ordered(
+    pub fn ordered(
         bundle: &ArtifactBundle,
         contract: Arc<RuntimeOrderContract>,
     ) -> Result<Self, RuntimeFilterArtifactQueryError> {

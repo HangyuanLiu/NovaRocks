@@ -51,8 +51,6 @@ use super::domain::{
     BackendTransportEventKind, BackendTransportFailOpenReason,
 };
 use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
-use crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery;
-use crate::runtime_filter::codec::{artifact as artifact_codec, producer as producer_codec};
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
@@ -66,7 +64,13 @@ use crate::runtime_filter::transport::{
     GrpcRuntimeFilterEnvelopeSink,
 };
 use novarocks_native_adapter::BackendDataRuntime;
-use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
+use novarocks_worker::{
+    RuntimeFilterContractError, RuntimeFilterContractErrorCode,
+    runtime_filter::{
+        artifact_query::BackendRuntimeFilterArtifactQuery,
+        codec::{artifact as artifact_codec, producer as producer_codec},
+    },
+};
 
 const QUERY_UNAVAILABLE_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: runtime filter query is not active or in delivery grace";
 const ACK_UNSUPPORTED_REJECTION: &str = "runtime filter ingress rejected [ack-unsupported]: runtime filter ack ingress is not supported";

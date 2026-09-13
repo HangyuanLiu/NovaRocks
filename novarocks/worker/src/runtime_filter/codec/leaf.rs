@@ -17,7 +17,7 @@
 
 //! Canonical `NRFL` membership leaf codec.
 //!
-//! Values are never decoded through a Backend copy of the logical domain
+//! Values are never decoded through a Worker copy of the logical domain
 //! grammar.  The leaf payload is reconstructed into Execution's canonical
 //! `ValueDomainDelta` body and validated there before a resident index is made.
 
@@ -31,7 +31,7 @@ use novarocks_execution::runtime_filter::{
     contribution::{self, ValueDomainDelta},
 };
 
-use novarocks_worker::runtime_filter::artifact::{
+use crate::runtime_filter::artifact::{
     ArtifactKind, ArtifactSchemaDigest, HashContractDigest, LEAF_CODEC_VERSION, PhysicalArtifact,
     ResidentFilterIndex, ResidentMembershipIndex,
 };
@@ -40,7 +40,7 @@ const MAGIC: &[u8; 4] = b"NRFL";
 const FLAG_CONTAINS_NULL: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactCodecError {
+pub enum ArtifactCodecError {
     ContractViolation,
     #[allow(
         dead_code,
@@ -71,14 +71,14 @@ impl fmt::Display for ArtifactCodecError {
 impl Error for ArtifactCodecError {}
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ArtifactDecodeExpectations<'a> {
-    pub(crate) expected_kind: ArtifactKind,
-    pub(crate) schema: &'a RuntimeFilterMembershipSchema,
-    pub(crate) expected_logical_version: LogicalVersion,
-    pub(crate) expected_hash_contract: Option<HashContractDigest>,
+pub struct ArtifactDecodeExpectations<'a> {
+    pub expected_kind: ArtifactKind,
+    pub schema: &'a RuntimeFilterMembershipSchema,
+    pub expected_logical_version: LogicalVersion,
+    pub expected_hash_contract: Option<HashContractDigest>,
 }
 
-pub(crate) fn encode_membership_leaf(
+pub fn encode_membership_leaf(
     domain: &ValueDomainDelta,
     schema: &RuntimeFilterMembershipSchema,
     logical_version: LogicalVersion,
@@ -103,7 +103,7 @@ pub(crate) fn encode_membership_leaf(
     encode_physical_leaf(kind, schema, logical_version, contains_null, None, &payload)
 }
 
-pub(crate) fn encode_physical_leaf(
+pub fn encode_physical_leaf(
     kind: ArtifactKind,
     schema: &RuntimeFilterMembershipSchema,
     logical_version: LogicalVersion,
@@ -159,7 +159,7 @@ pub(crate) fn encode_physical_leaf(
     Ok(encoded)
 }
 
-pub(crate) fn decode_leaf(
+pub fn decode_leaf(
     encoded: &[u8],
     expectations: ArtifactDecodeExpectations<'_>,
     max_artifact_bytes: usize,
@@ -574,7 +574,7 @@ fn inspect_membership_index(
 /// and receive only a boolean membership fact.  It deliberately has no Arrow
 /// or scan-domain dependency.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum MembershipProbe<'a> {
+pub enum MembershipProbe<'a> {
     Boolean(bool),
     Int8(i8),
     Int16(i16),
@@ -589,7 +589,7 @@ pub(crate) enum MembershipProbe<'a> {
     Decimal128(i128),
 }
 
-pub(crate) fn indexed_membership_contains(
+pub fn indexed_membership_contains(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
     probe: MembershipProbe<'_>,
@@ -647,7 +647,7 @@ pub(crate) fn indexed_membership_contains(
 /// Tests whether a sorted resident ValueSet has an entry in the inclusive
 /// closed range.  This stays logarithmic and never rehydrates a logical
 /// domain, preserving the Backend physical-artifact boundary.
-pub(crate) fn indexed_membership_range_may_match(
+pub fn indexed_membership_range_may_match(
     encoded: &[u8],
     index: &ResidentMembershipIndex,
     inclusive_min: MembershipProbe<'_>,

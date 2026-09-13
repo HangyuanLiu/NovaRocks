@@ -3,7 +3,7 @@ use novarocks_execution::runtime_filter::contribution::{
 };
 use sha2::{Digest, Sha256};
 
-use novarocks_worker::runtime_filter::artifact::{ArtifactSchemaDigest, HashContractDigest};
+use crate::runtime_filter::artifact::{ArtifactSchemaDigest, HashContractDigest};
 
 const CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.bloom-contract";
 #[allow(
@@ -15,10 +15,10 @@ const SCALAR_HASH_DOMAIN: &[u8] = b"novarocks.runtime-filter.bloom-scalar";
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) const METADATA_BYTES: usize = 40;
+pub const METADATA_BYTES: usize = 40;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct BloomHashContract {
+pub struct BloomHashContract {
     algorithm_version: u16,
     scalar_framing_version: u16,
     schema_digest: ArtifactSchemaDigest,
@@ -28,14 +28,14 @@ pub(crate) struct BloomHashContract {
     digest: HashContractDigest,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BloomError {
+pub enum BloomError {
     InvalidContract,
     EmptyDomain,
     SizeOverflow,
 }
 
 impl BloomHashContract {
-    pub(crate) fn from_fields(
+    pub fn from_fields(
         schema_digest: ArtifactSchemaDigest,
         algorithm_version: u16,
         scalar_framing_version: u16,
@@ -62,45 +62,45 @@ impl BloomHashContract {
         value.digest = HashContractDigest::new(value.canonical_digest());
         Ok(value)
     }
-    pub(crate) const fn digest(self) -> HashContractDigest {
+    pub const fn digest(self) -> HashContractDigest {
         self.digest
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn algorithm_version(self) -> u16 {
+    pub const fn algorithm_version(self) -> u16 {
         self.algorithm_version
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn scalar_framing_version(self) -> u16 {
+    pub const fn scalar_framing_version(self) -> u16 {
         self.scalar_framing_version
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn seed(self) -> u64 {
+    pub const fn seed(self) -> u64 {
         self.seed
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bits_per_key(self) -> u64 {
+    pub const fn bits_per_key(self) -> u64 {
         self.bits_per_key
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn hash_count(self) -> u32 {
+    pub const fn hash_count(self) -> u32 {
         self.hash_count
     }
-    pub(crate) fn bit_count(self, cardinality: usize) -> Result<u64, BloomError> {
+    pub fn bit_count(self, cardinality: usize) -> Result<u64, BloomError> {
         let cardinality = u64::try_from(cardinality).map_err(|_| BloomError::SizeOverflow)?;
         if cardinality == 0 {
             return Err(BloomError::EmptyDomain);
@@ -131,7 +131,7 @@ impl BloomHashContract {
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) fn build_bits(
+pub fn build_bits(
     values: &MembershipValues,
     contract: BloomHashContract,
 ) -> Result<(u64, Vec<u8>), BloomError> {

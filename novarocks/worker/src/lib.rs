@@ -57,6 +57,9 @@ mod task_registry_tests;
 /// Worker-owned runtime-filter artifacts and local resource contracts.
 pub mod runtime_filter {
     pub mod artifact;
+    pub mod artifact_query;
+    pub mod codec;
+    pub mod materializer;
 }
 
 pub use admission::{

@@ -1,11 +1,8 @@
 //! Backend-owned runtime-filter participant state.
 
-pub(crate) mod artifact_query;
-pub(crate) mod codec;
 pub(crate) mod domain;
 pub(crate) mod ingress;
 pub(crate) mod install_decode;
-pub(crate) mod materializer;
 pub(crate) mod membership_contract_decode;
 pub(crate) mod observation;
 pub(crate) mod participant;

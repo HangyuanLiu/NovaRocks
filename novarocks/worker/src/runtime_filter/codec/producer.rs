@@ -24,13 +24,13 @@ const MAGIC: &[u8; 4] = b"NRPU";
 const VERSION: u8 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ProducerFailureCodecError {
+pub enum ProducerFailureCodecError {
     Malformed,
     UnknownVersion,
     UnknownReason,
 }
 
-pub(crate) fn encode_producer_failure(reason: RuntimeFilterProducerFailure) -> [u8; 6] {
+pub fn encode_producer_failure(reason: RuntimeFilterProducerFailure) -> [u8; 6] {
     let tag = match reason {
         RuntimeFilterProducerFailure::Cancelled => 1,
         RuntimeFilterProducerFailure::ExecutionFailed => 2,
@@ -39,7 +39,7 @@ pub(crate) fn encode_producer_failure(reason: RuntimeFilterProducerFailure) -> [
     [b'N', b'R', b'P', b'U', VERSION, tag]
 }
 
-pub(crate) fn decode_producer_failure(
+pub fn decode_producer_failure(
     encoded: &[u8],
 ) -> Result<RuntimeFilterProducerFailure, ProducerFailureCodecError> {
     if encoded.len() != 6 || &encoded[..4] != MAGIC {

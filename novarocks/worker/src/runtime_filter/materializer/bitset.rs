@@ -5,7 +5,7 @@ use novarocks_execution::runtime_filter::contribution::MembershipValues;
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) struct BitsetPlan {
+pub struct BitsetPlan {
     type_tag: u8,
     min: i64,
     max: i64,
@@ -17,7 +17,7 @@ pub(crate) struct BitsetPlan {
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) enum BitsetError {
+pub enum BitsetError {
     UnsupportedType,
     EmptyDomain,
     ValueOutOfRange,
@@ -29,7 +29,7 @@ impl BitsetPlan {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn new(values: &MembershipValues) -> Result<Self, BitsetError> {
+    pub fn new(values: &MembershipValues) -> Result<Self, BitsetError> {
         let values = lossless_i64(values)?;
         let (&min, &max) = values
             .values
@@ -59,35 +59,35 @@ impl BitsetPlan {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn type_tag(self) -> u8 {
+    pub const fn type_tag(self) -> u8 {
         self.type_tag
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn min(self) -> i64 {
+    pub const fn min(self) -> i64 {
         self.min
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn max(self) -> i64 {
+    pub const fn max(self) -> i64 {
         self.max
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bit_count(self) -> u64 {
+    pub const fn bit_count(self) -> u64 {
         self.bit_count
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn byte_count(self) -> usize {
+    pub const fn byte_count(self) -> usize {
         self.byte_count
     }
 }
@@ -96,10 +96,7 @@ impl BitsetPlan {
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) fn build_bits(
-    values: &MembershipValues,
-    plan: BitsetPlan,
-) -> Result<Vec<u8>, BitsetError> {
+pub fn build_bits(values: &MembershipValues, plan: BitsetPlan) -> Result<Vec<u8>, BitsetError> {
     let values = lossless_i64(values)?;
     let mut bits = vec![0; plan.byte_count];
     for value in values.values {

@@ -4453,6 +4453,7 @@ dependencies = [
 name = "novarocks-worker"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-spi",

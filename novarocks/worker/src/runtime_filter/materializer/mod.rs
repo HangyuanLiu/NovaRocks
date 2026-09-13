@@ -17,9 +17,9 @@
 
 //! Backend admission and materialization of Execution-owned contributions.
 
-pub(crate) mod bitset;
-pub(crate) mod bloom;
-pub(crate) mod range;
+pub mod bitset;
+pub mod bloom;
+pub mod range;
 
 use std::sync::Arc;
 
@@ -27,37 +27,37 @@ use novarocks_execution::runtime_filter::{
     LogicalVersion, RuntimeFilterMembershipSchema, contribution::ValueDomainDelta,
 };
 
-use crate::runtime_filter::codec::leaf::{self, ArtifactCodecError, ArtifactDecodeExpectations};
-use novarocks_worker::runtime_filter::artifact as worker_artifact;
-use novarocks_worker::runtime_filter::artifact::{
+use crate::runtime_filter::artifact as worker_artifact;
+use crate::runtime_filter::artifact::{
     ArtifactBundle, ArtifactContractError, ArtifactKind, ConsumerArtifactProfile,
 };
+use crate::runtime_filter::codec::leaf::{self, ArtifactCodecError, ArtifactDecodeExpectations};
 
 use self::{bitset::BitsetPlan, bloom::BloomHashContract};
 
 #[derive(Clone, Debug)]
-pub(crate) struct MaterializationAdmission {
+pub struct MaterializationAdmission {
     max_artifact_bytes: usize,
     retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
     scratch_budget: Arc<worker_artifact::ArtifactScratchBudget>,
 }
 
-/// Frozen physical Bloom parameters.  The Backend profile digest remains the
+/// Frozen physical Bloom parameters.  The Worker profile digest remains the
 /// authority: callers must prove the derived contract digest matches it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) struct BloomMaterializationPolicy {
-    pub(crate) algorithm_version: u16,
-    pub(crate) seed: u64,
-    pub(crate) bits_per_key: u64,
-    pub(crate) hash_count: u32,
+pub struct BloomMaterializationPolicy {
+    pub algorithm_version: u16,
+    pub seed: u64,
+    pub bits_per_key: u64,
+    pub hash_count: u32,
 }
 
 impl MaterializationAdmission {
-    pub(crate) fn new(max_artifact_bytes: usize) -> Self {
+    pub fn new(max_artifact_bytes: usize) -> Self {
         Self {
             max_artifact_bytes,
             retained_budget: Arc::new(worker_artifact::ArtifactRetainedBudget::new(
@@ -68,14 +68,14 @@ impl MaterializationAdmission {
             )),
         }
     }
-    pub(crate) const fn max_artifact_bytes(&self) -> usize {
+    pub const fn max_artifact_bytes(&self) -> usize {
         self.max_artifact_bytes
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn with_retained_budget(
+    pub fn with_retained_budget(
         max_artifact_bytes: usize,
         retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
     ) -> Self {
@@ -91,7 +91,7 @@ impl MaterializationAdmission {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn with_budgets(
+    pub fn with_budgets(
         max_artifact_bytes: usize,
         retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
         scratch_budget: Arc<worker_artifact::ArtifactScratchBudget>,
@@ -119,7 +119,7 @@ impl MaterializationAdmission {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum MaterializationOutcome {
+pub enum MaterializationOutcome {
     Published(Arc<ArtifactBundle>),
     Unsupported(NoAcceptedRepresentation),
     #[allow(
@@ -130,16 +130,16 @@ pub(crate) enum MaterializationOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum NoAcceptedRepresentation {
+pub enum NoAcceptedRepresentation {
     NoAcceptedRepresentation,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MaterializationUnavailable {
+pub enum MaterializationUnavailable {
     ResourceLimit,
     MaterializationFailed,
 }
 
-pub(crate) fn materialize_membership(
+pub fn materialize_membership(
     channel_id: u32,
     domain: &ValueDomainDelta,
     schema: &RuntimeFilterMembershipSchema,
@@ -222,7 +222,7 @@ pub(crate) fn materialize_membership(
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) fn materialize_membership_with_policy(
+pub fn materialize_membership_with_policy(
     channel_id: u32,
     domain: &ValueDomainDelta,
     schema: &RuntimeFilterMembershipSchema,

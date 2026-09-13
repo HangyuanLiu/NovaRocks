@@ -38,7 +38,9 @@ use novarocks_execution::runtime_filter::{
     UnavailableReason,
 };
 use novarocks_types::UniqueId;
-use novarocks_worker::runtime_filter::artifact::ConsumerArtifactProfile;
+use novarocks_worker::{
+    runtime_filter as worker_runtime_filter, runtime_filter::artifact::ConsumerArtifactProfile,
+};
 
 use super::{
     BackendChannelIdentity, BackendChannelInstall, BackendConsumerInstall, BackendCoverageProgress,
@@ -720,18 +722,18 @@ impl BackendRuntimeFilterSession {
                 (
                     BackendReducedLogicalDomain::Membership(domain),
                     RuntimeFilterExecutionContract::Membership(schema),
-                ) => match crate::runtime_filter::materializer::materialize_membership(
+                ) => match worker_runtime_filter::materializer::materialize_membership(
                     snapshot.channel_id().get(),
                     domain,
                     schema,
                     logical_version,
                     &consumer.profile,
-                    crate::runtime_filter::materializer::MaterializationAdmission::new(
+                    worker_runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
                     ),
                 ) {
-                    crate::runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
-                        match crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::membership(
+                    worker_runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
+                        match worker_runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::membership(
                             &bundle,
                             schema.data_type().clone(),
                             schema.null_semantics(),
@@ -749,29 +751,29 @@ impl BackendRuntimeFilterSession {
                             ),
                         }
                     }
-                    crate::runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
                         SnapshotAcquireOutcome::Unsupported(
                             novarocks_execution::runtime_filter::ArtifactUnsupportedReason::NoAcceptedRepresentation,
                         )
                     }
-                    crate::runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
                         SnapshotAcquireOutcome::Unavailable(UnavailableReason::MaterializationFailed)
                     }
                 },
                 (
                     BackendReducedLogicalDomain::OrderedBound(bound),
                     RuntimeFilterExecutionContract::Ordered(order),
-                ) => match crate::runtime_filter::materializer::range::materialize_range(
+                ) => match worker_runtime_filter::materializer::range::materialize_range(
                     snapshot.channel_id().get(),
                     order,
                     bound,
                     logical_version,
                     &consumer.profile,
-                    &crate::runtime_filter::materializer::MaterializationAdmission::new(
+                    &worker_runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
                     ),
                 ) {
-                    Ok(bundle) => match crate::runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::ordered(
+                    Ok(bundle) => match worker_runtime_filter::artifact_query::BackendRuntimeFilterArtifactQuery::ordered(
                         &bundle,
                         Arc::clone(order),
                     ) {
@@ -982,47 +984,47 @@ impl BackendRuntimeFilterSession {
                 (
                     BackendReducedLogicalDomain::Membership(domain),
                     RuntimeFilterExecutionContract::Membership(schema),
-                ) => match crate::runtime_filter::materializer::materialize_membership(
+                ) => match worker_runtime_filter::materializer::materialize_membership(
                     snapshot.channel_id().get(),
                     domain,
                     schema,
                     logical_version,
                     group.profile(),
-                    crate::runtime_filter::materializer::MaterializationAdmission::new(
+                    worker_runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
                     ),
                 ) {
-                    crate::runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
-                        crate::runtime_filter::codec::artifact::encode_artifact_bundle(
+                    worker_runtime_filter::materializer::MaterializationOutcome::Published(bundle) => {
+                        worker_runtime_filter::codec::artifact::encode_artifact_bundle(
                             &bundle,
-                            crate::runtime_filter::codec::artifact::ArtifactDecodeExpectation {
+                            worker_runtime_filter::codec::artifact::ArtifactDecodeExpectation {
                                 profile: group.profile(),
                                 schema,
                                 order_contract: None,
                             },
-                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                            worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                                 self.channel.max_artifact_bytes(),
                             )
                             .map_err(|error| materialization_violation(error.to_string()))?,
                         )
                         .map_err(|error| materialization_violation(error.to_string()))?
                     }
-                    crate::runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
-                        crate::runtime_filter::codec::artifact::encode_unavailable(
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
+                        worker_runtime_filter::codec::artifact::encode_unavailable(
                             UnavailableReason::MaterializationFailed,
                             group.profile(),
-                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                            worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                                 self.channel.max_artifact_bytes(),
                             )
                             .map_err(|error| materialization_violation(error.to_string()))?,
                         )
                         .map_err(|error| materialization_violation(error.to_string()))?
                     }
-                    crate::runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
-                        crate::runtime_filter::codec::artifact::encode_unavailable(
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
+                        worker_runtime_filter::codec::artifact::encode_unavailable(
                             UnavailableReason::MaterializationFailed,
                             group.profile(),
-                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                            worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                                 self.channel.max_artifact_bytes(),
                             )
                             .map_err(|error| materialization_violation(error.to_string()))?,
@@ -1033,46 +1035,46 @@ impl BackendRuntimeFilterSession {
                 (
                     BackendReducedLogicalDomain::OrderedBound(bound),
                     RuntimeFilterExecutionContract::Ordered(order),
-                ) => match crate::runtime_filter::materializer::range::materialize_range(
+                ) => match worker_runtime_filter::materializer::range::materialize_range(
                     snapshot.channel_id().get(),
                     order,
                     bound,
                     logical_version,
                     group.profile(),
-                    &crate::runtime_filter::materializer::MaterializationAdmission::new(
+                    &worker_runtime_filter::materializer::MaterializationAdmission::new(
                         self.channel.max_artifact_bytes(),
                     ),
                 ) {
                     Ok(bundle) => {
                         let placeholder = placeholder_membership_schema()?;
-                        crate::runtime_filter::codec::artifact::encode_artifact_bundle(
+                        worker_runtime_filter::codec::artifact::encode_artifact_bundle(
                             &bundle,
-                            crate::runtime_filter::codec::artifact::ArtifactDecodeExpectation {
+                            worker_runtime_filter::codec::artifact::ArtifactDecodeExpectation {
                                 profile: group.profile(),
                                 schema: &placeholder,
                                 order_contract: Some(order),
                             },
-                            crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                            worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                                 self.channel.max_artifact_bytes(),
                             )
                             .map_err(|error| materialization_violation(error.to_string()))?,
                         )
                         .map_err(|error| materialization_violation(error.to_string()))?
                     }
-                    Err(_) => crate::runtime_filter::codec::artifact::encode_unavailable(
+                    Err(_) => worker_runtime_filter::codec::artifact::encode_unavailable(
                         UnavailableReason::MaterializationFailed,
                         group.profile(),
-                        crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                        worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                             self.channel.max_artifact_bytes(),
                         )
                         .map_err(|error| materialization_violation(error.to_string()))?,
                     )
                     .map_err(|error| materialization_violation(error.to_string()))?,
                 },
-                _ => crate::runtime_filter::codec::artifact::encode_unavailable(
+                _ => worker_runtime_filter::codec::artifact::encode_unavailable(
                     UnavailableReason::MaterializationFailed,
                     group.profile(),
-                    crate::runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
+                    worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                         self.channel.max_artifact_bytes(),
                     )
                     .map_err(|error| materialization_violation(error.to_string()))?,

@@ -9,22 +9,22 @@ use novarocks_execution::runtime_filter::{
     },
 };
 
+use crate::runtime_filter::artifact as worker_artifact;
 use crate::runtime_filter::codec::leaf::ArtifactCodecError;
-use novarocks_worker::runtime_filter::artifact as worker_artifact;
 use worker_artifact::ArtifactKind;
 
 const MAGIC: &[u8; 4] = b"NRRG";
 const VERSION: u16 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RangeResidentLayout {
-    pub(crate) key_count: usize,
-    pub(crate) tuple_arity: usize,
-    pub(crate) utf8_bytes: usize,
-    pub(crate) timezone_bytes: usize,
+pub struct RangeResidentLayout {
+    pub key_count: usize,
+    pub tuple_arity: usize,
+    pub utf8_bytes: usize,
+    pub timezone_bytes: usize,
 }
 
-pub(crate) fn decode_range_leaf(
+pub fn decode_range_leaf(
     encoded: &[u8],
     expected: &RuntimeOrderContract,
     expected_version: LogicalVersion,
@@ -265,7 +265,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-pub(crate) fn encode_range_leaf(
+pub fn encode_range_leaf(
     contract: &RuntimeOrderContract,
     bound: &OrderedTuple,
     version: LogicalVersion,
@@ -324,7 +324,7 @@ pub(crate) fn encode_range_leaf(
     Ok(output)
 }
 
-pub(crate) fn materialize_range(
+pub fn materialize_range(
     channel_id: u32,
     contract: &RuntimeOrderContract,
     bound: &OrderedTuple,

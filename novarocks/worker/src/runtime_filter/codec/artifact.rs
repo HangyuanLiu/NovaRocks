@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Canonical Backend artifact-delivery (`NRFA`) envelope.
+//! Canonical Worker artifact-delivery (`NRFA`) envelope.
 
 use std::error::Error;
 use std::fmt;
@@ -25,42 +25,40 @@ use novarocks_execution::runtime_filter::{
     LogicalVersion, RuntimeFilterMembershipSchema, UnavailableReason,
 };
 
+use crate::runtime_filter::artifact::{ArtifactBundle, ArtifactKind, ConsumerArtifactProfile};
 use crate::runtime_filter::codec::leaf::{self, ArtifactDecodeExpectations};
-use novarocks_worker::runtime_filter::artifact::{
-    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile,
-};
 
 const MAGIC: &[u8; 4] = b"NRFA";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 56;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct EncodedArtifactFrame {
+pub struct EncodedArtifactFrame {
     profile_digest: [u8; 32],
     payload: Vec<u8>,
 }
 impl EncodedArtifactFrame {
-    pub(crate) const fn profile_digest(&self) -> &[u8; 32] {
+    pub const fn profile_digest(&self) -> &[u8; 32] {
         &self.profile_digest
     }
-    pub(crate) fn payload(&self) -> &[u8] {
+    pub fn payload(&self) -> &[u8] {
         &self.payload
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ArtifactDecodeExpectation<'a> {
-    pub(crate) profile: &'a ConsumerArtifactProfile,
-    pub(crate) schema: &'a RuntimeFilterMembershipSchema,
+pub struct ArtifactDecodeExpectation<'a> {
+    pub profile: &'a ConsumerArtifactProfile,
+    pub schema: &'a RuntimeFilterMembershipSchema,
     /// Ordered artifacts carry their order-contract digest in the NRFA schema
     /// slot. Membership artifacts continue to use `schema`; callers must
     /// explicitly supply this contract before a Range bundle can be decoded.
-    pub(crate) order_contract:
+    pub order_contract:
         Option<&'a novarocks_execution::runtime_filter::contribution::RuntimeOrderContract>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactWireCodecError {
+pub enum ArtifactWireCodecError {
     Malformed,
     Truncated,
     UnknownVersion,
@@ -86,7 +84,7 @@ impl fmt::Display for ArtifactWireCodecError {
 }
 impl Error for ArtifactWireCodecError {}
 
-pub(crate) fn max_encoded_len_for_artifact_budget(
+pub fn max_encoded_len_for_artifact_budget(
     max_semantic_bytes: usize,
 ) -> Result<usize, ArtifactWireCodecError> {
     HEADER_LEN
@@ -94,7 +92,7 @@ pub(crate) fn max_encoded_len_for_artifact_budget(
         .ok_or(ArtifactWireCodecError::LengthOverflow)
 }
 
-pub(crate) fn encode_artifact_bundle(
+pub fn encode_artifact_bundle(
     bundle: &ArtifactBundle,
     expectation: ArtifactDecodeExpectation<'_>,
     max_encoded: usize,
@@ -141,7 +139,7 @@ pub(crate) fn encode_artifact_bundle(
     })
 }
 
-pub(crate) fn decode_artifact_bundle(
+pub fn decode_artifact_bundle(
     payload: &[u8],
     envelope_digest: &[u8; 32],
     expectation: ArtifactDecodeExpectation<'_>,
@@ -240,7 +238,7 @@ pub(crate) fn decode_artifact_bundle(
     Ok(Arc::new(bundle))
 }
 
-pub(crate) fn encode_unavailable(
+pub fn encode_unavailable(
     reason: UnavailableReason,
     profile: &ConsumerArtifactProfile,
     max_encoded: usize,
@@ -260,7 +258,7 @@ pub(crate) fn encode_unavailable(
     })
 }
 
-pub(crate) fn decode_unavailable(
+pub fn decode_unavailable(
     payload: &[u8],
     envelope_digest: &[u8; 32],
     profile: &ConsumerArtifactProfile,
