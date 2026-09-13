@@ -26,7 +26,7 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use novarocks_execution::exec::expr::{ExprArena, cast_array_to_target};
 use novarocks_execution::exec::node::values::ValuesNode;

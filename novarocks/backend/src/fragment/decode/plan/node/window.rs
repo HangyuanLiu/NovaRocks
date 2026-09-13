@@ -25,7 +25,7 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::aggregate::decode_resolved_aggregate_signature;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::analytic::{

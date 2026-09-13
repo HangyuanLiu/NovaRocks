@@ -48,7 +48,7 @@ use novarocks_types::QueryId;
 use crate::fragment::decode::plan::error::{
     NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
 };
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 
 /// Adapts connector reservations to the exact fragment tracker created by
 /// native task admission. The adapter exists during pure plan decode, but it

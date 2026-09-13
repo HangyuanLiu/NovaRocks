@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{
     ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema,
 };

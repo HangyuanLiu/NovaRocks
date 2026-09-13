@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Field};
 
 use super::DecodedNode;
 use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::node::repeat::RepeatNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};

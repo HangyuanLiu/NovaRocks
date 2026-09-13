@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,

@@ -45,12 +45,12 @@ use std::collections::BTreeMap;
 
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
 use crate::fragment::decode::plan::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
     NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use novarocks_execution::exec::node::aggregate::{

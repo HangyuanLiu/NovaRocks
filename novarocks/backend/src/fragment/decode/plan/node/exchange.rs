@@ -20,7 +20,7 @@
 use super::common::parse_optional_nonnegative_i64;
 use super::{DecodedNode, NativePlanDecodeContext, sort};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
 use novarocks_execution::exec::node::limit::LimitNode;

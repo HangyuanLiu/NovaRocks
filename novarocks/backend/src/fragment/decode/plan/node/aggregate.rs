@@ -24,8 +24,8 @@ use arrow::datatypes::{DataType, Field, Fields};
 use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,

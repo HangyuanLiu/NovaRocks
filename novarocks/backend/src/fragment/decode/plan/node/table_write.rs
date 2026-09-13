@@ -78,7 +78,7 @@ use crate::connector::write_data_plane::{
 };
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 
 fn decode_writer_multiplex_schema(
     wire: Option<&plan::WriterMultiplexSchema>,

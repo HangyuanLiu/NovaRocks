@@ -31,7 +31,7 @@ use novarocks_types::SlotId;
 
 use super::context::NativePlanDecodeContext;
 use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
-use super::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 
 #[allow(
     dead_code,
@@ -572,7 +572,7 @@ mod tests {
         decode_row_mutation_effect,
     };
     use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-    use crate::fragment::decode::plan::layout::Layout;
+    use novarocks_execution::exec::chunk::SlotLayout as Layout;
 
     #[test]
     fn row_mutation_effect_decoding_rejects_unspecified_and_unknown_values() {

@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
 use crate::fragment::decode::plan::error::NativeFragmentLeafDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::join::JoinType;
 use novarocks_execution::exec::node::project::ProjectNode;

@@ -24,7 +24,7 @@ use arrow::datatypes::{DataType, Field};
 use super::values::materialize_values_chunk_with_context;
 use super::{DecodedNode, NativePlanDecodeContext};
 use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
