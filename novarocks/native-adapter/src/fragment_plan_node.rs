@@ -567,6 +567,94 @@ fn repeat_grouping_values(
         .collect()
 }
 
+/// Validates a Native `RedistributeNode` while preserving its immutable child program.
+pub fn lower_redistribute_node(
+    physical: &plan::PlanNode,
+    redistribute: &plan::RedistributeNode,
+    path: FieldPath,
+    physical_output_path: FieldPath,
+    mut children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let child = children.pop().expect("validated RedistributeNode child");
+    let mode = redistribute
+        .mode
+        .as_ref()
+        .and_then(|mode| mode.mode.as_ref())
+        .ok_or_else(|| {
+            NativeFragmentDecodeError::missing(
+                path.clone().field("mode").field("mode"),
+                "RedistributeNode mode missing",
+            )
+        })?;
+    match mode {
+        plan::redistribute_mode::Mode::Gather(true)
+        | plan::redistribute_mode::Mode::Broadcast(true) => {}
+        plan::redistribute_mode::Mode::Hash(hash) => {
+            if hash.cols.is_empty() {
+                return Err(NativeFragmentDecodeError::missing(
+                    path.clone().field("mode").field("hash").field("cols"),
+                    "RedistributeNode hash mode requires cols",
+                ));
+            }
+            for col in &hash.cols {
+                NativeFragmentDecodeError::map_invalid(
+                    path.clone().field("mode").field("hash").field("cols"),
+                    child.layout.resolve_column_id(*col).ok_or_else(|| {
+                        format!("ColumnRef column_id={col} not found in input layout")
+                    }),
+                )?;
+            }
+        }
+        plan::redistribute_mode::Mode::Gather(false)
+        | plan::redistribute_mode::Mode::Broadcast(false) => {
+            return Err(NativeFragmentDecodeError::invalid_value(
+                path.clone().field("mode"),
+                "RedistributeNode boolean mode must be true",
+            ));
+        }
+    }
+    let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
+    for (idx, expr) in redistribute.partition_exprs.iter().enumerate() {
+        decode_expr_at(
+            expr,
+            path.clone().field("partition_exprs").index(idx),
+            arena,
+            &input,
+        )
+        .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
+    }
+    let (output_columns, output_path) = if redistribute.output_columns.is_empty() {
+        (&physical.output_columns, physical_output_path)
+    } else {
+        (
+            &redistribute.output_columns,
+            path.clone().field("output_columns"),
+        )
+    };
+    if output_columns.is_empty() {
+        return Ok(child);
+    }
+    let output_layout = decode_output_layout(output_columns, output_path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    if layout.order() != child.layout.order() {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            output_path.clone(),
+            format!(
+                "RedistributeNode output columns must preserve child order: child={:?} output={:?}",
+                child.layout.order(),
+                layout.order()
+            ),
+        ));
+    }
+    Ok(NativeLoweredPlanNode {
+        node: child.node,
+        layout,
+        output_schema: output_layout.chunk_schema(),
+    })
+}
+
 /// One fully lowered physical node and its immutable output contract.
 #[derive(Clone, Debug)]
 pub struct NativeLoweredPlanNode {
@@ -1386,6 +1474,127 @@ mod repeat_projection_tests {
         assert_eq!(
             protocol.path().to_string(),
             "plan_fragment.repeat.repeat_column_ref_ids[0].values[0]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redistribute_projection_tests {
+    use arrow::array::Int64Array;
+    use novarocks_plan_codec::encode_native_type as encode_type;
+
+    use super::*;
+
+    fn child() -> NativeLoweredPlanNode {
+        let schema = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                Field::new("id", DataType::Int64, true),
+                None,
+                None,
+            )])
+            .expect("schema"),
+        );
+        NativeLoweredPlanNode {
+            node: ExecNode {
+                kind: ExecNodeKind::Values(ValuesNode {
+                    chunk: Chunk::try_new_with_columns(
+                        Arc::clone(&schema),
+                        vec![Arc::new(Int64Array::from(vec![1]))],
+                    )
+                    .expect("chunk"),
+                    node_id: 1,
+                }),
+            },
+            layout: SlotLayout::for_slots([SlotId::new(1)]),
+            output_schema: schema,
+        }
+    }
+
+    fn output_column() -> proto_common::OutputColumn {
+        proto_common::OutputColumn {
+            column_id: 1,
+            name: "id".to_string(),
+            r#type: Some(encode_type(&DataType::Int64).expect("type")),
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    #[test]
+    fn redistribute_projection_preserves_child_program_and_refuses_invalid_modes() {
+        let physical = plan::PlanNode {
+            output_columns: vec![output_column()],
+            ..Default::default()
+        };
+        let mut arena = ExprArena::default();
+        let lowered = lower_redistribute_node(
+            &physical,
+            &plan::RedistributeNode {
+                mode: Some(plan::RedistributeMode {
+                    mode: Some(plan::redistribute_mode::Mode::Gather(true)),
+                }),
+                output_columns: vec![output_column()],
+                ..Default::default()
+            },
+            FieldPath::root("plan_fragment").field("redistribute"),
+            FieldPath::root("plan_fragment").field("output_columns"),
+            vec![child()],
+            &mut arena,
+        )
+        .expect("lower redistribute");
+        assert!(matches!(lowered.node.kind, ExecNodeKind::Values(_)));
+        assert_eq!(lowered.layout.order(), &[SlotId::new(1)]);
+
+        let error = lower_redistribute_node(
+            &physical,
+            &plan::RedistributeNode {
+                mode: Some(plan::RedistributeMode {
+                    mode: Some(plan::redistribute_mode::Mode::Gather(false)),
+                }),
+                ..Default::default()
+            },
+            FieldPath::root("plan_fragment").field("redistribute"),
+            FieldPath::root("plan_fragment").field("output_columns"),
+            vec![child()],
+            &mut arena,
+        )
+        .expect_err("false gather fails");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InvalidValue);
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.redistribute.mode"
+        );
+    }
+
+    #[test]
+    fn redistribute_hash_mode_requires_columns() {
+        let mut arena = ExprArena::default();
+        let error = lower_redistribute_node(
+            &plan::PlanNode::default(),
+            &plan::RedistributeNode {
+                mode: Some(plan::RedistributeMode {
+                    mode: Some(plan::redistribute_mode::Mode::Hash(
+                        plan::RedistributeHash {
+                            cols: Vec::new(),
+                            source: 0,
+                        },
+                    )),
+                }),
+                ..Default::default()
+            },
+            FieldPath::root("plan_fragment").field("redistribute"),
+            FieldPath::root("plan_fragment").field("output_columns"),
+            vec![child()],
+            &mut arena,
+        )
+        .expect_err("empty hash columns fail");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
+        assert_eq!(
+            protocol.path().to_string(),
+            "plan_fragment.redistribute.mode.hash.cols"
         );
     }
 }

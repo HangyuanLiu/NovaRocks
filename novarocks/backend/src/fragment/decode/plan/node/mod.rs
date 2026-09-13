@@ -25,7 +25,6 @@ mod filter;
 mod hash_join;
 mod nestloop_join;
 mod project;
-mod redistribute;
 mod set_op;
 mod sort;
 mod table_function;
@@ -61,7 +60,7 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_generate_series_node, lower_limit_node,
-    lower_repeat_node, lower_values_node, parse_distributed_limit,
+    lower_redistribute_node, lower_repeat_node, lower_values_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1706,14 +1705,13 @@ fn lower_physical_node(
             path.clone().field("cte_consume"),
             "native physical node kind CTEConsume is unsupported",
         )),
-        plan::plan_node::Kind::Redistribute(redistribute) => redistribute::lower_redistribute_node(
+        plan::plan_node::Kind::Redistribute(redistribute) => lower_redistribute_node(
             physical,
             redistribute,
             path.clone().field("redistribute"),
             physical_output_path,
             children,
             arena,
-            ctx,
         ),
     }
 }
