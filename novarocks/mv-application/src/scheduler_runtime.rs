@@ -80,6 +80,91 @@ pub struct MvRefreshSchedulerRuntime<K, R> {
     blocked: BTreeMap<K, String>,
 }
 
+/// The complete process-local refresh runtime.  In addition to queue and
+/// terminal state, it owns the last source revision used to decide whether a
+/// definition's cooldown/backoff may survive.  A repository adapter supplies
+/// the revision and runnable request; it must not retain a parallel revision
+/// ledger.
+#[derive(Debug)]
+pub struct MvRefreshProductRuntime<K, S, R> {
+    scheduler: MvRefreshSchedulerRuntime<K, R>,
+    source_revisions: BTreeMap<K, S>,
+}
+
+impl<K, S, R> MvRefreshProductRuntime<K, S, R>
+where
+    K: Clone + Ord,
+    S: Eq,
+{
+    pub fn new(config: MvSchedulerConfig) -> Self {
+        Self {
+            scheduler: MvRefreshSchedulerRuntime::new(config),
+            source_revisions: BTreeMap::new(),
+        }
+    }
+
+    /// Starts one repository/provider observation.  It first invalidates
+    /// obsolete process-local suppression using the exact frozen source
+    /// revision, then reports whether discovery may perform provider I/O.
+    pub fn begin_observation(&mut self, key: K, source_revision: S, now_ms: i64) -> bool {
+        let source_changed = self
+            .source_revisions
+            .get(&key)
+            .is_some_and(|current| current != &source_revision);
+        if source_changed {
+            self.scheduler.reset_after_source_change(&key);
+        }
+        self.source_revisions.insert(key.clone(), source_revision);
+        !self.scheduler.is_suppressed(&key, now_ms)
+    }
+
+    pub const fn enabled(&self) -> bool {
+        self.scheduler.enabled()
+    }
+
+    pub fn enqueue(&mut self, key: K, request: R) {
+        self.scheduler.enqueue(key, request);
+    }
+
+    pub fn take_ready(&mut self) -> Vec<R> {
+        self.scheduler.take_ready()
+    }
+
+    pub fn mark_started(&mut self, key: &K) -> bool {
+        self.scheduler.mark_started(key)
+    }
+
+    pub fn requeue(&mut self, key: K, request: R) {
+        self.scheduler.requeue(key, request);
+    }
+
+    pub fn complete(
+        &mut self,
+        key: &K,
+        disposition: MvRefreshDisposition,
+        now_ms: i64,
+    ) -> MvRefreshRuntimeDecision {
+        self.scheduler.complete(key, disposition, now_ms)
+    }
+
+    pub fn record(
+        &mut self,
+        key: &K,
+        disposition: MvRefreshDisposition,
+        now_ms: i64,
+    ) -> MvRefreshRuntimeDecision {
+        self.scheduler.record(key, disposition, now_ms)
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.scheduler.pending_len()
+    }
+
+    pub fn running_len(&self) -> usize {
+        self.scheduler.running_len()
+    }
+}
+
 impl<K, R> MvRefreshSchedulerRuntime<K, R>
 where
     K: Clone + Ord,
@@ -233,7 +318,10 @@ fn backoff_ms(config: &MvSchedulerConfig, attempt: u32) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MvRefreshDisposition, MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime};
+    use super::{
+        MvRefreshDisposition, MvRefreshProductRuntime, MvRefreshRuntimeDecision,
+        MvRefreshSchedulerRuntime,
+    };
     use crate::scheduler::MvSchedulerConfig;
 
     #[test]
@@ -259,5 +347,23 @@ mod tests {
         assert!(runtime.is_suppressed(&7, 109));
         runtime.reset_after_source_change(&7);
         assert!(!runtime.is_suppressed(&7, 109));
+    }
+
+    #[test]
+    fn source_revision_reset_is_owned_with_queue_and_backoff_state() {
+        let mut runtime = MvRefreshProductRuntime::<i64, &str, ()>::new(MvSchedulerConfig::new(
+            true, 1, 1, 10, 40,
+        ));
+        assert!(runtime.begin_observation(7_i64, "first", 100));
+        assert!(matches!(
+            runtime.record(
+                &7,
+                MvRefreshDisposition::TransientUnavailable("offline".into()),
+                100,
+            ),
+            MvRefreshRuntimeDecision::TransientBackoff { .. }
+        ));
+        assert!(!runtime.begin_observation(7, "first", 101));
+        assert!(runtime.begin_observation(7, "changed", 101));
     }
 }

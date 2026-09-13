@@ -20,6 +20,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::Mutex,
 };
 
 use novarocks_table_maintenance::{
@@ -382,6 +383,53 @@ impl MaintenancePolicyState {
 pub struct MaintenanceCoordinator {
     policy: MaintenancePolicyState,
     active: BTreeSet<i64>,
+}
+
+/// The sole process-local owner of automatic-maintenance policy state.
+///
+/// Repository and provider adapters supply facts and execute the durable
+/// action, but they do not own a second coordinator mutex, cooldown ledger or
+/// active set.  The explicit begin/finish pair preserves the admitted attempt
+/// across the provider call, including its exact terminal report.
+pub struct MvMaintenanceRuntime {
+    coordinator: Mutex<MaintenanceCoordinator>,
+}
+
+impl MvMaintenanceRuntime {
+    pub fn new(config: MaintenanceCoordinatorConfig) -> Self {
+        Self {
+            coordinator: Mutex::new(MaintenanceCoordinator::new(config)),
+        }
+    }
+
+    pub fn config(&self) -> MaintenanceCoordinatorConfig {
+        self.lock().config().clone()
+    }
+
+    pub fn try_begin(
+        &self,
+        mv_id: i64,
+        target: MaintenanceTarget,
+        facts: &MvMaintenanceFacts,
+        now_ms: i64,
+    ) -> Result<MaintenanceAttempt, MaintenanceAdmission> {
+        self.lock().try_begin(mv_id, target, facts, now_ms)
+    }
+
+    pub fn finish(
+        &self,
+        attempt: MaintenanceAttempt,
+        report: &MaintenanceExecutionReport,
+        now_ms: i64,
+    ) {
+        self.lock().finish_attempt(attempt, report, now_ms);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MaintenanceCoordinator> {
+        self.coordinator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl MaintenanceCoordinator {

@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Frontend-owned scheduling policy for asynchronous materialized-view refresh.
+//! Frontend repository/provider discovery adapter for asynchronous refresh.
 //!
-//! This module deliberately has no thread or provider implementation.  The
-//! application host polls [`FrontendMvScheduler::poll`], hands its returned
-//! requests to the worker runtime, then reports the typed terminal result via
-//! [`FrontendMvScheduler::complete`]. Consequently queue coalescing, activity,
-//! retry, and error state are process-local and deterministic without sleeps.
+//! It interprets validated durable definitions and provider observations. The
+//! MV application product owns the queue, source-revision, activity, retry and
+//! terminal state; this adapter owns no process runtime ledger.
 
 use std::collections::BTreeMap;
 
@@ -34,9 +32,7 @@ use crate::mv::domain::repository::{
 };
 use novarocks_mv_application::{
     scheduler::MvSchedulerConfig,
-    scheduler_runtime::{
-        MvRefreshDisposition, MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
-    },
+    scheduler_runtime::{MvRefreshDisposition, MvRefreshProductRuntime, MvRefreshRuntimeDecision},
 };
 
 pub(crate) type ScheduledRefreshDisposition = MvRefreshDisposition;
@@ -153,16 +149,17 @@ pub(crate) trait ScheduledRefreshRunner: Send + Sync {
 
 #[derive(Debug)]
 pub(crate) struct FrontendMvScheduler {
-    runtime: MvRefreshSchedulerRuntime<i64, ScheduledRefreshRequest>,
-    source_revisions:
-        BTreeMap<i64, crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision>,
+    runtime: MvRefreshProductRuntime<
+        i64,
+        crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision,
+        ScheduledRefreshRequest,
+    >,
 }
 
 impl FrontendMvScheduler {
     pub(crate) fn new(config: MvSchedulerConfig) -> Self {
         Self {
-            runtime: MvRefreshSchedulerRuntime::new(config),
-            source_revisions: BTreeMap::new(),
+            runtime: MvRefreshProductRuntime::new(config),
         }
     }
 
@@ -237,8 +234,12 @@ impl FrontendMvScheduler {
         definition: StoredMvDefinition,
         now_ms: i64,
     ) {
-        self.reset_runtime_state_if_source_changed(&definition);
-        if definition.refresh_paused || self.runtime.is_suppressed(&definition.mv_id, now_ms) {
+        if !self.runtime.begin_observation(
+            definition.mv_id,
+            definition.source_revision.clone(),
+            now_ms,
+        ) || definition.refresh_paused
+        {
             return;
         }
 
@@ -325,18 +326,6 @@ impl FrontendMvScheduler {
         now_ms: i64,
     ) {
         let _ = self.runtime.record(&definition.mv_id, disposition, now_ms);
-    }
-
-    fn reset_runtime_state_if_source_changed(&mut self, definition: &StoredMvDefinition) {
-        let source_changed = self
-            .source_revisions
-            .get(&definition.mv_id)
-            .is_some_and(|source| source != &definition.source_revision);
-        if source_changed {
-            self.runtime.reset_after_source_change(&definition.mv_id);
-        }
-        self.source_revisions
-            .insert(definition.mv_id, definition.source_revision.clone());
     }
 }
 

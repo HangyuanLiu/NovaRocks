@@ -32,8 +32,7 @@
 use novarocks_workload_control::{
     BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
 };
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::background::MvBackgroundEngine;
@@ -48,7 +47,7 @@ use novarocks_mv_application::{
     maintenance::{
         AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
         MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
-        MvBackgroundEngineErrorKind,
+        MvBackgroundEngineErrorKind, MvMaintenanceRuntime,
     },
 };
 use novarocks_table_maintenance::{
@@ -120,22 +119,19 @@ pub(crate) enum FrontendMaintenanceSkip {
     },
 }
 
-/// A frontend-owned, synchronous automatic-maintenance runtime.  A host may
-/// call [`Self::run_once`] from its bounded worker executor or use
-/// [`Self::run_until_stopped`] from a dedicated worker thread.  The latter is
-/// intentionally only a loop helper: it does not hide lifecycle ownership or
-/// manufacture an all-in-one execution path.
+/// Frontend repository/provider/native adapter for automatic maintenance.
+/// The MV product owns its coordinator, permits, cooldown and backoff state;
+/// this adapter only inventories definitions and invokes durable effects.
 pub(crate) struct FrontendMaintenanceWorker {
     dependencies: FrontendMaintenanceWorkerDependencies,
-    coordinator: Mutex<MaintenanceCoordinator>,
+    runtime: MvMaintenanceRuntime,
 }
 
 impl FrontendMaintenanceWorker {
     pub(crate) fn new(dependencies: FrontendMaintenanceWorkerDependencies) -> Self {
-        let coordinator = MaintenanceCoordinator::new(dependencies.coordinator_config.clone());
         Self {
+            runtime: MvMaintenanceRuntime::new(dependencies.coordinator_config.clone()),
             dependencies,
-            coordinator: Mutex::new(coordinator),
         }
     }
 
@@ -144,11 +140,7 @@ impl FrontendMaintenanceWorker {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn config(&self) -> MaintenanceCoordinatorConfig {
-        self.coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
-            .config()
-            .clone()
+        self.runtime.config()
     }
 
     /// Evaluate every current frontend MV definition once.  A ticket waiting
@@ -174,42 +166,6 @@ impl FrontendMaintenanceWorker {
             self.run_definition(definition, now_ms, &mut pass);
         }
         Ok(pass)
-    }
-
-    /// A simple process-local runtime loop.  Shutdown is owned by the host:
-    /// it calls `MvActivityGate::begin_stopping`, signals `stop_rx`, and joins
-    /// this thread with the application shutdown deadline.
-    pub(crate) fn run_until_stopped(
-        &self,
-        stop_rx: &Receiver<()>,
-        wake_rx: &Receiver<()>,
-        interval: Duration,
-    ) {
-        loop {
-            if stop_rx.try_recv().is_ok() {
-                return;
-            }
-            let now_ms = now_unix_millis();
-            if let Err(error) = self.run_once(now_ms) {
-                tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
-            }
-            let wait_until = std::time::Instant::now() + interval.max(Duration::from_millis(1));
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    return;
-                }
-                match wake_rx.try_recv() {
-                    Ok(()) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                    Err(TryRecvError::Empty) => {}
-                }
-                let remaining = wait_until.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(25)));
-            }
-        }
     }
 
     fn run_definition(
@@ -316,9 +272,7 @@ impl FrontendMaintenanceWorker {
         }
 
         let attempt = match self
-            .coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
+            .runtime
             .try_begin(definition.mv_id, target.clone(), &facts, now_ms)
         {
             Ok(attempt) => attempt,
@@ -342,10 +296,7 @@ impl FrontendMaintenanceWorker {
             handle: self.dependencies.runtime.clone(),
         };
         let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);
-        self.coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
-            .finish_attempt(attempt, &execution, now_ms);
+        self.runtime.finish(attempt, &execution, now_ms);
         // Release the activity lease only after all durable calls and the
         // coordinator's terminal transition have completed, then finish the
         // governed root.

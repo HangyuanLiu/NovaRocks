@@ -23,7 +23,8 @@
 //! independent concurrency budget.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::time::Duration;
 
 use novarocks_query_application::cancellation::{
     QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
@@ -72,11 +73,34 @@ pub enum MvActivityGateError {
     Stopping,
 }
 
+/// Terminal result of a foreground transition's product-owned FIFO admission.
+/// The caller remains responsible only for mapping its own cancellation/error
+/// vocabulary and executing the provider/native effect after the lease exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvActivityAdmissionError {
+    Stopping,
+    Cancelled,
+}
+
 /// A process-local FIFO gate shared by DDL, foreground refresh, the scheduler,
 /// and automatic maintenance.
 #[derive(Clone, Default)]
 pub struct MvActivityGate {
-    inner: Arc<Mutex<GateState>>,
+    inner: Arc<GateInner>,
+}
+
+struct GateInner {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+impl Default for GateInner {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(GateState::default()),
+            changed: Condvar::new(),
+        }
+    }
 }
 
 impl MvActivityGate {
@@ -90,7 +114,7 @@ impl MvActivityGate {
         target: CanonicalMvTarget,
         owner: MvActivityOwner,
     ) -> Result<MvActivityTicket, MvActivityGateError> {
-        let mut state = lock(&self.inner);
+        let mut state = lock(&self.inner.state);
         if state.stopping {
             return Err(MvActivityGateError::Stopping);
         }
@@ -105,6 +129,7 @@ impl MvActivityGate {
             .or_default()
             .waiters
             .push_back(Waiter { ticket_id, owner });
+        self.inner.changed.notify_all();
         Ok(MvActivityTicket {
             inner: Arc::downgrade(&self.inner),
             target,
@@ -116,7 +141,7 @@ impl MvActivityGate {
     /// Stops new admission and asks only worker-owned attempts to cancel.
     /// Foreground work retains its statement-owned cancellation lifecycle.
     pub fn begin_stopping(&self) {
-        let mut state = lock(&self.inner);
+        let mut state = lock(&self.inner.state);
         state.stopping = true;
         for entry in state.entries.values_mut() {
             if let Some(active) = &entry.active
@@ -125,18 +150,38 @@ impl MvActivityGate {
                 let _ = source.request(QueryCancellationReason::ServerShutdown);
             }
         }
+        self.inner.changed.notify_all();
+    }
+
+    /// Perform the complete foreground transition into an activity lease.
+    /// Hosts cannot retain a ticket or independently implement a wait loop;
+    /// they receive exactly one lease or an explicit terminal admission fact.
+    pub fn acquire_foreground(
+        &self,
+        target: CanonicalMvTarget,
+        owner: MvActivityOwner,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<MvActivityLease, MvActivityAdmissionError> {
+        let mut ticket = self
+            .request(target, owner)
+            .map_err(|_| MvActivityAdmissionError::Stopping)?;
+        match ticket.acquire_waiting(cancelled) {
+            Ok(Some(lease)) => Ok(lease),
+            Ok(None) => Err(MvActivityAdmissionError::Cancelled),
+            Err(_) => Err(MvActivityAdmissionError::Stopping),
+        }
     }
 
     #[cfg(test)]
     fn tracked_target_count(&self) -> usize {
-        lock(&self.inner).entries.len()
+        lock(&self.inner.state).entries.len()
     }
 }
 
 /// A queued request. Dropping an unclaimed ticket removes it from the FIFO
 /// queue, preventing cancelled pre-dispatch work from stranding later work.
 pub struct MvActivityTicket {
-    inner: Weak<Mutex<GateState>>,
+    inner: Weak<GateInner>,
     target: CanonicalMvTarget,
     ticket_id: u64,
     claimed: bool,
@@ -151,9 +196,10 @@ impl MvActivityTicket {
         let Some(inner) = self.inner.upgrade() else {
             return Err(MvActivityGateError::Stopping);
         };
-        let mut state = lock(&inner);
+        let mut state = lock(&inner.state);
         if state.stopping {
             remove_waiter(&mut state, &self.target, self.ticket_id);
+            inner.changed.notify_all();
             return Err(MvActivityGateError::Stopping);
         }
         let Some(entry) = state.entries.get_mut(&self.target) else {
@@ -181,12 +227,76 @@ impl MvActivityTicket {
             cancellation: cancellation.clone(),
         });
         self.claimed = true;
+        inner.changed.notify_all();
         Ok(Some(MvActivityLease {
             inner: Arc::downgrade(&inner),
             target: self.target.clone(),
             ticket_id: self.ticket_id,
             cancellation: cancellation.map(|source| source.view()),
         }))
+    }
+
+    /// Wait for the FIFO head without spin sleeping.  The cancellation probe
+    /// is intentionally owned by the statement/work-scope adapter; the gate
+    /// only owns queue ordering and wakes immediately for every state change.
+    pub fn acquire_waiting(
+        &mut self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<MvActivityLease>, MvActivityGateError> {
+        if self.claimed {
+            return Ok(None);
+        }
+        let Some(inner) = self.inner.upgrade() else {
+            return Err(MvActivityGateError::Stopping);
+        };
+        let mut state = lock(&inner.state);
+        loop {
+            if cancelled() {
+                remove_waiter(&mut state, &self.target, self.ticket_id);
+                inner.changed.notify_all();
+                return Ok(None);
+            }
+            if state.stopping {
+                remove_waiter(&mut state, &self.target, self.ticket_id);
+                inner.changed.notify_all();
+                return Err(MvActivityGateError::Stopping);
+            }
+            let Some(entry) = state.entries.get_mut(&self.target) else {
+                return Ok(None);
+            };
+            if entry.active.is_none()
+                && entry
+                    .waiters
+                    .front()
+                    .is_some_and(|waiter| waiter.ticket_id == self.ticket_id)
+            {
+                let waiter = entry
+                    .waiters
+                    .pop_front()
+                    .expect("front waiter exists after FIFO check");
+                let cancellation = waiter
+                    .owner
+                    .is_worker_owned()
+                    .then(QueryCancellationSource::new);
+                entry.active = Some(ActiveAttempt {
+                    ticket_id: self.ticket_id,
+                    cancellation: cancellation.clone(),
+                });
+                self.claimed = true;
+                inner.changed.notify_all();
+                return Ok(Some(MvActivityLease {
+                    inner: Arc::downgrade(&inner),
+                    target: self.target.clone(),
+                    ticket_id: self.ticket_id,
+                    cancellation: cancellation.map(|source| source.view()),
+                }));
+            }
+            let (next, _) = inner
+                .changed
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next;
+        }
     }
 }
 
@@ -198,13 +308,14 @@ impl Drop for MvActivityTicket {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        remove_waiter(&mut lock(&inner), &self.target, self.ticket_id);
+        remove_waiter(&mut lock(&inner.state), &self.target, self.ticket_id);
+        inner.changed.notify_all();
     }
 }
 
 /// Exclusive ownership of one MV activity slot. Dropping it releases the slot.
 pub struct MvActivityLease {
-    inner: Weak<Mutex<GateState>>,
+    inner: Weak<GateInner>,
     target: CanonicalMvTarget,
     ticket_id: u64,
     cancellation: Option<QueryCancellationView>,
@@ -221,7 +332,7 @@ impl Drop for MvActivityLease {
         let Some(inner) = self.inner.upgrade() else {
             return;
         };
-        let mut state = lock(&inner);
+        let mut state = lock(&inner.state);
         let mut remove_entry = false;
         if let Some(entry) = state.entries.get_mut(&self.target) {
             if entry
@@ -236,6 +347,7 @@ impl Drop for MvActivityLease {
         if remove_entry {
             state.entries.remove(&self.target);
         }
+        inner.changed.notify_all();
     }
 }
 
@@ -306,6 +418,48 @@ mod tests {
         assert!(worker.try_acquire().unwrap().is_none());
         drop(lease);
         assert!(worker.try_acquire().unwrap().is_some());
+    }
+
+    #[test]
+    fn foreground_transition_returns_a_terminal_cancellation_without_a_host_wait_loop() {
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground(target("mv"), MvActivityOwner::ManualRefresh, || false)
+            .expect("first foreground transition acquires its lease");
+        let cancelled =
+            gate.acquire_foreground(target("mv"), MvActivityOwner::ManualRefresh, || true);
+        assert!(matches!(
+            cancelled,
+            Err(MvActivityAdmissionError::Cancelled)
+        ));
+        drop(first);
+    }
+
+    #[test]
+    fn foreground_waiter_is_woken_by_lease_release() {
+        let gate = MvActivityGate::new();
+        let first = gate
+            .acquire_foreground(target("mv"), MvActivityOwner::ManualRefresh, || false)
+            .expect("first foreground transition acquires its lease");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let waiting_gate = gate.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).expect("test waiter starts");
+            let lease = waiting_gate
+                .acquire_foreground(target("mv"), MvActivityOwner::ManualRefresh, || false)
+                .expect("released lease wakes the next foreground transition");
+            finished_tx.send(()).expect("test waiter completes");
+            drop(lease);
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("waiter starts before releasing active lease");
+        drop(first);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("lease release wakes FIFO waiter without host sleeping");
+        waiter.join().expect("waiter does not panic");
     }
 
     #[test]

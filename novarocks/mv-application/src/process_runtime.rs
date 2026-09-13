@@ -20,16 +20,52 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Mutex, mpsc},
-    thread::JoinHandle,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
-/// Product-owned lifecycle for the two process-local MV background workers.
-///
-/// Frontend constructs the concrete workers because they consume Native,
-/// provider, and query adapters.  Once constructed, their stop and join state
-/// belongs here so a host cannot independently advance or retire MV work.
+/// A product worker callback.  The callback is one process-global event loop,
+/// never a per-MV worker.  Native/provider hosts supply only the adapter work
+/// performed for an event.
+pub type MvRefreshBackgroundTask =
+    Box<dyn FnMut(&MvBackgroundStop, &mpsc::SyncSender<()>) + Send + 'static>;
+pub type MvMaintenanceBackgroundTask = Box<dyn FnMut(&MvBackgroundStop) + Send + 'static>;
+
+/// Host adapters required to run the product's two bounded event loops.
+pub struct MvBackgroundTasks {
+    refresh: MvRefreshBackgroundTask,
+    maintenance: MvMaintenanceBackgroundTask,
+}
+
+impl MvBackgroundTasks {
+    pub fn new(refresh: MvRefreshBackgroundTask, maintenance: MvMaintenanceBackgroundTask) -> Self {
+        Self {
+            refresh,
+            maintenance,
+        }
+    }
+}
+
+/// Read-only stop observation passed into a product event callback.
+#[derive(Clone)]
+pub struct MvBackgroundStop {
+    requested: Arc<AtomicBool>,
+}
+
+impl MvBackgroundStop {
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+}
+
+/// Product-owned lifecycle and event runtime for the two process-local MV
+/// workers.  It owns worker creation, timer/wakeup waits, stop signals and
+/// joins. Frontend supplies only repository/provider/native adapters.
 pub struct MvBackgroundRuntime {
     refresh_stop_tx: mpsc::Sender<()>,
     refresh_worker: Option<JoinHandle<()>>,
@@ -40,6 +76,7 @@ pub struct MvBackgroundRuntime {
     )]
     maintenance_wakeup_tx: mpsc::SyncSender<()>,
     maintenance_worker: Option<JoinHandle<()>>,
+    stop: MvBackgroundStop,
 }
 
 impl MvBackgroundRuntime {
@@ -56,12 +93,87 @@ impl MvBackgroundRuntime {
             maintenance_stop_tx,
             maintenance_wakeup_tx,
             maintenance_worker: Some(maintenance_worker),
+            stop: MvBackgroundStop {
+                requested: Arc::new(AtomicBool::new(false)),
+            },
         }
     }
 
+    /// Start both fixed process-wide event loops.  Timer waits block on the
+    /// control channels; there is no sleep/poll loop and no worker is created
+    /// for an individual materialized view.
+    pub fn start(
+        refresh_interval: Duration,
+        maintenance_interval: Duration,
+        tasks: MvBackgroundTasks,
+    ) -> Result<Self, String> {
+        let (refresh_stop_tx, refresh_stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
+        let (maintenance_wakeup_tx, maintenance_wakeup_rx) = mpsc::sync_channel(1);
+        let stop = MvBackgroundStop {
+            requested: Arc::new(AtomicBool::new(false)),
+        };
+        let refresh_stop = stop.clone();
+        let maintenance_stop = stop.clone();
+        let refresh_wakeup_tx = maintenance_wakeup_tx.clone();
+        let mut refresh = tasks.refresh;
+        let refresh_worker = thread::Builder::new()
+            .name("novarocks-mv-refresh".to_string())
+            .spawn(move || {
+                while !refresh_stop.is_requested() {
+                    refresh(&refresh_stop, &refresh_wakeup_tx);
+                    match refresh_stop_rx
+                        .recv_timeout(refresh_interval.max(Duration::from_millis(1)))
+                    {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            })
+            .map_err(|error| format!("start MV refresh product worker: {error}"))?;
+        let mut maintenance = tasks.maintenance;
+        let maintenance_worker = match thread::Builder::new()
+            .name("novarocks-mv-maintenance".to_string())
+            .spawn(move || {
+                while !maintenance_stop.is_requested() {
+                    maintenance(&maintenance_stop);
+                    match maintenance_wakeup_rx
+                        .recv_timeout(maintenance_interval.max(Duration::from_millis(1)))
+                    {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                    if maintenance_stop_rx.try_recv().is_ok() {
+                        return;
+                    }
+                }
+            }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let _ = refresh_stop_tx.send(());
+                let _ = refresh_worker.join();
+                return Err(format!("start MV maintenance product worker: {error}"));
+            }
+        };
+        Ok(Self {
+            refresh_stop_tx,
+            refresh_worker: Some(refresh_worker),
+            maintenance_stop_tx,
+            maintenance_wakeup_tx,
+            maintenance_worker: Some(maintenance_worker),
+            stop,
+        })
+    }
+
+    pub fn maintenance_wakeup(&self) -> mpsc::SyncSender<()> {
+        self.maintenance_wakeup_tx.clone()
+    }
+
     pub fn request_stop(&self) {
+        self.stop.requested.store(true, Ordering::Release);
         let _ = self.refresh_stop_tx.send(());
         let _ = self.maintenance_stop_tx.send(());
+        let _ = self.maintenance_wakeup_tx.try_send(());
     }
 
     pub async fn stop_and_join_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -442,5 +554,42 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("product owner joins both workers");
+    }
+
+    #[tokio::test]
+    async fn product_runtime_wakes_maintenance_without_a_poll_sleep() {
+        let (refresh_seen_tx, refresh_seen_rx) = mpsc::channel();
+        let (maintenance_seen_tx, maintenance_seen_rx) = mpsc::channel();
+        let runtime = MvBackgroundRuntime::start(
+            Duration::from_secs(60),
+            Duration::from_secs(60),
+            super::MvBackgroundTasks::new(
+                Box::new(move |_, _| {
+                    let _ = refresh_seen_tx.send(());
+                }),
+                Box::new(move |_| {
+                    let _ = maintenance_seen_tx.send(());
+                }),
+            ),
+        )
+        .expect("product workers start");
+        refresh_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("refresh product event runs immediately");
+        maintenance_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance product event runs immediately");
+        runtime
+            .maintenance_wakeup()
+            .send(())
+            .expect("product wake channel remains owned");
+        maintenance_seen_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance wake runs without waiting for its timer");
+        let mut runtime = runtime;
+        runtime
+            .stop_and_join_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("woken workers observe the product stop signal");
     }
 }

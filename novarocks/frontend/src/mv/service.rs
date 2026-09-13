@@ -19,8 +19,6 @@ use novarocks_workload_control::{
     BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
 };
 use std::sync::Arc;
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::background::{MvBackgroundBindings, MvBackgroundEngine};
@@ -38,11 +36,13 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_mv_application::{
-    activity::{MvActivityGate, MvActivityLease, MvActivityOwner},
+    activity::{MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner},
     maintenance::{
         MaintenanceCoordinatorConfig, MvBackgroundEngineError, MvBackgroundEngineErrorKind,
     },
-    process_runtime::{MvBackgroundRuntime, MvBackgroundRuntimeOwner},
+    process_runtime::{
+        MvBackgroundRuntime, MvBackgroundRuntimeOwner, MvBackgroundStop, MvBackgroundTasks,
+    },
     scheduler::MvSchedulerConfig,
 };
 use novarocks_spi::connector::{ConnectorControlRegistry, ConnectorRequestContext};
@@ -156,7 +156,6 @@ impl FrontendMvService {
             table_maintenance_service,
             activity_gate: self.activity_gate.clone(),
             root_admission: self.root_admission.clone(),
-            maintenance_wakeup_tx: None,
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             attempt_timeout: self.attempt_timeout,
         })?;
@@ -244,33 +243,20 @@ impl FrontendMvService {
         owner: MvActivityOwner,
         execution: &crate::common::admitted_query_context::QueryExecutionContext,
     ) -> Result<MvActivityLease, MvApplicationError> {
-        let mut gate_ticket = self
-            .activity_gate
-            .request(canonical_mv_target(target), owner)
-            .map_err(|_| {
-                MvApplicationError::new(
-                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                    "frontend MV activity admission is closed",
-                )
-            })?;
-        loop {
-            if execution.cancellation().is_cancelled() {
-                return Err(MvApplicationError::new(
+        self.activity_gate
+            .acquire_foreground(canonical_mv_target(target), owner, || {
+                execution.cancellation().is_cancelled()
+            })
+            .map_err(|error| match error {
+                MvActivityAdmissionError::Cancelled => MvApplicationError::new(
                     crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
                     "MV statement was cancelled while waiting for activity gate",
-                ));
-            }
-            match gate_ticket.try_acquire() {
-                Ok(Some(lease)) => return Ok(lease),
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(_) => {
-                    return Err(MvApplicationError::new(
-                        crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
-                        "frontend MV activity admission is closed",
-                    ));
-                }
-            }
-        }
+                ),
+                MvActivityAdmissionError::Stopping => MvApplicationError::new(
+                    crate::mv::domain::application::MvApplicationErrorKind::ShutdownCancelled,
+                    "frontend MV activity admission is closed",
+                ),
+            })
     }
 
     fn reserve_refresh_attempt(&self) -> MvRefreshAttemptIdentity {
@@ -311,7 +297,6 @@ struct RefreshWorkerDependencies {
     table_maintenance_service: Arc<dyn TableMaintenanceService>,
     activity_gate: MvActivityGate,
     root_admission: RootAdmissionHandle,
-    maintenance_wakeup_tx: Option<mpsc::SyncSender<()>>,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
 }
@@ -319,9 +304,6 @@ struct RefreshWorkerDependencies {
 fn start_background_workers(
     dependencies: RefreshWorkerDependencies,
 ) -> Result<MvBackgroundRuntime, MvBackgroundEngineError> {
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
-    let (maintenance_wakeup_tx, maintenance_wakeup_rx) = mpsc::sync_channel(1);
     let interval = Duration::from_millis(dependencies.scheduler_config.tick_interval_ms().max(1));
     let maintenance_interval =
         Duration::from_millis(dependencies.maintenance_config.tick_interval_ms.max(1));
@@ -338,43 +320,31 @@ fn start_background_workers(
             runtime: tokio::runtime::Handle::current(),
         },
     ));
-    let mut refresh_dependencies = dependencies;
-    refresh_dependencies.maintenance_wakeup_tx = Some(maintenance_wakeup_tx.clone());
-    let refresh_worker = thread::Builder::new()
-        .name("novarocks-frontend-mv-refresh".to_string())
-        .spawn(move || run_refresh_worker(refresh_dependencies, stop_rx, interval))
-        .map_err(|error| {
-            MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::TransientUnavailable,
-                format!("start frontend MV refresh worker: {error}"),
-            )
-        })?;
-    let maintenance_worker = match thread::Builder::new()
-        .name("novarocks-frontend-mv-maintenance".to_string())
-        .spawn(move || {
-            maintenance.run_until_stopped(
-                &maintenance_stop_rx,
-                &maintenance_wakeup_rx,
-                maintenance_interval,
-            )
-        }) {
-        Ok(worker) => worker,
-        Err(error) => {
-            let _ = stop_tx.send(());
-            let _ = refresh_worker.join();
-            return Err(MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::TransientUnavailable,
-                format!("start frontend MV maintenance worker: {error}"),
-            ));
-        }
-    };
-    Ok(MvBackgroundRuntime::new(
-        stop_tx,
-        refresh_worker,
-        maintenance_stop_tx,
-        maintenance_wakeup_tx,
-        maintenance_worker,
-    ))
+    let refresh_task_dependencies = dependencies;
+    let mut refresh_scheduler =
+        FrontendMvScheduler::new(refresh_task_dependencies.scheduler_config.clone());
+    MvBackgroundRuntime::start(
+        interval,
+        maintenance_interval,
+        MvBackgroundTasks::new(
+            Box::new(move |stop, maintenance_wakeup_tx| {
+                run_refresh_event(
+                    &refresh_task_dependencies,
+                    &mut refresh_scheduler,
+                    stop,
+                    maintenance_wakeup_tx,
+                );
+            }),
+            Box::new(move |_| {
+                if let Err(error) = maintenance.run_once(now_unix_millis()) {
+                    tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
+                }
+            }),
+        ),
+    )
+    .map_err(|error| {
+        MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
+    })
 }
 
 fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
@@ -384,28 +354,28 @@ fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {
     )
 }
 
-fn run_refresh_worker(
-    dependencies: RefreshWorkerDependencies,
-    stop_rx: mpsc::Receiver<()>,
-    interval: Duration,
+fn run_refresh_event(
+    dependencies: &RefreshWorkerDependencies,
+    scheduler: &mut FrontendMvScheduler,
+    stop: &MvBackgroundStop,
+    maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
 ) {
-    let mut scheduler = FrontendMvScheduler::new(dependencies.scheduler_config.clone());
-    loop {
-        let now_ms = now_unix_millis();
-        match scheduler.poll(
-            dependencies.readiness.as_ref(),
-            dependencies.background_engine.as_ref(),
-            now_ms,
-        ) {
-            Ok(requests) => {
-                run_scheduled_refreshes(&dependencies, &mut scheduler, requests, &stop_rx);
-            }
-            Err(error) => tracing::warn!(error = %error, "frontend MV scheduler poll failed"),
+    let now_ms = now_unix_millis();
+    match scheduler.poll(
+        dependencies.readiness.as_ref(),
+        dependencies.background_engine.as_ref(),
+        now_ms,
+    ) {
+        Ok(requests) => {
+            run_scheduled_refreshes(
+                dependencies,
+                scheduler,
+                requests,
+                stop,
+                maintenance_wakeup_tx,
+            );
         }
-        match stop_rx.recv_timeout(interval) {
-            Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
-        }
+        Err(error) => tracing::warn!(error = %error, "frontend MV scheduler poll failed"),
     }
 }
 
@@ -413,10 +383,11 @@ fn run_scheduled_refreshes(
     dependencies: &RefreshWorkerDependencies,
     scheduler: &mut FrontendMvScheduler,
     requests: Vec<ScheduledRefreshRequest>,
-    stop_rx: &mpsc::Receiver<()>,
+    stop: &MvBackgroundStop,
+    maintenance_wakeup_tx: &std::sync::mpsc::SyncSender<()>,
 ) {
     for request in requests {
-        if stop_rx.try_recv().is_ok() {
+        if stop.is_requested() {
             scheduler.requeue(request);
             break;
         }
@@ -483,8 +454,8 @@ fn run_scheduled_refreshes(
             }
             if let Err(error) = scheduler.complete(&request, disposition, now_unix_millis()) {
                 tracing::warn!(mv_id = request.definition.mv_id, error = %error, "persist frontend MV scheduler outcome failed");
-            } else if completed && let Some(wakeup_tx) = &dependencies.maintenance_wakeup_tx {
-                let _ = wakeup_tx.try_send(());
+            } else if completed {
+                let _ = maintenance_wakeup_tx.try_send(());
             }
             // Release the activity lease only after the scheduler terminal is
             // durable, then complete the governed root.
@@ -639,7 +610,7 @@ fn scheduled_refresh_test_barrier(
         if cancellation.is_cancelled() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::park_timeout(Duration::from_millis(10));
     }
     cancellation.is_cancelled()
 }
