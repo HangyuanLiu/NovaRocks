@@ -25,7 +25,6 @@ mod filter;
 mod hash_join;
 mod nestloop_join;
 mod project;
-mod set_op;
 mod sort;
 mod table_function;
 mod table_write;
@@ -60,7 +59,8 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_generate_series_node, lower_limit_node,
-    lower_redistribute_node, lower_repeat_node, lower_values_node, parse_distributed_limit,
+    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_values_node,
+    parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1594,7 +1594,7 @@ fn lower_physical_node(
         plan::plan_node::Kind::Topn(topn) => {
             topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena, ctx)
         }
-        plan::plan_node::Kind::SetOp(set_op) => set_op::lower_set_op_node(
+        plan::plan_node::Kind::SetOp(set_op) => lower_set_op_node(
             node,
             physical,
             set_op,
@@ -1602,7 +1602,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::AssertOneRow(assert) => {
             lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
