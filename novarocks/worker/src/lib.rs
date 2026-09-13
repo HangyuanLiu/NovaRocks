@@ -60,6 +60,7 @@ pub mod runtime_filter {
     pub mod artifact_query;
     pub mod codec;
     pub mod domain;
+    pub mod final_domain;
     pub mod fixture;
     pub mod materializer;
     pub mod observation;

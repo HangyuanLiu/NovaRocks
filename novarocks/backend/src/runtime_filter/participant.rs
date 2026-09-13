@@ -29,12 +29,10 @@ use std::sync::{Arc, Mutex, Weak};
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime_filter::{
     RuntimeFilterBindOutcome, RuntimeFilterContractViolation, RuntimeFilterContractViolationKind,
-    RuntimeFilterExecutionContract, RuntimeFilterFinalDomain, RuntimeFilterFinalDomainCompletion,
-    RuntimeFilterFinalDomainCompletionHandle, RuntimeFilterFinalDomainOpenRequest,
-    RuntimeFilterFinalDomainPartition, RuntimeFilterFinalDomainPartitionHandle,
-    RuntimeFilterProducer, RuntimeFilterProducerOpenRequest, RuntimeFilterSession,
-    RuntimeFilterSessionRef, RuntimeFilterSnapshot, RuntimeFilterSubscriptionHandle,
-    RuntimeFilterSubscriptionRequest,
+    RuntimeFilterExecutionContract, RuntimeFilterFinalDomainCompletionHandle,
+    RuntimeFilterFinalDomainOpenRequest, RuntimeFilterProducer, RuntimeFilterProducerOpenRequest,
+    RuntimeFilterSession, RuntimeFilterSessionRef, RuntimeFilterSnapshot,
+    RuntimeFilterSubscriptionHandle, RuntimeFilterSubscriptionRequest,
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
@@ -63,6 +61,7 @@ use novarocks_worker::runtime_filter::domain::{
     BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
     BackendTransportEventKind, BackendTransportFailOpenReason,
 };
+use novarocks_worker::runtime_filter::final_domain::WorkerRuntimeFilterFinalDomainCompletion;
 use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot,
 };
@@ -1502,165 +1501,14 @@ impl RuntimeFilterSession for BackendRuntimeFilterExecutionContext {
             }
         };
         Ok(RuntimeFilterBindOutcome::Bound(Arc::new(
-            BackendFinalDomainCompletion {
+            WorkerRuntimeFilterFinalDomainCompletion::new(
                 producer,
-                data_type: schema.data_type().clone(),
-                contract_digest: schema.digest(),
-                max_domain_canonical_bytes: session.policy().max_contribution_bytes(),
-                local_partition_count: request.local_partition_count(),
-                claimed: Mutex::new(BTreeMap::new()),
-            },
+                schema.data_type().clone(),
+                schema.digest(),
+                session.policy().max_contribution_bytes(),
+                request.local_partition_count(),
+            ),
         )))
-    }
-}
-
-struct BackendFinalDomainCompletion {
-    producer: novarocks_execution::runtime_filter::RuntimeFilterProducerHandle,
-    data_type: arrow::datatypes::DataType,
-    contract_digest: [u8; 32],
-    max_domain_canonical_bytes: usize,
-    local_partition_count: u32,
-    claimed: Mutex<BTreeMap<novarocks_execution::runtime_filter::PartitionId, ()>>,
-}
-
-struct BackendFinalDomainPartition {
-    completion: Arc<BackendFinalDomainCompletion>,
-    partition: novarocks_execution::runtime_filter::PartitionId,
-    sealed: bool,
-}
-
-impl RuntimeFilterFinalDomainCompletion for BackendFinalDomainCompletion {
-    fn membership_key_type(&self) -> arrow::datatypes::DataType {
-        self.data_type.clone()
-    }
-
-    fn max_domain_canonical_bytes(&self) -> usize {
-        self.max_domain_canonical_bytes
-    }
-
-    fn contract_digest(&self) -> [u8; 32] {
-        self.contract_digest
-    }
-
-    fn claim_partition(
-        &self,
-        partition: novarocks_execution::runtime_filter::PartitionId,
-    ) -> Result<RuntimeFilterFinalDomainPartitionHandle, RuntimeFilterContractViolation> {
-        if partition.get() >= self.local_partition_count {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain partition is outside its declared local partition count",
-            ));
-        }
-        let mut claimed = self
-            .claimed
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if claimed.insert(partition, ()).is_some() {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain partition was claimed more than once",
-            ));
-        }
-        Ok(Box::new(BackendFinalDomainPartition {
-            completion: Arc::new(self.clone_for_partition()),
-            partition,
-            sealed: false,
-        }))
-    }
-
-    fn fail(
-        &self,
-        reason: novarocks_execution::runtime_filter::RuntimeFilterProducerFailure,
-    ) -> Result<
-        novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
-        RuntimeFilterContractViolation,
-    > {
-        self.producer.fail(reason)
-    }
-}
-
-impl BackendFinalDomainCompletion {
-    fn clone_for_partition(&self) -> Self {
-        Self {
-            producer: Arc::clone(&self.producer),
-            data_type: self.data_type.clone(),
-            contract_digest: self.contract_digest,
-            max_domain_canonical_bytes: self.max_domain_canonical_bytes,
-            local_partition_count: self.local_partition_count,
-            claimed: Mutex::new(BTreeMap::new()),
-        }
-    }
-}
-
-impl RuntimeFilterFinalDomainPartition for BackendFinalDomainPartition {
-    fn seal(
-        &mut self,
-        domain: RuntimeFilterFinalDomain,
-    ) -> Result<(), RuntimeFilterContractViolation> {
-        if self.sealed {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain partition was sealed twice",
-            ));
-        }
-        if domain.data_type() != &self.completion.data_type
-            || domain.contract_digest() != self.completion.contract_digest
-        {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain payload does not match the installed membership contract",
-            ));
-        }
-        let value_domain = novarocks_execution::runtime_filter::contribution::decode_value_domain(
-            domain.canonical_bytes(),
-            &self.completion.data_type,
-            self.completion.max_domain_canonical_bytes,
-        )
-        .map_err(|_| {
-            violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain canonical payload is invalid",
-            )
-        })?;
-        let encoded = novarocks_execution::runtime_filter::contribution::encode_contribution(
-            &novarocks_execution::runtime_filter::contribution::RuntimeFilterContribution::final_domain(
-                novarocks_execution::runtime_filter::contribution::FinalDomainShard::new(
-                    self.completion.contract_digest,
-                    value_domain,
-                ),
-            ),
-            novarocks_execution::runtime_filter::contribution::ContributionCodecExpectation::final_domain(
-                &self.completion.data_type,
-                self.completion.contract_digest,
-            ),
-            self.completion.max_domain_canonical_bytes,
-        ).map_err(|_| violation(RuntimeFilterContractViolationKind::ContractMismatch, "FinalDomain contribution cannot be encoded canonically"))?;
-        self.completion.producer.submit(
-            self.partition,
-            novarocks_execution::runtime_filter::ProducerSequence::new(0),
-            novarocks_execution::runtime_filter::RuntimeFilterContribution::new(
-                novarocks_execution::runtime_filter::RuntimeFilterContributionKind::FinalDomain,
-                *encoded.schema_digest(),
-                encoded.into_parts().1,
-            ),
-        )?;
-        self.sealed = true;
-        Ok(())
-    }
-
-    fn close(&mut self) -> Result<(), RuntimeFilterContractViolation> {
-        if !self.sealed {
-            return Err(violation(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "FinalDomain partition closed before seal",
-            ));
-        }
-        self.completion.producer.close_partition(
-            self.partition,
-            novarocks_execution::runtime_filter::ProducerSequence::new(1),
-        )?;
-        Ok(())
     }
 }
 
