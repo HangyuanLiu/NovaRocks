@@ -280,7 +280,7 @@ async fn build_frontend_role_products(
     let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
-    let mv_repository = host.mv_repository();
+    let mv_repository = host.mv_repository_for_role_product_construction();
     let view_service: Arc<dyn crate::view::ViewService> =
         Arc::new(crate::view::FrontendViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
@@ -410,10 +410,12 @@ async fn build_frontend_role_products(
             Handle::current(),
         ),
     );
-    // No fallible product construction follows this transfer.  Keeping it at
-    // the tail means an earlier failure still reaches Host's exact reverse
-    // cleanup path, while a serving role has one catalog shutdown owner.
+    // No fallible product construction follows these transfers. Keeping them
+    // at the tail means an earlier failure still reaches Host's exact reverse
+    // cleanup path, while a serving role owns the catalog lifecycle and its
+    // durable MV repository.
     let catalog_runtime = host.take_catalog_role_runtime()?;
+    let mv_repository = host.take_mv_repository()?;
     Ok(FrontendRoleProducts {
         catalog_runtime,
         catalog_service,

@@ -91,17 +91,23 @@ async fn configured_state_store_opens_and_reopens_mv_repository() {
     let mut host = open_host(Some(config.clone()))
         .await
         .expect("configured host must open its MV repository");
-    assert!(host.mv_repository().list_projections().await.is_ok());
-    let repository = host.mv_repository();
+    let repository = host
+        .take_mv_repository()
+        .expect("host transfers the opened MV repository to role products");
+    assert!(repository.list_projections().await.is_ok());
     drop(repository);
     host.shutdown()
         .await
-        .expect("shutdown must release MV repository first");
+        .expect("shutdown must release the StateStore after role products drop the repository");
 
     let mut reopened = open_host(Some(config))
         .await
         .expect("same StateStore must reopen its MV repository");
-    assert!(reopened.mv_repository().list_projections().await.is_ok());
+    let repository = reopened
+        .take_mv_repository()
+        .expect("reopened host transfers the MV repository to role products");
+    assert!(repository.list_projections().await.is_ok());
+    drop(repository);
     reopened.shutdown().await.expect("reopened host shutdown");
 }
 

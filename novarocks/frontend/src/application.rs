@@ -1446,12 +1446,33 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
-    pub fn mv_repository(&self) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
+    /// Borrows the repository only while Server is constructing the immutable
+    /// role-product graph. The final product owner is transferred separately
+    /// after every fallible constructor has succeeded, so Host still owns
+    /// startup rollback.
+    pub(crate) fn mv_repository_for_role_product_construction(
+        &self,
+    ) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
         Arc::clone(
             self.mv_repository
                 .as_ref()
                 .expect("frontend MV repository is installed before host open returns"),
         )
+    }
+
+    /// Transfers the durable MV repository to the immutable role graph after
+    /// its complete construction. The repository remains backed by the
+    /// Host-owned StateStore, which is released only after role products have
+    /// converged and been dropped.
+    pub(crate) fn take_mv_repository(
+        &mut self,
+    ) -> Result<Arc<dyn crate::mv::domain::repository::MvRepository>, FrontendApplicationError>
+    {
+        self.mv_repository.take().ok_or_else(|| {
+            FrontendApplicationError::server(
+                "frontend MV repository was already transferred or was never installed",
+            )
+        })
     }
 
     pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
@@ -1827,7 +1848,6 @@ impl FrontendApplicationHost {
             }
             return Err(primary_error.expect("catalog role runtime shutdown error is retained"));
         }
-        self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {
                 Ok(()) => {
