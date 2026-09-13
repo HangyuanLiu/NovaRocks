@@ -70,7 +70,6 @@ use crate::query_execution::native_execution_adapter::{
     FrontendNativeLogicalReadLauncher,
 };
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
-use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
     FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingWorkloadSnapshotReader,
@@ -502,7 +501,6 @@ pub struct FrontendApplicationHost {
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
     catalog_controller: Option<Arc<FrontendCatalogController>>,
     catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
-    view_service: Option<Arc<dyn crate::view::ViewService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
@@ -1007,7 +1005,6 @@ impl FrontendApplicationHost {
             abandoned_attempt_sweeper: None,
             catalog_controller: None,
             catalog_prune: None,
-            view_service: None,
             mv_repository: None,
             state_store_host: None,
             query_execution: None,
@@ -1247,9 +1244,6 @@ impl FrontendApplicationHost {
             host.abandoned_attempt_sweeper = Some(sweeper);
         }
         host.dml_service = Some(Arc::new(DmlService::new()));
-        // Local views are process runtime state, so this service has nothing to
-        // load and no store to fail against.
-        host.view_service = Some(Arc::new(FrontendViewService::new()));
         // The coordinator owns the immutable execution and connector-control
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
@@ -1290,14 +1284,6 @@ impl FrontendApplicationHost {
             return Err(host.cleanup_open_error(error).await);
         }
         Ok(host)
-    }
-
-    pub fn view_service(&self) -> Arc<dyn crate::view::ViewService> {
-        Arc::clone(
-            self.view_service
-                .as_ref()
-                .expect("frontend view service is installed before host open returns"),
-        )
     }
 
     pub fn dml_service(&self) -> Arc<DmlService> {
@@ -1808,7 +1794,6 @@ impl FrontendApplicationHost {
             return Err(primary_error.expect("catalog controller shutdown error is retained"));
         }
         self.catalog_application_port.take();
-        self.view_service.take();
         self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {

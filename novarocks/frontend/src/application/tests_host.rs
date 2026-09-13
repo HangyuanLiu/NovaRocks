@@ -342,43 +342,31 @@ async fn shared_test_provider_allows_multiple_live_hosts() {
         .expect("reopened SQLite host shutdown must succeed");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_host_does_not_restore_local_views_after_reopen() {
-    let temp = TempDir::new().expect("temporary SQLite deployment");
-    let config = sqlite_config(&temp);
-    let mut host = open_host(Some(config.clone()))
-        .await
-        .expect("configured host must open");
+#[test]
+fn local_view_service_does_not_restore_state_across_process_instances() {
+    let host = crate::view::FrontendViewService::new();
     execute_view_statement(
-        host.view_service().as_ref(),
+        &host,
         &SessionViewEngine,
         "CREATE VIEW local_view AS SELECT 42 AS answer",
         view_context(),
     )
-    .expect("host view service must register the view");
+    .expect("local view service must register the view");
     let mut visible = parse_query("SELECT * FROM local_view");
-    host.view_service()
-        .rewrite_query(&SessionViewEngine, &mut visible, view_context())
-        .expect("the defining host must expand its own view");
+    host.rewrite_query(&SessionViewEngine, &mut visible, view_context())
+        .expect("the defining process instance must expand its own view");
     assert_eq!(
         print_query(&visible),
         "SELECT * FROM (SELECT 42 AS answer) local_view"
     );
-    host.shutdown().await.expect("first host shutdown");
-
-    // A local view is process runtime state even when the host has a
-    // StateStore: the frontend is its only authority, so the view ends with the
-    // incarnation that defined it. Durable views live in an external catalog.
-    let mut reopened = open_host(Some(config))
-        .await
-        .expect("configured host must reopen");
+    // A local view is process runtime state: it ends with the process instance
+    // that defined it. Durable views live in an external catalog.
+    let reopened = crate::view::FrontendViewService::new();
     let mut query = parse_query("SELECT * FROM local_view");
     reopened
-        .view_service()
         .rewrite_query(&SessionViewEngine, &mut query, view_context())
-        .expect("reopened host must rewrite without the local view");
+        .expect("new process instance must rewrite without the local view");
     assert_eq!(print_query(&query), "SELECT * FROM local_view");
-    reopened.shutdown().await.expect("reopened host shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

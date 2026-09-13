@@ -255,7 +255,8 @@ async fn build_frontend_role_products(
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
-    let view_service = host.view_service();
+    let view_service: Arc<dyn crate::view::ViewService> =
+        Arc::new(crate::view::FrontendViewService::new());
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
         Arc::new(
             crate::table_maintenance::FrontendTableMaintenanceService::open(
@@ -481,7 +482,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            host.view_service(),
+            Arc::clone(&products.view_service),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(
