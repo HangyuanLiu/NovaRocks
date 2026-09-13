@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 novarocks-native-trust.workspace = true
+novarocks-execution.workspace = true
 novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-task-codec.workspace = true

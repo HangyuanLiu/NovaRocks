@@ -15,26 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Projection of one participant's sealed runtime-filter observation onto the
-//! canonical wire contribution.
+//! Native wire projection for a sealed runtime-filter observation.
 //!
-//! This lives beside the participant rather than inside either owner because
-//! both owners of a participant have to publish the same facts in the same
-//! shape: the retired query lifecycle carries them on its terminal report, and
-//! the task protocol carries them on the release that took the participant
-//! down. Two projections would be two chances for the two carriers to disagree
-//! about what a counter means.
+//! Worker owns the observation and its semantics. This adapter only encodes
+//! that immutable snapshot as terminal telemetry for the Native carrier.
 
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionV1;
-use tracing::warn;
-
 use novarocks_worker::RuntimeFilterContractError;
 use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
+use tracing::warn;
 
 /// The stage every unavailable runtime-filter contribution names.
-pub(crate) const RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE: &str = "runtime_filter_terminal_capture";
+pub const RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE: &str = "runtime_filter_terminal_capture";
 
 fn terminal_profile_contribution(
     snapshot: RuntimeFilterObservationSnapshot,
@@ -208,8 +202,9 @@ fn terminal_profile_contribution(
     .map_err(protocol_contract_error)
 }
 
-// Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
-pub(crate) fn capture_terminal_profile_contribution(
+/// Encodes the one terminal contribution permitted for a sealed Worker
+/// observation. An invalid projection remains unavailable on the wire.
+pub fn capture_runtime_filter_terminal_profile_contribution(
     snapshot: Option<RuntimeFilterObservationSnapshot>,
     runtime_filter_installed: bool,
 ) -> Result<
@@ -255,9 +250,38 @@ pub(crate) fn capture_terminal_profile_contribution(
     }
 }
 
-/// A protocol contract failure produced while sealing this projection.
 fn protocol_contract_error(
     error: novarocks_proto_codec::ProtocolError,
 ) -> RuntimeFilterContractError {
     RuntimeFilterContractError::invalid_contract(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absent_uninstalled_participant_projects_an_empty_available_contribution() {
+        let telemetry = capture_runtime_filter_terminal_profile_contribution(None, false)
+            .expect("empty contribution projection");
+        let Some(novarocks_proto_models::novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Available(contribution)) = telemetry.telemetry else {
+            panic!("uninstalled participant must have an available empty contribution");
+        };
+        assert_eq!(
+            contribution.version,
+            novarocks_proto_codec::lifecycle::terminal::QUERY_TERMINAL_PROFILE_CONTRIBUTION_VERSION_V1
+        );
+        assert!(contribution.channels.is_empty());
+    }
+
+    #[test]
+    fn released_installed_participant_projects_a_stable_unavailable_stage() {
+        let telemetry = capture_runtime_filter_terminal_profile_contribution(None, true)
+            .expect("unavailable contribution projection");
+        let Some(novarocks_proto_models::novarocks::query_terminal_profile_contribution_telemetry::Telemetry::Unavailable(unavailable)) = telemetry.telemetry else {
+            panic!("released participant must have unavailable telemetry");
+        };
+        assert_eq!(unavailable.stage, RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE);
+        assert_eq!(unavailable.code, "PARTICIPANT_RELEASED");
+    }
 }

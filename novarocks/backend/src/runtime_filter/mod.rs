@@ -5,7 +5,6 @@ pub(crate) mod install_decode;
 pub(crate) mod membership_contract_decode;
 pub(crate) mod participant;
 pub(crate) mod rpc;
-pub(crate) mod terminal_contribution;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod transport;

@@ -81,10 +81,12 @@ use crate::runtime_filter::install_decode::{
 use crate::runtime_filter::participant::{
     RuntimeFilterParticipant, RuntimeFilterParticipantFactory,
 };
-use crate::runtime_filter::terminal_contribution::{
-    RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
+use novarocks_native_adapter::{
+    BackendDataRuntime,
+    runtime_filter_terminal::{
+        RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_runtime_filter_terminal_profile_contribution,
+    },
 };
-use novarocks_native_adapter::BackendDataRuntime;
 use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
 use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
@@ -900,7 +902,7 @@ fn seal_runtime_filter_evidence(
 ) -> ReleasedContextEvidence {
     let snapshot = participant
         .prepare_terminal_capture(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
-    match capture_terminal_profile_contribution(Some(snapshot), true) {
+    match capture_runtime_filter_terminal_profile_contribution(Some(snapshot), true) {
         Ok(telemetry) => match QueryTerminalProfileContributionTelemetry::parse(telemetry) {
             Ok(telemetry) => sealed_runtime_filter_evidence(telemetry),
             Err(error) => {

@@ -4008,6 +4008,7 @@ dependencies = [
  "axum 0.7.9",
  "hyper",
  "hyper-util",
+ "novarocks-execution",
  "novarocks-native-trust",
  "novarocks-proto-codec",
  "novarocks-proto-models",
