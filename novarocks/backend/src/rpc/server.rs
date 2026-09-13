@@ -24,41 +24,18 @@ use std::sync::Arc;
 
 use crate::rpc::data_plane::BackendDataPlane;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
-use novarocks_proto_codec::catalog::{PruneCatalogsRequest, PruneCatalogsResponse};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio_stream::wrappers::ReceiverStream;
 
 use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder,
+    catalog_prune_rpc::{CatalogReachabilityAuthority, handle_prune_catalogs},
     exchange_data_plane::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority},
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
     task_protocol::{TaskExecutionIngress, TaskStatusEventStream},
 };
-use novarocks_worker::{CatalogPruneResult, TaskInboundCapabilities};
-
-/// What a rejected catalog prune is allowed to say on the wire.
-///
-/// A catalog definition carries credential material. This detail is a fixed
-/// string rather than anything derived from the handles involved, so no part
-/// of a catalog's properties can reach an error, a log, or a status by being
-/// interpolated into a rejection.
-const CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL: &str =
-    "catalog reachability snapshot omits one or more live catalogs";
-
-/// This process's owner of catalog reachability.
-///
-/// The frontend sends one complete reachability snapshot; the owner reconciles
-/// its retained catalog runtimes against it and answers in its own vocabulary.
-/// This port exists so the wire handler never holds a catalog registry of its
-/// own: there is exactly one `CatalogManager` per process, and a second
-/// reconciler would be a second authority over the same leases.
-pub(crate) trait CatalogReachabilityAuthority: Send + Sync + 'static {
-    fn prune_unreachable_catalogs(
-        &self,
-        reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
-    ) -> CatalogPruneResult;
-}
+use novarocks_worker::TaskInboundCapabilities;
 
 /// Backend-owned production Tonic service. Domain owners contribute the narrow
 /// ingress ports while this service composes them with `BackendDataPlane`.
@@ -211,30 +188,15 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<catalog::PruneCatalogsRequest>,
     ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
-        let request = PruneCatalogsRequest::parse(request.into_inner())
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let reachable = request
-            .reachable_catalogs()
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?
-            .into_iter()
-            .collect();
         let authority = Arc::clone(&self.catalog_reachability);
-        let response = tokio::task::spawn_blocking(move || {
-            match authority.prune_unreachable_catalogs(reachable) {
-                CatalogPruneResult::Pruned { .. } => PruneCatalogsResponse::accepted(),
-                // The rejected handles are deliberately not reported: naming
-                // them would put catalog properties on the wire.
-                CatalogPruneResult::Rejected { .. } => {
-                    PruneCatalogsResponse::rejected(CATALOG_PRUNE_STALE_SNAPSHOT_DETAIL)
-                        .expect("the fixed stale-snapshot detail is a bounded safe detail")
-                }
-            }
-        })
-        .await
-        .map_err(|error| {
-            tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
-        })?;
-        Ok(tonic::Response::new(response.as_proto().clone()))
+        let raw = request.into_inner();
+        let response =
+            tokio::task::spawn_blocking(move || handle_prune_catalogs(authority.as_ref(), raw))
+                .await
+                .map_err(|error| {
+                    tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
+                })??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn heartbeat(

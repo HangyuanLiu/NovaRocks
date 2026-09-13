@@ -594,7 +594,7 @@ impl BackendApplicationHost {
             BackendRpcService::new(
                 Arc::clone(&services.task_execution_ingress),
                 Arc::clone(&services.query_context_host)
-                    as Arc<dyn crate::rpc::server::CatalogReachabilityAuthority>,
+                    as Arc<dyn novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority>,
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
                 Arc::clone(&services.task_inbound_capabilities),

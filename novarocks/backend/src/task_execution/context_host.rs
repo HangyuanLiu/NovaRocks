@@ -651,7 +651,9 @@ impl Drop for PublishCatalogLeasesOnExit<'_> {
 /// This host reconciles catalog reachability because it is this process's only
 /// catalog lease owner: it takes the leases on establish and drops them on
 /// release, so it is the only owner that can decide what is still needed.
-impl crate::rpc::server::CatalogReachabilityAuthority for NativeQueryContextHost {
+impl novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority
+    for NativeQueryContextHost
+{
     fn prune_unreachable_catalogs(
         &self,
         reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
