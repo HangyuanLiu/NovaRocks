@@ -16,13 +16,15 @@
 // under the License.
 //! Native exchange wire projection and route settlement.
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverFrame, ExchangeReceiverKey, ExchangeReceiverPort,
 };
+use novarocks_execution_contract::FragmentNodeId;
 use novarocks_proto_models as proto;
 use novarocks_types::UniqueId;
+use novarocks_worker::{InboundFrameClaim, TaskInboundCapabilities};
 
 /// Exactly the addressing fields one inbound exchange frame carries.
 ///
@@ -75,6 +77,40 @@ pub trait ExchangeRouteAuthority: Send + Sync + 'static {
     fn authority_name(&self) -> &'static str;
 
     fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim;
+}
+
+/// Native projection of the Worker-owned task inbound-capability verdict.
+///
+/// The Worker owns frozen destination topology and the capability lifecycle;
+/// this adapter only translates its three-valued admission answer into the
+/// Native exchange route contract. Keeping that translation beside the wire
+/// handler prevents a Backend role service from becoming a second wire owner.
+pub struct TaskInboundCapabilitiesRouteAuthority(Arc<TaskInboundCapabilities>);
+
+impl TaskInboundCapabilitiesRouteAuthority {
+    pub fn new(capabilities: Arc<TaskInboundCapabilities>) -> Self {
+        Self(capabilities)
+    }
+}
+
+impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
+    fn authority_name(&self) -> &'static str {
+        "the task substrate"
+    }
+
+    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
+        match self.0.claim_frame(
+            query.destination_fragment_instance_id,
+            FragmentNodeId::new(query.destination_node_id),
+            query.source_fragment_instance_id,
+            query.sender_ordinal,
+            query.sender_count,
+        ) {
+            InboundFrameClaim::NotHeld => ExchangeRouteClaim::NotHeld,
+            InboundFrameClaim::Authorized => ExchangeRouteClaim::Authorized,
+            InboundFrameClaim::Refused(detail) => ExchangeRouteClaim::Refused(detail),
+        }
+    }
 }
 
 /// Why one inbound exchange frame is not admitted.

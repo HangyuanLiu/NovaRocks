@@ -30,6 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder,
+    exchange_data_plane::TaskInboundCapabilitiesRouteAuthority,
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
     task_protocol::{TaskExecutionIngress, TaskStatusEventStream},
@@ -85,7 +86,9 @@ impl BackendRpcService {
             heartbeat,
             data_plane: BackendDataPlane::with_exchange_receiver_port(
                 exchange_receiver_port,
-                task_inbound_capabilities,
+                Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
+                    task_inbound_capabilities,
+                )),
             ),
             runtime_filter_ingress,
         }

@@ -1409,7 +1409,9 @@ mod tests {
     };
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
 
-    use novarocks_native_adapter::exchange_data_plane::ExchangeRouteQuery;
+    use novarocks_native_adapter::exchange_data_plane::{
+        ExchangeRouteQuery, TaskInboundCapabilitiesRouteAuthority,
+    };
 
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_worker::ProcessMonotonicClock;
@@ -2116,7 +2118,9 @@ mod tests {
 
         let plane = BackendDataPlane::with_exchange_receiver_port(
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::clone(&capabilities),
+            Arc::new(TaskInboundCapabilitiesRouteAuthority::new(Arc::clone(
+                &capabilities,
+            ))),
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
             finst_id_hi: destination.high(),

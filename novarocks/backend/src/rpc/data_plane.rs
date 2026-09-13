@@ -14,40 +14,12 @@ use novarocks_execution::runtime::fragment::io::{
 };
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_native_adapter::exchange_data_plane::{
-    ExchangeRouteAuthority, ExchangeRouteClaim, ExchangeRouteQuery, handle_transmit_chunk,
+    ExchangeRouteAuthority, handle_transmit_chunk,
 };
 use novarocks_proto_models as proto;
-use novarocks_worker::{InboundFrameClaim, TaskInboundCapabilities};
 use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// The task substrate as an exchange-route authority.
-///
-/// It holds the destinations of every created task, and its frozen descriptor
-/// is the only place a task's inbound topology exists. Without this authority
-/// wired, no query on the task protocol can receive an exchange frame at all.
-struct TaskRouteAuthority(Arc<TaskInboundCapabilities>);
-
-impl ExchangeRouteAuthority for TaskRouteAuthority {
-    fn authority_name(&self) -> &'static str {
-        "the task substrate"
-    }
-
-    fn claim_exchange_route(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
-        match self.0.claim_frame(
-            query.destination_fragment_instance_id,
-            novarocks_execution_contract::FragmentNodeId::new(query.destination_node_id),
-            query.source_fragment_instance_id,
-            query.sender_ordinal,
-            query.sender_count,
-        ) {
-            InboundFrameClaim::NotHeld => ExchangeRouteClaim::NotHeld,
-            InboundFrameClaim::Authorized => ExchangeRouteClaim::Authorized,
-            InboundFrameClaim::Refused(detail) => ExchangeRouteClaim::Refused(detail),
-        }
-    }
-}
 
 #[derive(Clone)]
 pub struct BackendDataPlane {
@@ -91,13 +63,11 @@ impl BackendDataPlane {
     /// refusal rather than a race the wiring order settles.
     pub fn with_exchange_receiver_port(
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-        task_inbound_capabilities: Arc<TaskInboundCapabilities>,
+        exchange_route_authority: Arc<dyn ExchangeRouteAuthority>,
     ) -> Self {
         Self {
             exchange_receiver_port,
-            exchange_route_authorities: vec![Arc::new(TaskRouteAuthority(
-                task_inbound_capabilities,
-            ))],
+            exchange_route_authorities: vec![exchange_route_authority],
         }
     }
 
