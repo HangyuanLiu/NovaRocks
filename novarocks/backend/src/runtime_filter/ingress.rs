@@ -40,8 +40,8 @@ use std::sync::Arc;
 
 use tracing::{error, warn};
 
-use crate::runtime_filter::participant::RuntimeFilterParticipant;
 use crate::task_execution::NativeQueryContextHost;
+use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
 use novarocks_native_adapter::runtime_filter_rpc::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };

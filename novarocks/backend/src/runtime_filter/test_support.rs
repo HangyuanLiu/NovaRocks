@@ -13,8 +13,8 @@ use novarocks_worker::runtime_filter::domain::BackendParticipantIdentity;
 /// build a route graph first. Any envelope it receives is refused by its own
 /// route authority, which is exactly what distinguishes "the participant
 /// decided" from "nobody was asked".
-pub(crate) fn participant_for_test() -> std::sync::Arc<super::participant::RuntimeFilterParticipant>
-{
+pub(crate) fn participant_for_test()
+-> std::sync::Arc<novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant> {
     use super::participant::{
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
     };

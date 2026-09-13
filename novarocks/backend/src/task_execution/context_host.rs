@@ -75,14 +75,13 @@ use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
     sealed_runtime_filter_evidence,
 };
-use crate::runtime_filter::participant::{
-    RuntimeFilterParticipant, RuntimeFilterParticipantFactory,
-};
+use crate::runtime_filter::participant::RuntimeFilterParticipantFactory;
 use novarocks_native_adapter::{
     BackendDataRuntime,
     runtime_filter_install::{
         DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
     },
+    runtime_filter_participant::RuntimeFilterParticipant,
     runtime_filter_terminal::{
         RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_runtime_filter_terminal_profile_contribution,
     },
@@ -1197,13 +1196,13 @@ mod tests {
 
     use crate::rpc::runtime::test_backend_data_runtime;
     use crate::runtime_filter::participant::{
-        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
-        RuntimeFilterParticipantFactory,
+        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
     };
     use crate::task_execution::execution_host::TaskQueryContextFacts;
     use crate::task_execution::shared_facts::release_runtime_filter_telemetry;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
+    use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
     use novarocks_worker::QueryContextHost;
     use novarocks_worker::{
         CatalogManager, ConnectorExecutionRoleBindingFactorySet, ProcessMonotonicClock,
