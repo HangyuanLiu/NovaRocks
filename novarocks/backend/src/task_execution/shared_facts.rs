@@ -35,7 +35,6 @@ use std::sync::Arc;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution_contract::task_execution::descriptor::PhysicalFragmentPlan;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
-use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
 use novarocks_proto_codec::FieldPath;
@@ -45,14 +44,10 @@ use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
 use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain::{
-    WireContent, WireCredential, encode_task_dynamic_filter_domain, stored_credential,
-    stored_message,
+    WireContent, WireCredential, stored_credential, stored_message,
 };
-use novarocks_task_codec::identity::encode_task_identity;
 
-use novarocks_worker::{
-    HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation, TaskDynamicFilterRead,
-};
+use novarocks_worker::{HostRejection, ReleasedContextEvidence, RuntimeFilterReleaseObservation};
 
 const RELEASE_RUNTIME_FILTER_EVIDENCE_DOMAIN_TAG: &[u8] =
     b"novarocks.task_execution.release.runtime_filter_evidence.v1";
@@ -154,43 +149,6 @@ pub fn credential_material(update: &CredentialUpdate) -> Result<&WireCredential,
         .ok_or_else(|| internal("credential payload is not a decoded credential rotation"))
 }
 
-/// Projects one task's dynamic filter domains onto a fetch response.
-///
-/// `read` is `None` when the task has advertised nothing. The response then
-/// carries version zero, which is this field family's "nothing": a published
-/// `DomainVersion` is nonzero, so it cannot collide with one.
-///
-/// The alternative — answering an advertised version with an empty domain list
-/// — would claim that the version carries no content, which is a different and
-/// false statement. So a payload that cannot be projected is an error, not an
-/// empty answer.
-pub fn encode_dynamic_filter_read(
-    identity: TaskIdentity,
-    read: Option<&TaskDynamicFilterRead>,
-) -> Result<proto::FetchTaskDynamicFiltersResponse, HostRejection> {
-    let (version, domains) = match read {
-        Some(read) => {
-            let domain = encode_task_dynamic_filter_domain(read.version(), read.payload().as_ref())
-                .map_err(|error| {
-                    // Name the version: a reader that cannot be told which
-                    // advertisement failed has no way to correlate this with
-                    // the producer that published it.
-                    internal(&format!(
-                        "dynamic filter version {} cannot be projected: {error}",
-                        read.version().get()
-                    ))
-                })?;
-            (read.version().get(), vec![domain])
-        }
-        None => (0, Vec::new()),
-    };
-    Ok(proto::FetchTaskDynamicFiltersResponse {
-        identity: Some(encode_task_identity(identity)),
-        version,
-        domains,
-    })
-}
-
 /// Recovers the encoded fragment plan a descriptor carries.
 ///
 /// A descriptor's plan is an `Arc<dyn PhysicalFragmentPlan>` that answers only
@@ -217,8 +175,8 @@ fn protocol(detail: &str) -> HostRejection {
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog_bindings, credential_material, encode_dynamic_filter_read, fragment_plan,
-        release_runtime_filter_telemetry, runtime_filter_install,
+        catalog_bindings, credential_material, fragment_plan, release_runtime_filter_telemetry,
+        runtime_filter_install,
     };
 
     use std::sync::Arc;
@@ -228,6 +186,7 @@ mod tests {
     };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
+    use novarocks_native_adapter::task_protocol::encode_dynamic_filter_read;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, filter, novarocks as proto};
     use novarocks_task_codec::domain::{WireContent, WireCredential};

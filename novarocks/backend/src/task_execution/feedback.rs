@@ -233,7 +233,7 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use crate::task_execution::shared_facts::encode_dynamic_filter_read;
+    use novarocks_native_adapter::task_protocol::encode_dynamic_filter_read;
     use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::runtime_filter::domain::{
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,

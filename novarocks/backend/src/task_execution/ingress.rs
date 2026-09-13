@@ -60,19 +60,19 @@ use novarocks_task_codec::domain::{
 use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, decode_context_aware_subscribe_task_status,
     decode_fetch_dynamic_filters, decode_get_final_task_info, decode_operation_batch,
-    encode_abort_cause_field, encode_create_task_ack, encode_operation_outcome,
-    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
-    encode_release_ack, encode_update_task_ack,
+    encode_abort_cause_field, encode_create_task_ack, encode_query_context_ack,
+    encode_query_context_admission_ticket_ack, encode_receipt, encode_release_ack,
+    encode_update_task_ack,
 };
-use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
+use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
 use super::TaskExecutionRegistry;
-use super::shared_facts::encode_dynamic_filter_read;
 use novarocks_native_adapter::task_protocol::{
     TaskExecutionIngress, TaskOperationReceiptAck as ReceiptAck, TaskResultRead,
     TaskResultReadError, TaskResultReadRequest, TaskResultReader, TaskStatusEventStream,
-    encode_operation_receipt, fetch_task_result, host_rejection_status, task_status_event_stream,
+    encode_dynamic_filter_read, encode_final_task_info_response, encode_operation_receipt,
+    fetch_task_result, host_rejection_status, task_status_event_stream,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance};
@@ -476,19 +476,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
         let receipt = self.registry.get_final_task_info(&read);
-        let result = match receipt.acknowledgement() {
-            Some(info) => {
-                proto::get_final_task_info_response::Result::Info(encode_final_task_info(info))
-            }
-            // Losing final info costs diagnostics only, so why it is missing
-            // is reported as an outcome rather than as an error.
-            None => proto::get_final_task_info_response::Result::Unavailable(
-                encode_operation_outcome(receipt.outcome()),
-            ),
-        };
-        Ok(proto::GetFinalTaskInfoResponse {
-            result: Some(result),
-        })
+        Ok(encode_final_task_info_response(&receipt))
     }
 
     async fn fetch_task_result(

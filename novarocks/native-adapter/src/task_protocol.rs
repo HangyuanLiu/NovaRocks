@@ -39,14 +39,19 @@ use novarocks_execution_contract::task_execution::operation::ResultByteLimit;
 use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{
-    encode_context_convergence_event, encode_receipt, encode_status_event, encode_task_gone_event,
+    encode_context_convergence_event, encode_operation_outcome, encode_receipt,
+    encode_status_event, encode_task_gone_event,
+};
+use novarocks_task_codec::status::encode_final_task_info;
+use novarocks_task_codec::{
+    domain::encode_task_dynamic_filter_domain, identity::encode_task_identity,
 };
 use tokio_stream::Stream;
 
 use crate::task_protocol_fault;
 use novarocks_worker::{
-    ContextConvergenceCursorError, HostRejection, OperationReceipt, TaskStatusEvent,
-    TaskStatusSource, TaskStatusSubscriptionPosition,
+    ContextConvergenceCursorError, FinalTaskInfoOutcome, HostRejection, OperationReceipt,
+    TaskDynamicFilterRead, TaskStatusEvent, TaskStatusSource, TaskStatusSubscriptionPosition,
 };
 
 /// Server-side status event stream of one logical query-by-backend
@@ -236,6 +241,54 @@ pub fn host_rejection_status(rejection: HostRejection) -> tonic::Status {
         TaskFailureCategory::Execution
         | TaskFailureCategory::Exchange
         | TaskFailureCategory::Internal => tonic::Status::internal(detail),
+    }
+}
+
+/// Projects one task's dynamic-filter advertisement onto its Native read
+/// response without treating an unprojectable payload as an empty version.
+pub fn encode_dynamic_filter_read(
+    identity: TaskIdentity,
+    read: Option<&TaskDynamicFilterRead>,
+) -> Result<proto::FetchTaskDynamicFiltersResponse, HostRejection> {
+    let (version, domains) = match read {
+        Some(read) => {
+            let domain = encode_task_dynamic_filter_domain(read.version(), read.payload().as_ref())
+                .map_err(|error| {
+                    HostRejection::new(
+                        TaskFailureCategory::Internal,
+                        format!(
+                            "dynamic filter version {} cannot be projected: {error}",
+                            read.version().get()
+                        ),
+                    )
+                })?;
+            (read.version().get(), vec![domain])
+        }
+        None => (0, Vec::new()),
+    };
+    Ok(proto::FetchTaskDynamicFiltersResponse {
+        identity: Some(encode_task_identity(identity)),
+        version,
+        domains,
+    })
+}
+
+/// Encodes a final-task observation without reclassifying the Worker receipt.
+pub fn encode_final_task_info_response(
+    receipt: &FinalTaskInfoOutcome,
+) -> proto::GetFinalTaskInfoResponse {
+    let result = match receipt.acknowledgement() {
+        Some(info) => {
+            proto::get_final_task_info_response::Result::Info(encode_final_task_info(info))
+        }
+        // Losing final info costs diagnostics only, so why it is missing is
+        // reported as an outcome rather than as an error.
+        None => proto::get_final_task_info_response::Result::Unavailable(encode_operation_outcome(
+            receipt.outcome(),
+        )),
+    };
+    proto::GetFinalTaskInfoResponse {
+        result: Some(result),
     }
 }
 
