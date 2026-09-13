@@ -135,6 +135,7 @@ impl RunnableTask for TestRunnable {
 #[derive(Default)]
 struct TestTaskHost {
     receivers_installed: AtomicUsize,
+    capabilities_installed: AtomicUsize,
     submitted: AtomicUsize,
 }
 
@@ -154,6 +155,7 @@ impl TaskExecutionHost for TestTaskHost {
         &self,
         _descriptor: &TaskDescriptor,
     ) -> Result<(), HostRejection> {
+        self.capabilities_installed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -384,4 +386,77 @@ fn lost_create_acknowledgement_replays_without_resubmitting_the_runnable() {
     assert_eq!(replay.acknowledgement(), first.acknowledgement());
     assert_eq!(task_host.receivers_installed.load(Ordering::SeqCst), 1);
     assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn concurrent_exact_creates_share_one_runnable_and_receipt() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let execution = QueryExecutionId::new(
+        QueryId::new(61, 62),
+        AttemptId::new(1).expect("nonzero attempt"),
+    )
+    .expect("nonzero query id");
+    let context = QueryContextRef::new(execution, frontend, backend);
+    let task_host = Arc::new(TestTaskHost::default());
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+        test_ports(),
+    );
+
+    establish(&registry, context);
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("nonzero stage"),
+        TaskId::new(1).expect("nonzero task"),
+        backend,
+    );
+    let descriptor = TaskDescriptor::try_new(
+        identity,
+        UniqueId::new(1, 1),
+        std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+        vec![PlanNodeId::new(1).expect("nonnegative node")],
+        ExchangeTopology::default(),
+        Arc::new(TestPlan),
+    )
+    .expect("legal descriptor");
+
+    let mut creates = Vec::new();
+    for _ in 0..4 {
+        let registry = Arc::clone(&registry);
+        let descriptor = descriptor.clone();
+        creates.push(std::thread::spawn(move || {
+            registry.create_task(
+                &CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
+                    .expect("legal create"),
+            )
+        }));
+    }
+    let receipts: Vec<_> = creates
+        .into_iter()
+        .map(|create| create.join().expect("create thread"))
+        .collect();
+    let accepted: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| receipt.outcome() == OperationOutcome::Accepted)
+        .collect();
+    assert_eq!(accepted.len(), 1, "{receipts:?}");
+    assert_eq!(
+        receipts
+            .iter()
+            .filter(|receipt| receipt.outcome() == OperationOutcome::Idempotent)
+            .count(),
+        3,
+        "{receipts:?}"
+    );
+    for receipt in &receipts {
+        assert_eq!(receipt.acknowledgement(), accepted[0].acknowledgement());
+    }
+    assert_eq!(task_host.receivers_installed.load(Ordering::SeqCst), 1);
+    assert_eq!(task_host.capabilities_installed.load(Ordering::SeqCst), 1);
+    assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(registry.counters().tasks_created, 1);
 }

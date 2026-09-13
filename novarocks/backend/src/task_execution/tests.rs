@@ -744,66 +744,6 @@ fn split_update(node: i32, first: u64, last: u64, no_more: bool, payload: u8) ->
 // --------------------------------------------------------------------- create
 
 #[test]
-fn concurrent_exact_creates_produce_one_acknowledgement() {
-    let fixture = Fixture::new();
-    let context = fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    let descriptor = fixture.descriptor(identity, 5);
-
-    const CREATES: usize = 4;
-    fixture
-        .task_host
-        .require_arrivals
-        .store(CREATES, Ordering::SeqCst);
-
-    let mut handles = Vec::new();
-    for _ in 0..CREATES {
-        let registry = Arc::clone(&fixture.registry);
-        let task_host = Arc::clone(&fixture.task_host);
-        let descriptor = descriptor.clone();
-        handles.push(std::thread::spawn(move || {
-            let request =
-                CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
-                    .expect("a legal create");
-            task_host.arrivals.fetch_add(1, Ordering::SeqCst);
-            registry.create_task(&request)
-        }));
-    }
-    let receipts: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("create thread"))
-        .collect();
-
-    let accepted: Vec<_> = receipts
-        .iter()
-        .filter(|receipt| receipt.outcome() == OperationOutcome::Accepted)
-        .collect();
-    assert_eq!(accepted.len(), 1, "{receipts:?}");
-    assert_eq!(
-        receipts
-            .iter()
-            .filter(|receipt| receipt.outcome() == OperationOutcome::Idempotent)
-            .count(),
-        CREATES - 1
-    );
-    let expected = accepted[0]
-        .acknowledgement()
-        .expect("the acknowledged create carries a receipt");
-    for receipt in &receipts {
-        assert_eq!(
-            receipt.acknowledgement(),
-            Some(expected),
-            "every converging create sees the same receipt"
-        );
-    }
-    // One pipeline, not four.
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(fixture.registry.counters().tasks_created, 1);
-}
-
-#[test]
 fn a_conflicting_descriptor_fails_closed() {
     let fixture = Fixture::new();
     fixture.establish(1);
