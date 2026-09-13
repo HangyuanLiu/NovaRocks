@@ -40,12 +40,12 @@ use std::sync::Arc;
 
 use tracing::{error, warn};
 
-use crate::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 use crate::runtime_filter::participant::RuntimeFilterParticipant;
 use crate::runtime_filter::rpc::{
     BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
 };
 use crate::task_execution::NativeQueryContextHost;
+use novarocks_worker::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 
 const NO_OWNER_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: no runtime-filter participant owner on this backend holds this query execution attempt";
 const CONFLICTING_OWNERS_REJECTION: &str = "runtime filter ingress rejected [query-unavailable]: this query execution attempt is claimed by more than one runtime-filter participant owner";
@@ -195,8 +195,8 @@ mod tests {
 
     use std::sync::Mutex;
 
-    use crate::runtime_filter::domain::{BackendAcceptStatus, BackendEnvelopeKind};
     use crate::runtime_filter::test_support::participant_for_test;
+    use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendEnvelopeKind};
 
     struct StubAuthority {
         name: &'static str,

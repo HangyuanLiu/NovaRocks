@@ -27,7 +27,7 @@ use novarocks_proto_models as proto;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
-use crate::runtime_filter::domain::{
+use novarocks_worker::runtime_filter::domain::{
     BackendAcceptStatus, BackendEnvelopeKind, BackendIngressResult, BackendParticipantIdentity,
     BackendProducerOpenMetadata, BackendRouteEdgeId, BackendTransportSequence,
 };
@@ -184,7 +184,7 @@ impl BackendNativeProducerInstanceRouteIdentity {
 /// from the frozen protobuf shape.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct BackendNativeRuntimeFilterEnvelope {
-    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     participant: BackendParticipantIdentity,
     channel_id: RuntimeFilterChannelId,
     route_identity: BackendNativeRouteIdentity,
@@ -201,7 +201,7 @@ pub(crate) struct BackendNativeRuntimeFilterEnvelope {
 impl BackendNativeRuntimeFilterEnvelope {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+        kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
         participant: BackendParticipantIdentity,
         channel_id: RuntimeFilterChannelId,
         route_identity: BackendNativeRouteIdentity,
@@ -235,7 +235,9 @@ impl BackendNativeRuntimeFilterEnvelope {
         })
     }
 
-    pub(crate) const fn kind(&self) -> crate::runtime_filter::domain::BackendEnvelopeKind {
+    pub(crate) const fn kind(
+        &self,
+    ) -> novarocks_worker::runtime_filter::domain::BackendEnvelopeKind {
         self.kind
     }
 
@@ -276,8 +278,10 @@ impl BackendNativeRuntimeFilterEnvelope {
     }
 }
 
-fn native_kind_requires_payload(kind: crate::runtime_filter::domain::BackendEnvelopeKind) -> bool {
-    use crate::runtime_filter::domain::BackendEnvelopeKind;
+fn native_kind_requires_payload(
+    kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
+) -> bool {
+    use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     matches!(
         kind,
@@ -291,10 +295,10 @@ fn native_kind_requires_payload(kind: crate::runtime_filter::domain::BackendEnve
 }
 
 fn validate_native_route(
-    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     route: BackendNativeRouteIdentity,
 ) -> Result<(), String> {
-    use crate::runtime_filter::domain::BackendEnvelopeKind;
+    use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     let valid = match kind {
         BackendEnvelopeKind::Contribution | BackendEnvelopeKind::ProducerClosed => {
@@ -318,11 +322,11 @@ fn validate_native_route(
 }
 
 fn validate_native_presence(
-    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
     has_producer_open: bool,
     has_accept_status: bool,
 ) -> Result<(), String> {
-    use crate::runtime_filter::domain::BackendEnvelopeKind;
+    use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     let producer_open_required = matches!(
         kind,
@@ -574,7 +578,7 @@ fn drop_accepted_contribution_response(
 )]
 fn decode_kind(
     kind: i32,
-) -> Result<crate::runtime_filter::domain::BackendEnvelopeKind, tonic::Status> {
+) -> Result<novarocks_worker::runtime_filter::domain::BackendEnvelopeKind, tonic::Status> {
     let kind = proto::filter::RuntimeFilterEnvelopeKind::try_from(kind)
         .map_err(|_| invalid_argument("runtime filter envelope kind is unknown"))?;
     match kind {
@@ -582,39 +586,39 @@ fn decode_kind(
             "runtime filter envelope kind must be specified",
         )),
         proto::filter::RuntimeFilterEnvelopeKind::Contribution => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Contribution)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::Contribution)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Artifact => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Artifact)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::Artifact)
         }
         proto::filter::RuntimeFilterEnvelopeKind::ProducerClosed => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::ProducerClosed)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::ProducerClosed)
         }
         proto::filter::RuntimeFilterEnvelopeKind::ProducerUnavailable => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::ProducerUnavailable)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::ProducerUnavailable)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Unavailable => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Unavailable)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::Unavailable)
         }
         proto::filter::RuntimeFilterEnvelopeKind::Ack => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::Ack)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::Ack)
         }
-        proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::CompletedWithoutArtifact)
-        }
+        proto::filter::RuntimeFilterEnvelopeKind::CompletedWithoutArtifact => Ok(
+            novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::CompletedWithoutArtifact,
+        ),
         proto::filter::RuntimeFilterEnvelopeKind::DegradedLogical => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::DegradedLogical)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::DegradedLogical)
         }
         proto::filter::RuntimeFilterEnvelopeKind::FinalArtifact => {
-            Ok(crate::runtime_filter::domain::BackendEnvelopeKind::FinalArtifact)
+            Ok(novarocks_worker::runtime_filter::domain::BackendEnvelopeKind::FinalArtifact)
         }
     }
 }
 
 fn encode_kind(
-    kind: crate::runtime_filter::domain::BackendEnvelopeKind,
+    kind: novarocks_worker::runtime_filter::domain::BackendEnvelopeKind,
 ) -> proto::filter::RuntimeFilterEnvelopeKind {
-    use crate::runtime_filter::domain::BackendEnvelopeKind;
+    use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
     match kind {
         BackendEnvelopeKind::Contribution => proto::filter::RuntimeFilterEnvelopeKind::Contribution,
@@ -781,7 +785,7 @@ mod tests {
     use novarocks_proto_models as proto;
     use novarocks_types::UniqueId;
 
-    use crate::runtime_filter::domain::{
+    use novarocks_worker::runtime_filter::domain::{
         BackendAcceptStatus as RuntimeFilterAcceptStatus,
         BackendEnvelopeKind as RuntimeFilterEnvelopeKind,
         BackendIngressResult as RuntimeFilterIngressResult, BackendParticipantIdentity,

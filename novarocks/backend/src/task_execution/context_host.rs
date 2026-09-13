@@ -75,7 +75,6 @@ use super::shared_facts::{
     catalog_bindings, credential_material, query_options, runtime_filter_install,
     sealed_runtime_filter_evidence,
 };
-use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
 use crate::runtime_filter::install_decode::{
     DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
 };
@@ -86,6 +85,7 @@ use crate::runtime_filter::terminal_contribution::{
     RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
 };
 use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
 use novarocks_worker::{
     CatalogManager, CatalogManagerError, CatalogPruneResult,
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextHost,
@@ -325,7 +325,7 @@ impl NativeQueryContextHost {
     /// consumer waits out its whole wait cap before scanning unfiltered.
     pub(crate) fn claim_runtime_filter_participant(
         &self,
-        participant: crate::runtime_filter::domain::BackendParticipantIdentity,
+        participant: novarocks_worker::runtime_filter::domain::BackendParticipantIdentity,
     ) -> Option<Arc<RuntimeFilterParticipant>> {
         let execution = {
             let contexts = self

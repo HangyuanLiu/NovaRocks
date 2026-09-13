@@ -27,6 +27,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
+use crate::{
+    runtime_filter as worker_runtime_filter, runtime_filter::artifact::ConsumerArtifactProfile,
+};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
     LiveTerminal, LogicalVersion, PartitionId, ProducerSequence, RuntimeFilterBindOutcome,
@@ -38,9 +41,6 @@ use novarocks_execution::runtime_filter::{
     UnavailableReason,
 };
 use novarocks_types::UniqueId;
-use novarocks_worker::{
-    runtime_filter as worker_runtime_filter, runtime_filter::artifact::ConsumerArtifactProfile,
-};
 
 use super::{
     BackendChannelIdentity, BackendChannelInstall, BackendConsumerInstall, BackendCoverageProgress,
@@ -56,7 +56,7 @@ use super::{
 /// Session materializes exactly one consumer profile; the participant chooses
 /// the physical loopback or remote leg for the sealed route set.
 #[derive(Clone, Debug)]
-pub(crate) struct BackendMaterializedDelivery {
+pub struct BackendMaterializedDelivery {
     channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
     route_edge_ids: Arc<[BackendRouteEdgeId]>,
     kind: super::BackendEnvelopeKind,
@@ -65,7 +65,7 @@ pub(crate) struct BackendMaterializedDelivery {
 }
 
 impl BackendMaterializedDelivery {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
         route_edge_ids: impl Into<Arc<[BackendRouteEdgeId]>>,
         kind: super::BackendEnvelopeKind,
@@ -81,32 +81,30 @@ impl BackendMaterializedDelivery {
         }
     }
 
-    pub(crate) const fn channel_id(
-        &self,
-    ) -> novarocks_execution::runtime_filter::RuntimeFilterChannelId {
+    pub const fn channel_id(&self) -> novarocks_execution::runtime_filter::RuntimeFilterChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn route_edge_ids(&self) -> &Arc<[BackendRouteEdgeId]> {
+    pub const fn route_edge_ids(&self) -> &Arc<[BackendRouteEdgeId]> {
         &self.route_edge_ids
     }
 
-    pub(crate) const fn kind(&self) -> super::BackendEnvelopeKind {
+    pub const fn kind(&self) -> super::BackendEnvelopeKind {
         self.kind
     }
 
-    pub(crate) const fn schema_digest(&self) -> [u8; 32] {
+    pub const fn schema_digest(&self) -> [u8; 32] {
         self.schema_digest
     }
 
-    pub(crate) const fn payload(&self) -> &Arc<[u8]> {
+    pub const fn payload(&self) -> &Arc<[u8]> {
         &self.payload
     }
 }
 
 /// Participant-private physical fanout. It deliberately receives only an
 /// encoded artifact frame and cannot observe reducer or evaluator state.
-pub(crate) trait BackendMaterializedDeliverySink: Send + Sync {
+pub trait BackendMaterializedDeliverySink: Send + Sync {
     fn dispatch(
         &self,
         delivery: BackendMaterializedDelivery,
@@ -117,7 +115,7 @@ pub(crate) trait BackendMaterializedDeliverySink: Send + Sync {
 /// artifact routing.  Its implementation belongs to the attempt-local query
 /// lifecycle owner, which may drop it at cancellation without retaining this
 /// runtime-filter session.
-pub(crate) trait BackendFrontendFeedbackSink: Send + Sync {
+pub trait BackendFrontendFeedbackSink: Send + Sync {
     fn try_publish(
         &self,
         channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
@@ -128,7 +126,7 @@ pub(crate) trait BackendFrontendFeedbackSink: Send + Sync {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendFrontendFeedbackOutcome {
+pub enum BackendFrontendFeedbackOutcome {
     CanonicalDomain(Arc<[u8]>),
     DomainBudget,
     TypeUnsupported,
@@ -137,7 +135,7 @@ pub(crate) enum BackendFrontendFeedbackOutcome {
 }
 
 #[derive(Debug)]
-pub(crate) enum BackendRuntimeFilterSessionError {
+pub enum BackendRuntimeFilterSessionError {
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
@@ -169,13 +167,13 @@ impl fmt::Display for BackendRuntimeFilterSessionError {
 impl std::error::Error for BackendRuntimeFilterSessionError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRuntimeFilterSessionSubmission {
+pub struct BackendRuntimeFilterSessionSubmission {
     outcome: RuntimeFilterSubmitOutcome,
     publication: Option<BackendReducedLogicalSnapshot>,
 }
 
 impl BackendRuntimeFilterSessionSubmission {
-    pub(crate) const fn outcome(&self) -> RuntimeFilterSubmitOutcome {
+    pub const fn outcome(&self) -> RuntimeFilterSubmitOutcome {
         self.outcome
     }
 
@@ -183,7 +181,7 @@ impl BackendRuntimeFilterSessionSubmission {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn publication(&self) -> Option<&BackendReducedLogicalSnapshot> {
+    pub const fn publication(&self) -> Option<&BackendReducedLogicalSnapshot> {
         self.publication.as_ref()
     }
 }
@@ -233,7 +231,7 @@ struct BackendInstalledConsumer {
 /// A channel-wide Backend session.  A single strict reduction state is shared
 /// by every installed producer binding only after construction verifies they
 /// have identical Execution semantics and contribution budget.
-pub(crate) struct BackendRuntimeFilterSession {
+pub struct BackendRuntimeFilterSession {
     // A participant that only consumes a remotely materialized artifact has
     // no local producer/reducer authority. Its subscription state remains a
     // first-class installed session, but every producer-side field is absent.
@@ -257,7 +255,7 @@ impl BackendRuntimeFilterSession {
     /// Builds a session from one sealed channel installation. The caller
     /// supplies only the Backend event observer; no Core transition adapter is
     /// involved in construction.
-    pub(crate) fn from_channel_install(
+    pub fn from_channel_install(
         participant: BackendParticipantIdentity,
         channel: BackendChannelInstall,
         events: Arc<dyn BackendRuntimeFilterEventObserver>,
@@ -345,41 +343,38 @@ impl BackendRuntimeFilterSession {
         })
     }
 
-    pub(crate) fn set_materialized_delivery_sink(
-        &self,
-        sink: Arc<dyn BackendMaterializedDeliverySink>,
-    ) {
+    pub fn set_materialized_delivery_sink(&self, sink: Arc<dyn BackendMaterializedDeliverySink>) {
         *self
             .materialized_delivery_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sink);
     }
 
-    pub(crate) fn set_frontend_feedback_sink(&self, sink: Weak<dyn BackendFrontendFeedbackSink>) {
+    pub fn set_frontend_feedback_sink(&self, sink: Weak<dyn BackendFrontendFeedbackSink>) {
         *self
             .frontend_feedback_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(sink);
     }
 
-    pub(crate) fn clear_frontend_feedback_sink(&self) {
+    pub fn clear_frontend_feedback_sink(&self) {
         *self
             .frontend_feedback_sink
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
-    pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
+    pub const fn policy(&self) -> &BackendInstallPolicy {
         self.policy
             .as_ref()
             .expect("only an installed producer binding can request a contribution budget")
     }
 
-    pub(crate) const fn channel(&self) -> &BackendChannelInstall {
+    pub const fn channel(&self) -> &BackendChannelInstall {
         &self.channel
     }
 
-    pub(crate) fn availability_progress(&self) -> BackendCoverageProgress {
+    pub fn availability_progress(&self) -> BackendCoverageProgress {
         self.availability
             .as_ref()
             .map_or(BackendCoverageProgress::Satisfied, |availability| {
@@ -394,7 +389,7 @@ impl BackendRuntimeFilterSession {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn terminal_progress(&self) -> BackendCoverageProgress {
+    pub fn terminal_progress(&self) -> BackendCoverageProgress {
         self.terminal
             .as_ref()
             .map_or(BackendCoverageProgress::Satisfied, |terminal| {
@@ -407,7 +402,7 @@ impl BackendRuntimeFilterSession {
 
     /// Opens one authorized producer binding/instance. Binding, witness, and
     /// expected instance authority all come from the sealed channel install.
-    pub(crate) fn open_producer(
+    pub fn open_producer(
         self: &Arc<Self>,
         fragment_instance_id: UniqueId,
         request: RuntimeFilterProducerOpenRequest,
@@ -428,7 +423,7 @@ impl BackendRuntimeFilterSession {
     /// and fragment instance. The sealed installation authorizes both values;
     /// an unexpected fragment instance is a contract violation, not a
     /// runtime route-unavailable outcome.
-    pub(crate) fn subscribe(
+    pub fn subscribe(
         &self,
         fragment_instance_id: UniqueId,
         request: RuntimeFilterSubscriptionRequest,
@@ -461,7 +456,7 @@ impl BackendRuntimeFilterSession {
     /// Strictly reduces one canonical Execution contribution. A participant
     /// artifact owner may consume `publication`; this session never turns it
     /// into an artifact bundle itself.
-    pub(crate) fn submit(
+    pub fn submit(
         &self,
         binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
@@ -505,7 +500,7 @@ impl BackendRuntimeFilterSession {
     /// Closes one producer partition. Its witness is marked satisfied only
     /// when every expected fragment instance for that same producer binding
     /// has opened and closed every declared local partition.
-    pub(crate) fn close_partition(
+    pub fn close_partition(
         &self,
         binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
@@ -601,7 +596,7 @@ impl BackendRuntimeFilterSession {
 
     /// Fails one producer binding and fail-opens every installed consumer via
     /// the typed Execution unavailable outcome. No evaluator effect is made.
-    pub(crate) fn fail(
+    pub fn fail(
         &self,
         binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
@@ -653,7 +648,7 @@ impl BackendRuntimeFilterSession {
 
     /// Injects an immutable artifact-owner result for its authorized consumer
     /// route. It accepts neither Arrow values nor row/scan evaluator facts.
-    pub(crate) fn publish_materialized(
+    pub fn publish_materialized(
         &self,
         route_edge_id: BackendRouteEdgeId,
         outcome: SnapshotAcquireOutcome,
@@ -866,7 +861,7 @@ impl BackendRuntimeFilterSession {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn record_cancelled_if_open(&self) {
+    pub fn record_cancelled_if_open(&self) {
         self.record_channel_event(|channel| BackendRuntimeFilterEvent::ChannelCancelled {
             channel,
         });
@@ -1448,15 +1443,15 @@ mod tests {
     };
 
     use super::*;
+    use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::{
         domain::{
             BackendChannelLifecycle, BackendCoverage, BackendCoverageWitnessId,
             BackendMaterializationPolicy, BackendProducerInstall,
             CollectingBackendRuntimeFilterEventObserver,
         },
-        test_support::BackendRuntimeFilterFixture,
+        fixture::BackendRuntimeFilterFixture,
     };
-    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
 
     fn instance(raw: i64) -> UniqueId {
         UniqueId::new(raw, raw + 1)

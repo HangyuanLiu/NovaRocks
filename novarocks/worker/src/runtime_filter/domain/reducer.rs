@@ -26,7 +26,7 @@ use novarocks_execution::runtime_filter::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ReducerError {
+pub enum ReducerError {
     TypeMismatch,
     UnsupportedType,
     SizeOverflow,
@@ -47,7 +47,7 @@ impl fmt::Display for ReducerError {
 impl std::error::Error for ReducerError {}
 
 #[derive(Clone, Debug)]
-pub(crate) struct MembershipReducer {
+pub struct MembershipReducer {
     data_type: DataType,
     null_semantics: RuntimeFilterNullSemantics,
     /// Backend-owned mutable union state. Execution supplies canonical deltas;
@@ -56,18 +56,18 @@ pub(crate) struct MembershipReducer {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ReducerProjection {
+pub struct ReducerProjection {
     retained_growth: usize,
 }
 
 impl ReducerProjection {
-    pub(crate) const fn retained_growth(self) -> usize {
+    pub const fn retained_growth(self) -> usize {
         self.retained_growth
     }
 }
 
 impl MembershipReducer {
-    pub(crate) fn try_new(
+    pub fn try_new(
         data_type: DataType,
         null_semantics: RuntimeFilterNullSemantics,
     ) -> Result<Self, ReducerError> {
@@ -79,10 +79,7 @@ impl MembershipReducer {
         })
     }
 
-    pub(crate) fn preflight(
-        &self,
-        delta: &ValueDomainDelta,
-    ) -> Result<ReducerProjection, ReducerError> {
+    pub fn preflight(&self, delta: &ValueDomainDelta) -> Result<ReducerProjection, ReducerError> {
         if !delta.matches_data_type(&self.data_type) {
             return Err(ReducerError::TypeMismatch);
         }
@@ -99,10 +96,7 @@ impl MembershipReducer {
         })
     }
 
-    pub(crate) fn commit_preflighted(
-        &mut self,
-        delta: &ValueDomainDelta,
-    ) -> Result<(), ReducerError> {
+    pub fn commit_preflighted(&mut self, delta: &ValueDomainDelta) -> Result<(), ReducerError> {
         let mut values = self.domain.values().clone();
         union_membership_values(&mut values, delta.values())?;
         let contains_null = self.domain.contains_null()
@@ -112,7 +106,7 @@ impl MembershipReducer {
         Ok(())
     }
 
-    pub(crate) const fn domain(&self) -> &ValueDomainDelta {
+    pub const fn domain(&self) -> &ValueDomainDelta {
         &self.domain
     }
 
@@ -120,7 +114,7 @@ impl MembershipReducer {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn into_domain(self) -> ValueDomainDelta {
+    pub fn into_domain(self) -> ValueDomainDelta {
         self.domain
     }
 }

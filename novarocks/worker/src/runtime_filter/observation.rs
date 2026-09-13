@@ -47,7 +47,7 @@ thread_local! {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterObservationError {
+pub enum RuntimeFilterObservationError {
     UnknownParticipant,
     UnknownChannel(BackendChannelIdentity),
     UnknownProducerInstance {
@@ -117,7 +117,7 @@ impl fmt::Display for RuntimeFilterObservationError {
 impl std::error::Error for RuntimeFilterObservationError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterChannelObservation {
+pub struct RuntimeFilterChannelObservation {
     identity: BackendChannelIdentity,
     latest_published_version: Option<LogicalVersion>,
     terminal: Option<RuntimeFilterChannelTerminal>,
@@ -129,44 +129,44 @@ pub(crate) struct RuntimeFilterChannelObservation {
 }
 
 impl RuntimeFilterChannelObservation {
-    pub(crate) const fn identity(&self) -> BackendChannelIdentity {
+    pub const fn identity(&self) -> BackendChannelIdentity {
         self.identity
     }
 
-    pub(crate) const fn latest_published_version(&self) -> Option<LogicalVersion> {
+    pub const fn latest_published_version(&self) -> Option<LogicalVersion> {
         self.latest_published_version
     }
 
-    pub(crate) const fn terminal(&self) -> Option<RuntimeFilterChannelTerminal> {
+    pub const fn terminal(&self) -> Option<RuntimeFilterChannelTerminal> {
         self.terminal
     }
 
-    pub(crate) const fn published(&self) -> u64 {
+    pub const fn published(&self) -> u64 {
         self.published
     }
 
-    pub(crate) const fn completed(&self) -> u64 {
+    pub const fn completed(&self) -> u64 {
         self.completed
     }
 
-    pub(crate) const fn unavailable(&self) -> u64 {
+    pub const fn unavailable(&self) -> u64 {
         self.unavailable
     }
 
-    pub(crate) const fn cancelled(&self) -> u64 {
+    pub const fn cancelled(&self) -> u64 {
         self.cancelled
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterChannelTerminal {
+pub enum RuntimeFilterChannelTerminal {
     Completed(LogicalVersion),
     Unavailable(UnavailableReason),
     Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterProducerStreamObservation {
+pub struct RuntimeFilterProducerStreamObservation {
     identity: BackendProducerStreamIdentity,
     latest_accepted_sequence: Option<u64>,
     accepted: u64,
@@ -177,37 +177,37 @@ pub(crate) struct RuntimeFilterProducerStreamObservation {
 }
 
 impl RuntimeFilterProducerStreamObservation {
-    pub(crate) const fn identity(&self) -> BackendProducerStreamIdentity {
+    pub const fn identity(&self) -> BackendProducerStreamIdentity {
         self.identity
     }
 
-    pub(crate) const fn latest_accepted_sequence(&self) -> Option<u64> {
+    pub const fn latest_accepted_sequence(&self) -> Option<u64> {
         self.latest_accepted_sequence
     }
 
-    pub(crate) const fn accepted(&self) -> u64 {
+    pub const fn accepted(&self) -> u64 {
         self.accepted
     }
 
-    pub(crate) const fn duplicate(&self) -> u64 {
+    pub const fn duplicate(&self) -> u64 {
         self.duplicate
     }
 
-    pub(crate) const fn stale(&self) -> u64 {
+    pub const fn stale(&self) -> u64 {
         self.stale
     }
 
-    pub(crate) const fn conflict(&self) -> u64 {
+    pub const fn conflict(&self) -> u64 {
         self.conflict
     }
 
-    pub(crate) const fn resource_limit(&self) -> u64 {
+    pub const fn resource_limit(&self) -> u64 {
         self.resource_limit
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterTransportObservation {
+pub struct RuntimeFilterTransportObservation {
     identity: BackendTransportEventIdentity,
     sent: u64,
     retried: u64,
@@ -221,23 +221,23 @@ pub(crate) struct RuntimeFilterTransportObservation {
 }
 
 impl RuntimeFilterTransportObservation {
-    pub(crate) const fn identity(&self) -> BackendTransportEventIdentity {
+    pub const fn identity(&self) -> BackendTransportEventIdentity {
         self.identity
     }
 
-    pub(crate) const fn sent(&self) -> u64 {
+    pub const fn sent(&self) -> u64 {
         self.sent
     }
 
-    pub(crate) const fn retried(&self) -> u64 {
+    pub const fn retried(&self) -> u64 {
         self.retried
     }
 
-    pub(crate) const fn acked(&self) -> u64 {
+    pub const fn acked(&self) -> u64 {
         self.acked
     }
 
-    pub(crate) const fn failed_open(&self) -> u64 {
+    pub const fn failed_open(&self) -> u64 {
         self.failed_open
     }
 
@@ -245,29 +245,29 @@ impl RuntimeFilterTransportObservation {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bytes(&self) -> u64 {
+    pub const fn bytes(&self) -> u64 {
         self.bytes
     }
 
-    pub(crate) const fn sent_bytes(&self) -> u64 {
+    pub const fn sent_bytes(&self) -> u64 {
         self.sent_bytes
     }
 
-    pub(crate) const fn retried_bytes(&self) -> u64 {
+    pub const fn retried_bytes(&self) -> u64 {
         self.retried_bytes
     }
 
-    pub(crate) const fn acked_bytes(&self) -> u64 {
+    pub const fn acked_bytes(&self) -> u64 {
         self.acked_bytes
     }
 
-    pub(crate) const fn failed_open_bytes(&self) -> u64 {
+    pub const fn failed_open_bytes(&self) -> u64 {
         self.failed_open_bytes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterConsumerObservation {
+pub struct RuntimeFilterConsumerObservation {
     identity: BackendConsumerSubscriptionIdentity,
     latest_delivered_version: Option<LogicalVersion>,
     latest_applied_version: Option<LogicalVersion>,
@@ -286,75 +286,73 @@ pub(crate) struct RuntimeFilterConsumerObservation {
 }
 
 impl RuntimeFilterConsumerObservation {
-    pub(crate) const fn identity(&self) -> BackendConsumerSubscriptionIdentity {
+    pub const fn identity(&self) -> BackendConsumerSubscriptionIdentity {
         self.identity
     }
 
-    pub(crate) const fn latest_delivered_version(&self) -> Option<LogicalVersion> {
+    pub const fn latest_delivered_version(&self) -> Option<LogicalVersion> {
         self.latest_delivered_version
     }
 
-    pub(crate) const fn latest_applied_version(&self) -> Option<LogicalVersion> {
+    pub const fn latest_applied_version(&self) -> Option<LogicalVersion> {
         self.latest_applied_version
     }
 
-    pub(crate) const fn outcome(&self) -> Option<RuntimeFilterConsumerOutcome> {
+    pub const fn outcome(&self) -> Option<RuntimeFilterConsumerOutcome> {
         self.outcome
     }
 
-    pub(crate) const fn terminal(&self) -> Option<LiveTerminal> {
+    pub const fn terminal(&self) -> Option<LiveTerminal> {
         self.terminal
     }
 
-    pub(crate) const fn row_evaluations(&self) -> u64 {
+    pub const fn row_evaluations(&self) -> u64 {
         self.row_evaluations
     }
 
-    pub(crate) const fn row_input(&self) -> u64 {
+    pub const fn row_input(&self) -> u64 {
         self.row_input
     }
 
-    pub(crate) const fn row_output(&self) -> u64 {
+    pub const fn row_output(&self) -> u64 {
         self.row_output
     }
 
-    pub(crate) const fn scan_evaluated(&self) -> u64 {
+    pub const fn scan_evaluated(&self) -> u64 {
         self.scan_evaluated
     }
 
-    pub(crate) const fn scan_kept(&self) -> u64 {
+    pub const fn scan_kept(&self) -> u64 {
         self.scan_kept
     }
 
-    pub(crate) const fn scan_pruned(&self) -> u64 {
+    pub const fn scan_pruned(&self) -> u64 {
         self.scan_pruned
     }
 
-    pub(crate) const fn scan_not_evaluated(&self) -> u64 {
+    pub const fn scan_not_evaluated(&self) -> u64 {
         self.scan_not_evaluated
     }
 
-    pub(crate) const fn scan_not_evaluated_reasons(
-        &self,
-    ) -> RuntimeFilterScanNotEvaluatedObservation {
+    pub const fn scan_not_evaluated_reasons(&self) -> RuntimeFilterScanNotEvaluatedObservation {
         self.scan_not_evaluated_reasons
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterScanNotEvaluatedObservation {
-    pub(crate) unit_facts_missing: u64,
-    pub(crate) column_facts_missing: u64,
-    pub(crate) data_type_unsupported: u64,
-    pub(crate) predicate_capability_unsupported: u64,
-    pub(crate) resource_unavailable: u64,
-    pub(crate) snapshot_unavailable: u64,
-    pub(crate) snapshot_timed_out: u64,
-    pub(crate) snapshot_not_published: u64,
+pub struct RuntimeFilterScanNotEvaluatedObservation {
+    pub unit_facts_missing: u64,
+    pub column_facts_missing: u64,
+    pub data_type_unsupported: u64,
+    pub predicate_capability_unsupported: u64,
+    pub resource_unavailable: u64,
+    pub snapshot_unavailable: u64,
+    pub snapshot_timed_out: u64,
+    pub snapshot_not_published: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterConsumerOutcome {
+pub enum RuntimeFilterConsumerOutcome {
     Acquired,
     TimedOut,
     Unavailable(UnavailableReason),
@@ -363,7 +361,7 @@ pub(crate) enum RuntimeFilterConsumerOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterObservationSnapshot {
+pub struct RuntimeFilterObservationSnapshot {
     channels: Vec<RuntimeFilterChannelObservation>,
     producer_streams: Vec<RuntimeFilterProducerStreamObservation>,
     transport_routes: Vec<RuntimeFilterTransportObservation>,
@@ -373,19 +371,19 @@ pub(crate) struct RuntimeFilterObservationSnapshot {
 }
 
 impl RuntimeFilterObservationSnapshot {
-    pub(crate) fn channels(&self) -> &[RuntimeFilterChannelObservation] {
+    pub fn channels(&self) -> &[RuntimeFilterChannelObservation] {
         &self.channels
     }
 
-    pub(crate) fn producer_streams(&self) -> &[RuntimeFilterProducerStreamObservation] {
+    pub fn producer_streams(&self) -> &[RuntimeFilterProducerStreamObservation] {
         &self.producer_streams
     }
 
-    pub(crate) fn transport_routes(&self) -> &[RuntimeFilterTransportObservation] {
+    pub fn transport_routes(&self) -> &[RuntimeFilterTransportObservation] {
         &self.transport_routes
     }
 
-    pub(crate) fn consumers(&self) -> &[RuntimeFilterConsumerObservation] {
+    pub fn consumers(&self) -> &[RuntimeFilterConsumerObservation] {
         &self.consumers
     }
 
@@ -393,11 +391,11 @@ impl RuntimeFilterObservationSnapshot {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn anomalies(&self) -> &RuntimeFilterObservationAnomalies {
+    pub const fn anomalies(&self) -> &RuntimeFilterObservationAnomalies {
         &self.anomalies
     }
 
-    pub(crate) fn correctness_error(&self) -> Option<&str> {
+    pub fn correctness_error(&self) -> Option<&str> {
         self.correctness_error.as_deref()
     }
 }
@@ -406,7 +404,7 @@ impl RuntimeFilterObservationSnapshot {
 /// violations also become first-wins correctness evidence at terminal capture;
 /// late-after-seal observations remain diagnostic only.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterObservationAnomalies {
+pub struct RuntimeFilterObservationAnomalies {
     unattributed: RuntimeFilterUnattributedObservations,
     conflicting_reports: RuntimeFilterConflictingReportObservations,
     saturated: u64,
@@ -419,7 +417,7 @@ impl RuntimeFilterObservationAnomalies {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn unattributed(&self) -> RuntimeFilterUnattributedObservations {
+    pub const fn unattributed(&self) -> RuntimeFilterUnattributedObservations {
         self.unattributed
     }
 
@@ -427,7 +425,7 @@ impl RuntimeFilterObservationAnomalies {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn conflicting_reports(&self) -> RuntimeFilterConflictingReportObservations {
+    pub const fn conflicting_reports(&self) -> RuntimeFilterConflictingReportObservations {
         self.conflicting_reports
     }
 
@@ -435,7 +433,7 @@ impl RuntimeFilterObservationAnomalies {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn saturated(&self) -> u64 {
+    pub const fn saturated(&self) -> u64 {
         self.saturated
     }
 
@@ -443,7 +441,7 @@ impl RuntimeFilterObservationAnomalies {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn late_after_seal(&self) -> u64 {
+    pub const fn late_after_seal(&self) -> u64 {
         self.late_after_seal
     }
 
@@ -451,13 +449,13 @@ impl RuntimeFilterObservationAnomalies {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn rejected(&self) -> u64 {
+    pub const fn rejected(&self) -> u64 {
         self.rejected
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterUnattributedObservations {
+pub struct RuntimeFilterUnattributedObservations {
     participant: u64,
     channel: u64,
     producer_instance: u64,
@@ -472,55 +470,55 @@ impl RuntimeFilterUnattributedObservations {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn participant(&self) -> u64 {
+    pub const fn participant(&self) -> u64 {
         self.participant
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn channel(&self) -> u64 {
+    pub const fn channel(&self) -> u64 {
         self.channel
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn producer_instance(&self) -> u64 {
+    pub const fn producer_instance(&self) -> u64 {
         self.producer_instance
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn producer_stream(&self) -> u64 {
+    pub const fn producer_stream(&self) -> u64 {
         self.producer_stream
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn transport_route(&self) -> u64 {
+    pub const fn transport_route(&self) -> u64 {
         self.transport_route
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn consumer(&self) -> u64 {
+    pub const fn consumer(&self) -> u64 {
         self.consumer
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn identity_mismatch(&self) -> u64 {
+    pub const fn identity_mismatch(&self) -> u64 {
         self.identity_mismatch
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterConflictingReportObservations {
+pub struct RuntimeFilterConflictingReportObservations {
     channel_terminal: u64,
     consumer_outcome: u64,
     consumer_terminal: u64,
@@ -531,21 +529,21 @@ impl RuntimeFilterConflictingReportObservations {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn channel_terminal(&self) -> u64 {
+    pub const fn channel_terminal(&self) -> u64 {
         self.channel_terminal
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn consumer_outcome(&self) -> u64 {
+    pub const fn consumer_outcome(&self) -> u64 {
         self.consumer_outcome
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn consumer_terminal(&self) -> u64 {
+    pub const fn consumer_terminal(&self) -> u64 {
         self.consumer_terminal
     }
 }
@@ -575,13 +573,13 @@ struct ObservationState {
 }
 
 // Design: ADR-0106 (docs/adr/ADR-0106-native-wire-layering-and-terminal-content-identity.md)
-pub(crate) struct RuntimeFilterObservationStore {
+pub struct RuntimeFilterObservationStore {
     state: Mutex<ObservationState>,
     saturated: AtomicU64,
 }
 
 impl RuntimeFilterObservationStore {
-    pub(crate) fn from_install(install: &BackendParticipantInstall) -> Self {
+    pub fn from_install(install: &BackendParticipantInstall) -> Self {
         let participant = install.participant();
         let mut channels = BTreeMap::new();
         let mut producer_instances = BTreeMap::new();
@@ -683,7 +681,7 @@ impl RuntimeFilterObservationStore {
         }
     }
 
-    pub(crate) fn register_producer_instance(
+    pub fn register_producer_instance(
         &self,
         channel: BackendChannelIdentity,
         fragment_instance_id: UniqueId,
@@ -730,7 +728,7 @@ impl RuntimeFilterObservationStore {
         }
     }
 
-    pub(crate) fn fold(&self, event: &BackendRuntimeFilterEvent) {
+    pub fn fold(&self, event: &BackendRuntimeFilterEvent) {
         let mut state = self.lock();
         if state.sealed.is_some() {
             increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
@@ -746,7 +744,7 @@ impl RuntimeFilterObservationStore {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
+    pub fn reject(&self, error: RuntimeFilterObservationError) {
         let mut state = self.lock();
         if state.sealed.is_some() {
             increment_field(&mut state.anomalies.late_after_seal, 1, &self.saturated);
@@ -760,7 +758,7 @@ impl RuntimeFilterObservationStore {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
+    pub fn capture(&self) -> RuntimeFilterObservationSnapshot {
         let state = self.lock();
         state
             .sealed
@@ -770,7 +768,7 @@ impl RuntimeFilterObservationStore {
 
     /// Freezes the contribution that terminalization may retain. Later events
     /// are intentionally observable only as process-local anomaly metrics.
-    pub(crate) fn seal(&self) -> RuntimeFilterObservationSnapshot {
+    pub fn seal(&self) -> RuntimeFilterObservationSnapshot {
         let mut state = self.lock();
         if let Some(snapshot) = &state.sealed {
             return snapshot.clone();
@@ -824,13 +822,13 @@ impl RuntimeFilterObservationStore {
     }
 }
 
-pub(crate) struct RuntimeFilterObservationEmitter {
+pub struct RuntimeFilterObservationEmitter {
     store: Arc<RuntimeFilterObservationStore>,
     observer: Option<Arc<dyn BackendRuntimeFilterEventObserver>>,
 }
 
 impl RuntimeFilterObservationEmitter {
-    pub(crate) fn from_install(
+    pub fn from_install(
         install: &BackendParticipantInstall,
         observer: Option<Arc<dyn BackendRuntimeFilterEventObserver>>,
     ) -> Arc<Self> {
@@ -840,7 +838,7 @@ impl RuntimeFilterObservationEmitter {
         })
     }
 
-    pub(crate) fn register_producer_instance(
+    pub fn register_producer_instance(
         &self,
         channel: BackendChannelIdentity,
         fragment_instance_id: UniqueId,
@@ -854,11 +852,11 @@ impl RuntimeFilterObservationEmitter {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn capture(&self) -> RuntimeFilterObservationSnapshot {
+    pub fn capture(&self) -> RuntimeFilterObservationSnapshot {
         self.store.capture()
     }
 
-    pub(crate) fn seal(&self) -> RuntimeFilterObservationSnapshot {
+    pub fn seal(&self) -> RuntimeFilterObservationSnapshot {
         self.store.seal()
     }
 
@@ -866,7 +864,7 @@ impl RuntimeFilterObservationEmitter {
     /// seals the contribution as one store transaction. Observer notification
     /// follows the freeze because it is diagnostic-only and must not reopen
     /// the retained terminal proof.
-    pub(crate) fn cancel_open_channels_and_seal(&self) -> RuntimeFilterObservationSnapshot {
+    pub fn cancel_open_channels_and_seal(&self) -> RuntimeFilterObservationSnapshot {
         let (snapshot, events) = self.store.cancel_open_channels_and_seal();
         for event in events {
             self.notify(event);
@@ -878,7 +876,7 @@ impl RuntimeFilterObservationEmitter {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn reject(&self, error: RuntimeFilterObservationError) {
+    pub fn reject(&self, error: RuntimeFilterObservationError) {
         self.store.reject(error);
     }
 }
@@ -1706,13 +1704,13 @@ mod tests {
     };
 
     use super::*;
+    use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::domain::{
         BackendAcceptStatus, BackendChannelInstall, BackendChannelLifecycle,
         BackendConsumerInstall, BackendCoverageWitnessId, BackendMaterializationPolicy,
         BackendProducerInstall, BackendRouteEdgeId, BackendRoutingShard,
     };
-    use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
-    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
+    use crate::runtime_filter::fixture::BackendRuntimeFilterFixture;
 
     struct Fixture {
         install: BackendParticipantInstall,

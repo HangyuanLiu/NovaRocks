@@ -36,7 +36,11 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
 
-use crate::runtime_filter::domain::{
+use crate::runtime_filter::membership_contract_decode::{
+    MembershipContractDecodeError, decode_membership_contract,
+};
+use novarocks_plan_codec::native_type::decode_type;
+use novarocks_worker::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
     BackendCoverageWitnessId, BackendEnvelopeKind, BackendFrontendFeedbackPublication,
     BackendMaterializationOwner, BackendMaterializationPolicy, BackendOutboundMaterializationGroup,
@@ -44,10 +48,6 @@ use crate::runtime_filter::domain::{
     BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
     BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
 };
-use crate::runtime_filter::membership_contract_decode::{
-    MembershipContractDecodeError, decode_membership_contract,
-};
-use novarocks_plan_codec::native_type::decode_type;
 use novarocks_worker::{
     RuntimeFilterContractError,
     runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest},
@@ -1782,20 +1782,22 @@ mod tests {
     use super::{
         decode_contract, decode_runtime_filter_contribution, validate_participant_install,
     };
-    use crate::runtime_filter::{
-        domain::{
-            BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
-            BackendParticipantInstall, BackendRoutingShard,
-        },
-        test_support::BackendRuntimeFilterFixture,
-    };
     use novarocks_proto_codec::{
         FieldPath, ProtocolErrorKind,
         lifecycle::{AttemptId, QueryExecutionId, RuntimeFilterContribution},
     };
     use novarocks_proto_models::{filter, novarocks as proto_novarocks, plan};
     use novarocks_types::QueryId;
-    use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
+    use novarocks_worker::{
+        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
+        runtime_filter::{
+            domain::{
+                BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
+                BackendParticipantInstall, BackendRoutingShard,
+            },
+            fixture::BackendRuntimeFilterFixture,
+        },
+    };
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

@@ -32,12 +32,12 @@ use prost::Message;
 
 use novarocks_proto_models::filter::RuntimeFilterEnvelopeResponse;
 
-use crate::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
 use crate::runtime_filter::rpc::{
     BackendNativeRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
 };
 use novarocks_native_adapter::{BackendDataRuntime, NativeRpcClient};
+use novarocks_worker::runtime_filter::domain::{BackendAcceptStatus, BackendRemoteRoute};
 use novarocks_worker::{
     ReliableTransportFailOpenReason, ReliableTransportFailureOutcome, ReliableTransportPolicy,
     ReliableTransportSendOutcome, ReliableTransportState,
@@ -608,12 +608,12 @@ mod tests {
         decode_runtime_filter_unary_ack,
     };
     use crate::rpc::runtime::test_backend_data_runtime;
-    use crate::runtime_filter::domain::BackendAcceptStatus;
     use novarocks_proto_models::filter::{
         RuntimeFilterAcceptStatus, RuntimeFilterContributionRouteIdentity,
         RuntimeFilterEnvelopeResponse, RuntimeFilterRouteIdentity,
         runtime_filter_route_identity::Value,
     };
+    use novarocks_worker::runtime_filter::domain::BackendAcceptStatus;
 
     fn contribution_route() -> RuntimeFilterRouteIdentity {
         RuntimeFilterRouteIdentity {

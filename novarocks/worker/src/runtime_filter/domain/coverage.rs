@@ -21,15 +21,15 @@ use std::fmt;
 macro_rules! id {
     ($name:ident, $raw:ty) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub(crate) struct $name($raw);
+        pub struct $name($raw);
 
         impl $name {
-            pub(crate) const fn new(raw: $raw) -> Self {
+            pub const fn new(raw: $raw) -> Self {
                 Self(raw)
             }
 
 #[allow(dead_code, reason = "Retained for staged backend runtime-filter domain and materialization integration.")]
-            pub(crate) const fn get(self) -> $raw {
+            pub const fn get(self) -> $raw {
                 self.0
             }
         }
@@ -42,14 +42,14 @@ id!(BackendCoverageWitnessId, u32);
 /// participant. It describes readiness only and does not encode a reduction
 /// or any fragment value.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendCoverage {
+pub enum BackendCoverage {
     Witness(BackendCoverageWitnessId),
     AllOf(Vec<Self>),
     AnyOf(Vec<Self>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendCoverageError {
+pub enum BackendCoverageError {
     EmptyComposite,
 }
 
@@ -65,23 +65,19 @@ impl fmt::Display for BackendCoverageError {
 impl std::error::Error for BackendCoverageError {}
 
 impl BackendCoverage {
-    pub(crate) const fn witness(witness: BackendCoverageWitnessId) -> Self {
+    pub const fn witness(witness: BackendCoverageWitnessId) -> Self {
         Self::Witness(witness)
     }
 
-    pub(crate) fn all_of(
-        children: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, BackendCoverageError> {
+    pub fn all_of(children: impl IntoIterator<Item = Self>) -> Result<Self, BackendCoverageError> {
         Self::composite(children, Self::AllOf)
     }
 
-    pub(crate) fn any_of(
-        children: impl IntoIterator<Item = Self>,
-    ) -> Result<Self, BackendCoverageError> {
+    pub fn any_of(children: impl IntoIterator<Item = Self>) -> Result<Self, BackendCoverageError> {
         Self::composite(children, Self::AnyOf)
     }
 
-    pub(crate) fn witnesses(&self) -> BTreeSet<BackendCoverageWitnessId> {
+    pub fn witnesses(&self) -> BTreeSet<BackendCoverageWitnessId> {
         let mut witnesses = BTreeSet::new();
         self.collect_witnesses(&mut witnesses);
         witnesses
@@ -113,14 +109,14 @@ impl BackendCoverage {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendCoverageWitnessProgress {
+pub enum BackendCoverageWitnessProgress {
     Pending,
     Satisfied,
     Impossible,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendCoverageProgress {
+pub enum BackendCoverageProgress {
     Pending,
     Satisfied,
     Impossible,
@@ -129,12 +125,12 @@ pub(crate) enum BackendCoverageProgress {
 /// Mutable readiness state. A terminal witness may be recorded once only,
 /// which makes duplicate delivery idempotent and prevents terminal regression.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendCoverageState {
+pub struct BackendCoverageState {
     witnesses: BTreeMap<BackendCoverageWitnessId, BackendCoverageWitnessProgress>,
 }
 
 impl BackendCoverageState {
-    pub(crate) fn new(coverage: &BackendCoverage) -> Result<Self, BackendCoverageError> {
+    pub fn new(coverage: &BackendCoverage) -> Result<Self, BackendCoverageError> {
         let witnesses = coverage.witnesses();
         if witnesses.is_empty() {
             return Err(BackendCoverageError::EmptyComposite);
@@ -147,15 +143,15 @@ impl BackendCoverageState {
         })
     }
 
-    pub(crate) fn mark_satisfied(&mut self, witness: BackendCoverageWitnessId) -> bool {
+    pub fn mark_satisfied(&mut self, witness: BackendCoverageWitnessId) -> bool {
         self.advance(witness, BackendCoverageWitnessProgress::Satisfied)
     }
 
-    pub(crate) fn mark_impossible(&mut self, witness: BackendCoverageWitnessId) -> bool {
+    pub fn mark_impossible(&mut self, witness: BackendCoverageWitnessId) -> bool {
         self.advance(witness, BackendCoverageWitnessProgress::Impossible)
     }
 
-    pub(crate) fn progress(&self, coverage: &BackendCoverage) -> BackendCoverageProgress {
+    pub fn progress(&self, coverage: &BackendCoverage) -> BackendCoverageProgress {
         match coverage {
             BackendCoverage::Witness(witness) => match self
                 .witnesses

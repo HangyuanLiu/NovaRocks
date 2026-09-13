@@ -32,7 +32,7 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_types::UniqueId;
 
-use novarocks_worker::runtime_filter::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
+use crate::runtime_filter::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
 
 use super::{
     BackendCoverage, BackendCoverageWitnessId, BackendParticipantIdentity, BackendRouteEdgeId,
@@ -40,13 +40,13 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendChannelLifecycle {
+pub enum BackendChannelLifecycle {
     CompleteOnce,
     MonotonicUpdates,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendMaterializationOwner {
+pub enum BackendMaterializationOwner {
     DirectSource,
     Aggregator,
 }
@@ -55,14 +55,14 @@ pub(crate) enum BackendMaterializationOwner {
 /// stays in the Backend install domain rather than retaining the protobuf
 /// carrier after native decoding.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendFrontendFeedbackPublication {
+pub struct BackendFrontendFeedbackPublication {
     publisher_owner: BackendMaterializationOwner,
     contract_digest: [u8; 32],
     max_encoded_domain_bytes: usize,
 }
 
 impl BackendFrontendFeedbackPublication {
-    pub(crate) fn new(
+    pub fn new(
         publisher_owner: BackendMaterializationOwner,
         contract_digest: [u8; 32],
         max_encoded_domain_bytes: usize,
@@ -77,21 +77,21 @@ impl BackendFrontendFeedbackPublication {
         })
     }
 
-    pub(crate) const fn publisher_owner(&self) -> BackendMaterializationOwner {
+    pub const fn publisher_owner(&self) -> BackendMaterializationOwner {
         self.publisher_owner
     }
 
-    pub(crate) const fn contract_digest(&self) -> [u8; 32] {
+    pub const fn contract_digest(&self) -> [u8; 32] {
         self.contract_digest
     }
 
-    pub(crate) const fn max_encoded_domain_bytes(&self) -> usize {
+    pub const fn max_encoded_domain_bytes(&self) -> usize {
         self.max_encoded_domain_bytes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendMaterializationPolicy {
+pub struct BackendMaterializationPolicy {
     bloom_bits_per_key: u32,
     bloom_hash_count: u32,
     bloom_seed: u64,
@@ -102,7 +102,7 @@ pub(crate) struct BackendMaterializationPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendParticipantInstallError {
+pub enum BackendParticipantInstallError {
     ZeroBudget,
     ZeroConcurrentJobs,
     AggregateScratchOverflow,
@@ -127,7 +127,7 @@ impl std::error::Error for BackendParticipantInstallError {}
 
 impl BackendMaterializationPolicy {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         bloom_bits_per_key: u32,
         bloom_hash_count: u32,
         bloom_seed: u64,
@@ -160,52 +160,52 @@ impl BackendMaterializationPolicy {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bloom_bits_per_key(&self) -> u32 {
+    pub const fn bloom_bits_per_key(&self) -> u32 {
         self.bloom_bits_per_key
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bloom_hash_count(&self) -> u32 {
+    pub const fn bloom_hash_count(&self) -> u32 {
         self.bloom_hash_count
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bloom_seed(&self) -> u64 {
+    pub const fn bloom_seed(&self) -> u64 {
         self.bloom_seed
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn bloom_algorithm_version(&self) -> u16 {
+    pub const fn bloom_algorithm_version(&self) -> u16 {
         self.bloom_algorithm_version
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn max_total_retained_bytes(&self) -> usize {
+    pub const fn max_total_retained_bytes(&self) -> usize {
         self.max_total_retained_bytes
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn max_scratch_bytes_per_job(&self) -> usize {
+    pub const fn max_scratch_bytes_per_job(&self) -> usize {
         self.max_scratch_bytes_per_job
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn max_concurrent_jobs(&self) -> usize {
+    pub const fn max_concurrent_jobs(&self) -> usize {
         self.max_concurrent_jobs
     }
-    pub(crate) fn aggregate_scratch_bytes(&self) -> Result<usize, BackendParticipantInstallError> {
+    pub fn aggregate_scratch_bytes(&self) -> Result<usize, BackendParticipantInstallError> {
         self.max_scratch_bytes_per_job
             .checked_mul(self.max_concurrent_jobs)
             .ok_or(BackendParticipantInstallError::AggregateScratchOverflow)
@@ -213,14 +213,14 @@ impl BackendMaterializationPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendOutboundMaterializationGroup {
+pub struct BackendOutboundMaterializationGroup {
     owner: BackendMaterializationOwner,
     profile: ConsumerArtifactProfile,
     route_edge_ids: BTreeSet<BackendRouteEdgeId>,
 }
 
 impl BackendOutboundMaterializationGroup {
-    pub(crate) fn new(
+    pub fn new(
         owner: BackendMaterializationOwner,
         profile: ConsumerArtifactProfile,
         route_edge_ids: impl IntoIterator<Item = BackendRouteEdgeId>,
@@ -240,19 +240,19 @@ impl BackendOutboundMaterializationGroup {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn owner(&self) -> BackendMaterializationOwner {
+    pub const fn owner(&self) -> BackendMaterializationOwner {
         self.owner
     }
-    pub(crate) const fn profile(&self) -> &ConsumerArtifactProfile {
+    pub const fn profile(&self) -> &ConsumerArtifactProfile {
         &self.profile
     }
-    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<BackendRouteEdgeId> {
+    pub const fn route_edge_ids(&self) -> &BTreeSet<BackendRouteEdgeId> {
         &self.route_edge_ids
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendProducerInstall {
+pub struct BackendProducerInstall {
     contract: RuntimeFilterProducerContract,
     coverage_witness: BackendCoverageWitnessId,
     expected_fragment_instances: BTreeSet<UniqueId>,
@@ -260,7 +260,7 @@ pub(crate) struct BackendProducerInstall {
 }
 
 impl BackendProducerInstall {
-    pub(crate) fn new(
+    pub fn new(
         contract: RuntimeFilterProducerContract,
         coverage_witness: BackendCoverageWitnessId,
         expected_fragment_instances: impl IntoIterator<Item = UniqueId>,
@@ -282,22 +282,22 @@ impl BackendProducerInstall {
         })
     }
 
-    pub(crate) const fn contract(&self) -> &RuntimeFilterProducerContract {
+    pub const fn contract(&self) -> &RuntimeFilterProducerContract {
         &self.contract
     }
-    pub(crate) const fn coverage_witness(&self) -> BackendCoverageWitnessId {
+    pub const fn coverage_witness(&self) -> BackendCoverageWitnessId {
         self.coverage_witness
     }
-    pub(crate) const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
+    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
         &self.expected_fragment_instances
     }
-    pub(crate) const fn max_contribution_bytes(&self) -> usize {
+    pub const fn max_contribution_bytes(&self) -> usize {
         self.max_contribution_bytes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendConsumerInstall {
+pub struct BackendConsumerInstall {
     contract: RuntimeFilterConsumerContract,
     profile: ConsumerArtifactProfile,
     route_edge_ids: BTreeSet<BackendRouteEdgeId>,
@@ -305,7 +305,7 @@ pub(crate) struct BackendConsumerInstall {
 }
 
 impl BackendConsumerInstall {
-    pub(crate) fn new(
+    pub fn new(
         contract: RuntimeFilterConsumerContract,
         profile: ConsumerArtifactProfile,
         route_edge_ids: impl IntoIterator<Item = BackendRouteEdgeId>,
@@ -328,22 +328,22 @@ impl BackendConsumerInstall {
         })
     }
 
-    pub(crate) const fn contract(&self) -> &RuntimeFilterConsumerContract {
+    pub const fn contract(&self) -> &RuntimeFilterConsumerContract {
         &self.contract
     }
-    pub(crate) const fn profile(&self) -> &ConsumerArtifactProfile {
+    pub const fn profile(&self) -> &ConsumerArtifactProfile {
         &self.profile
     }
-    pub(crate) const fn route_edge_ids(&self) -> &BTreeSet<BackendRouteEdgeId> {
+    pub const fn route_edge_ids(&self) -> &BTreeSet<BackendRouteEdgeId> {
         &self.route_edge_ids
     }
-    pub(crate) const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
+    pub const fn expected_fragment_instances(&self) -> &BTreeSet<UniqueId> {
         &self.expected_fragment_instances
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendChannelInstall {
+pub struct BackendChannelInstall {
     channel_id: RuntimeFilterChannelId,
     execution_contract: RuntimeFilterExecutionContract,
     lifecycle: BackendChannelLifecycle,
@@ -361,7 +361,7 @@ pub(crate) struct BackendChannelInstall {
 
 impl BackendChannelInstall {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         channel_id: RuntimeFilterChannelId,
         execution_contract: RuntimeFilterExecutionContract,
         lifecycle: BackendChannelLifecycle,
@@ -425,7 +425,7 @@ impl BackendChannelInstall {
         })
     }
 
-    pub(crate) fn with_frontend_feedback_publication(
+    pub fn with_frontend_feedback_publication(
         mut self,
         publication: BackendFrontendFeedbackPublication,
     ) -> Result<Self, BackendParticipantInstallError> {
@@ -446,50 +446,46 @@ impl BackendChannelInstall {
         Ok(self)
     }
 
-    pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
+    pub const fn channel_id(&self) -> RuntimeFilterChannelId {
         self.channel_id
     }
-    pub(crate) const fn execution_contract(&self) -> &RuntimeFilterExecutionContract {
+    pub const fn execution_contract(&self) -> &RuntimeFilterExecutionContract {
         &self.execution_contract
     }
-    pub(crate) const fn lifecycle(&self) -> BackendChannelLifecycle {
+    pub const fn lifecycle(&self) -> BackendChannelLifecycle {
         self.lifecycle
     }
-    pub(crate) const fn availability_coverage(&self) -> &BackendCoverage {
+    pub const fn availability_coverage(&self) -> &BackendCoverage {
         &self.availability_coverage
     }
-    pub(crate) const fn terminal_coverage(&self) -> &BackendCoverage {
+    pub const fn terminal_coverage(&self) -> &BackendCoverage {
         &self.terminal_coverage
     }
-    pub(crate) const fn materialization_policy(&self) -> &BackendMaterializationPolicy {
+    pub const fn materialization_policy(&self) -> &BackendMaterializationPolicy {
         &self.materialization_policy
     }
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn max_reducer_bytes(&self) -> usize {
+    pub const fn max_reducer_bytes(&self) -> usize {
         self.max_reducer_bytes
     }
-    pub(crate) const fn max_artifact_bytes(&self) -> usize {
+    pub const fn max_artifact_bytes(&self) -> usize {
         self.max_artifact_bytes
     }
-    pub(crate) const fn producers(
-        &self,
-    ) -> &BTreeMap<RuntimeFilterBindingId, BackendProducerInstall> {
+    pub const fn producers(&self) -> &BTreeMap<RuntimeFilterBindingId, BackendProducerInstall> {
         &self.producers
     }
-    pub(crate) const fn consumers(
-        &self,
-    ) -> &BTreeMap<RuntimeFilterBindingId, BackendConsumerInstall> {
+    pub const fn consumers(&self) -> &BTreeMap<RuntimeFilterBindingId, BackendConsumerInstall> {
         &self.consumers
     }
-    pub(crate) const fn outbound_materialization_groups(
+    pub const fn outbound_materialization_groups(
         &self,
     ) -> &BTreeMap<ConsumerProfileId, BackendOutboundMaterializationGroup> {
         &self.outbound_materialization_groups
     }
-    pub(crate) const fn frontend_feedback_publication(
+    pub const fn frontend_feedback_publication(
         &self,
     ) -> Option<&BackendFrontendFeedbackPublication> {
         self.frontend_feedback_publication.as_ref()
@@ -497,7 +493,7 @@ impl BackendChannelInstall {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendParticipantInstall {
+pub struct BackendParticipantInstall {
     participant: BackendParticipantIdentity,
     local_participant_id: u32,
     channels: BTreeMap<RuntimeFilterChannelId, BackendChannelInstall>,
@@ -505,7 +501,7 @@ pub(crate) struct BackendParticipantInstall {
 }
 
 impl BackendParticipantInstall {
-    pub(crate) fn new(
+    pub fn new(
         participant: BackendParticipantIdentity,
         local_participant_id: u32,
         channels: impl IntoIterator<Item = BackendChannelInstall>,
@@ -525,19 +521,17 @@ impl BackendParticipantInstall {
         })
     }
 
-    pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
+    pub const fn participant(&self) -> BackendParticipantIdentity {
         self.participant
     }
 
-    pub(crate) const fn local_participant_id(&self) -> u32 {
+    pub const fn local_participant_id(&self) -> u32 {
         self.local_participant_id
     }
-    pub(crate) const fn channels(
-        &self,
-    ) -> &BTreeMap<RuntimeFilterChannelId, BackendChannelInstall> {
+    pub const fn channels(&self) -> &BTreeMap<RuntimeFilterChannelId, BackendChannelInstall> {
         &self.channels
     }
-    pub(crate) const fn routing(&self) -> &BackendRoutingShard {
+    pub const fn routing(&self) -> &BackendRoutingShard {
         &self.routing
     }
 }

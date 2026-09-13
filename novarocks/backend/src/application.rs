@@ -929,7 +929,6 @@ mod tests {
     #[test]
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
         use super::native_runtime_filter_envelope_ingress;
-        use crate::runtime_filter::domain::BackendEnvelopeKind;
         use crate::runtime_filter::test_support::delivery_envelope_for_test;
         use crate::task_execution::QueryContextHost;
         use novarocks_execution_contract::CredentialUpdate;
@@ -942,6 +941,7 @@ mod tests {
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
         use novarocks_worker::SharedFactsRequest;
+        use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
         let services = compose_backend_application_services(
             test_data_runtime(),

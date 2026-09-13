@@ -30,7 +30,7 @@ use novarocks_types::UniqueId;
 use super::{BackendEnvelopeKind, BackendParticipantIdentity, BackendRouteEdgeId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum BackendRouteRole {
+pub enum BackendRouteRole {
     Producer(RuntimeFilterBindingId),
     Consumer(RuntimeFilterBindingId),
     Aggregator,
@@ -38,7 +38,7 @@ pub(crate) enum BackendRouteRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRoutePeer {
+pub enum BackendRoutePeer {
     Loopback,
     Remote {
         participant_id: u32,
@@ -47,16 +47,13 @@ pub(crate) enum BackendRoutePeer {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRouteEndpoint {
+pub struct BackendRouteEndpoint {
     participant_id: u32,
     role: BackendRouteRole,
 }
 
 impl BackendRouteEndpoint {
-    pub(crate) fn new(
-        participant_id: u32,
-        role: BackendRouteRole,
-    ) -> Result<Self, BackendRoutingError> {
+    pub fn new(participant_id: u32, role: BackendRouteRole) -> Result<Self, BackendRoutingError> {
         if participant_id == 0 {
             return Err(BackendRoutingError::ZeroParticipant);
         }
@@ -66,17 +63,17 @@ impl BackendRouteEndpoint {
         })
     }
 
-    pub(crate) const fn participant_id(&self) -> u32 {
+    pub const fn participant_id(&self) -> u32 {
         self.participant_id
     }
 
-    pub(crate) const fn role(&self) -> BackendRouteRole {
+    pub const fn role(&self) -> BackendRouteRole {
         self.role
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRoutingEdge {
+pub struct BackendRoutingEdge {
     id: BackendRouteEdgeId,
     source: BackendRouteEndpoint,
     target: BackendRouteEndpoint,
@@ -85,7 +82,7 @@ pub(crate) struct BackendRoutingEdge {
 }
 
 impl BackendRoutingEdge {
-    pub(crate) fn new(
+    pub fn new(
         id: BackendRouteEdgeId,
         source: BackendRouteEndpoint,
         target: BackendRouteEndpoint,
@@ -117,7 +114,7 @@ impl BackendRoutingEdge {
         })
     }
 
-    pub(crate) const fn id(&self) -> BackendRouteEdgeId {
+    pub const fn id(&self) -> BackendRouteEdgeId {
         self.id
     }
 
@@ -125,19 +122,19 @@ impl BackendRoutingEdge {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn source(&self) -> &BackendRouteEndpoint {
+    pub const fn source(&self) -> &BackendRouteEndpoint {
         &self.source
     }
 
-    pub(crate) const fn target(&self) -> &BackendRouteEndpoint {
+    pub const fn target(&self) -> &BackendRouteEndpoint {
         &self.target
     }
 
-    pub(crate) const fn peer(&self) -> &BackendRoutePeer {
+    pub const fn peer(&self) -> &BackendRoutePeer {
         &self.peer
     }
 
-    pub(crate) fn allows(&self, kind: BackendEnvelopeKind) -> bool {
+    pub fn allows(&self, kind: BackendEnvelopeKind) -> bool {
         self.allowed_kinds.contains(&kind)
     }
 
@@ -148,7 +145,7 @@ impl BackendRoutingEdge {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRemoteRoute {
+pub struct BackendRemoteRoute {
     edge_id: BackendRouteEdgeId,
     participant_id: u32,
     endpoint: RuntimeEndpoint,
@@ -156,7 +153,7 @@ pub(crate) struct BackendRemoteRoute {
 }
 
 impl BackendRemoteRoute {
-    pub(crate) const fn edge_id(&self) -> BackendRouteEdgeId {
+    pub const fn edge_id(&self) -> BackendRouteEdgeId {
         self.edge_id
     }
 
@@ -164,11 +161,11 @@ impl BackendRemoteRoute {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn participant_id(&self) -> u32 {
+    pub const fn participant_id(&self) -> u32 {
         self.participant_id
     }
 
-    pub(crate) const fn endpoint(&self) -> &RuntimeEndpoint {
+    pub const fn endpoint(&self) -> &RuntimeEndpoint {
         &self.endpoint
     }
 
@@ -176,29 +173,29 @@ impl BackendRemoteRoute {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn target_role(&self) -> BackendRouteRole {
+    pub const fn target_role(&self) -> BackendRouteRole {
         self.target_role
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRouteDecision {
+pub struct BackendRouteDecision {
     loopback_route_edge_ids: Vec<BackendRouteEdgeId>,
     remote_routes: Vec<BackendRemoteRoute>,
 }
 
 impl BackendRouteDecision {
-    pub(crate) fn loopback_route_edge_ids(&self) -> &[BackendRouteEdgeId] {
+    pub fn loopback_route_edge_ids(&self) -> &[BackendRouteEdgeId] {
         &self.loopback_route_edge_ids
     }
 
-    pub(crate) fn remote_routes(&self) -> &[BackendRemoteRoute] {
+    pub fn remote_routes(&self) -> &[BackendRemoteRoute] {
         &self.remote_routes
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRoutingChannel {
+pub struct BackendRoutingChannel {
     channel_id: RuntimeFilterChannelId,
     local_roles: BTreeSet<BackendRouteRole>,
     inbound_edges: Vec<BackendRoutingEdge>,
@@ -207,7 +204,7 @@ pub(crate) struct BackendRoutingChannel {
 }
 
 impl BackendRoutingChannel {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: RuntimeFilterChannelId,
         local_roles: impl IntoIterator<Item = BackendRouteRole>,
         inbound_edges: impl IntoIterator<Item = BackendRoutingEdge>,
@@ -264,20 +261,20 @@ impl BackendRoutingChannel {
         })
     }
 
-    pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
+    pub const fn channel_id(&self) -> RuntimeFilterChannelId {
         self.channel_id
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendRoutingShard {
+pub struct BackendRoutingShard {
     participant: BackendParticipantIdentity,
     local_participant_id: u32,
     channels: BTreeMap<RuntimeFilterChannelId, BackendRoutingChannel>,
 }
 
 impl BackendRoutingShard {
-    pub(crate) fn new(
+    pub fn new(
         participant: BackendParticipantIdentity,
         local_participant_id: u32,
         channels: impl IntoIterator<Item = BackendRoutingChannel>,
@@ -303,7 +300,7 @@ impl BackendRoutingShard {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn participant(&self) -> BackendParticipantIdentity {
+    pub const fn participant(&self) -> BackendParticipantIdentity {
         self.participant
     }
 
@@ -311,11 +308,11 @@ impl BackendRoutingShard {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn local_participant_id(&self) -> u32 {
+    pub const fn local_participant_id(&self) -> u32 {
         self.local_participant_id
     }
 
-    pub(crate) fn route_producer(
+    pub fn route_producer(
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
@@ -335,7 +332,7 @@ impl BackendRoutingShard {
         self.decision(channel_id, source, kind, edges)
     }
 
-    pub(crate) fn route_delivery(
+    pub fn route_delivery(
         &self,
         channel_id: RuntimeFilterChannelId,
         route_edge_ids: &[BackendRouteEdgeId],
@@ -364,7 +361,7 @@ impl BackendRoutingShard {
         self.make_decision(edges)
     }
 
-    pub(crate) fn authorize_contribution(
+    pub fn authorize_contribution(
         &self,
         channel_id: RuntimeFilterChannelId,
         binding_id: RuntimeFilterBindingId,
@@ -434,7 +431,7 @@ impl BackendRoutingShard {
         Ok(edge)
     }
 
-    pub(crate) fn authorize_delivery(
+    pub fn authorize_delivery(
         &self,
         channel_id: RuntimeFilterChannelId,
         route_edge_id: BackendRouteEdgeId,
@@ -551,7 +548,7 @@ impl BackendRoutingShard {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRoutingError {
+pub enum BackendRoutingError {
     ZeroParticipant,
     ZeroRouteEdge,
     EmptyAllowedKinds(BackendRouteEdgeId),

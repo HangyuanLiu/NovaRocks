@@ -34,33 +34,30 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendTransportEventIdentity {
+pub struct BackendTransportEventIdentity {
     channel: BackendChannelIdentity,
     route_edge_id: BackendRouteEdgeId,
 }
 
 impl BackendTransportEventIdentity {
-    pub(crate) const fn new(
-        channel: BackendChannelIdentity,
-        route_edge_id: BackendRouteEdgeId,
-    ) -> Self {
+    pub const fn new(channel: BackendChannelIdentity, route_edge_id: BackendRouteEdgeId) -> Self {
         Self {
             channel,
             route_edge_id,
         }
     }
 
-    pub(crate) const fn channel(self) -> BackendChannelIdentity {
+    pub const fn channel(self) -> BackendChannelIdentity {
         self.channel
     }
 
-    pub(crate) const fn route_edge_id(self) -> BackendRouteEdgeId {
+    pub const fn route_edge_id(self) -> BackendRouteEdgeId {
         self.route_edge_id
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendTransportEventKind {
+pub enum BackendTransportEventKind {
     Sent,
     Retried,
     Acked(BackendAcceptStatus),
@@ -68,7 +65,7 @@ pub(crate) enum BackendTransportEventKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendRuntimeFilterEvent {
+pub enum BackendRuntimeFilterEvent {
     DeploymentInstalled {
         participant: super::BackendParticipantIdentity,
     },
@@ -172,7 +169,7 @@ pub(crate) enum BackendRuntimeFilterEvent {
     },
 }
 
-pub(crate) trait BackendRuntimeFilterEventObserver: Send + Sync {
+pub trait BackendRuntimeFilterEventObserver: Send + Sync {
     fn record(&self, event: BackendRuntimeFilterEvent);
 }
 
@@ -183,7 +180,7 @@ pub(crate) trait BackendRuntimeFilterEventObserver: Send + Sync {
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) struct DiscardBackendRuntimeFilterEventObserver;
+pub struct DiscardBackendRuntimeFilterEventObserver;
 
 impl BackendRuntimeFilterEventObserver for DiscardBackendRuntimeFilterEventObserver {
     fn record(&self, _: BackendRuntimeFilterEvent) {}
@@ -191,13 +188,13 @@ impl BackendRuntimeFilterEventObserver for DiscardBackendRuntimeFilterEventObser
 
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct CollectingBackendRuntimeFilterEventObserver(
+pub struct CollectingBackendRuntimeFilterEventObserver(
     std::sync::Mutex<Vec<BackendRuntimeFilterEvent>>,
 );
 
 #[cfg(test)]
 impl CollectingBackendRuntimeFilterEventObserver {
-    pub(crate) fn events(&self) -> Vec<BackendRuntimeFilterEvent> {
+    pub fn events(&self) -> Vec<BackendRuntimeFilterEvent> {
         self.0
             .lock()
             .unwrap_or_else(|error| error.into_inner())

@@ -39,7 +39,7 @@ use super::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendSubscriptionError {
+pub enum BackendSubscriptionError {
     UnknownRoute(BackendRouteEdgeId),
     VersionRegression {
         observed: LogicalVersion,
@@ -63,7 +63,7 @@ enum BlockingState {
     Terminal(SnapshotAcquireOutcome),
 }
 
-pub(crate) struct BackendBlockingSubscription {
+pub struct BackendBlockingSubscription {
     identity: BackendConsumerSubscriptionIdentity,
     events: Arc<dyn BackendRuntimeFilterEventObserver>,
     state: Mutex<BlockingState>,
@@ -163,7 +163,7 @@ struct LiveState {
     terminal: Option<LiveTerminal>,
 }
 
-pub(crate) struct BackendLiveSubscription {
+pub struct BackendLiveSubscription {
     identity: BackendConsumerSubscriptionIdentity,
     events: Arc<dyn BackendRuntimeFilterEventObserver>,
     state: Mutex<LiveState>,
@@ -313,7 +313,7 @@ fn merge_terminal(current: Option<LiveTerminal>, incoming: LiveTerminal) -> Live
 
 /// All Backend-local slots for a consumer binding and its authorized delivery
 /// routes. The group does not materialize artifacts or make evaluator choices.
-pub(crate) struct BackendSubscriptionGroup {
+pub struct BackendSubscriptionGroup {
     #[allow(
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
@@ -329,7 +329,7 @@ enum BackendInstalledSubscriptionSlot {
 }
 
 impl BackendSubscriptionGroup {
-    pub(crate) fn new(
+    pub fn new(
         channel: BackendChannelIdentity,
         consumer_binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
         activation: ConsumerActivation,
@@ -367,7 +367,7 @@ impl BackendSubscriptionGroup {
         }
     }
 
-    pub(crate) fn handle(
+    pub fn handle(
         &self,
         fragment_instance_id: UniqueId,
     ) -> Option<RuntimeFilterSubscriptionHandle> {
@@ -387,11 +387,11 @@ impl BackendSubscriptionGroup {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn activation(&self) -> ConsumerActivation {
+    pub fn activation(&self) -> ConsumerActivation {
         self.activation
     }
 
-    pub(crate) fn publish(
+    pub fn publish(
         &self,
         route_edge_id: BackendRouteEdgeId,
         outcome: SnapshotAcquireOutcome,
@@ -422,7 +422,7 @@ impl BackendSubscriptionGroup {
         Ok(())
     }
 
-    pub(crate) fn publish_terminal(
+    pub fn publish_terminal(
         &self,
         route_edge_id: BackendRouteEdgeId,
         terminal: LiveTerminal,

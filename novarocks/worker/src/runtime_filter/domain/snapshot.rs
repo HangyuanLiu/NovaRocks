@@ -29,7 +29,7 @@ use super::{BackendInstallPolicy, BackendInstallPolicyError};
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) enum BackendLogicalSnapshotError {
+pub enum BackendLogicalSnapshotError {
     InvalidContribution(BackendInstallPolicyError),
     VersionRegression,
 }
@@ -53,7 +53,7 @@ impl std::error::Error for BackendLogicalSnapshotError {}
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) struct BackendLogicalSnapshot {
+pub struct BackendLogicalSnapshot {
     logical_version: LogicalVersion,
     contribution: Arc<contribution::RuntimeFilterContribution>,
 }
@@ -63,7 +63,7 @@ impl BackendLogicalSnapshot {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn new(
+    pub fn new(
         policy: &BackendInstallPolicy,
         logical_version: LogicalVersion,
         contribution: RuntimeFilterContribution,
@@ -81,7 +81,7 @@ impl BackendLogicalSnapshot {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn next_after(
+    pub fn next_after(
         previous: &Self,
         policy: &BackendInstallPolicy,
         contribution: RuntimeFilterContribution,
@@ -97,7 +97,7 @@ impl BackendLogicalSnapshot {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn logical_version(&self) -> LogicalVersion {
+    pub const fn logical_version(&self) -> LogicalVersion {
         self.logical_version
     }
 
@@ -105,7 +105,7 @@ impl BackendLogicalSnapshot {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn contribution(&self) -> &Arc<contribution::RuntimeFilterContribution> {
+    pub const fn contribution(&self) -> &Arc<contribution::RuntimeFilterContribution> {
         &self.contribution
     }
 }
@@ -116,20 +116,20 @@ impl BackendLogicalSnapshot {
 /// accepted streams.  The semantic payload remains an Execution value; only
 /// the publication identity and reduction lifetime are Backend-owned.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendReducedLogicalSnapshot {
+pub struct BackendReducedLogicalSnapshot {
     channel_id: RuntimeFilterChannelId,
     logical_version: LogicalVersion,
     domain: BackendReducedLogicalDomain,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendReducedLogicalDomain {
+pub enum BackendReducedLogicalDomain {
     Membership(contribution::ValueDomainDelta),
     OrderedBound(contribution::OrderedTuple),
 }
 
 impl BackendReducedLogicalSnapshot {
-    pub(crate) const fn membership(
+    pub const fn membership(
         channel_id: RuntimeFilterChannelId,
         logical_version: LogicalVersion,
         domain: contribution::ValueDomainDelta,
@@ -141,7 +141,7 @@ impl BackendReducedLogicalSnapshot {
         }
     }
 
-    pub(crate) const fn ordered_bound(
+    pub const fn ordered_bound(
         channel_id: RuntimeFilterChannelId,
         logical_version: LogicalVersion,
         bound: contribution::OrderedTuple,
@@ -153,15 +153,15 @@ impl BackendReducedLogicalSnapshot {
         }
     }
 
-    pub(crate) const fn channel_id(&self) -> RuntimeFilterChannelId {
+    pub const fn channel_id(&self) -> RuntimeFilterChannelId {
         self.channel_id
     }
 
-    pub(crate) const fn logical_version(&self) -> LogicalVersion {
+    pub const fn logical_version(&self) -> LogicalVersion {
         self.logical_version
     }
 
-    pub(crate) const fn domain(&self) -> &BackendReducedLogicalDomain {
+    pub const fn domain(&self) -> &BackendReducedLogicalDomain {
         &self.domain
     }
 }

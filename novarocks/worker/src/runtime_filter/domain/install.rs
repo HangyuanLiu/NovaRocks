@@ -25,7 +25,7 @@ use novarocks_execution::runtime_filter::{
 use super::{BackendChannelIdentity, BackendCoverage, BackendParticipantIdentity};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendInstallPolicyError {
+pub enum BackendInstallPolicyError {
     ZeroContributionBudget,
     ContributionTooLarge,
     ContributionKindMismatch,
@@ -50,7 +50,7 @@ impl std::error::Error for BackendInstallPolicyError {}
 /// values; this type adds the participant authority, coverage, and resource
 /// ceiling that only Backend owns.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct BackendInstallPolicy {
+pub struct BackendInstallPolicy {
     channel: BackendChannelIdentity,
     producer: RuntimeFilterProducerContract,
     coverage: BackendCoverage,
@@ -58,7 +58,7 @@ pub(crate) struct BackendInstallPolicy {
 }
 
 impl BackendInstallPolicy {
-    pub(crate) fn new(
+    pub fn new(
         participant: BackendParticipantIdentity,
         producer: RuntimeFilterProducerContract,
         coverage: BackendCoverage,
@@ -79,11 +79,11 @@ impl BackendInstallPolicy {
         })
     }
 
-    pub(crate) const fn channel(&self) -> BackendChannelIdentity {
+    pub const fn channel(&self) -> BackendChannelIdentity {
         self.channel
     }
 
-    pub(crate) const fn producer(&self) -> &RuntimeFilterProducerContract {
+    pub const fn producer(&self) -> &RuntimeFilterProducerContract {
         &self.producer
     }
 
@@ -91,22 +91,22 @@ impl BackendInstallPolicy {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn coverage(&self) -> &BackendCoverage {
+    pub const fn coverage(&self) -> &BackendCoverage {
         &self.coverage
     }
 
-    pub(crate) const fn max_contribution_bytes(&self) -> usize {
+    pub const fn max_contribution_bytes(&self) -> usize {
         self.max_contribution_bytes
     }
 
-    pub(crate) fn contract_digest(&self) -> [u8; 32] {
+    pub fn contract_digest(&self) -> [u8; 32] {
         match self.producer.contract() {
             RuntimeFilterExecutionContract::Membership(schema) => schema.digest(),
             RuntimeFilterExecutionContract::Ordered(contract) => contract.digest(),
         }
     }
 
-    pub(crate) fn decode_contribution(
+    pub fn decode_contribution(
         &self,
         contribution: &RuntimeFilterContribution,
     ) -> Result<contribution::RuntimeFilterContribution, BackendInstallPolicyError> {

@@ -32,46 +32,46 @@ mod transport;
 /// Per installed producer instance bound used by both the execution binding
 /// and the terminal observation store. A partition id is never a free-form
 /// observation key beyond this frozen bound.
-pub(crate) const MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE: u32 = 16_384;
+pub const MAX_RUNTIME_FILTER_PRODUCER_PARTITIONS_PER_INSTANCE: u32 = 16_384;
 
-pub(crate) use coverage::{
+pub use coverage::{
     BackendCoverage, BackendCoverageProgress, BackendCoverageState, BackendCoverageWitnessId,
 };
-pub(crate) use dedupe::{BackendDeliveryAdmission, BackendIngressDedupe};
+pub use dedupe::{BackendDeliveryAdmission, BackendIngressDedupe};
 #[cfg(test)]
-pub(crate) use events::CollectingBackendRuntimeFilterEventObserver;
-pub(crate) use events::{
+pub use events::CollectingBackendRuntimeFilterEventObserver;
+pub use events::{
     BackendRuntimeFilterEvent, BackendRuntimeFilterEventObserver, BackendTransportEventIdentity,
     BackendTransportEventKind,
 };
-pub(crate) use identity::{
+pub use identity::{
     BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendParticipantIdentity,
     BackendProducerStreamIdentity, BackendRouteEdgeId, BackendTransportSequence,
 };
-pub(crate) use install::{BackendInstallPolicy, BackendInstallPolicyError};
-pub(crate) use participant_install::{
+pub use install::{BackendInstallPolicy, BackendInstallPolicyError};
+pub use participant_install::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall,
     BackendFrontendFeedbackPublication, BackendMaterializationOwner, BackendMaterializationPolicy,
     BackendOutboundMaterializationGroup, BackendParticipantInstall, BackendProducerInstall,
 };
-pub(crate) use reducer::{MembershipReducer, ReducerError};
-pub(crate) use reduction_state::{
+pub use reducer::{MembershipReducer, ReducerError};
+pub use reduction_state::{
     BackendReductionApply, BackendReductionState, BackendReductionStateError,
 };
-pub(crate) use routing::{
+pub use routing::{
     BackendRemoteRoute, BackendRouteDecision, BackendRouteEndpoint, BackendRoutePeer,
     BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge, BackendRoutingError,
     BackendRoutingShard,
 };
-pub(crate) use session::{
+pub use session::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackSink, BackendMaterializedDelivery,
     BackendMaterializedDeliverySink, BackendRuntimeFilterSession,
 };
 #[cfg(test)]
-pub(crate) use snapshot::BackendLogicalSnapshot;
-pub(crate) use snapshot::{BackendReducedLogicalDomain, BackendReducedLogicalSnapshot};
-pub(crate) use subscription::{BackendSubscriptionError, BackendSubscriptionGroup};
-pub(crate) use transport::{
+pub use snapshot::BackendLogicalSnapshot;
+pub use snapshot::{BackendReducedLogicalDomain, BackendReducedLogicalSnapshot};
+pub use subscription::{BackendSubscriptionError, BackendSubscriptionGroup};
+pub use transport::{
     BackendAcceptStatus, BackendContributionRouteIdentity, BackendDeliveryRouteIdentity,
     BackendEnvelopeKind, BackendIngressResult, BackendProducerOpenMetadata,
     BackendTransportFailOpenReason,

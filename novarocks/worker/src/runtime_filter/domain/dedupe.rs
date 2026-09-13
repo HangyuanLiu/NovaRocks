@@ -36,7 +36,7 @@ type RouteVersionState = BTreeMap<(BackendRouteEdgeId, LogicalVersion), ([u8; 32
     dead_code,
     reason = "Retained for staged backend runtime-filter domain and materialization integration."
 )]
-pub(crate) enum BackendContributionAdmission {
+pub enum BackendContributionAdmission {
     Fresh,
     DuplicateRetry,
     Conflict,
@@ -44,7 +44,7 @@ pub(crate) enum BackendContributionAdmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendDeliveryAdmission {
+pub enum BackendDeliveryAdmission {
     Fresh,
     Duplicate,
     Conflict,
@@ -54,7 +54,7 @@ pub(crate) enum BackendDeliveryAdmission {
 /// Query-scoped bounded identity state. A repeated contribution is only a
 /// retry when its exact content digest agrees; otherwise the caller must
 /// surface the conflict instead of silently swallowing it.
-pub(crate) struct BackendIngressDedupe {
+pub struct BackendIngressDedupe {
     max_identities_per_channel: usize,
     state: Mutex<BackendIngressDedupeState>,
     changed: Condvar,
@@ -74,7 +74,7 @@ struct BackendIngressDedupeState {
 }
 
 impl BackendIngressDedupe {
-    pub(crate) fn new(max_identities_per_channel: usize) -> Self {
+    pub fn new(max_identities_per_channel: usize) -> Self {
         assert!(
             max_identities_per_channel > 0,
             "dedupe must admit one identity"
@@ -90,7 +90,7 @@ impl BackendIngressDedupe {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn admit_contribution(
+    pub fn admit_contribution(
         &self,
         route: BackendContributionRouteIdentity,
         digest: [u8; 32],
@@ -111,7 +111,7 @@ impl BackendIngressDedupe {
         }
     }
 
-    pub(crate) fn reserve_delivery(
+    pub fn reserve_delivery(
         &self,
         route: BackendDeliveryRouteIdentity,
         version: Option<LogicalVersion>,
@@ -208,7 +208,7 @@ impl BackendIngressDedupe {
         }
     }
 
-    pub(crate) fn commit_delivery(
+    pub fn commit_delivery(
         &self,
         route: BackendDeliveryRouteIdentity,
         version: Option<LogicalVersion>,
@@ -237,7 +237,7 @@ impl BackendIngressDedupe {
         self.changed.notify_all();
     }
 
-    pub(crate) fn abort_delivery(
+    pub fn abort_delivery(
         &self,
         route: BackendDeliveryRouteIdentity,
         version: Option<LogicalVersion>,

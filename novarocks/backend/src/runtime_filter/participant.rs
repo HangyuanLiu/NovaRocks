@@ -41,16 +41,6 @@ use novarocks_types::UniqueId;
 use prost::Message;
 use sha2::{Digest, Sha256};
 
-use super::domain::{
-    BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendDeliveryAdmission,
-    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink,
-    BackendIngressDedupe, BackendIngressResult, BackendMaterializedDelivery,
-    BackendMaterializedDeliverySink, BackendParticipantInstall, BackendProducerStreamIdentity,
-    BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
-    BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
-    BackendTransportEventKind, BackendTransportFailOpenReason,
-};
-use super::observation::{RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot};
 use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
@@ -64,6 +54,18 @@ use crate::runtime_filter::transport::{
     GrpcRuntimeFilterEnvelopeSink,
 };
 use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_worker::runtime_filter::domain::{
+    BackendChannelIdentity, BackendConsumerSubscriptionIdentity, BackendDeliveryAdmission,
+    BackendDeliveryRouteIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink,
+    BackendIngressDedupe, BackendIngressResult, BackendMaterializedDelivery,
+    BackendMaterializedDeliverySink, BackendParticipantInstall, BackendProducerStreamIdentity,
+    BackendRouteDecision, BackendRoutingError, BackendRuntimeFilterEvent,
+    BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession, BackendTransportEventIdentity,
+    BackendTransportEventKind, BackendTransportFailOpenReason,
+};
+use novarocks_worker::runtime_filter::observation::{
+    RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot,
+};
 use novarocks_worker::{
     RuntimeFilterContractError, RuntimeFilterContractErrorCode,
     runtime_filter::{
@@ -1046,11 +1048,15 @@ impl BackendParticipantOutbound {
                 binding_id,
                 fragment_instance_id,
                 partition,
-                super::domain::BackendTransportSequence::new(sequence.get()),
+                novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(
+                    sequence.get(),
+                ),
             )),
             Some(
-                super::domain::BackendProducerOpenMetadata::try_new(local_partition_count)
-                    .map_err(|error| outbound_violation(error.to_string()))?,
+                novarocks_worker::runtime_filter::domain::BackendProducerOpenMetadata::try_new(
+                    local_partition_count,
+                )
+                .map_err(|error| outbound_violation(error.to_string()))?,
             ),
             None,
             contribution.contract_digest(),
@@ -1082,11 +1088,15 @@ impl BackendParticipantOutbound {
                 binding_id,
                 fragment_instance_id,
                 partition,
-                super::domain::BackendTransportSequence::new(sequence.get()),
+                novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(
+                    sequence.get(),
+                ),
             )),
             Some(
-                super::domain::BackendProducerOpenMetadata::try_new(local_partition_count)
-                    .map_err(|error| outbound_violation(error.to_string()))?,
+                novarocks_worker::runtime_filter::domain::BackendProducerOpenMetadata::try_new(
+                    local_partition_count,
+                )
+                .map_err(|error| outbound_violation(error.to_string()))?,
             ),
             None,
             [0; 32],
@@ -1177,8 +1187,8 @@ impl BackendParticipantOutbound {
     fn delivery_envelope(
         &self,
         delivery: &BackendMaterializedDelivery,
-        route_edge_id: super::domain::BackendRouteEdgeId,
-        sequence: super::domain::BackendTransportSequence,
+        route_edge_id: novarocks_worker::runtime_filter::domain::BackendRouteEdgeId,
+        sequence: novarocks_worker::runtime_filter::domain::BackendTransportSequence,
     ) -> Result<BackendNativeRuntimeFilterEnvelope, RuntimeFilterContractViolation> {
         BackendNativeRuntimeFilterEnvelope::new(
             delivery.kind(),
@@ -1196,8 +1206,10 @@ impl BackendParticipantOutbound {
         .map_err(outbound_violation)
     }
 
-    fn next_delivery_sequence(&self) -> super::domain::BackendTransportSequence {
-        super::domain::BackendTransportSequence::new(
+    fn next_delivery_sequence(
+        &self,
+    ) -> novarocks_worker::runtime_filter::domain::BackendTransportSequence {
+        novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(
             self.next_delivery_sequence.fetch_add(1, Ordering::Relaxed),
         )
     }
@@ -1216,7 +1228,7 @@ impl BackendParticipantOutbound {
 
     fn submit_remote(
         &self,
-        route: super::domain::BackendRemoteRoute,
+        route: novarocks_worker::runtime_filter::domain::BackendRemoteRoute,
         envelope: BackendNativeRuntimeFilterEnvelope,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
     ) {
@@ -1361,7 +1373,7 @@ impl BackendMaterializedDeliverySink for BackendParticipantOutbound {
 
 struct BackendRuntimeFilterExecutionContext {
     fragment_instance_id: UniqueId,
-    participant: super::domain::BackendParticipantIdentity,
+    participant: novarocks_worker::runtime_filter::domain::BackendParticipantIdentity,
     producers: BTreeMap<
         novarocks_execution::runtime_filter::RuntimeFilterBindingId,
         Arc<BackendRuntimeFilterSession>,
@@ -1741,7 +1753,11 @@ mod tests {
     use novarocks_types::QueryId;
 
     use super::*;
-    use crate::runtime_filter::domain::{
+    use crate::runtime_filter::transport::{
+        BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
+    };
+    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
+    use novarocks_worker::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
         BackendMaterializationOwner, BackendMaterializationPolicy,
         BackendOutboundMaterializationGroup, BackendParticipantIdentity,
@@ -1749,11 +1765,7 @@ mod tests {
         BackendRoutePeer, BackendRouteRole, BackendRoutingChannel, BackendRoutingEdge,
         BackendRoutingShard,
     };
-    use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
-    use crate::runtime_filter::transport::{
-        BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
-    };
-    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
+    use novarocks_worker::runtime_filter::fixture::BackendRuntimeFilterFixture;
 
     struct ForwardingSink {
         target: Arc<RuntimeFilterParticipant>,
@@ -1770,8 +1782,8 @@ mod tests {
             assert!(
                 matches!(
                     result.status(),
-                    super::super::domain::BackendAcceptStatus::Accepted
-                        | super::super::domain::BackendAcceptStatus::Duplicate
+                    novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
+                        | novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
                 ),
                 "remote envelope rejected: {:?}",
                 result.rejection_reason()
@@ -1780,8 +1792,8 @@ mod tests {
             assert!(
                 matches!(
                     replay.status(),
-                    super::super::domain::BackendAcceptStatus::Accepted
-                        | super::super::domain::BackendAcceptStatus::Duplicate
+                    novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
+                        | novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
                 ),
                 "replayed remote envelope rejected: {:?}",
                 replay.rejection_reason()
@@ -1858,7 +1870,8 @@ mod tests {
             contract.clone(),
         )
         .expect("FinalDomain producer contract is valid");
-        let coverage_witness = super::super::domain::BackendCoverageWitnessId::new(79);
+        let coverage_witness =
+            novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(79);
         let coverage = BackendCoverage::witness(coverage_witness);
         let channel = BackendChannelInstall::new(
             producer.channel_id(),
@@ -1870,13 +1883,15 @@ mod tests {
                 .expect("materialization policy"),
             max_contribution_bytes,
             4096,
-            [super::super::domain::BackendProducerInstall::new(
-                producer.clone(),
-                coverage_witness,
-                [fragment_instance],
-                max_contribution_bytes,
-            )
-            .expect("FinalDomain producer install")],
+            [
+                novarocks_worker::runtime_filter::domain::BackendProducerInstall::new(
+                    producer.clone(),
+                    coverage_witness,
+                    [fragment_instance],
+                    max_contribution_bytes,
+                )
+                .expect("FinalDomain producer install"),
+            ],
             [],
             [],
         )
@@ -2104,7 +2119,7 @@ mod tests {
         assert_eq!(
             channel.terminal(),
             Some(
-                super::super::observation::RuntimeFilterChannelTerminal::Completed(
+                novarocks_worker::runtime_filter::observation::RuntimeFilterChannelTerminal::Completed(
                     LogicalVersion::FIRST
                 )
             )
@@ -2312,13 +2327,15 @@ mod tests {
             policy.clone(),
             4096,
             4096,
-            [super::super::domain::BackendProducerInstall::new(
-                producer.clone(),
-                super::super::domain::BackendCoverageWitnessId::new(29),
-                [source_instance],
-                4096,
-            )
-            .expect("source producer")],
+            [
+                novarocks_worker::runtime_filter::domain::BackendProducerInstall::new(
+                    producer.clone(),
+                    novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29),
+                    [source_instance],
+                    4096,
+                )
+                .expect("source producer"),
+            ],
             [],
             [BackendOutboundMaterializationGroup::new(
                 BackendMaterializationOwner::DirectSource,
@@ -2332,8 +2349,12 @@ mod tests {
             producer.channel_id(),
             execution_contract,
             BackendChannelLifecycle::CompleteOnce,
-            BackendCoverage::witness(super::super::domain::BackendCoverageWitnessId::new(29)),
-            BackendCoverage::witness(super::super::domain::BackendCoverageWitnessId::new(29)),
+            BackendCoverage::witness(
+                novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29),
+            ),
+            BackendCoverage::witness(
+                novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29),
+            ),
             policy,
             4096,
             4096,
@@ -2495,7 +2516,7 @@ mod tests {
             consumer.latest_delivered_version().is_some()
                 && matches!(
                     consumer.outcome(),
-                    Some(super::super::observation::RuntimeFilterConsumerOutcome::Acquired)
+                    Some(novarocks_worker::runtime_filter::observation::RuntimeFilterConsumerOutcome::Acquired)
                 )
         }));
     }
@@ -2506,7 +2527,7 @@ mod tests {
         let identity = fixture.identity();
         let producer = fixture.producer_contract();
         let source_instance = UniqueId::new(101, 102);
-        let witness = super::super::domain::BackendCoverageWitnessId::new(29);
+        let witness = novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29);
         let source_endpoint =
             BackendRouteEndpoint::new(1, BackendRouteRole::Producer(producer.binding_id()))
                 .expect("source endpoint");
@@ -2534,13 +2555,15 @@ mod tests {
                 .expect("materialization policy"),
             4096,
             4096,
-            [super::super::domain::BackendProducerInstall::new(
-                producer.clone(),
-                witness,
-                [source_instance],
-                4096,
-            )
-            .expect("producer install")],
+            [
+                novarocks_worker::runtime_filter::domain::BackendProducerInstall::new(
+                    producer.clone(),
+                    witness,
+                    [source_instance],
+                    4096,
+                )
+                .expect("producer install"),
+            ],
             [],
             [],
         )
@@ -2596,7 +2619,7 @@ mod tests {
                         producer.binding_id(),
                         source_instance,
                         novarocks_execution::runtime_filter::PartitionId::new(0),
-                        super::super::domain::BackendTransportSequence::new(0),
+                        novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(0),
                     ),
                 ),
                 Some(BackendProducerOpenMetadata::try_new(1).expect("producer open")),
@@ -2609,11 +2632,11 @@ mod tests {
 
         assert_eq!(
             participant.dispatch_envelope(envelope()).status(),
-            super::super::domain::BackendAcceptStatus::Accepted
+            novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
         );
         assert_eq!(
             participant.dispatch_envelope(envelope()).status(),
-            super::super::domain::BackendAcceptStatus::Duplicate
+            novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
         );
 
         let snapshot = participant.capture_runtime_filter_observation();
@@ -2668,8 +2691,12 @@ mod tests {
             producer.channel_id(),
             producer.contract().clone(),
             BackendChannelLifecycle::CompleteOnce,
-            BackendCoverage::witness(super::super::domain::BackendCoverageWitnessId::new(29)),
-            BackendCoverage::witness(super::super::domain::BackendCoverageWitnessId::new(29)),
+            BackendCoverage::witness(
+                novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29),
+            ),
+            BackendCoverage::witness(
+                novarocks_worker::runtime_filter::domain::BackendCoverageWitnessId::new(29),
+            ),
             policy,
             4096,
             4096,
@@ -2745,7 +2772,7 @@ mod tests {
             producer.channel_id(),
             BackendNativeRouteIdentity::delivery(BackendNativeDeliveryRouteIdentity::new(
                 edge_id,
-                super::super::domain::BackendTransportSequence::new(1),
+                novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(1),
             )),
             None,
             None,
@@ -2756,7 +2783,7 @@ mod tests {
 
         assert!(matches!(
             target.dispatch_envelope(envelope).status(),
-            super::super::domain::BackendAcceptStatus::Accepted
+            novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
         ));
         assert!(matches!(
             subscription.acquire(Duration::from_millis(1)),

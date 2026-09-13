@@ -24,24 +24,24 @@ use novarocks_types::UniqueId;
 /// local to the participant domain; Execution owns fragment semantics, not
 /// participant lifetime.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendParticipantIdentity {
+pub struct BackendParticipantIdentity {
     query_id: UniqueId,
     deployment_epoch: u64,
 }
 
 impl BackendParticipantIdentity {
-    pub(crate) const fn new(query_id: UniqueId, deployment_epoch: u64) -> Self {
+    pub const fn new(query_id: UniqueId, deployment_epoch: u64) -> Self {
         Self {
             query_id,
             deployment_epoch,
         }
     }
 
-    pub(crate) const fn query_id(self) -> UniqueId {
+    pub const fn query_id(self) -> UniqueId {
         self.query_id
     }
 
-    pub(crate) const fn deployment_epoch(self) -> u64 {
+    pub const fn deployment_epoch(self) -> u64 {
         self.deployment_epoch
     }
 }
@@ -50,14 +50,14 @@ impl BackendParticipantIdentity {
 /// stay in Execution's vocabulary so the participant never mirrors fragment
 /// contract identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendChannelIdentity {
+pub struct BackendChannelIdentity {
     participant: BackendParticipantIdentity,
     binding_id: RuntimeFilterBindingId,
     channel_id: RuntimeFilterChannelId,
 }
 
 impl BackendChannelIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         participant: BackendParticipantIdentity,
         binding_id: RuntimeFilterBindingId,
         channel_id: RuntimeFilterChannelId,
@@ -73,15 +73,15 @@ impl BackendChannelIdentity {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn participant(self) -> BackendParticipantIdentity {
+    pub const fn participant(self) -> BackendParticipantIdentity {
         self.participant
     }
 
-    pub(crate) const fn binding_id(self) -> RuntimeFilterBindingId {
+    pub const fn binding_id(self) -> RuntimeFilterBindingId {
         self.binding_id
     }
 
-    pub(crate) const fn channel_id(self) -> RuntimeFilterChannelId {
+    pub const fn channel_id(self) -> RuntimeFilterChannelId {
         self.channel_id
     }
 }
@@ -89,7 +89,7 @@ impl BackendChannelIdentity {
 /// One producer partition under a sealed Backend channel. This is a routing
 /// coordinate only; it contains no contribution or reducer state.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendProducerStreamIdentity {
+pub struct BackendProducerStreamIdentity {
     channel: BackendChannelIdentity,
     fragment_instance_id: UniqueId,
     partition_id: PartitionId,
@@ -98,42 +98,42 @@ pub(crate) struct BackendProducerStreamIdentity {
 /// Backend-private physical route edge.  It is intentionally not an Execution
 /// identifier: route topology is a participant delivery concern.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendRouteEdgeId(u64);
+pub struct BackendRouteEdgeId(u64);
 
 impl BackendRouteEdgeId {
-    pub(crate) const fn new(raw: u64) -> Self {
+    pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
 
 /// Monotonic transport sequence scoped by its Backend route identity.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendTransportSequence(u64);
+pub struct BackendTransportSequence(u64);
 
 impl BackendTransportSequence {
-    pub(crate) const fn new(raw: u64) -> Self {
+    pub const fn new(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub(crate) const fn get(self) -> u64 {
+    pub const fn get(self) -> u64 {
         self.0
     }
 }
 
 /// One Backend-local consumer instance subscribed to a sealed channel.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct BackendConsumerSubscriptionIdentity {
+pub struct BackendConsumerSubscriptionIdentity {
     channel: BackendChannelIdentity,
     consumer_binding_id: RuntimeFilterBindingId,
     fragment_instance_id: UniqueId,
 }
 
 impl BackendConsumerSubscriptionIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         channel: BackendChannelIdentity,
         consumer_binding_id: RuntimeFilterBindingId,
         fragment_instance_id: UniqueId,
@@ -145,21 +145,21 @@ impl BackendConsumerSubscriptionIdentity {
         }
     }
 
-    pub(crate) const fn channel(self) -> BackendChannelIdentity {
+    pub const fn channel(self) -> BackendChannelIdentity {
         self.channel
     }
 
-    pub(crate) const fn consumer_binding_id(self) -> RuntimeFilterBindingId {
+    pub const fn consumer_binding_id(self) -> RuntimeFilterBindingId {
         self.consumer_binding_id
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 }
 
 impl BackendProducerStreamIdentity {
-    pub(crate) const fn new(
+    pub const fn new(
         channel: BackendChannelIdentity,
         fragment_instance_id: UniqueId,
         partition_id: PartitionId,
@@ -171,15 +171,15 @@ impl BackendProducerStreamIdentity {
         }
     }
 
-    pub(crate) const fn channel(self) -> BackendChannelIdentity {
+    pub const fn channel(self) -> BackendChannelIdentity {
         self.channel
     }
 
-    pub(crate) const fn fragment_instance_id(self) -> UniqueId {
+    pub const fn fragment_instance_id(self) -> UniqueId {
         self.fragment_instance_id
     }
 
-    pub(crate) const fn partition_id(self) -> PartitionId {
+    pub const fn partition_id(self) -> PartitionId {
         self.partition_id
     }
 }

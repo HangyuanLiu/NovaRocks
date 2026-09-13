@@ -21,7 +21,7 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum BackendReductionApply {
+pub enum BackendReductionApply {
     Applied { version: LogicalVersion },
     Duplicate,
     Stale,
@@ -29,7 +29,7 @@ pub(crate) enum BackendReductionApply {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum BackendReductionStateError {
+pub enum BackendReductionStateError {
     Install(BackendInstallPolicyError),
     ReplayConflict,
     #[allow(
@@ -78,7 +78,7 @@ impl StreamReplay {
 /// One Backend channel's mutable participant reduction.  Contribution bodies
 /// are copied only from Execution typed values; canonical frame validation
 /// happened in [`BackendInstallPolicy`].
-pub(crate) struct BackendReductionState {
+pub struct BackendReductionState {
     policy: BackendInstallPolicy,
     streams: BTreeMap<BackendProducerStreamIdentity, StreamReplay>,
     membership: Option<MembershipReducer>,
@@ -88,7 +88,7 @@ pub(crate) struct BackendReductionState {
 }
 
 impl BackendReductionState {
-    pub(crate) fn new(policy: BackendInstallPolicy) -> Result<Self, BackendReductionStateError> {
+    pub fn new(policy: BackendInstallPolicy) -> Result<Self, BackendReductionStateError> {
         let membership = match policy.producer().contract() {
             RuntimeFilterExecutionContract::Membership(schema) => Some(
                 MembershipReducer::try_new(schema.data_type().clone(), schema.null_semantics())
@@ -110,11 +110,11 @@ impl BackendReductionState {
         dead_code,
         reason = "Retained for staged backend runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn policy(&self) -> &BackendInstallPolicy {
+    pub const fn policy(&self) -> &BackendInstallPolicy {
         &self.policy
     }
 
-    pub(crate) fn latest_snapshot(&self) -> Option<BackendReducedLogicalSnapshot> {
+    pub fn latest_snapshot(&self) -> Option<BackendReducedLogicalSnapshot> {
         let version = self.version?;
         match self.policy.producer().contract() {
             RuntimeFilterExecutionContract::Membership(_) => {
@@ -138,7 +138,7 @@ impl BackendReductionState {
         }
     }
 
-    pub(crate) fn submit(
+    pub fn submit(
         &mut self,
         stream: BackendProducerStreamIdentity,
         sequence: ProducerSequence,

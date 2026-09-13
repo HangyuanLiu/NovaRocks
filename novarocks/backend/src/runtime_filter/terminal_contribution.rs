@@ -28,10 +28,10 @@
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionV1;
 use tracing::warn;
 
-use super::observation::{
+use novarocks_worker::RuntimeFilterContractError;
+use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
-use novarocks_worker::RuntimeFilterContractError;
 
 /// The stage every unavailable runtime-filter contribution names.
 pub(crate) const RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE: &str = "runtime_filter_terminal_capture";

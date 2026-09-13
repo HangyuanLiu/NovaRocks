@@ -13,7 +13,7 @@ use super::{
     BackendReducedLogicalDomain, BackendReducedLogicalSnapshot, BackendReductionApply,
     BackendReductionState,
 };
-use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
+use crate::runtime_filter::fixture::BackendRuntimeFilterFixture;
 
 #[test]
 fn membership_install_accepts_only_its_exact_execution_contribution() {
