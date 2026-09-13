@@ -49,27 +49,24 @@ use std::sync::Arc;
 use novarocks_execution_contract::task_execution::operation::{
     OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::domain::{
-    ConfidentialTransport, refuse_confidential_material_in_the_clear,
-};
+use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_task_codec::operation::{
-    DecodedOperation, DecodedUpdateQueryContext, decode_operation_batch, encode_abort_cause_field,
-    encode_create_task_ack, encode_query_context_ack, encode_query_context_admission_ticket_ack,
-    encode_receipt, encode_release_ack, encode_update_task_ack,
+    DecodedOperation, DecodedUpdateQueryContext, encode_abort_cause_field, encode_create_task_ack,
+    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
+    encode_release_ack, encode_update_task_ack,
 };
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
 use super::TaskExecutionRegistry;
 use novarocks_native_adapter::task_protocol::{
-    TaskExecutionIngress, TaskObservationReader, TaskOperationReceiptAck as ReceiptAck,
-    TaskResultRead, TaskResultReadError, TaskResultReadRequest, TaskResultReader,
-    TaskStatusEventStream, TaskStatusSubscriptionReader, encode_operation_receipt,
-    fetch_task_dynamic_filters, fetch_task_result, get_final_task_info, host_rejection_status,
-    subscribe_task_status,
+    TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
+    TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
+    TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
+    apply_task_operations, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
+    get_final_task_info, host_rejection_status, subscribe_task_status,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance};
@@ -393,35 +390,26 @@ impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
     }
 }
 
+impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
+    fn native_transport_confidentiality(&self) -> ConfidentialTransport {
+        self.native_transport_confidentiality
+    }
+
+    fn apply_task_operation(
+        &self,
+        operation: &DecodedOperation,
+    ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
+        self.apply_one(operation)
+    }
+}
+
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
         &self,
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
-        // Confidential bytes are refused on the raw request, before any
-        // domain decoder can project or retain them and before any registry
-        // operation can take effect. The fact comes from the same
-        // Server-resolved transport mode that configured this BE listener.
-        refuse_confidential_material_in_the_clear(
-            &request,
-            self.native_transport_confidentiality,
-            FieldPath::root("apply_task_operations"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        // The transport budget is checked over the whole batch before any
-        // item is decoded, so an oversized batch never reaches the owner.
-        let operations = decode_operation_batch(
-            &request,
-            TransportBudget::DEFAULT,
-            FieldPath::root("apply_task_operations"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let mut receipts = Vec::with_capacity(operations.len());
-        for operation in &operations {
-            receipts.push(self.apply_one(operation)?);
-        }
-        Ok(proto::ApplyTaskOperationsResponse { receipts })
+        apply_task_operations(self, request)
     }
 
     fn subscribe_task_status(
@@ -484,6 +472,7 @@ mod tests {
         TaskStatusVersion,
     };
     use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, common, plan};
     use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,

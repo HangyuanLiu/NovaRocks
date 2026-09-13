@@ -44,11 +44,15 @@ use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailu
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{
-    decode_context_aware_subscribe_task_status, decode_fetch_dynamic_filters,
-    decode_get_final_task_info, encode_context_convergence_event, encode_operation_outcome,
-    encode_receipt, encode_status_event, encode_task_gone_event,
+    DecodedOperation, decode_context_aware_subscribe_task_status, decode_fetch_dynamic_filters,
+    decode_get_final_task_info, decode_operation_batch, encode_context_convergence_event,
+    encode_operation_outcome, encode_receipt, encode_status_event, encode_task_gone_event,
 };
 use novarocks_task_codec::status::encode_final_task_info;
+use novarocks_task_codec::{
+    TransportBudget,
+    domain::{ConfidentialTransport, refuse_confidential_material_in_the_clear},
+};
 use novarocks_task_codec::{
     domain::encode_task_dynamic_filter_domain, identity::encode_task_identity,
 };
@@ -180,6 +184,48 @@ pub trait TaskObservationReader: Send + Sync {
 pub trait TaskStatusSubscriptionReader: Send + Sync {
     /// Returns the source only when this role currently holds the exact context.
     fn task_status_source(&self, context: QueryContextRef) -> Option<Arc<TaskStatusSource>>;
+}
+
+/// Role-local authority that linearly applies one already decoded task
+/// operation. It never receives a raw Native request.
+pub trait TaskOperationBatchApplier: Send + Sync {
+    /// The confidentiality mode of this role's Native listener.
+    fn native_transport_confidentiality(&self) -> ConfidentialTransport;
+
+    /// Applies one domain operation and returns its role-owned receipt.
+    fn apply_task_operation(
+        &self,
+        operation: &DecodedOperation,
+    ) -> Result<proto::TaskOperationReceipt, tonic::Status>;
+}
+
+/// Rejects raw confidential material, decodes one bounded operation batch, and
+/// delegates each item in request order to its role-local owner.
+pub fn apply_task_operations(
+    applier: &dyn TaskOperationBatchApplier,
+    request: proto::ApplyTaskOperationsRequest,
+) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+    // This gate runs before a decoder can project or retain confidential bytes
+    // and before any registry operation can take effect.
+    refuse_confidential_material_in_the_clear(
+        &request,
+        applier.native_transport_confidentiality(),
+        FieldPath::root("apply_task_operations"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    // Check the whole batch before decoding an item, so an oversized request
+    // never reaches the role owner.
+    let operations = decode_operation_batch(
+        &request,
+        TransportBudget::DEFAULT,
+        FieldPath::root("apply_task_operations"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let mut receipts = Vec::with_capacity(operations.len());
+    for operation in &operations {
+        receipts.push(applier.apply_task_operation(operation)?);
+    }
+    Ok(proto::ApplyTaskOperationsResponse { receipts })
 }
 
 /// Decodes, captures, and starts one Native task-status subscription.
