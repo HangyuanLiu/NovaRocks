@@ -27,7 +27,7 @@ use novarocks_execution::runtime_filter as execution;
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
-use crate::runtime_filter::membership_contract_decode::{
+use novarocks_native_adapter::runtime_filter_membership::{
     MembershipContractDecodeError, decode_membership_contract,
 };
 

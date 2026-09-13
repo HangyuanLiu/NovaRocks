@@ -1,8 +1,6 @@
 //! Backend-owned runtime-filter participant state.
 
 pub(crate) mod ingress;
-pub(crate) mod install_decode;
-pub(crate) mod membership_contract_decode;
 pub(crate) mod participant;
 pub(crate) mod rpc;
 #[cfg(test)]

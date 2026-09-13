@@ -4005,11 +4005,13 @@ dependencies = [
 name = "novarocks-native-adapter"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "axum 0.7.9",
  "hyper",
  "hyper-util",
  "novarocks-execution",
  "novarocks-native-trust",
+ "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-task-codec",

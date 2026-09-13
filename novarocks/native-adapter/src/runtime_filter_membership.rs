@@ -1,4 +1,4 @@
-//! Typed decoding for the membership portion of a runtime-filter wire contract.
+//! Native decoding for the membership portion of a runtime-filter wire contract.
 
 use std::fmt;
 
@@ -9,7 +9,7 @@ use novarocks_execution::runtime_filter::{
 use novarocks_proto_models::plan;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MembershipContractDecodeError {
+pub enum MembershipContractDecodeError {
     UnspecifiedNullSemantics,
     UnknownNullSemantics { raw: i32 },
     InvalidExecutionSchema { detail: String },
@@ -41,7 +41,7 @@ impl std::error::Error for MembershipContractDecodeError {}
 
 /// Rebuilds the Execution-owned membership schema from the carrier's only
 /// type authority and the closed wire null-comparison semantics.
-pub(crate) fn decode_membership_contract(
+pub fn decode_membership_contract(
     context_data_type: &DataType,
     wire: &plan::RuntimeFilterMembershipContract,
 ) -> Result<RuntimeFilterMembershipSchema, MembershipContractDecodeError> {

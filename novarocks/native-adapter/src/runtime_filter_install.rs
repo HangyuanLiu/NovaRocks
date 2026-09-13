@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-owned runtime-filter install decoder.
+//! Native runtime-filter install decoder.
 //!
 //! Core carries an opaque contribution DTO. This module is the only native
 //! boundary that interprets its lifecycle/install/routing semantics and builds
-//! the participant-local install consumed by the Backend service.
+//! the participant-local install consumed by the Worker service.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -36,9 +36,7 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
 
-use crate::runtime_filter::membership_contract_decode::{
-    MembershipContractDecodeError, decode_membership_contract,
-};
+use crate::runtime_filter_membership::{MembershipContractDecodeError, decode_membership_contract};
 use novarocks_plan_codec::native_type::decode_type;
 use novarocks_worker::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
@@ -54,27 +52,27 @@ use novarocks_worker::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RuntimeFilterQueryLifecycleOptions {
-    pub(crate) delivery_expire: Duration,
-    pub(crate) query_expire: Duration,
-    pub(crate) transport_retry_interval: Duration,
-    pub(crate) transport_max_attempts: u32,
-    pub(crate) transport_deadline: Duration,
-    pub(crate) transport_max_pending_entries: usize,
-    pub(crate) transport_max_pending_bytes: usize,
+pub struct RuntimeFilterQueryLifecycleOptions {
+    pub delivery_expire: Duration,
+    pub query_expire: Duration,
+    pub transport_retry_interval: Duration,
+    pub transport_max_attempts: u32,
+    pub transport_deadline: Duration,
+    pub transport_max_pending_entries: usize,
+    pub transport_max_pending_bytes: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct DecodedRuntimeFilterParticipantInstall {
-    pub(crate) query_id: UniqueId,
-    pub(crate) lifecycle: RuntimeFilterQueryLifecycleOptions,
-    pub(crate) install: BackendParticipantInstall,
+pub struct DecodedRuntimeFilterParticipantInstall {
+    pub query_id: UniqueId,
+    pub lifecycle: RuntimeFilterQueryLifecycleOptions,
+    pub install: BackendParticipantInstall,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DecodedRuntimeFilterContribution {
-    pub(crate) lifecycle: RuntimeFilterQueryLifecycleOptions,
-    pub(crate) install: BackendParticipantInstall,
+pub struct DecodedRuntimeFilterContribution {
+    pub lifecycle: RuntimeFilterQueryLifecycleOptions,
+    pub install: BackendParticipantInstall,
 }
 
 type CodecResult<T> = Result<T, ProtocolError>;
@@ -88,7 +86,7 @@ type CodecResult<T> = Result<T, ProtocolError>;
 /// execution identity used here is the admitted one, not a restated copy.
 /// Every structural and cross-field rejection below therefore still runs on
 /// the exact bytes that were admitted.
-pub(crate) fn decode_runtime_filter_contribution(
+pub fn decode_runtime_filter_contribution(
     execution_id: QueryExecutionId,
     contribution: &RuntimeFilterContribution,
 ) -> Result<DecodedRuntimeFilterContribution, RuntimeFilterContractError> {
@@ -625,7 +623,7 @@ fn decode_lifecycle_options(
     })
 }
 
-pub(crate) fn decode_participant_install(
+pub fn decode_participant_install(
     request: &filter::InstallRuntimeFilterDeploymentRequest,
 ) -> CodecResult<DecodedRuntimeFilterParticipantInstall> {
     let root = FieldPath::root("install_runtime_filter_deployment_request");
@@ -1732,9 +1730,7 @@ fn validate_runtime_filter_policy(
     Ok(())
 }
 
-pub(crate) fn validate_participant_install(
-    install: &BackendParticipantInstall,
-) -> Result<(), String> {
+pub fn validate_participant_install(install: &BackendParticipantInstall) -> Result<(), String> {
     if install.local_participant_id() == 0 {
         return Err("participant id must be non-zero".to_string());
     }

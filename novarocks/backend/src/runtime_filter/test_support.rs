@@ -39,11 +39,12 @@ pub(crate) fn participant_for_test() -> std::sync::Arc<super::participant::Runti
         },
     )
     .expect("a channel-less contribution is legal");
-    let decoded = super::install_decode::decode_runtime_filter_contribution(
-        participant_execution_id(),
-        &contribution,
-    )
-    .expect("a channel-less contribution decodes");
+    let decoded =
+        novarocks_native_adapter::runtime_filter_install::decode_runtime_filter_contribution(
+            participant_execution_id(),
+            &contribution,
+        )
+        .expect("a channel-less contribution decodes");
     BackendRuntimeFilterParticipantFactory::new(crate::rpc::runtime::test_backend_data_runtime())
         .install(participant_execution_id(), decoded)
         .expect("a channel-less participant installs")

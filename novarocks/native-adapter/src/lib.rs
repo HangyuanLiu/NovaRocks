@@ -26,6 +26,8 @@ pub use native_client::NativeRpcClient;
 pub mod native_codec;
 pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
+pub mod runtime_filter_install;
+pub mod runtime_filter_membership;
 pub mod runtime_filter_terminal;
 
 pub mod generated {

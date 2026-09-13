@@ -33,7 +33,6 @@ use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason}
 use novarocks_types::UniqueId;
 use prost::Message;
 
-use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
 use crate::runtime_filter::rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
     BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
@@ -45,7 +44,9 @@ use crate::runtime_filter::transport::{
     BackendRuntimeFilterSinkSubmitOutcome, BackendRuntimeFilterTransportFailureReason,
     GrpcRuntimeFilterEnvelopeSink,
 };
-use novarocks_native_adapter::BackendDataRuntime;
+use novarocks_native_adapter::{
+    BackendDataRuntime, runtime_filter_install::DecodedRuntimeFilterContribution,
+};
 use novarocks_worker::runtime_filter::domain::{
     BackendChannelIdentity, BackendEnvelopeKind, BackendFrontendFeedbackSink, BackendIngressResult,
     BackendMaterializedDelivery, BackendMaterializedDeliverySink, BackendParticipantInstall,
