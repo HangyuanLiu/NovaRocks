@@ -2752,6 +2752,112 @@ pub struct NativeLoweredPlanNode {
     pub output_schema: ChunkSchemaRef,
 }
 
+/// Validates the child contract declared by a Native distributed node.
+///
+/// This is wire-shape validation only. Runtime-filter attachment, Connector
+/// binding, and recursive program assembly remain role-local concerns.
+pub fn validate_distributed_node_children(
+    node: &plan::DistributedNode,
+    node_path: FieldPath,
+) -> Result<(), NativeFragmentDecodeError> {
+    let actual = node.children.len();
+    let Some(payload) = node.payload.as_ref() else {
+        return Ok(());
+    };
+    match payload {
+        plan::distributed_node::Payload::Exchange(_) => {
+            require_exact_children(node_path, "ExchangeReceiver", 0, actual)
+        }
+        plan::distributed_node::Payload::TableWriter(_) => {
+            require_exact_children(node_path, "TableWriterNode", 1, actual)
+        }
+        plan::distributed_node::Payload::TableFinish(_) => {
+            require_min_children(node_path, "TableFinishNode", 1, actual)
+        }
+        plan::distributed_node::Payload::Physical(physical) => {
+            let Some(kind) = physical.kind.as_ref() else {
+                return Ok(());
+            };
+            let (kind_name, expected) = match kind {
+                plan::plan_node::Kind::Values(_) => ("ValuesNode", 0),
+                plan::plan_node::Kind::Project(_) => ("ProjectNode", 1),
+                plan::plan_node::Kind::Unpivot(_) => ("UnpivotNode", 1),
+                plan::plan_node::Kind::Filter(_) => ("FilterNode", 1),
+                plan::plan_node::Kind::Limit(_) => ("LimitNode", 1),
+                plan::plan_node::Kind::Sort(_) => ("SortNode", 1),
+                plan::plan_node::Kind::Topn(_) => ("TopNNode", 1),
+                plan::plan_node::Kind::SetOp(_) => {
+                    return require_min_children(node_path, "SetOpNode", 2, actual);
+                }
+                plan::plan_node::Kind::AssertOneRow(_) => ("AssertOneRowNode", 1),
+                plan::plan_node::Kind::Scan(_) => ("ScanNode", 0),
+                plan::plan_node::Kind::HashAggregate(_) => ("HashAggregateNode", 1),
+                plan::plan_node::Kind::HashJoin(_) => ("HashJoinNode", 2),
+                plan::plan_node::Kind::NestLoopJoin(_) => ("NestLoopJoinNode", 2),
+                plan::plan_node::Kind::Window(_) => ("WindowNode", 1),
+                plan::plan_node::Kind::Repeat(_) => ("RepeatNode", 1),
+                plan::plan_node::Kind::GenerateSeries(_) => ("GenerateSeriesNode", 0),
+                plan::plan_node::Kind::TableFunction(_) => ("TableFunctionNode", 1),
+                plan::plan_node::Kind::ChangeEventExpand(_) => ("ChangeEventExpandNode", 1),
+                plan::plan_node::Kind::Redistribute(_) => ("RedistributeNode", 1),
+                plan::plan_node::Kind::Decode(_)
+                | plan::plan_node::Kind::CteAnchor(_)
+                | plan::plan_node::Kind::CteProduce(_)
+                | plan::plan_node::Kind::CteConsume(_) => return Ok(()),
+            };
+            require_exact_children(node_path, kind_name, expected, actual)
+        }
+    }
+}
+
+/// Applies the outer distributed limit after physical-node projection.
+///
+/// A write relation cannot carry this limit because silently truncating staged
+/// commit fragments would corrupt the connector-owned publication protocol.
+pub fn apply_distributed_limit(
+    node: &plan::DistributedNode,
+    mut lowered: NativeLoweredPlanNode,
+    path: FieldPath,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let Some(limit) = NativeFragmentDecodeError::map_invalid(
+        path.field("limit"),
+        parse_distributed_limit(node.limit, "DistributedNode.limit"),
+    )?
+    else {
+        return Ok(lowered);
+    };
+    if matches!(
+        node.payload.as_ref(),
+        Some(
+            plan::distributed_node::Payload::TableWriter(_)
+                | plan::distributed_node::Payload::TableFinish(_)
+        )
+    ) {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.field("limit"),
+            format!(
+                "native node_id={} is a write dataflow node and cannot carry a limit",
+                node.node_id
+            ),
+        ));
+    }
+    if matches!(
+        lowered.node.kind,
+        ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)
+    ) {
+        return Ok(lowered);
+    }
+    lowered.node = ExecNode {
+        kind: ExecNodeKind::Limit(LimitNode {
+            input: Box::new(lowered.node),
+            node_id: node.node_id,
+            limit: Some(limit),
+            offset: 0,
+        }),
+    };
+    Ok(lowered)
+}
+
 /// Lowers a Native `LimitNode` after Backend recursion has supplied its child.
 pub fn lower_limit_node(
     node: &plan::DistributedNode,
@@ -2972,8 +3078,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        NativeLoweredPlanNode, lower_assert_one_row_node, lower_limit_node, merge_limits,
-        parse_distributed_limit, parse_optional_nonnegative_i64,
+        NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
+        lower_limit_node, merge_limits, parse_distributed_limit, parse_optional_nonnegative_i64,
+        validate_distributed_node_children,
     };
     use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field};
@@ -3046,6 +3153,44 @@ mod tests {
         assert!(parse_distributed_limit(-2, "DistributedNode.limit").is_err());
         assert_eq!(merge_limits("LimitNode", Some(2), Some(2)), Ok(Some(2)));
         assert!(merge_limits("LimitNode", Some(2), Some(3)).is_err());
+    }
+
+    #[test]
+    fn distributed_node_structure_and_outer_limit_are_adapter_owned() {
+        let root = FieldPath::root("plan_fragment").field("root");
+        let invalid_project = plan::DistributedNode {
+            payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                kind: Some(plan::plan_node::Kind::Project(plan::ProjectNode::default())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let error = validate_distributed_node_children(&invalid_project, root.clone())
+            .expect_err("ProjectNode needs one child");
+        let protocol = error.protocol().expect("protocol error");
+        assert_eq!(protocol.path().to_string(), "plan_fragment.root.children");
+        assert_eq!(protocol.kind(), ProtocolErrorKind::InconsistentFields);
+
+        let limited = apply_distributed_limit(
+            &plan::DistributedNode {
+                node_id: 9,
+                limit: 2,
+                payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
+                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode::default())),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+            child(),
+            root,
+        )
+        .expect("outer limit lowers");
+        let ExecNodeKind::Limit(limit) = limited.node.kind else {
+            panic!("outer limit must create a LimitNode");
+        };
+        assert_eq!(limit.node_id, 9);
+        assert_eq!(limit.limit, Some(2));
+        assert_eq!(limit.offset, 0);
     }
 
     #[test]

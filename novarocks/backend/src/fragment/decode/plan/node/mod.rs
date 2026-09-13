@@ -57,7 +57,6 @@ use novarocks_execution::exec::node::aggregate::{
 use novarocks_execution::exec::node::join::{
     JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding,
 };
-use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
@@ -65,11 +64,11 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
 use novarocks_native_adapter::fragment_plan_node::{
-    NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
-    lower_filter_node, lower_generate_series_node, lower_limit_node, lower_nest_loop_join_node,
-    lower_project_node, lower_redistribute_node, lower_repeat_node, lower_set_op_node,
-    lower_sort_node, lower_table_function_node, lower_topn_node, lower_unpivot_node,
-    lower_values_node, parse_distributed_limit, require_exact_children, require_min_children,
+    NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
+    lower_change_event_expand_node, lower_filter_node, lower_generate_series_node,
+    lower_limit_node, lower_nest_loop_join_node, lower_project_node, lower_redistribute_node,
+    lower_repeat_node, lower_set_op_node, lower_sort_node, lower_table_function_node,
+    lower_topn_node, lower_unpivot_node, lower_values_node, validate_distributed_node_children,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -276,7 +275,7 @@ fn decode_node_inner(
     if children_are_absent(node) && !consumer_bindings.is_empty() {
         attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
-    let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
+    let mut lowered = apply_distributed_limit(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
         attach_producers(
             node,
@@ -293,99 +292,6 @@ fn decode_node_inner(
             .map_err(|error| error.into_native(path))?;
     }
     Ok(lowered)
-}
-
-fn validate_distributed_node_children(
-    node: &plan::DistributedNode,
-    node_path: FieldPath,
-) -> Result<(), NativeFragmentDecodeError> {
-    let actual = node.children.len();
-    let Some(payload) = node.payload.as_ref() else {
-        return Ok(());
-    };
-    match payload {
-        plan::distributed_node::Payload::Exchange(_) => {
-            require_exact_children(node_path, "ExchangeReceiver", 0, actual)
-        }
-        // A writer is an ordinary unary processor.
-        plan::distributed_node::Payload::TableWriter(_) => {
-            require_exact_children(node_path, "TableWriterNode", 1, actual)
-        }
-        // The finish node is n-ary: the planner gives it one exchange receiver
-        // per writer fragment, because a receiver names exactly one source
-        // fragment and therefore cannot be shared between senders.
-        plan::distributed_node::Payload::TableFinish(_) => {
-            require_min_children(node_path, "TableFinishNode", 1, actual)
-        }
-        plan::distributed_node::Payload::Physical(physical) => {
-            let Some(kind) = physical.kind.as_ref() else {
-                return Ok(());
-            };
-            match kind {
-                plan::plan_node::Kind::Values(_) => {
-                    require_exact_children(node_path, "ValuesNode", 0, actual)
-                }
-                plan::plan_node::Kind::Project(_) => {
-                    require_exact_children(node_path, "ProjectNode", 1, actual)
-                }
-                plan::plan_node::Kind::Unpivot(_) => {
-                    require_exact_children(node_path, "UnpivotNode", 1, actual)
-                }
-                plan::plan_node::Kind::Filter(_) => {
-                    require_exact_children(node_path, "FilterNode", 1, actual)
-                }
-                plan::plan_node::Kind::Limit(_) => {
-                    require_exact_children(node_path, "LimitNode", 1, actual)
-                }
-                plan::plan_node::Kind::Sort(_) => {
-                    require_exact_children(node_path, "SortNode", 1, actual)
-                }
-                plan::plan_node::Kind::Topn(_) => {
-                    require_exact_children(node_path, "TopNNode", 1, actual)
-                }
-                plan::plan_node::Kind::SetOp(_) => {
-                    require_min_children(node_path, "SetOpNode", 2, actual)
-                }
-                plan::plan_node::Kind::AssertOneRow(_) => {
-                    require_exact_children(node_path, "AssertOneRowNode", 1, actual)
-                }
-                plan::plan_node::Kind::Scan(_) => {
-                    require_exact_children(node_path, "ScanNode", 0, actual)
-                }
-                plan::plan_node::Kind::HashAggregate(_) => {
-                    require_exact_children(node_path, "HashAggregateNode", 1, actual)
-                }
-                plan::plan_node::Kind::HashJoin(_) => {
-                    require_exact_children(node_path, "HashJoinNode", 2, actual)
-                }
-                plan::plan_node::Kind::NestLoopJoin(_) => {
-                    require_exact_children(node_path, "NestLoopJoinNode", 2, actual)
-                }
-                plan::plan_node::Kind::Window(_) => {
-                    require_exact_children(node_path, "WindowNode", 1, actual)
-                }
-                plan::plan_node::Kind::Repeat(_) => {
-                    require_exact_children(node_path, "RepeatNode", 1, actual)
-                }
-                plan::plan_node::Kind::GenerateSeries(_) => {
-                    require_exact_children(node_path, "GenerateSeriesNode", 0, actual)
-                }
-                plan::plan_node::Kind::TableFunction(_) => {
-                    require_exact_children(node_path, "TableFunctionNode", 1, actual)
-                }
-                plan::plan_node::Kind::ChangeEventExpand(_) => {
-                    require_exact_children(node_path, "ChangeEventExpandNode", 1, actual)
-                }
-                plan::plan_node::Kind::Redistribute(_) => {
-                    require_exact_children(node_path, "RedistributeNode", 1, actual)
-                }
-                plan::plan_node::Kind::Decode(_)
-                | plan::plan_node::Kind::CteAnchor(_)
-                | plan::plan_node::Kind::CteProduce(_)
-                | plan::plan_node::Kind::CteConsume(_) => Ok(()),
-            }
-        }
-    }
 }
 
 fn children_are_absent(node: &plan::DistributedNode) -> bool {
@@ -1466,53 +1372,6 @@ fn validate_column_refs_exact(
             )
         }
     }
-}
-
-fn apply_distributed_limit_if_needed(
-    node: &plan::DistributedNode,
-    mut lowered: DecodedNode,
-    path: FieldPath,
-) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    let Some(limit) = NativeFragmentDecodeError::map_invalid(
-        path.field("limit"),
-        parse_distributed_limit(node.limit, "DistributedNode.limit"),
-    )?
-    else {
-        return Ok(lowered);
-    };
-    // A limit over a write dataflow node would truncate the write relation, and
-    // the rows it dropped would be commit fragments the frontend must commit.
-    // Refuse it instead of silently losing staged artifacts.
-    if matches!(
-        node.payload.as_ref(),
-        Some(
-            plan::distributed_node::Payload::TableWriter(_)
-                | plan::distributed_node::Payload::TableFinish(_)
-        )
-    ) {
-        return Err(NativeFragmentDecodeError::inconsistent(
-            path.field("limit"),
-            format!(
-                "native node_id={} is a write dataflow node and cannot carry a limit",
-                node.node_id
-            ),
-        ));
-    }
-    if matches!(
-        lowered.node.kind,
-        ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)
-    ) {
-        return Ok(lowered);
-    }
-    lowered.node = ExecNode {
-        kind: ExecNodeKind::Limit(LimitNode {
-            input: Box::new(lowered.node),
-            node_id: node.node_id,
-            limit: Some(limit),
-            offset: 0,
-        }),
-    };
-    Ok(lowered)
 }
 
 fn lower_physical_node(
