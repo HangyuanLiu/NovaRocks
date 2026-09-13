@@ -18,7 +18,6 @@
 //! Fragment-native protocol plan-node decoding.
 
 mod aggregate;
-mod assert;
 mod change_event_expand;
 mod common;
 mod exchange;
@@ -64,7 +63,7 @@ use novarocks_execution::exec::node::runtime_filter::{
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
-    NativeLoweredPlanNode, lower_limit_node, parse_distributed_limit,
+    NativeLoweredPlanNode, lower_assert_one_row_node, lower_limit_node, parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1609,12 +1608,9 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
-        plan::plan_node::Kind::AssertOneRow(assert) => assert::lower_assert_one_row_node(
-            node,
-            assert,
-            path.clone().field("assert_one_row"),
-            children,
-        ),
+        plan::plan_node::Kind::AssertOneRow(assert) => {
+            lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
+        }
         plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
             node,
             physical,
