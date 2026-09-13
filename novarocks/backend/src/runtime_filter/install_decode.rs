@@ -36,7 +36,6 @@ use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{common, filter, plan};
 use novarocks_types::UniqueId;
 
-use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest};
 use crate::runtime_filter::domain::{
     BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
     BackendCoverageWitnessId, BackendEnvelopeKind, BackendFrontendFeedbackPublication,
@@ -49,7 +48,10 @@ use crate::runtime_filter::membership_contract_decode::{
     MembershipContractDecodeError, decode_membership_contract,
 };
 use novarocks_plan_codec::native_type::decode_type;
-use novarocks_worker::RuntimeFilterContractError;
+use novarocks_worker::{
+    RuntimeFilterContractError,
+    runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile, HashContractDigest},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterQueryLifecycleOptions {

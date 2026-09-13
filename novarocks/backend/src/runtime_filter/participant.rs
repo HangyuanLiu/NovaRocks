@@ -1737,7 +1737,6 @@ mod tests {
     use novarocks_types::QueryId;
 
     use super::*;
-    use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::domain::{
         BackendChannelInstall, BackendChannelLifecycle, BackendConsumerInstall, BackendCoverage,
         BackendMaterializationOwner, BackendMaterializationPolicy,
@@ -1750,6 +1749,7 @@ mod tests {
     use crate::runtime_filter::transport::{
         BackendRuntimeFilterSinkCompletion, BackendRuntimeFilterSinkSubmitOutcome,
     };
+    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
 
     struct ForwardingSink {
         target: Arc<RuntimeFilterParticipant>,

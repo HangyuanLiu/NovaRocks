@@ -25,8 +25,10 @@ use novarocks_execution::runtime_filter::{
     LogicalVersion, RuntimeFilterMembershipSchema, UnavailableReason,
 };
 
-use crate::runtime_filter::artifact::{ArtifactBundle, ArtifactKind, ConsumerArtifactProfile};
 use crate::runtime_filter::codec::leaf::{self, ArtifactDecodeExpectations};
+use novarocks_worker::runtime_filter::artifact::{
+    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile,
+};
 
 const MAGIC: &[u8; 4] = b"NRFA";
 const VERSION: u16 = 1;
@@ -415,7 +417,7 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_filter::{artifact::*, codec::leaf::encode_membership_leaf};
+    use crate::runtime_filter::codec::leaf::encode_membership_leaf;
     use arrow::datatypes::DataType;
     use novarocks_execution::runtime_filter::{
         RuntimeFilterNullSemantics,

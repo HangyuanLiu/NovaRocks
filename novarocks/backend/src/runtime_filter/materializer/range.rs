@@ -9,8 +9,9 @@ use novarocks_execution::runtime_filter::{
     },
 };
 
-use crate::runtime_filter::artifact::ArtifactKind;
 use crate::runtime_filter::codec::leaf::ArtifactCodecError;
+use novarocks_worker::runtime_filter::artifact as worker_artifact;
+use worker_artifact::ArtifactKind;
 
 const MAGIC: &[u8; 4] = b"NRRG";
 const VERSION: u16 = 1;
@@ -30,7 +31,7 @@ pub(crate) fn decode_range_leaf(
     max_artifact_bytes: usize,
 ) -> Result<
     (
-        std::sync::Arc<crate::runtime_filter::artifact::PhysicalArtifact>,
+        std::sync::Arc<worker_artifact::PhysicalArtifact>,
         RangeResidentLayout,
     ),
     ArtifactCodecError,
@@ -83,15 +84,15 @@ pub(crate) fn decode_range_leaf(
         utf8_bytes,
         timezone_bytes,
     };
-    let physical = crate::runtime_filter::artifact::PhysicalArtifact::new(
+    let physical = worker_artifact::PhysicalArtifact::new(
         ArtifactKind::Range,
-        crate::runtime_filter::artifact::ArtifactSchemaDigest::new(digest),
+        worker_artifact::ArtifactSchemaDigest::new(digest),
         version,
         bound.values().iter().any(Option::is_none),
         std::sync::Arc::from(encoded),
         None,
     )
-    .with_range_data(crate::runtime_filter::artifact::RangeResidentData {
+    .with_range_data(worker_artifact::RangeResidentData {
         contract: std::sync::Arc::new(expected.clone()),
         bound,
     });
@@ -328,9 +329,9 @@ pub(crate) fn materialize_range(
     contract: &RuntimeOrderContract,
     bound: &OrderedTuple,
     version: LogicalVersion,
-    profile: &crate::runtime_filter::artifact::ConsumerArtifactProfile,
+    profile: &worker_artifact::ConsumerArtifactProfile,
     admission: &crate::runtime_filter::materializer::MaterializationAdmission,
-) -> Result<std::sync::Arc<crate::runtime_filter::artifact::ArtifactBundle>, ArtifactCodecError> {
+) -> Result<std::sync::Arc<worker_artifact::ArtifactBundle>, ArtifactCodecError> {
     if profile.order_contract_digest() != Some(contract.digest())
         || !profile.accepts(ArtifactKind::Range)
     {
@@ -354,9 +355,9 @@ pub(crate) fn materialize_range(
     )
     .map(std::sync::Arc::new)
     .map_err(|error| match error {
-        crate::runtime_filter::artifact::ArtifactContractError::RetentionCapacityExceeded
-        | crate::runtime_filter::artifact::ArtifactContractError::ResidentSizeOverflow
-        | crate::runtime_filter::artifact::ArtifactContractError::LengthOverflow => {
+        worker_artifact::ArtifactContractError::RetentionCapacityExceeded
+        | worker_artifact::ArtifactContractError::ResidentSizeOverflow
+        | worker_artifact::ArtifactContractError::LengthOverflow => {
             ArtifactCodecError::ResourceLimit
         }
         _ => ArtifactCodecError::ContractViolation,

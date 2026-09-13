@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Backend-private physical runtime-filter artifacts.
+//! Worker-owned physical runtime-filter artifacts.
 //!
 //! This module deliberately stores only sealed Execution contracts plus
 //! canonical physical bytes.  It has no query, scan, Arrow-array, or Core
@@ -31,26 +31,26 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use novarocks_execution::runtime_filter::LogicalVersion;
 use sha2::{Digest, Sha256};
 
-pub(crate) const LEAF_CODEC_VERSION: u16 = 1;
+pub const LEAF_CODEC_VERSION: u16 = 1;
 
-/// Backend-private retained-artifact admission. The lease is held by both the
+/// Worker-owned retained-artifact admission. The lease is held by both the
 /// bundle and every artifact it protects, so a cloned resident artifact cannot
 /// outlive its reservation.
 #[derive(Debug)]
-pub(crate) struct ArtifactRetainedBudget {
+pub struct ArtifactRetainedBudget {
     max_bytes: usize,
     retained_bytes: AtomicUsize,
 }
 
 impl ArtifactRetainedBudget {
-    pub(crate) fn new(max_bytes: usize) -> Self {
+    pub fn new(max_bytes: usize) -> Self {
         Self {
             max_bytes,
             retained_bytes: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn try_acquire(
+    pub fn try_acquire(
         self: &Arc<Self>,
         bytes: usize,
     ) -> Result<ArtifactRetention, ArtifactContractError> {
@@ -80,24 +80,24 @@ impl ArtifactRetainedBudget {
     }
 
     #[cfg(test)]
-    pub(crate) fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.retained_bytes.load(Ordering::Acquire)
     }
 }
 
 #[derive(Debug)]
-pub(crate) struct ArtifactRetention {
+pub struct ArtifactRetention {
     budget: Arc<ArtifactRetainedBudget>,
     bytes: usize,
 }
 
 /// Scratch uses the same bounded atomic lease mechanics but is deliberately
 /// a separate budget from retained resident artifacts.
-pub(crate) type ArtifactScratchBudget = ArtifactRetainedBudget;
-pub(crate) type ArtifactScratchReservation = ArtifactRetention;
+pub type ArtifactScratchBudget = ArtifactRetainedBudget;
+pub type ArtifactScratchReservation = ArtifactRetention;
 
 impl ArtifactRetention {
-    pub(crate) const fn bytes(&self) -> usize {
+    pub const fn bytes(&self) -> usize {
         self.bytes
     }
 }
@@ -115,7 +115,7 @@ impl Drop for ArtifactRetention {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum ArtifactKind {
+pub enum ArtifactKind {
     ValueSet,
     Bloom,
     Bitset,
@@ -124,7 +124,7 @@ pub(crate) enum ArtifactKind {
 }
 
 impl ArtifactKind {
-    pub(crate) const fn tag(self) -> u8 {
+    pub const fn tag(self) -> u8 {
         match self {
             Self::ValueSet => 1,
             Self::Bloom => 2,
@@ -134,7 +134,7 @@ impl ArtifactKind {
         }
     }
 
-    pub(crate) const fn from_tag(tag: u8) -> Option<Self> {
+    pub const fn from_tag(tag: u8) -> Option<Self> {
         match tag {
             1 => Some(Self::ValueSet),
             2 => Some(Self::Bloom),
@@ -149,13 +149,13 @@ impl ArtifactKind {
 macro_rules! digest {
     ($name:ident) => {
         #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        pub(crate) struct $name([u8; 32]);
+        pub struct $name([u8; 32]);
         impl $name {
-#[allow(dead_code, reason = "Retained for staged backend runtime-filter domain and materialization integration.")]
-            pub(crate) const fn new(bytes: [u8; 32]) -> Self {
+#[allow(dead_code, reason = "Retained for staged Worker runtime-filter domain and materialization integration.")]
+            pub const fn new(bytes: [u8; 32]) -> Self {
                 Self(bytes)
             }
-            pub(crate) const fn bytes(self) -> [u8; 32] {
+            pub const fn bytes(self) -> [u8; 32] {
                 self.0
             }
         }
@@ -167,7 +167,7 @@ digest!(HashContractDigest);
 digest!(ConsumerProfileId);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ConsumerArtifactProfile {
+pub struct ConsumerArtifactProfile {
     accepted_kinds: BTreeSet<ArtifactKind>,
     bloom_hash_contract: Option<HashContractDigest>,
     order_contract_digest: Option<[u8; 32]>,
@@ -176,7 +176,7 @@ pub(crate) struct ConsumerArtifactProfile {
 }
 
 impl ConsumerArtifactProfile {
-    pub(crate) fn new(
+    pub fn new(
         accepted_kinds: BTreeSet<ArtifactKind>,
         bloom_hash_contract: Option<HashContractDigest>,
     ) -> Result<Self, ArtifactContractError> {
@@ -209,13 +209,13 @@ impl ConsumerArtifactProfile {
         })
     }
 
-    pub(crate) fn accepts(&self, kind: ArtifactKind) -> bool {
+    pub fn accepts(&self, kind: ArtifactKind) -> bool {
         self.accepted_kinds.contains(&kind)
     }
-    pub(crate) const fn bloom_hash_contract(&self) -> Option<HashContractDigest> {
+    pub const fn bloom_hash_contract(&self) -> Option<HashContractDigest> {
         self.bloom_hash_contract
     }
-    pub(crate) fn new_ordered_range(
+    pub fn new_ordered_range(
         order_contract_digest: [u8; 32],
     ) -> Result<Self, ArtifactContractError> {
         let accepted_kinds = BTreeSet::from([ArtifactKind::Range]);
@@ -229,19 +229,19 @@ impl ConsumerArtifactProfile {
             canonical_bytes: canonical.into(),
         })
     }
-    pub(crate) const fn order_contract_digest(&self) -> Option<[u8; 32]> {
+    pub const fn order_contract_digest(&self) -> Option<[u8; 32]> {
         self.order_contract_digest
     }
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+    pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
-    pub(crate) const fn id(&self) -> ConsumerProfileId {
+    pub const fn id(&self) -> ConsumerProfileId {
         self.id
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResidentMembershipIndex {
+pub enum ResidentMembershipIndex {
     EmptyDomain,
     Fixed {
         tag: u8,
@@ -256,7 +256,7 @@ pub(crate) enum ResidentMembershipIndex {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ResidentFilterIndex {
+pub enum ResidentFilterIndex {
     Bitset {
         min: i64,
         bit_count: u64,
@@ -272,12 +272,12 @@ pub(crate) enum ResidentFilterIndex {
 impl ResidentFilterIndex {
     /// Exact query for the retained numeric bitset representation. Bloom is
     /// intentionally not exposed here: its scalar framing is typed and is
-    /// evaluated only by the later Backend artifact-query adapter.
+    /// evaluated only by the later Worker artifact-query adapter.
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn bitset_contains_i64(
+    pub fn bitset_contains_i64(
         &self,
         encoded: &[u8],
         value: i64,
@@ -321,17 +321,16 @@ impl ResidentFilterIndex {
     }
 }
 
-/// Backend-owned retained ordered-bound facts.  Keeping this alongside the
+/// Worker-owned retained ordered-bound facts.  Keeping this alongside the
 /// canonical NRRG bytes prevents a later consumer from re-decoding plan state.
 #[derive(Clone, Debug)]
-pub(crate) struct RangeResidentData {
-    pub(crate) contract:
-        Arc<novarocks_execution::runtime_filter::contribution::RuntimeOrderContract>,
-    pub(crate) bound: novarocks_execution::runtime_filter::contribution::OrderedTuple,
+pub struct RangeResidentData {
+    pub contract: Arc<novarocks_execution::runtime_filter::contribution::RuntimeOrderContract>,
+    pub bound: novarocks_execution::runtime_filter::contribution::OrderedTuple,
 }
 
 impl ResidentMembershipIndex {
-    pub(crate) fn heap_bytes(&self) -> Result<usize, ArtifactContractError> {
+    pub fn heap_bytes(&self) -> Result<usize, ArtifactContractError> {
         match self {
             Self::Utf8 { length_offsets, .. } => length_offsets
                 .len()
@@ -346,9 +345,9 @@ impl ResidentMembershipIndex {
     /// back to a logical-domain decode.
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn contains_i64(
+    pub fn contains_i64(
         &self,
         encoded: &[u8],
         needle: i64,
@@ -388,9 +387,9 @@ impl ResidentMembershipIndex {
 
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
-    pub(crate) fn range_may_match_i64(
+    pub fn range_may_match_i64(
         &self,
         encoded: &[u8],
         min: i64,
@@ -434,7 +433,7 @@ impl ResidentMembershipIndex {
 
 #[allow(
     dead_code,
-    reason = "Retained for staged backend runtime-filter domain and materialization integration."
+    reason = "Retained for staged Worker runtime-filter domain and materialization integration."
 )]
 fn fixed_i64_at(bytes: &[u8], offset: usize) -> Result<i64, ArtifactContractError> {
     let start = offset
@@ -449,7 +448,7 @@ fn fixed_i64_at(bytes: &[u8], offset: usize) -> Result<i64, ArtifactContractErro
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct PhysicalArtifact {
+pub struct PhysicalArtifact {
     kind: ArtifactKind,
     schema_digest: ArtifactSchemaDigest,
     version: LogicalVersion,
@@ -457,7 +456,7 @@ pub(crate) struct PhysicalArtifact {
     canonical_bytes: Arc<[u8]>,
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
     canonical_digest: [u8; 32],
     membership_index: Option<ResidentMembershipIndex>,
@@ -467,7 +466,7 @@ pub(crate) struct PhysicalArtifact {
 }
 
 impl PhysicalArtifact {
-    pub(crate) fn new(
+    pub fn new(
         kind: ArtifactKind,
         schema_digest: ArtifactSchemaDigest,
         version: LogicalVersion,
@@ -489,53 +488,51 @@ impl PhysicalArtifact {
             retained_memory: None,
         }
     }
-    pub(crate) const fn kind(&self) -> ArtifactKind {
+    pub const fn kind(&self) -> ArtifactKind {
         self.kind
     }
-    pub(crate) const fn schema_digest(&self) -> ArtifactSchemaDigest {
+    pub const fn schema_digest(&self) -> ArtifactSchemaDigest {
         self.schema_digest
     }
-    pub(crate) const fn version(&self) -> LogicalVersion {
+    pub const fn version(&self) -> LogicalVersion {
         self.version
     }
-    pub(crate) const fn contains_null(&self) -> bool {
+    pub const fn contains_null(&self) -> bool {
         self.contains_null
     }
-    pub(crate) fn canonical_bytes(&self) -> &[u8] {
+    pub fn canonical_bytes(&self) -> &[u8] {
         &self.canonical_bytes
     }
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn canonical_digest(&self) -> [u8; 32] {
+    pub const fn canonical_digest(&self) -> [u8; 32] {
         self.canonical_digest
     }
-    pub(crate) const fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
+    pub const fn membership_index(&self) -> Option<&ResidentMembershipIndex> {
         self.membership_index.as_ref()
     }
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
-    pub(crate) const fn filter_index(&self) -> Option<&ResidentFilterIndex> {
+    pub const fn filter_index(&self) -> Option<&ResidentFilterIndex> {
         self.filter_index.as_ref()
     }
-    pub(crate) fn with_filter_index(mut self, index: ResidentFilterIndex) -> Self {
+    pub fn with_filter_index(mut self, index: ResidentFilterIndex) -> Self {
         self.filter_index = Some(index);
         self
     }
-    pub(crate) fn with_range_data(mut self, data: RangeResidentData) -> Self {
+    pub fn with_range_data(mut self, data: RangeResidentData) -> Self {
         self.range_data = Some(Arc::new(data));
         self
     }
-    pub(crate) fn with_retention(mut self, retention: Arc<ArtifactRetention>) -> Self {
+    pub fn with_retention(mut self, retention: Arc<ArtifactRetention>) -> Self {
         self.retained_memory = Some(retention);
         self
     }
-    pub(crate) fn accounted_resident_component_bytes(
-        &self,
-    ) -> Result<usize, ArtifactContractError> {
+    pub fn accounted_resident_component_bytes(&self) -> Result<usize, ArtifactContractError> {
         let index_heap = self
             .membership_index
             .as_ref()
@@ -549,13 +546,13 @@ impl PhysicalArtifact {
             .and_then(|bytes| bytes.checked_add(index_heap))
             .ok_or(ArtifactContractError::ResidentSizeOverflow)
     }
-    pub(crate) const fn range_data(&self) -> Option<&Arc<RangeResidentData>> {
+    pub const fn range_data(&self) -> Option<&Arc<RangeResidentData>> {
         self.range_data.as_ref()
     }
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ArtifactBundle {
+pub struct ArtifactBundle {
     channel_id: u32,
     version: LogicalVersion,
     profile_id: ConsumerProfileId,
@@ -564,7 +561,7 @@ pub(crate) struct ArtifactBundle {
 }
 
 impl ArtifactBundle {
-    pub(crate) fn new(
+    pub fn new(
         channel_id: u32,
         version: LogicalVersion,
         profile: &ConsumerArtifactProfile,
@@ -612,7 +609,7 @@ impl ArtifactBundle {
             retained_memory: None,
         })
     }
-    pub(crate) fn accounted_resident_bytes(
+    pub fn accounted_resident_bytes(
         profile: &ConsumerArtifactProfile,
         artifacts: &[(ArtifactKind, Arc<PhysicalArtifact>)],
     ) -> Result<usize, ArtifactContractError> {
@@ -630,7 +627,7 @@ impl ArtifactBundle {
                 .ok_or(ArtifactContractError::ResidentSizeOverflow)
         })
     }
-    pub(crate) fn new_retained(
+    pub fn new_retained(
         channel_id: u32,
         version: LogicalVersion,
         profile: &ConsumerArtifactProfile,
@@ -659,22 +656,22 @@ impl ArtifactBundle {
         bundle.retained_memory = Some(retained_memory);
         Ok(bundle)
     }
-    pub(crate) const fn channel_id(&self) -> u32 {
+    pub const fn channel_id(&self) -> u32 {
         self.channel_id
     }
-    pub(crate) const fn version(&self) -> LogicalVersion {
+    pub const fn version(&self) -> LogicalVersion {
         self.version
     }
-    pub(crate) const fn profile_id(&self) -> ConsumerProfileId {
+    pub const fn profile_id(&self) -> ConsumerProfileId {
         self.profile_id
     }
-    pub(crate) const fn artifacts(&self) -> &[(ArtifactKind, Arc<PhysicalArtifact>)] {
+    pub const fn artifacts(&self) -> &[(ArtifactKind, Arc<PhysicalArtifact>)] {
         &self.artifacts
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ArtifactContractError {
+pub enum ArtifactContractError {
     EmptyProfile,
     BloomHashContractMismatch,
     LengthOverflow,
@@ -688,12 +685,12 @@ pub(crate) enum ArtifactContractError {
     ResidentSizeOverflow,
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
     InvalidMembershipIndex,
     #[allow(
         dead_code,
-        reason = "Retained for staged backend runtime-filter domain and materialization integration."
+        reason = "Retained for staged Worker runtime-filter domain and materialization integration."
     )]
     InvalidResidentFilterIndex,
     RetentionCapacityExceeded,

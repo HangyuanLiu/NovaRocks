@@ -3,7 +3,7 @@ use novarocks_execution::runtime_filter::contribution::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::runtime_filter::artifact::{ArtifactSchemaDigest, HashContractDigest};
+use novarocks_worker::runtime_filter::artifact::{ArtifactSchemaDigest, HashContractDigest};
 
 const CONTRACT_DOMAIN: &[u8] = b"novarocks.runtime-filter.bloom-contract";
 #[allow(

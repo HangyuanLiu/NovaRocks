@@ -28,13 +28,13 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_spi::connector::ConnectorScalarValue;
 
-use crate::runtime_filter::artifact::{
-    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, PhysicalArtifact,
-    ResidentMembershipIndex,
-};
 use crate::runtime_filter::codec::leaf::{
     ArtifactCodecError, MembershipProbe, indexed_membership_contains,
     indexed_membership_range_may_match,
+};
+use novarocks_worker::runtime_filter::artifact::{
+    ArtifactBundle, ArtifactKind, ConsumerArtifactProfile, PhysicalArtifact, RangeResidentData,
+    ResidentMembershipIndex,
 };
 
 /// Immutable adapter over one Backend artifact bundle. It has no Arrow batch,
@@ -124,10 +124,7 @@ impl BackendRuntimeFilterArtifactQuery {
         })
     }
 
-    fn ordered_range(
-        &self,
-    ) -> Result<&crate::runtime_filter::artifact::RangeResidentData, RuntimeFilterArtifactQueryError>
-    {
+    fn ordered_range(&self) -> Result<&RangeResidentData, RuntimeFilterArtifactQueryError> {
         let Self::Ordered { artifact, .. } = self else {
             return Err(RuntimeFilterArtifactQueryError::ContractViolation);
         };

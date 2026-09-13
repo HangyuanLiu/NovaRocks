@@ -38,6 +38,7 @@ use novarocks_execution::runtime_filter::{
     UnavailableReason,
 };
 use novarocks_types::UniqueId;
+use novarocks_worker::runtime_filter::artifact::ConsumerArtifactProfile;
 
 use super::{
     BackendChannelIdentity, BackendChannelInstall, BackendConsumerInstall, BackendCoverageProgress,
@@ -222,7 +223,7 @@ struct BackendProducerBindingProgress {
 
 struct BackendInstalledConsumer {
     contract: RuntimeFilterConsumerContract,
-    profile: crate::runtime_filter::artifact::ConsumerArtifactProfile,
+    profile: ConsumerArtifactProfile,
     routes: BTreeSet<BackendRouteEdgeId>,
     subscriptions: BackendSubscriptionGroup,
 }
@@ -1446,7 +1447,6 @@ mod tests {
 
     use super::*;
     use crate::runtime_filter::{
-        artifact::{ArtifactKind, ConsumerArtifactProfile},
         domain::{
             BackendChannelLifecycle, BackendCoverage, BackendCoverageWitnessId,
             BackendMaterializationPolicy, BackendProducerInstall,
@@ -1454,6 +1454,7 @@ mod tests {
         },
         test_support::BackendRuntimeFilterFixture,
     };
+    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
 
     fn instance(raw: i64) -> UniqueId {
         UniqueId::new(raw, raw + 1)

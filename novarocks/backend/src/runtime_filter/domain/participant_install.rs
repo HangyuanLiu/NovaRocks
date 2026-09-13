@@ -32,7 +32,7 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_types::UniqueId;
 
-use crate::runtime_filter::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
+use novarocks_worker::runtime_filter::artifact::{ConsumerArtifactProfile, ConsumerProfileId};
 
 use super::{
     BackendCoverage, BackendCoverageWitnessId, BackendParticipantIdentity, BackendRouteEdgeId,

@@ -1706,13 +1706,13 @@ mod tests {
     };
 
     use super::*;
-    use crate::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
     use crate::runtime_filter::domain::{
         BackendAcceptStatus, BackendChannelInstall, BackendChannelLifecycle,
         BackendConsumerInstall, BackendCoverageWitnessId, BackendMaterializationPolicy,
         BackendProducerInstall, BackendRouteEdgeId, BackendRoutingShard,
     };
     use crate::runtime_filter::test_support::BackendRuntimeFilterFixture;
+    use novarocks_worker::runtime_filter::artifact::{ArtifactKind, ConsumerArtifactProfile};
 
     struct Fixture {
         install: BackendParticipantInstall,

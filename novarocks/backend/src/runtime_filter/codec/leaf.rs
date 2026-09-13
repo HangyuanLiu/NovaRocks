@@ -31,9 +31,9 @@ use novarocks_execution::runtime_filter::{
     contribution::{self, ValueDomainDelta},
 };
 
-use crate::runtime_filter::artifact::{
+use novarocks_worker::runtime_filter::artifact::{
     ArtifactKind, ArtifactSchemaDigest, HashContractDigest, LEAF_CODEC_VERSION, PhysicalArtifact,
-    ResidentMembershipIndex,
+    ResidentFilterIndex, ResidentMembershipIndex,
 };
 
 const MAGIC: &[u8; 4] = b"NRFL";
@@ -218,24 +218,20 @@ pub(crate) fn decode_leaf(
         ArtifactKind::Range => return Err(ArtifactCodecError::ContractViolation),
     };
     let filter_index = match parsed.kind {
-        ArtifactKind::Bitset => Some(
-            crate::runtime_filter::artifact::ResidentFilterIndex::Bitset {
-                min: i64::from_be_bytes(parsed.payload[1..9].try_into().expect("validated bitset")),
-                bit_count: u64::from_be_bytes(
-                    parsed.payload[17..25].try_into().expect("validated bitset"),
-                ),
-                bits: parsed.payload_offset + 25..parsed.payload_offset + parsed.payload.len(),
-            },
-        ),
-        ArtifactKind::Bloom => Some(
-            crate::runtime_filter::artifact::ResidentFilterIndex::Bloom {
-                bit_count: u64::from_be_bytes(
-                    parsed.payload[32..40].try_into().expect("validated bloom"),
-                ),
-                bits: parsed.payload_offset + 40..parsed.payload_offset + parsed.payload.len(),
-                hash_contract: parsed.hash_contract.expect("validated bloom hash contract"),
-            },
-        ),
+        ArtifactKind::Bitset => Some(ResidentFilterIndex::Bitset {
+            min: i64::from_be_bytes(parsed.payload[1..9].try_into().expect("validated bitset")),
+            bit_count: u64::from_be_bytes(
+                parsed.payload[17..25].try_into().expect("validated bitset"),
+            ),
+            bits: parsed.payload_offset + 25..parsed.payload_offset + parsed.payload.len(),
+        }),
+        ArtifactKind::Bloom => Some(ResidentFilterIndex::Bloom {
+            bit_count: u64::from_be_bytes(
+                parsed.payload[32..40].try_into().expect("validated bloom"),
+            ),
+            bits: parsed.payload_offset + 40..parsed.payload_offset + parsed.payload.len(),
+            hash_contract: parsed.hash_contract.expect("validated bloom hash contract"),
+        }),
         _ => None,
     };
     let artifact = PhysicalArtifact::new(

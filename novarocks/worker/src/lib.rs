@@ -54,6 +54,11 @@ mod task_registry_entry;
 #[cfg(test)]
 mod task_registry_tests;
 
+/// Worker-owned runtime-filter artifacts and local resource contracts.
+pub mod runtime_filter {
+    pub mod artifact;
+}
+
 pub use admission::{
     AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
     AdmissionTicketGrant, AdmissionTicketProgression, AdmissionTicketRedemption,

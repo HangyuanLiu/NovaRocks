@@ -27,18 +27,19 @@ use novarocks_execution::runtime_filter::{
     LogicalVersion, RuntimeFilterMembershipSchema, contribution::ValueDomainDelta,
 };
 
-use crate::runtime_filter::artifact::{
+use crate::runtime_filter::codec::leaf::{self, ArtifactCodecError, ArtifactDecodeExpectations};
+use novarocks_worker::runtime_filter::artifact as worker_artifact;
+use novarocks_worker::runtime_filter::artifact::{
     ArtifactBundle, ArtifactContractError, ArtifactKind, ConsumerArtifactProfile,
 };
-use crate::runtime_filter::codec::leaf::{self, ArtifactCodecError, ArtifactDecodeExpectations};
 
 use self::{bitset::BitsetPlan, bloom::BloomHashContract};
 
 #[derive(Clone, Debug)]
 pub(crate) struct MaterializationAdmission {
     max_artifact_bytes: usize,
-    retained_budget: Arc<crate::runtime_filter::artifact::ArtifactRetainedBudget>,
-    scratch_budget: Arc<crate::runtime_filter::artifact::ArtifactScratchBudget>,
+    retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
+    scratch_budget: Arc<worker_artifact::ArtifactScratchBudget>,
 }
 
 /// Frozen physical Bloom parameters.  The Backend profile digest remains the
@@ -59,10 +60,10 @@ impl MaterializationAdmission {
     pub(crate) fn new(max_artifact_bytes: usize) -> Self {
         Self {
             max_artifact_bytes,
-            retained_budget: Arc::new(
-                crate::runtime_filter::artifact::ArtifactRetainedBudget::new(max_artifact_bytes),
-            ),
-            scratch_budget: Arc::new(crate::runtime_filter::artifact::ArtifactScratchBudget::new(
+            retained_budget: Arc::new(worker_artifact::ArtifactRetainedBudget::new(
+                max_artifact_bytes,
+            )),
+            scratch_budget: Arc::new(worker_artifact::ArtifactScratchBudget::new(
                 max_artifact_bytes,
             )),
         }
@@ -76,12 +77,12 @@ impl MaterializationAdmission {
     )]
     pub(crate) fn with_retained_budget(
         max_artifact_bytes: usize,
-        retained_budget: Arc<crate::runtime_filter::artifact::ArtifactRetainedBudget>,
+        retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
     ) -> Self {
         Self {
             max_artifact_bytes,
             retained_budget,
-            scratch_budget: Arc::new(crate::runtime_filter::artifact::ArtifactScratchBudget::new(
+            scratch_budget: Arc::new(worker_artifact::ArtifactScratchBudget::new(
                 max_artifact_bytes,
             )),
         }
@@ -92,8 +93,8 @@ impl MaterializationAdmission {
     )]
     pub(crate) fn with_budgets(
         max_artifact_bytes: usize,
-        retained_budget: Arc<crate::runtime_filter::artifact::ArtifactRetainedBudget>,
-        scratch_budget: Arc<crate::runtime_filter::artifact::ArtifactScratchBudget>,
+        retained_budget: Arc<worker_artifact::ArtifactRetainedBudget>,
+        scratch_budget: Arc<worker_artifact::ArtifactScratchBudget>,
     ) -> Self {
         Self {
             max_artifact_bytes,
@@ -104,22 +105,15 @@ impl MaterializationAdmission {
     fn retain(
         &self,
         profile: &ConsumerArtifactProfile,
-        artifacts: &[(
-            ArtifactKind,
-            Arc<crate::runtime_filter::artifact::PhysicalArtifact>,
-        )],
-    ) -> Result<Arc<crate::runtime_filter::artifact::ArtifactRetention>, ArtifactContractError>
-    {
+        artifacts: &[(ArtifactKind, Arc<worker_artifact::PhysicalArtifact>)],
+    ) -> Result<Arc<worker_artifact::ArtifactRetention>, ArtifactContractError> {
         let bytes = ArtifactBundle::accounted_resident_bytes(profile, artifacts)?;
         self.retained_budget.try_acquire(bytes).map(Arc::new)
     }
     pub(super) fn reserve_scratch(
         &self,
         bytes: usize,
-    ) -> Result<
-        Arc<crate::runtime_filter::artifact::ArtifactScratchReservation>,
-        ArtifactContractError,
-    > {
+    ) -> Result<Arc<worker_artifact::ArtifactScratchReservation>, ArtifactContractError> {
         self.scratch_budget.try_acquire(bytes).map(Arc::new)
     }
 }
@@ -291,7 +285,7 @@ pub(crate) fn materialize_membership_with_policy(
         );
     }
     let contract = match BloomHashContract::from_fields(
-        crate::runtime_filter::artifact::ArtifactSchemaDigest::new(schema.digest()),
+        worker_artifact::ArtifactSchemaDigest::new(schema.digest()),
         bloom_policy.algorithm_version,
         1,
         bloom_policy.seed,
@@ -460,10 +454,7 @@ pub(super) fn retain_bundle(
     channel_id: u32,
     logical_version: LogicalVersion,
     profile: &ConsumerArtifactProfile,
-    artifacts: Vec<(
-        ArtifactKind,
-        Arc<crate::runtime_filter::artifact::PhysicalArtifact>,
-    )>,
+    artifacts: Vec<(ArtifactKind, Arc<worker_artifact::PhysicalArtifact>)>,
     admission: &MaterializationAdmission,
 ) -> Result<ArtifactBundle, ArtifactContractError> {
     let retention = admission.retain(profile, &artifacts)?;
@@ -524,9 +515,7 @@ mod tests {
     fn admission_does_not_downgrade_an_unaccepted_representation() {
         let profile = ConsumerArtifactProfile::new(
             BTreeSet::from([ArtifactKind::Bloom]),
-            Some(crate::runtime_filter::artifact::HashContractDigest::new(
-                [9; 32],
-            )),
+            Some(worker_artifact::HashContractDigest::new([9; 32])),
         )
         .unwrap();
         let schema = RuntimeFilterMembershipSchema::new(
@@ -558,7 +547,7 @@ mod tests {
             RuntimeFilterNullSemantics::NeverMatches,
         )
         .unwrap();
-        let budget = Arc::new(crate::runtime_filter::artifact::ArtifactRetainedBudget::new(1));
+        let budget = Arc::new(worker_artifact::ArtifactRetainedBudget::new(1));
         let domain = ValueDomainDelta::new(MembershipValues::int64([]), false);
         assert!(matches!(
             materialize_membership(
@@ -593,10 +582,8 @@ mod tests {
                 &profile,
                 MaterializationAdmission::with_budgets(
                     4096,
-                    Arc::new(crate::runtime_filter::artifact::ArtifactRetainedBudget::new(4096)),
-                    Arc::new(crate::runtime_filter::artifact::ArtifactScratchBudget::new(
-                        1
-                    )),
+                    Arc::new(worker_artifact::ArtifactRetainedBudget::new(4096)),
+                    Arc::new(worker_artifact::ArtifactScratchBudget::new(1)),
                 ),
             ),
             MaterializationOutcome::Unavailable(MaterializationUnavailable::ResourceLimit)
