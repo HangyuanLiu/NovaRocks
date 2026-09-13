@@ -205,6 +205,23 @@ struct FrontendExecutionRuntimeOwner {
     shutdown_complete: bool,
 }
 
+/// Frozen native-read policy consumed while Server composes one Frontend role
+/// graph.
+///
+/// This belongs with the process execution runtime that supplies the client,
+/// decode owner and lifecycle diagnostics. The resulting launcher is held by
+/// the immutable role-product graph, never by the lifecycle Host.
+#[derive(Clone, Copy)]
+struct FrontendNativeLogicalExecutionConfig {
+    native_compatibility_id: NativeCompatibilityId,
+    runtime_filter_worker_count: NonZeroUsize,
+    task_update_retry_policy: TaskUpdateRetryPolicy,
+    split_initial_wait_cap: Duration,
+    coordination_budgets: CoordinationBudgets,
+    transport_budget: FrontendTaskTransportBudget,
+    abort_capacity: NonZeroUsize,
+}
+
 impl FrontendExecutionRuntimeOwner {
     fn try_new(
         runtime: Handle,
@@ -502,7 +519,7 @@ pub struct FrontendApplicationHost {
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_execution: Option<QueryExecutionService>,
-    logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
+    native_logical_execution: FrontendNativeLogicalExecutionConfig,
     query_control: novarocks_query_application::session_control::QueryControlService,
     coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
@@ -1005,7 +1022,15 @@ impl FrontendApplicationHost {
             mv_repository: None,
             state_store_host: None,
             query_execution: None,
-            logical_read_launcher: None,
+            native_logical_execution: FrontendNativeLogicalExecutionConfig {
+                native_compatibility_id: execution.native_compatibility_id,
+                runtime_filter_worker_count: execution.runtime_filter_worker_count,
+                task_update_retry_policy: execution.task_update_retry_policy,
+                split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
+                coordination_budgets: execution.coordination_budgets,
+                transport_budget: execution.transport_budget,
+                abort_capacity: execution.logical_abort_effect_capacity,
+            },
             query_control: QueryApplicationControl::service(),
             coordinator: None,
             execution_runtime_owner,
@@ -1184,25 +1209,6 @@ impl FrontendApplicationHost {
                     .await);
             }
         }
-        let topology = Arc::clone(host.topology());
-        let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
-            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
-            topology as crate::common::backend_topology::BackendProcessObservationService,
-            host.data_runtime.clone(),
-            host.result_decode_runtime(),
-            execution.native_compatibility_id,
-            execution.runtime_filter_worker_count,
-            execution.task_update_retry_policy,
-            execution.connector_split_initial_dynamic_filter_wait_cap,
-            execution.coordination_budgets,
-            execution.transport_budget.into_codec(),
-            execution.logical_abort_effect_capacity,
-            host.execution_runtime_owner.lifecycle_diagnostics(),
-        );
-        host.logical_read_launcher = Some(Arc::new(FrontendNativeLogicalReadLauncher::new(
-            host.logical_execution_client(),
-            native_runtime,
-        )));
         let catalog_prune = FrontendCatalogPruneService::new(
             Arc::clone(
                 host.catalog_application_port
@@ -1477,12 +1483,31 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.logical_execution_client()
     }
 
-    pub(crate) fn logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
-        Arc::clone(
-            self.logical_read_launcher
-                .as_ref()
-                .expect("frontend logical read launcher is installed before host open returns"),
-        ) as Arc<dyn LogicalReadLauncher>
+    /// Materializes the native-read launcher while Server constructs its
+    /// immutable role products. The returned launcher owns no process
+    /// lifecycle state; it only joins the Host-owned execution runtime with
+    /// the role's fixed topology and data-plane capabilities.
+    pub(crate) fn build_logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
+        let topology = Arc::clone(self.topology());
+        let config = self.native_logical_execution;
+        let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
+            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            topology as crate::common::backend_topology::BackendProcessObservationService,
+            self.data_runtime.clone(),
+            self.result_decode_runtime(),
+            config.native_compatibility_id,
+            config.runtime_filter_worker_count,
+            config.task_update_retry_policy,
+            config.split_initial_wait_cap,
+            config.coordination_budgets,
+            config.transport_budget.into_codec(),
+            config.abort_capacity,
+            self.execution_runtime_owner.lifecycle_diagnostics(),
+        );
+        Arc::new(FrontendNativeLogicalReadLauncher::new(
+            self.logical_execution_client(),
+            native_runtime,
+        )) as Arc<dyn LogicalReadLauncher>
     }
 
     #[allow(

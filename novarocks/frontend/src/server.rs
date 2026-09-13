@@ -129,6 +129,7 @@ struct FrontendRoleProducts {
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     query_execution: crate::query_execution::service::QueryExecutionService,
+    logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
     topology: crate::common::backend_topology::BackendTopologyService,
     role: novarocks_types::ClusterRole,
     mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
@@ -253,6 +254,7 @@ async fn build_frontend_role_products(
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
     let query_execution = host.query_execution_service();
+    let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
     let mv_repository = host.mv_repository();
@@ -393,6 +395,7 @@ async fn build_frontend_role_products(
         connector_control,
         typed_connector_control,
         query_execution,
+        logical_read_launcher,
         topology,
         role,
         mv_repository,
@@ -534,7 +537,7 @@ fn build_frontend_query_session_factory_from_role_products(
         host.query_control_service(),
         client_connection_control,
         query_execution,
-        host.logical_read_launcher(),
+        Arc::clone(&products.logical_read_launcher),
         host.workload_root_admission(),
         host.workload_resources(),
         role,
