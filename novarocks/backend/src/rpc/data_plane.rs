@@ -9,80 +9,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use novarocks_types::UniqueId;
 
 use crate::runtime::result_buffer::{TryFetchTypedResult, wait_fetch_typed_legacy};
-use novarocks_execution::runtime::fragment::io::{
-    ExchangeReceiverPort, UnavailableExchangeReceiverPort,
-};
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
-use novarocks_native_adapter::exchange_data_plane::{
-    ExchangeRouteAuthority, handle_transmit_chunk,
-};
 use novarocks_proto_models as proto;
-use std::sync::Arc;
 
 static FETCH_RESULT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone)]
-pub struct BackendDataPlane {
-    exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-    /// Every owner of exchange destinations on this backend. One frame is
-    /// admitted only when exactly one of them claims its destination.
-    exchange_route_authorities: Vec<Arc<dyn ExchangeRouteAuthority>>,
-}
-
-impl std::fmt::Debug for BackendDataPlane {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("BackendDataPlane")
-            .finish_non_exhaustive()
-    }
-}
-
-impl Default for BackendDataPlane {
-    fn default() -> Self {
-        Self::query_scoped()
-    }
-}
+#[derive(Clone, Debug, Default)]
+pub struct BackendDataPlane;
 
 impl BackendDataPlane {
-    pub fn query_scoped() -> Self {
-        Self {
-            exchange_receiver_port: Arc::new(UnavailableExchangeReceiverPort),
-            exchange_route_authorities: Vec::new(),
-        }
-    }
-
-    /// Composes the data plane with every exchange-destination owner.
-    ///
-    /// One owner is wired today, so `settle_exchange_route`'s conflict arm
-    /// cannot fire from this composition -- a single authority can produce at
-    /// most one claimant. Its zero-claimant refusal stays live and is the
-    /// normal answer for a frame naming a destination this backend no longer
-    /// holds. The list is still a list because the conflict arm is the reason
-    /// this shape exists: whoever wires a second owner here needs it to
-    /// already be there, so that two owners claiming one destination is a
-    /// refusal rather than a race the wiring order settles.
-    pub fn with_exchange_receiver_port(
-        exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
-        exchange_route_authority: Arc<dyn ExchangeRouteAuthority>,
-    ) -> Self {
-        Self {
-            exchange_receiver_port,
-            exchange_route_authorities: vec![exchange_route_authority],
-        }
-    }
-
-    pub fn exchange(
-        &self,
-        request: proto::novarocks::ExchangeRequest,
-    ) -> proto::novarocks::ExchangeResponse {
-        let authorities: Vec<&dyn ExchangeRouteAuthority> = self
-            .exchange_route_authorities
-            .iter()
-            .map(Arc::as_ref)
-            .collect();
-        handle_transmit_chunk(self.exchange_receiver_port.as_ref(), &authorities, request)
-    }
-
     pub fn fetch_result(
         &self,
         request: proto::novarocks::FetchResultRequest,

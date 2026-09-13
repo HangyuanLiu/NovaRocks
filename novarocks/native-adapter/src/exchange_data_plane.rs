@@ -113,6 +113,37 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
     }
 }
 
+/// Native exchange ingress composition.
+///
+/// This owns only wire-facing ports. Each route authority and the receiver it
+/// delegates to remain owned by their respective runtime domains.
+#[derive(Clone)]
+pub struct NativeExchangeDataPlane {
+    receiver_port: Arc<dyn ExchangeReceiverPort>,
+    route_authorities: Vec<Arc<dyn ExchangeRouteAuthority>>,
+}
+
+impl NativeExchangeDataPlane {
+    pub fn new(
+        receiver_port: Arc<dyn ExchangeReceiverPort>,
+        route_authorities: Vec<Arc<dyn ExchangeRouteAuthority>>,
+    ) -> Self {
+        Self {
+            receiver_port,
+            route_authorities,
+        }
+    }
+
+    pub fn transmit(
+        &self,
+        request: proto::novarocks::ExchangeRequest,
+    ) -> proto::novarocks::ExchangeResponse {
+        let authorities: Vec<&dyn ExchangeRouteAuthority> =
+            self.route_authorities.iter().map(Arc::as_ref).collect();
+        handle_transmit_chunk(self.receiver_port.as_ref(), &authorities, request)
+    }
+}
+
 /// Why one inbound exchange frame is not admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExchangeRouteRefusal {

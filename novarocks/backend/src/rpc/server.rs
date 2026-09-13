@@ -30,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use novarocks_native_adapter::{
     backend_heartbeat::BackendHeartbeatResponder,
-    exchange_data_plane::TaskInboundCapabilitiesRouteAuthority,
+    exchange_data_plane::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority},
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
     task_protocol::{TaskExecutionIngress, TaskStatusEventStream},
@@ -67,6 +67,7 @@ pub(crate) struct BackendRpcService {
     task_execution_ingress: Arc<dyn TaskExecutionIngress>,
     catalog_reachability: Arc<dyn CatalogReachabilityAuthority>,
     heartbeat: BackendHeartbeatResponder,
+    exchange_data_plane: NativeExchangeDataPlane,
     data_plane: BackendDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
 }
@@ -84,12 +85,13 @@ impl BackendRpcService {
             task_execution_ingress,
             catalog_reachability,
             heartbeat,
-            data_plane: BackendDataPlane::with_exchange_receiver_port(
+            exchange_data_plane: NativeExchangeDataPlane::new(
                 exchange_receiver_port,
-                Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
+                vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
                     task_inbound_capabilities,
-                )),
+                ))],
             ),
+            data_plane: BackendDataPlane,
             runtime_filter_ingress,
         }
     }
@@ -121,7 +123,7 @@ impl NovaRocksGrpc for BackendRpcService {
     ) -> Result<tonic::Response<Self::ExchangeStream>, tonic::Status> {
         let mut inbound = request.into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(4096);
-        let kernel = self.data_plane.clone();
+        let kernel = self.exchange_data_plane.clone();
         tokio::spawn(async move {
             loop {
                 let request = match inbound.message().await {
@@ -138,7 +140,7 @@ impl NovaRocksGrpc for BackendRpcService {
                 };
                 let kernel = kernel.clone();
                 let response =
-                    match tokio::task::spawn_blocking(move || kernel.exchange(request)).await {
+                    match tokio::task::spawn_blocking(move || kernel.transmit(request)).await {
                         Ok(response) => response,
                         Err(error) => {
                             let _ = tx
@@ -165,8 +167,8 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::ExchangeRequest>,
     ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
-        let kernel = self.data_plane.clone();
-        let response = tokio::task::spawn_blocking(move || kernel.exchange(request.into_inner()))
+        let kernel = self.exchange_data_plane.clone();
+        let response = tokio::task::spawn_blocking(move || kernel.transmit(request.into_inner()))
             .await
             .map_err(|error| {
                 tonic::Status::internal(format!("exchange_unary handler panicked: {error}"))

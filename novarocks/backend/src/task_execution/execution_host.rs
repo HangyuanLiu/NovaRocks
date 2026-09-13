@@ -1410,7 +1410,7 @@ mod tests {
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
 
     use novarocks_native_adapter::exchange_data_plane::{
-        ExchangeRouteQuery, TaskInboundCapabilitiesRouteAuthority,
+        ExchangeRouteQuery, NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority,
     };
 
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
@@ -2098,8 +2098,6 @@ mod tests {
     /// move a single frame.
     #[test]
     fn the_composed_data_plane_admits_a_frame_only_the_task_substrate_holds() {
-        use crate::rpc::data_plane::BackendDataPlane;
-
         let consumer = identity(15, 1, 1);
         let producer = identity(15, 2, 1);
         let producer_key = UniqueId::new(101, 102);
@@ -2116,11 +2114,11 @@ mod tests {
             )))
             .expect("a legal install");
 
-        let plane = BackendDataPlane::with_exchange_receiver_port(
+        let plane = NativeExchangeDataPlane::new(
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::new(TaskInboundCapabilitiesRouteAuthority::new(Arc::clone(
-                &capabilities,
-            ))),
+            vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
+                Arc::clone(&capabilities),
+            ))],
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
             finst_id_hi: destination.high(),
@@ -2140,7 +2138,7 @@ mod tests {
         // The receiver port is deliberately unavailable, so reaching delivery
         // is the proof the route was authorized.
         let status = plane
-            .exchange(request(kernel_key, producer_key))
+            .transmit(request(kernel_key, producer_key))
             .status
             .expect("status");
         assert_eq!(status.code, 1);
@@ -2153,7 +2151,7 @@ mod tests {
         // A destination neither owner holds is still refused, and the refusal
         // names no owner.
         let status = plane
-            .exchange(request(UniqueId::new(1, 1), producer_key))
+            .transmit(request(UniqueId::new(1, 1), producer_key))
             .status
             .expect("status");
         assert_eq!(status.code, 1);
