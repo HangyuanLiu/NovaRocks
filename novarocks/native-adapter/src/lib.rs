@@ -26,6 +26,7 @@ pub mod fragment_expression;
 pub mod fragment_instance;
 pub mod fragment_layout;
 pub mod fragment_runtime_filter;
+pub mod fragment_scan_output;
 pub mod fragment_submission;
 pub mod fragment_validation;
 pub mod fragment_variant_path;
