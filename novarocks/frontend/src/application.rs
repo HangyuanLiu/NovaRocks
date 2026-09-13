@@ -59,7 +59,6 @@ use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
 use crate::coordinator::FrontendDistributedQueryCoordinator;
-use crate::dml::DmlService;
 use crate::mv::repository::StateStoreMvRepository;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
@@ -494,7 +493,6 @@ pub struct FrontendApplicationHost {
     connector_control: Arc<ConnectorControlHost>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
-    dml_service: Option<Arc<DmlService>>,
     catalog_application_port: Option<Arc<CatalogApplicationService>>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
@@ -1000,7 +998,6 @@ impl FrontendApplicationHost {
             connector_control,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
-            dml_service: None,
             catalog_application_port: None,
             abandoned_attempt_sweeper: None,
             catalog_controller: None,
@@ -1243,7 +1240,6 @@ impl FrontendApplicationHost {
             }
             host.abandoned_attempt_sweeper = Some(sweeper);
         }
-        host.dml_service = Some(Arc::new(DmlService::new()));
         // The coordinator owns the immutable execution and connector-control
         // context consumed by frontend application services. Install it before
         // constructing those services so MV refresh never observes an
@@ -1284,14 +1280,6 @@ impl FrontendApplicationHost {
             return Err(host.cleanup_open_error(error).await);
         }
         Ok(host)
-    }
-
-    pub fn dml_service(&self) -> Arc<DmlService> {
-        Arc::clone(
-            self.dml_service
-                .as_ref()
-                .expect("frontend DML service is installed before host open returns"),
-        )
     }
 
     pub fn catalog_application_port(
@@ -1743,7 +1731,6 @@ impl FrontendApplicationHost {
             return Err(primary_error.expect("heartbeat shutdown error is retained"));
         }
         self.topology.take();
-        self.dml_service.take();
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.

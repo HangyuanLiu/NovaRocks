@@ -133,6 +133,7 @@ struct FrontendRoleProducts {
     role: novarocks_types::ClusterRole,
     mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
     view_service: Arc<dyn crate::view::ViewService>,
+    dml_service: Arc<crate::dml::DmlService>,
     statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
     maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
     maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
@@ -257,6 +258,7 @@ async fn build_frontend_role_products(
     let mv_repository = host.mv_repository();
     let view_service: Arc<dyn crate::view::ViewService> =
         Arc::new(crate::view::FrontendViewService::new());
+    let dml_service = Arc::new(crate::dml::DmlService::new());
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
         Arc::new(
             crate::table_maintenance::FrontendTableMaintenanceService::open(
@@ -395,6 +397,7 @@ async fn build_frontend_role_products(
         role,
         mv_repository,
         view_service,
+        dml_service,
         statistics_application,
         maintenance_service,
         maintenance_engine,
@@ -536,7 +539,7 @@ fn build_frontend_query_session_factory_from_role_products(
         host.workload_resources(),
         role,
         topology,
-        host.dml_service(),
+        Arc::clone(&products.dml_service),
         dml_engines.insert,
         dml_engines.delete,
         dml_engines.mutation,

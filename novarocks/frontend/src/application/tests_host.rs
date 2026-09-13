@@ -197,27 +197,6 @@ fn sqlite_config(_temp: &TempDir) -> StateStoreHostInput {
     state_store_input()
 }
 
-#[tokio::test]
-async fn host_exposes_one_dml_service_identity() {
-    let mut host = open_host(Some(state_store_input())).await.expect("host");
-    let first = host.dml_service();
-    let second = host.dml_service();
-    assert!(Arc::ptr_eq(&first, &second));
-    host.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_host_reopens_without_a_dml_recovery_surface() {
-    let config = state_store_input();
-    let mut host = open_host(Some(config.clone())).await.expect("first host");
-    let first = host.dml_service();
-    host.shutdown().await.expect("first shutdown");
-
-    let mut reopened = open_host(Some(config)).await.expect("reopened host");
-    assert!(!Arc::ptr_eq(&first, &reopened.dml_service()));
-    reopened.shutdown().await.expect("reopened shutdown");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fe_without_state_store_fails_before_durable_services_open() {
     let error = match FrontendApplicationHost::open(
