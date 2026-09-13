@@ -128,6 +128,7 @@ struct FrontendRoleProducts {
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
     typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
+    query_control: novarocks_query_application::session_control::QueryControlService,
     query_execution: crate::query_execution::service::QueryExecutionService,
     logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
     topology: crate::common::backend_topology::BackendTopologyService,
@@ -253,6 +254,8 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
+    let query_control =
+        novarocks_query_application::query_control::QueryApplicationControl::service();
     let query_execution = host.build_query_execution_service()?;
     let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
@@ -394,6 +397,7 @@ async fn build_frontend_role_products(
         function_catalog,
         connector_control,
         typed_connector_control,
+        query_control,
         query_execution,
         logical_read_launcher,
         topology,
@@ -534,7 +538,7 @@ fn build_frontend_query_session_factory_from_role_products(
         mv_command_executor,
         maintenance_command_executor,
         maintenance_read_command_executor,
-        host.query_control_service(),
+        products.query_control.clone(),
         client_connection_control,
         query_execution,
         Arc::clone(&products.logical_read_launcher),

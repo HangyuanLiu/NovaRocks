@@ -80,7 +80,6 @@ use novarocks_catalog_application::{
 };
 use novarocks_native_adapter::FrontendNativeTransport;
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
-use novarocks_query_application::query_control::QueryApplicationControl;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -520,7 +519,6 @@ pub struct FrontendApplicationHost {
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
     query_runtime: FrontendQueryRuntimeConfig,
-    query_control: novarocks_query_application::session_control::QueryControlService,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
@@ -1026,7 +1024,6 @@ impl FrontendApplicationHost {
                 result_fetch_byte_limit: execution.result_fetch_byte_limit,
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
-            query_control: QueryApplicationControl::service(),
             execution_runtime_owner,
             execution_role: backend.role(),
             data_runtime: data_runtime.clone(),
@@ -1543,12 +1540,6 @@ impl FrontendApplicationHost {
     )]
     pub(crate) fn workload_resources(&self) -> LocalResourceAuthority {
         self.execution_runtime_owner.resources()
-    }
-
-    pub fn query_control_service(
-        &self,
-    ) -> novarocks_query_application::session_control::QueryControlService {
-        self.query_control.clone()
     }
 
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
