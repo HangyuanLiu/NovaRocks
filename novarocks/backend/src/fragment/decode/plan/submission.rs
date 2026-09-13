@@ -17,19 +17,17 @@
 
 //! Fragment-owned native fragment submission assembly.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
+    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec,
 };
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
@@ -47,6 +45,7 @@ use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
 use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
 use novarocks_native_adapter::fragment_submission::{
     decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
+    validate_scan_range_nodes,
 };
 
 pub(crate) struct DecodedNativeFragment {
@@ -84,11 +83,12 @@ pub(crate) fn decode_fragment_submission(
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())
         .map_err(NativeFragmentDecodeError::from)?;
-    validate_raw_scan_range_nodes(
+    validate_scan_range_nodes(
         &scan_sources,
         &instance.raw_scan_ranges,
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
-    )?;
+    )
+    .map_err(NativeFragmentDecodeError::from)?;
     let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)
         .map_err(NativeFragmentDecodeError::from)?;
 
@@ -152,31 +152,6 @@ pub(crate) fn decode_fragment_submission(
         submission,
         backend_num,
     })
-}
-
-fn validate_raw_scan_range_nodes(
-    contracts: &BTreeMap<
-        novarocks_execution::exec::fragment::program::FragmentNodeId,
-        ScanSourceContract,
-    >,
-    raw_ranges: &BTreeMap<
-        novarocks_execution::exec::fragment::program::FragmentNodeId,
-        Vec<ScanRangeParams>,
-    >,
-    path: FieldPath,
-) -> Result<(), NativeFragmentDecodeError> {
-    for node_id in raw_ranges.keys() {
-        if !contracts.contains_key(node_id) {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().map_key(node_id.get().to_string()),
-                format!(
-                    "scan ranges assigned to unknown scan node {}",
-                    node_id.get()
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

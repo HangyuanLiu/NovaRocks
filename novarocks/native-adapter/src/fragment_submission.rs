@@ -28,6 +28,7 @@ use novarocks_execution::exec::fragment::program::{
 };
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_types::UniqueId;
@@ -61,6 +62,30 @@ pub fn decode_scan_source_contracts(
     let mut assignments = BTreeMap::new();
     visit_scan_contracts(root, path, &mut assignments)?;
     Ok(assignments)
+}
+
+/// Refuse scan ranges that do not name a scan source frozen by the plan.
+///
+/// Both inputs are immutable native-wire projections, so this check belongs
+/// beside their decoding rather than in Backend plan lowering.
+pub fn validate_scan_range_nodes(
+    contracts: &BTreeMap<FragmentNodeId, ScanSourceContract>,
+    raw_ranges: &BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    for node_id in raw_ranges.keys() {
+        if !contracts.contains_key(node_id) {
+            return Err(error(
+                path.clone().map_key(node_id.get().to_string()),
+                ProtocolErrorKind::InconsistentFields,
+                format!(
+                    "scan ranges assigned to unknown scan node {}",
+                    node_id.get()
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn visit_scan_contracts(
@@ -297,7 +322,10 @@ fn error(path: FieldPath, kind: ProtocolErrorKind, detail: impl Into<String>) ->
 mod tests {
     use super::{
         decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
+        validate_scan_range_nodes,
     };
+    use std::collections::BTreeMap;
+
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{novarocks as proto, plan};
@@ -371,6 +399,30 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "native protocol error at plan_fragment.root.payload.physical.scan.table.source (missing field): native ScanNode node_id=17 requires source"
+        );
+    }
+
+    #[test]
+    fn rejects_scan_ranges_for_unknown_scan_node() {
+        let mut contracts = BTreeMap::new();
+        contracts.insert(
+            FragmentNodeId::new(17),
+            novarocks_execution::exec::fragment::program::ScanSourceContract::new(
+                ScanAssignmentKind::File,
+            ),
+        );
+        let mut ranges = BTreeMap::new();
+        ranges.insert(FragmentNodeId::new(19), Vec::new());
+
+        let error = validate_scan_range_nodes(
+            &contracts,
+            &ranges,
+            FieldPath::root("instance_params").field("per_node_scan_ranges"),
+        )
+        .expect_err("unknown scan range node must fail");
+        assert_eq!(
+            error.to_string(),
+            "native protocol error at instance_params.per_node_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
         );
     }
 
