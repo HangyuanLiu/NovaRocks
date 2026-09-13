@@ -65,6 +65,7 @@ use novarocks_worker::runtime_filter::execution_session::{
 use novarocks_worker::runtime_filter::observation::{
     RuntimeFilterObservationEmitter, RuntimeFilterObservationSnapshot,
 };
+use novarocks_worker::runtime_filter::participant_ingress;
 use novarocks_worker::{
     RuntimeFilterContractError, RuntimeFilterContractErrorCode,
     runtime_filter::{
@@ -699,46 +700,13 @@ impl RuntimeFilterParticipant {
                 "runtime filter ingress rejected [route-identity]: producer-instance route identity is required",
             );
         };
-        let binding_id = identity.producer_binding_id();
-        let channel_id = envelope.channel_id();
-        if self
-            .install
-            .routing()
-            .authorize_contribution(
-                channel_id,
-                binding_id,
-                identity.fragment_instance_id(),
-                BackendEnvelopeKind::ProducerUnavailable,
-            )
-            .is_err()
-        {
-            return rejected(
-                "runtime filter ingress rejected [route-authority]: producer failure route is not installed",
-            );
-        }
-        let Some(session) = self.producer_sessions.get(&binding_id) else {
-            return rejected(
-                "runtime filter ingress rejected [producer-binding]: producer binding is not installed",
-            );
-        };
-        if session.channel().channel_id() != channel_id {
-            return rejected(
-                "runtime filter ingress rejected [producer-binding]: producer binding is installed for a different channel",
-            );
-        }
-        match session.fail(
-            binding_id,
+        participant_ingress::dispatch_producer_failure(
+            &self.install,
+            &self.producer_sessions,
+            envelope.channel_id(),
+            identity.producer_binding_id(),
             identity.fragment_instance_id(),
-            novarocks_execution::runtime_filter::RuntimeFilterProducerFailure::UpstreamUnavailable,
-        ) {
-            Ok(novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::TerminalNoop) => {
-                BackendIngressResult::duplicate()
-            }
-            Ok(_) => BackendIngressResult::accepted(),
-            Err(_) => rejected(
-                "runtime filter ingress rejected [producer-failure]: failure violates the installed producer route",
-            ),
-        }
+        )
     }
 
     pub(crate) fn close(
