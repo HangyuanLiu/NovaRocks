@@ -21,15 +21,51 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime_filter::{
-    RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterProducerFailure,
-    RuntimeFilterSubmitOutcome,
+    PartitionId, ProducerSequence, RuntimeFilterBindingId, RuntimeFilterChannelId,
+    RuntimeFilterProducerFailure, RuntimeFilterSubmitOutcome,
 };
 use novarocks_types::UniqueId;
 
 use super::domain::{
-    BackendEnvelopeKind, BackendIngressResult, BackendParticipantInstall,
-    BackendRuntimeFilterSession,
+    BackendChannelIdentity, BackendEnvelopeKind, BackendIngressResult, BackendParticipantIdentity,
+    BackendParticipantInstall, BackendProducerStreamIdentity, BackendRuntimeFilterEvent,
+    BackendRuntimeFilterEventObserver, BackendRuntimeFilterSession,
 };
+use super::observation::RuntimeFilterObservationEmitter;
+
+/// Records the Worker-owned outcome of an already-authorized contribution.
+pub fn record_contribution_outcome(
+    observation: &RuntimeFilterObservationEmitter,
+    participant: BackendParticipantIdentity,
+    binding_id: RuntimeFilterBindingId,
+    channel_id: RuntimeFilterChannelId,
+    fragment_instance_id: UniqueId,
+    partition: PartitionId,
+    sequence: ProducerSequence,
+    outcome: RuntimeFilterSubmitOutcome,
+) {
+    let stream = BackendProducerStreamIdentity::new(
+        BackendChannelIdentity::new(participant, binding_id, channel_id),
+        fragment_instance_id,
+        partition,
+    );
+    observation.record(match outcome {
+        RuntimeFilterSubmitOutcome::Duplicate => {
+            BackendRuntimeFilterEvent::ContributionDuplicateIgnored {
+                stream,
+                sequence: sequence.get(),
+            }
+        }
+        RuntimeFilterSubmitOutcome::Stale => BackendRuntimeFilterEvent::ContributionStaleIgnored {
+            stream,
+            sequence: sequence.get(),
+        },
+        _ => BackendRuntimeFilterEvent::ContributionAccepted {
+            stream,
+            sequence: sequence.get(),
+        },
+    });
+}
 
 /// Applies a decoded producer-failure frame against one installed participant.
 ///

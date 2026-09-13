@@ -611,7 +611,9 @@ impl RuntimeFilterParticipant {
                     contribution,
                 ) {
                     Ok(submission) => {
-                        self.record_contribution_outcome(
+                        participant_ingress::record_contribution_outcome(
+                            &self.observation,
+                            self.install.participant(),
                             binding_id,
                             channel_id,
                             identity.fragment_instance_id(),
@@ -654,41 +656,6 @@ impl RuntimeFilterParticipant {
             },
             _ => unreachable!("caller selects producer envelope kinds"),
         }
-    }
-
-    fn record_contribution_outcome(
-        &self,
-        binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-        channel_id: novarocks_execution::runtime_filter::RuntimeFilterChannelId,
-        fragment_instance_id: UniqueId,
-        partition: novarocks_execution::runtime_filter::PartitionId,
-        sequence: novarocks_execution::runtime_filter::ProducerSequence,
-        outcome: novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome,
-    ) {
-        let stream = BackendProducerStreamIdentity::new(
-            BackendChannelIdentity::new(self.install.participant(), binding_id, channel_id),
-            fragment_instance_id,
-            partition,
-        );
-        let event = match outcome {
-            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate => {
-                BackendRuntimeFilterEvent::ContributionDuplicateIgnored {
-                    stream,
-                    sequence: sequence.get(),
-                }
-            }
-            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale => {
-                BackendRuntimeFilterEvent::ContributionStaleIgnored {
-                    stream,
-                    sequence: sequence.get(),
-                }
-            }
-            _ => BackendRuntimeFilterEvent::ContributionAccepted {
-                stream,
-                sequence: sequence.get(),
-            },
-        };
-        self.observation.record(event);
     }
 
     fn dispatch_producer_failure(
