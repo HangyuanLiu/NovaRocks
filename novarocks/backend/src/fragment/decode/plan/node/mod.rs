@@ -50,7 +50,6 @@ use crate::fragment::decode::plan::runtime_filter_binding::{
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use novarocks_execution::exec::node::aggregate::{
     AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
 };
@@ -74,79 +73,6 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
 pub(crate) type DecodedNode = NativeLoweredPlanNode;
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(super) fn collect_scan_assignment_kinds(
-    root: &plan::DistributedNode,
-    root_path: FieldPath,
-) -> Result<BTreeMap<FragmentNodeId, ScanAssignmentKind>, NativeFragmentDecodeError> {
-    fn visit(
-        node: &plan::DistributedNode,
-        path: FieldPath,
-        assignments: &mut BTreeMap<FragmentNodeId, ScanAssignmentKind>,
-    ) -> Result<(), NativeFragmentDecodeError> {
-        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
-            && let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref()
-        {
-            let scan_path = path
-                .clone()
-                .field("payload")
-                .field("physical")
-                .field("scan");
-            let table = scan.table.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path.clone().field("table"),
-                    format!("native ScanNode node_id={} requires table", node.node_id),
-                )
-            })?;
-            let source = table.source.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path.clone().field("table").field("source"),
-                    format!("native ScanNode node_id={} requires source", node.node_id),
-                )
-            })?;
-            let source = source.kind.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path
-                        .clone()
-                        .field("table")
-                        .field("source")
-                        .field("kind"),
-                    format!(
-                        "native ScanNode node_id={} requires source kind",
-                        node.node_id
-                    ),
-                )
-            })?;
-            let _ = source;
-            let kind = ScanAssignmentKind::File;
-            if assignments
-                .insert(FragmentNodeId::new(node.node_id), kind)
-                .is_some()
-            {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.clone().field("node_id"),
-                    format!("native plan has duplicate scan node_id={}", node.node_id),
-                ));
-            }
-        }
-        for (index, child) in node.children.iter().enumerate() {
-            visit(
-                child,
-                path.clone().field("children").index(index),
-                assignments,
-            )?;
-        }
-        Ok(())
-    }
-
-    let mut assignments = BTreeMap::new();
-    visit(root, root_path, &mut assignments)?;
-    Ok(assignments)
-}
-
 #[allow(dead_code)]
 pub(crate) fn decode_node(
     node: &plan::DistributedNode,
