@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use super::common::proto_join_type;
 use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
@@ -30,7 +29,9 @@ use novarocks_execution::exec::node::join::{
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
-use novarocks_native_adapter::fragment_plan_node::{concat_slot_layouts, join_output_chunk_schema};
+use novarocks_native_adapter::fragment_plan_node::{
+    concat_slot_layouts, join_output_chunk_schema, proto_join_type,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;

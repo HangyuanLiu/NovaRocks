@@ -37,6 +37,7 @@ use novarocks_execution::exec::node::change_event_expand::{
     ChangeEventExpandNode, ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
 };
 use novarocks_execution::exec::node::filter::FilterNode;
+use novarocks_execution::exec::node::join::JoinType;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks_execution::exec::node::project::ProjectNode;
@@ -60,6 +61,80 @@ use prost::Message;
 use crate::fragment_error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use crate::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
 use crate::fragment_layout::decode_output_layout;
+
+pub fn require_exact_children(
+    node_path: FieldPath,
+    kind: &str,
+    expected: usize,
+    actual: usize,
+) -> Result<(), NativeFragmentDecodeError> {
+    check_children_arity(
+        node_path,
+        kind,
+        &expected.to_string(),
+        actual,
+        actual == expected,
+    )
+}
+
+pub fn require_min_children(
+    node_path: FieldPath,
+    kind: &str,
+    min: usize,
+    actual: usize,
+) -> Result<(), NativeFragmentDecodeError> {
+    check_children_arity(node_path, kind, &format!(">={min}"), actual, actual >= min)
+}
+
+fn check_children_arity(
+    node_path: FieldPath,
+    kind: &str,
+    expected: &str,
+    actual: usize,
+    ok: bool,
+) -> Result<(), NativeFragmentDecodeError> {
+    if ok {
+        Ok(())
+    } else {
+        Err(NativeFragmentDecodeError::inconsistent(
+            node_path.field("children"),
+            format!("{kind} expected {expected} children, got {actual}"),
+        ))
+    }
+}
+
+pub fn proto_join_type(
+    value: i32,
+    node_kind: &str,
+) -> Result<JoinType, NativeFragmentLeafDecodeError> {
+    match plan::JoinKind::try_from(value).map_err(|_| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "join_type",
+            format!("{node_kind} unknown join_type {value}"),
+        )
+    })? {
+        plan::JoinKind::Inner => Ok(JoinType::Inner),
+        plan::JoinKind::LeftOuter => Ok(JoinType::LeftOuter),
+        plan::JoinKind::RightOuter => Ok(JoinType::RightOuter),
+        plan::JoinKind::FullOuter => Ok(JoinType::FullOuter),
+        plan::JoinKind::LeftSemi => Ok(JoinType::LeftSemi),
+        plan::JoinKind::RightSemi => Ok(JoinType::RightSemi),
+        plan::JoinKind::LeftAnti => Ok(JoinType::LeftAnti),
+        plan::JoinKind::RightAnti => Ok(JoinType::RightAnti),
+        plan::JoinKind::NullAwareLeftAnti => Ok(JoinType::NullAwareLeftAnti),
+        plan::JoinKind::Cross => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InconsistentFields,
+            "join_type",
+            format!("{node_kind} CROSS join requires NestLoopJoinNode"),
+        )),
+        plan::JoinKind::Unspecified => Err(NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidEnum,
+            "join_type",
+            format!("{node_kind} join_type is unspecified"),
+        )),
+    }
+}
 
 pub fn decode_zero_input_expression(
     e: &expr::Expr,
@@ -879,7 +954,7 @@ fn parse_sort_topn_type(value: Option<i32>) -> Result<SortTopNType, NativeFragme
     }
 }
 
-fn build_slot_projection(
+pub fn build_slot_projection(
     label: &str,
     input: NativeLoweredPlanNode,
     output_columns: &[proto_common::OutputColumn],
