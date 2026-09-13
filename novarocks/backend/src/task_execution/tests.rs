@@ -744,24 +744,6 @@ fn split_update(node: i32, first: u64, last: u64, no_more: bool, payload: u8) ->
 // --------------------------------------------------------------------- create
 
 #[test]
-fn a_conflicting_descriptor_fails_closed() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    fixture.create(identity, 5);
-
-    let conflicting = fixture
-        .registry
-        .create_task(&fixture.create_request(identity, 6));
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
-    assert!(conflicting.acknowledgement().is_none());
-    // The installed task is untouched.
-    assert!(fixture.registry.has_live_task(identity));
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
-}
-
-#[test]
 fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);

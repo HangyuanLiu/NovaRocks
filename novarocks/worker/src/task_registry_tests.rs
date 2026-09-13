@@ -50,11 +50,11 @@ use crate::{
 };
 
 #[derive(Debug)]
-struct TestPlan;
+struct TestPlan(u8);
 
 impl CodecOwnedContent for TestPlan {
     fn fingerprint(&self) -> ContentFingerprint {
-        ContentFingerprint::from_bytes([0x51; 16])
+        ContentFingerprint::from_bytes([self.0; 16])
     }
 
     fn encoded_len(&self) -> usize {
@@ -135,6 +135,7 @@ impl RunnableTask for TestRunnable {
 #[derive(Default)]
 struct TestTaskHost {
     receivers_installed: AtomicUsize,
+    receivers_removed: AtomicUsize,
     capabilities_installed: AtomicUsize,
     submitted: AtomicUsize,
 }
@@ -149,7 +150,9 @@ impl TaskExecutionHost for TestTaskHost {
         Ok(())
     }
 
-    fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}
+    fn remove_receiver(&self, _descriptor: &TaskDescriptor) {
+        self.receivers_removed.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn install_inbound_capability(
         &self,
@@ -324,7 +327,7 @@ fn adapter_gate_blocks_runnable_submission_until_it_releases() {
         std::num::NonZeroUsize::new(1).expect("nonzero dop"),
         vec![PlanNodeId::new(1).expect("nonnegative node")],
         ExchangeTopology::default(),
-        Arc::new(TestPlan),
+        Arc::new(TestPlan(0x51)),
     )
     .expect("legal descriptor");
     let request = CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
@@ -373,7 +376,7 @@ fn lost_create_acknowledgement_replays_without_resubmitting_the_runnable() {
         std::num::NonZeroUsize::new(1).expect("nonzero dop"),
         vec![PlanNodeId::new(1).expect("nonnegative node")],
         ExchangeTopology::default(),
-        Arc::new(TestPlan),
+        Arc::new(TestPlan(0x51)),
     )
     .expect("legal descriptor");
     let request = CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
@@ -420,7 +423,7 @@ fn concurrent_exact_creates_share_one_runnable_and_receipt() {
         std::num::NonZeroUsize::new(1).expect("nonzero dop"),
         vec![PlanNodeId::new(1).expect("nonnegative node")],
         ExchangeTopology::default(),
-        Arc::new(TestPlan),
+        Arc::new(TestPlan(0x51)),
     )
     .expect("legal descriptor");
 
@@ -459,4 +462,72 @@ fn concurrent_exact_creates_share_one_runnable_and_receipt() {
     assert_eq!(task_host.capabilities_installed.load(Ordering::SeqCst), 1);
     assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
     assert_eq!(registry.counters().tasks_created, 1);
+}
+
+#[test]
+fn conflicting_descriptor_is_refused_without_touching_the_live_task() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let execution = QueryExecutionId::new(
+        QueryId::new(71, 72),
+        AttemptId::new(1).expect("nonzero attempt"),
+    )
+    .expect("nonzero query id");
+    let context = QueryContextRef::new(execution, frontend, backend);
+    let task_host = Arc::new(TestTaskHost::default());
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+        test_ports(),
+    );
+
+    establish(&registry, context);
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("nonzero stage"),
+        TaskId::new(1).expect("nonzero task"),
+        backend,
+    );
+    let descriptor = |fingerprint| {
+        TaskDescriptor::try_new(
+            identity,
+            UniqueId::new(1, 1),
+            std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+            vec![PlanNodeId::new(1).expect("nonnegative node")],
+            ExchangeTopology::default(),
+            Arc::new(TestPlan(fingerprint)),
+        )
+        .expect("legal descriptor")
+    };
+    let accepted = registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(5),
+            Vec::new(),
+        )
+        .expect("legal create"),
+    );
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+
+    let conflicting = registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(6),
+            Vec::new(),
+        )
+        .expect("legal create"),
+    );
+    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
+    assert!(conflicting.acknowledgement().is_none());
+    assert!(registry.has_live_task(identity));
+    assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(task_host.receivers_removed.load(Ordering::SeqCst), 0);
 }
