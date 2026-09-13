@@ -57,7 +57,9 @@ pub(super) fn lower_redistribute_node(
             for col in &hash.cols {
                 NativeFragmentDecodeError::map_invalid(
                     path.clone().field("mode").field("hash").field("cols"),
-                    child.layout.resolve_column_id(*col),
+                    child.layout.resolve_column_id(*col).ok_or_else(|| {
+                        format!("ColumnRef column_id={col} not found in input layout")
+                    }),
                 )?;
             }
         }

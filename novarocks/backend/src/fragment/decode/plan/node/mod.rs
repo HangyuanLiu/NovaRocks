@@ -1185,10 +1185,13 @@ fn validate_column_refs_exact(
         let column_path = path.clone().field("column_ref");
         let slot_id = layout
             .resolve_column_id(column.column_id)
-            .map_err(|error| {
+            .ok_or_else(|| {
                 NativeFragmentDecodeError::invalid_value(
                     column_path.clone().field("column_id"),
-                    format!("native runtime-filter binding_id={binding_id}: {error}"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id}: ColumnRef column_id={} not found in input layout",
+                        column.column_id
+                    ),
                 )
             })?;
         let expected = schema.field_by_slot(slot_id).ok_or_else(|| {

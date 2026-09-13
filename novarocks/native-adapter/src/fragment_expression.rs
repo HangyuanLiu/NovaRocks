@@ -40,8 +40,8 @@ mod nested;
 mod predicate;
 mod unary;
 
-/// Immutable input-slot layout used solely by Backend native expression
-/// decoding. It carries no runtime or connector state.
+/// Immutable input-slot layout used solely by Native expression decoding.
+/// It carries no runtime or connector state.
 #[derive(Clone, Debug, Default)]
 pub struct NativeExpressionInputLayout {
     slots: Vec<SlotId>,

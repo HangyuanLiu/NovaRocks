@@ -19,6 +19,7 @@ mod chunk_impl;
 mod hydrate;
 mod memory;
 mod schema;
+mod slot_layout;
 #[cfg(test)]
 mod tests;
 pub mod type_compatibility;
@@ -31,3 +32,4 @@ pub(crate) use memory::{
     record_batch_shared_owner_bytes,
 };
 pub use schema::{ChunkFieldSchema, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+pub use slot_layout::SlotLayout;

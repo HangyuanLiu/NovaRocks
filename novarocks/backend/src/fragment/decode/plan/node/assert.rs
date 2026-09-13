@@ -92,14 +92,20 @@ pub(super) fn lower_assert_one_row_node(
                 .iter()
                 .enumerate()
                 .map(|(index, column_id)| {
-                    child.layout.resolve_column_id(*column_id).map_err(|error| {
-                        NativeFragmentLeafDecodeError::at_field(
-                            ProtocolErrorKind::InvalidValue,
-                            "group_key_column_ids",
-                            format!("AssertOneRowNode group key: {error}"),
-                        )
-                        .append_index(index)
-                    })
+                    child
+                        .layout
+                        .resolve_column_id(*column_id)
+                        .ok_or_else(|| {
+                            format!("ColumnRef column_id={column_id} not found in input layout")
+                        })
+                        .map_err(|error| {
+                            NativeFragmentLeafDecodeError::at_field(
+                                ProtocolErrorKind::InvalidValue,
+                                "group_key_column_ids",
+                                format!("AssertOneRowNode group key: {error}"),
+                            )
+                            .append_index(index)
+                        })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let key_labels = if assert.group_key_labels.is_empty() {

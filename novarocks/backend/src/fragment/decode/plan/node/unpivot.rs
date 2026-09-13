@@ -118,7 +118,15 @@ pub(super) fn lower_unpivot_node(
         let input_slot_id = child
             .layout
             .resolve_column_id(mapping.input_column_id)
-            .map_err(|error| error.into_native(mapping_path.clone()))?;
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::invalid_value(
+                    mapping_path.clone().field("column_id"),
+                    format!(
+                        "ColumnRef column_id={} not found in input layout",
+                        mapping.input_column_id
+                    ),
+                )
+            })?;
         let output_slot_id = SlotId::new(mapping.output_column_id);
         require_output_role(
             output_slot_id,
@@ -187,7 +195,15 @@ pub(super) fn lower_unpivot_node(
         let input_value_slot_id = child
             .layout
             .resolve_column_id(mapping.input_value_column_id)
-            .map_err(|error| error.into_native(mapping_path.clone()))?;
+            .ok_or_else(|| {
+                NativeFragmentDecodeError::invalid_value(
+                    mapping_path.clone().field("column_id"),
+                    format!(
+                        "ColumnRef column_id={} not found in input layout",
+                        mapping.input_value_column_id
+                    ),
+                )
+            })?;
         let input_value = child
             .output_schema
             .slot(input_value_slot_id)
