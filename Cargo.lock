@@ -4006,6 +4006,7 @@ name = "novarocks-native-adapter"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-buffer",
  "async-trait",
  "axum 0.7.9",
  "bytes",

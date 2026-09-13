@@ -343,7 +343,7 @@ fn decode_binding(
             "runtime-filter binding requires expression",
         )
     })?;
-    crate::fragment::decode::expression::validate_proto_expr_shape_at(
+    novarocks_native_adapter::fragment_expression::validate_proto_expr_shape_at(
         &expression,
         expression_path.clone(),
     )

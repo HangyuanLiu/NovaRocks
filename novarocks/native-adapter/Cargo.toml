@@ -21,6 +21,7 @@ novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-worker.workspace = true
 arrow.workspace = true
+arrow-buffer.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true

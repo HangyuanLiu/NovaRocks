@@ -23,7 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::fragment::decode::expression::NativeExpressionInputLayout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
@@ -33,6 +32,7 @@ use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
+use novarocks_native_adapter::fragment_expression::{NativeExpressionInputLayout, decode_expr_at};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{common, expr};
@@ -526,7 +526,7 @@ impl NativePlanDecodeContext {
         layout: &Layout,
     ) -> Result<ExprId, NativeFragmentDecodeError> {
         let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
-        crate::fragment::decode::expression::decode_expr_at(expression, path, arena, &input)
+        decode_expr_at(expression, path, arena, &input)
             .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
     }
 

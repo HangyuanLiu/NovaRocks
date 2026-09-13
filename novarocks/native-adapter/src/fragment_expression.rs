@@ -43,12 +43,12 @@ mod unary;
 /// Immutable input-slot layout used solely by Backend native expression
 /// decoding. It carries no runtime or connector state.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct NativeExpressionInputLayout {
+pub struct NativeExpressionInputLayout {
     slots: Vec<SlotId>,
 }
 
 impl NativeExpressionInputLayout {
-    pub(crate) fn from_slot_ids(slots: impl IntoIterator<Item = SlotId>) -> Self {
+    pub fn from_slot_ids(slots: impl IntoIterator<Item = SlotId>) -> Self {
         let mut layout = Self::default();
         for slot in slots {
             if !layout.slots.contains(&slot) {
@@ -85,7 +85,7 @@ pub(crate) fn decode_expr(
     decode_expr_at(e, FieldPath::root("expr"), arena, input_layout)
 }
 
-pub(crate) fn decode_expr_at(
+pub fn decode_expr_at(
     e: &expr::Expr,
     path: FieldPath,
     arena: &mut ExprArena,
@@ -227,7 +227,7 @@ fn decode_expr_type_at(
         .map_err(|error| NativeExpressionDecodeError::invalid_value(path.field("type"), error))
 }
 
-pub(crate) fn validate_proto_expr_shape_at(
+pub fn validate_proto_expr_shape_at(
     e: &expr::Expr,
     path: FieldPath,
 ) -> Result<(), NativeExpressionDecodeError> {

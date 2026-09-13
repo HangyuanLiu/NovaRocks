@@ -20,7 +20,7 @@
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
-use super::expression::validate_proto_expr_shape_at;
+use novarocks_native_adapter::fragment_expression::validate_proto_expr_shape_at;
 
 pub(crate) fn validate_fragment_expressions(
     fragment: &plan::PlanFragment,

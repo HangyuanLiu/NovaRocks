@@ -21,6 +21,7 @@ pub mod backend_announce;
 pub mod backend_heartbeat;
 pub mod backend_readiness;
 pub mod connector_blocking_io;
+pub mod fragment_expression;
 pub mod fragment_instance;
 pub mod fragment_layout;
 pub mod fragment_runtime_filter;

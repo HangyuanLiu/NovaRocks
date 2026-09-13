@@ -89,7 +89,7 @@ impl fmt::Display for NativeExpressionLeafDecodeError {
 }
 
 #[derive(Debug)]
-pub(crate) struct NativeExpressionDecodeError(ProtocolError);
+pub struct NativeExpressionDecodeError(ProtocolError);
 
 impl NativeExpressionDecodeError {
     pub(crate) fn missing(path: FieldPath, detail: impl fmt::Display) -> Self {
@@ -113,7 +113,7 @@ impl NativeExpressionDecodeError {
     fn new(path: FieldPath, kind: ProtocolErrorKind, detail: impl fmt::Display) -> Self {
         Self(ProtocolError::new(path, kind, detail.to_string()))
     }
-    pub(crate) fn into_protocol(self) -> ProtocolError {
+    pub fn into_protocol(self) -> ProtocolError {
         self.0
     }
 
