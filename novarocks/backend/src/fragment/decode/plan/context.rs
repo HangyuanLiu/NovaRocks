@@ -510,9 +510,11 @@ impl NativePlanDecodeContext {
         &self,
         columns: &[common::OutputColumn],
         path: FieldPath,
-    ) -> Result<crate::fragment::decode::layout::NativeOutputLayout, NativeFragmentDecodeError>
-    {
-        crate::fragment::decode::layout::decode_output_layout(columns, path)
+    ) -> Result<
+        novarocks_native_adapter::fragment_layout::NativeOutputLayout,
+        NativeFragmentDecodeError,
+    > {
+        novarocks_native_adapter::fragment_layout::decode_output_layout(columns, path)
             .map_err(NativeFragmentDecodeError::from)
     }
 
