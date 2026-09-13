@@ -71,7 +71,6 @@ const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
 use super::aggregate::decode_resolved_aggregate_signature;
-use super::unpivot::decode_unpivot_constant;
 use crate::connector::write_data_plane::{
     ObservedConnectorWriteExecution, RoleBoundCommitFragmentEncoder,
     RootCommitFragmentCarrierValidator,
@@ -79,6 +78,7 @@ use crate::connector::write_data_plane::{
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::decode_unpivot_constant;
 
 fn decode_writer_multiplex_schema(
     wire: Option<&plan::WriterMultiplexSchema>,
@@ -456,7 +456,6 @@ fn decode_final_aggregate_plan(
             &final_slots,
             path.clone().field("unpivot"),
             arena,
-            ctx,
         )?),
     };
     Ok(WriterFinalAggregatePlan { calls, unpivot })
@@ -474,7 +473,6 @@ fn decode_writer_grouped_unpivot(
     final_slots: &BTreeSet<SlotId>,
     path: FieldPath,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<WriterGroupedUnpivotPlan, NativeFragmentDecodeError> {
     if wire.mappings.is_empty() || wire.mappings.len() > MAX_WRITE_UNPIVOT_MAPPINGS {
         return Err(NativeFragmentDecodeError::out_of_range(
@@ -617,7 +615,6 @@ fn decode_writer_grouped_unpivot(
                 constant,
                 constant_path.clone(),
                 arena,
-                ctx,
                 &mut decoded_nested_elements,
                 &mut decoded_constant_bytes,
             )?;
