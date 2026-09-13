@@ -60,7 +60,6 @@ use novarocks_task_codec::operation::{
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
-use super::TaskExecutionRegistry;
 use novarocks_native_adapter::task_protocol::{
     TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
     TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
@@ -69,7 +68,7 @@ use novarocks_native_adapter::task_protocol::{
     get_final_task_info, host_rejection_status, subscribe_task_status,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
-use novarocks_worker::{RootResultRoute, StatusAdvance};
+use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
 
 /// The wire adapter of one backend's task protocol owner.
 pub(crate) struct RegistryTaskExecutionIngress {

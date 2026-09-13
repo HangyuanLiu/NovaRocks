@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The backend-local owner of the native task protocol.
+//! Backend role adapters for the Worker-owned native task protocol.
 //!
-//! This module owns query context lifecycle, the task registry and its
-//! creation transaction, per-task status, the observation channel, and
-//! terminal retention. It owns no transport: every entry point takes a neutral
-//! typed request from
+//! Worker owns query context lifecycle, the task registry and its creation
+//! transaction, per-task status, the observation channel, and terminal
+//! retention. This Backend module supplies role-local ports and execution hosts
+//! to that owner; it owns no transport. Every entry point takes a neutral typed request from
 //! `novarocks_execution_contract::task_execution::operation` and returns a neutral
 //! typed receipt, so it is fully drivable by an in-process caller and a
 //! transport adapter adds only encoding.
@@ -56,8 +56,4 @@ pub(crate) use completion::TaskCompletionSupervisor;
 pub(crate) use context_host::NativeQueryContextHost;
 pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use ingress::RegistryTaskExecutionIngress;
-pub(crate) use novarocks_native_adapter::task_protocol_fault::RestartAfterEstablishTaskCreationGate;
-pub(crate) use novarocks_worker::QueryContextHost;
-pub(crate) use novarocks_worker::TaskExecutionRegistry;
-pub(crate) use novarocks_worker::TaskExecutionRegistryConfig;
 pub(crate) use ports::backend_task_execution_ports;

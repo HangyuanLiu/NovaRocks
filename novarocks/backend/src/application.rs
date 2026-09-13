@@ -20,19 +20,7 @@ use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
 use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
 use crate::rpc::server::BackendRpcService;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
-use crate::task_execution::{
-    RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
-    backend_task_execution_ports,
-};
-use novarocks_native_adapter::{
-    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
-    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
-    backend_readiness::wait_for_backend_native_endpoint_ready,
-    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
-};
-// Only the refusing hosts below name these, and they exist for one test.
-#[cfg(test)]
-use crate::task_execution::QueryContextHost;
+use crate::task_execution::{RegistryTaskExecutionIngress, backend_task_execution_ports};
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
@@ -47,6 +35,13 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
+use novarocks_native_adapter::{
+    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
+    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
+    backend_readiness::wait_for_backend_native_endpoint_ready,
+    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
+    task_protocol_fault::RestartAfterEstablishTaskCreationGate,
+};
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
 #[cfg(test)]
 use novarocks_worker::ReleasedContextEvidence;
@@ -54,6 +49,7 @@ use novarocks_worker::ReleasedContextEvidence;
 use novarocks_worker::TaskStatusReporter;
 #[cfg(test)]
 use novarocks_worker::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+use novarocks_worker::{QueryContextHost, TaskExecutionRegistry, TaskExecutionRegistryConfig};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the task protocol owner re-evaluates its own deadlines.
@@ -391,10 +387,10 @@ fn compose_backend_application_services(
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
         task_execution_registry_config,
-        Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
+        Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
         execution_host,
         backend_task_execution_ports(),
-        Arc::new(crate::task_execution::RestartAfterEstablishTaskCreationGate),
+        Arc::new(RestartAfterEstablishTaskCreationGate),
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),
@@ -723,8 +719,8 @@ mod tests {
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
         BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
-        TaskExecutionRegistryConfig, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
-        combine_primary_and_shutdown, compose_backend_application_services,
+        UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
+        compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
@@ -737,7 +733,10 @@ mod tests {
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
-    use novarocks_worker::{CatalogManagerConfig, WorkerResultRetainedLimits};
+    use novarocks_worker::{
+        CatalogManagerConfig, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+        WorkerResultRetainedLimits,
+    };
     use novarocks_worker::{ManualClock, WorkerDeadlineSupervisor, WorkerMonotonicClock};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -808,7 +807,7 @@ mod tests {
 
         let backend = novarocks_types::BackendProcessId::new_v7();
         let clock = Arc::new(ManualClock::new());
-        let registry = crate::task_execution::TaskExecutionRegistry::new(
+        let registry = TaskExecutionRegistry::new(
             TaskExecutionRegistryConfig::for_process(
                 backend,
                 novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
@@ -929,7 +928,6 @@ mod tests {
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
         use super::native_runtime_filter_envelope_ingress;
         use crate::runtime_filter::test_support::delivery_envelope_for_test;
-        use crate::task_execution::QueryContextHost;
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
@@ -939,6 +937,7 @@ mod tests {
         use novarocks_proto_models::filter;
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
+        use novarocks_worker::QueryContextHost;
         use novarocks_worker::SharedFactsRequest;
         use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
