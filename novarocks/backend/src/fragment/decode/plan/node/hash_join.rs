@@ -21,15 +21,16 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field};
 
-use super::common::{concat_layouts, proto_join_type};
+use super::common::proto_join_type;
 use super::{DecodedNode, NativePlanDecodeContext};
-use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::{concat_slot_layouts, join_output_chunk_schema};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
@@ -66,7 +67,7 @@ pub(super) fn lower_hash_join_node(
     let distribution_mode = hash_join_distribution_mode(join, path.clone())?;
     let join_layout = NativeFragmentDecodeError::map_invalid(
         node_path.clone().field("children"),
-        concat_layouts(&left.layout, &right.layout),
+        concat_slot_layouts(&left.layout, &right.layout),
     )?;
     let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
         node_path.field("children"),
@@ -75,9 +76,7 @@ pub(super) fn lower_hash_join_node(
     let output_schema = join_output_chunk_schema(
         physical,
         join_scope_chunk_schema.clone(),
-        "HashJoinNode",
         physical_output_path,
-        ctx,
     )?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
@@ -163,25 +162,6 @@ pub(super) fn lower_hash_join_node(
         layout: join_layout,
         output_schema,
     })
-}
-
-pub(super) fn join_output_chunk_schema(
-    physical: &plan::PlanNode,
-    fallback: ChunkSchemaRef,
-    _node_kind: &str,
-    path: FieldPath,
-    ctx: &NativePlanDecodeContext,
-) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
-    if physical.output_columns.is_empty() {
-        return Ok(fallback);
-    }
-    let output_schema = ctx
-        .decode_output_layout(&physical.output_columns, path)?
-        .chunk_schema();
-    if output_schema.slot_ids() == fallback.slot_ids() {
-        return Ok(output_schema);
-    }
-    Ok(fallback)
 }
 
 fn hash_join_distribution_mode(

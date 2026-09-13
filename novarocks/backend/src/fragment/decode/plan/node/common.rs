@@ -17,8 +17,6 @@
 
 //! Shared fragment plan-node decoding helpers.
 
-use std::collections::HashSet;
-
 use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
@@ -110,18 +108,6 @@ pub(crate) fn require_min_children(
     actual: usize,
 ) -> Result<(), NativeFragmentDecodeError> {
     check_children_arity(node_path, kind, &format!(">={min}"), actual, actual >= min)
-}
-
-pub(crate) fn concat_layouts(left: &Layout, right: &Layout) -> Result<Layout, String> {
-    let mut slots = Vec::with_capacity(left.order().len() + right.order().len());
-    let mut seen = HashSet::with_capacity(left.order().len() + right.order().len());
-    for slot in left.order().iter().chain(right.order().iter()).copied() {
-        if !seen.insert(slot) {
-            return Err(format!("duplicate slot id {} in joined layout", slot));
-        }
-        slots.push(slot);
-    }
-    Ok(Layout::for_slots(slots))
 }
 
 pub(crate) fn proto_join_type(

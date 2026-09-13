@@ -19,8 +19,6 @@
 
 use std::sync::Arc;
 
-use super::common::concat_layouts;
-use super::hash_join;
 use super::{DecodedNode, NativePlanDecodeContext};
 use novarocks_execution::exec::chunk::ChunkSchema;
 use novarocks_execution::exec::chunk::SlotLayout as Layout;
@@ -28,6 +26,7 @@ use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::nljoin::{NestedLoopJoinNode, NestedLoopJoinType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_plan_node::{concat_slot_layouts, join_output_chunk_schema};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -71,7 +70,7 @@ pub(super) fn lower_nest_loop_join_node(
     };
     let join_layout = NativeFragmentDecodeError::map_invalid(
         node_path.clone().field("children"),
-        concat_layouts(&left.layout, &right.layout),
+        concat_slot_layouts(&left.layout, &right.layout),
     )?;
     let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
         node_path.field("children"),
@@ -87,12 +86,10 @@ pub(super) fn lower_nest_loop_join_node(
         ctx.decode_output_layout(&physical.output_columns, physical_output_path.clone())?
             .chunk_schema()
     } else {
-        hash_join::join_output_chunk_schema(
+        join_output_chunk_schema(
             physical,
             join_scope_chunk_schema.clone(),
-            "NestLoopJoinNode",
             physical_output_path,
-            ctx,
         )?
     };
     let join_conjunct = join

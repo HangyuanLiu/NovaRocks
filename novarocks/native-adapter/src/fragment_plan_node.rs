@@ -1737,6 +1737,35 @@ pub fn lower_sort_items_for_layout(
     lower_sort_items(node_kind, items, path, arena, &input)
 }
 
+pub fn concat_slot_layouts(left: &SlotLayout, right: &SlotLayout) -> Result<SlotLayout, String> {
+    let mut slots = Vec::with_capacity(left.order().len() + right.order().len());
+    let mut seen = HashSet::with_capacity(left.order().len() + right.order().len());
+    for slot in left.order().iter().chain(right.order().iter()).copied() {
+        if !seen.insert(slot) {
+            return Err(format!("duplicate slot id {} in joined layout", slot));
+        }
+        slots.push(slot);
+    }
+    Ok(SlotLayout::for_slots(slots))
+}
+
+pub fn join_output_chunk_schema(
+    physical: &plan::PlanNode,
+    fallback: ChunkSchemaRef,
+    path: FieldPath,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
+    if physical.output_columns.is_empty() {
+        return Ok(fallback);
+    }
+    let output_schema = decode_output_layout(&physical.output_columns, path)
+        .map_err(NativeFragmentDecodeError::from)?
+        .chunk_schema();
+    if output_schema.slot_ids() == fallback.slot_ids() {
+        return Ok(output_schema);
+    }
+    Ok(fallback)
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The frozen native boundary keeps independently validated inputs explicit."
