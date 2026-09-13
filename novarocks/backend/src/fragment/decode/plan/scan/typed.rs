@@ -32,6 +32,7 @@ use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_variant_path::NativeVariantPathPlan;
 use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
@@ -51,7 +52,6 @@ use super::common::{
     ConnectorVariantPathTransform, DecodedScanOutputColumns, lower_scan_predicate,
     parse_scan_limit, validate_variant_path_read_slots,
 };
-use super::variant_path::NativeVariantPathPlan;
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
 pub(super) fn lower_typed_connector_scan(
@@ -877,7 +877,7 @@ mod tests {
         let output_columns =
             super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
                 .expect("decode scan output columns");
-        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
             scan,
             table,
             output_columns.columns(),
@@ -916,7 +916,7 @@ mod tests {
         let output_columns =
             super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
                 .expect("decode narrowed output columns");
-        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
             scan,
             table,
             output_columns.columns(),

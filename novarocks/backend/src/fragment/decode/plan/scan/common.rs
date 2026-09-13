@@ -343,40 +343,6 @@ pub(super) fn validate_variant_path_read_slots(
     Ok(())
 }
 
-pub(super) fn column_def_data_type(
-    column: &plan::ColumnDef,
-) -> Result<DataType, NativeFragmentLeafDecodeError> {
-    let desc = column
-        .logical_type
-        .as_ref()
-        .or(column.data_type.as_ref())
-        .ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                ProtocolErrorKind::MissingField,
-                "data_type",
-                format!("column {} type missing", column.name),
-            )
-        })?;
-    decode_type(desc).map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "data_type", error)
-    })
-}
-
-pub(super) fn output_column_data_type(
-    column: &common::OutputColumn,
-) -> Result<DataType, NativeFragmentLeafDecodeError> {
-    let desc = column.r#type.as_ref().ok_or_else(|| {
-        NativeFragmentLeafDecodeError::at_field(
-            ProtocolErrorKind::MissingField,
-            "type",
-            format!("output column {} type missing", column.name),
-        )
-    })?;
-    decode_type(desc).map_err(|error| {
-        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "type", error)
-    })
-}
-
 pub(super) fn lower_scan_predicate(
     scan: &plan::ScanNode,
     arena: &mut ExprArena,

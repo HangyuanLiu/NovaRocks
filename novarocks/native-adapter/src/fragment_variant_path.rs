@@ -15,26 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment variant-path scan decoding.
+//! Native fragment VARIANT-path scan wire decoding.
 
 use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::{DataType, Field};
-
-use super::super::error::NativeFragmentLeafDecodeError;
-use super::common::{column_def_data_type, output_column_data_type};
 use novarocks_execution::exec::variant_read::VariantPathSpec;
 use novarocks_proto_codec::ProtocolErrorKind;
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
 
+use crate::fragment_error::NativeFragmentLeafDecodeError;
+
 #[derive(Clone, Debug, Default)]
-pub(super) struct NativeVariantPathPlan {
-    pub(super) specs: Vec<VariantPathSpec>,
-    pub(super) output_slot_ids: HashSet<SlotId>,
+pub struct NativeVariantPathPlan {
+    pub specs: Vec<VariantPathSpec>,
+    pub output_slot_ids: HashSet<SlotId>,
 }
 
-pub(super) fn parse_native_scan_variant_path_columns(
+pub fn parse_native_scan_variant_path_columns(
     scan: &plan::ScanNode,
     table: &plan::TableDef,
     output_columns: &[common::OutputColumn],
@@ -257,6 +256,40 @@ fn validate_native_variant_path_column_path(
         ));
     }
     Ok(())
+}
+
+fn column_def_data_type(
+    column: &plan::ColumnDef,
+) -> Result<DataType, NativeFragmentLeafDecodeError> {
+    let desc = column
+        .logical_type
+        .as_ref()
+        .or(column.data_type.as_ref())
+        .ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                ProtocolErrorKind::MissingField,
+                "data_type",
+                format!("column {} type missing", column.name),
+            )
+        })?;
+    novarocks_plan_codec::native_type::decode_type(desc).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "data_type", error)
+    })
+}
+
+fn output_column_data_type(
+    column: &common::OutputColumn,
+) -> Result<DataType, NativeFragmentLeafDecodeError> {
+    let desc = column.r#type.as_ref().ok_or_else(|| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::MissingField,
+            "type",
+            format!("output column {} type missing", column.name),
+        )
+    })?;
+    novarocks_plan_codec::native_type::decode_type(desc).map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "type", error)
+    })
 }
 
 fn variant_error(

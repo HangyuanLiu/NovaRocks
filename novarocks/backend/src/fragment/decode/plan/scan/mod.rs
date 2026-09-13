@@ -19,12 +19,12 @@
 
 mod common;
 mod typed;
-mod variant_path;
 
 use super::context::NativePlanDecodeContext;
 use super::error::NativeFragmentDecodeError;
 use super::node::DecodedNode;
 use novarocks_execution::exec::expr::ExprArena;
+use novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -60,7 +60,7 @@ pub(crate) fn lower_scan_node(
     let source_path = path.clone().field("table").field("source");
     let output_columns = common::decode_scan_output_columns(scan, path.clone())?;
     let variant_path_plan =
-        variant_path::parse_native_scan_variant_path_columns(scan, table, output_columns.columns())
+        parse_native_scan_variant_path_columns(scan, table, output_columns.columns())
             .map_err(|error| error.into_native(path.clone()))?;
     match source {
         plan::scan_source::Kind::TypedConnectorRead(source) => typed::lower_typed_connector_scan(
