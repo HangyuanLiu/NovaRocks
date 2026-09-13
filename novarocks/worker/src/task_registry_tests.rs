@@ -134,6 +134,7 @@ impl RunnableTask for TestRunnable {
 
 #[derive(Default)]
 struct TestTaskHost {
+    install_gate: Option<Arc<InstallGate>>,
     receivers_installed: AtomicUsize,
     receivers_removed: AtomicUsize,
     capabilities_installed: AtomicUsize,
@@ -146,6 +147,9 @@ impl TaskExecutionHost for TestTaskHost {
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        if let Some(gate) = &self.install_gate {
+            gate.wait_for_release();
+        }
         self.receivers_installed.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -179,6 +183,46 @@ impl TaskExecutionHost for TestTaskHost {
         _domain: &novarocks_execution_contract::task_execution::operation::TaskDomainUpdate,
     ) -> Result<Option<u64>, HostRejection> {
         Ok(None)
+    }
+}
+
+#[derive(Default)]
+struct InstallGate {
+    state: Mutex<GateState>,
+    changed: Condvar,
+}
+
+impl InstallGate {
+    fn held() -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                held: true,
+                waiter_entered: false,
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait_until_entered(&self) {
+        let mut state = self.state.lock().expect("test install gate");
+        while !state.waiter_entered {
+            state = self.changed.wait(state).expect("test install gate");
+        }
+    }
+
+    fn wait_for_release(&self) {
+        let mut state = self.state.lock().expect("test install gate");
+        state.waiter_entered = true;
+        self.changed.notify_all();
+        while state.held {
+            state = self.changed.wait(state).expect("test install gate");
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("test install gate");
+        state.held = false;
+        self.changed.notify_all();
     }
 }
 
@@ -530,4 +574,78 @@ fn conflicting_descriptor_is_refused_without_touching_the_live_task() {
     assert!(registry.has_live_task(identity));
     assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
     assert_eq!(task_host.receivers_removed.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let execution = QueryExecutionId::new(
+        QueryId::new(81, 82),
+        AttemptId::new(1).expect("nonzero attempt"),
+    )
+    .expect("nonzero query id");
+    let context = QueryContextRef::new(execution, frontend, backend);
+    let install_gate = Arc::new(InstallGate::held());
+    let task_host = Arc::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&install_gate)),
+        ..TestTaskHost::default()
+    });
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+        test_ports(),
+    );
+
+    establish(&registry, context);
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("nonzero stage"),
+        TaskId::new(1).expect("nonzero task"),
+        backend,
+    );
+    let descriptor = |fingerprint| {
+        TaskDescriptor::try_new(
+            identity,
+            UniqueId::new(1, 1),
+            std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+            vec![PlanNodeId::new(1).expect("nonnegative node")],
+            ExchangeTopology::default(),
+            Arc::new(TestPlan(fingerprint)),
+        )
+        .expect("legal descriptor")
+    };
+    let owner_request = CreateTask::try_new(
+        TaskOperationId::new_v7(),
+        context,
+        descriptor(5),
+        Vec::new(),
+    )
+    .expect("legal create");
+    let owner_registry = Arc::clone(&registry);
+    let owner = std::thread::spawn(move || owner_registry.create_task(&owner_request));
+    install_gate.wait_until_entered();
+
+    let conflicting = registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(9),
+            Vec::new(),
+        )
+        .expect("legal create"),
+    );
+    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
+
+    install_gate.release();
+    let accepted = owner.join().expect("owner create thread");
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+    assert!(registry.has_live_task(identity));
+    assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
 }

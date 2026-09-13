@@ -220,15 +220,6 @@ impl HostLedger {
 struct HostGate {
     open: Mutex<bool>,
     changed: Condvar,
-    /// How many host calls have reached this gate.
-    ///
-    /// This is the only honest rendezvous for "the owner is inside its
-    /// creation transaction". Counting in-flight operations is not: that
-    /// becomes true when an operation enters its scope, which is *before* the
-    /// identity is elected, so a test waiting on it can race ahead and become
-    /// the creation owner itself -- and then block on a gate only it could
-    /// open.
-    entered: AtomicUsize,
 }
 
 impl HostGate {
@@ -236,17 +227,11 @@ impl HostGate {
         Self {
             open: Mutex::new(true),
             changed: Condvar::new(),
-            entered: AtomicUsize::new(0),
         }
-    }
-
-    fn entered(&self) -> usize {
-        self.entered.load(Ordering::SeqCst)
     }
 
     fn wait(&self) {
         let mut open = self.open.lock().expect("host gate");
-        self.entered.fetch_add(1, Ordering::SeqCst);
         while !*open {
             open = self.changed.wait(open).expect("host gate");
         }
@@ -796,45 +781,6 @@ fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
         .expect("legal create"),
     );
     assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-}
-
-#[test]
-fn a_conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-
-    // Hold the creation owner inside its transaction, before its receiver is
-    // installed.
-    fixture.task_host.install_gate.close();
-    let registry = Arc::clone(&fixture.registry);
-    let owner_request = fixture.create_request(identity, 5);
-    let owner = std::thread::spawn(move || registry.create_task(&owner_request));
-    // Bounded, because the owner thread reaching its gate is a scheduling
-    // event this test does not control. An unbounded spin here turns a starved
-    // thread into a run that never ends, which is worse than a failure: it
-    // takes the whole suite with it and says nothing about why.
-    let rendezvous = std::time::Instant::now();
-    while fixture.task_host.install_gate.entered() == 0 {
-        assert!(
-            rendezvous.elapsed() < std::time::Duration::from_secs(30),
-            "the creation owner never reached its install gate"
-        );
-        std::thread::yield_now();
-    }
-
-    // A conflicting create reaches the reserved identity and is refused
-    // without touching the creation in progress.
-    let conflicting = fixture
-        .registry
-        .create_task(&fixture.create_request(identity, 9));
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
-
-    fixture.task_host.install_gate.open();
-    let accepted = owner.join().expect("owner thread");
-    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
-    assert!(fixture.registry.has_live_task(identity));
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
 }
 
