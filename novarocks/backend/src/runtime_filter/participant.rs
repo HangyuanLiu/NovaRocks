@@ -532,130 +532,38 @@ impl RuntimeFilterParticipant {
                 "runtime filter ingress rejected [route-identity]: contribution route identity is required",
             );
         };
-        let binding_id = identity.producer_binding_id();
-        let channel_id = envelope.channel_id();
-        let kind = envelope.kind();
-        if self
-            .install
-            .routing()
-            .authorize_contribution(
-                channel_id,
-                binding_id,
-                identity.fragment_instance_id(),
-                kind,
-            )
-            .is_err()
-        {
-            return rejected(
-                "runtime filter ingress rejected [route-authority]: producer route is not installed",
-            );
-        }
-        let Some(session) = self.producer_sessions.get(&binding_id) else {
-            return rejected(
-                "runtime filter ingress rejected [producer-binding]: producer binding is not installed",
-            );
-        };
-        if session.channel().channel_id() != channel_id {
-            return rejected(
-                "runtime filter ingress rejected [producer-binding]: producer binding is installed for a different channel",
-            );
-        }
-        let Some(install) = session.channel().producers().get(&binding_id) else {
-            return rejected(
-                "runtime filter ingress rejected [producer-binding]: producer binding is not installed in its channel",
-            );
-        };
         let Some(open) = envelope.producer_open() else {
             return rejected(
                 "runtime filter ingress rejected [producer-open]: producer open metadata is required",
             );
         };
-        if session
-            .open_producer(
-                identity.fragment_instance_id(),
-                RuntimeFilterProducerOpenRequest::new(
-                    install.contract().clone(),
-                    open.local_partition_count().get(),
-                ),
-            )
-            .is_err()
-        {
-            return rejected(
-                "runtime filter ingress rejected [producer-open]: producer open does not match the installed binding",
-            );
-        }
-        self.observation.register_producer_instance(
-            BackendChannelIdentity::new(self.install.participant(), binding_id, channel_id),
+        let route = participant_ingress::ProducerIngressRoute::new(
+            envelope.channel_id(),
+            identity.producer_binding_id(),
             identity.fragment_instance_id(),
+            novarocks_execution::runtime_filter::PartitionId::new(identity.partition_id().get()),
+            novarocks_execution::runtime_filter::ProducerSequence::new(identity.sequence().get()),
             open.local_partition_count().get(),
         );
-        match envelope.kind() {
+        let command = match envelope.kind() {
             BackendEnvelopeKind::Contribution => {
-                let partition = novarocks_execution::runtime_filter::PartitionId::new(
-                    identity.partition_id().get(),
-                );
-                let sequence = novarocks_execution::runtime_filter::ProducerSequence::new(
-                    identity.sequence().get(),
-                );
-                let contribution =
-                    novarocks_execution::runtime_filter::RuntimeFilterContribution::new(
-                        contribution_kind(install.contract().kind()),
-                        *envelope.schema_digest(),
-                        Arc::<[u8]>::from(envelope.payload()),
-                    );
-                match session.submit(
-                    binding_id,
-                    identity.fragment_instance_id(),
-                    partition,
-                    sequence,
-                    contribution,
-                ) {
-                    Ok(submission) => {
-                        participant_ingress::record_contribution_outcome(
-                            &self.observation,
-                            self.install.participant(),
-                            binding_id,
-                            channel_id,
-                            identity.fragment_instance_id(),
-                            partition,
-                            sequence,
-                            submission.outcome(),
-                        );
-                        if matches!(
-                            submission.outcome(),
-                            novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Duplicate
-                                | novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::Stale
-                        ) {
-                            BackendIngressResult::duplicate()
-                        } else {
-                            BackendIngressResult::accepted()
-                        }
-                    }
-                    Err(_) => rejected(
-                        "runtime filter ingress rejected [contribution]: contribution violates the installed execution contract",
-                    ),
+                participant_ingress::ProducerIngressCommand::Contribution {
+                    schema_digest: *envelope.schema_digest(),
+                    payload: Arc::<[u8]>::from(envelope.payload()),
                 }
             }
-            BackendEnvelopeKind::ProducerClosed => match session.close_partition(
-                binding_id,
-                identity.fragment_instance_id(),
-                novarocks_execution::runtime_filter::PartitionId::new(
-                    identity.partition_id().get(),
-                ),
-                novarocks_execution::runtime_filter::ProducerSequence::new(
-                    identity.sequence().get(),
-                ),
-            ) {
-                Ok(
-                    novarocks_execution::runtime_filter::RuntimeFilterSubmitOutcome::TerminalNoop,
-                ) => BackendIngressResult::duplicate(),
-                Ok(_) => BackendIngressResult::accepted(),
-                Err(_) => rejected(
-                    "runtime filter ingress rejected [producer-close]: close violates the installed producer route",
-                ),
-            },
+            BackendEnvelopeKind::ProducerClosed => {
+                participant_ingress::ProducerIngressCommand::Closed
+            }
             _ => unreachable!("caller selects producer envelope kinds"),
-        }
+        };
+        participant_ingress::dispatch_producer_frame(
+            &self.install,
+            &self.producer_sessions,
+            &self.observation,
+            route,
+            command,
+        )
     }
 
     fn dispatch_producer_failure(
@@ -1242,25 +1150,6 @@ impl BackendMaterializedDeliverySink for BackendParticipantOutbound {
         delivery: BackendMaterializedDelivery,
     ) -> Result<(), RuntimeFilterContractViolation> {
         self.dispatch_materialized(delivery)
-    }
-}
-
-fn contribution_kind(
-    kind: novarocks_execution::runtime_filter::RuntimeFilterProducerKind,
-) -> novarocks_execution::runtime_filter::RuntimeFilterContributionKind {
-    match kind {
-        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::Membership => {
-            novarocks_execution::runtime_filter::RuntimeFilterContributionKind::Membership
-        }
-        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::OrderedBound => {
-            novarocks_execution::runtime_filter::RuntimeFilterContributionKind::OrderedBound
-        }
-        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::TopKSummary => {
-            novarocks_execution::runtime_filter::RuntimeFilterContributionKind::TopKSummary
-        }
-        novarocks_execution::runtime_filter::RuntimeFilterProducerKind::FinalDomain => {
-            novarocks_execution::runtime_filter::RuntimeFilterContributionKind::FinalDomain
-        }
     }
 }
 
