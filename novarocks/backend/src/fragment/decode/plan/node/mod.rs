@@ -25,6 +25,7 @@ mod exchange;
 #[cfg(test)]
 mod filter;
 mod hash_join;
+#[cfg(test)]
 mod nestloop_join;
 #[cfg(test)]
 mod project;
@@ -65,9 +66,10 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
-    lower_filter_node, lower_generate_series_node, lower_limit_node, lower_project_node,
-    lower_redistribute_node, lower_repeat_node, lower_set_op_node, lower_sort_node,
-    lower_table_function_node, lower_topn_node, lower_values_node, parse_distributed_limit,
+    lower_filter_node, lower_generate_series_node, lower_limit_node, lower_nest_loop_join_node,
+    lower_project_node, lower_redistribute_node, lower_repeat_node, lower_set_op_node,
+    lower_sort_node, lower_table_function_node, lower_topn_node, lower_values_node,
+    parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1635,7 +1637,7 @@ fn lower_physical_node(
             arena,
             ctx,
         ),
-        plan::plan_node::Kind::NestLoopJoin(join) => nestloop_join::lower_nest_loop_join_node(
+        plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,
             physical,
             join,
@@ -1644,7 +1646,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Window(window) => window::lower_window_node(
             node,
