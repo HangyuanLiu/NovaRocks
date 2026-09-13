@@ -212,13 +212,14 @@ struct FrontendExecutionRuntimeOwner {
 /// decode owner and lifecycle diagnostics. The resulting launcher is held by
 /// the immutable role-product graph, never by the lifecycle Host.
 #[derive(Clone, Copy)]
-struct FrontendNativeLogicalExecutionConfig {
+struct FrontendQueryRuntimeConfig {
     native_compatibility_id: NativeCompatibilityId,
     runtime_filter_worker_count: NonZeroUsize,
     task_update_retry_policy: TaskUpdateRetryPolicy,
     split_initial_wait_cap: Duration,
     coordination_budgets: CoordinationBudgets,
     transport_budget: FrontendTaskTransportBudget,
+    result_fetch_byte_limit: ResultByteLimit,
     abort_capacity: NonZeroUsize,
 }
 
@@ -518,10 +519,8 @@ pub struct FrontendApplicationHost {
     catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
     state_store_host: Option<StateStoreHost>,
-    query_execution: Option<QueryExecutionService>,
-    native_logical_execution: FrontendNativeLogicalExecutionConfig,
+    query_runtime: FrontendQueryRuntimeConfig,
     query_control: novarocks_query_application::session_control::QueryControlService,
-    coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
@@ -753,10 +752,6 @@ impl FrontendExecutionConfig {
             function_catalog,
             FrontendLogicalExecutionRuntimeConfig::for_test(),
         )
-    }
-
-    pub(crate) const fn native_compatibility_id(&self) -> NativeCompatibilityId {
-        self.native_compatibility_id
     }
 
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
@@ -1021,18 +1016,17 @@ impl FrontendApplicationHost {
             catalog_prune: None,
             mv_repository: None,
             state_store_host: None,
-            query_execution: None,
-            native_logical_execution: FrontendNativeLogicalExecutionConfig {
+            query_runtime: FrontendQueryRuntimeConfig {
                 native_compatibility_id: execution.native_compatibility_id,
                 runtime_filter_worker_count: execution.runtime_filter_worker_count,
                 task_update_retry_policy: execution.task_update_retry_policy,
                 split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
                 coordination_budgets: execution.coordination_budgets,
                 transport_budget: execution.transport_budget,
+                result_fetch_byte_limit: execution.result_fetch_byte_limit,
                 abort_capacity: execution.logical_abort_effect_capacity,
             },
             query_control: QueryApplicationControl::service(),
-            coordinator: None,
             execution_runtime_owner,
             execution_role: backend.role(),
             data_runtime: data_runtime.clone(),
@@ -1246,15 +1240,11 @@ impl FrontendApplicationHost {
             }
             host.abandoned_attempt_sweeper = Some(sweeper);
         }
-        // The coordinator owns the immutable execution and connector-control
-        // context consumed by frontend application services. Install it before
-        // constructing those services so MV refresh never observes an
+        // Freeze the policy consumed by the role-product coordinator before
+        // constructing any product service, so no path can observe an
         // all-in-one-only direct execution fallback.
         host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
         host.lake_publication_runtime_policy = execution.lake_publication_runtime_policy();
-        if let Err(error) = host.open_coordinator(execution.clone()) {
-            return Err(host.cleanup_open_error(error).await);
-        }
         match host.state_store() {
             Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
                 Ok(repository) => {
@@ -1441,11 +1431,30 @@ impl FrontendApplicationHost {
             .map(StateStoreHost::provider_id)
     }
 
-    pub fn query_execution_service(&self) -> QueryExecutionService {
-        self.query_execution
-            .as_ref()
-            .expect("frontend query execution service is installed before host open returns")
-            .clone()
+    /// Materializes the query-execution service while Server constructs the
+    /// immutable role products. The coordinator has no independent process
+    /// lifecycle: its runtime is the Host-owned execution supervisor and its
+    /// only production consumer is the role graph.
+    pub(crate) fn build_query_execution_service(
+        &self,
+    ) -> Result<QueryExecutionService, FrontendApplicationError> {
+        let config = self.query_runtime;
+        let coordinator = Arc::new(
+            FrontendDistributedQueryCoordinator::new(
+                config.runtime_filter_worker_count,
+                config.native_compatibility_id,
+                config.task_update_retry_policy,
+                config.split_initial_wait_cap,
+                config.coordination_budgets,
+                config.transport_budget.into_codec(),
+                config.result_fetch_byte_limit,
+                self.backend_topology_port(),
+                self.data_runtime.clone(),
+                self.execution_runtime_owner.lifecycle_diagnostics(),
+            )
+            .map_err(FrontendApplicationError::server)?,
+        );
+        Ok(QueryExecutionService::new(coordinator))
     }
 
     /// Cloneable query handle for the one process-owned result decode runtime.
@@ -1489,7 +1498,7 @@ impl FrontendApplicationHost {
     /// the role's fixed topology and data-plane capabilities.
     pub(crate) fn build_logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
         let topology = Arc::clone(self.topology());
-        let config = self.native_logical_execution;
+        let config = self.query_runtime;
         let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
             Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
             topology as crate::common::backend_topology::BackendProcessObservationService,
@@ -1595,27 +1604,6 @@ impl FrontendApplicationHost {
             as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "Retained as the integration-test entry point for the frontend coordinator."
-    )]
-    pub(crate) fn execute_distributed_query_for_test(
-        &self,
-        request: crate::query_execution::contract::DistributedQueryRequest,
-    ) -> Result<
-        crate::query_execution::outcome::DistributedQueryOutcome,
-        crate::query_execution::contract::DistributedQueryError,
-    > {
-        crate::query_execution::contract::DistributedQueryCoordinator::execute(
-            self.coordinator
-                .as_ref()
-                .expect("frontend coordinator is installed before host open returns")
-                .as_ref(),
-            request,
-        )
-    }
-
     /// Frontend composition-time topology leaf used by FE-owned services.
     pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
         Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
@@ -1686,31 +1674,6 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
-    fn open_coordinator(
-        &mut self,
-        execution: FrontendExecutionConfig,
-    ) -> Result<(), FrontendApplicationError> {
-        let native_compatibility_id = execution.native_compatibility_id();
-        let coordinator = Arc::new(
-            FrontendDistributedQueryCoordinator::new(
-                execution.runtime_filter_worker_count,
-                native_compatibility_id,
-                execution.task_update_retry_policy,
-                execution.connector_split_initial_dynamic_filter_wait_cap,
-                execution.coordination_budgets,
-                execution.transport_budget.into_codec(),
-                execution.result_fetch_byte_limit,
-                self.backend_topology_port(),
-                self.data_runtime.clone(),
-                self.execution_runtime_owner.lifecycle_diagnostics(),
-            )
-            .map_err(FrontendApplicationError::server)?,
-        );
-        self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
-        self.coordinator = Some(coordinator);
-        Ok(())
-    }
-
     async fn cleanup_open_error(
         &mut self,
         primary: FrontendApplicationError,
@@ -1741,8 +1704,6 @@ impl FrontendApplicationHost {
                 primary_error = Some(error);
             }
         }
-        self.query_execution.take();
-        self.coordinator.take();
         let heartbeat_error = match self.topology.as_ref() {
             Some(topology) => topology.stop_heartbeat_manager_until(deadline).await.err(),
             None => None,

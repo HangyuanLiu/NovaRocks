@@ -253,7 +253,7 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    let query_execution = host.query_execution_service();
+    let query_execution = host.build_query_execution_service()?;
     let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
