@@ -45,11 +45,11 @@ use crate::runtime_filter::domain::{
     BackendRouteEdgeId, BackendRouteEndpoint, BackendRoutePeer, BackendRouteRole,
     BackendRoutingChannel, BackendRoutingEdge, BackendRoutingShard,
 };
-use crate::runtime_filter::error::RuntimeFilterContractError;
 use crate::runtime_filter::membership_contract_decode::{
     MembershipContractDecodeError, decode_membership_contract,
 };
 use novarocks_plan_codec::native_type::decode_type;
+use novarocks_worker::RuntimeFilterContractError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeFilterQueryLifecycleOptions {
@@ -1780,9 +1780,6 @@ mod tests {
     use super::{
         decode_contract, decode_runtime_filter_contribution, validate_participant_install,
     };
-    use crate::runtime_filter::error::{
-        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
-    };
     use crate::runtime_filter::{
         domain::{
             BackendChannelInstall, BackendChannelLifecycle, BackendMaterializationPolicy,
@@ -1796,6 +1793,7 @@ mod tests {
     };
     use novarocks_proto_models::{filter, novarocks as proto_novarocks, plan};
     use novarocks_types::QueryId;
+    use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
     fn execution_id() -> QueryExecutionId {
         QueryExecutionId::new(

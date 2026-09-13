@@ -42,6 +42,7 @@ mod observation;
 mod operation;
 mod receipt;
 mod reliable_transport;
+mod runtime_filter_error;
 mod status;
 mod task_creation_gate;
 mod task_domain_execution;
@@ -104,6 +105,7 @@ pub use reliable_transport::{
     ReliableTransportPolicy, ReliableTransportResourceLimit, ReliableTransportSendOutcome,
     ReliableTransportState, ReliableTransportStateError, ReliableTransportTick,
 };
+pub use runtime_filter_error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 pub use status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,

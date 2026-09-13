@@ -31,7 +31,7 @@ use tracing::warn;
 use super::observation::{
     RuntimeFilterChannelTerminal, RuntimeFilterConsumerOutcome, RuntimeFilterObservationSnapshot,
 };
-use crate::runtime_filter::error::RuntimeFilterContractError;
+use novarocks_worker::RuntimeFilterContractError;
 
 /// The stage every unavailable runtime-filter contribution names.
 pub(crate) const RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE: &str = "runtime_filter_terminal_capture";

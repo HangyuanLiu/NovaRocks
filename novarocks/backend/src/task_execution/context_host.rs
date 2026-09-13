@@ -76,7 +76,6 @@ use super::shared_facts::{
     sealed_runtime_filter_evidence,
 };
 use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
-use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 use crate::runtime_filter::install_decode::{
     DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
 };
@@ -92,6 +91,7 @@ use novarocks_worker::{
     ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextHost,
     ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
+use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
 /// The mutable half of one context's installed facts.
 ///
@@ -1194,9 +1194,6 @@ mod tests {
     };
 
     use crate::rpc::runtime::test_backend_data_runtime;
-    use crate::runtime_filter::error::{
-        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
-    };
     use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
     use crate::runtime_filter::participant::{
         BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
@@ -1213,6 +1210,7 @@ mod tests {
         METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
         TaskStatusSource,
     };
+    use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
