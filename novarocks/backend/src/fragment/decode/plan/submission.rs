@@ -33,7 +33,7 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::fragment::decode::submission_validation::{
+use novarocks_native_adapter::fragment_validation::{
     validate_fragment_expressions, validate_node_required_fields,
 };
 

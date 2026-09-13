@@ -15,16 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Fragment-owned structural validation for native fragment wire payloads.
+//! Structural validation for Native fragment wire payloads.
 
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::plan;
 
-use novarocks_native_adapter::fragment_expression::validate_proto_expr_shape_at;
+use crate::fragment_expression::validate_proto_expr_shape_at;
 
-pub(crate) fn validate_fragment_expressions(
-    fragment: &plan::PlanFragment,
-) -> Result<(), ProtocolError> {
+pub fn validate_fragment_expressions(fragment: &plan::PlanFragment) -> Result<(), ProtocolError> {
     for (index, expression) in fragment.output_exprs.iter().enumerate() {
         validate_proto_expr_shape_at(
             expression,
@@ -55,7 +53,7 @@ pub(crate) fn validate_fragment_expressions(
     Ok(())
 }
 
-pub(crate) fn validate_node_required_fields(
+pub fn validate_node_required_fields(
     node: &plan::DistributedNode,
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
