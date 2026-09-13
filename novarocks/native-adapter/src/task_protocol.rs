@@ -44,8 +44,9 @@ use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailu
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::operation::{
-    decode_fetch_dynamic_filters, decode_get_final_task_info, encode_context_convergence_event,
-    encode_operation_outcome, encode_receipt, encode_status_event, encode_task_gone_event,
+    decode_context_aware_subscribe_task_status, decode_fetch_dynamic_filters,
+    decode_get_final_task_info, encode_context_convergence_event, encode_operation_outcome,
+    encode_receipt, encode_status_event, encode_task_gone_event,
 };
 use novarocks_task_codec::status::encode_final_task_info;
 use novarocks_task_codec::{
@@ -172,6 +173,43 @@ pub trait TaskObservationReader: Send + Sync {
 
     /// Reads a task's terminal diagnostic information from the role-local owner.
     fn read_final_task_info(&self, request: &GetFinalTaskInfo) -> FinalTaskInfoOutcome;
+}
+
+/// Role-local authority over the observation channel for one held query
+/// context. The channel and every retained status fact remain role-owned.
+pub trait TaskStatusSubscriptionReader: Send + Sync {
+    /// Returns the source only when this role currently holds the exact context.
+    fn task_status_source(&self, context: QueryContextRef) -> Option<Arc<TaskStatusSource>>;
+}
+
+/// Decodes, captures, and starts one Native task-status subscription.
+pub fn subscribe_task_status(
+    reader: &dyn TaskStatusSubscriptionReader,
+    request: proto::SubscribeTaskStatusRequest,
+) -> Result<TaskStatusEventStream, tonic::Status> {
+    let (context, cursors, context_convergence_cursor) =
+        decode_context_aware_subscribe_task_status(
+            &request,
+            FieldPath::root("subscribe_task_status"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    let source = reader.task_status_source(context).ok_or_else(|| {
+        tonic::Status::failed_precondition(
+            "subscribe names a query context this backend does not hold",
+        )
+    })?;
+    // The catch-up frames are captured before the stream exists, so a cursor
+    // that is behind cannot miss a version published between the two.
+    let catch_up = source
+        .subscribe_context_aware(context, &cursors, context_convergence_cursor)
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    task_status_event_stream(
+        source,
+        catch_up,
+        context,
+        cursors,
+        context_convergence_cursor,
+    )
 }
 
 /// Decodes, delegates, classifies, and encodes one dynamic-filter observation.

@@ -56,10 +56,9 @@ use novarocks_task_codec::domain::{
     ConfidentialTransport, refuse_confidential_material_in_the_clear,
 };
 use novarocks_task_codec::operation::{
-    DecodedOperation, DecodedUpdateQueryContext, decode_context_aware_subscribe_task_status,
-    decode_operation_batch, encode_abort_cause_field, encode_create_task_ack,
-    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
-    encode_release_ack, encode_update_task_ack,
+    DecodedOperation, DecodedUpdateQueryContext, decode_operation_batch, encode_abort_cause_field,
+    encode_create_task_ack, encode_query_context_ack, encode_query_context_admission_ticket_ack,
+    encode_receipt, encode_release_ack, encode_update_task_ack,
 };
 use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
@@ -68,8 +67,9 @@ use super::TaskExecutionRegistry;
 use novarocks_native_adapter::task_protocol::{
     TaskExecutionIngress, TaskObservationReader, TaskOperationReceiptAck as ReceiptAck,
     TaskResultRead, TaskResultReadError, TaskResultReadRequest, TaskResultReader,
-    TaskStatusEventStream, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
-    get_final_task_info, host_rejection_status, task_status_event_stream,
+    TaskStatusEventStream, TaskStatusSubscriptionReader, encode_operation_receipt,
+    fetch_task_dynamic_filters, fetch_task_result, get_final_task_info, host_rejection_status,
+    subscribe_task_status,
 };
 use novarocks_native_adapter::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance};
@@ -384,6 +384,15 @@ impl TaskObservationReader for RegistryTaskExecutionIngress {
     }
 }
 
+impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
+    fn task_status_source(
+        &self,
+        context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
+    ) -> Option<Arc<novarocks_worker::TaskStatusSource>> {
+        self.registry.status_source(context)
+    }
+}
+
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     fn apply_task_operations(
@@ -419,29 +428,7 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::SubscribeTaskStatusRequest,
     ) -> Result<TaskStatusEventStream, tonic::Status> {
-        let (context, cursors, context_convergence_cursor) =
-            decode_context_aware_subscribe_task_status(
-                &request,
-                FieldPath::root("subscribe_task_status"),
-            )
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let source = self.registry.status_source(context).ok_or_else(|| {
-            tonic::Status::failed_precondition(
-                "subscribe names a query context this backend does not hold",
-            )
-        })?;
-        // The catch-up frames are taken before the stream exists, so a cursor
-        // that is behind cannot miss a version published between the two.
-        let catch_up = source
-            .subscribe_context_aware(context, &cursors, context_convergence_cursor)
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        task_status_event_stream(
-            source,
-            catch_up,
-            context,
-            cursors,
-            context_convergence_cursor,
-        )
+        subscribe_task_status(self, request)
     }
 
     fn fetch_task_dynamic_filters(
