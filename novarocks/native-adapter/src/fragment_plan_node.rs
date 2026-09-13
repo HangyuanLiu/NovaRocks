@@ -41,6 +41,7 @@ use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::repeat::RepeatNode;
 use novarocks_execution::exec::node::set_op::{SetOpKind, SetOpNode};
+use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::table_function::{TableFunctionNode, TableFunctionOutputSlot};
 use novarocks_execution::exec::node::union_all::UnionAllNode;
 use novarocks_execution::exec::node::values::ValuesNode;
@@ -766,6 +767,113 @@ pub fn lower_filter_node(
         layout: child.layout,
         output_schema: child.output_schema,
     })
+}
+
+pub fn lower_topn_node(
+    node: &plan::DistributedNode,
+    topn: &plan::TopNNode,
+    path: FieldPath,
+    mut children: Vec<NativeLoweredPlanNode>,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let child = children.pop().expect("validated TopNNode child");
+    let payload_limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_optional_nonnegative_i64(topn.limit, "TopNNode.limit"),
+    )?;
+    let outer_limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        parse_distributed_limit(node.limit, "TopNNode DistributedNode.limit"),
+    )?;
+    let limit = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("limit"),
+        merge_limits("TopNNode", payload_limit, outer_limit),
+    )?;
+    if limit.is_none() {
+        return Err(NativeFragmentDecodeError::missing(
+            path.clone().field("limit"),
+            "TopNNode requires a non-negative limit",
+        ));
+    }
+    let offset = NativeFragmentDecodeError::map_invalid(
+        path.clone().field("offset"),
+        parse_optional_nonnegative_i64(topn.offset, "TopNNode.offset"),
+    )?
+    .unwrap_or(0);
+    let phase = plan::TopNPhase::try_from(topn.phase).map_err(|_| {
+        NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("phase"),
+            format!("TopNNode unknown phase {}", topn.phase),
+        )
+    })?;
+    if phase == plan::TopNPhase::TopnPhaseUnspecified {
+        return Err(NativeFragmentDecodeError::invalid_enum(
+            path.clone().field("phase"),
+            "TopNNode phase is unspecified",
+        ));
+    }
+    if topn.is_split && phase == plan::TopNPhase::TopnPhaseFinal {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path.clone().field("is_split"),
+            "TopNNode final split must be represented as ExchangeReceiver TopNSplit",
+        ));
+    }
+    let input = NativeExpressionInputLayout::from_slot_ids(child.layout.order().iter().copied());
+    let order_by = lower_sort_items(
+        "TopNNode",
+        &topn.items,
+        path.clone().field("items"),
+        arena,
+        &input,
+    )?;
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Sort(SortNode {
+                input: Box::new(child.node),
+                node_id: node.node_id,
+                use_top_n: true,
+                order_by,
+                limit,
+                offset,
+                topn_type: SortTopNType::RowNumber,
+                max_buffered_rows: None,
+                max_buffered_bytes: None,
+                partition_exprs: Vec::new(),
+                partition_limit: None,
+            }),
+        },
+        layout: child.layout,
+        output_schema: child.output_schema,
+    })
+}
+
+fn lower_sort_items(
+    node_kind: &str,
+    items: &[expr::SortItem],
+    path: FieldPath,
+    arena: &mut ExprArena,
+    input: &NativeExpressionInputLayout,
+) -> Result<Vec<SortExpression>, NativeFragmentDecodeError> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let item_path = path.clone().index(idx);
+            let expr = item.expr.as_ref().ok_or_else(|| {
+                NativeFragmentDecodeError::missing(
+                    item_path.clone().field("expr"),
+                    format!("{node_kind} sort item {idx} expr missing"),
+                )
+            })?;
+            let expr = decode_expr_at(expr, item_path.field("expr"), arena, input)
+                .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
+            Ok(SortExpression {
+                expr,
+                asc: item.asc,
+                nulls_first: item.nulls_first,
+            })
+        })
+        .collect()
 }
 
 #[expect(

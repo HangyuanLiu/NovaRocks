@@ -30,6 +30,7 @@ mod project;
 mod sort;
 mod table_function;
 mod table_write;
+#[cfg(test)]
 mod topn;
 mod unpivot;
 mod window;
@@ -62,7 +63,8 @@ use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 use novarocks_native_adapter::fragment_plan_node::{
     NativeLoweredPlanNode, lower_assert_one_row_node, lower_change_event_expand_node,
     lower_filter_node, lower_generate_series_node, lower_limit_node, lower_redistribute_node,
-    lower_repeat_node, lower_set_op_node, lower_values_node, parse_distributed_limit,
+    lower_repeat_node, lower_set_op_node, lower_topn_node, lower_values_node,
+    parse_distributed_limit,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -1589,7 +1591,7 @@ fn lower_physical_node(
             ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
-            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena, ctx)
+            lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
         }
         plan::plan_node::Kind::SetOp(set_op) => lower_set_op_node(
             node,
