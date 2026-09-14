@@ -1858,25 +1858,19 @@ impl ContractLoweringVisitor {
             output.push(imported);
             columns.insert(consumer_column.column_id, imported);
         }
-        let properties = PhysicalProperties {
-            distribution: Distribution::Unconstrained,
-            row_multiplicity: producer_multiplicity,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: receiver,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node: receiver,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::ExchangeSource {
-                edge,
-                imports: receive_mapping.clone().into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_exchange_source(
+            receiver,
+            edge,
+            receive_mapping.clone().into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+            Distribution::Unconstrained,
+            producer_multiplicity,
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(receiver)
+            .expect("the exchange source was just inserted")
+            .clone();
         let edge_contract = Edge {
             id: edge,
             kind: EdgeKind::CteMulticast,
@@ -2823,25 +2817,19 @@ impl ContractLoweringVisitor {
                     },
                 )
             };
-            let receiver_properties = PhysicalProperties {
-                distribution: destination_distribution.clone(),
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            };
-            self.fragment_mut().insert_node(PhysicalNode {
-                id: receiver,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: receiver_properties.clone(),
-                output: OutputPort {
-                    node: receiver,
-                    columns: imported.clone().into_boxed_slice(),
-                },
-                kind: NodeKind::ExchangeSource {
-                    edge,
-                    imports: imports.clone().into_boxed_slice(),
-                },
-            })?;
+            self.fragment_mut().add_exchange_source(
+                receiver,
+                edge,
+                imports.clone().into_boxed_slice(),
+                imported.clone().into_boxed_slice(),
+                destination_distribution.clone(),
+                RowMultiplicity::SingleCopy,
+            )?;
+            let receiver_properties = self
+                .fragment_mut()
+                .node_output_properties(receiver)
+                .expect("the exchange source was just inserted")
+                .clone();
             self.plan_builder.add_edge(Edge {
                 id: edge,
                 kind: EdgeKind::ChangeStreamRouter,
@@ -2966,20 +2954,14 @@ impl ContractLoweringVisitor {
                 imports.push((*source, destination));
                 imported.push(destination);
             }
-            self.fragment_mut().insert_node(PhysicalNode {
-                id: exchange,
-                inputs: Box::default(),
-                required_inputs: Box::default(),
-                output_properties: singleton_properties(),
-                output: OutputPort {
-                    node: exchange,
-                    columns: imported.clone().into_boxed_slice(),
-                },
-                kind: NodeKind::ExchangeSource {
-                    edge,
-                    imports: imports.clone().into_boxed_slice(),
-                },
-            })?;
+            self.fragment_mut().add_exchange_source(
+                exchange,
+                edge,
+                imports.clone().into_boxed_slice(),
+                imported.clone().into_boxed_slice(),
+                Distribution::Singleton,
+                RowMultiplicity::SingleCopy,
+            )?;
             self.plan_builder.add_edge(Edge {
                 id: edge,
                 kind: EdgeKind::Stream,
@@ -3445,25 +3427,19 @@ impl ContractLoweringVisitor {
                 )
             }
         };
-        let properties = PhysicalProperties {
-            distribution: destination_distribution.clone(),
-            row_multiplicity: destination_multiplicity,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: receiver,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node: receiver,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::ExchangeSource {
-                edge,
-                imports: receive_mapping.clone().into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_exchange_source(
+            receiver,
+            edge,
+            receive_mapping.clone().into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+            destination_distribution.clone(),
+            destination_multiplicity,
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(receiver)
+            .expect("the exchange source was just inserted")
+            .clone();
         let edge_contract = Edge {
             id: edge,
             kind: EdgeKind::Stream,
@@ -4680,19 +4656,11 @@ impl ContractLoweringVisitor {
         }
 
         let properties = singleton_properties();
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Values {
-                rows: rows.into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_values(
+            node,
+            rows.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -4950,7 +4918,10 @@ impl ContractLoweringVisitor {
             }
         })?;
         let passthrough_map = passthrough.iter().copied().collect::<BTreeMap<_, _>>();
-        let properties = remap_properties_through_values(&child.properties, &passthrough_map);
+        let properties = novarocks_physical_plan::remap_properties_through_values(
+            &child.properties,
+            &passthrough_map,
+        );
         self.fragment_mut().insert_node(PhysicalNode {
             id: node,
             inputs: Box::from([child.node]),
@@ -5493,29 +5464,26 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
-        let passthrough_map = child
+        let _passthrough_map = child
             .output
             .iter()
             .copied()
             .zip(output.iter().copied())
             .filter(|(input, output)| input == output)
             .collect::<BTreeMap<_, _>>();
-        let properties = remap_properties_through_values(&child.properties, &passthrough_map);
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Repeat {
-                grouping_sets: grouping_sets.into_boxed_slice(),
-                grouping_values: grouping_values.into_boxed_slice(),
-                grouping_outputs: grouping_outputs.into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_repeat(
+            node,
+            child.node,
+            grouping_sets.into_boxed_slice(),
+            grouping_values.into_boxed_slice(),
+            grouping_outputs.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the repeat was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -6109,21 +6077,8 @@ impl ContractLoweringVisitor {
             },
         )?;
         let properties = singleton_properties();
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: Box::from([value]),
-            },
-            kind: NodeKind::GenerateSeries {
-                start,
-                stop,
-                step: Some(step),
-            },
-        })?;
+        self.fragment_mut()
+            .add_generate_series(node, start, stop, Some(step), value)?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -7593,52 +7548,6 @@ fn aggregate_output_distribution(input: &PhysicalProperties, output: &[ValueId])
         | Distribution::Broadcast
         | Distribution::Hash { .. }
         | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
-    }
-}
-
-fn remap_properties_through_values(
-    input: &PhysicalProperties,
-    values: &BTreeMap<ValueId, ValueId>,
-) -> PhysicalProperties {
-    let remap_keys = |keys: &[ValueId]| {
-        keys.iter()
-            .map(|key| values.get(key).copied())
-            .collect::<Option<Vec<_>>>()
-            .map(Vec::into_boxed_slice)
-    };
-    let distribution = match &input.distribution {
-        Distribution::Singleton => Distribution::Singleton,
-        Distribution::Broadcast => Distribution::Broadcast,
-        Distribution::Hash { keys, scheme } => remap_keys(keys)
-            .map(|keys| Distribution::Hash {
-                keys,
-                scheme: scheme.clone(),
-            })
-            .unwrap_or(Distribution::Unconstrained),
-        Distribution::BucketShuffle { keys, scheme } => remap_keys(keys)
-            .map(|keys| Distribution::BucketShuffle {
-                keys,
-                scheme: scheme.clone(),
-            })
-            .unwrap_or(Distribution::Unconstrained),
-        Distribution::Unconstrained | Distribution::RoundRobin => Distribution::Unconstrained,
-    };
-    let ordering = input
-        .ordering
-        .iter()
-        .map_while(|key| {
-            Some(novarocks_physical_plan::OrderingKey {
-                value: values.get(&key.value).copied()?,
-                direction: key.direction,
-                null_ordering: key.null_ordering,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    PhysicalProperties {
-        distribution,
-        row_multiplicity: input.row_multiplicity,
-        ordering,
     }
 }
 

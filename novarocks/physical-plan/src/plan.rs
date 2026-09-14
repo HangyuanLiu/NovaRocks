@@ -223,10 +223,6 @@ pub struct PhysicalProperties {
     pub ordering: Box<[OrderingKey]>,
 }
 
-/// Derive the exact properties preserved by a filter.
-///
-/// A broadcast input remains replica-equivalent only when every replica
-/// evaluates the predicate identically.
 /// What an operator requires of an input whose rows it passes through.
 ///
 /// Passing rows through constrains neither layout nor order, but it cannot
@@ -241,6 +237,10 @@ pub fn passthrough_requirement(input: &PhysicalProperties) -> PhysicalProperties
     }
 }
 
+/// Properties a filter preserves.
+///
+/// A broadcast input stays replica-equivalent only when every replica
+/// evaluates the predicate identically.
 pub fn derive_filter_output_properties(
     input: &PhysicalProperties,
     predicate_replica_deterministic: bool,
@@ -263,6 +263,58 @@ pub fn derive_filter_output_properties(
 /// Partitioning survives only when every partition key is still materialized.
 /// Ordering survives as its longest consecutive output prefix. Broadcast
 /// replica equivalence additionally requires deterministic expressions.
+/// Properties that survive an operator which renames the values it passes on.
+///
+/// A layout or ordering stated over values the operator no longer produces
+/// says nothing about its output, so any key that does not survive the mapping
+/// drops the fact that depended on it rather than being carried forward under
+/// a stale name.
+pub fn remap_properties_through_values(
+    input: &crate::PhysicalProperties,
+    values: &BTreeMap<ValueId, ValueId>,
+) -> crate::PhysicalProperties {
+    let remap_keys = |keys: &[ValueId]| {
+        keys.iter()
+            .map(|key| values.get(key).copied())
+            .collect::<Option<Vec<_>>>()
+            .map(Vec::into_boxed_slice)
+    };
+    let distribution = match &input.distribution {
+        Distribution::Singleton => Distribution::Singleton,
+        Distribution::Broadcast => Distribution::Broadcast,
+        Distribution::Hash { keys, scheme } => remap_keys(keys)
+            .map(|keys| Distribution::Hash {
+                keys,
+                scheme: scheme.clone(),
+            })
+            .unwrap_or(Distribution::Unconstrained),
+        Distribution::BucketShuffle { keys, scheme } => remap_keys(keys)
+            .map(|keys| Distribution::BucketShuffle {
+                keys,
+                scheme: scheme.clone(),
+            })
+            .unwrap_or(Distribution::Unconstrained),
+        Distribution::Unconstrained | Distribution::RoundRobin => Distribution::Unconstrained,
+    };
+    let ordering = input
+        .ordering
+        .iter()
+        .map_while(|key| {
+            Some(crate::OrderingKey {
+                value: values.get(&key.value).copied()?,
+                direction: key.direction,
+                null_ordering: key.null_ordering,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    crate::PhysicalProperties {
+        distribution,
+        row_multiplicity: input.row_multiplicity,
+        ordering,
+    }
+}
+
 pub fn derive_project_output_properties(
     input: &PhysicalProperties,
     output_values: &[ValueId],

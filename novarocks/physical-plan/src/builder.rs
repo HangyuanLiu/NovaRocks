@@ -177,17 +177,7 @@ impl FragmentBuilder {
         let columns = source.output.columns.clone();
         let input_properties = source.output_properties.clone();
         for predicate in &predicates {
-            let expression = self
-                .expressions
-                .get(*predicate)
-                .ok_or(BuildError::UndefinedExpression(*predicate))?;
-            if expression.owner != node {
-                return Err(BuildError::ExpressionOutsideOwner {
-                    expr: *predicate,
-                    owner: expression.owner,
-                    node,
-                });
-            }
+            let expression = self.require_owned_expression(node, *predicate)?;
             if expression.ty.data_type != DataType::Boolean {
                 return Err(BuildError::PredicateIsNotBoolean(*predicate));
             }
@@ -395,17 +385,7 @@ impl FragmentBuilder {
             .ok_or(BuildError::UndefinedInput { node, input })?;
         let input_properties = source.output_properties.clone();
         for (expression, value) in &expressions {
-            let node_expression = self
-                .expressions
-                .get(*expression)
-                .ok_or(BuildError::UndefinedExpression(*expression))?;
-            if node_expression.owner != node {
-                return Err(BuildError::ExpressionOutsideOwner {
-                    expr: *expression,
-                    owner: node_expression.owner,
-                    node,
-                });
-            }
+            self.require_owned_expression(node, *expression)?;
             if !self.values.contains_key(value) {
                 return Err(BuildError::UndefinedValue(*value));
             }
@@ -436,6 +416,201 @@ impl FragmentBuilder {
             },
             kind: NodeKind::Project { expressions },
         })
+    }
+
+    /// Adds the receiving end of an exchange edge.
+    ///
+    /// An exchange source is a leaf in its own fragment: its rows come from
+    /// another fragment over `edge`, so it has no inputs and no input
+    /// requirement, and every value it offers must be one it imported. It also
+    /// cannot claim an ordering - rows arrive interleaved from senders this
+    /// release does not merge - so the caller states only the layout and row
+    /// multiplicity the edge delivers.
+    pub fn add_exchange_source(
+        &mut self,
+        node: NodeId,
+        edge: EdgeId,
+        imports: Box<[(ValueId, ValueId)]>,
+        output: Box<[ValueId]>,
+        distribution: crate::Distribution,
+        row_multiplicity: crate::RowMultiplicity,
+    ) -> Result<(), BuildError> {
+        let imported = imports
+            .iter()
+            .map(|(_, destination)| *destination)
+            .collect::<BTreeSet<_>>();
+        for (_, destination) in &imports {
+            if !self.values.contains_key(destination) {
+                return Err(BuildError::UndefinedValue(*destination));
+            }
+        }
+        for value in &output {
+            if !imported.contains(value) {
+                return Err(BuildError::ExchangeOutputWasNotImported {
+                    node,
+                    value: *value,
+                });
+            }
+        }
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: crate::PhysicalProperties {
+                distribution,
+                row_multiplicity,
+                ordering: Box::default(),
+            },
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind: NodeKind::ExchangeSource { edge, imports },
+        })
+    }
+
+    /// Adds inline rows.
+    ///
+    /// Literal rows exist in one place and are not distributed, so the layout
+    /// is not a caller decision. Every row must fill the output port exactly:
+    /// a short or long row is a column that has no value or no home.
+    pub fn add_values(
+        &mut self,
+        node: NodeId,
+        rows: Box<[Box<[ExprId]>]>,
+        output: Box<[ValueId]>,
+    ) -> Result<(), BuildError> {
+        for row in &rows {
+            if row.len() != output.len() {
+                return Err(BuildError::ValuesRowWidthMismatch {
+                    node,
+                    expected: output.len(),
+                    actual: row.len(),
+                });
+            }
+            for expression in row {
+                self.require_owned_expression(node, *expression)?;
+            }
+        }
+        for value in &output {
+            if !self.values.contains_key(value) {
+                return Err(BuildError::UndefinedValue(*value));
+            }
+        }
+        self.insert_leaf(node, output, NodeKind::Values { rows })
+    }
+
+    /// Adds a generated integer series.
+    pub fn add_generate_series(
+        &mut self,
+        node: NodeId,
+        start: ExprId,
+        stop: ExprId,
+        step: Option<ExprId>,
+        value: ValueId,
+    ) -> Result<(), BuildError> {
+        for bound in [Some(start), Some(stop), step].into_iter().flatten() {
+            self.require_owned_expression(node, bound)?;
+        }
+        if !self.values.contains_key(&value) {
+            return Err(BuildError::UndefinedValue(value));
+        }
+        self.insert_leaf(
+            node,
+            Box::from([value]),
+            NodeKind::GenerateSeries { start, stop, step },
+        )
+    }
+
+    /// Adds a grouping-set expansion over `input`.
+    ///
+    /// Repeat re-emits each input row once per grouping set, so the values it
+    /// passes through keep their identity and the values it rewrites do not.
+    /// The surviving layout and ordering follow from exactly that split, which
+    /// the builder computes from the input and output ports rather than taking
+    /// on trust.
+    pub fn add_repeat(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        grouping_sets: Box<[Box<[ValueId]>]>,
+        grouping_values: Box<[(ValueId, ValueId)]>,
+        grouping_outputs: Box<[crate::GroupingOutput]>,
+        output: Box<[ValueId]>,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let input_properties = source.output_properties.clone();
+        let passthrough = source
+            .output
+            .columns
+            .iter()
+            .copied()
+            .zip(output.iter().copied())
+            .filter(|(input_value, output_value)| input_value == output_value)
+            .collect::<BTreeMap<_, _>>();
+        let output_properties =
+            crate::remap_properties_through_values(&input_properties, &passthrough);
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
+            output_properties,
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind: NodeKind::Repeat {
+                grouping_sets,
+                grouping_values,
+                grouping_outputs,
+            },
+        })
+    }
+
+    /// Inserts a node that produces rows without reading any.
+    fn insert_leaf(
+        &mut self,
+        node: NodeId,
+        output: Box<[ValueId]>,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: crate::PhysicalProperties {
+                distribution: crate::Distribution::Singleton,
+                row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            },
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    fn require_owned_expression(
+        &self,
+        node: NodeId,
+        expression: ExprId,
+    ) -> Result<&ExprNode, BuildError> {
+        let found = self
+            .expressions
+            .get(expression)
+            .ok_or(BuildError::UndefinedExpression(expression))?;
+        if found.owner != node {
+            return Err(BuildError::ExpressionOutsideOwner {
+                expr: expression,
+                owner: found.owner,
+                node,
+            });
+        }
+        Ok(found)
     }
 
     /// Output and input properties for an operator that orders rows it passes
@@ -704,6 +879,19 @@ pub enum BuildError {
     /// A global order was built over rows spread across more than one stream,
     /// where "the first N in order" has no single meaning.
     GlobalOrderOverManyStreams(NodeId),
+    /// An exchange source offered a value it did not import, which no sender
+    /// could have produced.
+    ExchangeOutputWasNotImported {
+        node: NodeId,
+        value: ValueId,
+    },
+    /// An inline row does not fill the output port, leaving a column with no
+    /// value or a value with no column.
+    ValuesRowWidthMismatch {
+        node: NodeId,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for BuildError {
@@ -769,6 +957,21 @@ impl fmt::Display for BuildError {
                 formatter,
                 "node {} requires one single-copy singleton input for a global order",
                 id.get()
+            ),
+            Self::ExchangeOutputWasNotImported { node, value } => write!(
+                formatter,
+                "exchange source {} offers value {} without importing it",
+                node.get(),
+                value.get()
+            ),
+            Self::ValuesRowWidthMismatch {
+                node,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "values node {} has a row of {actual} expressions for {expected} columns",
+                node.get()
             ),
             Self::DuplicateArtifactRef(id) => {
                 write!(formatter, "duplicate artifact reference {}", id.get())

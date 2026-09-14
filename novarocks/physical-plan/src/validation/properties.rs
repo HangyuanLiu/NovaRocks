@@ -299,52 +299,6 @@ pub(crate) fn validate_partition_count_domain(
     }
 }
 
-pub(crate) fn remap_properties_through_values(
-    input: &crate::PhysicalProperties,
-    values: &BTreeMap<ValueId, ValueId>,
-) -> crate::PhysicalProperties {
-    let remap_keys = |keys: &[ValueId]| {
-        keys.iter()
-            .map(|key| values.get(key).copied())
-            .collect::<Option<Vec<_>>>()
-            .map(Vec::into_boxed_slice)
-    };
-    let distribution = match &input.distribution {
-        Distribution::Singleton => Distribution::Singleton,
-        Distribution::Broadcast => Distribution::Broadcast,
-        Distribution::Hash { keys, scheme } => remap_keys(keys)
-            .map(|keys| Distribution::Hash {
-                keys,
-                scheme: scheme.clone(),
-            })
-            .unwrap_or(Distribution::Unconstrained),
-        Distribution::BucketShuffle { keys, scheme } => remap_keys(keys)
-            .map(|keys| Distribution::BucketShuffle {
-                keys,
-                scheme: scheme.clone(),
-            })
-            .unwrap_or(Distribution::Unconstrained),
-        Distribution::Unconstrained | Distribution::RoundRobin => Distribution::Unconstrained,
-    };
-    let ordering = input
-        .ordering
-        .iter()
-        .map_while(|key| {
-            Some(crate::OrderingKey {
-                value: values.get(&key.value).copied()?,
-                direction: key.direction,
-                null_ordering: key.null_ordering,
-            })
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    crate::PhysicalProperties {
-        distribution,
-        row_multiplicity: input.row_multiplicity,
-        ordering,
-    }
-}
-
 pub(crate) fn properties_satisfy(
     actual: &crate::PhysicalProperties,
     required: &crate::PhysicalProperties,
@@ -1060,7 +1014,7 @@ pub(crate) fn validate_node_output_properties(
                 _ => unreachable!(),
             };
             let expected =
-                remap_properties_through_values(&input.output_properties, &value_mapping);
+                crate::remap_properties_through_values(&input.output_properties, &value_mapping);
             if node.output_properties != expected {
                 errors.push(ValidationError::new(
                     path,
