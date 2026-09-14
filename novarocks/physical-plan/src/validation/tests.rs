@@ -35,7 +35,7 @@ mod validation_error_tests {
 
     #[test]
     fn validation_diagnostics_have_a_fixed_cardinality_and_display_bound() {
-        let mut collector = ValidationErrorCollector::new();
+        let mut collector = ValidationContext::new();
         for ordinal in 0..(MAX_VALIDATION_ERRORS * 4) {
             collector.push(ValidationError::new(
                 format!("expressions[{ordinal}]"),
@@ -68,7 +68,7 @@ mod validation_error_tests {
         let left = expression(1, largeint.clone());
         let right = expression(2, DataType::Int64);
         let output = expression(3, largeint);
-        let mut errors = ValidationErrorCollector::new();
+        let mut errors = ValidationContext::new();
         validate_binary_types(
             &left,
             crate::BinaryOperator::Add,
@@ -108,7 +108,7 @@ mod validation_error_tests {
             .collect::<Vec<_>>();
         let expected = [mapping[0].1, mapping[512].1, mapping[1023].1];
         let mut indexes = SemanticTraceIndexes::default();
-        let mut budget = SemanticTraceWorkBudget::new();
+        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
         let initial = budget.remaining;
 
         assert!(
@@ -341,7 +341,7 @@ mod validation_error_tests {
         let project_node = fragment.nodes().get(&project).unwrap();
         let input_node = fragment.nodes().get(&input).unwrap();
         let mut indexes = SemanticTraceIndexes::default();
-        let mut budget = SemanticTraceWorkBudget::new();
+        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
         assert_eq!(
             indexes
                 .map_project_values(
@@ -390,7 +390,7 @@ mod validation_error_tests {
             },
             destination_multiplicity: RowMultiplicity::SingleCopy,
         };
-        let mut errors = ValidationErrorCollector::new();
+        let mut errors = ValidationContext::new();
 
         validate_mapped_partitioning(&partitioning, &mapping, "wide_hash", &mut errors);
 
@@ -446,7 +446,7 @@ mod validation_error_tests {
             output: ValueId::new(4097),
         });
         let mut indexes = SemanticTraceIndexes::default();
-        let mut budget = SemanticTraceWorkBudget::new();
+        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
         let initial_work = budget.remaining;
 
         for id in 1..4096 {
@@ -531,7 +531,7 @@ mod validation_error_tests {
             annotations: Box::default(),
         });
         let mut cache = RuntimeFilterBuildDependencyCache::default();
-        let mut budget = SemanticTraceWorkBudget::new();
+        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
         let mut rejected = false;
 
         for id in 2..=257 {

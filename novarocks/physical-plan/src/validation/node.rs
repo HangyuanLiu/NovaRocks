@@ -98,7 +98,7 @@ pub(crate) fn validate_value(
     fragment: &Fragment,
     value: &ValueDef,
     aggregate_calls: &BTreeMap<crate::AggregateCallId, AggregatePhase>,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!(
         "fragments[{}].values[{}]",
@@ -232,7 +232,7 @@ pub(crate) fn validate_node(
     fragment: &Fragment,
     node: &PhysicalNode,
     indexes: &FragmentValidationIndexes,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!(
         "fragments[{}].nodes[{}]",
@@ -336,7 +336,7 @@ pub(crate) fn validate_node_output_closure(
     node: &PhysicalNode,
     indexes: &FragmentValidationIndexes,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let input_columns = node
         .inputs
@@ -481,7 +481,7 @@ pub(crate) fn validate_scan_output_coverage(
     provider_outputs: &[(ProviderColumnReference, ValueId)],
     derived_values: &[ValueId],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let expected = ValuePortIndex::new(
         &provider_outputs
@@ -504,7 +504,7 @@ pub(crate) fn validate_join_output_closure(
     node: &PhysicalNode,
     indexes: &FragmentValidationIndexes,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let Some(left) = node.inputs.first().and_then(|id| fragment.nodes().get(id)) else {
         return;
@@ -675,11 +675,7 @@ pub(crate) fn value_origin_allowed(
     }
 }
 
-pub(crate) fn validate_node_arity(
-    node: &PhysicalNode,
-    path: &str,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_node_arity(node: &PhysicalNode, path: &str, errors: &mut ValidationContext) {
     let valid = match &node.kind {
         NodeKind::Scan { .. }
         | NodeKind::Values { .. }
@@ -700,7 +696,7 @@ pub(crate) fn validate_node_semantics(
     node: &PhysicalNode,
     indexes: &FragmentValidationIndexes,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     match &node.kind {
         NodeKind::Scan {
@@ -1923,7 +1919,7 @@ pub(crate) fn validate_aggregate_value_inputs(
     args: &[ExprId],
     order_by: &[crate::SortExpr],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     validate_aggregate_arguments(fragment, binding, args, order_by, path, errors);
 }
@@ -1934,7 +1930,7 @@ pub(crate) fn validate_ordering_expressions(
     indexes: &FragmentValidationIndexes,
     ordering: &[crate::SortExpr],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let input_values = node.inputs.first().and_then(|input| indexes.output(*input));
     for key in ordering {
@@ -1954,7 +1950,7 @@ pub(crate) fn validate_partition_ordering(
     indexes: &FragmentValidationIndexes,
     partition_by: &[crate::SortExpr],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if partition_by.is_empty() {
         errors.push(ValidationError::new(
@@ -1977,7 +1973,7 @@ pub(crate) fn validate_writer_schema(
     contract: WriterRelationContract,
     owner: Option<NodeId>,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let expected_revision = match contract {
         WriterRelationContract::Multiplex => crate::WRITER_MULTIPLEX_SCHEMA_REVISION,
@@ -2156,7 +2152,7 @@ pub(crate) fn validate_writer_aggregates(
     fragment: &Fragment,
     calls: &[crate::WriterAggregateCall],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     for call in calls {
         if call.binding.function.kind != FunctionKind::Aggregate {
@@ -2225,7 +2221,7 @@ pub(crate) fn validate_writer_aggregate_ports(
     owner: NodeId,
     child_values: &VisibleInputIndex,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut outputs = BTreeSet::new();
     for call in calls {
@@ -2261,7 +2257,7 @@ pub(crate) fn validate_unpivot(
     indexes: &FragmentValidationIndexes,
     spec: &crate::UnpivotSpec,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if spec.mappings.is_empty() {
         errors.push(ValidationError::new(path, "unpivot requires mappings"));
@@ -2407,7 +2403,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
     finish: &crate::WriterFinishSpec,
     spec: &crate::WriterGroupedUnpivotSpec,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if finish.final_aggregates.is_empty() || spec.mappings.is_empty() {
         errors.push(ValidationError::new(
@@ -2668,7 +2664,7 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
     max_output_rows: u64,
     max_output_bytes: u64,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> bool {
     if max_output_rows == 0
         || max_output_bytes == 0
@@ -2681,7 +2677,7 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
         ));
         return false;
     }
-    if mapping_count > MAX_UNPIVOT_MAPPINGS {
+    if mapping_count > errors.limits().unpivot_mappings {
         errors.push(ValidationError::resource_limit(
             path,
             "unpivot mapping count exceeds the contract maximum",
@@ -2694,7 +2690,7 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
     let mut literal_bytes = 0_usize;
     for constants in constants {
         constant_count = match constant_count.checked_add(constants.len()) {
-            Some(count) if count <= MAX_UNPIVOT_CONSTANTS => count,
+            Some(count) if count <= errors.limits().unpivot_constants => count,
             _ => {
                 errors.push(ValidationError::resource_limit(
                     path,
@@ -2721,7 +2717,7 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
             };
             collection_items = collection_items.saturating_add(items);
             literal_bytes = literal_bytes.saturating_add(bytes);
-            if collection_items > MAX_UNPIVOT_COLLECTION_ITEMS
+            if collection_items > errors.limits().unpivot_collection_items
                 || literal_bytes > MAX_UNPIVOT_LITERAL_BYTES
             {
                 errors.push(ValidationError::resource_limit(
@@ -2766,7 +2762,7 @@ pub(crate) fn validate_unpivot_constant(
     output: ValueId,
     context: &str,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> Option<bool> {
     let output_type = fragment.values().get(&output).map(|value| &value.ty)?;
     let (matches, nullable) = match constant {
@@ -2841,7 +2837,7 @@ pub(crate) fn validate_relation(
     fragment: &Fragment,
     relation: &Relation,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     validate_read_reference(relation.read(), path, errors);
     if relation.work_source() == ConnectorReadWorkSource::WholeRelation
@@ -2931,7 +2927,7 @@ pub(crate) fn validate_scan_predicate_contract(
     relation: &Relation,
     residuals: &[ExprId],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut guarantees = BTreeMap::new();
     for guarantee in relation.predicate_guarantees() {
@@ -3004,7 +3000,7 @@ pub(crate) fn validate_scan_predicate_contract(
 pub(crate) fn validate_read_reference(
     reference: &ProviderReadReference,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let descriptor = reference.binding.descriptor();
     let catalog = reference.binding.catalog_handle();
@@ -3034,7 +3030,7 @@ pub(crate) fn validate_column_reference(
     relation: Option<&ProviderReadReference>,
     column: &ProviderColumnReference,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     validate_encoded_payload(
         relation,
@@ -3050,7 +3046,7 @@ pub(crate) fn validate_encoded_payload(
     payload: &ConnectorEncodedPayload,
     allowed_categories: &[ConnectorCodecCategory],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if payload.payload().is_empty() || payload.payload().len() > MAX_PROVIDER_PRIVATE_PAYLOAD_BYTES
     {
@@ -3081,7 +3077,7 @@ pub(crate) fn validate_null_extended(
     owner: NodeId,
     values: &[ValueId],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     for value in values {
         match fragment.values().get(value) {
@@ -3100,7 +3096,7 @@ pub(crate) fn require_passthrough_output(
     fragment: &Fragment,
     node: &PhysicalNode,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if let Some(input) = node.inputs.first().and_then(|id| fragment.nodes().get(id))
         && input.output.columns != node.output.columns
@@ -3116,7 +3112,7 @@ pub(crate) fn require_boolean_expression(
     fragment: &Fragment,
     expression: ExprId,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     match fragment.expressions().get(expression) {
         Some(expression) if expression.ty.data_type == DataType::Boolean => {}

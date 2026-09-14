@@ -27,7 +27,7 @@ use crate::{
 pub(crate) fn validate_fragment_partition_identities(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut spaces = BTreeMap::new();
     let mut counts = BTreeMap::new();
@@ -99,10 +99,7 @@ pub(crate) enum PartitionSpaceDefinition {
     Bucket(crate::BucketPartitionScheme),
 }
 
-pub(crate) fn validate_partition_identities(
-    plan: &PhysicalPlan,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_partition_identities(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut spaces = BTreeMap::new();
     let mut counts = BTreeMap::new();
     for fragment in plan.fragments().values() {
@@ -172,7 +169,7 @@ pub(crate) fn register_partition_identity(
         novarocks_type_contract::PartitionCountParameterId,
         crate::PartitionCountDomain,
     >,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let (space, definition) = match distribution {
         Distribution::Hash { scheme, .. } => {
@@ -211,7 +208,7 @@ pub(crate) fn validate_distribution(
     fragment: &Fragment,
     distribution: &Distribution,
     label: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].{label}", fragment.id().get());
     let (keys, algorithm) = match distribution {
@@ -281,7 +278,7 @@ pub(crate) fn validate_distribution(
 pub(crate) fn validate_partition_count_domain(
     domain: &crate::PartitionCountDomain,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if domain.min == 0 || domain.min > domain.max || domain.max > MAX_PARTITION_COUNT {
         errors.push(ValidationError::new(
@@ -581,7 +578,7 @@ pub(crate) fn validate_node_output_properties(
     fragment: &Fragment,
     node: &PhysicalNode,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let empty = crate::PhysicalProperties {
         distribution: Distribution::Unconstrained,
@@ -1189,7 +1186,7 @@ pub(crate) fn validate_window_properties(
     node: &PhysicalNode,
     spec: &crate::WindowSpec,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let Some(input) = node
         .inputs
@@ -1242,7 +1239,7 @@ pub(crate) fn validate_assertion_properties(
     node: &PhysicalNode,
     spec: &crate::RowCountAssertionSpec,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let Some(input) = node
         .inputs
@@ -1290,7 +1287,7 @@ pub(crate) fn validate_table_function_properties(
     arguments: &[ExprId],
     outputs: &[crate::TableFunctionOutput],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let Some(input) = node
         .inputs
@@ -1365,7 +1362,7 @@ pub(crate) fn validate_property_keys_on_port(
     properties: &crate::PhysicalProperties,
     port_values: &ValuePortIndex,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if properties.distribution == Distribution::Broadcast
         && properties.row_multiplicity != RowMultiplicity::Replicated

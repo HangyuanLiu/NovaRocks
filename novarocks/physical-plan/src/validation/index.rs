@@ -170,9 +170,9 @@ pub(crate) struct SemanticTraceWorkBudget {
 }
 
 impl SemanticTraceWorkBudget {
-    pub(crate) const fn new() -> Self {
+    pub(crate) const fn new(limits: &PlanLimits) -> Self {
         Self {
-            remaining: MAX_PLAN_SEMANTIC_TRACE_WORK,
+            remaining: limits.plan_semantic_trace_work,
         }
     }
 
@@ -807,7 +807,7 @@ pub(crate) fn same_source_bindings(
 }
 
 pub(crate) fn bounded_count(
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
     path: &str,
     actual: usize,
     maximum: usize,

@@ -24,10 +24,7 @@ use crate::{
     ValueId,
 };
 
-pub(crate) fn validate_aggregate_sequences(
-    plan: &PhysicalPlan,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_aggregate_sequences(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     type CallRef = (FragmentId, NodeId, crate::AggregateCallId);
 
     #[derive(Default)]
@@ -65,7 +62,7 @@ pub(crate) fn validate_aggregate_sequences(
         }
     }
 
-    let mut trace_budget = SemanticTraceWorkBudget::new();
+    let mut trace_budget = SemanticTraceWorkBudget::new(errors.limits());
     let mut trace_indexes = SemanticTraceIndexes::default();
     for (sequence, members) in sequences {
         let path = format!("aggregate_sequences[{}]", sequence.get());
@@ -324,7 +321,7 @@ pub(crate) fn trace_aggregate_sequence_inputs(
     true
 }
 
-pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     type NodeRef = (FragmentId, NodeId);
 
     let mut partials: BTreeMap<crate::TopNSequenceId, BTreeSet<NodeRef>> = BTreeMap::new();
@@ -356,7 +353,7 @@ pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut Validat
         .chain(finals.keys())
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut trace_budget = SemanticTraceWorkBudget::new();
+    let mut trace_budget = SemanticTraceWorkBudget::new(errors.limits());
     let mut trace_indexes = SemanticTraceIndexes::default();
     for sequence in sequences {
         let sequence_path = format!("topn_sequences[{}]", sequence.get());

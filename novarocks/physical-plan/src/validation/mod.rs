@@ -21,6 +21,7 @@ mod error;
 mod expr;
 mod graph;
 mod index;
+mod limits;
 mod node;
 mod properties;
 mod runtime_filter;
@@ -34,6 +35,7 @@ pub use error::*;
 pub(crate) use expr::*;
 pub(crate) use graph::*;
 pub(crate) use index::*;
+pub use limits::*;
 pub(crate) use node::*;
 pub(crate) use properties::*;
 pub(crate) use runtime_filter::*;
@@ -50,38 +52,25 @@ use crate::{
     PLAN_CONTRACT_REVISION, PhysicalPlan, RequiredContracts, ValueId,
 };
 
-pub const MAX_PLAN_FRAGMENTS: usize = 16_384;
-pub const MAX_FRAGMENT_NODES: usize = 4_096;
-pub const MAX_FRAGMENT_VALUES: usize = 65_536;
-pub const MAX_FRAGMENT_EXPRESSIONS: usize = 262_144;
-pub const MAX_EXPRESSION_SEMANTIC_DEPTH: usize = 256;
-pub const MAX_PLAN_EDGES: usize = 65_536;
-pub const MAX_PLAN_RUNTIME_FILTERS: usize = 65_536;
-pub const MAX_RUNTIME_FILTER_COVERAGE_DEPTH: usize = 256;
+// Guard rails, not operational bounds: these fence off values no
+// legitimate plan produces. Counting them as structural protection would
+// overstate what is actually bounded. Real bounds live in `PlanLimits`.
 pub const MAX_RUNTIME_FILTER_ARTIFACT_BYTES: u64 = 1 << 30;
 pub const MAX_RUNTIME_FILTER_DEADLINE_MS: u64 = 86_400_000;
 pub const MAX_RUNTIME_FILTER_RETRIES: u32 = 100;
-pub const MAX_RUNTIME_FILTER_ENDPOINTS: usize = 4_096;
-pub const MAX_RUNTIME_FILTER_COVERAGE_NODES: usize = 16_384;
-pub const MAX_RUNTIME_FILTER_LINEAGE_STEPS: usize = 4_096;
-pub const MAX_PLAN_ARTIFACT_REFS: usize = 65_536;
 pub const MAX_PROVIDER_PRIVATE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_METADATA_COVERAGE_EVIDENCE_BYTES: usize = 1024 * 1024;
 pub const MAX_ARTIFACT_REFERENCE_BYTES: u32 = 16 * 1024 * 1024;
-pub const MAX_UNPIVOT_MAPPINGS: usize = 4_096;
-pub const MAX_UNPIVOT_CONSTANTS: usize = 16_384;
-pub const MAX_UNPIVOT_COLLECTION_ITEMS: usize = 4_096;
 pub const MAX_UNPIVOT_LITERAL_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_UNPIVOT_OUTPUT_ROWS: u64 = 1 << 30;
 pub const MAX_UNPIVOT_OUTPUT_BYTES: u64 = 1 << 30;
 pub const MAX_PARTITION_COUNT: u32 = 1 << 20;
 pub const MAX_SCAN_BATCH_ROWS: u64 = 1 << 30;
 pub const MAX_SCAN_BATCH_BYTES: u64 = 1 << 30;
-pub const MAX_PLAN_SEMANTIC_TRACE_WORK: usize = 1 << 20;
 pub const MAX_PIPELINE_DOP: u32 = 1 << 20;
 
 pub fn validate_fragment(fragment: &Fragment, cuts: &FragmentCuts) -> Result<(), ValidationErrors> {
-    let mut errors = ValidationErrorCollector::new();
+    let mut errors = ValidationContext::new();
     validate_fragment_into(fragment, &mut errors);
     validate_fragment_cut_resources(fragment, cuts, &mut errors);
     if !errors.is_empty() {
@@ -97,7 +86,7 @@ pub fn validate_fragment(fragment: &Fragment, cuts: &FragmentCuts) -> Result<(),
 }
 
 pub(crate) fn validate_fragment_definition(fragment: &Fragment) -> Result<(), ValidationErrors> {
-    let mut errors = ValidationErrorCollector::new();
+    let mut errors = ValidationContext::new();
     validate_fragment_into(fragment, &mut errors);
     validate_fragment_partition_identities(fragment, &FragmentCuts::default(), &mut errors);
     if errors.is_empty() {
@@ -108,7 +97,18 @@ pub(crate) fn validate_fragment_definition(fragment: &Fragment) -> Result<(), Va
 }
 
 pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
-    let mut errors = ValidationErrorCollector::new();
+    validate_plan_with_limits(plan, PlanLimits::FROZEN)
+}
+
+/// Validates against caller-supplied bounds.
+///
+/// A refused plan is a user-visible refusal, so the bounds that produce one
+/// are a deployment decision rather than a property of this build.
+pub fn validate_plan_with_limits(
+    plan: &PhysicalPlan,
+    limits: PlanLimits,
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationContext::with_limits(limits);
     validate_plan_resources(plan, &mut errors);
     if !errors.is_empty() {
         return Err(ValidationErrors::from_collector(errors));
@@ -126,20 +126,20 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
         &mut errors,
         "fragments",
         plan.fragments().len(),
-        MAX_PLAN_FRAGMENTS,
+        limits.plan_fragments,
     );
-    bounded_count(&mut errors, "edges", plan.edges().len(), MAX_PLAN_EDGES);
+    bounded_count(&mut errors, "edges", plan.edges().len(), limits.plan_edges);
     bounded_count(
         &mut errors,
         "runtime_filters",
         plan.runtime_filters().len(),
-        MAX_PLAN_RUNTIME_FILTERS,
+        limits.plan_runtime_filters,
     );
     bounded_count(
         &mut errors,
         "artifact_refs",
         plan.artifact_refs().len(),
-        MAX_PLAN_ARTIFACT_REFS,
+        limits.plan_artifact_refs,
     );
     if plan.fragments().is_empty() {
         errors.push(ValidationError::new("fragments", "plan has no fragments"));
@@ -184,7 +184,7 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
     run_validation_stage!(validate_topn_reductions(plan, &mut errors));
 
     if errors.is_empty() {
-        let Some(derivation) = FragmentCutDerivation::new(plan) else {
+        let Some(derivation) = FragmentCutDerivation::new(plan, errors.limits()) else {
             errors.push(ValidationError::new(
                 "fragments.cuts",
                 "cannot index the complete fragment cut graph",
@@ -240,7 +240,7 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
 
 pub(crate) fn validate_provider_read_occurrences(
     plan: &PhysicalPlan,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut occurrences = BTreeMap::new();
     for fragment in plan.fragments().values() {
@@ -269,7 +269,7 @@ pub(crate) fn validate_provider_read_occurrences(
     }
 }
 
-pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut ValidationContext) {
     let prefix = format!("fragments[{}]", fragment.id().get());
     let previous_errors = errors.len();
     validate_fragment_resources(fragment, errors);
@@ -280,19 +280,19 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
         errors,
         &format!("{prefix}.nodes"),
         fragment.nodes().len(),
-        MAX_FRAGMENT_NODES,
+        errors.limits().fragment_nodes,
     );
     bounded_count(
         errors,
         &format!("{prefix}.values"),
         fragment.values().len(),
-        MAX_FRAGMENT_VALUES,
+        errors.limits().fragment_values,
     );
     bounded_count(
         errors,
         &format!("{prefix}.expressions"),
         fragment.expressions().len(),
-        MAX_FRAGMENT_EXPRESSIONS,
+        errors.limits().fragment_expressions,
     );
     if !fragment.nodes().contains_key(&fragment.root()) {
         errors.push(ValidationError::new(
@@ -411,7 +411,7 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
     validate_fragment_sink(fragment, errors);
 }
 
-pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     bounded_count(
         errors,
         "annotations",
@@ -462,7 +462,7 @@ pub(crate) fn require_node(
     fragment: &Fragment,
     node: NodeId,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if !fragment.nodes().contains_key(&node) {
         errors.push(ValidationError::new(
@@ -476,7 +476,7 @@ pub(crate) fn require_value(
     fragment: &Fragment,
     value: ValueId,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if !fragment.values().contains_key(&value) {
         errors.push(ValidationError::new(

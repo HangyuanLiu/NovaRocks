@@ -25,7 +25,7 @@ use crate::{
     SealedArtifactSinkSpec, ValueId, ValueOrigin,
 };
 
-pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut indegree = plan
         .fragments()
         .keys()
@@ -70,7 +70,7 @@ pub(crate) fn validate_fragment_graph(plan: &PhysicalPlan, errors: &mut Validati
     }
 }
 
-pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_fragment_sink(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].sink", fragment.id().get());
     let root_output = fragment
         .nodes()
@@ -246,7 +246,7 @@ pub(crate) fn import_origin_matches(
     }
 }
 
-pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_node_graph(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].nodes", fragment.id().get());
     let mut remaining_inputs = BTreeMap::new();
     let mut dependents: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
@@ -306,7 +306,7 @@ pub(crate) fn validate_edge(
     plan: &PhysicalPlan,
     edge: &Edge,
     root_port_indexes: &mut BTreeMap<FragmentId, ValuePortIndex>,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!("edges[{}]", edge.id.get());
     let Some(source) = plan.fragments().get(&edge.source.fragment) else {
@@ -444,11 +444,7 @@ pub(crate) fn validate_edge(
     }
 }
 
-pub(crate) fn validate_edge_partitioning(
-    edge: &Edge,
-    path: &str,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_edge_partitioning(edge: &Edge, path: &str, errors: &mut ValidationContext) {
     validate_mapped_partitioning(
         &edge.partitioning,
         &edge.destination.receive_mapping,
@@ -461,7 +457,7 @@ pub(crate) fn validate_mapped_partitioning(
     partitioning: &crate::EdgePartitioning,
     mapping: &[(ValueId, ValueId)],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let layout_valid = match (&partitioning.source, &partitioning.destination) {
         (Distribution::Unconstrained, Distribution::Unconstrained)
@@ -533,7 +529,7 @@ pub(crate) fn distribution_values(distribution: &Distribution) -> &[ValueId] {
     }
 }
 
-pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_sinks(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut referenced = BTreeSet::new();
     for fragment in plan.fragments().values() {
         let path = format!("fragments[{}].sink", fragment.id().get());
@@ -619,7 +615,7 @@ pub(crate) fn validate_router_writer_contract(
     route: &crate::ChangeStreamRoute,
     edge: &Edge,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let Some(destination) = plan.fragments().get(&edge.destination.fragment) else {
         return;
@@ -678,7 +674,7 @@ pub(crate) fn validate_router_partitioning(
     route: &crate::ChangeStreamRoute,
     source_distribution: &Distribution,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let matches = match source_distribution {
         Distribution::Singleton => route.partition_by.is_empty(),
@@ -704,7 +700,7 @@ pub(crate) fn edge_kind_matches_sink(sink: &FragmentSink, kind: crate::EdgeKind)
     }
 }
 
-pub(crate) fn validate_writer_flows(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_writer_flows(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let writers = plan
         .fragments()
         .values()
@@ -894,7 +890,7 @@ pub(crate) fn validate_writer_flows(plan: &PhysicalPlan, errors: &mut Validation
     }
 }
 
-pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let result_sinks = plan
         .fragments()
         .values()
@@ -975,7 +971,7 @@ pub(crate) fn validate_result(plan: &PhysicalPlan, errors: &mut ValidationErrorC
 pub(crate) fn validate_artifact_sink(
     fragment: &Fragment,
     spec: &SealedArtifactSinkSpec,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].sink.sealed_artifact", fragment.id().get());
     if spec.format.revision == 0
@@ -1081,16 +1077,13 @@ pub(crate) fn validate_artifact_sink(
     }
 }
 
-pub(crate) fn validate_artifact_refs(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_artifact_refs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     for artifact in plan.artifact_refs().values() {
         validate_artifact_ref(artifact, errors);
     }
 }
 
-pub(crate) fn validate_artifact_ref(
-    artifact: &SealedArtifactRef,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_artifact_ref(artifact: &SealedArtifactRef, errors: &mut ValidationContext) {
     let path = format!("artifact_refs[{}]", artifact.id.get());
     if artifact.format.revision == 0 || artifact.schema.is_empty() {
         errors.push(ValidationError::new(
@@ -1126,7 +1119,7 @@ pub(crate) fn validate_artifact_ref(
 pub(crate) fn validate_coverage(
     coverage: &CoverageSet,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if coverage.domain.is_empty()
         || coverage.domain.len() > 1024
@@ -1189,7 +1182,7 @@ pub(crate) fn validate_coverage(
     }
 }
 
-pub(crate) fn validate_artifact_inputs(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_artifact_inputs(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
             if let NodeKind::Scan { relation, .. } = &node.kind {
@@ -1229,7 +1222,7 @@ pub(crate) fn validate_artifact_inputs(plan: &PhysicalPlan, errors: &mut Validat
 
 pub(crate) fn validate_cross_fragment_value_origins(
     plan: &PhysicalPlan,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let receive_mappings = plan
         .edges()

@@ -558,6 +558,22 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         plan.result_port().unwrap().output.columns.as_ref(),
         &[destination_value, destination_value]
     );
+
+    // The same plan is accepted or refused purely by the bounds it is given,
+    // and a refusal is reported as admission information rather than as a
+    // malformed plan. That difference is the whole reason the bounds are a
+    // value: an operator can act on the first and cannot act on the second.
+    validate_plan_with_limits(&plan, PlanLimits::FROZEN).expect("valid under the frozen bounds");
+    let errors = validate_plan_with_limits(
+        &plan,
+        PlanLimits {
+            plan_fragments: 1,
+            ..PlanLimits::FROZEN
+        },
+    )
+    .expect_err("a two-fragment plan cannot fit a one-fragment bound");
+    assert!(errors.has(ValidationErrorCategory::ResourceLimit));
+    assert!(!errors.is_producer_defect());
     let cuts = fragment_cuts(&plan, FragmentId::new(2)).unwrap();
     assert_eq!(cuts.inbound.len(), 1);
     let all_cuts = derive_fragment_cuts(&plan).unwrap();
@@ -926,7 +942,7 @@ fn artifact_coverage_rejects_overlapping_ranges() {
         ]),
         complete_input: false,
     };
-    let mut errors = super::validation::ValidationErrorCollector::new();
+    let mut errors = super::validation::ValidationContext::new();
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert_eq!(errors.len(), 1);
     assert!(errors[0].message().contains("overlap"));
@@ -949,7 +965,7 @@ fn complete_artifact_coverage_rejects_a_gap() {
         ]),
         complete_input: true,
     };
-    let mut errors = super::validation::ValidationErrorCollector::new();
+    let mut errors = super::validation::ValidationContext::new();
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert!(errors.iter().any(|error| {
         error
@@ -969,7 +985,7 @@ fn complete_artifact_coverage_rejects_bounded_ends() {
         }]),
         complete_input: true,
     };
-    let mut errors = super::validation::ValidationErrorCollector::new();
+    let mut errors = super::validation::ValidationContext::new();
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert!(errors.iter().any(|error| {
         error
@@ -1121,7 +1137,7 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
             ExprKind::Literal(LiteralValue::Int64(1)),
         )
         .unwrap();
-    for _ in 1..=MAX_EXPRESSION_SEMANTIC_DEPTH {
+    for _ in 1..=PlanLimits::FROZEN.expression_semantic_depth {
         expression = builder
             .add_expression(
                 node,
@@ -1225,13 +1241,13 @@ fn wide_connective_fragment(
 
 #[test]
 fn a_wide_predicate_is_width_and_not_depth() {
-    // Comfortably past MAX_EXPRESSION_SEMANTIC_DEPTH. A dashboard filter panel
+    // Comfortably past PlanLimits::FROZEN.expression_semantic_depth. A dashboard filter panel
     // or a generated `(a=1 AND b=2) OR ...` reaches this size routinely, so it
     // must validate: the depth bound exists to stop pathological nesting, not
     // to cap how many conditions a query may state.
-    const CONJUNCTS: usize = MAX_EXPRESSION_SEMANTIC_DEPTH * 2;
+    const CONJUNCTS: usize = PlanLimits::FROZEN.expression_semantic_depth * 2;
     const _: () = assert!(
-        CONJUNCTS > MAX_EXPRESSION_SEMANTIC_DEPTH,
+        CONJUNCTS > PlanLimits::FROZEN.expression_semantic_depth,
         "the fixture must exceed the depth bound or it proves nothing"
     );
     wide_connective_fragment(CONJUNCTS, |args| ExprKind::Conjunction { args })

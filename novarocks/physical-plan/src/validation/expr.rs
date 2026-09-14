@@ -108,7 +108,7 @@ pub(crate) fn validate_expression(
     window_roots: &BTreeSet<ExprId>,
     operator_roots: &BTreeSet<ExprId>,
     parents: &[ExpressionParentReference],
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!(
         "fragments[{}].expressions[{}]",
@@ -473,7 +473,7 @@ pub(crate) fn validate_literal_type(
     literal: &crate::LiteralValue,
     ty: &ValueType,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let valid = match literal {
         crate::LiteralValue::Null => ty.nullable,
@@ -562,7 +562,7 @@ pub(crate) fn validate_boolean_connective_types(
     args: &[ExprId],
     output: &crate::ExprNode,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if args.len() < 2 {
         errors.push(ValidationError::new(
@@ -598,7 +598,7 @@ pub(crate) fn validate_binary_types(
     right: &crate::ExprNode,
     output: &crate::ExprNode,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let same_inputs = left.ty.data_type == right.ty.data_type;
     let nullable = left.ty.nullable || right.ty.nullable;
@@ -670,7 +670,7 @@ pub(crate) fn validate_case_types(
     when_then: &[(ExprId, ExprId)],
     else_expr: Option<ExprId>,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if when_then.is_empty() {
         errors.push(ValidationError::new(
@@ -735,7 +735,7 @@ pub(crate) fn validate_window_frame(
     fragment: &Fragment,
     frame: &crate::WindowFrame,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if matches!(frame.start, crate::WindowBound::UnboundedFollowing)
         || matches!(frame.end, crate::WindowBound::UnboundedPreceding)
@@ -860,11 +860,7 @@ pub(crate) fn window_row_offset(fragment: &Fragment, expression: ExprId) -> Opti
     }
 }
 
-pub(crate) fn require_boolean_result(
-    ty: &ValueType,
-    path: &str,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn require_boolean_result(ty: &ValueType, path: &str, errors: &mut ValidationContext) {
     if ty.data_type != DataType::Boolean {
         errors.push(ValidationError::new(
             path,
@@ -876,7 +872,7 @@ pub(crate) fn require_boolean_result(
 pub(crate) fn require_non_nullable_boolean(
     ty: &ValueType,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if ty.data_type != DataType::Boolean || ty.nullable {
         errors.push(ValidationError::new(
@@ -927,7 +923,7 @@ pub(crate) fn validate_function_call(
     function: &crate::BoundFunction,
     args: &[ExprId],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     validate_function_arguments(fragment, &function.argument_types, args, path, errors);
     if expression.ty != function.result_type {
@@ -943,7 +939,7 @@ pub(crate) fn validate_function_arguments(
     expected: &[crate::FunctionArgumentType],
     args: &[ExprId],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if expected.len() != args.len() {
         errors.push(ValidationError::new(
@@ -983,10 +979,7 @@ pub(crate) fn validate_function_arguments(
     }
 }
 
-pub(crate) fn validate_expression_acyclic(
-    fragment: &Fragment,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_expression_acyclic(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].expressions", fragment.id().get());
     let mut remaining_dependencies = BTreeMap::new();
     let mut dependents: BTreeMap<ExprId, Vec<ExprId>> = BTreeMap::new();
@@ -1036,18 +1029,18 @@ pub(crate) fn validate_expression_acyclic(
             "expression graph contains a cycle",
         ));
     }
-    if depths.values().copied().max().unwrap_or(0) > MAX_EXPRESSION_SEMANTIC_DEPTH {
+    if depths.values().copied().max().unwrap_or(0) > errors.limits().expression_semantic_depth {
         errors.push(ValidationError::resource_limit(
             &path,
-            format!("expression semantic depth exceeds {MAX_EXPRESSION_SEMANTIC_DEPTH}"),
+            format!(
+                "expression semantic depth exceeds {}",
+                errors.limits().expression_semantic_depth
+            ),
         ));
     }
 }
 
-pub(crate) fn validate_lambda_scope_acyclic(
-    fragment: &Fragment,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_lambda_scope_acyclic(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].expressions", fragment.id().get());
     let mut complete = BTreeSet::new();
     for (start, _) in fragment.expressions().iter() {
@@ -1078,7 +1071,7 @@ pub(crate) fn validate_lambda_scope_acyclic(
 
 pub(crate) fn validate_expression_reachability(
     fragment: &Fragment,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].expressions", fragment.id().get());
     let mut pending = Vec::new();
@@ -1119,7 +1112,7 @@ pub(crate) fn validate_aggregate_arguments(
     args: &[ExprId],
     order_by: &[crate::SortExpr],
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     match binding.phase {
         AggregatePhase::Single | AggregatePhase::Partial { .. } => {
@@ -1179,7 +1172,7 @@ pub(crate) fn validate_expression_values_on_port(
     roots: &[ExprId],
     port_values: &ValuePortIndex,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut visited = BTreeSet::new();
     let mut pending = roots.to_vec();

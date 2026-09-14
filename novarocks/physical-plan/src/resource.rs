@@ -22,7 +22,7 @@ use arrow_schema::{
 };
 use novarocks_connector_contract::ConnectorEncodedPayload;
 
-use crate::validation::ValidationErrorCollector;
+use crate::validation::ValidationContext;
 use crate::{
     AggregateBinding, ArtifactInputRequirement, ArtifactSourceBinding, BoundFunction,
     BoundTableFunction, CoverageSet, ExprKind, Fragment, FragmentCuts, FragmentSink,
@@ -97,7 +97,7 @@ impl CutResourcePreflight {
         &mut self,
         artifact: &SealedArtifactRef,
         path: &str,
-        errors: &mut ValidationErrorCollector,
+        errors: &mut ValidationContext,
     ) {
         add_artifact_ref_usage(artifact, path, &mut self.usage, errors);
     }
@@ -106,16 +106,12 @@ impl CutResourcePreflight {
         &mut self,
         filter: &RuntimeFilter,
         path: &str,
-        errors: &mut ValidationErrorCollector,
+        errors: &mut ValidationContext,
     ) {
         add_runtime_filter_usage(filter, path, &mut self.usage, errors);
     }
 
-    pub(crate) fn add_fragment(
-        &mut self,
-        fragment: &Fragment,
-        errors: &mut ValidationErrorCollector,
-    ) {
+    pub(crate) fn add_fragment(&mut self, fragment: &Fragment, errors: &mut ValidationContext) {
         self.usage.merge(fragment_usage(fragment, errors));
     }
 
@@ -132,16 +128,12 @@ impl CutResourcePreflight {
         &mut self,
         ty: &ValueType,
         path: &str,
-        errors: &mut ValidationErrorCollector,
+        errors: &mut ValidationContext,
     ) {
         validate_value_type(ty, path, &mut self.usage, errors);
     }
 
-    pub(crate) fn validate(
-        self,
-        path: &str,
-        errors: &mut ValidationErrorCollector,
-    ) -> CutResourceUsage {
+    pub(crate) fn validate(self, path: &str, errors: &mut ValidationContext) -> CutResourceUsage {
         let result = CutResourceUsage {
             items: self.usage.items,
             bytes: self.usage.bytes,
@@ -209,10 +201,7 @@ impl ResourceUsage {
     }
 }
 
-pub(crate) fn validate_fragment_resources(
-    fragment: &Fragment,
-    errors: &mut ValidationErrorCollector,
-) {
+pub(crate) fn validate_fragment_resources(fragment: &Fragment, errors: &mut ValidationContext) {
     let path = format!("fragments[{}].resources", fragment.id().get());
     let usage = fragment_usage(fragment, errors);
     validate_usage(
@@ -227,7 +216,7 @@ pub(crate) fn validate_fragment_resources(
 pub(crate) fn validate_fragment_cut_resources(
     fragment: &Fragment,
     cuts: &FragmentCuts,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let prefix = format!("fragments[{}].cuts", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
@@ -400,7 +389,7 @@ fn add_writer_result_cut_usage(
     writer: &crate::WriterResultCut,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_items(writer.fields.len());
     for (ordinal, field) in writer.fields.iter().enumerate() {
@@ -417,7 +406,7 @@ fn add_writer_result_cut_usage(
     }
 }
 
-pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_plan_resources(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut usage = ResourceUsage::limited(MAX_PLAN_DYNAMIC_ITEMS, MAX_PLAN_DYNAMIC_BYTES);
     usage.add_item_counts([
         plan.fragments().len(),
@@ -500,7 +489,7 @@ fn validate_usage(
     usage: ResourceUsage,
     max_items: usize,
     max_bytes: usize,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.items > max_items {
         errors.push(ValidationError::resource_limit(
@@ -522,7 +511,7 @@ fn validate_usage(
     }
 }
 
-fn fragment_usage(fragment: &Fragment, errors: &mut ValidationErrorCollector) -> ResourceUsage {
+fn fragment_usage(fragment: &Fragment, errors: &mut ValidationContext) -> ResourceUsage {
     let prefix = format!("fragments[{}]", fragment.id().get());
     let mut usage = ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
     usage.add_item_counts([
@@ -598,7 +587,7 @@ fn add_expression_usage(
     kind: &ExprKind,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.exhausted() {
         return;
@@ -660,7 +649,7 @@ fn add_function_usage(
     function: &BoundFunction,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_items(function.argument_types.len());
     usage.add_byte_counts([
@@ -680,7 +669,7 @@ fn add_table_function_usage(
     function: &BoundTableFunction,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_item_counts([function.argument_types.len(), function.result_types.len()]);
     usage.add_byte_counts([
@@ -700,7 +689,7 @@ fn add_argument_types_usage(
     argument_types: &[FunctionArgumentType],
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     for (index, argument) in argument_types.iter().enumerate() {
         if usage.exhausted() {
@@ -744,7 +733,7 @@ fn add_aggregate_binding_usage(
     binding: &AggregateBinding,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_bytes(binding.state_format.as_str().len());
     add_function_usage(
@@ -765,7 +754,7 @@ fn add_node_usage(
     kind: &NodeKind,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.exhausted() {
         return;
@@ -973,7 +962,7 @@ fn add_writer_finish_usage(
     spec: &WriterFinishSpec,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_item_counts([
         spec.expected_target_ordinals.len(),
@@ -1027,7 +1016,7 @@ fn add_writer_schema_usage(
     schema: &WriterRelationSchema,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_items(schema.fields.len());
     for (index, field) in schema.fields.iter().enumerate() {
@@ -1064,7 +1053,7 @@ fn add_relation_usage(
     relation: &Relation,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let (schema, guarantees, artifacts, evidence_bytes, metadata_kind_bytes) = match relation {
         Relation::Data(relation) => (
@@ -1147,7 +1136,7 @@ fn add_artifact_requirement_usage(
     artifact: &ArtifactInputRequirement,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_items(artifact.schema.len());
     usage.add_byte_counts([
@@ -1168,7 +1157,7 @@ fn add_artifact_ref_usage(
     artifact: &SealedArtifactRef,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_items(artifact.schema.len());
     usage.add_byte_counts([
@@ -1190,7 +1179,7 @@ fn add_sink_usage(
     sink: &FragmentSink,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     match sink {
         FragmentSink::Multicast { edges } => usage.add_items(edges.len()),
@@ -1218,7 +1207,7 @@ fn add_artifact_sink_usage(
     spec: &SealedArtifactSinkSpec,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_item_counts([
         spec.input.len(),
@@ -1260,7 +1249,7 @@ fn add_runtime_filter_usage(
     filter: &RuntimeFilter,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.exhausted() {
         return;
@@ -1327,18 +1316,18 @@ fn add_runtime_filter_coverage_usage(
     coverage: &RuntimeFilterCoverage,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.exhausted() {
         return;
     }
     usage.add_items(coverage.nodes.len());
-    if coverage.nodes.len() > crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES {
+    if coverage.nodes.len() > errors.limits().runtime_filter_coverage_nodes {
         errors.push(ValidationError::resource_limit(
             path,
             format!(
                 "contains more than {} arena nodes",
-                crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES
+                errors.limits().runtime_filter_coverage_nodes
             ),
         ));
         return;
@@ -1352,12 +1341,12 @@ fn add_runtime_filter_coverage_usage(
         | RuntimeFilterCoverageNode::AnyOf { children } = node
         {
             child_references = child_references.saturating_add(children.len());
-            if child_references > crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES {
+            if child_references > errors.limits().runtime_filter_coverage_nodes {
                 errors.push(ValidationError::resource_limit(
                     path,
                     format!(
                         "contains more than {} child references",
-                        crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES
+                        errors.limits().runtime_filter_coverage_nodes
                     ),
                 ));
                 return;
@@ -1390,7 +1379,7 @@ fn validate_value_type(
     ty: &ValueType,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     validate_data_type(&ty.data_type, path, usage, errors);
 }
@@ -1399,7 +1388,7 @@ fn validate_data_type(
     root: &DataType,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if usage.exhausted() {
         return;
@@ -1585,7 +1574,7 @@ fn data_type_children_exceed_budget(
     pending: usize,
     children: usize,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> bool {
     if visited.saturating_add(pending).saturating_add(children) <= MAX_DATA_TYPE_NODES {
         return false;
@@ -1601,7 +1590,7 @@ fn validate_field(
     field: &Field,
     path: &str,
     usage: &mut ResourceUsage,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     usage.add_bytes(field.name().len());
     if field.name().len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
@@ -1647,14 +1636,14 @@ fn validate_decimal(
     scale: i8,
     max_precision: u8,
     max_scale: i8,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if precision == 0 || precision > max_precision || scale < -max_scale || scale > max_scale {
         errors.push(ValidationError::new(path, format!( "Arrow decimal precision/scale ({precision}, {scale}) is outside 1..={max_precision} and -{max_scale}..={max_scale}" )));
     }
 }
 
-fn invalid_fixed_size(path: &str, size: i32, errors: &mut ValidationErrorCollector) {
+fn invalid_fixed_size(path: &str, size: i32, errors: &mut ValidationContext) {
     // A negative length is not a plan that is too large; it is a type that
     // cannot exist. Only the upper bound is a limit an operator could raise.
     if size < 0 {
@@ -1705,7 +1694,7 @@ mod tests {
         };
         let mut usage =
             ResourceUsage::limited(MAX_FRAGMENT_DYNAMIC_ITEMS, MAX_FRAGMENT_DYNAMIC_BYTES);
-        let mut errors = ValidationErrorCollector::new();
+        let mut errors = ValidationContext::new();
 
         add_aggregate_binding_usage(&binding, "binding", &mut usage, &mut errors);
 
@@ -1715,7 +1704,7 @@ mod tests {
 
     #[test]
     fn cumulative_resource_limits_fail_closed_without_large_allocations() {
-        let mut errors = ValidationErrorCollector::new();
+        let mut errors = ValidationContext::new();
         validate_usage(
             "fragment.resources",
             ResourceUsage {

@@ -32,14 +32,14 @@ use crate::{
 /// Derive the explicit cut contract used to validate one fragment without the
 /// rest of the plan graph.
 pub fn fragment_cuts(plan: &PhysicalPlan, fragment_id: FragmentId) -> Option<FragmentCuts> {
-    let derivation = FragmentCutDerivation::new(plan)?;
+    let derivation = FragmentCutDerivation::new(plan, &PlanLimits::FROZEN)?;
     derivation.derive(plan, fragment_id)
 }
 
 /// Derive every independently verifiable fragment cut in one indexed pass.
 pub fn derive_fragment_cuts(plan: &PhysicalPlan) -> Option<BTreeMap<FragmentId, FragmentCuts>> {
-    let mut errors = ValidationErrorCollector::new();
-    let derivation = FragmentCutDerivation::new(plan)?;
+    let mut errors = ValidationContext::new();
+    let derivation = FragmentCutDerivation::new(plan, &PlanLimits::FROZEN)?;
     let mut total_items = 0usize;
     let mut total_bytes = 0usize;
     for fragment in plan.fragments().keys().copied() {
@@ -99,7 +99,7 @@ pub(crate) struct RuntimeFilterBuildExpansion<'a> {
 }
 
 impl FragmentCutDerivation {
-    pub(crate) fn new(plan: &PhysicalPlan) -> Option<Self> {
+    pub(crate) fn new(plan: &PhysicalPlan, limits: &PlanLimits) -> Option<Self> {
         let provenance = source_provenance_index(plan)?;
         let mut inbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
         let mut outbound = BTreeMap::<FragmentId, Vec<EdgeId>>::new();
@@ -136,7 +136,7 @@ impl FragmentCutDerivation {
         let mut proof_hull_by_fragment = BTreeMap::new();
         let mut proof_hull_by_filter_set = BTreeMap::<Box<[crate::RuntimeFilterId]>, usize>::new();
         let mut build_dependency_cache = RuntimeFilterBuildDependencyCache::default();
-        let mut proof_work_budget = SemanticTraceWorkBudget::new();
+        let mut proof_work_budget = SemanticTraceWorkBudget::new(limits);
         for fragment in plan.fragments().values() {
             let mut key = fragment.runtime_filters().to_vec();
             key.sort_unstable();
@@ -184,7 +184,7 @@ impl FragmentCutDerivation {
         plan: &PhysicalPlan,
         fragment_id: FragmentId,
     ) -> Option<FragmentCuts> {
-        let mut errors = ValidationErrorCollector::new();
+        let mut errors = ValidationContext::new();
         preflight_fragment_cut_resources(plan, fragment_id, self, &mut errors)?;
         if !errors.is_empty() {
             return None;
@@ -231,7 +231,7 @@ pub(crate) fn preflight_fragment_cut_resources(
     plan: &PhysicalPlan,
     fragment_id: FragmentId,
     derivation: &FragmentCutDerivation,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> Option<CutResourceUsage> {
     let fragment = plan.fragments().get(&fragment_id)?;
     let inbound = derivation
@@ -818,7 +818,7 @@ pub(crate) fn validate_fragment_cuts_into(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     validate_runtime_filter_proof: bool,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let path = format!("fragments[{}].cuts", fragment.id().get());
     let local_provenance = fragment_source_provenance(fragment, cuts);
@@ -826,25 +826,25 @@ pub(crate) fn validate_fragment_cuts_into(
         errors,
         &format!("{path}.inbound"),
         cuts.inbound.len(),
-        MAX_PLAN_EDGES,
+        errors.limits().plan_edges,
     );
     bounded_count(
         errors,
         &format!("{path}.outbound"),
         cuts.outbound.len(),
-        MAX_PLAN_EDGES,
+        errors.limits().plan_edges,
     );
     bounded_count(
         errors,
         &format!("{path}.artifact_refs"),
         cuts.artifact_refs.len(),
-        MAX_PLAN_ARTIFACT_REFS,
+        errors.limits().plan_artifact_refs,
     );
     bounded_count(
         errors,
         &format!("{path}.runtime_filters"),
         cuts.runtime_filters.len(),
-        MAX_PLAN_RUNTIME_FILTERS,
+        errors.limits().plan_runtime_filters,
     );
     let mut inbound_ids = BTreeSet::new();
     for cut in &cuts.inbound {
@@ -852,13 +852,13 @@ pub(crate) fn validate_fragment_cuts_into(
             errors,
             &format!("{path}.inbound.imports"),
             cut.imports.len(),
-            MAX_FRAGMENT_VALUES,
+            errors.limits().fragment_values,
         );
         bounded_count(
             errors,
             &format!("{path}.inbound.source_bindings"),
             cut.source_bindings.len(),
-            MAX_PLAN_ARTIFACT_REFS,
+            errors.limits().plan_artifact_refs,
         );
         for source in &cut.source_bindings {
             validate_read_reference(&source.source, &path, errors);
@@ -1029,13 +1029,13 @@ pub(crate) fn validate_fragment_cuts_into(
             errors,
             &format!("{path}.outbound.projection"),
             cut.projection.len(),
-            MAX_FRAGMENT_VALUES,
+            errors.limits().fragment_values,
         );
         bounded_count(
             errors,
             &format!("{path}.outbound.source_bindings"),
             cut.source_bindings.len(),
-            MAX_PLAN_ARTIFACT_REFS,
+            errors.limits().plan_artifact_refs,
         );
         for source in &cut.source_bindings {
             validate_read_reference(&source.source, &path, errors);
@@ -1231,7 +1231,7 @@ pub(crate) fn validate_inbound_change_stream_writer(
     fragment: &Fragment,
     cut: &InboundFragmentCut,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::ChangeStreamRouter {
         if cut.change_stream_writer.is_some() {
@@ -1290,7 +1290,7 @@ pub(crate) fn validate_inbound_writer_result_structure(
     fragment: &Fragment,
     cut: &InboundFragmentCut,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::Stream {
         if cut.writer_result.is_some() {
@@ -1331,7 +1331,7 @@ pub(crate) fn validate_outbound_writer_result(
     fragment: &Fragment,
     cut: &OutboundFragmentCut,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if cut.kind != crate::EdgeKind::Stream {
         if cut.writer_result.is_some() {
@@ -1390,7 +1390,7 @@ pub(crate) fn validate_fragment_writer_results(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let inbound_by_edge = cuts
         .inbound
@@ -1548,7 +1548,7 @@ pub(crate) fn validate_fragment_artifact_cuts(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut supplied = BTreeMap::new();
     for artifact in &cuts.artifact_refs {
@@ -1604,7 +1604,7 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
     fragment: &Fragment,
     cuts: &FragmentCuts,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
     let inbound_edges = cuts
@@ -1733,7 +1733,7 @@ pub(crate) fn validate_runtime_filter_join_coverage(
     filter: &crate::RuntimeFilter,
     producer: &crate::RuntimeFilterProducer,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if !matches!(
         producer.target,
@@ -1781,7 +1781,7 @@ pub(crate) fn validate_runtime_filter_proof_graph(
     local_fragment: &Fragment,
     cuts: &FragmentCuts,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
     let mut root_port_indexes = BTreeMap::new();
@@ -1850,7 +1850,7 @@ pub(crate) fn validate_runtime_filter_proof_graph(
     let mut required_fragments = BTreeSet::new();
     let mut required_edges = BTreeSet::new();
     let mut build_dependency_cache = RuntimeFilterBuildDependencyCache::default();
-    let mut proof_work_budget = SemanticTraceWorkBudget::new();
+    let mut proof_work_budget = SemanticTraceWorkBudget::new(errors.limits());
     let Some(required_filters) = extend_runtime_filter_proof_hull(
         &proof_plan,
         cuts.runtime_filters.iter().map(|filter| filter.id),

@@ -1143,7 +1143,7 @@ fn runtime_filter_coverage_depth_is_bounded_without_recursive_values() {
         null_safe_join_filter(RuntimeFilterNullSemantics::NullSafeEqual);
     let witness = filter.producers[0].witness;
     let mut nodes = vec![RuntimeFilterCoverageNode::Witness(witness)];
-    for child in 0..MAX_RUNTIME_FILTER_COVERAGE_DEPTH {
+    for child in 0..PlanLimits::FROZEN.runtime_filter_coverage_depth {
         nodes.push(RuntimeFilterCoverageNode::AllOf {
             children: Box::from([u32::try_from(child).unwrap()]),
         });
@@ -2696,7 +2696,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
         let mut constants = vec![
             if matches!(fixture, GroupedWriterFixture::NestedLiteralBudgetExceeded) && target == 0 {
                 UnpivotConstant::Int32List(
-                    vec![0; MAX_UNPIVOT_COLLECTION_ITEMS + 1].into_boxed_slice(),
+                    vec![0; PlanLimits::FROZEN.unpivot_collection_items + 1].into_boxed_slice(),
                 )
             } else if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
                 UnpivotConstant::Utf8Map(Box::default())

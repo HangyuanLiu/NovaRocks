@@ -29,7 +29,7 @@ use crate::{
 pub(crate) fn validate_runtime_filter_proof_edge_source_sinks(
     plan: &PhysicalPlan,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let source_sinks = SourceSinkEdgeIndex::new(plan);
     for edge in plan.edges().values() {
@@ -58,7 +58,7 @@ pub(crate) fn validate_runtime_filter_proof_edge_source_sinks(
     }
 }
 
-pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationErrorCollector) {
+pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut ValidationContext) {
     let mut lineage_indexes = RuntimeFilterLineageIndexes::default();
     let attachments = runtime_filter_attachment_index(plan);
     let inbound_edges = runtime_filter_inbound_edge_index(plan);
@@ -198,7 +198,7 @@ pub(crate) enum RuntimeFilterWaitNode {
 pub(crate) fn validate_runtime_filter_wait_graph(
     plan: &PhysicalPlan,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let mut dependencies =
         BTreeMap::<RuntimeFilterWaitNode, BTreeSet<RuntimeFilterWaitNode>>::new();
@@ -361,7 +361,7 @@ pub(crate) fn validate_runtime_filter_attachment(
     id: crate::RuntimeFilterId,
     endpoint: &RuntimeFilterEndpoint,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if let Some(fragment) = plan.fragments().get(&endpoint.fragment)
         && !attachments
@@ -423,16 +423,16 @@ pub(crate) fn runtime_filter_inbound_edge_index(
 pub(crate) fn validate_runtime_filter_shape(
     filter: &crate::RuntimeFilter,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> bool {
-    if filter.producers.len() > MAX_RUNTIME_FILTER_ENDPOINTS
-        || filter.consumers.len() > MAX_RUNTIME_FILTER_ENDPOINTS
-        || filter.equality_witnesses.len() > MAX_RUNTIME_FILTER_ENDPOINTS
+    if filter.producers.len() > errors.limits().runtime_filter_endpoints
+        || filter.consumers.len() > errors.limits().runtime_filter_endpoints
+        || filter.equality_witnesses.len() > errors.limits().runtime_filter_endpoints
         || filter
             .producers
             .len()
             .saturating_add(filter.consumers.len())
-            > MAX_RUNTIME_FILTER_ENDPOINTS
+            > errors.limits().runtime_filter_endpoints
     {
         errors.push(ValidationError::resource_limit(
             path,
@@ -449,7 +449,7 @@ pub(crate) fn validate_runtime_filter_shape(
             }
         })
     });
-    if lineage_steps > MAX_RUNTIME_FILTER_LINEAGE_STEPS {
+    if lineage_steps > errors.limits().runtime_filter_lineage_steps {
         errors.push(ValidationError::resource_limit(
             path,
             "runtime filter lineage exceeds the contract maximum",
@@ -652,7 +652,7 @@ pub(crate) fn validate_runtime_filter_matrix(
     filter: &crate::RuntimeFilter,
     coverage_comparison_safe: bool,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if coverage_comparison_safe
         && filter.lifecycle == crate::RuntimeFilterLifecycle::CompleteOnce
@@ -860,14 +860,16 @@ pub(crate) fn validate_runtime_filter_coverage(
     coverage: &crate::RuntimeFilterCoverage,
     label: &str,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) -> (BTreeSet<crate::RuntimeFilterWitnessId>, bool) {
-    if coverage.nodes.is_empty() || coverage.nodes.len() > MAX_RUNTIME_FILTER_COVERAGE_NODES {
+    if coverage.nodes.is_empty()
+        || coverage.nodes.len() > errors.limits().runtime_filter_coverage_nodes
+    {
         errors.push(ValidationError::new(
             path,
             format!(
                 "runtime filter {label} coverage requires 1..={} arena nodes",
-                MAX_RUNTIME_FILTER_COVERAGE_NODES
+                errors.limits().runtime_filter_coverage_nodes
             ),
         ));
         return (BTreeSet::new(), false);
@@ -903,13 +905,13 @@ pub(crate) fn validate_runtime_filter_coverage(
                     ));
                 }
                 child_references = child_references.saturating_add(children.len());
-                if child_references > MAX_RUNTIME_FILTER_COVERAGE_NODES {
+                if child_references > errors.limits().runtime_filter_coverage_nodes {
                     safe = false;
                     errors.push(ValidationError::resource_limit(
                         path,
                         format!(
                             "runtime filter {label} coverage exceeds {} child references",
-                            MAX_RUNTIME_FILTER_COVERAGE_NODES
+                            errors.limits().runtime_filter_coverage_nodes
                         ),
                     ));
                     break;
@@ -942,13 +944,13 @@ pub(crate) fn validate_runtime_filter_coverage(
                     ));
                 }
                 let depth = child_depth.saturating_add(1);
-                if depth > MAX_RUNTIME_FILTER_COVERAGE_DEPTH {
+                if depth > errors.limits().runtime_filter_coverage_depth {
                     safe = false;
                     errors.push(ValidationError::resource_limit(
                         path,
                         format!(
                             "runtime filter {label} coverage exceeds semantic depth {}",
-                            MAX_RUNTIME_FILTER_COVERAGE_DEPTH
+                            errors.limits().runtime_filter_coverage_depth
                         ),
                     ));
                 }
@@ -999,7 +1001,7 @@ pub(crate) fn validate_runtime_filter_producer_progress(
     inbound_edges: &BTreeSet<EdgeId>,
     indexes: &mut RuntimeFilterLineageIndexes,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let crate::RuntimeFilterProducerProgress {
         build_edges,
@@ -1098,7 +1100,7 @@ pub(crate) fn validate_runtime_filter_endpoint(
     endpoint: &RuntimeFilterEndpoint,
     domain: &crate::RuntimeFilterDomain,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     match plan.fragments().get(&endpoint.fragment) {
         Some(fragment) => {
@@ -1116,7 +1118,7 @@ pub(crate) fn validate_runtime_filter_endpoint_in_fragment(
     endpoint: &RuntimeFilterEndpoint,
     domain: &crate::RuntimeFilterDomain,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     require_node(fragment, endpoint.node, path, errors);
     let expected = match domain {
@@ -1161,7 +1163,7 @@ pub(crate) fn validate_apply_point(
     endpoint: &RuntimeFilterEndpoint,
     apply_point: crate::RuntimeFilterApplyPoint,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if let Some(fragment) = plan.fragments().get(&endpoint.fragment) {
         validate_apply_point_in_fragment(fragment, indexes, endpoint, apply_point, path, errors);
@@ -1174,7 +1176,7 @@ pub(crate) fn validate_apply_point_in_fragment(
     endpoint: &RuntimeFilterEndpoint,
     apply_point: crate::RuntimeFilterApplyPoint,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if let Some(node) = fragment.nodes().get(&endpoint.node) {
         match indexes.apply_port_contains_all(fragment, node, apply_point, &endpoint.values) {
@@ -1222,7 +1224,7 @@ pub(crate) fn validate_runtime_filter_equality_witness(
     witness: &crate::RuntimeFilterEqualityWitness,
     domain: &crate::RuntimeFilterDomain,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let valid = fragment.nodes().get(&witness.join).is_some_and(|node| {
         let NodeKind::HashJoin {
@@ -1290,7 +1292,7 @@ pub(crate) fn validate_runtime_filter_producer_target(
     domain: &crate::RuntimeFilterDomain,
     reduction: crate::RuntimeFilterReduction,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if matches!(
         producer.target,
@@ -1416,7 +1418,7 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     consumer: &crate::RuntimeFilterConsumer,
     indexes: &mut RuntimeFilterLineageIndexes,
     path: &str,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     if let crate::RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { late_apply }
     | crate::RuntimeFilterConsumerActivation::NonBlockingLive { late_apply } =
@@ -1520,7 +1522,7 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
     consumer: &crate::RuntimeFilterConsumer,
     path: &str,
     indexes: &mut RuntimeFilterLineageIndexes,
-    errors: &mut ValidationErrorCollector,
+    errors: &mut ValidationContext,
 ) {
     let (origin, lineage) = match &consumer.target {
         crate::RuntimeFilterConsumerTarget::ScanField { equality, lineage } => (
@@ -1533,7 +1535,7 @@ pub(crate) fn validate_runtime_filter_consumer_lineage(
         ),
         crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => return,
     };
-    if lineage.len() > MAX_RUNTIME_FILTER_LINEAGE_STEPS
+    if lineage.len() > errors.limits().runtime_filter_lineage_steps
         || runtime_filter_scan_lineage_is_valid(
             plan, witnesses, producers, consumer, origin, lineage, indexes,
         )

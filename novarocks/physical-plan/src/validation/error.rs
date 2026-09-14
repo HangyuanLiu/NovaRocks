@@ -17,6 +17,8 @@
 
 use std::fmt;
 
+use super::limits::PlanLimits;
+
 /// How a validation failure must be routed by whoever receives it.
 ///
 /// The categories do not rank severity. They record *who is at fault*, which is
@@ -131,18 +133,36 @@ pub struct ValidationErrors(Box<[ValidationError]>);
 
 pub const MAX_VALIDATION_ERRORS: usize = 128;
 
+/// Everything a check needs besides the plan itself: where to report a
+/// failure, and the bounds it is being validated against.
+///
+/// Limits travel with the error sink because that is the one value already
+/// threaded through every check. It also keeps the two halves of a limit
+/// decision together: the bound that was applied, and the refusal it produced.
+/// A `ResourceLimit` error therefore cannot be raised against a number the
+/// caller did not supply.
 #[derive(Default)]
-pub(crate) struct ValidationErrorCollector {
+pub(crate) struct ValidationContext {
     pub(crate) errors: Vec<ValidationError>,
     pub(crate) truncated: bool,
+    pub(crate) limits: PlanLimits,
 }
 
-impl ValidationErrorCollector {
+impl ValidationContext {
     pub(crate) const fn new() -> Self {
+        Self::with_limits(PlanLimits::FROZEN)
+    }
+
+    pub(crate) const fn with_limits(limits: PlanLimits) -> Self {
         Self {
             errors: Vec::new(),
             truncated: false,
+            limits,
         }
+    }
+
+    pub(crate) const fn limits(&self) -> &PlanLimits {
+        &self.limits
     }
 
     pub(crate) fn push(&mut self, error: ValidationError) {
@@ -172,7 +192,7 @@ impl ValidationErrorCollector {
     }
 }
 
-impl std::ops::Deref for ValidationErrorCollector {
+impl std::ops::Deref for ValidationContext {
     type Target = Vec<ValidationError>;
 
     fn deref(&self) -> &Self::Target {
@@ -202,7 +222,7 @@ impl ValidationErrors {
                 .all(|error| error.category() == ValidationErrorCategory::StructuralInvariant)
     }
 
-    pub(crate) fn from_collector(errors: ValidationErrorCollector) -> Self {
+    pub(crate) fn from_collector(errors: ValidationContext) -> Self {
         Self(errors.into_vec().into_boxed_slice())
     }
 }
