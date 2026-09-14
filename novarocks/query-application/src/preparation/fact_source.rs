@@ -36,7 +36,7 @@ use novarocks_sql::compiler::{
     ProviderReadFact, ProviderReadNeed, SqlFactBatch, SqlNeedBatch, StatisticsFact, StatisticsNeed,
 };
 
-use super::final_plan::SqlCompletionFactSource;
+use super::{final_plan::SqlCompletionFactSource, runtime_access::ReadAccessSink};
 
 /// Resolves table and metadata-relation lookups.
 #[async_trait]
@@ -73,30 +73,36 @@ pub trait MaterializedViewFactPort: Send + Sync {
 ///
 /// Unlike the others, answering here is not a lookup: the owner negotiates what
 /// the provider will take on and then commits it, and what it commits is what
-/// the plan is built against. It also holds the runtime capabilities the freeze
-/// yields, which never travel with the facts.
+/// the plan is built against. A freeze also yields the capability to perform
+/// that read, which never travels with the facts - it is deposited in the sink
+/// as each read is frozen, so a freeze that fails on its third read of four
+/// still leaves the first two accounted for.
 #[async_trait]
 pub trait ProviderReadFactPort: Send + Sync {
+    /// What performing one frozen read requires at runtime.
+    type Access: Send;
+
     async fn resolve_provider_reads(
         &self,
         needs: &[ProviderReadNeed],
+        taken: &ReadAccessSink<Self::Access>,
     ) -> Result<Vec<ProviderReadFact>, String>;
 }
 
 /// The one place that knows which owner answers which kind of question.
-pub struct QueryCompletionFactSource {
+pub struct QueryCompletionFactSource<A> {
     catalog: Arc<dyn CatalogFactPort>,
     statistics: Arc<dyn StatisticsFactPort>,
     materialized_views: Arc<dyn MaterializedViewFactPort>,
-    provider_reads: Arc<dyn ProviderReadFactPort>,
+    provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
 }
 
-impl QueryCompletionFactSource {
+impl<A> QueryCompletionFactSource<A> {
     pub const fn new(
         catalog: Arc<dyn CatalogFactPort>,
         statistics: Arc<dyn StatisticsFactPort>,
         materialized_views: Arc<dyn MaterializedViewFactPort>,
-        provider_reads: Arc<dyn ProviderReadFactPort>,
+        provider_reads: Arc<dyn ProviderReadFactPort<Access = A>>,
     ) -> Self {
         Self {
             catalog,
@@ -124,8 +130,14 @@ fn expect_one_answer_each<T>(kind: &str, asked: usize, answers: Vec<T>) -> Resul
 }
 
 #[async_trait]
-impl SqlCompletionFactSource for QueryCompletionFactSource {
-    async fn resolve(&self, needs: &SqlNeedBatch) -> Result<SqlFactBatch, String> {
+impl<A: Send + Sync> SqlCompletionFactSource for QueryCompletionFactSource<A> {
+    type Access = A;
+
+    async fn resolve(
+        &self,
+        needs: &SqlNeedBatch,
+        taken: &ReadAccessSink<A>,
+    ) -> Result<SqlFactBatch, String> {
         match needs {
             SqlNeedBatch::CatalogRelations(needs) => self
                 .catalog
@@ -147,7 +159,7 @@ impl SqlCompletionFactSource for QueryCompletionFactSource {
                 .map(|facts| SqlFactBatch::MaterializedViews(facts.into_boxed_slice())),
             SqlNeedBatch::ProviderReads(needs) => self
                 .provider_reads
-                .resolve_provider_reads(needs)
+                .resolve_provider_reads(needs, taken)
                 .await
                 .and_then(|facts| expect_one_answer_each("provider read", needs.len(), facts))
                 .map(|facts| SqlFactBatch::ProviderReads(facts.into_boxed_slice())),
@@ -193,9 +205,12 @@ mod tests {
 
     #[async_trait]
     impl ProviderReadFactPort for Silent {
+        type Access = ();
+
         async fn resolve_provider_reads(
             &self,
             _: &[ProviderReadNeed],
+            _: &ReadAccessSink<()>,
         ) -> Result<Vec<ProviderReadFact>, String> {
             Ok(Vec::new())
         }
@@ -227,14 +242,18 @@ mod tests {
             SqlNeedBatch::MaterializedViews(Box::default()),
             SqlNeedBatch::ProviderReads(Box::default()),
         ];
+        let taken = ReadAccessSink::new();
         for needs in batches {
             let kind = needs.kind();
             let answered = tokio::runtime::Builder::new_current_thread()
                 .build()
                 .expect("runtime")
-                .block_on(source.resolve(&needs))
+                .block_on(source.resolve(&needs, &taken))
                 .unwrap_or_else(|error| panic!("{kind:?}: {error}"));
             assert_eq!(answered.kind(), kind);
         }
+        // A lookup is not a freeze: routing four kinds of question took no
+        // capability at all.
+        assert!(taken.into_taken().is_empty());
     }
 }

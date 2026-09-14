@@ -33,6 +33,10 @@ use novarocks_sql::compiler::{
 };
 use novarocks_workload_control::{CancellationView, Stage, StageRequest, WorkScope};
 
+use super::runtime_access::{
+    CompletedPlanWithAccess, FinalPlanAccessError, FrozenReadAccess, ReadAccessSink,
+};
+
 /// Immutable, fully validated final plan held by query application before any
 /// runtime projection is built. There is deliberately no mutable-plan or
 /// unchecked-plan constructor.
@@ -85,29 +89,73 @@ impl CompletedPhysicalPlanCandidate {
 /// Role composition supplies the application-owned adapter that resolves the
 /// current exact SQL need batch. A fact source cannot retain compiler state,
 /// mint a plan, or substitute a different need batch.
+///
+/// Answering a need can require freezing a provider read, which yields a
+/// runtime capability that must not travel with the facts. The sink is where
+/// such a capability goes the instant it is taken, so the driver accounts for
+/// it whether or not this call goes on to succeed. A source that freezes
+/// nothing never touches it.
 #[async_trait]
 pub trait SqlCompletionFactSource: Send + Sync {
-    async fn resolve(&self, needs: &SqlNeedBatch) -> Result<SqlFactBatch, String>;
+    /// What performing a frozen read requires at runtime. A source that
+    /// freezes nothing uses `()`.
+    type Access: Send;
+
+    async fn resolve(
+        &self,
+        needs: &SqlNeedBatch,
+        taken: &ReadAccessSink<Self::Access>,
+    ) -> Result<SqlFactBatch, String>;
 }
 
 /// Drives one query's pure SQL completion protocol under its admitted scope.
 ///
-/// The driver carries no resource authority or runtime capability. It holds
-/// the stage permit for the complete preparation lifetime and interrupts the
-/// pending role adapter on statement cancellation or the frozen deadline.
-pub struct FinalPlanCompletionDriver {
-    facts: Arc<dyn SqlCompletionFactSource>,
+/// The driver carries no resource authority. It holds the stage permit for the
+/// complete preparation lifetime, interrupts the pending role adapter on
+/// statement cancellation or the frozen deadline, and owns every runtime
+/// capability the completion takes until it either publishes them with a plan
+/// or returns them unpaired.
+pub struct FinalPlanCompletionDriver<A> {
+    facts: Arc<dyn SqlCompletionFactSource<Access = A>>,
 }
 
-impl FinalPlanCompletionDriver {
-    pub fn new(facts: Arc<dyn SqlCompletionFactSource>) -> Self {
+impl<A: Send> FinalPlanCompletionDriver<A> {
+    pub fn new(facts: Arc<dyn SqlCompletionFactSource<Access = A>>) -> Self {
         Self { facts }
     }
 
+    /// Complete one statement into a plan and the capabilities its scans were
+    /// frozen with.
+    ///
+    /// The two are published together or not at all. Every path that does not
+    /// publish returns the capabilities taken on the way, because a capability
+    /// whose plan never appeared still has an owner waiting to release it.
     pub async fn complete(
         &self,
         request: SqlFinalPlanCompileRequest,
         scope: &WorkScope,
+    ) -> Result<CompletedPlanWithAccess<A>, FinalPlanCompletionFailure<A>> {
+        let taken = ReadAccessSink::new();
+        let candidate = match self.complete_plan(request, scope, &taken).await {
+            Ok(candidate) => candidate,
+            Err(error) => return Err(FinalPlanCompletionFailure::new(error, taken.into_taken())),
+        };
+        let access = match taken.try_into_access() {
+            Ok(access) => access,
+            Err((error, taken)) => {
+                return Err(FinalPlanCompletionFailure::new(access_error(error), taken));
+            }
+        };
+        CompletedPlanWithAccess::try_pair(candidate, access).map_err(|(error, access)| {
+            FinalPlanCompletionFailure::new(access_error(error), access.into_taken())
+        })
+    }
+
+    async fn complete_plan(
+        &self,
+        request: SqlFinalPlanCompileRequest,
+        scope: &WorkScope,
+        taken: &ReadAccessSink<A>,
     ) -> Result<CompletedPhysicalPlanCandidate, FinalPlanCompletionError> {
         let control = request.control().clone();
         let permit = scope
@@ -135,7 +183,12 @@ impl FinalPlanCompletionDriver {
                 }
                 SqlCompileProgress::Incomplete(compilation) => {
                     let facts = self
-                        .resolve(&cancellation, control.deadline(), compilation.needs())
+                        .resolve(
+                            &cancellation,
+                            control.deadline(),
+                            compilation.needs(),
+                            taken,
+                        )
                         .await?;
                     SqlCompiler::finish(compilation, facts, &control)
                         .map_err(compiler_progress_error)?
@@ -149,8 +202,9 @@ impl FinalPlanCompletionDriver {
         cancellation: &CancellationView,
         deadline: Option<Instant>,
         needs: &SqlNeedBatch,
+        taken: &ReadAccessSink<A>,
     ) -> Result<SqlFactBatch, FinalPlanCompletionError> {
-        let future = self.facts.resolve(needs);
+        let future = self.facts.resolve(needs, taken);
         match deadline {
             Some(deadline) => {
                 tokio::select! {
@@ -169,14 +223,82 @@ impl FinalPlanCompletionDriver {
     }
 }
 
+/// A completion that published nothing, and the capabilities it took before it
+/// stopped.
+///
+/// The capabilities leave with the failure because the alternative is dropping
+/// them here, where their owner cannot see that they were ever taken.
+pub struct FinalPlanCompletionFailure<A> {
+    error: FinalPlanCompletionError,
+    taken: Vec<FrozenReadAccess<A>>,
+}
+
+impl<A> FinalPlanCompletionFailure<A> {
+    const fn new(error: FinalPlanCompletionError, taken: Vec<FrozenReadAccess<A>>) -> Self {
+        Self { error, taken }
+    }
+
+    pub const fn error(&self) -> &FinalPlanCompletionError {
+        &self.error
+    }
+
+    pub fn into_error(self) -> FinalPlanCompletionError {
+        self.error
+    }
+
+    /// The capabilities taken before the failure, for their owner to release.
+    pub fn into_taken(self) -> Vec<FrozenReadAccess<A>> {
+        self.taken
+    }
+
+    pub fn into_parts(self) -> (FinalPlanCompletionError, Vec<FrozenReadAccess<A>>) {
+        (self.error, self.taken)
+    }
+}
+
+/// Written without asking the capability to be printable: what a reader needs
+/// here is why completion stopped and how much is owed back.
+impl<A> fmt::Debug for FinalPlanCompletionFailure<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FinalPlanCompletionFailure")
+            .field("error", &self.error)
+            .field("capabilities_to_release", &self.taken.len())
+            .finish()
+    }
+}
+
+impl<A> fmt::Display for FinalPlanCompletionFailure<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl<A> std::error::Error for FinalPlanCompletionFailure<A> {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FinalPlanCompletionError {
-    Governance { message: Arc<str> },
-    Cancelled { reason: Arc<str> },
+    Governance {
+        message: Arc<str>,
+    },
+    Cancelled {
+        reason: Arc<str>,
+    },
     DeadlineExceeded,
-    Compiler { message: Arc<str> },
-    FactSource { message: Arc<str> },
-    InvalidPlan { message: Arc<str> },
+    Compiler {
+        message: Arc<str>,
+    },
+    FactSource {
+        message: Arc<str>,
+    },
+    InvalidPlan {
+        message: Arc<str>,
+    },
+    /// The plan and the capabilities do not account for each other, so neither
+    /// is publishable.
+    AccessCoverage {
+        message: Arc<str>,
+    },
 }
 
 impl fmt::Display for FinalPlanCompletionError {
@@ -185,7 +307,8 @@ impl fmt::Display for FinalPlanCompletionError {
             Self::Governance { message }
             | Self::Compiler { message }
             | Self::FactSource { message }
-            | Self::InvalidPlan { message } => formatter.write_str(message),
+            | Self::InvalidPlan { message }
+            | Self::AccessCoverage { message } => formatter.write_str(message),
             Self::Cancelled { reason } => {
                 write!(formatter, "final plan completion cancelled: {reason}")
             }
@@ -197,6 +320,12 @@ impl fmt::Display for FinalPlanCompletionError {
 }
 
 impl std::error::Error for FinalPlanCompletionError {}
+
+fn access_error(error: FinalPlanAccessError) -> FinalPlanCompletionError {
+    FinalPlanCompletionError::AccessCoverage {
+        message: Arc::from(error.to_string()),
+    }
+}
 
 fn governance_error(error: novarocks_workload_control::WorkError) -> FinalPlanCompletionError {
     FinalPlanCompletionError::Governance {
@@ -255,7 +384,13 @@ mod tests {
 
     #[async_trait]
     impl SqlCompletionFactSource for NoFactSource {
-        async fn resolve(&self, _needs: &SqlNeedBatch) -> Result<SqlFactBatch, String> {
+        type Access = ();
+
+        async fn resolve(
+            &self,
+            _needs: &SqlNeedBatch,
+            _taken: &ReadAccessSink<()>,
+        ) -> Result<SqlFactBatch, String> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err("VALUES completion must not request facts".to_string())
         }
@@ -326,10 +461,14 @@ mod tests {
         let driver = FinalPlanCompletionDriver::new(source.clone());
         let (_root, scope) = scope();
 
-        let candidate = driver
+        let completed = driver
             .complete(values_request(), &scope)
             .await
             .expect("VALUES final plan completion");
+        // A statement that scans no provider publishes an empty sidecar, not
+        // an absent one.
+        assert!(completed.access().is_empty());
+        let candidate = completed.candidate();
 
         assert_eq!(
             candidate.plan().version(),
@@ -362,6 +501,7 @@ mod tests {
             )
             .await
             .expect("VALUES explain final plan completion");
+        let candidate = candidate.candidate();
 
         assert_eq!(
             candidate.display_intent(),
@@ -377,7 +517,13 @@ mod tests {
 
     #[async_trait]
     impl SqlCompletionFactSource for PendingFactSource {
-        async fn resolve(&self, _needs: &SqlNeedBatch) -> Result<SqlFactBatch, String> {
+        type Access = ();
+
+        async fn resolve(
+            &self,
+            _needs: &SqlNeedBatch,
+            _taken: &ReadAccessSink<()>,
+        ) -> Result<SqlFactBatch, String> {
             std::future::pending().await
         }
     }
@@ -400,7 +546,10 @@ mod tests {
             .await
             .expect_err("deadline must interrupt a pending fact round");
 
-        assert_eq!(error, FinalPlanCompletionError::DeadlineExceeded);
+        assert_eq!(error.error(), &FinalPlanCompletionError::DeadlineExceeded);
+        // The round was interrupted before any read was frozen, so there is
+        // nothing owed back.
+        assert!(error.into_taken().is_empty());
     }
 
     struct NeverCancelled;

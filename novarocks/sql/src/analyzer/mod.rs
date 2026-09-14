@@ -31,7 +31,10 @@ mod load_op_column;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
-pub use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
+/// The analyzer owns this bound and enforces it; it is named outside the
+/// analyzer only where a test has to build a chain that crosses it.
+#[cfg(test)]
+pub(crate) use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
 mod resolve_from;
 mod scope;
 mod subquery_rewrite;
