@@ -66,6 +66,7 @@ h2 = "0.4"
 hex = "0.4"
 hmac = "0.12"
 http = "1"
+hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = "0.1"
 libc = "0.2"
 md-5 = "0.10"

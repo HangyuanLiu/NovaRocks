@@ -25,7 +25,7 @@ arrow-buffer.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 bytes.workspace = true
-hyper = { version = "1", features = ["http2", "server"] }
+hyper.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 prost.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "sync"] }
