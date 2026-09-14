@@ -169,6 +169,7 @@ pub struct IcebergMvCorePorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    typed_connector_control: Option<Arc<novarocks_catalog_application::ConnectorControlHost>>,
     repository: Arc<dyn MvRepository>,
     readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -196,6 +197,7 @@ impl IcebergMvCorePorts {
             catalog_service,
             catalog_application,
             connector_control,
+            typed_connector_control: None,
             repository,
             readiness,
             storage_observation,
@@ -209,6 +211,7 @@ impl IcebergMvCorePorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         repository: Arc<dyn MvRepository>,
         readiness: Arc<MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -219,6 +222,7 @@ impl IcebergMvCorePorts {
             catalog_service,
             catalog_application,
             connector_control,
+            typed_connector_control: Some(typed_connector_control),
             repository,
             readiness,
             storage_observation,
@@ -231,6 +235,15 @@ impl IcebergMvCorePorts {
     ) -> Result<&Arc<novarocks_mv_application::management::ManagementEntrance>, String> {
         self.management_entrance.as_ref().ok_or_else(|| {
             "document-managed MV CREATE requires the composed FE management entrance".to_string()
+        })
+    }
+
+    pub(crate) fn typed_connector_control(
+        &self,
+    ) -> Result<&Arc<novarocks_catalog_application::ConnectorControlHost>, String> {
+        self.typed_connector_control.as_ref().ok_or_else(|| {
+            "document-managed MV CREATE requires the composed typed connector control host"
+                .to_string()
         })
     }
 

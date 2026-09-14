@@ -547,6 +547,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
+            Arc::clone(&products.typed_connector_control),
             Arc::clone(&mv_repository),
             mv_application,
             mv_service,
