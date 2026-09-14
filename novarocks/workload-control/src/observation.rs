@@ -148,6 +148,14 @@ pub struct WorkloadSnapshot {
     pub unknown_creates: usize,
     pub control_ready: usize,
     pub control_inflight: usize,
+    /// Fixed process-local resource ceiling resolved by Server at startup.
+    pub resource_limit_bytes: u64,
+    /// Current charge held by the single process-local resource authority.
+    pub held_bytes: u64,
+    /// Exact high-water mark recorded by that authority.
+    pub peak_held_bytes: u64,
+    /// Current subset of `held_bytes` retained by result delivery credits.
+    pub result_credit_held_bytes: u64,
     pub root_lifecycle: RootLifecycleSnapshot,
     pub scopes: Vec<ScopeSnapshot>,
 }
@@ -212,6 +220,14 @@ fn snapshot(inner: &crate::scope::Inner) -> WorkloadSnapshot {
         unknown_creates: state.unknown_creates,
         control_ready: state.control_ready.len(),
         control_inflight: state.control_inflight,
+        resource_limit_bytes: inner.resource_config.total_bytes,
+        held_bytes: state
+            .data_reserved
+            .saturating_add(state.data_used)
+            .saturating_add(state.control_reserved)
+            .saturating_add(state.control_used),
+        peak_held_bytes: state.peak_held_bytes,
+        result_credit_held_bytes: state.result_credit.held_bytes(),
         root_lifecycle: state.root_lifecycle.clone(),
         scopes: state
             .nodes
@@ -468,6 +484,9 @@ impl ControlIntents {
     }
     pub(crate) fn insert(&mut self, intent: ControlIntent) {
         self.0 |= Self::bit(intent);
+    }
+    pub(crate) fn remove(&mut self, intent: ControlIntent) {
+        self.0 &= !Self::bit(intent);
     }
     fn merge(&mut self, other: Self) {
         self.0 |= other.0;

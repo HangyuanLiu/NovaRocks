@@ -987,15 +987,51 @@ impl WorkOwner {
         Ok(self)
     }
 
-    pub fn complete(mut self) {
+    pub fn complete(self) {
+        self.complete_with_terminal_cancel_settled(false);
+    }
+
+    /// Records responsibility completion after the matching cancellation
+    /// delivery has reached its terminal boundary.
+    ///
+    /// This is narrower than [`Self::complete`]: ordinary completion retains
+    /// a pending cancellation notification until its dispatcher settles it.
+    /// A logical-execution owner may use this only after it has observed the
+    /// real attempt/output/resource terminal condition that makes a pending
+    /// Cancel notification obsolete.
+    pub fn complete_after_terminal_cancel_settled(self) {
+        self.complete_with_terminal_cancel_settled(true);
+    }
+
+    fn complete_with_terminal_cancel_settled(mut self, terminal_cancel_settled: bool) {
         let scope = self.scope.take().unwrap();
         scope.inner.update(|state| {
-            let (is_root, class) = {
+            let (is_root, class, remove_ready_control, remove_waiting_control) = {
                 let node = state.nodes.get_mut(&scope.id).unwrap();
                 node.completed = true;
                 node.owner = OwnerState::Completed;
-                (node.parent.is_none(), node.class)
+                if terminal_cancel_settled {
+                    node.control_pending.remove(crate::ControlIntent::Cancel);
+                }
+                let remove_waiting_control =
+                    terminal_cancel_settled && node.control_pending.is_empty();
+                let remove_ready_control = remove_waiting_control && node.control_queued;
+                if remove_ready_control {
+                    node.control_queued = false;
+                }
+                (
+                    node.parent.is_none(),
+                    node.class,
+                    remove_ready_control,
+                    remove_waiting_control,
+                )
             };
+            if remove_waiting_control {
+                state.control_waiting.remove(&scope.id);
+            }
+            if remove_ready_control {
+                state.control_ready.retain(|id| *id != scope.id);
+            }
             if is_root && state.closed {
                 state
                     .root_lifecycle

@@ -2236,7 +2236,7 @@ async fn run_actor(
             && actor_cleanup_complete(state, &attempts, replacement.as_ref())
             && result_runtime.as_ref().is_none_or(ResultRuntime::idle)
         {
-            work_owner.complete();
+            work_owner.complete_after_terminal_cancel_settled();
             return;
         }
         let abort_retry_at = next_abort_retry_at(&attempts);
