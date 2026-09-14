@@ -31,6 +31,7 @@ mod load_op_column;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+pub use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
 mod resolve_from;
 mod scope;
 mod subquery_rewrite;

@@ -3799,6 +3799,40 @@ mod tests {
         ]
     }
 
+    /// A chain wide enough to exhaust the stack is refused, not aborted on.
+    ///
+    /// The engine cannot report a stack overflow: it aborts the process rather
+    /// than unwinding. So the width that would get there has to be an error a
+    /// client can see, raised before the walks that would consume the stack.
+    #[test]
+    fn an_unboundedly_wide_boolean_chain_is_refused_rather_than_aborted_on() {
+        // On a thread with room, because parsing a chain this wide is itself
+        // depth-linear and would abort before analysis got to refuse it. That
+        // earlier exposure is real and separate; this test is about the refusal.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(check_wide_boolean_chain_is_refused)
+            .expect("spawn")
+            .join()
+            .expect("refusal thread");
+    }
+
+    fn check_wide_boolean_chain_is_refused() {
+        let conjuncts = (0..crate::analyzer::MAX_BOOLEAN_CHAIN_OPERANDS + 1)
+            .map(|i| format!("c0 <> {i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conjuncts}");
+        let error = match request(&sql, SqlCompileIntent::Query, 7).try_into_completion() {
+            Ok(_) => panic!("a chain this wide must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains("exceeds the supported maximum"),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn generated_sql_shapes_are_not_refused_by_a_structural_bound() {
         // Compiling a wide predicate still recurses once per conjunct through

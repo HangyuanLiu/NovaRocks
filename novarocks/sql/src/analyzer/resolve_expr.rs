@@ -59,6 +59,21 @@ fn interval_field_name(field: ast::IntervalField) -> &'static str {
     }
 }
 
+/// How many conditions one `AND`/`OR` chain may state.
+///
+/// Analysis no longer recurses per condition, but the rewrites and optimizer
+/// passes that walk the resulting tree still do, so stack use remains
+/// proportional to chain width. Exhausting the stack aborts the process
+/// instead of unwinding, which is not a failure the engine can report - so the
+/// width is bounded here, where exceeding it is an error a client can see.
+///
+/// The number comes from measurement rather than taste: a release build on a
+/// 2 MiB stack compiles 512 conditions and aborts before 1024, and the process
+/// gives its runtime threads 16 MiB, which puts the abort near 4096. This
+/// leaves a factor of two, and is four times the widest shape in the generated
+/// SQL corpus. Removing the bound means making the tree walks iterative too.
+pub const MAX_BOOLEAN_CHAIN_OPERANDS: usize = 2_048;
+
 fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
         kind: ast::LiteralKind::String(value),
@@ -1086,6 +1101,71 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 
     /// Analyze a binary operation.
+    /// Analyze a same-operator `AND`/`OR` chain without recursing once per
+    /// conjunct.
+    ///
+    /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for why the width is still bounded.
+    ///
+    /// How many conditions a query states is not how deeply nested it is. A
+    /// filter panel emitting several hundred of them arrives as one long chain,
+    /// and analyzing it by recursing into the left operand made stack depth a
+    /// function of user input - which is not an error the engine can report,
+    /// because exhausting the stack aborts the process rather than unwinding.
+    ///
+    /// Operands are collected iteratively and analyzed one at a time, each only
+    /// as deep as it actually is. They are folded back left-deep, so the tree
+    /// and its evaluation order are exactly what recursion produced.
+    fn analyze_boolean_chain(
+        &self,
+        left: &ast::Expr,
+        op: &ast::BinaryOperator,
+        right: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut operands: Vec<&ast::Expr> = Vec::new();
+        let mut pending: Vec<&ast::Expr> = vec![right, left];
+        while let Some(current) = pending.pop() {
+            match current {
+                ast::Expr::Binary(binary) if &binary.operator == op => {
+                    pending.push(&binary.right);
+                    pending.push(&binary.left);
+                }
+                other => operands.push(other),
+            }
+        }
+        if operands.len() > MAX_BOOLEAN_CHAIN_OPERANDS {
+            return Err(AnalyzeError::unsupported_expression(
+                format!(
+                    "boolean chain of {} conditions exceeds the supported maximum of {MAX_BOOLEAN_CHAIN_OPERANDS}",
+                    operands.len()
+                ),
+                left.span(),
+            ));
+        }
+        let mut analyzed = Vec::with_capacity(operands.len());
+        for operand in operands {
+            analyzed.push(self.analyze_expr(operand, scope)?);
+        }
+        let bin_op = match op {
+            ast::BinaryOperator::And => BinOp::And,
+            _ => BinOp::Or,
+        };
+        let mut folded = analyzed.remove(0);
+        for next in analyzed {
+            let nullable = folded.nullable || next.nullable;
+            folded = TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(folded),
+                    op: bin_op,
+                    right: Box::new(next),
+                },
+                data_type: DataType::Boolean,
+                nullable,
+            };
+        }
+        Ok(folded)
+    }
+
     fn analyze_binary_op(
         &self,
         left: &ast::Expr,
@@ -1093,6 +1173,9 @@ impl<'a> super::AnalyzerContext<'a> {
         right: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
+            return self.analyze_boolean_chain(left, op, right, scope);
+        }
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
