@@ -33,6 +33,11 @@ use tokio::runtime::Handle;
 #[derive(Clone)]
 pub struct FrontendRoleConfig {
     pub application: FrontendApplicationOpenConfig,
+    /// The one memory capacity authority this OS process was given.
+    ///
+    /// Under `all-in-one` this is the very same handle the backend role holds:
+    /// two roles in one address space share one bound.
+    pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     pub management: FrontendManagementConfig,
     pub serving: FrontendServingConfig,
     pub mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,

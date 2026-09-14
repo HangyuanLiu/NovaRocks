@@ -23,6 +23,7 @@ use novarocks_execution::exec::expr::agg::{
     ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
     contribute_builtin_aggregate_implementations,
 };
+use novarocks_memory::MemoryAuthority;
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::{
     composition, launch, logging, memory_observation, native_compatibility,
@@ -127,6 +128,7 @@ fn run_frontend(
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: Arc<ServerProviderManifest>,
+    memory_authority: Arc<MemoryAuthority>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     let frontend = composition::compose_frontend_role_config(
@@ -136,6 +138,7 @@ fn run_frontend(
         native_compatibility_id,
         function_catalog,
         provider_manifest,
+        memory_authority,
         runtime.handle().clone(),
     )?;
     runtime
@@ -152,6 +155,7 @@ fn run_backend(
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: Arc<ServerProviderManifest>,
+    memory_authority: Arc<MemoryAuthority>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
@@ -161,6 +165,7 @@ fn run_backend(
         native_compatibility_id,
         function_set,
         provider_manifest,
+        memory_authority,
         runtime.handle().clone(),
     )?;
     let data_runtime = novarocks_native_adapter::BackendDataRuntime::new(
@@ -191,6 +196,7 @@ async fn run_all_in_one(
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: Arc<ServerProviderManifest>,
+    memory_authority: Arc<MemoryAuthority>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
@@ -201,6 +207,8 @@ async fn run_all_in_one(
         native_compatibility_id,
         std::sync::Arc::clone(function_set.catalog()),
         Arc::clone(&provider_manifest),
+        // Both roles consume the same authority: one OS process, one bound.
+        Arc::clone(&memory_authority),
         runtime.clone(),
     )?;
     let backend = composition::compose_backend_server_config(
@@ -209,6 +217,7 @@ async fn run_all_in_one(
         native_compatibility_id,
         function_set,
         provider_manifest,
+        memory_authority,
         runtime.clone(),
     )?;
     let backend_runtime = novarocks_native_adapter::BackendDataRuntime::new(
@@ -267,6 +276,39 @@ fn initialize_backend_file_caches(config: &NovaRocksConfig) {
     });
 }
 
+/// Builds the one memory authority this OS process gets.
+///
+/// A capacity bound is a property of the process, not of a role, so this is
+/// deliberately called once in `run()` and the resulting handle is shared.
+/// Under `all-in-one` both role runners consume *this* authority: two
+/// authorities over one address space would each believe they owned the whole
+/// bound, and sampling the same RSS twice would not make that safe. There is
+/// no `all-in-one` branch here for the same reason -- the single-process form
+/// is a test convenience, not a topology to model for.
+///
+/// `all-in-one` reads its bound from the FE config, matching how the process
+/// already resolves its tokio runtime and log filter from that same config.
+fn compose_memory_authority(config: &NovaRocksConfig) -> anyhow::Result<Arc<MemoryAuthority>> {
+    let authority_config = config.runtime.effective_authority_config()?;
+    let authority = MemoryAuthority::new(authority_config)
+        .map_err(|error| anyhow::anyhow!("compose process memory authority: {error}"))?;
+    // Control-plane traffic gets its own branch off the root before any work
+    // account exists, so a process that later fills its work capacity still
+    // has somewhere to allocate a cancellation or a status.
+    let control_bytes = config.runtime.frontend_workload.control_bytes;
+    authority
+        .install_control_branch(control_bytes)
+        .map_err(|error| anyhow::anyhow!("install process control branch: {error}"))?;
+    tracing::info!(
+        process_bound_bytes = authority.process_bound_bytes(),
+        capacity_bytes = authority.capacity_bytes(),
+        headroom_budget_bytes = authority.headroom_budget_bytes(),
+        control_bytes,
+        "installed the process memory authority"
+    );
+    Ok(Arc::new(authority))
+}
+
 fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
     let resolved = launch::resolve_server_launch(args)?;
     let process_config = match &resolved {
@@ -276,6 +318,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
     let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
+    let memory_authority = compose_memory_authority(process_config)?;
     let runtime = init_process(process_config)?;
     let function_set = compose_process_function_set()?;
     let functions = std::sync::Arc::clone(function_set.catalog());
@@ -297,6 +340,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
             native_compatibility.id(),
             functions,
             provider_manifest,
+            memory_authority,
             &runtime,
         ),
         launch::ResolvedServerLaunch::Be(role) => run_backend(
@@ -304,6 +348,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
             native_compatibility.id(),
             function_set,
             provider_manifest,
+            memory_authority,
             &runtime,
         ),
         launch::ResolvedServerLaunch::AllInOne { fe, be } => runtime.block_on(run_all_in_one(
@@ -312,6 +357,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
             native_compatibility.id(),
             function_set,
             provider_manifest,
+            memory_authority,
             runtime.handle().clone(),
         )),
     }

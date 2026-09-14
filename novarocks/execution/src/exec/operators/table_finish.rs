@@ -1928,6 +1928,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 function_set,
+                crate::runtime::execution_runtime::test_memory_authority(),
             )
             .expect("composite test runtime"),
         );

@@ -18,6 +18,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use novarocks_memory::MemoryAuthority;
+
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::IntoResponse;
@@ -41,6 +43,7 @@ struct FrontendManagementState {
     registry: Arc<FrontendMetricsRegistry>,
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
+    memory_authority: Arc<MemoryAuthority>,
 }
 
 /// Versioned management document composed from independent read-only owners.
@@ -89,18 +92,69 @@ impl FrontendManagementSnapshot {
 
 /// Builds the complete Frontend management HTTP surface. Native report gRPC
 /// must not compose any management routes.
-pub(crate) fn frontend_management_router(
-    registry: Arc<FrontendMetricsRegistry>,
-    convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
-    island_reader: Arc<dyn BackendIslandSnapshotReader>,
-) -> Router {
-    frontend_management_router_with_readers(
-        registry,
-        Arc::new(FrontendServingLifecycle::new()),
-        island_reader,
-        Some(convergence_reader),
-        crate::native::report_server::lifecycle_convergence_debug_enabled(),
-    )
+/// The process memory authority's own facts, rendered for a reader.
+///
+/// The memory core carries no dependencies at all, so it cannot derive
+/// `Serialize`; this projection is where its numbers meet a wire format, and
+/// keeping it here is what lets the core stay neutral.
+///
+/// The two tiers are reported side by side and **must not be added together**:
+/// `capacity_bytes` is what this authority governs hard, `headroom_budget_bytes`
+/// is what the deployment set aside for allocations it does not cover. A gap
+/// between the two and the process bound is a coverage fact, not a leak.
+#[derive(serde::Serialize)]
+struct MemoryAuthorityManagementSnapshot {
+    schema_version: u8,
+    /// `P`: what the whole process may use.
+    process_bound_bytes: u64,
+    /// `B`: the part governed hard.
+    capacity_bytes: u64,
+    /// `H`: the part set aside for declared blind spots.
+    headroom_budget_bytes: u64,
+    /// `C` at the root, as the root itself maintains it.
+    committed_bytes: u64,
+    /// `L`: allocation an owner proved and that is still alive.
+    live_bytes: u64,
+    /// `F`: issued rights not yet fulfilled.
+    granted_bytes: u64,
+    /// `O`: authorised third-party upper bound, not measured usage.
+    bounded_bytes: u64,
+    /// What `B` can still issue.
+    capacity_remaining_bytes: u64,
+    /// Whether `C <= B` held in this reading.
+    honours_capacity_bound: bool,
+    live_accounts: u32,
+    /// Whether a separate control partition is installed in this process.
+    control_branch_installed: bool,
+}
+
+impl MemoryAuthorityManagementSnapshot {
+    fn of(authority: &MemoryAuthority) -> Self {
+        let snapshot = authority.snapshot();
+        Self {
+            schema_version: 1,
+            process_bound_bytes: snapshot.process_bound_bytes,
+            capacity_bytes: snapshot.capacity_bytes,
+            headroom_budget_bytes: snapshot.headroom_budget_bytes,
+            committed_bytes: snapshot.root.committed_bytes,
+            live_bytes: snapshot.root.live_bytes,
+            granted_bytes: snapshot.root.granted_bytes,
+            bounded_bytes: snapshot.root.bounded_bytes,
+            capacity_remaining_bytes: snapshot.capacity_remaining_bytes(),
+            honours_capacity_bound: snapshot.honours_capacity_bound(),
+            live_accounts: snapshot.live_accounts,
+            control_branch_installed: authority.control_branch().is_some(),
+        }
+    }
+}
+
+async fn memory_authority_snapshot(
+    State(state): State<FrontendManagementState>,
+) -> axum::response::Response {
+    axum::Json(MemoryAuthorityManagementSnapshot::of(
+        &state.memory_authority,
+    ))
+    .into_response()
 }
 
 /// Builds the management surface from late-bindable, read-only capabilities.
@@ -110,19 +164,22 @@ pub(crate) fn frontend_management_router_with_readers(
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
+    memory_authority: Arc<MemoryAuthority>,
     debug_enabled: bool,
 ) -> Router {
     let state = FrontendManagementState {
         registry,
         serving_reader,
         island_reader,
+        memory_authority,
     };
     let router = Router::new()
         .route("/metrics", get(handle_management_metrics))
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/island-readyz", get(island_readyz))
-        .route("/v1/frontend/state", get(frontend_state));
+        .route("/v1/frontend/state", get(frontend_state))
+        .route("/v1/memory/authority", get(memory_authority_snapshot));
     let router = if debug_enabled && convergence_reader.is_some() {
         let convergence_reader = convergence_reader.expect("checked above");
         router.route(
@@ -273,7 +330,9 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
-    use super::{FrontendMetricsRegistry, frontend_management_router_with_readers};
+    use super::{
+        FrontendMetricsRegistry, MemoryAuthority, frontend_management_router_with_readers,
+    };
     use crate::query_execution::lifecycle_diagnostics::{
         QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
     };
@@ -328,6 +387,22 @@ mod tests {
         )
     }
 
+    /// A small but real authority, so the management surface is exercised
+    /// against the same type production installs rather than a stub.
+    fn test_memory_authority() -> Arc<MemoryAuthority> {
+        const BOUND: u64 = 64 * 1024 * 1024;
+        let authority = MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
+            BOUND,
+            BOUND - BOUND / 4,
+            BOUND / 4,
+        ))
+        .expect("the test partition must be valid");
+        authority
+            .install_control_branch(1024 * 1024)
+            .expect("the control branch must install");
+        Arc::new(authority)
+    }
+
     fn router(
         debug_enabled: bool,
         lifecycle: Arc<FrontendServingLifecycle>,
@@ -338,8 +413,51 @@ mod tests {
             lifecycle,
             island,
             Some(Arc::new(EmptyConvergenceReader)),
+            test_memory_authority(),
             debug_enabled,
         )
+    }
+
+    #[tokio::test]
+    async fn the_management_surface_reports_both_memory_tiers_without_adding_them() {
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
+        let island = Arc::new(TestIslandReader::new(island_snapshot(0, 0, 0, 0)));
+        let response = router(false, lifecycle, island)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/memory/authority")
+                    .body(axum::body::Body::empty())
+                    .expect("build the authority snapshot request"),
+            )
+            .await
+            .expect("the authority snapshot route must answer");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the authority snapshot body");
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).expect("the snapshot must be JSON");
+
+        const BOUND: u64 = 64 * 1024 * 1024;
+        assert_eq!(document["process_bound_bytes"], BOUND);
+        assert_eq!(document["capacity_bytes"], BOUND - BOUND / 4);
+        assert_eq!(document["headroom_budget_bytes"], BOUND / 4);
+        // The two tiers are reported separately and are never summed for the
+        // reader: B + H is the partition of P, not a total of anything used.
+        assert_eq!(
+            document["capacity_bytes"].as_u64().unwrap()
+                + document["headroom_budget_bytes"].as_u64().unwrap(),
+            BOUND
+        );
+        assert_eq!(document["honours_capacity_bound"], true);
+        assert_eq!(document["control_branch_installed"], true);
+        for decomposed in ["live_bytes", "granted_bytes", "bounded_bytes"] {
+            assert!(
+                document[decomposed].is_u64(),
+                "the snapshot must report {decomposed} so L/F/O can be read apart"
+            );
+        }
     }
 
     #[tokio::test]

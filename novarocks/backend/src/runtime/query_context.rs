@@ -195,7 +195,10 @@ impl QueryContext {
     ) -> Self {
         let now = Instant::now();
         let process = mem_tracker::process_mem_tracker();
-        let query_label = format!("query_{:x}_{:x}", query_id.high(), query_id.low());
+        // Same parent and same label as every other query-tracker owner: the
+        // label is minted once in the execution crate so the two construction
+        // paths cannot drift apart.
+        let query_label = mem_tracker::query_tracker_label(query_id.high(), query_id.low());
         let mem_tracker = MemTracker::new_child(query_label, &process);
         Self {
             query_id,
@@ -1543,4 +1546,122 @@ mod incremental_scan_domain_tests {
 }
 
 #[cfg(test)]
-mod tests {}
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use novarocks_execution::exec::expr::agg::{
+        ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+    };
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
+    };
+    use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
+    use novarocks_execution::runtime::runtime_state::RuntimeState;
+    use novarocks_types::UniqueId;
+
+    use super::{QueryContext, QueryId};
+
+    fn execution_runtime() -> Arc<ExecutionRuntime> {
+        let config = ExecutionRuntimeConfig {
+            driver_threads: 1,
+            scan_threads: 1,
+            scan_queue_capacity: 1,
+            spill_io_threads: 1,
+            spill_io_queue_capacity: 1,
+            spill_storage: ExecutionSpillStorageConfig::default(),
+            exchange_wait_ms: 1,
+            exchange_io_threads: 1,
+            exchange_io_max_inflight_bytes: 1,
+            exchange_max_transmit_batched_bytes: 1,
+            operator_buffer_chunks: 1,
+            local_exchange_buffer_mem_limit_per_driver: 1,
+            local_exchange_max_buffered_rows: -1,
+            connector_io_tasks_per_scan_operator: 1,
+            scan_submit_fail_max: 1,
+            scan_submit_fail_timeout_ms: 1,
+            runtime_filter_scan_wait_time_ms_override: None,
+            runtime_filter_wait_timeout_ms_override: None,
+            sink_io_worker_threads: 1,
+            sink_io_max_blocking_threads: 1,
+        };
+        let mut builder = ExecutionFunctionSetBuilder::new();
+        novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+            .expect("builtin function metadata");
+        novarocks_execution::exec::expr::agg::contribute_builtin_aggregate_implementations(
+            &mut builder,
+        )
+        .expect("builtin aggregate implementations");
+        let function_set: Arc<SealedExecutionFunctionSet> =
+            Arc::new(builder.seal().expect("builtin execution function set"));
+        Arc::new(
+            ExecutionRuntime::new(
+                config,
+                function_set,
+                crate::application::test_memory_authority(),
+            )
+            .expect("execution runtime"),
+        )
+    }
+
+    fn process_root_children_labelled(label: &str) -> Vec<Arc<MemTracker>> {
+        mem_tracker::process_mem_tracker()
+            .children()
+            .into_iter()
+            .filter(|child| child.label() == label)
+            .collect()
+    }
+
+    /// One query has exactly one parent and one name, whichever owner mints its
+    /// tracker. Before this held, the Backend query-context path hung off the
+    /// process root while the Execution RuntimeState path hung off a separate
+    /// `"execution"` root, so the same query produced two subtrees whose
+    /// charges never met.
+    #[test]
+    fn both_query_tracker_paths_agree_on_one_parent_and_one_label() {
+        let query_id = QueryId::new(0x6d65_6d31, 0x6d65_6d32);
+        let label = mem_tracker::query_tracker_label(query_id.high(), query_id.low());
+        assert!(
+            process_root_children_labelled(&label).is_empty(),
+            "the test query id must be unique to this test"
+        );
+
+        // Path 1: the Backend query-context owner.
+        let context = QueryContext::new(query_id, Duration::from_secs(5), Duration::from_secs(5));
+        let from_context = context.mem_tracker();
+        assert_eq!(from_context.label(), label);
+        let after_context = process_root_children_labelled(&label);
+        assert_eq!(after_context.len(), 1);
+        assert!(
+            Arc::ptr_eq(&after_context[0], &from_context),
+            "the query-context tracker must be a direct child of the process root"
+        );
+
+        // Path 2: the Execution RuntimeState synthesis, which production only
+        // reaches when no fragment tracker was supplied.
+        let _state = RuntimeState::new(
+            None,
+            None,
+            Some(query_id),
+            Some(UniqueId::new(0x6d65_6d33, 0x6d65_6d34)),
+            None,
+            None,
+            None,
+            None,
+            Some(execution_runtime()),
+            None,
+        );
+        let after_state = process_root_children_labelled(&label);
+        assert_eq!(
+            after_state.len(),
+            2,
+            "the RuntimeState path must mint its query tracker under the same process root, under the same label"
+        );
+        assert!(
+            after_state
+                .iter()
+                .any(|child| Arc::ptr_eq(child, &from_context)),
+            "the query-context tracker must still be the process root's child"
+        );
+    }
+}

@@ -39,11 +39,12 @@
 //! against it. The difference between the two is a diagnostic, never an
 //! attribution to a query.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::account::{AccountHandle, AccountTreeShared, TopUpPolicy};
 use crate::error::{CapacityError, ConfigError, MetadataRegistryLabel};
-use crate::ids::{ConfigVersion, ExternalRef};
+use crate::ids::{AccountKind, ConfigVersion, ExternalRef};
+use crate::policy::LimitDimension;
 use crate::snapshot::{AuthoritySnapshot, EventRing};
 
 /// How one process's memory authority is sized.
@@ -135,6 +136,7 @@ pub struct MemoryAuthority {
     config_version: ConfigVersion,
     root: AccountHandle,
     shared: Arc<AccountTreeShared>,
+    control: OnceLock<AccountHandle>,
 }
 
 impl MemoryAuthority {
@@ -160,6 +162,7 @@ impl MemoryAuthority {
             config_version: ConfigVersion::new(1),
             root,
             shared,
+            control: OnceLock::new(),
         })
     }
 
@@ -231,5 +234,52 @@ impl MemoryAuthority {
         external: ExternalRef,
     ) -> Result<AccountHandle, CapacityError> {
         self.root.create_child(kind, external)
+    }
+
+    /// Installs this process's control branch.
+    ///
+    /// Control-plane work — the traffic that carries a cancellation, a status
+    /// or a result header — must not be refused because ordinary query work
+    /// filled the process. Giving it a *separate branch* rather than a
+    /// reservation inside the work branch is what makes that true: the two
+    /// branches share only the root, so a work-side limit cannot reach it and
+    /// exhausting work capacity leaves this branch untouched.
+    ///
+    /// Three further properties follow from the core as it already stands,
+    /// which is why control needs no partition concept of its own:
+    ///
+    /// * *Exempt from cancellation checks*: nothing calls `close_to_growth`
+    ///   on this account, and a refusal only ever consults the account's own
+    ///   closed flag.
+    /// * *Outside per-scope limits*: a per-scope policy is installed on the
+    ///   work branch, and a strict tree gives one account exactly one parent
+    ///   chain — this branch is not on it.
+    /// * *Its own wait timeout*: waiting belongs to the arbitrator, so a
+    ///   timeout is a policy it applies per branch, not a mechanism here.
+    ///
+    /// Installing it twice is refused rather than silently ignored: a second
+    /// call means two owners each believe they sized the control partition.
+    pub fn install_control_branch(
+        &self,
+        limit_bytes: u64,
+    ) -> Result<&AccountHandle, CapacityError> {
+        let branch = self
+            .root
+            .create_child(AccountKind::Service, ExternalRef::NONE)?;
+        branch.install_policy(limit_bytes, LimitDimension::Service);
+        self.control
+            .set(branch)
+            .map_err(|_| CapacityError::Unsupported {
+                detail: "the process control branch is already installed",
+            })?;
+        Ok(self
+            .control
+            .get()
+            .expect("the control branch was just installed"))
+    }
+
+    /// Returns this process's control branch, if one was installed.
+    pub fn control_branch(&self) -> Option<&AccountHandle> {
+        self.control.get()
     }
 }

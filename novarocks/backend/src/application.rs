@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+use novarocks_memory::MemoryAuthority;
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
@@ -79,6 +80,12 @@ pub struct BackendServerConfig {
     pub native_compatibility_id: NativeCompatibilityId,
     /// Process-wide immutable engine function metadata and implementations.
     pub function_set: Arc<SealedExecutionFunctionSet>,
+    /// The one memory capacity authority this OS process was given.
+    ///
+    /// The backend receives a handle, never the right to install a second
+    /// authority: a capacity bound belongs to the process, and a role that
+    /// could mint its own would be governing a budget nobody else can see.
+    pub memory_authority: Arc<MemoryAuthority>,
     pub native_transport: BackendNativeTransport,
     /// Exact FE native ingress used exclusively for authenticated membership announce.
     pub frontend_endpoint: NativeEndpoint,
@@ -281,16 +288,39 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
     }
 }
 
+/// A real, small memory authority for backend tests.
+///
+/// Backend tests build the production types, so they build the production
+/// authority too: a stub here would let a wiring mistake reach the role.
+#[cfg(test)]
+pub(crate) fn test_memory_authority() -> Arc<MemoryAuthority> {
+    const BOUND: u64 = 64 * 1024 * 1024;
+    Arc::new(
+        MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
+            BOUND,
+            BOUND - BOUND / 4,
+            BOUND / 4,
+        ))
+        .expect("the test partition must be valid"),
+    )
+}
+
 struct BackendExecutionRuntimeInput {
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
+    memory_authority: Arc<MemoryAuthority>,
 }
 
 impl BackendExecutionRuntimeInput {
-    fn new(config: ExecutionRuntimeConfig, function_set: Arc<SealedExecutionFunctionSet>) -> Self {
+    fn new(
+        config: ExecutionRuntimeConfig,
+        function_set: Arc<SealedExecutionFunctionSet>,
+        memory_authority: Arc<MemoryAuthority>,
+    ) -> Self {
         Self {
             config,
             function_set,
+            memory_authority,
         }
     }
 }
@@ -308,11 +338,17 @@ fn compose_backend_application_services(
     let BackendExecutionRuntimeInput {
         config: execution_runtime_config,
         function_set,
+        memory_authority,
     } = execution;
     let execution_runtime = Arc::new(
-        ExecutionRuntime::new(execution_runtime_config, Arc::clone(&function_set)).map_err(
-            |error| BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error),
-        )?,
+        ExecutionRuntime::new(
+            execution_runtime_config,
+            Arc::clone(&function_set),
+            memory_authority,
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+        })?,
     );
     // One process identity, minted here. It is what the announce carries,
     // what a heartbeat is checked against, and what both execution owners
@@ -514,6 +550,7 @@ impl BackendApplicationHost {
             native_trust,
             native_compatibility_id,
             function_set,
+            memory_authority,
             native_transport,
             frontend_endpoint,
             announce_interval,
@@ -538,7 +575,11 @@ impl BackendApplicationHost {
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
-            BackendExecutionRuntimeInput::new(execution_runtime_config, function_set),
+            BackendExecutionRuntimeInput::new(
+                execution_runtime_config,
+                function_set,
+                memory_authority,
+            ),
             native_compatibility_id,
             native_transport.confidentiality(),
             write_commit_evidence_limits,
@@ -878,6 +919,7 @@ mod tests {
 
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         BackendServerConfig {
+            memory_authority: crate::application::test_memory_authority(),
             bind_host: "127.0.0.1".to_string(),
             grpc_port,
             metrics_http_port: unused_port(),
@@ -947,6 +989,7 @@ mod tests {
             BackendExecutionRuntimeInput::new(
                 execution_runtime_config(),
                 test_execution_function_set(),
+                crate::application::test_memory_authority(),
             ),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ConfidentialTransport::Plaintext,

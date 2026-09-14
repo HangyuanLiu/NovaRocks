@@ -21,7 +21,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use novarocks_execution::runtime::mem_tracker::MemTracker;
+use novarocks_execution::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use novarocks_execution::runtime_filter::{
     RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterRowEffect,
     RuntimeFilterSessionRef, scan_domain::RuntimeFilterScanUnitOutcome,
@@ -67,8 +67,36 @@ impl WorkerRuntimeFilterParticipant {
     ///
     /// The native adapter supplies neither session maps nor lifecycle state:
     /// those are derived once from the Worker-owned installation authority.
+    ///
+    /// The participant's memory tracker attaches to the process root, because
+    /// this seam holds no query tracker. It is never a root of its own: a
+    /// disconnected root hides every runtime-filter byte from the process
+    /// memory boundary. Use `from_install_under` when the query tracker is
+    /// available.
     pub fn from_install(
         install: BackendParticipantInstall,
+    ) -> Result<Self, RuntimeFilterContractError> {
+        // Fallback parent, deliberately the process root and never a new root.
+        //
+        // This seam is reached from the Native adapter's participant factory,
+        // which carries the sealed install and nothing else; the query tracker
+        // lives in the Backend query-context registry, two crates above, and
+        // the Worker crate cannot and must not reach back into it. Attaching
+        // to the process root keeps the charge inside the one process
+        // hierarchy - it loses per-query attribution, not the accounting.
+        // `from_install_under` is the attributed form for every owner that
+        // does hold the query tracker.
+        Self::from_install_under(install, &process_mem_tracker())
+    }
+
+    /// Builds the local state and attributes its memory to `memory_parent`.
+    ///
+    /// `memory_parent` is the caller's query tracker wherever one is held, so
+    /// runtime-filter memory counts against that query's limit instead of only
+    /// against the process total.
+    pub fn from_install_under(
+        install: BackendParticipantInstall,
+        memory_parent: &Arc<MemTracker>,
     ) -> Result<Self, RuntimeFilterContractError> {
         let participant = install.participant();
         let observation = RuntimeFilterObservationEmitter::from_install(&install, None);
@@ -107,12 +135,15 @@ impl WorkerRuntimeFilterParticipant {
             }
         }
         let query_id = participant.query_id();
-        let memory = MemTracker::new_root(format!(
-            "runtime_filter_participant_{:x}_{:x}_{}",
-            query_id.high(),
-            query_id.low(),
-            participant.deployment_epoch()
-        ));
+        let memory = MemTracker::new_child(
+            format!(
+                "runtime_filter_participant_{:x}_{:x}_{}",
+                query_id.high(),
+                query_id.low(),
+                participant.deployment_epoch()
+            ),
+            memory_parent,
+        );
         Ok(Self::new(
             install,
             observation,
@@ -318,5 +349,79 @@ impl WorkerRuntimeFilterParticipant {
             binding_id,
             fragment_instance_id,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_filter::domain::{BackendParticipantIdentity, BackendRoutingShard};
+
+    fn install_for(query_id: UniqueId, deployment_epoch: u64) -> BackendParticipantInstall {
+        let participant = BackendParticipantIdentity::new(query_id, deployment_epoch);
+        let routing = BackendRoutingShard::new(participant, 1, [])
+            .expect("empty routing is sufficient for memory-hierarchy tests");
+        BackendParticipantInstall::new(participant, 1, [], routing)
+            .expect("channel-less install is a valid sealed install")
+    }
+
+    fn expected_label(query_id: UniqueId, deployment_epoch: u64) -> String {
+        format!(
+            "runtime_filter_participant_{:x}_{:x}_{deployment_epoch}",
+            query_id.high(),
+            query_id.low()
+        )
+    }
+
+    #[test]
+    fn participant_memory_is_a_child_of_the_supplied_query_tracker() {
+        let query_id = UniqueId::new(0x7e57_0001, 0x7e57_0002);
+        let query = MemTracker::new_child(
+            novarocks_execution::runtime::mem_tracker::query_tracker_label(
+                query_id.high(),
+                query_id.low(),
+            ),
+            &process_mem_tracker(),
+        );
+
+        let participant =
+            WorkerRuntimeFilterParticipant::from_install_under(install_for(query_id, 23), &query)
+                .expect("install builds participant state");
+
+        let children = query.children();
+        assert_eq!(
+            children.len(),
+            1,
+            "the participant must own exactly one tracker under its query"
+        );
+        assert_eq!(children[0].label(), expected_label(query_id, 23));
+
+        // A root would keep this charge out of the query subtree entirely.
+        children[0].consume(64);
+        assert_eq!(query.current(), 64);
+        children[0].release(64);
+        assert_eq!(query.current(), 0);
+        drop(participant);
+    }
+
+    #[test]
+    fn participant_memory_falls_back_to_the_process_root_never_to_a_new_root() {
+        let query_id = UniqueId::new(0x7e57_0003, 0x7e57_0004);
+        let label = expected_label(query_id, 29);
+
+        let participant = WorkerRuntimeFilterParticipant::from_install(install_for(query_id, 29))
+            .expect("install builds participant state");
+
+        let matches: Vec<_> = process_mem_tracker()
+            .children()
+            .into_iter()
+            .filter(|child| child.label() == label)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "the fallback must attach to the process root, not mint a second root"
+        );
+        drop(participant);
     }
 }

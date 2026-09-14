@@ -101,6 +101,9 @@ pub struct FrontendManagementConfig {
     pub bind_host: String,
     pub http_port: u16,
     pub native_compatibility_id: novarocks_types::NativeCompatibilityId,
+    /// The one memory capacity authority this OS process was given, so the
+    /// management surface can report its facts without owning any of them.
+    pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
 }
 
 /// Inputs for serving one ready Frontend application through native and MySQL
@@ -721,6 +724,7 @@ pub fn start_frontend_management_server(
         management_reader,
         management_island_reader,
         Some(management_convergence_reader),
+        Arc::clone(&config.memory_authority),
     )
     .map_err(FrontendApplicationError::server)?;
     Ok(FrontendManagementServer {

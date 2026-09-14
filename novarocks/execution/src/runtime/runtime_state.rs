@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::runtime::cache::ExecutionCacheOptions;
 use crate::runtime::fragment::io::ScanRegistrationPort;
-use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker, query_tracker_label};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_options::QueryOptions;
 use crate::runtime::{ExecutionRuntime, execution_services::IoExecutor};
@@ -138,13 +138,19 @@ impl RuntimeState {
         scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
     ) -> Self {
         let mem_tracker = mem_tracker.or_else(|| {
-            let execution_runtime = execution_runtime.as_ref()?;
-            if query_id.is_none() && fragment_instance_id.is_none() {
+            // An execution runtime still gates host-owned query accounting, so
+            // a runtime-less RuntimeState stays untracked exactly as before.
+            // Only the parent moves: the query subtree hangs off the single
+            // process root, under the same label the Backend query-context
+            // owner mints, so one query cannot end up as two subtrees whose
+            // charges never meet.
+            if execution_runtime.is_none() || (query_id.is_none() && fragment_instance_id.is_none())
+            {
                 return None;
             }
-            let process = execution_runtime.mem_root();
+            let process = process_mem_tracker();
             let query_label = query_id
-                .map(|id| format!("query_{:x}_{:x}", id.high(), id.low()))
+                .map(|id| query_tracker_label(id.high(), id.low()))
                 .unwrap_or_else(|| "query_unknown".to_string());
             let query_tracker = MemTracker::new_child(query_label, &process);
             let fragment_label = fragment_instance_id
@@ -348,6 +354,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 crate::runtime::execution_runtime::test_execution_function_set(),
+                crate::runtime::execution_runtime::test_memory_authority(),
             )
             .expect("test runtime"),
         );
