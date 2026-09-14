@@ -713,7 +713,7 @@ impl ConnectorDocumentManagementObservation {
         }
     }
 
-    pub(crate) fn validate_sealed(&self) -> Result<(), ConnectorError> {
+    pub fn validate_sealed(&self) -> Result<(), ConnectorError> {
         if self.lease_witness != Some(self.request_digest) {
             return Err(invalid(
                 "management observation was not validated by its exact storage lease",
