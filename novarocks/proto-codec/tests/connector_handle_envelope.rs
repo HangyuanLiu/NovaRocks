@@ -322,12 +322,14 @@ impl ConnectorPrivateDecoder<u8> for StrictSplitDecoder {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<u8, novarocks_spi::connector::ConnectorCodecError> {
-        context.expected_header().validate_expected(
-            self.expected.provider_id(),
-            self.expected.catalog(),
-            self.expected.category(),
-            self.expected.codec_revision(),
-        )?;
+        context
+            .expected_header()
+            .validate_expected::<novarocks_spi::connector::ConnectorCodecError>(
+                self.expected.provider_id(),
+                self.expected.catalog(),
+                self.expected.category(),
+                self.expected.codec_revision(),
+            )?;
         self.payload_parses.fetch_add(1, Ordering::SeqCst);
         context.ledger().charge_raw(payload.len())?;
         if payload != [42] {

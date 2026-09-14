@@ -821,7 +821,7 @@ mod tests {
             },
         ]);
 
-        let program = decode_fragment_sink_program(&fragment, &Layout::default())
+        let program = decode_fragment_sink_program(&fragment, &SlotLayout::default())
             .expect("distinct occurrence slots must survive router decode");
         let novarocks_execution::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(split) =
             program
