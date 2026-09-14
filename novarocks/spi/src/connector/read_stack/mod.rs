@@ -31,6 +31,7 @@
 pub mod adapter;
 pub mod dynamic_filter;
 pub mod handle;
+pub mod negotiation;
 pub mod page_source;
 pub mod predicate;
 pub mod projection;

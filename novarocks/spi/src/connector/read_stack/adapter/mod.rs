@@ -519,7 +519,143 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
     }
 }
 
+impl<P: ProviderReadMetadata> ReadRuntimeAdapter<P> {
+    fn bridge_filter(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        constraint: &ConnectorReadConstraint,
+    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError> {
+        let table = self.table(table)?;
+        let constraint = self.typed_constraint(constraint)?;
+        self.provider
+            .apply_filter(session, table, &constraint)
+            .map(|result| {
+                result.map(|result| {
+                    let remaining_constraint = self.role_constraint(result.remaining_constraint());
+                    let remaining_expression = result.remaining_expression().cloned();
+                    let handle = result.into_handle();
+                    ConnectorReadFilterApplication::new(
+                        self.wrap_table(handle),
+                        remaining_constraint,
+                        remaining_expression,
+                    )
+                })
+            })
+    }
+
+    fn bridge_projection(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        assignments: &[Assignment<ConnectorReadColumnHandle>],
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        let table = self.table(table)?;
+        let assignments = self.typed_assignments(assignments)?;
+        self.provider
+            .apply_projection(session, table, &assignments)
+            .map(|value| value.map(|table| self.wrap_table(table)))
+    }
+
+    fn bridge_limit(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        limit: u64,
+    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError> {
+        let table = self.table(table)?;
+        self.provider
+            .apply_limit(session, table, limit)
+            .map(|result| {
+                result.map(|result| {
+                    let limit_guaranteed = result.limit_guaranteed();
+                    let handle = result.into_handle();
+                    ConnectorReadLimitApplication::new(self.wrap_table(handle), limit_guaranteed)
+                })
+            })
+    }
+}
+
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn negotiate(
+        &self,
+        session: &ConnectorSession,
+        negotiation: &crate::connector::read_stack::negotiation::ReadNegotiation,
+    ) -> Result<crate::connector::read_stack::negotiation::ReadNegotiated, ConnectorError> {
+        use crate::connector::read_stack::negotiation::{
+            ReadNegotiated, ReadPushdownDisposition, ReadPushdownOp, ReadPushdownOutcome,
+        };
+
+        // Operations apply in the order they were offered, each against the
+        // handle the previous one produced. A declined operation leaves the
+        // handle where it was, so the rest of the list still means what the
+        // caller intended.
+        let mut handle = negotiation.handle.clone();
+        let mut outcomes = Vec::with_capacity(negotiation.ops.len());
+        let mut changed = false;
+        for op in &negotiation.ops {
+            let outcome = match op {
+                ReadPushdownOp::Projection { assignments } => {
+                    match self.bridge_projection(session, &handle, assignments)? {
+                        Some(narrowed) => {
+                            handle = narrowed;
+                            changed = true;
+                            ReadPushdownOutcome::exact()
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+                ReadPushdownOp::Filter { constraint } => {
+                    match self.bridge_filter(session, &handle, constraint)? {
+                        Some(application) => {
+                            let remaining = application.remaining_constraint().clone();
+                            // A provider that hands back nothing to evaluate has
+                            // guaranteed the predicate; anything left over is a
+                            // pruning answer with the residual named.
+                            let exact = remaining.summary().is_all()
+                                && remaining.expression().is_constant_true();
+                            handle = application.into_handle();
+                            changed = true;
+                            ReadPushdownOutcome {
+                                disposition: if exact {
+                                    ReadPushdownDisposition::Exact
+                                } else {
+                                    ReadPushdownDisposition::PruningOnly
+                                },
+                                residual: Some(remaining),
+                            }
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+                ReadPushdownOp::Limit { rows } => {
+                    match self.bridge_limit(session, &handle, *rows)? {
+                        Some(application) => {
+                            let guaranteed = application.limit_guaranteed();
+                            handle = application.into_handle();
+                            changed = true;
+                            ReadPushdownOutcome {
+                                disposition: if guaranteed {
+                                    ReadPushdownDisposition::Exact
+                                } else {
+                                    ReadPushdownDisposition::PruningOnly
+                                },
+                                residual: None,
+                            }
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+            };
+            outcomes.push(outcome);
+        }
+        Ok(ReadNegotiated {
+            handle,
+            outcomes,
+            changed,
+        })
+    }
+
     fn binding(&self) -> &ConnectorReadBinding {
         &self.binding
     }
@@ -646,61 +782,6 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             facts.artifact_coverage().clone(),
             Arc::<[u8]>::from(facts.coverage_evidence()),
         )
-    }
-
-    fn apply_filter(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError> {
-        let table = self.table(table)?;
-        let constraint = self.typed_constraint(constraint)?;
-        self.provider
-            .apply_filter(session, table, &constraint)
-            .map(|result| {
-                result.map(|result| {
-                    let remaining_constraint = self.role_constraint(result.remaining_constraint());
-                    let remaining_expression = result.remaining_expression().cloned();
-                    let handle = result.into_handle();
-                    ConnectorReadFilterApplication::new(
-                        self.wrap_table(handle),
-                        remaining_constraint,
-                        remaining_expression,
-                    )
-                })
-            })
-    }
-
-    fn apply_projection(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        assignments: &[Assignment<ConnectorReadColumnHandle>],
-    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
-        let table = self.table(table)?;
-        let assignments = self.typed_assignments(assignments)?;
-        self.provider
-            .apply_projection(session, table, &assignments)
-            .map(|value| value.map(|table| self.wrap_table(table)))
-    }
-
-    fn apply_limit(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        limit: u64,
-    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError> {
-        let table = self.table(table)?;
-        self.provider
-            .apply_limit(session, table, limit)
-            .map(|result| {
-                result.map(|result| {
-                    let limit_guaranteed = result.limit_guaranteed();
-                    let handle = result.into_handle();
-                    ConnectorReadLimitApplication::new(self.wrap_table(handle), limit_guaranteed)
-                })
-            })
     }
 
     fn get_system_table_plan(

@@ -25,6 +25,9 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
     ProviderReadMetadata, ProviderReadRuntime, ReadRuntimeAdapter,
 };
+use novarocks_spi::connector::read_stack::negotiation::{
+    ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
+};
 use novarocks_spi::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorReadMetadata, ConnectorReadRelationVersion,
     ConnectorReadTableExecuteProcedure, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
@@ -274,24 +277,57 @@ fn one_adapter_path_keeps_residual_limit_and_assignment_order_for_two_type_famil
             )]))
             .expect("domain"),
         );
-        let filter = metadata
-            .apply_filter(&session(), &table, &constraint)
-            .expect("filter")
-            .expect("accepted");
-        assert_eq!(filter.remaining_constraint(), &constraint);
-        assert!(filter.remaining_expression().is_none());
-        assert!(
-            metadata
-                .apply_projection(&session(), &table, &assignments)
-                .expect("projection")
-                .is_some()
+        // One offer, three operations, answered in the order offered.
+        let negotiation = ReadNegotiation {
+            handle: table.clone(),
+            ops: vec![
+                ReadPushdownOp::Filter {
+                    constraint: constraint.clone(),
+                },
+                ReadPushdownOp::Projection {
+                    assignments: assignments.clone(),
+                },
+                ReadPushdownOp::Limit { rows: 5 },
+            ],
+        };
+        let negotiated = metadata
+            .negotiate(&session(), &negotiation)
+            .expect("negotiate");
+        negotiated
+            .verify_shape(3)
+            .expect("one answer per operation");
+        assert!(negotiated.changed);
+        // The fixture hands the predicate back unchanged, and this predicate
+        // restricts nothing, so nothing is left for the engine to evaluate.
+        // The residual is echoed either way; the disposition is what says
+        // whether the engine is relieved.
+        assert_eq!(negotiated.outcomes[0].residual.as_ref(), Some(&constraint));
+        assert_eq!(
+            negotiated.outcomes[0].disposition,
+            ReadPushdownDisposition::Exact
         );
-        assert!(
-            metadata
-                .apply_limit(&session(), &table, 5)
-                .expect("limit")
-                .expect("accepted")
-                .limit_guaranteed()
+        assert_eq!(
+            negotiated.outcomes[1].disposition,
+            ReadPushdownDisposition::Exact
+        );
+        assert!(negotiated.outcomes[2].disposition.relieves_engine());
+
+        // Offering the same operations against the same handle again answers
+        // the same way: negotiating commits to nothing.
+        let again = metadata
+            .negotiate(&session(), &negotiation)
+            .expect("negotiate again");
+        assert_eq!(
+            again
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>(),
+            negotiated
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>()
         );
     }
 

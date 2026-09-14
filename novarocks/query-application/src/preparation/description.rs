@@ -17,6 +17,9 @@
 
 use std::sync::Arc;
 
+use novarocks_spi::connector::read_stack::negotiation::{
+    ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp, ReadPushdownOutcome,
+};
 use novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadConstraint, ConnectorReadFilterApplication, ConnectorReadLimitApplication,
@@ -640,6 +643,43 @@ impl<'a> ScanNegotiationSession<'a> {
         Ok(response)
     }
 
+    /// Offer one pushdown and read back the single answer.
+    ///
+    /// The provider surface takes an ordered list, because order is part of
+    /// what is being asked. This session still offers one at a time so that
+    /// each offer keeps its own once-only guard and its own recorded outcome;
+    /// assembling them into a single offer belongs with the freeze that
+    /// consumes them.
+    fn offer_one(
+        &mut self,
+        operation: &str,
+        op: ReadPushdownOp,
+    ) -> Result<Option<(ConnectorReadTableHandle, ReadPushdownOutcome)>, String> {
+        let negotiation = ReadNegotiation {
+            handle: self.handle.clone(),
+            ops: vec![op],
+        };
+        let negotiated = self.observe(operation, || {
+            self.metadata
+                .negotiate(self.connector_session, &negotiation)
+        })?;
+        negotiated.verify_shape(1).map_err(|error| {
+            format!(
+                "typed scan {operation} on relation {} answered the wrong shape: {error}",
+                self.relation_name
+            )
+        })?;
+        let outcome = negotiated
+            .outcomes
+            .into_iter()
+            .next()
+            .expect("shape verified");
+        if outcome.disposition == ReadPushdownDisposition::Unsupported {
+            return Ok(None);
+        }
+        Ok(Some((negotiated.handle, outcome)))
+    }
+
     pub fn apply_filter(
         &mut self,
         constraint: &ConnectorReadConstraint,
@@ -650,10 +690,18 @@ impl<'a> ScanNegotiationSession<'a> {
                 self.outcome.contract.node_id()
             ));
         }
-        let response = self.observe("apply_filter", || {
-            self.metadata
-                .apply_filter(self.connector_session, &self.handle, constraint)
-        })?;
+        let response = self.offer_one(
+            "apply_filter",
+            ReadPushdownOp::Filter {
+                constraint: constraint.clone(),
+            },
+        )?;
+        let response = response.map(|(handle, outcome)| {
+            let residual = outcome
+                .residual
+                .expect("an answered filter names its residual");
+            ConnectorReadFilterApplication::new(handle, residual, None)
+        });
         self.outcome.record_filter_response(response.as_ref())?;
         self.offered_constraint = Some(constraint.clone());
         if let Some(application) = &response {
@@ -666,10 +714,14 @@ impl<'a> ScanNegotiationSession<'a> {
         &mut self,
         assignments: &[ConnectorReadAssignment],
     ) -> Result<bool, String> {
-        let response = self.observe("apply_projection", || {
-            self.metadata
-                .apply_projection(self.connector_session, &self.handle, assignments)
-        })?;
+        let response = self
+            .offer_one(
+                "apply_projection",
+                ReadPushdownOp::Projection {
+                    assignments: assignments.to_vec(),
+                },
+            )?
+            .map(|(handle, _)| handle);
         self.outcome.record_projection_response(response.as_ref())?;
         if let Some(handle) = response {
             self.accept_handle(handle)?;
@@ -681,10 +733,14 @@ impl<'a> ScanNegotiationSession<'a> {
 
     pub fn apply_limit(&mut self, limit: Option<u64>) -> Result<bool, String> {
         let response = match limit {
-            Some(limit) => self.observe("apply_limit", || {
-                self.metadata
-                    .apply_limit(self.connector_session, &self.handle, limit)
-            })?,
+            Some(rows) => self
+                .offer_one("apply_limit", ReadPushdownOp::Limit { rows })?
+                .map(|(handle, outcome)| {
+                    ConnectorReadLimitApplication::new(
+                        handle,
+                        outcome.disposition.relieves_engine(),
+                    )
+                }),
             None => None,
         };
         self.outcome

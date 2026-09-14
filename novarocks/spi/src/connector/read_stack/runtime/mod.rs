@@ -540,26 +540,18 @@ pub trait ConnectorReadMetadata: Send + Sync {
         ))
     }
 
-    fn apply_filter(
+    /// Offer a provider an ordered list of pushdowns and learn what it takes on.
+    ///
+    /// This is the one way a caller asks that question. It is pure and
+    /// repeatable: the same offer against the same handle answers the same way
+    /// and commits to nothing, so it can be asked while a decision is still
+    /// open. Committing is a separate call - see `final_static_facts` - which
+    /// happens once and freezes what was negotiated.
+    fn negotiate(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError>;
-
-    fn apply_projection(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        assignments: &[ConnectorReadAssignment],
-    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
-
-    fn apply_limit(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        limit: u64,
-    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError>;
+        negotiation: &super::negotiation::ReadNegotiation,
+    ) -> Result<super::negotiation::ReadNegotiated, ConnectorError>;
 
     fn get_system_table_plan(
         &self,
