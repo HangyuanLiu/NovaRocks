@@ -27,6 +27,13 @@ use novarocks_parser::{
     printer,
 };
 
+pub use super::mv_persistence::{
+    SqlMvCreatePersistenceFacts, SqlMvPersistenceAggregateFacts, SqlMvPersistenceExpressionFacts,
+    SqlMvPersistenceExpressionKind, SqlMvPersistenceOutputFacts,
+    SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
+    SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
+};
+
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
 /// the planner vocabulary remains private.
@@ -671,6 +678,17 @@ impl SqlResolvedMvRefreshInput {
         SqlMvAnalysisFacts {
             output_columns: output_column_facts(&self.0),
         }
+    }
+
+    /// Project the stable SQL facts needed to construct CREATE-time MV
+    /// persistence documents.
+    ///
+    /// This is a read-only, flat semantic projection of the same analyzed
+    /// query used for refresh planning. It is deliberately not an AST or plan:
+    /// provider object, schema, and field identities remain application-owned
+    /// observations that are joined to these occurrence-qualified SQL facts.
+    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
+        super::mv_persistence::project_create_persistence_facts(&self.0)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and
