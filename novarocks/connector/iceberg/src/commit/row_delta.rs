@@ -51,7 +51,7 @@ use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_prope
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
-    snapshot_summary, submit_occ_action, target_ref_snapshot_id, write_manifest_list,
+    snapshot_summary, submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, WrittenFile};
@@ -110,7 +110,16 @@ impl IcebergCommitAction for RowDeltaCommit {
                 .clone()
         };
 
-        match submit_occ_action(ctx.catalog, ctx.table, action, "RowDelta", None).await {
+        match submit_snapshot_occ_action(
+            ctx.catalog,
+            ctx.table,
+            action,
+            "RowDelta",
+            None,
+            ctx.snapshot_properties,
+        )
+        .await
+        {
             Ok(OccSubmit::Committed(table_after)) => {
                 let new_snapshot_id = required_target_ref_snapshot_id(
                     table_after.metadata(),
@@ -238,6 +247,8 @@ impl TransactionAction for RowDeltaTxnAction {
             additional_properties: merge_snapshot_summary_properties(
                 finalize_snapshot_summary(row_delta_summary(&self.written), parent_summary, false),
                 &self.snapshot_properties,
+                m.uuid(),
+                new_snapshot_id,
             )
             .map_err(to_iceberg_unexpected)?,
         };

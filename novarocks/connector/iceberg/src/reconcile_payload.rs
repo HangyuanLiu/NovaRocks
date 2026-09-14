@@ -76,6 +76,16 @@ pub enum IcebergMutationEvidenceTarget {
         table_uuid: String,
         before_metadata_location: Option<String>,
     },
+    ApplicationDocuments {
+        namespace: String,
+        table: String,
+        table_uuid: String,
+        operation_marker: String,
+        manifest_digest: [u8; 32],
+        managed_kind: String,
+        managed_owner: String,
+        managed_incarnation: String,
+    },
     BootstrapEmptyTableSnapshot {
         namespace: String,
         table: String,

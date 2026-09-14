@@ -27,6 +27,7 @@ mod discovery;
 pub(crate) mod envelope;
 pub(crate) mod io;
 pub(crate) mod observation;
+pub(crate) mod publication;
 mod reference;
 mod retention;
 

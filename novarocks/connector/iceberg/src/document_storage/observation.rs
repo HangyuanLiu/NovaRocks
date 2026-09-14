@@ -19,6 +19,10 @@ use novarocks_spi::connector::{
 
 use super::envelope::DOCUMENT_MANIFEST_PROPERTY;
 
+fn exhausted(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
+}
+
 pub(crate) const MANAGED_KIND_PROPERTY: &str = "novarocks.managed.kind";
 pub(crate) const MANAGED_OWNER_PROPERTY: &str = "novarocks.managed.owner";
 pub(crate) const MANAGED_INCARNATION_PROPERTY: &str = "novarocks.managed.incarnation";
@@ -56,15 +60,39 @@ pub(crate) fn project_documents(
     metadata: &crate::iceberg::spec::TableMetadata,
     limits: novarocks_spi::connector::ConnectorDocumentStorageLimits,
 ) -> Result<Vec<ConnectorStoredDocument>, ConnectorError> {
-    let Some(encoded) = metadata.properties().get(DOCUMENT_MANIFEST_PROPERTY) else {
-        return Ok(Vec::new());
-    };
-    let manifest = super::codec::decode_document_manifest_with_limits(encoded.as_bytes(), limits)?;
-    manifest
-        .documents
-        .iter()
-        .map(super::codec::stored_document)
-        .collect()
+    let metadata_manifest = metadata.properties().get(DOCUMENT_MANIFEST_PROPERTY);
+    let snapshot_manifest = metadata.current_snapshot().and_then(|snapshot| {
+        snapshot
+            .summary()
+            .additional_properties
+            .get(DOCUMENT_MANIFEST_PROPERTY)
+    });
+    let mut documents = Vec::new();
+    let mut identities = std::collections::HashSet::new();
+    let mut references = 0usize;
+    for encoded in metadata_manifest.into_iter().chain(snapshot_manifest) {
+        let manifest =
+            super::codec::decode_document_manifest_with_limits(encoded.as_bytes(), limits)?;
+        for envelope in &manifest.documents {
+            let document = super::codec::stored_document(envelope)?;
+            references = references
+                .checked_add(document.references().len())
+                .ok_or_else(|| exhausted("Iceberg projected document references overflowed"))?;
+            if !identities.insert(document.id().clone()) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::CorruptData,
+                    "Iceberg metadata repeats an application document identity",
+                ));
+            }
+            if documents.len() >= limits.max_documents() || references > limits.max_references() {
+                return Err(exhausted(
+                    "Iceberg projected documents exceed the combined observation budget",
+                ));
+            }
+            documents.push(document);
+        }
+    }
+    Ok(documents)
 }
 
 pub(crate) fn managed_marker(
@@ -489,7 +517,9 @@ mod tests {
     use std::collections::HashMap;
 
     use bytes::Bytes;
-    use novarocks_spi::connector::{ConnectorTableObjectBindingFailure, ConnectorTableObjectId};
+    use novarocks_spi::connector::{
+        ConnectorDocumentStorageLimits, ConnectorTableObjectBindingFailure, ConnectorTableObjectId,
+    };
 
     use super::*;
 
@@ -520,6 +550,60 @@ mod tests {
         .metadata
     }
 
+    fn encoded_document_manifest(name: &str) -> String {
+        let content = name.as_bytes().to_vec();
+        let manifest = super::super::envelope::IcebergDocumentManifestV1 {
+            version: super::super::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: vec![super::super::envelope::IcebergDocumentEnvelopeV1 {
+                version: super::super::envelope::DOCUMENT_ENVELOPE_VERSION,
+                owner: "novarocks.mv".to_string(),
+                name: name.to_string(),
+                format_owner: "novarocks.mv".to_string(),
+                format_name: name.to_string(),
+                format_version: 1,
+                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
+                    &content,
+                )
+                .to_bytes(),
+                encoded_len: content.len() as u64,
+                references: Vec::new(),
+                attachment: super::super::envelope::IcebergDocumentAttachmentV1::TableMetadata,
+                carrier: super::super::envelope::IcebergDocumentCarrierV1::Available { content },
+            }],
+        };
+        String::from_utf8(
+            super::super::codec::encode_document_manifest(&manifest)
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    fn with_snapshot_manifest(
+        base: crate::iceberg::spec::TableMetadata,
+        manifest: String,
+    ) -> crate::iceberg::spec::TableMetadata {
+        let snapshot = crate::iceberg::spec::Snapshot::builder()
+            .with_snapshot_id(12)
+            .with_sequence_number(1)
+            .with_timestamp_ms(base.last_updated_ms() + 1)
+            .with_manifest_list("memory://table/snap.avro")
+            .with_summary(crate::iceberg::spec::Summary {
+                operation: crate::iceberg::spec::Operation::Append,
+                additional_properties: HashMap::from([(
+                    DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                    manifest,
+                )]),
+            })
+            .build();
+        base.into_builder(None)
+            .set_branch_snapshot(snapshot, "main")
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
+    }
+
     #[test]
     fn exact_object_validation_reports_a_typed_replacement() {
         let metadata = metadata(HashMap::new());
@@ -539,6 +623,39 @@ mod tests {
         )]));
         assert_eq!(
             managed_marker(&metadata).unwrap_err().kind(),
+            ConnectorErrorKind::CorruptData
+        );
+    }
+
+    #[test]
+    fn projection_combines_configuration_and_current_publication_documents() {
+        let metadata = metadata(HashMap::from([(
+            DOCUMENT_MANIFEST_PROPERTY.to_string(),
+            encoded_document_manifest("configuration"),
+        )]));
+        let metadata = with_snapshot_manifest(metadata, encoded_document_manifest("publication"));
+
+        let documents =
+            project_documents(&metadata, ConnectorDocumentStorageLimits::spec_default())
+                .expect("project current application documents");
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0].id().name().as_str(), "configuration");
+        assert_eq!(documents[1].id().name().as_str(), "publication");
+    }
+
+    #[test]
+    fn projection_rejects_duplicate_identity_across_configuration_and_publication() {
+        let encoded = encoded_document_manifest("definition");
+        let metadata = metadata(HashMap::from([(
+            DOCUMENT_MANIFEST_PROPERTY.to_string(),
+            encoded.clone(),
+        )]));
+        let metadata = with_snapshot_manifest(metadata, encoded);
+
+        assert_eq!(
+            project_documents(&metadata, ConnectorDocumentStorageLimits::spec_default())
+                .unwrap_err()
+                .kind(),
             ConnectorErrorKind::CorruptData
         );
     }

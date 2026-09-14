@@ -84,20 +84,27 @@ pub(crate) fn prepare_write(
             format!("decode admitted Iceberg write metadata: {error}"),
         )
     })?;
-    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml)
-        && metadata
-            .properties()
-            .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
-    {
-        return Ok(ConnectorWritePreparationOutcome::Denied(
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                format!(
-                    "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
-                    table.catalog, table.namespace, table.table
+    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
+        let managed = match crate::document_storage::observation::managed_marker(&metadata) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
+            Err(error) => return Ok(ConnectorWritePreparationOutcome::Denied(error)),
+        };
+        if managed
+            || metadata
+                .properties()
+                .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
+        {
+            return Ok(ConnectorWritePreparationOutcome::Denied(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
+                        table.catalog, table.namespace, table.table
+                    ),
                 ),
-            ),
-        ));
+            ));
+        }
     }
 
     let target_fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
@@ -1118,6 +1125,74 @@ mod tests {
             )
             .expect("managed MV refresh outcome"),
         );
+    }
+
+    #[test]
+    fn application_managed_marker_denies_ordinary_dml_but_allows_refresh() {
+        let owner = owner();
+        let metadata = metadata_with_properties(HashMap::from([
+            (
+                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+                "mv".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+                "deployment".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+                "writer".to_string(),
+            ),
+        ]));
+        let payload = table_payload(Some(table_info(&metadata)));
+
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                ),
+                &owner,
+            )
+            .expect("application-managed MV outcome"),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::InvalidRequest);
+
+        expect_prepared(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+                ),
+                &owner,
+            )
+            .expect("application-managed MV refresh outcome"),
+        );
+    }
+
+    #[test]
+    fn partial_application_managed_marker_fails_closed() {
+        let owner = owner();
+        let metadata = metadata_with_properties(HashMap::from([(
+            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+            "deployment".to_string(),
+        )]));
+        let payload = table_payload(Some(table_info(&metadata)));
+
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                ),
+                &owner,
+            )
+            .expect("partial managed marker outcome"),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]
