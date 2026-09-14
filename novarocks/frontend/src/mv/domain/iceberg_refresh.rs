@@ -260,6 +260,8 @@ struct IcebergMvCreatePreparation {
     property: RefreshFragmentProperty,
     base_refs: Vec<TableIdentity>,
     dependencies: Vec<CreateMvDependencyRequest>,
+    source_field_observations:
+        Vec<crate::mv::domain::persistence::aggregate_bindings::MvCreateRelationObservation>,
     base_field_observations: std::collections::BTreeMap<
         String,
         crate::mv::domain::storage_observation::MvSchemaValidationObservation,
@@ -1007,6 +1009,14 @@ fn prepare_iceberg_mv_create_with_ports(
         )
     })?;
     let property = derive_fragment_property(&analysis)?;
+    let create_persistence_facts = analysis.refresh_input.create_persistence_facts()?;
+    let source_field_observations =
+        crate::mv::domain::persistence::source_bindings::observe_mv_create_source_bindings(
+            ports.storage_observation.as_ref(),
+            &create_persistence_facts,
+            provider.query_table_bindings().as_ref(),
+            connector_context.clone(),
+        )?;
     let base_field_observations = observe_base_fields_for_refs_with_ports(
         ports,
         &resolved_dependencies.base_refs,
@@ -1112,6 +1122,7 @@ fn prepare_iceberg_mv_create_with_ports(
         property,
         base_refs: resolved_dependencies.base_refs,
         dependencies: resolved_dependencies.dependencies,
+        source_field_observations,
         base_field_observations,
         expected_apply_key_field_id,
         columns,

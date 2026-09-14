@@ -58,14 +58,14 @@ use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExec
 use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
-    MvLakePackageObservation, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvPublishedBaseObservation,
-    MvPublishedRefreshObservation, MvPublishedRefreshTechnique, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    WriteCommitEvidenceLimits,
+    ConnectorTableMetadata, MvCreateSourceObservation, MvCreatedTargetObservation,
+    MvLakeDescriptorProjection, MvLakePackageObservation, MvLakePublicationObservation,
+    MvLakeTargetSnapshotObservation, MvMaintenanceMetadataObservation, MvObservedField,
+    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
+    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedSourceField, MvPublishedBaseObservation, MvPublishedRefreshObservation,
+    MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
+    MvSchemaValidationObservation, MvStorageObservationPort, WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
 use novarocks_state_store_runtime::{
@@ -146,6 +146,42 @@ fn mv_lake_target_snapshot_observation(
 }
 
 impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
+    fn observe_create_source(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+        let observed =
+            self.inspector
+                .observe_create_source(exact_lease, metadata, context.clone())?;
+        if metadata.version.as_ref() != Some(&observed.schema_version) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg CREATE source observation does not match its sealed metadata schema version",
+            ));
+        }
+        let fields = observed
+            .fields
+            .into_iter()
+            .map(|field| {
+                MvObservedSourceField::try_new(
+                    field.provider_field_id,
+                    field.name,
+                    field.type_signature,
+                    field.nullable,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        MvCreateSourceObservation::try_new(
+            metadata.identity.clone(),
+            observed.object_id,
+            observed.schema_version,
+            fields,
+            &context,
+        )
+    }
+
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,

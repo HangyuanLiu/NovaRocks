@@ -112,6 +112,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
                 crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
                     planning_lease,
                 ),
+            source_metadata: None,
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
             write_target_admission: None,

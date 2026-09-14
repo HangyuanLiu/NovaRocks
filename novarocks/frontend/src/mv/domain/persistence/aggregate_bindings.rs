@@ -249,7 +249,7 @@ fn source_field_map(
             let observed = fields.get(&field.field_ordinal()).ok_or_else(|| {
                 "CREATE source observation is missing a SQL-referenced field ordinal".to_string()
             })?;
-            if observed.field_name != field.name() {
+            if !observed.field_name.eq_ignore_ascii_case(field.name()) {
                 return Err(
                     "CREATE source field ordinal resolves to a different field name".to_string(),
                 );

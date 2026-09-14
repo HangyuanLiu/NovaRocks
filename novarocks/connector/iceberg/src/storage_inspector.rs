@@ -86,6 +86,24 @@ pub struct IcebergStorageTargetField {
     pub nullable: bool,
 }
 
+/// Provider-owned source schema facts frozen from one decoded Iceberg
+/// metadata document. The byte identity is emitted here, rather than by the
+/// Frontend, so consumers cannot manufacture a durable provider field ID.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageCreateSourceObservation {
+    pub object_id: ConnectorTableObjectId,
+    pub schema_version: Bytes,
+    pub fields: Vec<IcebergStorageSourceField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageSourceField {
+    pub provider_field_id: Bytes,
+    pub name: String,
+    pub type_signature: String,
+    pub nullable: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergStoragePartitionContract {
     pub target_spec_id: i32,
@@ -262,6 +280,16 @@ pub struct IcebergStorageMaintenancePolicy {
 pub struct IcebergStorageInspector;
 
 impl IcebergStorageInspector {
+    pub fn observe_create_source(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
+        let table = decoded_table(exact_lease, metadata, &context)?;
+        create_source_observation(&table, &context)
+    }
+
     pub fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -598,6 +626,30 @@ fn target_observation(
     })
 }
 
+fn create_source_observation(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
+    let target = target_observation(table, context)?;
+    let object_id = iceberg_object_id_from_uuid(target.table_uuid)?;
+    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
+    let fields = target
+        .fields
+        .into_iter()
+        .map(|field| IcebergStorageSourceField {
+            provider_field_id: Bytes::copy_from_slice(&field.field_id.to_be_bytes()),
+            name: field.name,
+            type_signature: field.type_signature,
+            nullable: field.nullable,
+        })
+        .collect();
+    Ok(IcebergStorageCreateSourceObservation {
+        object_id,
+        schema_version,
+        fields,
+    })
+}
+
 fn lake_package_observation(
     table: &TableMetadata,
     context: &ConnectorRequestContext,
@@ -912,6 +964,22 @@ mod tests {
         assert!(observed.partition.fields.is_empty());
         assert!(!observed.format_v3);
         assert!(!observed.explicit_row_lineage_enabled);
+    }
+
+    #[test]
+    fn create_source_projection_keeps_opaque_provider_field_ids() {
+        let observed = create_source_observation(&metadata(HashMap::new()), &context(4096))
+            .expect("source observation");
+        assert_eq!(observed.fields.len(), 2);
+        assert_eq!(
+            observed.fields[0].provider_field_id,
+            Bytes::copy_from_slice(&1_i32.to_be_bytes())
+        );
+        assert_eq!(
+            observed.fields[1].provider_field_id,
+            Bytes::copy_from_slice(&2_i32.to_be_bytes())
+        );
+        assert!(!observed.schema_version.is_empty());
     }
 
     #[test]

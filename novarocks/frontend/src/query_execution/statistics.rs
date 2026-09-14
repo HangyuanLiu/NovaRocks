@@ -406,6 +406,7 @@ fn admit_statistics_scan_binding(
                 admission: crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact(
                     planning_lease.clone(),
                 ),
+                source_metadata: None,
                 scan_materialization: Some(
                     crate::catalog_application::query_bindings::QueryScanMaterialization {
                         table: program.table().clone(),
