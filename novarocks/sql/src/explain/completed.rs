@@ -3745,6 +3745,104 @@ mod tests {
         completed
     }
 
+    /// Shapes that generated SQL actually produces at scale.
+    ///
+    /// Every structural bound that can refuse a plan needs the symmetric
+    /// evidence: not only that it rejects what it should, but that no
+    /// legitimate query trips it. A dashboard filter panel, an ORM `IN`
+    /// expansion and a wide `UNION ALL` are ordinary queries, and a bound that
+    /// refuses one is a user-visible loss of function rather than a slow path.
+    fn generated_sql_corpus() -> Vec<(&'static str, String)> {
+        let conjuncts = (0..512)
+            .map(|i| format!("c0 <> {i}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let disjuncts = (0..512)
+            .map(|i| format!("(c0 = {i} AND c1 = {i})"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let in_list = (0..4096)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let union_all = (0..256)
+            .map(|i| format!("SELECT {i} AS c0"))
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let wide_projection = (0..1024)
+            .map(|i| format!("c0 + {i} AS p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut nested = "SELECT c0 FROM (VALUES (1)) AS t(c0)".to_string();
+        for _ in 0..64 {
+            nested = format!("SELECT c0 FROM ({nested}) AS s");
+        }
+        vec![
+            (
+                "wide filter panel",
+                format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {conjuncts}"),
+            ),
+            (
+                "generated disjunction",
+                format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE {disjuncts}"),
+            ),
+            (
+                "orm in expansion",
+                format!("SELECT c0 FROM (VALUES (1, 2)) AS t(c0, c1) WHERE c0 IN ({in_list})"),
+            ),
+            ("wide union all", union_all),
+            (
+                "wide projection",
+                format!("SELECT {wide_projection} FROM (VALUES (1, 2)) AS t(c0, c1)"),
+            ),
+            ("deeply nested subqueries", nested),
+        ]
+    }
+
+    #[test]
+    fn generated_sql_shapes_are_not_refused_by_a_structural_bound() {
+        // Compiling a wide predicate still recurses once per conjunct through
+        // SQL analysis and rewriting, at roughly 32 KiB of stack each, so a
+        // 2 MiB test thread aborts around 64 conjuncts. That is a separate
+        // defect about stack use, not about structural bounds; this test is
+        // about the bounds, so it runs where the recursion has room.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(check_generated_sql_shapes)
+            .expect("spawn")
+            .join()
+            .expect("corpus thread");
+    }
+
+    fn check_generated_sql_shapes() {
+        for (name, sql) in generated_sql_corpus() {
+            let plan = completed_sql(&sql, SqlCompileIntent::Query, 7);
+            let physical = plan.plan();
+            // Record the headroom, so a future bound change shows which shape
+            // is closest to it rather than only that something broke.
+            let nodes = physical
+                .fragments()
+                .values()
+                .map(|fragment| fragment.nodes().len())
+                .max()
+                .unwrap_or(0);
+            let expressions = physical
+                .fragments()
+                .values()
+                .map(|fragment| fragment.expressions().len())
+                .max()
+                .unwrap_or(0);
+            assert!(
+                nodes <= novarocks_physical_plan::PlanLimits::FROZEN.fragment_nodes,
+                "{name}: {nodes} nodes"
+            );
+            assert!(
+                expressions <= novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions,
+                "{name}: {expressions} expressions"
+            );
+        }
+    }
+
     fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {
         match progress {
             SqlCompileProgress::Incomplete(compilation) => compilation,

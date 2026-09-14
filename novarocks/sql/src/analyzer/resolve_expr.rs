@@ -307,6 +307,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         *item = cast_null_preserving_target_type(item.clone(), &common_type);
                     }
                 }
+                // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
+                // NULL, so the result is nullable whenever any operand is.
+                let nullable =
+                    expr_typed.nullable || list_typed.iter().any(|candidate| candidate.nullable);
                 Ok(TypedExpr {
                     kind: ExprKind::InList {
                         expr: Box::new(expr_typed),
@@ -314,7 +318,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: in_list.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
