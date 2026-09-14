@@ -48,9 +48,10 @@ use novarocks_spi::connector::write_stack::{
     PreparedWriteSetLedger, UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
-    ConnectorDocumentPublicationIntent, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext, ConnectorStorageResolver, ConnectorWriteAbortOutcome,
-    ConnectorWriteReceipt, ExternalMutationEvidence, ExternalMutationOutcome,
+    ConnectorDocumentPublicationDeclaration, ConnectorDocumentPublicationIntent, ConnectorError,
+    ConnectorErrorKind, ConnectorRequestContext, ConnectorStorageResolver,
+    ConnectorWriteAbortOutcome, ConnectorWriteReceipt, ExternalMutationEvidence,
+    ExternalMutationOutcome,
 };
 
 use crate::query_execution::write_result::DecodedPreparedWriteSet;
@@ -68,14 +69,26 @@ enum TerminalDecision {
     CommitUnknown,
 }
 
+/// The application-document payload is not knowable when writer recipes are
+/// admitted: it includes the exact read occurrences and the write outcome.
+/// Keep its declaration frozen from begin, then permit one exact late bind
+/// before the provider's terminal call.
+enum WritePublicationState {
+    Ordinary,
+    Pending {
+        declaration: ConnectorDocumentPublicationDeclaration,
+    },
+    Bound(ConnectorDocumentPublicationIntent),
+}
+
 /// One distributed write's frontend session.
 pub(crate) struct ConnectorWriteSession {
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
-    /// The exact application-owned publication attached to the provider's
-    /// single external commit. Ordinary writes freeze `None`; document
-    /// publications freeze their prepared payload before execution starts.
-    finish_publication: ConnectorWriteFinishPublication,
+    /// The application-owned publication attached to the provider's single
+    /// external commit. Its declaration is frozen at begin, while its exact
+    /// payload may be bound once after the data plane closes.
+    finish_publication: Mutex<WritePublicationState>,
     /// The catalog runtime this session's writers execute against, kept whole
     /// rather than reduced to its handle: the backend leases a catalog from its
     /// properties, and a writer node that named a handle the query never leased
@@ -137,14 +150,41 @@ impl ConnectorWriteSession {
         ) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
-                "application-document writes require an exact publication intent at begin",
+                "application-document writes require an application-document session entrypoint",
             ));
         }
         Self::begin_validated(
             lease,
             catalog_properties,
             request,
-            ConnectorWriteFinishPublication::None,
+            WritePublicationState::Ordinary,
+        )
+    }
+
+    /// Admit an application-document write before its exact publication can be
+    /// constructed. The frozen declaration is the authority against which the
+    /// one later bind is validated.
+    pub(crate) fn begin_pending_application_document_publication(
+        lease: ConnectorWriteStackLease,
+        catalog_properties: novarocks_spi::connector::CatalogProperties,
+        request: ConnectorWriteBeginRequest,
+    ) -> Result<Self, ConnectorError> {
+        let declaration = match &request.flavor {
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } => {
+                declaration.clone()
+            }
+            _ => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "pending application-document publication requires an application-document write",
+                ));
+            }
+        };
+        Self::begin_validated(
+            lease,
+            catalog_properties,
+            request,
+            WritePublicationState::Pending { declaration },
         )
     }
 
@@ -169,7 +209,7 @@ impl ConnectorWriteSession {
             lease,
             catalog_properties,
             request,
-            ConnectorWriteFinishPublication::ApplicationDocuments(publication),
+            WritePublicationState::Bound(publication),
         )
     }
 
@@ -177,19 +217,49 @@ impl ConnectorWriteSession {
         lease: ConnectorWriteStackLease,
         catalog_properties: novarocks_spi::connector::CatalogProperties,
         request: ConnectorWriteBeginRequest,
-        finish_publication: ConnectorWriteFinishPublication,
+        finish_publication: WritePublicationState,
     ) -> Result<Self, ConnectorError> {
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             lease,
             plan,
-            finish_publication,
+            finish_publication: Mutex::new(finish_publication),
             catalog_properties,
             accumulated: Mutex::new(AccumulatedWriteSet::default()),
             terminal: Mutex::new(None),
             finish_invocations: AtomicUsize::new(0),
             terminal_storage: Mutex::new(None),
         })
+    }
+
+    /// Bind the exact application-document payload once the statement has the
+    /// executed scan facts and write result needed to construct it.
+    pub(crate) fn bind_application_document_publication(
+        &self,
+        publication: ConnectorDocumentPublicationIntent,
+    ) -> Result<(), ConnectorError> {
+        let mut state = self.lock_finish_publication()?;
+        if self.lock_terminal()?.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "connector write session already reached a terminal decision",
+            ));
+        }
+        match &*state {
+            WritePublicationState::Ordinary => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "ordinary connector write session cannot bind an application-document publication",
+            )),
+            WritePublicationState::Pending { declaration } => {
+                publication.validate_for(declaration)?;
+                *state = WritePublicationState::Bound(publication);
+                Ok(())
+            }
+            WritePublicationState::Bound(_) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "application-document publication is already bound",
+            )),
+        }
     }
 
     /// Retain the query attempt's terminal-only storage capability for this
@@ -462,8 +532,9 @@ impl ConnectorWriteSession {
         context: ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         ensure_finish_context_active(&context)?;
+        let publication = self.finish_publication_for_commit()?;
         self.claim_terminal(TerminalDecision::Committed)?;
-        let outcome = self.commit_accumulated(context);
+        let outcome = self.commit_accumulated(context, publication);
         // Reconciliation is the one decision that may still follow a commit,
         // and it reads the same object store. Every other way out of here --
         // committed, uncommitted, or an error that leaves neither a retry nor
@@ -477,14 +548,16 @@ impl ConnectorWriteSession {
     fn commit_accumulated(
         &self,
         context: ConnectorRequestContext,
+        publication: ConnectorWriteFinishPublication,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let context = self.terminal_context(context)?;
-        self.commit_accumulated_with_context(context)
+        self.commit_accumulated_with_context(context, publication)
     }
 
     fn commit_accumulated_with_context(
         &self,
         context: ConnectorRequestContext,
+        publication: ConnectorWriteFinishPublication,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let (row_count, fragments, statistics) = {
             let mut accumulated = self.lock_accumulated()?;
@@ -503,7 +576,7 @@ impl ConnectorWriteSession {
                 commit: self.plan.commit_handle(),
                 prepared,
                 statistics,
-                publication: self.finish_publication.clone(),
+                publication,
                 context,
             })?;
         if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {
@@ -550,9 +623,10 @@ impl ConnectorWriteSession {
         ConnectorError,
     > {
         self.accumulate(prepared)?;
+        let publication = self.finish_publication_for_commit()?;
         self.claim_terminal(TerminalDecision::Committed)?;
         let terminal_context = self.terminal_context(context)?;
-        let outcome = self.commit_accumulated_with_context(terminal_context.clone());
+        let outcome = self.commit_accumulated_with_context(terminal_context.clone(), publication);
         // The returned context owns the terminal capability from here. On an
         // error it drops below, so the session never leaves an orphaned hold.
         self.release_terminal_storage_resolver();
@@ -671,6 +745,32 @@ impl ConnectorWriteSession {
         })
     }
 
+    fn finish_publication_for_commit(
+        &self,
+    ) -> Result<ConnectorWriteFinishPublication, ConnectorError> {
+        match &*self.lock_finish_publication()? {
+            WritePublicationState::Ordinary => Ok(ConnectorWriteFinishPublication::None),
+            WritePublicationState::Pending { .. } => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "application-document publication must be bound before finish",
+            )),
+            WritePublicationState::Bound(publication) => Ok(
+                ConnectorWriteFinishPublication::ApplicationDocuments(publication.clone()),
+            ),
+        }
+    }
+
+    fn lock_finish_publication(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, WritePublicationState>, ConnectorError> {
+        self.finish_publication.lock().map_err(|_| {
+            ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "connector write session publication state is poisoned",
+            )
+        })
+    }
+
     fn claim_terminal(&self, decision: TerminalDecision) -> Result<(), ConnectorError> {
         let mut terminal = self.lock_terminal()?;
         match *terminal {
@@ -739,6 +839,27 @@ pub(crate) fn begin_connector_write_session(
     ConnectorWriteSession::begin(lease, catalog_properties, request)
         .map(std::sync::Arc::new)
         .map_err(|error| format!("begin connector write session: {error}"))
+}
+
+/// Open an application-document write with its declaration frozen and its
+/// exact publication pending until execution supplies the remaining facts.
+pub(crate) fn begin_connector_application_document_write_session_pending(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+) -> Result<std::sync::Arc<ConnectorWriteSession>, String> {
+    let catalog_properties = write_lease.catalog_properties().cloned().ok_or_else(|| {
+        "connector write lease has no immutable catalog runtime identity".to_string()
+    })?;
+    ConnectorWriteSession::begin_pending_application_document_publication(
+        lease,
+        catalog_properties,
+        request,
+    )
+    .map(std::sync::Arc::new)
+    .map_err(|error| {
+        format!("begin connector write session with pending application documents: {error}")
+    })
 }
 
 /// Open a distributed write whose terminal commit must attach one exact
@@ -1729,6 +1850,120 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn pending_application_publication_binds_once_after_execution_and_reaches_finish() {
+        let (declaration, publication) = application_document_publication();
+        let expected = ConnectorWriteFinishPublication::ApplicationDocuments(publication.clone());
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+            lease,
+            catalog_properties(),
+            application_document_begin_request(declaration),
+        )
+        .expect("begin pending application-document publication");
+
+        session
+            .accumulate(empty_prepared())
+            .expect("execution result");
+        session
+            .bind_application_document_publication(publication)
+            .expect("bind exact publication");
+        session
+            .finish_accumulated(request_context())
+            .expect("finish bound publication");
+
+        let recorded = recorded.lock().expect("recorded");
+        assert_eq!(recorded.begin, 1);
+        assert_eq!(recorded.finish, 1);
+        assert_eq!(recorded.publication, Some(expected));
+    }
+
+    #[test]
+    fn pending_application_publication_refuses_finish_before_provider_invocation() {
+        let (declaration, publication) = application_document_publication();
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+            lease,
+            catalog_properties(),
+            application_document_begin_request(declaration),
+        )
+        .expect("begin pending application-document publication");
+
+        let error = session
+            .finish(empty_prepared(), request_context())
+            .expect_err("pending publication must not finish");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(session.finish_invocations(), 0);
+        assert_eq!(recorded.lock().expect("recorded").finish, 0);
+
+        session
+            .bind_application_document_publication(publication)
+            .expect("failed finish must leave publication bindable");
+        session
+            .finish_accumulated(request_context())
+            .expect("finish after bind");
+        assert_eq!(recorded.lock().expect("recorded").finish, 1);
+    }
+
+    #[test]
+    fn application_document_publication_rejects_a_second_bind() {
+        let (declaration, publication) = application_document_publication();
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+            lease,
+            catalog_properties(),
+            application_document_begin_request(declaration),
+        )
+        .expect("begin pending application-document publication");
+
+        session
+            .bind_application_document_publication(publication.clone())
+            .expect("first bind");
+        let error = session
+            .bind_application_document_publication(publication)
+            .expect_err("second bind must be rejected");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(recorded.lock().expect("recorded").finish, 0);
+    }
+
+    #[test]
+    fn pending_application_publication_rejects_a_mismatched_bind() {
+        let (declaration, publication) = application_document_publication();
+        let (_, other_publication) = application_document_publication();
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+        let session = ConnectorWriteSession::begin_pending_application_document_publication(
+            lease,
+            catalog_properties(),
+            application_document_begin_request(declaration),
+        )
+        .expect("begin pending application-document publication");
+
+        let error = session
+            .bind_application_document_publication(other_publication)
+            .expect_err("mismatched publication must be rejected");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(recorded.lock().expect("recorded").finish, 0);
+
+        session
+            .bind_application_document_publication(publication)
+            .expect("mismatched bind must leave the exact bind available");
+    }
+
+    #[test]
+    fn ordinary_write_session_rejects_application_document_bind() {
+        let (_, publication) = application_document_publication();
+        let fixture = fixture(1, 16);
+
+        let error = fixture
+            .session
+            .bind_application_document_publication(publication)
+            .expect_err("ordinary write must reject document publication");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.recorded.lock().expect("recorded").finish, 0);
+    }
+
+    #[test]
     fn ordinary_begin_rejects_an_application_document_flavor_before_provider_begin() {
         let (declaration, _) = application_document_publication();
         let (lease, recorded) = unopened_fixture(1, 16, known_committed());
@@ -1760,6 +1995,24 @@ pub(crate) mod tests {
         )
         .err()
         .expect("publication intent must require an application-document flavor");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let recorded = recorded.lock().expect("recorded");
+        assert_eq!(recorded.begin, 0);
+        assert_eq!(recorded.finish, 0);
+    }
+
+    #[test]
+    fn pending_application_document_begin_rejects_an_ordinary_flavor_before_provider_begin() {
+        let (lease, recorded) = unopened_fixture(1, 16, known_committed());
+
+        let error = ConnectorWriteSession::begin_pending_application_document_publication(
+            lease,
+            catalog_properties(),
+            begin_request(),
+        )
+        .err()
+        .expect("pending publication requires an application-document flavor");
 
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         let recorded = recorded.lock().expect("recorded");
