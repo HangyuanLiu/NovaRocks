@@ -29,7 +29,7 @@ mod readmission;
 
 pub use admission::{
     ManagementAdmissionError, ManagementDependencySet, ManagementEntrance, ManagementEntranceLease,
-    ManagementRequest,
+    ManagementEntranceTicket, ManagementRequest,
 };
 pub use effects::{
     EffectDisposition, EffectIdentity, EffectPath, EffectResponsibility, EffectScope,

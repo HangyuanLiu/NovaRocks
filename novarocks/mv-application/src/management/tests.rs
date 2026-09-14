@@ -1694,3 +1694,81 @@ fn same_target_wait_honors_work_scope_cancellation() {
     );
     drop(first);
 }
+
+#[test]
+fn management_ticket_preserves_worker_owner_and_nonblocking_fifo() {
+    let target = target("mv", b"object-a");
+    let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    let request = || {
+        ManagementRequest::try_new(
+            target.catalog().clone(),
+            target.table().clone(),
+            Some(target.object_id().clone()),
+            ConnectorDocumentManagementOperation::Publication,
+            Some(dependencies.clone()),
+            EffectScope::CATALOG_COMMIT,
+        )
+        .unwrap()
+    };
+
+    let mut scheduled = entrance
+        .request(
+            request(),
+            crate::activity::MvActivityOwner::ScheduledRefresh,
+        )
+        .unwrap();
+    let scheduled = scheduled
+        .try_acquire()
+        .unwrap()
+        .expect("first worker ticket acquires without blocking");
+    assert!(scheduled.worker_cancellation().is_some());
+
+    let mut manual = entrance
+        .request(request(), crate::activity::MvActivityOwner::ManualRefresh)
+        .unwrap();
+    assert!(manual.try_acquire().unwrap().is_none());
+    drop(scheduled);
+
+    let manual = manual
+        .try_acquire()
+        .unwrap()
+        .expect("next ticket acquires after the worker releases the target");
+    assert!(manual.worker_cancellation().is_none());
+}
+
+#[test]
+fn stopping_cancels_worker_acquired_through_management_entrance() {
+    let target = target("mv", b"object-a");
+    let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    let request = ManagementRequest::try_new(
+        target.catalog().clone(),
+        target.table().clone(),
+        Some(target.object_id().clone()),
+        ConnectorDocumentManagementOperation::SingleTargetUpdate,
+        Some(dependencies),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    let mut ticket = entrance
+        .request(
+            request,
+            crate::activity::MvActivityOwner::AutomaticMaintenance,
+        )
+        .unwrap();
+    let lease = ticket.try_acquire().unwrap().expect("worker lease");
+    let cancellation = lease.worker_cancellation().expect("worker cancellation");
+
+    entrance.begin_stopping();
+
+    assert!(cancellation.is_cancelled());
+}

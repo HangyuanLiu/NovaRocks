@@ -25,7 +25,8 @@ use novarocks_spi::connector::{
 };
 
 use crate::activity::{
-    CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityLease, MvActivityOwner,
+    CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
+    MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
 
 use super::observation::{ManagementObservationAuthorization, ManagementObservationLiveness};
@@ -373,14 +374,17 @@ impl ManagementEntrance {
         Ok(())
     }
 
-    /// The only normal mutation entrance. Same-target requests share the
-    /// existing FIFO gate; cancellation/deadline policy is supplied by the
-    /// owning WorkScope through `cancelled`.
-    pub fn acquire(
+    /// Queue one normal mutation on the only management entrance.
+    ///
+    /// The caller supplies its real activity owner so foreground, scheduler,
+    /// and maintenance work share one FIFO without being mislabeled as a
+    /// manual refresh. Domain dependencies are checked only after the ticket
+    /// reaches the head and owns the target activity lease.
+    pub fn request(
         &self,
         request: ManagementRequest,
-        cancelled: impl Fn() -> bool,
-    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        owner: MvActivityOwner,
+    ) -> Result<ManagementEntranceTicket, ManagementAdmissionError> {
         let activity_target = CanonicalMvTarget::from_parts(
             Some(request.table.instance_id.as_str()),
             &request.table.namespace,
@@ -389,66 +393,27 @@ impl ManagementEntrance {
         let activity = self
             .inner
             .activity
-            .acquire_foreground(
-                activity_target,
-                activity_owner(request.operation),
-                cancelled,
-            )
+            .request(activity_target, owner)
             .map_err(ManagementAdmissionError::from)?;
-
-        {
-            let mut state = lock(&self.inner.state);
-            match request.operation {
-                ConnectorDocumentManagementOperation::Create => {
-                    if let Some(current) = state.get(&request.table) {
-                        return Err(if current.unsettled.is_empty() {
-                            ManagementAdmissionError::TargetAlreadyExists
-                        } else {
-                            ManagementAdmissionError::EffectUnsettled
-                        });
-                    }
-                }
-                ConnectorDocumentManagementOperation::SingleTargetUpdate
-                | ConnectorDocumentManagementOperation::Publication => {
-                    let current = state
-                        .get_mut(&request.table)
-                        .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
-                    if current
-                        .installed_observation
-                        .as_ref()
-                        .is_some_and(|observation| !observation.is_open())
-                    {
-                        current.ready = false;
-                        current.installed_observation = None;
-                    }
-                    if !current.ready {
-                        return Err(if current.unsettled.is_empty() {
-                            ManagementAdmissionError::ReadmissionIncomplete
-                        } else {
-                            ManagementAdmissionError::EffectUnsettled
-                        });
-                    }
-                    if current.target.catalog() != &request.catalog
-                        || request.expected_object_id.as_ref() != Some(current.target.object_id())
-                    {
-                        return Err(ManagementAdmissionError::TargetReplaced);
-                    }
-                    if request.expected_dependencies.as_ref() != Some(&current.dependencies) {
-                        return Err(ManagementAdmissionError::DependencyChanged);
-                    }
-                    if !current.unsettled.is_empty() {
-                        return Err(ManagementAdmissionError::EffectUnsettled);
-                    }
-                }
-            }
-        }
-
-        Ok(ManagementEntranceLease {
+        Ok(ManagementEntranceTicket {
             entrance: Arc::downgrade(&self.inner),
-            request,
-            activity: Some(activity),
-            dispatched: None,
+            request: Some(request),
+            activity,
         })
+    }
+
+    /// Blocking convenience for foreground callers. Worker adapters should
+    /// retain the ticket and use `try_acquire` so their event loop never
+    /// blocks behind another owner.
+    pub fn acquire(
+        &self,
+        request: ManagementRequest,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        let owner = activity_owner(request.operation);
+        self.request(request, owner)?
+            .acquire_waiting(cancelled)?
+            .ok_or(ManagementAdmissionError::Cancelled)
     }
 
     pub fn begin_stopping(&self) {
@@ -465,6 +430,67 @@ impl ManagementEntrance {
     }
 }
 
+/// A queued management request. Dropping it before acquisition removes the
+/// request from the shared target FIFO through the embedded activity ticket.
+pub struct ManagementEntranceTicket {
+    entrance: Weak<EntranceInner>,
+    request: Option<ManagementRequest>,
+    activity: MvActivityTicket,
+}
+
+impl ManagementEntranceTicket {
+    /// Acquire only when this request is at the head of the target FIFO.
+    pub fn try_acquire(
+        &mut self,
+    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+        let Some(activity) = self
+            .activity
+            .try_acquire()
+            .map_err(ManagementAdmissionError::from)?
+        else {
+            return Ok(None);
+        };
+        self.finish_acquire(activity).map(Some)
+    }
+
+    /// Wait for the target FIFO while honoring the caller-owned cancellation
+    /// probe. Worker callers normally use `try_acquire` instead.
+    pub fn acquire_waiting(
+        &mut self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<ManagementEntranceLease>, ManagementAdmissionError> {
+        let Some(activity) = self
+            .activity
+            .acquire_waiting(cancelled)
+            .map_err(ManagementAdmissionError::from)?
+        else {
+            return Ok(None);
+        };
+        self.finish_acquire(activity).map(Some)
+    }
+
+    fn finish_acquire(
+        &mut self,
+        activity: MvActivityLease,
+    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let request = self
+            .request
+            .take()
+            .ok_or(ManagementAdmissionError::InvalidRequest)?;
+        validate_request_against_state(&entrance, &request)?;
+        Ok(ManagementEntranceLease {
+            entrance: Arc::downgrade(&entrance),
+            request,
+            activity: Some(activity),
+            dispatched: None,
+        })
+    }
+}
+
 pub struct ManagementEntranceLease {
     entrance: Weak<EntranceInner>,
     request: ManagementRequest,
@@ -473,6 +499,17 @@ pub struct ManagementEntranceLease {
 }
 
 impl ManagementEntranceLease {
+    /// Worker-owned admissions receive a shutdown cancellation view from the
+    /// shared activity gate. Foreground admissions deliberately return none;
+    /// their statement WorkScope remains the cancellation owner.
+    pub fn worker_cancellation(
+        &self,
+    ) -> Option<novarocks_query_application::cancellation::QueryCancellationView> {
+        self.activity
+            .as_ref()
+            .and_then(MvActivityLease::cancellation)
+    }
+
     /// Must be called immediately before crossing the provider side-effect
     /// boundary. Dropping after this point conservatively records Unknown.
     pub fn mark_dispatched(
@@ -649,6 +686,65 @@ impl From<MvActivityAdmissionError> for ManagementAdmissionError {
             MvActivityAdmissionError::Cancelled => Self::Cancelled,
         }
     }
+}
+
+impl From<MvActivityGateError> for ManagementAdmissionError {
+    fn from(value: MvActivityGateError) -> Self {
+        match value {
+            MvActivityGateError::Stopping => Self::Stopping,
+        }
+    }
+}
+
+fn validate_request_against_state(
+    entrance: &EntranceInner,
+    request: &ManagementRequest,
+) -> Result<(), ManagementAdmissionError> {
+    let mut state = lock(&entrance.state);
+    match request.operation {
+        ConnectorDocumentManagementOperation::Create => {
+            if let Some(current) = state.get(&request.table) {
+                return Err(if current.unsettled.is_empty() {
+                    ManagementAdmissionError::TargetAlreadyExists
+                } else {
+                    ManagementAdmissionError::EffectUnsettled
+                });
+            }
+        }
+        ConnectorDocumentManagementOperation::SingleTargetUpdate
+        | ConnectorDocumentManagementOperation::Publication => {
+            let current = state
+                .get_mut(&request.table)
+                .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+            if current
+                .installed_observation
+                .as_ref()
+                .is_some_and(|observation| !observation.is_open())
+            {
+                current.ready = false;
+                current.installed_observation = None;
+            }
+            if !current.ready {
+                return Err(if current.unsettled.is_empty() {
+                    ManagementAdmissionError::ReadmissionIncomplete
+                } else {
+                    ManagementAdmissionError::EffectUnsettled
+                });
+            }
+            if current.target.catalog() != &request.catalog
+                || request.expected_object_id.as_ref() != Some(current.target.object_id())
+            {
+                return Err(ManagementAdmissionError::TargetReplaced);
+            }
+            if request.expected_dependencies.as_ref() != Some(&current.dependencies) {
+                return Err(ManagementAdmissionError::DependencyChanged);
+            }
+            if !current.unsettled.is_empty() {
+                return Err(ManagementAdmissionError::EffectUnsettled);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn activity_owner(operation: ConnectorDocumentManagementOperation) -> MvActivityOwner {
