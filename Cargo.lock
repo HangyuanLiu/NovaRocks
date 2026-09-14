@@ -3903,6 +3903,7 @@ dependencies = [
  "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",

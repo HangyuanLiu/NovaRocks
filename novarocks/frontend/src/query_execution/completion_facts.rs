@@ -38,7 +38,10 @@ use novarocks_query_application::preparation::{
     CatalogFactPort, MaterializedViewFactPort, ProviderReadFactPort, QueryCompletionFactSource,
     StatisticsFactPort,
 };
-use novarocks_spi::connector::{ConnectorRequestContext, MvStorageObservationPort};
+use novarocks_spi::connector::{
+    ConnectorReadAttemptAccess, ConnectorRequestContext, MvStorageObservationPort,
+    read_stack::ConnectorSession,
+};
 use novarocks_sql::compiler::{
     CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact,
     MaterializedViewNeed, StatisticsFact, StatisticsNeed,
@@ -53,6 +56,7 @@ use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports;
 use crate::query_execution::planning::statistics::resolve_statistics_need;
+use crate::query_execution::provider_read_facts::FrontendProviderReadFacts;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 
 /// The owners in this process that can answer a compilation question, and the
@@ -290,6 +294,23 @@ where
         .finish()
         .await
         .map_err(|error| format!("frontend completion fact lane: {error}"))?
+}
+
+/// The fact source one statement's completion is driven with, with all four
+/// kinds of question answered by this process.
+pub(crate) fn frontend_fact_source(
+    owners: CompletionFactOwners,
+    scope: StatementFactScope,
+    session: ConnectorSession,
+) -> QueryCompletionFactSource<ConnectorReadAttemptAccess> {
+    let provider_reads = Arc::new(FrontendProviderReadFacts::new(
+        Arc::clone(&owners.connector_control),
+        Arc::clone(&scope.bindings),
+        session,
+        scope.connector_context.clone(),
+        owners.blocking.clone(),
+    ));
+    statement_fact_source(owners, scope, provider_reads)
 }
 
 /// The one fact source one statement's completion is driven with.

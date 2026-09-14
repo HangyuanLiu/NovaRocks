@@ -36,7 +36,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Mutex, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use novarocks_physical_plan::{NodeKind, PhysicalPlan, ProviderReadOccurrenceId};
@@ -66,13 +66,15 @@ pub struct FrozenReadAccess<A> {
 /// adapter doing the freezing and the owner is the driver that outlives it;
 /// the adapter never reads back what it put in.
 pub struct ReadAccessSink<A> {
-    taken: Mutex<Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>>,
+    taken: Taken<A>,
 }
+
+type Taken<A> = Arc<Mutex<Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>>>;
 
 impl<A> Default for ReadAccessSink<A> {
     fn default() -> Self {
         Self {
-            taken: Mutex::new(Vec::new()),
+            taken: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -90,6 +92,18 @@ impl<A> ReadAccessSink<A> {
     /// already in hand.
     pub fn deposit(&self, occurrence: ProviderReadOccurrenceId, access: FrozenReadAccess<A>) {
         self.entries().push((occurrence, access));
+    }
+
+    /// A deposit slip for wherever the freezing actually happens.
+    ///
+    /// Freezing may run somewhere the sink's borrow cannot reach - a blocking
+    /// lane, another thread - and "deposited the moment it is taken" has to
+    /// hold there too, or that thread becomes a place capabilities can be lost.
+    /// The slip reaches the same account and can do nothing else with it.
+    pub fn deposits(&self) -> ReadAccessDeposit<A> {
+        ReadAccessDeposit {
+            taken: Arc::clone(&self.taken),
+        }
     }
 
     /// Everything taken so far, for an owner that will release rather than use
@@ -124,20 +138,36 @@ impl<A> ReadAccessSink<A> {
         })
     }
 
-    /// A panic while holding this lock leaves a consistent vector, and the
-    /// capabilities in it still have to reach their owner. Refusing to look at
-    /// them would turn one panic into a leak.
     fn entries(
         &self,
     ) -> std::sync::MutexGuard<'_, Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>> {
-        self.taken.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.taken)
     }
 
     fn into_entries(self) -> Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)> {
-        self.taken
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner)
+        std::mem::take(&mut *self.entries())
     }
+}
+
+/// A deposit-only view of one sink, for the thread where a read is frozen.
+#[derive(Clone)]
+pub struct ReadAccessDeposit<A> {
+    taken: Taken<A>,
+}
+
+impl<A> ReadAccessDeposit<A> {
+    pub fn deposit(&self, occurrence: ProviderReadOccurrenceId, access: FrozenReadAccess<A>) {
+        lock(&self.taken).push((occurrence, access));
+    }
+}
+
+/// A panic while holding this lock leaves a consistent vector, and the
+/// capabilities in it still have to reach their owner. Refusing to look at them
+/// would turn one panic into a leak.
+fn lock<A>(
+    taken: &Taken<A>,
+) -> std::sync::MutexGuard<'_, Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>> {
+    taken.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Capabilities for every scan of one completed plan.
