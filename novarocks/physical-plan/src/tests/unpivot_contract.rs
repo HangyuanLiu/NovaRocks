@@ -61,7 +61,7 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -117,7 +117,7 @@ fn finish_unpivot(shape: UnpivotShape) -> Result<Fragment, ValidationErrors> {
         UnpivotShape::Valid | UnpivotShape::ConstantTypeDrift => number,
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: unpivot,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),

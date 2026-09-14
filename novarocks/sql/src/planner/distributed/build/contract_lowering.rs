@@ -41,20 +41,20 @@ use novarocks_physical_plan::{
     JoinDistribution as ContractJoinDistribution, JoinKey, JoinKind as ContractJoinKind,
     JoinSide as ContractJoinSide, LiteralValue as ContractLiteralValue, MetadataRelation,
     MetadataRelationKind, NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering, OrderingKey,
-    OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalNode, PhysicalProperties,
+    OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalProperties,
     PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId, PredicateGuarantee,
     PredicateGuaranteeKind, ProviderReadReference, ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation,
-    RelationField, ResultField, ResultPort, RowCountAssertion, RowCountAssertionSpec,
-    RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability, RuntimeFilterCompletion,
-    RuntimeFilterConsumer, RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget,
-    RuntimeFilterContributionKind, RuntimeFilterCoverage, RuntimeFilterCoverageNode,
-    RuntimeFilterDomain, RuntimeFilterEndpoint, RuntimeFilterEqualityWitness,
-    RuntimeFilterEqualityWitnessId, RuntimeFilterId, RuntimeFilterKind, RuntimeFilterLifecycle,
-    RuntimeFilterLineageStep, RuntimeFilterNullSemantics, RuntimeFilterOrderKey,
-    RuntimeFilterPolicy, RuntimeFilterProducer, RuntimeFilterProducerProgress,
-    RuntimeFilterProducerTarget, RuntimeFilterReduction, RuntimeFilterWitnessId, SealedArtifactRef,
-    SetOperationKind, SortDirection, SortExpr, SortMode, TableFunctionOutput,
-    TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
+    RelationField, RequiredInputs, ResultField, ResultPort, RowCountAssertion,
+    RowCountAssertionSpec, RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability,
+    RuntimeFilterCompletion, RuntimeFilterConsumer, RuntimeFilterConsumerActivation,
+    RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterCoverage,
+    RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
+    RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId, RuntimeFilterId,
+    RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
+    RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy, RuntimeFilterProducer,
+    RuntimeFilterProducerProgress, RuntimeFilterProducerTarget, RuntimeFilterReduction,
+    RuntimeFilterWitnessId, SealedArtifactRef, SetOperationKind, SortDirection, SortExpr, SortMode,
+    TableFunctionOutput, TopNPhase as ContractTopNPhase, TopNSequenceId, UnaryOperator,
     UnpivotConstant as ContractUnpivotConstant, UnpivotSpec, UnpivotValueMapping, ValidationErrors,
     ValueId, ValueOrigin, ValueType, WRITER_MULTIPLEX_SCHEMA_REVISION,
     WindowBound as ContractWindowBound, WindowExpression, WindowFrame as ContractWindowFrame,
@@ -1612,25 +1612,21 @@ impl ContractLoweringVisitor {
                 })
             })
             .collect::<Result<Vec<_>, ContractLoweringError>>()?;
-        let properties = PhysicalProperties {
-            distribution: Distribution::Unconstrained,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::ChangeEventExpand {
+        self.fragment_mut().add_row_rewriting(
+            node,
+            child.node,
+            None,
+            output.clone().into_boxed_slice(),
+            NodeKind::ChangeEventExpand {
                 events: events.into_boxed_slice(),
                 effect_output,
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -2286,16 +2282,9 @@ impl ContractLoweringVisitor {
                 artifact_inputs: contract.artifact_inputs,
             }),
         };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::default(),
-            required_inputs: Box::default(),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Scan {
+        self.fragment_mut().add_scan(
+            node,
+            NodeKind::Scan {
                 occurrence: scan_occurrence,
                 relation: Box::new(relation),
                 read_budget,
@@ -2303,7 +2292,8 @@ impl ContractLoweringVisitor {
                 residuals: residuals.into_boxed_slice(),
                 derived_values: derived_values.into_boxed_slice(),
             },
-        })?;
+            output.clone().into_boxed_slice(),
+        )?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -2468,37 +2458,29 @@ impl ContractLoweringVisitor {
             })
             .collect::<Result<Vec<_>, ContractLoweringError>>()?;
 
-        let required = PhysicalProperties {
-            distribution: projected.properties.distribution.clone(),
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        let properties = PhysicalProperties {
-            distribution: Distribution::Unconstrained,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([projected.node]),
-            required_inputs: Box::from([required.clone()]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone(),
-            },
-            kind: NodeKind::TableWriter {
+        self.fragment_mut().add_row_consuming(
+            node,
+            Box::from([projected.node]),
+            RequiredInputs::AsProduced,
+            Distribution::Unconstrained,
+            output.clone(),
+            NodeKind::TableWriter {
                 target: WriterTarget {
                     handle,
                     write_target_ordinal: ordinal,
                     input: projected.output,
-                    required_distribution: required.distribution,
+                    required_distribution: projected.properties.distribution.clone(),
                     target_fields: target_fields.into_boxed_slice(),
                     output_schema,
                     partial_aggregates: partial_aggregates.into_boxed_slice(),
                 },
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the writer was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -3007,23 +2989,17 @@ impl ContractLoweringVisitor {
                     },
                 )?);
             }
-            self.fragment_mut().insert_node(PhysicalNode {
-                id: union,
-                inputs: exchange_nodes.into_boxed_slice(),
-                required_inputs: (0..exchange_outputs.len())
-                    .map(|_| singleton_properties())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice(),
-                output_properties: singleton_properties(),
-                output: OutputPort {
-                    node: union,
-                    columns: output.clone().into_boxed_slice(),
-                },
-                kind: NodeKind::SetOp {
+            self.fragment_mut().add_row_consuming(
+                union,
+                exchange_nodes.into_boxed_slice(),
+                RequiredInputs::Singleton,
+                Distribution::Singleton,
+                output.clone().into_boxed_slice(),
+                NodeKind::SetOp {
                     kind: SetOperationKind::UnionAll,
                     input_mappings: exchange_outputs.into_boxed_slice(),
                 },
-            })?;
+            )?;
             (union, output)
         };
 
@@ -3205,23 +3181,20 @@ impl ContractLoweringVisitor {
                 },
             )
             .transpose()?;
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: finish,
-            inputs: Box::from([finish_input]),
-            required_inputs: Box::from([singleton_properties()]),
-            output_properties: singleton_properties(),
-            output: OutputPort {
-                node: finish,
-                columns: output.clone(),
-            },
-            kind: NodeKind::TableFinish(WriterFinishSpec {
+        self.fragment_mut().add_row_consuming(
+            finish,
+            Box::from([finish_input]),
+            RequiredInputs::Singleton,
+            Distribution::Singleton,
+            output.clone(),
+            NodeKind::TableFinish(WriterFinishSpec {
                 expected_target_ordinals: ordinals,
                 input_schema,
                 output_schema,
                 final_aggregates: final_aggregates.into_boxed_slice(),
                 grouped_unpivot,
             }),
-        })?;
+        )?;
         let fields = root_schema
             .arrow_schema()
             .fields()
@@ -3605,25 +3578,18 @@ impl ContractLoweringVisitor {
             columns,
             null_extended,
         } = lowered_output;
-        let properties = PhysicalProperties {
-            distribution: if distribution == ContractJoinDistribution::Singleton {
-                Distribution::Singleton
-            } else {
-                hash_join_output_distribution(kind, build_side, left, right)
-            },
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
+        let output_distribution = if distribution == ContractJoinDistribution::Singleton {
+            Distribution::Singleton
+        } else {
+            hash_join_output_distribution(kind, build_side, left, right)
         };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([left.node, right.node]),
+        self.fragment_mut().add_join(
+            node,
+            [left.node, right.node],
             required_inputs,
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone(),
-            },
-            kind: NodeKind::HashJoin {
+            output.clone(),
+            output_distribution,
+            NodeKind::HashJoin {
                 kind,
                 keys: keys.into_boxed_slice(),
                 build_side,
@@ -3631,7 +3597,12 @@ impl ContractLoweringVisitor {
                 residual,
                 null_extended,
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the join was just inserted")
+            .clone();
         for intent in &join.build_runtime_filters {
             if join.execution_mode != Some(intent.execution_mode) {
                 return Err(ContractLoweringError::InvalidRuntimeFilter {
@@ -3825,27 +3796,24 @@ impl ContractLoweringVisitor {
                 right_columns: &plan.children[1].output_columns,
             },
         )?;
-        let properties = PhysicalProperties {
-            distribution: output_distribution,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([left.node, right.node]),
+        self.fragment_mut().add_join(
+            node,
+            [left.node, right.node],
             required_inputs,
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone(),
-            },
-            kind: NodeKind::NestLoopJoin {
+            output.clone(),
+            output_distribution,
+            NodeKind::NestLoopJoin {
                 kind,
                 distribution,
                 predicate,
                 null_extended,
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the join was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -4166,25 +4134,22 @@ impl ContractLoweringVisitor {
                 )
             }
         };
-        let properties = PhysicalProperties {
-            distribution: output_distribution,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: inputs.iter().map(|input| input.node).collect(),
-            required_inputs,
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::SetOp {
+        self.fragment_mut().add_row_consuming(
+            node,
+            inputs.iter().map(|input| input.node).collect(),
+            RequiredInputs::Exact(required_inputs),
+            output_distribution,
+            output.clone().into_boxed_slice(),
+            NodeKind::SetOp {
                 kind,
                 input_mappings: mappings,
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -4510,25 +4475,22 @@ impl ContractLoweringVisitor {
         };
         require_single_copy_input("HashAggregate", &child.properties)?;
         let output_distribution = aggregate_output_distribution(&child.properties, &output);
-        let properties = PhysicalProperties {
-            distribution: output_distribution,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: Box::default(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([required]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Aggregate {
+        self.fragment_mut().add_row_consuming(
+            node,
+            Box::from([child.node]),
+            RequiredInputs::Exact(Box::from([required])),
+            output_distribution,
+            output.clone().into_boxed_slice(),
+            NodeKind::Aggregate {
                 group_by: group_by.into_boxed_slice(),
                 calls: calls.into_boxed_slice(),
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
         for intent in &aggregate.topn_runtime_filter_builds {
             let group_key_ordinal = u32::try_from(intent.group_key_ordinal).map_err(|_| {
                 ContractLoweringError::InvalidRuntimeFilter {
@@ -4655,12 +4617,17 @@ impl ContractLoweringVisitor {
             rows.push(lowered_row.into_boxed_slice());
         }
 
-        let properties = singleton_properties();
+        let _properties = singleton_properties();
         self.fragment_mut().add_values(
             node,
             rows.into_boxed_slice(),
             output.clone().into_boxed_slice(),
         )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -4918,20 +4885,12 @@ impl ContractLoweringVisitor {
             }
         })?;
         let passthrough_map = passthrough.iter().copied().collect::<BTreeMap<_, _>>();
-        let properties = novarocks_physical_plan::remap_properties_through_values(
-            &child.properties,
-            &passthrough_map,
-        );
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Unpivot {
+        self.fragment_mut().add_row_rewriting(
+            node,
+            child.node,
+            Some(&passthrough_map),
+            output.clone().into_boxed_slice(),
+            NodeKind::Unpivot {
                 spec: UnpivotSpec {
                     passthrough: passthrough.into_boxed_slice(),
                     value_output,
@@ -4941,7 +4900,12 @@ impl ContractLoweringVisitor {
                     max_output_bytes,
                 },
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the node was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5623,21 +5587,12 @@ impl ContractLoweringVisitor {
             }
             distribution => distribution.clone(),
         };
-        let properties = PhysicalProperties {
+        self.fragment_mut().add_row_expanding(
+            node,
+            child.node,
             distribution,
-            row_multiplicity: child.properties.row_multiplicity,
-            ordering: child.properties.ordering.clone(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::TableFunction {
+            output.clone().into_boxed_slice(),
+            NodeKind::TableFunction {
                 function: BoundTableFunction {
                     function_id: binding.function_id.clone(),
                     overload: binding.selected.overload.clone(),
@@ -5651,7 +5606,12 @@ impl ContractLoweringVisitor {
                 outputs: outputs.into_boxed_slice(),
                 left_outer: table_function.is_left_join,
             },
-        })?;
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the table function was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5814,21 +5774,16 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
         let properties = child.properties.clone();
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([child.properties.clone()]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Window(WindowSpec {
+        self.fragment_mut().add_row_widening(
+            node,
+            child.node,
+            output.clone().into_boxed_slice(),
+            NodeKind::Window(WindowSpec {
                 partition_by,
                 order_by,
                 expressions: window_expressions.into_boxed_slice(),
             }),
-        })?;
+        )?;
         let mut display_names = child.display_names.to_vec();
         display_names.extend(output_columns.iter().map(|column| column.name.clone()));
         Ok(LoweredNode {

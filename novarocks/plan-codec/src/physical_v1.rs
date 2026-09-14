@@ -1284,7 +1284,7 @@ mod tests {
             );
         }
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -1353,7 +1353,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -1373,7 +1373,7 @@ mod tests {
             .add_expression(project, ty, ExprKind::Value(value))
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -1390,7 +1390,7 @@ mod tests {
 
         let limit = builder.reserve_node_id().unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: limit,
                 inputs: Box::from([project]),
                 required_inputs: Box::from([properties()]),

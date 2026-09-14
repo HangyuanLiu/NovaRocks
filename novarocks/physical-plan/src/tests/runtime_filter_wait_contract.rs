@@ -70,7 +70,7 @@ fn append_single_copy_literal(builder: &mut FragmentBuilder) -> (NodeId, ValueId
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -101,7 +101,7 @@ fn append_exchange(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -137,7 +137,7 @@ fn append_cte_exchange(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -168,7 +168,7 @@ fn append_broadcast_join(
         .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(right.1))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([single_copy(), broadcast()]),

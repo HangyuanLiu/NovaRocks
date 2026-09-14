@@ -4472,7 +4472,7 @@ mod tests {
             ordering: Box::default(),
         };
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: root,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4494,7 +4494,7 @@ mod tests {
         for _ in 0..4_000 {
             let node = builder.reserve_node_id().expect("deep node id");
             builder
-                .insert_node(PhysicalNode {
+                .insert_node_unchecked(PhysicalNode {
                     id: node,
                     inputs: Box::from([root]),
                     required_inputs: Box::from([properties.clone()]),

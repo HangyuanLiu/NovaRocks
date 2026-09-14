@@ -189,7 +189,7 @@ impl FragmentBuilder {
         );
         let output_properties =
             crate::derive_filter_output_properties(&input_properties, replica_deterministic);
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -227,7 +227,7 @@ impl FragmentBuilder {
             row_multiplicity: crate::RowMultiplicity::SingleCopy,
             ordering: source.output_properties.ordering.clone(),
         };
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::PhysicalProperties {
@@ -265,7 +265,7 @@ impl FragmentBuilder {
             row_multiplicity: crate::RowMultiplicity::SingleCopy,
             ordering: Box::default(),
         };
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -307,7 +307,7 @@ impl FragmentBuilder {
             self.passthrough_ordering_properties(node, input, &mode, ordering)?;
         let source = self.nodes.get(&input).expect("checked above");
         let columns = source.output.columns.clone();
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -350,7 +350,7 @@ impl FragmentBuilder {
             self.passthrough_ordering_properties(node, input, &mode, ordering)?;
         let source = self.nodes.get(&input).expect("checked above");
         let columns = source.output.columns.clone();
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([required]),
@@ -405,7 +405,7 @@ impl FragmentBuilder {
             &output,
             replica_deterministic,
         );
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -452,7 +452,7 @@ impl FragmentBuilder {
                 });
             }
         }
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -553,7 +553,7 @@ impl FragmentBuilder {
             .collect::<BTreeMap<_, _>>();
         let output_properties =
             crate::remap_properties_through_values(&input_properties, &passthrough);
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
@@ -570,6 +570,269 @@ impl FragmentBuilder {
         })
     }
 
+    /// Adds a join of `left` and `right`.
+    ///
+    /// A join result owns each logical row once, which is why a broadcast-build
+    /// join is sound at all: the replicated side is consumed against a
+    /// single-copy side that anchors ownership. Both sides replicated has no
+    /// anchor, so the result would carry copies the contract then forbids
+    /// downstream. Stating `SingleCopy` at the call site let that mistake be
+    /// written; deriving it here means the anchor is checked instead.
+    ///
+    /// A join also establishes no ordering, so none is carried forward.
+    pub fn add_join(
+        &mut self,
+        node: NodeId,
+        sides: [NodeId; 2],
+        required_inputs: Box<[crate::PhysicalProperties]>,
+        output: Box<[ValueId]>,
+        distribution: crate::Distribution,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        debug_assert!(
+            matches!(
+                kind,
+                NodeKind::HashJoin { .. } | NodeKind::NestLoopJoin { .. }
+            ),
+            "add_join is for join kinds"
+        );
+        let mut single_copy = false;
+        for input in sides {
+            let source = self
+                .nodes
+                .get(&input)
+                .ok_or(BuildError::UndefinedInput { node, input })?;
+            single_copy |=
+                source.output_properties.row_multiplicity == crate::RowMultiplicity::SingleCopy;
+        }
+        if !single_copy {
+            return Err(BuildError::JoinWithoutOwnershipAnchor(node));
+        }
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::from(sides),
+            required_inputs,
+            output_properties: crate::PhysicalProperties {
+                distribution,
+                row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            },
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    /// Adds a provider scan.
+    ///
+    /// A scan's properties are the relation's own: the provider stated what its
+    /// read delivers, so restating it on the node is only a chance to disagree
+    /// with it.
+    pub fn add_scan(
+        &mut self,
+        node: NodeId,
+        kind: NodeKind,
+        output: Box<[ValueId]>,
+    ) -> Result<(), BuildError> {
+        let NodeKind::Scan { relation, .. } = &kind else {
+            return Err(BuildError::WrongNodeKindForConstructor {
+                node,
+                expected: "Scan",
+            });
+        };
+        let output_properties = relation.provided_properties().clone();
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties,
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    /// Adds an operator that consumes every logical row exactly once.
+    ///
+    /// A complete aggregate, a set operation, a writer and a table finish all
+    /// share one requirement the contract states and each call site restated:
+    /// they must not see execution copies, because each copy would be counted,
+    /// combined or written again. They also establish no ordering. The caller
+    /// supplies the layout the operator produces; the rest follows.
+    pub fn add_row_consuming(
+        &mut self,
+        node: NodeId,
+        inputs: Box<[NodeId]>,
+        required_inputs: RequiredInputs,
+        output_distribution: crate::Distribution,
+        output: Box<[ValueId]>,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        let mut derived = Vec::with_capacity(inputs.len());
+        for input in &inputs {
+            let source = self.nodes.get(input).ok_or(BuildError::UndefinedInput {
+                node,
+                input: *input,
+            })?;
+            if source.output_properties.row_multiplicity != crate::RowMultiplicity::SingleCopy {
+                return Err(BuildError::ReplicatedRowsConsumedOnce {
+                    node,
+                    input: *input,
+                });
+            }
+            let distribution = match &required_inputs {
+                RequiredInputs::Singleton => crate::Distribution::Singleton,
+                RequiredInputs::AsProduced | RequiredInputs::Exact(_) => {
+                    source.output_properties.distribution.clone()
+                }
+            };
+            derived.push(crate::PhysicalProperties {
+                distribution,
+                row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            });
+        }
+        let required = match required_inputs {
+            RequiredInputs::Exact(exact) if exact.len() == inputs.len() => exact.into_vec(),
+            RequiredInputs::Exact(exact) => {
+                return Err(BuildError::RequirementCountMismatch {
+                    node,
+                    inputs: inputs.len(),
+                    requirements: exact.len(),
+                });
+            }
+            _ => derived,
+        };
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs,
+            required_inputs: required.into_boxed_slice(),
+            output_properties: crate::PhysicalProperties {
+                distribution: output_distribution,
+                row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            },
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    /// Adds an operator that adds columns to the rows it passes through.
+    ///
+    /// A window leaves layout, multiplicity and ordering exactly as it found
+    /// them - it only widens rows - so all three are taken from the input
+    /// rather than restated.
+    pub fn add_row_widening(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        output: Box<[ValueId]>,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let properties = source.output_properties.clone();
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([properties.clone()]),
+            output_properties: properties,
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    /// Adds an operator that rewrites the rows it reads, keeping the values in
+    /// `passthrough` and replacing the rest.
+    ///
+    /// Whatever layout or ordering the input had survives only for values that
+    /// survive, which is precisely what `passthrough` records, so the builder
+    /// remaps rather than taking the result on trust. Passing `None` states
+    /// that nothing survives.
+    pub fn add_row_rewriting(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        passthrough: Option<&BTreeMap<ValueId, ValueId>>,
+        output: Box<[ValueId]>,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let input_properties = source.output_properties.clone();
+        let output_properties = match passthrough {
+            Some(passthrough) => {
+                crate::remap_properties_through_values(&input_properties, passthrough)
+            }
+            None => crate::PhysicalProperties {
+                distribution: crate::Distribution::Unconstrained,
+                row_multiplicity: input_properties.row_multiplicity,
+                ordering: Box::default(),
+            },
+        };
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
+            output_properties,
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
+    /// Adds an operator that appends generated rows to each input row while
+    /// leaving the input's own rows intact.
+    ///
+    /// A lateral table function keeps each input row's ordering and copies and
+    /// only narrows the layout when the function is not replica-deterministic,
+    /// which is a property of the function rather than a caller choice.
+    pub fn add_row_expanding(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        distribution: crate::Distribution,
+        output: Box<[ValueId]>,
+        kind: NodeKind,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let input_properties = source.output_properties.clone();
+        self.insert_node_unchecked(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
+            output_properties: crate::PhysicalProperties {
+                distribution,
+                row_multiplicity: input_properties.row_multiplicity,
+                ordering: input_properties.ordering.clone(),
+            },
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind,
+        })
+    }
+
     /// Inserts a node that produces rows without reading any.
     fn insert_leaf(
         &mut self,
@@ -577,7 +840,7 @@ impl FragmentBuilder {
         output: Box<[ValueId]>,
         kind: NodeKind,
     ) -> Result<(), BuildError> {
-        self.insert_node(PhysicalNode {
+        self.insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -668,7 +931,13 @@ impl FragmentBuilder {
         self.nodes.get(&node).map(|node| &node.output_properties)
     }
 
-    pub fn insert_node(&mut self, node: PhysicalNode) -> Result<(), BuildError> {
+    /// Inserts a fully-stated node without deriving or checking anything.
+    ///
+    /// The planner does not use this: every node family has a constructor that
+    /// derives what the caller does not decide and refuses what it cannot mean.
+    /// It remains reachable so tests can build the states those constructors
+    /// exist to reject, which is the only way to prove they are rejected.
+    pub fn insert_node_unchecked(&mut self, node: PhysicalNode) -> Result<(), BuildError> {
         let id = node.id;
         let next_node = self.next_node.max(
             id.get()
@@ -892,6 +1161,40 @@ pub enum BuildError {
         expected: usize,
         actual: usize,
     },
+    /// Both join inputs are replicated, so nothing anchors ownership of a
+    /// logical row and the result would carry execution copies.
+    JoinWithoutOwnershipAnchor(NodeId),
+    /// An operator that consumes each logical row once was given replicated
+    /// rows, where every execution copy would be counted or written again.
+    ReplicatedRowsConsumedOnce {
+        node: NodeId,
+        input: NodeId,
+    },
+    WrongNodeKindForConstructor {
+        node: NodeId,
+        expected: &'static str,
+    },
+    RequirementCountMismatch {
+        node: NodeId,
+        inputs: usize,
+        requirements: usize,
+    },
+}
+
+/// What an operator needs of its inputs' layout.
+///
+/// `Singleton` and `AsProduced` are derived per input, so the caller states an
+/// intent rather than a value. `Exact` exists for operators whose requirement
+/// depends on a choice the planner made - a join's build side, a set
+/// operation's strategy - which the contract cannot re-derive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequiredInputs {
+    /// All rows on one lane.
+    Singleton,
+    /// Whatever each input already produces, unchanged.
+    AsProduced,
+    /// Exactly these, one per input.
+    Exact(Box<[crate::PhysicalProperties]>),
 }
 
 impl fmt::Display for BuildError {
@@ -971,6 +1274,31 @@ impl fmt::Display for BuildError {
             } => write!(
                 formatter,
                 "values node {} has a row of {actual} expressions for {expected} columns",
+                node.get()
+            ),
+            Self::JoinWithoutOwnershipAnchor(id) => write!(
+                formatter,
+                "join {} has no single-copy input to anchor row ownership",
+                id.get()
+            ),
+            Self::ReplicatedRowsConsumedOnce { node, input } => write!(
+                formatter,
+                "node {} consumes each row once but input {} is replicated",
+                node.get(),
+                input.get()
+            ),
+            Self::WrongNodeKindForConstructor { node, expected } => write!(
+                formatter,
+                "node {} was built with the {expected} constructor for another kind",
+                node.get()
+            ),
+            Self::RequirementCountMismatch {
+                node,
+                inputs,
+                requirements,
+            } => write!(
+                formatter,
+                "node {} has {inputs} inputs but {requirements} input requirements",
                 node.get()
             ),
             Self::DuplicateArtifactRef(id) => {

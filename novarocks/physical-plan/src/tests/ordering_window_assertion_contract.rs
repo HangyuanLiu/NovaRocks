@@ -104,7 +104,7 @@ fn append_exchange_source(
         },
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -160,7 +160,7 @@ fn finish_sort(
         ]),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([input_properties.clone()]),
@@ -191,7 +191,7 @@ fn finish_topn(
         .add_expression(node, ty(DataType::Int64, false), ExprKind::Value(order))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([input_properties.clone()]),
@@ -250,7 +250,7 @@ fn finish_topn_reduction(
         scheme: hash_scheme(81),
     };
     partial_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: partial_source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -278,7 +278,7 @@ fn finish_topn_reduction(
         )
         .unwrap();
     partial_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: partial_topn,
             inputs: Box::from([partial_source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -325,7 +325,7 @@ fn finish_topn_reduction(
         )
         .unwrap();
     final_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: final_source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -353,7 +353,7 @@ fn finish_topn_reduction(
         )
         .unwrap();
     final_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: final_topn,
             inputs: Box::from([final_source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -575,7 +575,7 @@ fn finish_window(
         },
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([required_properties]),
@@ -603,7 +603,7 @@ fn finish_assertion(
         append_exchange_source(&mut builder, 404, distribution_kind, false);
     let node = builder.reserve_node_id().unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([properties.clone()]),
@@ -980,7 +980,7 @@ fn finish_table_function_with_sink(
         SourceDistribution::Broadcast | SourceDistribution::Singleton => properties.clone(),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([properties]),

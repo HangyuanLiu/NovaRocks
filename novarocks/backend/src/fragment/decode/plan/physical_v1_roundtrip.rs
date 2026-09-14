@@ -96,7 +96,7 @@ fn append_i64_values(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -127,7 +127,7 @@ fn append_empty_broadcast_i64_values(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -231,7 +231,7 @@ fn finish_hash_join_plan(
         ),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([left, right]),
             required_inputs,
@@ -265,7 +265,7 @@ fn finish_nest_loop_projection_plan(fragment_id: u32) -> PhysicalPlan {
     let join = builder.reserve_node_id().unwrap();
     let outputs: Box<[ValueId]> = Box::from([right_value]);
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([singleton_properties(), singleton_properties()]),
@@ -681,7 +681,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         )
         .unwrap();
     source_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: expand,
             inputs: Box::from([values]),
             required_inputs: Box::from([singleton_properties()]),
@@ -712,7 +712,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         .add_expression(project, input_ty.clone(), ExprKind::Value(routed))
         .unwrap();
     source_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: project,
             inputs: Box::from([expand]),
             required_inputs: Box::from([unconstrained_properties()]),
@@ -774,7 +774,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         )
         .unwrap();
     writer_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -793,7 +793,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
     let writer_fields = writer_relation_fields(&mut writer_builder, writer, false);
     let handle = write_handle();
     writer_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: writer,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([singleton_properties()]),
@@ -869,7 +869,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
         .map(|(source, imported)| (source.value, imported.value))
         .collect();
     finish_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: finish_exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -890,7 +890,7 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
     let finish = finish_builder.reserve_node_id().unwrap();
     let root_fields = writer_relation_fields(&mut finish_builder, finish, true);
     finish_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: finish,
             inputs: Box::from([finish_exchange]),
             required_inputs: Box::from([singleton_properties()]),
@@ -1024,7 +1024,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: values,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1044,7 +1044,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
         .add_expression(project, ty.clone(), ExprKind::Value(value))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: project,
             inputs: Box::from([values]),
             required_inputs: Box::from([properties.clone()]),
@@ -1061,7 +1061,7 @@ fn physical_plan_finish_encode_decode_preserves_transparent_duplicate_layout() {
 
     let limit = builder.reserve_node_id().unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: limit,
             inputs: Box::from([project]),
             required_inputs: Box::from([properties.clone()]),
@@ -1157,7 +1157,7 @@ fn physical_plan_finish_encode_decode_preserves_set_op_fresh_output_layout() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: set_op,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([singleton_properties(), singleton_properties()]),

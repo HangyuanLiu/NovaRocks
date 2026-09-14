@@ -55,7 +55,7 @@ fn append_exchange_input(
         ordering: Box::default(),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -99,7 +99,7 @@ fn finish_join(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -143,7 +143,7 @@ fn finish_scan_with_budget(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -222,7 +222,7 @@ fn finish_plan_with_partition_distributions(
             .unwrap();
         assert_eq!(value, ValueId::new(0));
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: scan,
                 inputs: Box::default(),
                 required_inputs: Box::default(),

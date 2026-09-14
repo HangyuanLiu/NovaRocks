@@ -118,7 +118,7 @@ fn add_provider_scan(
         .into_boxed_slice();
     metadata.provided_properties = output_properties.clone();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -168,7 +168,7 @@ fn add_exchange_source(
         })
         .collect::<Vec<_>>();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -247,7 +247,7 @@ fn add_aggregate(
     let mut columns = group_inputs.to_vec();
     columns.push(output);
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([input_properties]),
@@ -510,7 +510,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
         })
         .collect::<Vec<_>>();
     destination
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: final_node,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([singleton.clone()]),

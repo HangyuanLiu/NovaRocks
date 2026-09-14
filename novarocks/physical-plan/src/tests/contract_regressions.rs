@@ -80,7 +80,7 @@ fn append_literal_with_distribution(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -123,7 +123,7 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
         )
         .map_err(|error| error.to_string())?;
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -181,7 +181,7 @@ fn null_safe_join_filter(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: left,
             inputs: Box::from([left_source]),
             required_inputs: Box::from([unconstrained()]),
@@ -213,7 +213,7 @@ fn null_safe_join_filter(
         .add_expression(join, value_type.clone(), ExprKind::Value(right_value))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([
@@ -370,7 +370,7 @@ fn scan_lineage_filter(
         .map(|(_, value)| *value)
         .collect::<Vec<_>>();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -400,7 +400,7 @@ fn scan_lineage_filter(
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: filter,
                 inputs: Box::from([scan]),
                 required_inputs: Box::from([unconstrained()]),
@@ -462,7 +462,7 @@ fn scan_lineage_filter(
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([lineage_input]),
                 required_inputs: Box::from([unconstrained()]),
@@ -512,7 +512,7 @@ fn scan_lineage_filter(
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: inner_join,
                 inputs: Box::from([probe_node, equivalent]),
                 required_inputs: Box::from([
@@ -573,7 +573,7 @@ fn scan_lineage_filter(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([probe_node, build]),
             required_inputs: Box::from([
@@ -722,7 +722,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -750,7 +750,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: aggregate,
             inputs: Box::from([scan]),
             required_inputs: Box::from([singleton()]),
@@ -774,7 +774,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: topn,
             inputs: Box::from([aggregate]),
             required_inputs: Box::from([singleton()]),
@@ -1222,7 +1222,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: aggregate,
             inputs: Box::from([aggregate_input]),
             required_inputs: Box::from([PhysicalProperties {
@@ -1353,7 +1353,7 @@ fn append_hash_exchange_source(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1394,7 +1394,7 @@ fn append_partitioned_inner_join(
         .add_expression(node, value_type, ExprKind::Value(right.1))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -1503,7 +1503,7 @@ fn append_exchange_source(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1538,7 +1538,7 @@ fn append_inner_join_with_properties(
         .add_expression(node, value_type, ExprKind::Value(right.1))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([left.0, right.0]),
             required_inputs: Box::from([left_properties, right_properties]),
@@ -1928,7 +1928,7 @@ fn table_function_fragment(
             .unwrap()
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([unconstrained()]),
@@ -2056,7 +2056,7 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2195,7 +2195,7 @@ fn higher_order_function_fragment(
         projections.push((lambda, lambda_output));
     }
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([input]),
             required_inputs: Box::from([unconstrained()]),
@@ -2325,7 +2325,7 @@ fn invalid_table_writer_fragment(
         Distribution::Unconstrained
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: writer,
             inputs: Box::from([input]),
             required_inputs: Box::from([unconstrained()]),
@@ -2494,7 +2494,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
         })
         .collect::<Vec<_>>();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: input,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2780,7 +2780,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
         columns: output_fields.iter().map(|field| field.value).collect(),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: finish,
             inputs: Box::from([input]),
             required_inputs: Box::from([PhysicalProperties {

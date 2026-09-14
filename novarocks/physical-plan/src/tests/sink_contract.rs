@@ -57,7 +57,7 @@ fn literal_root() -> (FragmentBuilder, NodeId, ValueId, ValueId) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -129,7 +129,7 @@ fn change_event_root_with_assignment(
         }
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -259,7 +259,7 @@ fn finish_router_writer_fixture(
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -360,7 +360,7 @@ fn finish_router_writer_fixture(
         route_token
     };
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: writer,
             inputs: Box::from([exchange]),
             required_inputs: Box::from([PhysicalProperties {
@@ -424,7 +424,7 @@ fn finish_router_writer_fixture(
         })
         .collect::<Vec<_>>();
     finish_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: finish_exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -470,7 +470,7 @@ fn finish_router_writer_fixture(
             )
             .unwrap();
         local_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: local_input,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -524,7 +524,7 @@ fn finish_router_writer_fixture(
             })
             .collect::<Vec<_>>();
         local_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: local_writer,
                 inputs: Box::from([local_input]),
                 required_inputs: Box::from([PhysicalProperties {
@@ -591,7 +591,7 @@ fn finish_router_writer_fixture(
             })
             .collect::<Vec<_>>();
         finish_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: local_exchange,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -647,7 +647,7 @@ fn finish_router_writer_fixture(
             local_mapping.swap(4, 5);
         }
         finish_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: union,
                 inputs: Box::from([finish_exchange, local_exchange]),
                 required_inputs: Box::from([
@@ -816,7 +816,7 @@ fn finish_router_writer_fixture(
         })
         .collect::<Vec<_>>();
     finish_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: finish,
             inputs: Box::from([finish_input_node]),
             required_inputs: Box::from([PhysicalProperties {

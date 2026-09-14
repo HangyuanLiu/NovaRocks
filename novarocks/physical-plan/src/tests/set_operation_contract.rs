@@ -42,7 +42,7 @@ fn append_hash_exchange(
         ordering: Box::default(),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -98,7 +98,7 @@ fn finish_duplicate_comparison_intersect(
         Box::from([output])
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: set_op,
             inputs: Box::from([left, right]),
             required_inputs: Box::from([left_properties, right_properties]),

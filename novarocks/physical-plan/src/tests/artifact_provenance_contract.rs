@@ -39,7 +39,7 @@ fn provenance_cut_fixture() -> (PhysicalPlan, FragmentId) {
         )
         .unwrap();
     source_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -71,7 +71,7 @@ fn provenance_cut_fixture() -> (PhysicalPlan, FragmentId) {
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: exchange,
             inputs: Box::default(),
             required_inputs: Box::default(),

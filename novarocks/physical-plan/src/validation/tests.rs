@@ -192,7 +192,7 @@ mod validation_error_tests {
             })
             .collect::<Vec<_>>();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -284,7 +284,7 @@ mod validation_error_tests {
             ordering: Box::default(),
         };
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: input,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -310,7 +310,7 @@ mod validation_error_tests {
             .collect::<Vec<_>>();
         let output_values = input_values.clone();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([input]),
                 required_inputs: Box::from([singleton.clone()]),
@@ -582,7 +582,7 @@ mod validation_error_tests {
             ordering: Box::default(),
         };
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -605,7 +605,7 @@ mod validation_error_tests {
                 .add_expression(project, value_type.clone(), ExprKind::Value(*value))
                 .unwrap();
             builder
-                .insert_node(PhysicalNode {
+                .insert_node_unchecked(PhysicalNode {
                     id: project,
                     inputs: Box::from([source]),
                     required_inputs: Box::from([singleton.clone()]),
@@ -634,7 +634,7 @@ mod validation_error_tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: union,
                 inputs: projects.clone().into_boxed_slice(),
                 required_inputs: vec![singleton.clone(); projects.len()].into_boxed_slice(),

@@ -4615,7 +4615,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: left,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4644,7 +4644,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: right,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4667,7 +4667,7 @@ mod tests {
             .add_expression(join, ty.clone(), ExprKind::Value(right_value))
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: join,
                 inputs: Box::from([left, right]),
                 required_inputs: Box::from([properties(), properties()]),
@@ -4740,7 +4740,7 @@ mod tests {
             .add_expression(join, ty.clone(), ExprKind::Value(right_value))
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: join,
                 inputs: Box::from([left, right]),
                 required_inputs: Box::from([properties(), properties()]),
@@ -4828,7 +4828,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4847,7 +4847,7 @@ mod tests {
         for _ in 1..depth {
             let limit = builder.reserve_node_id().unwrap();
             builder
-                .insert_node(PhysicalNode {
+                .insert_node_unchecked(PhysicalNode {
                     id: limit,
                     inputs: Box::from([root]),
                     required_inputs: Box::from([properties()]),
@@ -4917,7 +4917,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -4971,7 +4971,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -5044,7 +5044,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5062,7 +5062,7 @@ mod tests {
         for _ in 1..node_depth {
             let limit = builder.reserve_node_id().unwrap();
             builder
-                .insert_node(PhysicalNode {
+                .insert_node_unchecked(PhysicalNode {
                     id: limit,
                     inputs: Box::from([root]),
                     required_inputs: Box::from([properties()]),
@@ -5187,7 +5187,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5221,7 +5221,7 @@ mod tests {
             outputs.push(output);
         }
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -5331,7 +5331,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5414,7 +5414,7 @@ mod tests {
             ordering: Box::default(),
         };
         partial_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: partial_source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5435,7 +5435,7 @@ mod tests {
             .unwrap();
         let sequence = TopNSequenceId::new(1);
         partial_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: partial_topn,
                 inputs: Box::from([partial_source]),
                 required_inputs: Box::from([partial_input_properties]),
@@ -5488,7 +5488,7 @@ mod tests {
             )
             .unwrap();
         final_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: final_source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5508,7 +5508,7 @@ mod tests {
             .add_expression(final_topn, ty.clone(), ExprKind::Value(final_value))
             .unwrap();
         final_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: final_topn,
                 inputs: Box::from([final_source]),
                 required_inputs: Box::from([properties()]),
@@ -5697,7 +5697,7 @@ mod tests {
             ordering: Box::default(),
         };
         join_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: left,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5732,7 +5732,7 @@ mod tests {
             ordering: Box::default(),
         };
         join_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: right,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -5752,7 +5752,7 @@ mod tests {
             .add_expression(aggregate, ty.clone(), ExprKind::Value(right_value))
             .unwrap();
         join_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: aggregate,
                 inputs: Box::from([right]),
                 required_inputs: Box::from([right_properties.clone()]),
@@ -5775,7 +5775,7 @@ mod tests {
             .add_expression(join, ty.clone(), ExprKind::Value(right_value))
             .unwrap();
         join_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: join,
                 inputs: Box::from([left, aggregate]),
                 required_inputs: Box::from([left_properties.clone(), right_properties]),
@@ -6054,7 +6054,7 @@ mod tests {
             )
             .unwrap();
         fragment_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: values,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -6073,7 +6073,7 @@ mod tests {
             .add_expression(project, ty.clone(), ExprKind::Value(value))
             .unwrap();
         fragment_builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: project,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -6144,7 +6144,7 @@ mod tests {
         let (values, value) = append_test_i64_values(&mut builder, 1);
         let limit = builder.reserve_node_id().unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: limit,
                 inputs: Box::from([values]),
                 required_inputs: Box::from([properties()]),
@@ -6233,7 +6233,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -6292,7 +6292,7 @@ mod tests {
             }]);
         assert!(!v1_repeat_grouping_values_are_lossless(&grouping_values));
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: repeat,
                 inputs: Box::from([source]),
                 required_inputs: Box::from([properties()]),
@@ -6429,7 +6429,7 @@ mod tests {
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: source,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -6445,7 +6445,7 @@ mod tests {
             .unwrap();
         let assertion = builder.reserve_node_id().unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: assertion,
                 inputs: Box::from([source]),
                 required_inputs: Box::from([properties()]),

@@ -134,7 +134,7 @@ fn literal_fragment(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -235,7 +235,7 @@ fn finish_scan_relation_at(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -350,7 +350,7 @@ fn finish_scan_predicate_contract(
         Relation::Metadata(relation) => relation.predicate_guarantees = predicate_guarantees,
     }
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -462,7 +462,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: destination_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -486,7 +486,7 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: result_node,
             inputs: Box::from([destination_node]),
             required_inputs: Box::from([unconstrained()]),
@@ -595,7 +595,7 @@ fn edge_rejects_a_nullable_type_mismatch_before_plan_publication() {
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: destination_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -655,7 +655,7 @@ fn broadcast_edge_plan(
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: receiver,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -734,7 +734,7 @@ fn broadcast_properties_cannot_claim_single_copy_rows() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -783,7 +783,7 @@ fn non_empty_values_require_an_exact_singleton_or_replicated_broadcast_placement
             )
             .unwrap();
         builder
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
@@ -844,7 +844,7 @@ fn metadata_relation_and_progressive_artifact_sink_are_closed_contracts() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1049,7 +1049,7 @@ fn cte_import_is_proven_by_the_exact_multicast_cut() {
         )
         .unwrap();
     consumer_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: receiver,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1159,7 +1159,7 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1222,7 +1222,7 @@ fn wide_connective_fragment(
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1262,7 +1262,7 @@ fn boolean_source() -> (FragmentBuilder, NodeId, ExprId) {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: values,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1400,7 +1400,7 @@ fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1457,7 +1457,7 @@ fn output_properties_cannot_name_a_value_absent_from_the_output_port() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1507,7 +1507,7 @@ fn project_cannot_publish_an_uncomputed_output() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1539,7 +1539,7 @@ fn project_cannot_publish_an_uncomputed_output() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: project,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -1582,7 +1582,7 @@ fn literal_representation_must_match_its_declared_type() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1655,7 +1655,7 @@ fn fragment_validation_requires_its_exact_artifact_cut() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1698,7 +1698,7 @@ fn exchange_partitioning_maps_source_and_destination_value_domains() {
         )
         .unwrap();
     receiver
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: receiver_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1787,7 +1787,7 @@ fn integer_division_keeps_its_resolved_float_result() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1827,7 +1827,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: left_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1852,7 +1852,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: right_node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1868,7 +1868,7 @@ fn left_outer_join_cannot_publish_the_original_build_value() {
         .unwrap();
     let join = builder.reserve_node_id().unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: join,
             inputs: Box::from([left_node, right_node]),
             required_inputs: Box::from([unconstrained(), unconstrained()]),
@@ -1918,7 +1918,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -1951,7 +1951,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         }]),
     };
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: sort,
             inputs: Box::from([source]),
             required_inputs: Box::from([PhysicalProperties {
@@ -1979,7 +1979,7 @@ fn project_drops_ordering_when_its_key_is_not_projected() {
         .add_expression(project, ty(DataType::Int64, false), ExprKind::Value(b))
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: project,
             inputs: Box::from([sort]),
             required_inputs: Box::from([unconstrained()]),
@@ -2032,7 +2032,7 @@ fn sealed_artifact_accepts_exact_source_provenance_across_an_exchange() {
         )
         .unwrap();
     source_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: scan,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2069,7 +2069,7 @@ fn sealed_artifact_accepts_exact_source_provenance_across_an_exchange() {
         )
         .unwrap();
     destination_builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: receiver,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2184,7 +2184,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: source,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2209,7 +2209,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: repeat,
             inputs: Box::from([source]),
             required_inputs: Box::from([unconstrained()]),
@@ -2265,7 +2265,7 @@ fn lambda_parameter_type_is_part_of_its_declaration() {
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),
@@ -2299,7 +2299,7 @@ fn finish_fragment_with_declared_type(data_type: DataType) -> Result<Fragment, V
         )
         .unwrap();
     builder
-        .insert_node(PhysicalNode {
+        .insert_node_unchecked(PhysicalNode {
             id: node,
             inputs: Box::default(),
             required_inputs: Box::default(),

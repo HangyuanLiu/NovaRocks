@@ -3475,7 +3475,7 @@ mod tests {
             )
             .unwrap();
         fragment
-            .insert_node(PhysicalNode {
+            .insert_node_unchecked(PhysicalNode {
                 id: node,
                 inputs: Box::default(),
                 required_inputs: Box::default(),
