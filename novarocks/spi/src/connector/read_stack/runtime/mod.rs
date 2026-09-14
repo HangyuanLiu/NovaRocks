@@ -526,6 +526,20 @@ pub trait ConnectorReadMetadata: Send + Sync {
         table: &ConnectorReadTableHandle,
     ) -> Result<Vec<ConnectorReadColumnBinding>, ConnectorError>;
 
+    /// Freeze the exact immutable provider facts of the final negotiated
+    /// handle. This call performs no split enumeration and returns no runtime
+    /// capability.
+    fn final_static_facts(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+    ) -> Result<super::ConnectorReadStaticFacts<ConnectorReadColumnHandle>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not publish final static facts",
+        ))
+    }
+
     fn apply_filter(
         &self,
         session: &ConnectorSession,
@@ -552,6 +566,21 @@ pub trait ConnectorReadMetadata: Send + Sync {
         session: &ConnectorSession,
         name: &SchemaTableName,
     ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError>;
+
+    /// Resolve a metadata relation while preserving its typed kind and version
+    /// request. The legacy name-only method remains separate until its callers
+    /// are retired; implementations must never infer missing request fields.
+    fn get_system_table_plan_for_request(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not support typed metadata requests",
+        ))
+    }
 
     fn get_change_window_plan(
         &self,

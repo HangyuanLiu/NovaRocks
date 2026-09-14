@@ -40,9 +40,10 @@ use super::runtime::{
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
-    ConnectorPageSource, ConnectorSession, ConnectorSplit, ConnectorSplitBatch, Constraint,
-    DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics, SchemaTableName, SourcePage,
-    SystemTableDistribution, TupleDomain,
+    ConnectorPageSource, ConnectorReadDistribution, ConnectorReadOrderingKey,
+    ConnectorReadProperties, ConnectorReadStaticFacts, ConnectorSession, ConnectorSplit,
+    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics,
+    SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
@@ -210,6 +211,17 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         table: &Self::Table,
     ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError>;
 
+    fn final_static_facts(
+        &self,
+        _session: &ConnectorSession,
+        _table: &Self::Table,
+    ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not publish final static facts",
+        ))
+    }
+
     fn apply_filter(
         &self,
         session: &ConnectorSession,
@@ -236,6 +248,18 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         session: &ConnectorSession,
         name: &SchemaTableName,
     ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError>;
+
+    fn get_system_table_plan_for_request(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support typed metadata requests",
+        ))
+    }
 
     fn get_change_window_plan(
         &self,
@@ -554,6 +578,76 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             })
     }
 
+    fn final_static_facts(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+    ) -> Result<ConnectorReadStaticFacts<ConnectorReadColumnHandle>, ConnectorError> {
+        let table = self.table(table)?;
+        let facts = self.provider.final_static_facts(session, table)?;
+        let distribution = match facts.properties().distribution() {
+            ConnectorReadDistribution::Unconstrained => ConnectorReadDistribution::Unconstrained,
+            ConnectorReadDistribution::Singleton => ConnectorReadDistribution::Singleton,
+            ConnectorReadDistribution::RoundRobin => ConnectorReadDistribution::RoundRobin,
+            ConnectorReadDistribution::Hash {
+                keys,
+                partition_space,
+                admissible,
+                algorithm,
+            } => ConnectorReadDistribution::Hash {
+                keys: keys
+                    .iter()
+                    .cloned()
+                    .map(|column| self.wrap_column(column))
+                    .collect::<Vec<_>>()
+                    .into(),
+                partition_space: *partition_space,
+                admissible: *admissible,
+                algorithm: *algorithm,
+            },
+            ConnectorReadDistribution::BucketShuffle {
+                keys,
+                partition_space,
+                bucket_count,
+                hash,
+                layout,
+                ordinal_domain_evidence,
+            } => ConnectorReadDistribution::BucketShuffle {
+                keys: keys
+                    .iter()
+                    .cloned()
+                    .map(|column| self.wrap_column(column))
+                    .collect::<Vec<_>>()
+                    .into(),
+                partition_space: *partition_space,
+                bucket_count: *bucket_count,
+                hash: *hash,
+                layout: *layout,
+                ordinal_domain_evidence: *ordinal_domain_evidence,
+            },
+        };
+        let ordering = facts
+            .properties()
+            .ordering()
+            .iter()
+            .map(|key| {
+                ConnectorReadOrderingKey::new(
+                    self.wrap_column(key.column().clone()),
+                    key.direction(),
+                    key.null_ordering(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let properties = ConnectorReadProperties::try_new(distribution, ordering)?;
+        ConnectorReadStaticFacts::try_new(
+            facts.input_version().clone(),
+            facts.selection_digest(),
+            properties,
+            facts.artifact_coverage().clone(),
+            Arc::<[u8]>::from(facts.coverage_evidence()),
+        )
+    }
+
     fn apply_filter(
         &self,
         session: &ConnectorSession,
@@ -616,6 +710,23 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
     ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
         self.provider
             .get_system_table_plan(session, name)
+            .map(|result| {
+                result.map(|result| {
+                    let distribution = result.distribution();
+                    let handle = result.into_handle();
+                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), distribution)
+                })
+            })
+    }
+
+    fn get_system_table_plan_for_request(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
+        self.provider
+            .get_system_table_plan_for_request(session, name, request)
             .map(|result| {
                 result.map(|result| {
                     let distribution = result.distribution();
