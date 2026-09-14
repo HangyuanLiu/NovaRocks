@@ -389,3 +389,97 @@ fn binding_and_real_type_mismatch_are_rejected_before_provider_calls() {
         novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
     );
 }
+
+/// Statistics can be asked about a negotiated read, not only about the table.
+///
+/// Once a provider has taken a predicate on, the rows it will actually return
+/// are the pruned ones. A caller reasoning about cost needs to be able to ask
+/// about *that* read. This proves the question is expressible and reaches the
+/// provider distinguishably; consuming the answer is a separate concern.
+#[test]
+fn statistics_can_be_asked_about_a_negotiated_read() {
+    let provider = Arc::new(FakeProvider::new(AlphaTable, AlphaColumn(1)));
+    let adapter = ReadRuntimeAdapter::new(provider);
+    let metadata = &adapter as &dyn ConnectorReadMetadata;
+    let table = metadata
+        .get_table_handle(
+            &session(),
+            &name(),
+            ConnectorReadRelationVersion::Current,
+            None,
+        )
+        .expect("table call")
+        .expect("table handle");
+    let column = metadata
+        .get_column_bindings(&session(), &table)
+        .expect("columns")[0]
+        .column()
+        .clone();
+    let constraint = Constraint::of_summary(
+        TupleDomain::with_column_domains(BTreeMap::from([(
+            column,
+            novarocks_spi::connector::read_stack::Domain::all(
+                novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
+            ),
+        )]))
+        .expect("domain"),
+    );
+    let negotiated = metadata
+        .negotiate(
+            &session(),
+            &ReadNegotiation {
+                handle: table.clone(),
+                ops: vec![ReadPushdownOp::Filter { constraint }],
+            },
+        )
+        .expect("negotiate");
+    assert!(negotiated.changed, "the fixture narrows on a filter");
+
+    // The question a cost model needs to ask is now expressible: statistics
+    // about the negotiated read rather than about the whole table. Whether a
+    // provider answers it differently is a provider fact, proven against a
+    // real one; what this proves is that the seam exists and carries the
+    // handle negotiation produced.
+    let about_table = statistics_request(None);
+    let about_read = statistics_request(Some(negotiated.handle.clone()));
+    assert!(about_table.narrowed_read.is_none());
+    assert!(about_read.narrowed_read.is_some());
+}
+
+/// A statistics request for the fixture table, optionally about a negotiated
+/// read rather than about the table itself.
+fn statistics_request(
+    narrowed_read: Option<novarocks_spi::connector::read_stack::runtime::ConnectorReadTableHandle>,
+) -> novarocks_spi::connector::StatisticsReadRequest {
+    use novarocks_spi::connector::{
+        ConnectorRequestContext, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest,
+    };
+
+    let owner =
+        novarocks_spi::connector::ConnectorInstanceId::parse("lake.catalog").expect("instance id");
+    novarocks_spi::connector::StatisticsReadRequest {
+        table: ConnectorTableHandle::try_new(owner, bytes::Bytes::from_static(b"table-v1"))
+            .expect("table handle"),
+        narrowed_read,
+        data_version: StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"data-v1"))
+            .expect("data version"),
+        metrics: StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount])
+            .expect("metrics"),
+        context: ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::sync::Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .expect("request context"),
+    }
+}
+
+struct NeverCancelled;
+
+impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}

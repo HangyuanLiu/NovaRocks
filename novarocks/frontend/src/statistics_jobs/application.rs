@@ -300,6 +300,8 @@ impl StatisticsTableReader for ConnectorStatisticsTableReader {
             .map_err(|error| StatisticsApplicationError::new(error.to_string()))?;
         let evidence = lease
             .read(StatisticsReadRequest {
+                // An ANALYZE job measures the table, not one query's read.
+                narrowed_read: None,
                 table: metadata.table,
                 data_version,
                 metrics,
