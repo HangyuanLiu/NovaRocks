@@ -123,6 +123,13 @@ impl SqlFinalPlanCompileRequest {
         }
     }
 
+    /// Returns the immutable request control that must govern every fact round.
+    /// The application may clone it before consuming this request, but cannot
+    /// replace it with a broader deadline or a different cancellation view.
+    pub const fn control(&self) -> &SqlCompileControl {
+        &self.control
+    }
+
     /// Parse the owned statement and publish the first exact observation need,
     /// or complete immediately when the query has no external relation.
     pub fn try_into_completion(self) -> Result<SqlCompileRequest, SqlCompileError> {

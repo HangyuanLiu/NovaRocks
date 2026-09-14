@@ -4144,6 +4144,7 @@ dependencies = [
  "bytes",
  "novarocks-execution-contract",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",

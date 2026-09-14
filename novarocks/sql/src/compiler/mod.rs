@@ -521,7 +521,7 @@ impl SqlCompileControl {
         Ok(())
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 }
