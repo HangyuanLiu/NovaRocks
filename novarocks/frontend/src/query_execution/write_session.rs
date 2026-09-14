@@ -662,6 +662,11 @@ impl ConnectorWriteSession {
                 "only an invisible staged-create write may seal an implicit empty prepared set",
             ));
         }
+        // Unlike a distributed completion, this path has no coordinator
+        // barrier that already proved the request was live. Check it before
+        // claiming the one terminal decision so cancellation cannot consume a
+        // staged CREATE that never dispatched a seal.
+        ensure_finish_context_active(&context)?;
         let publication = self.finish_publication_for_commit()?;
         self.claim_terminal(TerminalDecision::Committed)?;
         let terminal_context = self.terminal_context(context)?;
