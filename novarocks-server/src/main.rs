@@ -318,8 +318,11 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
     let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
-    let memory_authority = compose_memory_authority(process_config)?;
     let runtime = init_process(process_config)?;
+    // After `init_process`, because composing the authority is the first thing
+    // this process reports about its own memory and logging is not installed
+    // until then. It does not depend on the runtime.
+    let memory_authority = compose_memory_authority(process_config)?;
     let function_set = compose_process_function_set()?;
     let functions = std::sync::Arc::clone(function_set.catalog());
     let native_compatibility = native_compatibility::resolve_native_compatibility_material(
