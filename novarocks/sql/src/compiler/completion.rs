@@ -3439,6 +3439,86 @@ where
     Ok(())
 }
 
+/// Needs a role adapter can be proved against.
+///
+/// A need is normally minted only by compilation, and that is what keeps a role
+/// from answering questions the compiler would never ask. But a role's answer
+/// has to be provable on its own - whether an absent relation becomes a fact or
+/// an error is a decision with no plan in it - so these mint one directly.
+/// They exist only under `test-support`, so no product build can reach them.
+#[cfg(feature = "test-support")]
+pub mod fixtures {
+    use super::{
+        CatalogLookupTarget, CatalogRelationNeed, CompileNeedId, CompletionProtocolError,
+        MaterializedViewNeed, ProviderReadColumnNeed, ProviderReadNeed, ProviderReadPredicateNeed,
+        ProviderReadRelationNeed, SqlTableBindingId, StatisticsMetric, StatisticsNeed, TableIdentity,
+    };
+
+    pub fn catalog_relation_need(
+        id: u32,
+        relation: TableIdentity,
+        target: CatalogLookupTarget,
+    ) -> Result<CatalogRelationNeed, CompletionProtocolError> {
+        CatalogRelationNeed::try_new(CompileNeedId::new(id), relation, target)
+    }
+
+    pub fn statistics_need(
+        id: u32,
+        binding: SqlTableBindingId,
+        metrics: impl Into<Box<[StatisticsMetric]>>,
+    ) -> Result<StatisticsNeed, CompletionProtocolError> {
+        StatisticsNeed::try_new(CompileNeedId::new(id), binding, metrics)
+    }
+
+    pub fn materialized_view_need(
+        id: u32,
+        referenced_relations: impl Into<Box<[TableIdentity]>>,
+    ) -> Result<MaterializedViewNeed, CompletionProtocolError> {
+        MaterializedViewNeed::try_new(CompileNeedId::new(id), referenced_relations)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn provider_read_need(
+        id: u32,
+        occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
+        binding: SqlTableBindingId,
+        relation: ProviderReadRelationNeed,
+        columns: impl Into<Box<[ProviderReadColumnNeed]>>,
+        predicates: impl Into<Box<[ProviderReadPredicateNeed]>>,
+        limit: Option<u64>,
+    ) -> Result<ProviderReadNeed, CompletionProtocolError> {
+        ProviderReadNeed::try_new(
+            CompileNeedId::new(id),
+            occurrence,
+            binding,
+            relation,
+            columns,
+            predicates,
+            limit,
+        )
+    }
+
+    pub const fn provider_predicate_occurrence(value: u32) -> super::ProviderPredicateOccurrenceId {
+        super::ProviderPredicateOccurrenceId::new(value)
+    }
+
+    pub fn provider_read_predicate_need(
+        occurrence: super::ProviderPredicateOccurrenceId,
+        constraint: super::Constraint<u32>,
+    ) -> super::ProviderReadPredicateNeed {
+        super::ProviderReadPredicateNeed::new(occurrence, constraint)
+    }
+
+    pub fn provider_read_column_need(
+        ordinal: u32,
+        name: &str,
+        engine_type: novarocks_physical_plan::ValueType,
+        connector_type: novarocks_spi::connector::read_stack::ConnectorValueType,
+    ) -> Result<ProviderReadColumnNeed, CompletionProtocolError> {
+        ProviderReadColumnNeed::try_new(ordinal, name, engine_type, connector_type)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

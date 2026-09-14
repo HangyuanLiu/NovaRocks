@@ -48,7 +48,9 @@ use novarocks_sql::compiler::{
 };
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::catalog_application::query_catalog::{CatalogResolutionError, QueryCatalogService};
+use crate::catalog_application::query_catalog::{
+    CatalogResolutionError, CatalogResolutionResult, QueryCatalogService,
+};
 use crate::catalog_application::query_materializer::{
     CatalogServiceMaterializer, iceberg_table_binding_loader,
 };
@@ -189,6 +191,13 @@ fn catalog_fact(
             kind,
         ),
     };
+    catalog_fact_from(need, resolved)
+}
+
+fn catalog_fact_from(
+    need: &CatalogRelationNeed,
+    resolved: CatalogResolutionResult<novarocks_sql::planning::catalog::ResolvedAnalyzerTable>,
+) -> Result<CatalogRelationFact, String> {
     match resolved {
         Ok(table) => CatalogRelationFact::resolved(need, table),
         Err(CatalogResolutionError::Missing { reason }) => {
@@ -330,4 +339,53 @@ pub(crate) fn statement_fact_source<A>(
         Arc::new(FrontendMaterializedViewFacts::new(owners)),
         provider_reads,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use novarocks_sql::compiler::{CatalogLookupTarget, CatalogRelationOutcome, fixtures};
+    use novarocks_sql::planning::catalog::TableLookupMode;
+    use novarocks_types::naming::TableIdentity;
+
+    use super::*;
+
+    fn a_need() -> CatalogRelationNeed {
+        fixtures::catalog_relation_need(
+            1,
+            TableIdentity::new("iceberg", "db", "orders"),
+            CatalogLookupTarget::Table {
+                mode: TableLookupMode::SchemaOnly,
+            },
+        )
+        .expect("catalog relation need")
+    }
+
+    /// A relation that is not there is a fact about the query. The compiler
+    /// can act on it - a missing table is an error it raises itself, with the
+    /// name it asked about.
+    #[test]
+    fn an_absent_relation_becomes_a_fact() {
+        let need = a_need();
+        let fact = catalog_fact_from(&need, Err(CatalogResolutionError::missing("no such table")))
+            .expect("absence is an answer");
+        assert!(matches!(
+            fact.outcome(),
+            CatalogRelationOutcome::Missing { .. }
+        ));
+        assert_eq!(fact.relation(), need.relation());
+    }
+
+    /// A catalog that could not say is a fact about this process, and it must
+    /// not become the other one. Flattened into absence, a query over a
+    /// healthy table would report that the table does not exist for as long as
+    /// its catalog was unreachable.
+    #[test]
+    fn a_catalog_that_could_not_answer_fails_the_query() {
+        let error = catalog_fact_from(
+            &a_need(),
+            Err(CatalogResolutionError::failed("REST timeout")),
+        )
+        .expect_err("a catalog that could not say has answered nothing");
+        assert!(error.contains("REST timeout"), "{error}");
+    }
 }

@@ -666,3 +666,202 @@ fn request_control_for(
         .for_planning(&planning)
         .map_err(|error| format!("read request control: {error}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use novarocks_physical_plan::{ProviderReadOccurrenceId, ValueType};
+    use novarocks_spi::connector::read_stack::{ConnectorValueType, TupleDomain};
+    use novarocks_sql::binding::SqlTableBindingAllocator;
+    use novarocks_sql::compiler::fixtures;
+    use novarocks_types::naming::TableIdentity;
+
+    use super::*;
+
+    fn identity() -> TableIdentity {
+        TableIdentity::new("iceberg", "db", "orders")
+    }
+
+    fn a_binding() -> novarocks_sql::binding::SqlTableBindingId {
+        SqlTableBindingAllocator::try_new_for_test(std::num::NonZeroU64::new(1).unwrap())
+            .expect("allocator")
+            .allocate()
+            .expect("binding")
+    }
+
+    /// One read of one column, with one predicate and a limit, so both
+    /// responsibilities below have something to be decided about.
+    fn a_need(limit: Option<u64>) -> ProviderReadNeed {
+        let column = fixtures::provider_read_column_need(
+            0,
+            "order_key",
+            ValueType::new(arrow::datatypes::DataType::Int64, false),
+            ConnectorValueType::BigInt,
+        )
+        .expect("column need");
+        let predicate = fixtures::provider_read_predicate_need(
+            fixtures::provider_predicate_occurrence(0),
+            Constraint::of_summary(TupleDomain::all()),
+        );
+        fixtures::provider_read_need(
+            1,
+            ProviderReadOccurrenceId::new(1),
+            a_binding(),
+            ProviderReadRelationNeed::Data {
+                relation: identity(),
+                version: ProviderReadVersionNeed::Current,
+            },
+            vec![column],
+            vec![predicate],
+            limit,
+        )
+        .expect("provider read need")
+    }
+
+    /// The offer layout production builds for this need: projection, then
+    /// filter, then limit. Only the positions matter to what is read back, so
+    /// the operations themselves stand in for ones carrying provider columns.
+    fn offer_of(need: &ProviderReadNeed) -> OfferedOps {
+        let mut ops = vec![ReadPushdownOp::Projection {
+            assignments: Vec::new(),
+        }];
+        let filter = (!need.predicates().is_empty()).then(|| {
+            ops.push(ReadPushdownOp::Filter {
+                constraint: Constraint::of_summary(TupleDomain::all()),
+            });
+            ops.len() - 1
+        });
+        let limit = need.limit().map(|rows| {
+            ops.push(ReadPushdownOp::Limit { rows });
+            ops.len() - 1
+        });
+        OfferedOps { ops, filter, limit }
+    }
+
+    /// One answer per offered operation, in the offered order.
+    fn all_answered(
+        offer: &OfferedOps,
+        filter: ReadPushdownDisposition,
+        limit: ReadPushdownDisposition,
+    ) -> Vec<ReadPushdownOutcome> {
+        let mut outcomes = vec![answered(ReadPushdownDisposition::Exact); offer.ops.len()];
+        if let Some(index) = offer.filter {
+            outcomes[index] = answered(filter);
+        }
+        if let Some(index) = offer.limit {
+            outcomes[index] = answered(limit);
+        }
+        outcomes
+    }
+
+    fn answered(disposition: ReadPushdownDisposition) -> ReadPushdownOutcome {
+        ReadPushdownOutcome {
+            disposition,
+            residual: None,
+        }
+    }
+
+    /// The version a read names is the admitted input it reads, and it selects
+    /// that input by value alone.
+    #[test]
+    fn a_read_names_the_input_it_was_admitted_against() {
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::Data {
+                relation: identity(),
+                version: ProviderReadVersionNeed::Current,
+            }),
+            Ok(QueryFrozenReadInput::Current)
+        ));
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::FrozenInputSet {
+                relation: identity(),
+                version: ProviderReadVersionNeed::Snapshot(7),
+            }),
+            Ok(QueryFrozenReadInput::Snapshot(7))
+        ));
+    }
+
+    /// A change window is frozen from endpoints this read request does not
+    /// name. Opening it as an ordinary table would read the whole relation
+    /// instead of the difference between two snapshots, so it is refused.
+    #[test]
+    fn a_relation_frozen_from_an_unnamed_carrier_is_refused() {
+        for relation in [
+            ProviderReadRelationNeed::Delta {
+                relation: identity(),
+                from_snapshot_id: 1,
+                to_snapshot_id: 2,
+            },
+            ProviderReadRelationNeed::PinnedFileSet {
+                relation: identity(),
+            },
+            ProviderReadRelationNeed::TableExecute {
+                relation: identity(),
+            },
+        ] {
+            assert!(
+                frozen_input(&relation).is_err(),
+                "{relation:?} has no admitted input this request names"
+            );
+        }
+    }
+
+    /// Only `Exact` relieves the engine. A provider that prunes has answered
+    /// about its own work, not about which rows the query returns, so the
+    /// engine keeps evaluating every predicate.
+    #[test]
+    fn only_an_exact_filter_answer_guarantees_a_predicate() {
+        let need = a_need(None);
+        let offer = offer_of(&need);
+        for (disposition, expected) in [
+            (
+                ReadPushdownDisposition::Exact,
+                PredicateGuaranteeKind::Exact,
+            ),
+            (
+                ReadPushdownDisposition::PruningOnly,
+                PredicateGuaranteeKind::PruningOnly,
+            ),
+            (
+                ReadPushdownDisposition::Unsupported,
+                PredicateGuaranteeKind::PruningOnly,
+            ),
+        ] {
+            let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            let facts = predicate_facts(&need, &offer, &outcomes);
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].guarantee(), expected, "{disposition:?}");
+        }
+    }
+
+    /// A limit the provider only used stays the engine's to enforce; repeating
+    /// a limit is free, and not repeating one the provider never guaranteed
+    /// returns rows the query excluded.
+    #[test]
+    fn a_limit_is_residual_unless_the_provider_took_it_on() {
+        let unasked = a_need(None);
+        assert!(matches!(
+            limit_fact(&unasked, &offer_of(&unasked), &[]),
+            ProviderReadLimitFact::NotRequested
+        ));
+        let need = a_need(Some(10));
+        let offer = offer_of(&need);
+        let took_it_on = all_answered(
+            &offer,
+            ReadPushdownDisposition::Exact,
+            ReadPushdownDisposition::Exact,
+        );
+        assert!(matches!(
+            limit_fact(&need, &offer, &took_it_on),
+            ProviderReadLimitFact::Exact(10)
+        ));
+        let only_used_it = all_answered(
+            &offer,
+            ReadPushdownDisposition::Exact,
+            ReadPushdownDisposition::PruningOnly,
+        );
+        assert!(matches!(
+            limit_fact(&need, &offer, &only_used_it),
+            ProviderReadLimitFact::Residual(10)
+        ));
+    }
+}
