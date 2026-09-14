@@ -16,6 +16,7 @@
 // under the License.
 
 pub(crate) mod aggregate_bindings;
+pub(crate) mod create_documents;
 pub mod definition;
 pub mod dependency;
 pub mod descriptor;

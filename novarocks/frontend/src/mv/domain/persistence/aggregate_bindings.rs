@@ -99,6 +99,12 @@ pub(crate) struct MvAggregateCreateBindingInput<'a> {
 /// interpretation document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvAggregateCreateBindings {
+    /// Shared semantic identities used by both D and L. The document builder
+    /// must consume these values rather than recomputing output or branch
+    /// hashes from an adjacent representation.
+    pub source_fields: BTreeMap<(u32, u32), FieldIdentity>,
+    pub output_identities: BTreeMap<u32, OutputIdentity>,
+    pub branch_identities: BTreeMap<u32, BranchIdentity>,
     pub aggregate_layout: RuntimeAggregateLayoutFacts,
     pub target_fields: Vec<RuntimePhysicalFieldFacts>,
 }
@@ -201,6 +207,9 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     }
 
     Ok(MvAggregateCreateBindings {
+        source_fields,
+        output_identities,
+        branch_identities: branches,
         aggregate_layout: RuntimeAggregateLayoutFacts {
             state_slots,
             aggregates,
