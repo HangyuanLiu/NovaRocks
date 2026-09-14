@@ -3603,7 +3603,9 @@ dependencies = [
  "novarocks-execution-contract",
  "novarocks-failpoint",
  "novarocks-functions",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
+ "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
@@ -3617,13 +3619,11 @@ dependencies = [
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "protoc-bin-vendored",
  "serde_json",
  "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-build",
  "tower 0.5.2",
  "tracing",
 ]
@@ -3632,7 +3632,24 @@ dependencies = [
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "novarocks-connector-starrocks",
  "novarocks-spi",
+ "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
+ "novarocks-state-store-testkit",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -3778,8 +3795,8 @@ dependencies = [
 name = "novarocks-error-manifest"
 version = "0.1.0"
 dependencies = [
- "novarocks-frontend",
  "novarocks-parser",
+ "novarocks-query-application",
  "novarocks-sql",
  "novarocks-user-error",
 ]
@@ -3862,8 +3879,6 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
- "libc",
- "mysql_common 0.32.4",
  "novarocks-catalog-application",
  "novarocks-connector-starrocks",
  "novarocks-execution",
@@ -3871,6 +3886,9 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-functions",
+ "novarocks-mv-application",
+ "novarocks-mysql-adapter",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
  "novarocks-plan-codec",
@@ -3883,17 +3901,17 @@ dependencies = [
  "novarocks-state-store-api",
  "novarocks-state-store-runtime",
  "novarocks-state-store-testkit",
+ "novarocks-statistics-application",
+ "novarocks-table-maintenance",
  "novarocks-task-codec",
  "novarocks-types",
  "novarocks-user-error",
  "novarocks-version",
  "novarocks-workload-control",
  "once_cell",
- "opensrv-mysql",
  "parquet",
  "prometheus",
  "prost 0.13.5",
- "protoc-bin-vendored",
  "regex",
  "serde",
  "serde_json",
@@ -3903,7 +3921,6 @@ dependencies = [
  "tokio-stream",
  "toml 0.8.23",
  "tonic",
- "tonic-build",
  "tower 0.5.2",
  "tracing",
  "uuid",
@@ -3951,6 +3968,70 @@ dependencies = [
  "arrow",
  "arrow-buffer",
  "novarocks-memory",
+]
+
+[[package]]
+name = "novarocks-mv-application"
+version = "0.1.0"
+dependencies = [
+ "novarocks-query-application",
+ "novarocks-state-store-runtime",
+ "novarocks-table-maintenance",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "novarocks-mysql-adapter"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "chrono",
+ "libc",
+ "mysql_common 0.32.4",
+ "novarocks-parser",
+ "novarocks-query-application",
+ "novarocks-sql",
+ "novarocks-types",
+ "novarocks-user-error",
+ "novarocks-workload-control",
+ "opensrv-mysql",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "novarocks-native-adapter"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-buffer",
+ "async-trait",
+ "axum 0.7.9",
+ "bytes",
+ "hyper",
+ "hyper-util",
+ "novarocks-execution",
+ "novarocks-execution-contract",
+ "novarocks-failpoint",
+ "novarocks-native-trust",
+ "novarocks-plan-codec",
+ "novarocks-proto-codec",
+ "novarocks-proto-models",
+ "novarocks-secret",
+ "novarocks-spi",
+ "novarocks-task-codec",
+ "novarocks-types",
+ "novarocks-worker",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-build",
+ "tower 0.5.2",
+ "tracing",
 ]
 
 [[package]]
@@ -4034,13 +4115,19 @@ name = "novarocks-query-application"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "bytes",
  "novarocks-execution-contract",
+ "novarocks-parser",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
+ "novarocks-user-error",
  "novarocks-workload-control",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4060,6 +4147,7 @@ dependencies = [
  "libc",
  "mysql",
  "novarocks-backend",
+ "novarocks-catalog-application",
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-connector-paimon",
@@ -4070,12 +4158,16 @@ dependencies = [
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-memory",
+ "novarocks-mv-application",
+ "novarocks-mysql-adapter",
+ "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
  "novarocks-state-store-sqlite",
  "novarocks-test-support",
  "novarocks-types",
@@ -4213,10 +4305,15 @@ dependencies = [
 name = "novarocks-state-store-runtime"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
+ "hex",
  "novarocks-state-store-api",
  "novarocks-state-store-testkit",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -4247,6 +4344,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-statistics-application"
+version = "0.1.0"
+dependencies = [
+ "novarocks-query-application",
+ "novarocks-workload-control",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "novarocks-system-test-runner"
 version = "0.1.0"
 dependencies = [
@@ -4269,6 +4376,22 @@ dependencies = [
  "sha2",
  "tokio",
  "tonic",
+]
+
+[[package]]
+name = "novarocks-table-maintenance"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "hex",
+ "novarocks-query-application",
+ "novarocks-state-store-api",
+ "novarocks-state-store-runtime",
+ "novarocks-state-store-testkit",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -4341,8 +4464,14 @@ dependencies = [
 name = "novarocks-worker"
 version = "0.1.0"
 dependencies = [
+ "arrow",
+ "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-spi",
  "novarocks-types",
+ "sha2",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -4545,8 +4674,6 @@ dependencies = [
 [[package]]
 name = "opensrv-mysql"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4148ab944991b0a33be74d2636a815268974578812a9e4cf7dc785325e858154"
 dependencies = [
  "async-trait",
  "byteorder",

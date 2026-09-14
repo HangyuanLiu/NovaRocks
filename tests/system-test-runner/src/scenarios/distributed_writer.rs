@@ -50,6 +50,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
+use mysql::{Row, Value};
 use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
 use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
@@ -876,6 +877,7 @@ impl Scenario for DistributedStatisticsDataflow {
         control
             .query_drop(format!("ANALYZE TABLE {source}"))
             .context("run native distributed ANALYZE")?;
+        wait_for_statistics_job_success(context, &mut control, CATALOG, DATABASE, SOURCE)?;
 
         let analyze_tasks_after = task_admission_counts(context)?;
         let analyze_task_delta = assert_every_backend_accepted_task(
@@ -1149,6 +1151,87 @@ type TableStatisticsRow = (
     String,
     String,
 );
+
+/// Wait for the accepted ANALYZE job's business conclusion before observing
+/// effects that belong to its background attempt. `ANALYZE` itself only proves
+/// submission; a terminal `SUCCEEDED` record is the semantic precondition for
+/// inspecting BE task admission and provider publication evidence.
+fn wait_for_statistics_job_success(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    context.action("wait for the submitted ANALYZE job to reach SUCCEEDED");
+    loop {
+        let rows: Vec<Row> = control
+            .query("SHOW ANALYZE JOBS")
+            .context("observe submitted native distributed ANALYZE job")?;
+        let mut matches = Vec::new();
+        for row in rows {
+            if analyze_job_field(&row, "catalog")?.as_deref() == Some(catalog)
+                && analyze_job_field(&row, "namespace")?.as_deref() == Some(namespace)
+                && analyze_job_field(&row, "table")?.as_deref() == Some(table)
+            {
+                matches.push(row);
+            }
+        }
+        let Some(job) = matches.pop() else {
+            context.remaining("wait for submitted ANALYZE job to become observable")?;
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        if !matches.is_empty() {
+            bail!(
+                "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
+            );
+        }
+        let job_id = analyze_job_field(&job, "job_id")?
+            .filter(|value| !value.is_empty())
+            .context("ANALYZE job observation has no job_id")?;
+        let state = analyze_job_field(&job, "state")?
+            .filter(|value| !value.is_empty())
+            .context("ANALYZE job observation has no state")?;
+        match state.as_str() {
+            "SUCCEEDED" => return Ok(()),
+            "SUBMITTED" | "PREPARING" | "COLLECTING" | "PUBLISHING" => {
+                context.remaining(&format!(
+                    "wait for ANALYZE job {job_id} to reach its business conclusion"
+                ))?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let detail = analyze_job_field(&job, "error_message")?.unwrap_or_default();
+                bail!(
+                    "ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
+                );
+            }
+        }
+    }
+}
+
+fn analyze_job_field(row: &Row, name: &str) -> Result<Option<String>> {
+    let index = row
+        .columns_ref()
+        .iter()
+        .position(|column| column.name_str().eq_ignore_ascii_case(name))
+        .with_context(|| format!("ANALYZE job observation omitted column {name}"))?;
+    match row
+        .as_ref(index)
+        .context("ANALYZE job observation value is missing")?
+    {
+        Value::NULL => Ok(None),
+        Value::Bytes(bytes) => Ok(Some(
+            String::from_utf8(bytes.clone()).context("ANALYZE job observation is not UTF-8")?,
+        )),
+        Value::Int(value) => Ok(Some(value.to_string())),
+        Value::UInt(value) => Ok(Some(value.to_string())),
+        Value::Float(value) => Ok(Some(value.to_string())),
+        Value::Double(value) => Ok(Some(value.to_string())),
+        _ => bail!("ANALYZE job observation column {name} has an unsupported value type"),
+    }
+}
 
 fn assert_show_theta_statistics(
     control: &mut mysql::Conn,

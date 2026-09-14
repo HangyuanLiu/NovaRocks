@@ -23,8 +23,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::fragment::decode::expression::NativeExpressionInputLayout;
-use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::node::scan::BoundScanRanges;
 use novarocks_execution::runtime::exchange::ExchangeKey;
@@ -33,20 +31,17 @@ use novarocks_execution::runtime::fragment::ExchangeInputAssignment;
 use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentInstanceId};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
-use novarocks_proto_codec::FieldPath;
+#[cfg(test)]
+use novarocks_native_adapter::fragment_instance::decode_scan_range_params;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
-use novarocks_proto_models::{common, expr};
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
-    ConnectorResourceLedger,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
+    ConnectorExecutionWriteBinding, ConnectorRequestResources, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
 };
 use novarocks_types::QueryId;
 
-use crate::fragment::decode::plan::error::{
-    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
-};
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
 /// Adapts connector reservations to the exact fragment tracker created by
 /// native task admission. The adapter exists during pure plan decode, but it
@@ -302,7 +297,7 @@ pub(crate) type RuntimeFilterSessionResolver = Arc<
 pub(crate) type CatalogReadExecutionResolver = Arc<
     dyn Fn(
             &novarocks_spi::connector::CatalogHandle,
-        ) -> Result<crate::connector::ConnectorExecutionReadBinding, String>
+        ) -> Result<ConnectorExecutionReadBinding, String>
         + Send
         + Sync,
 >;
@@ -312,7 +307,7 @@ pub(crate) type CatalogReadExecutionResolver = Arc<
 pub(crate) type CatalogWriteExecutionResolver = Arc<
     dyn Fn(
             &novarocks_spi::connector::CatalogHandle,
-        ) -> Result<crate::connector::ConnectorExecutionWriteBinding, String>
+        ) -> Result<ConnectorExecutionWriteBinding, String>
         + Send
         + Sync,
 >;
@@ -360,14 +355,14 @@ impl TypedScanRuntime {
     pub(crate) fn catalog_read_execution(
         &self,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::ConnectorExecutionReadBinding, String> {
+    ) -> Result<ConnectorExecutionReadBinding, String> {
         (self.catalog_read_execution)(handle)
     }
 
     pub(crate) fn catalog_write_execution(
         &self,
         handle: &novarocks_spi::connector::CatalogHandle,
-    ) -> Result<crate::connector::ConnectorExecutionWriteBinding, String> {
+    ) -> Result<ConnectorExecutionWriteBinding, String> {
         (self.catalog_write_execution)(handle)
     }
 
@@ -411,7 +406,7 @@ impl TypedScanRuntime {
     pub(crate) fn register_read_execution(
         &self,
         plan_node_id: i32,
-        execution: crate::connector::ConnectorExecutionReadBinding,
+        execution: ConnectorExecutionReadBinding,
     ) -> Result<(), String> {
         self.read_context.register(plan_node_id, execution)
     }
@@ -504,28 +499,6 @@ impl NativePlanDecodeContext {
 
     pub(crate) fn typed_scan_runtime(&self) -> Option<&TypedScanRuntime> {
         self.typed_scan_runtime.as_ref()
-    }
-
-    pub(crate) fn decode_output_layout(
-        &self,
-        columns: &[common::OutputColumn],
-        path: FieldPath,
-    ) -> Result<crate::fragment::decode::layout::NativeOutputLayout, NativeFragmentDecodeError>
-    {
-        crate::fragment::decode::layout::decode_output_layout(columns, path)
-            .map_err(NativeFragmentDecodeError::from)
-    }
-
-    pub(crate) fn decode_expression(
-        &self,
-        expression: &expr::Expr,
-        path: FieldPath,
-        arena: &mut ExprArena,
-        layout: &Layout,
-    ) -> Result<ExprId, NativeFragmentDecodeError> {
-        let input = NativeExpressionInputLayout::from_slot_ids(layout.order().iter().copied());
-        crate::fragment::decode::expression::decode_expr_at(expression, path, arena, &input)
-            .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))
     }
 
     pub(crate) fn capture_scan_ranges(&self, node_id: i32, ranges: BoundScanRanges) {
@@ -663,7 +636,7 @@ impl NativePlanDecodeContext {
     ) -> Self {
         let ranges = ranges
             .iter()
-            .map(crate::fragment::decode::plan::instance::decode_scan_range_params)
+            .map(decode_scan_range_params)
             .collect::<Result<Vec<_>, _>>()
             .expect("decode test scan ranges");
         self.raw_scan_ranges

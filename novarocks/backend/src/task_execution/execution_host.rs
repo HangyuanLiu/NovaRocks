@@ -41,7 +41,7 @@
 //! query-scoped fact it needs arrives through [`TaskQueryContextFacts`], which
 //! the query context half of execution implements.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -50,7 +50,7 @@ use novarocks_execution::connector::{
     SplitQueueConfig, SplitQueueError, SplitQueueErrorKind, SplitQueueRegistry,
     SplitSequenceEvidence, TaskAttemptKey, TaskAttemptSplitQueues,
 };
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
+use novarocks_execution::exec::fragment::program::FragmentSinkKind;
 use novarocks_execution::runtime::execution_runtime::ExecutionRuntime;
 use novarocks_execution::runtime::fragment::io::{
     ExchangeEdgeGates, ExchangeFrameTransmitter, ExchangeReceiverPort, FragmentCommitPort,
@@ -64,7 +64,7 @@ use novarocks_execution::runtime::operator_statistics::project_operator_statisti
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution_contract::task_execution::descriptor::{ExchangeSource, TaskDescriptor};
+use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ContentFingerprint, DomainVersion,
 };
@@ -78,29 +78,27 @@ use novarocks_proto_codec::connector_read::{
 };
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorStorageResolver, read_stack::ConnectorSession,
+    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
+    ConnectorStorageResolver, read_stack::ConnectorSession,
 };
 use novarocks_task_codec::domain::{WireContent, stored_message};
 use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 use novarocks_types::{QueryExecutionId, UniqueId};
-use novarocks_worker::{IngressRejection, authorize_inbound_frame};
+use novarocks_worker::TaskInboundCapabilities;
 use tracing::debug;
 
-use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
 use crate::fragment::decode::plan::context::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
     TypedScanRuntime,
 };
 use crate::fragment::decode::request::NativeFragmentRequest;
 use crate::fragment::ingress::{ReceivedReadSplit, TypedReadAttemptContext};
-use crate::rpc::data_plane_handlers::{ExchangeRouteClaim, ExchangeRouteQuery};
 use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
 
 use super::completion::{TaskCompletionSignal, TaskCompletionSupervisor};
-use super::fault;
-use super::host::{HostRejection, RunnableTask, TaskExecutionHost};
-use super::shared_facts::fragment_plan;
-use super::status::TaskStatusReporter;
+use novarocks_native_adapter::task_protocol_fault as fault;
+use novarocks_native_adapter::task_shared_facts::fragment_plan;
+use novarocks_worker::{HostRejection, RunnableTask, TaskExecutionHost, TaskStatusReporter};
 
 /// Everything one query context contributes to preparing and running a task.
 ///
@@ -218,215 +216,6 @@ pub trait TaskQueryContextFacts: Send + Sync {
         &self,
         execution: QueryExecutionId,
     ) -> Result<Arc<dyn ConnectorStorageResolver>, HostRejection>;
-}
-
-/// Which task, if any, may receive one inbound exchange frame.
-///
-/// The old stack answered this with a linear scan over every active lifecycle
-/// entry. A descriptor already froze its complete inbound topology, so the
-/// answer is a single lookup on the kernel key the frame carries, followed by
-/// the descriptor's own [`TaskDescriptor::authorize_inbound_frame`].
-///
-/// Installation is exclusive on that key: two live tasks sharing one kernel
-/// key would make a frame ambiguous, and no later check could disambiguate it.
-#[derive(Debug, Default)]
-struct TaskInboundCapabilityState {
-    installed: HashMap<UniqueId, Arc<TaskDescriptor>>,
-    /// A descriptor carries no frontend process identity. The registry owns
-    /// that mapping and permits only one context for a query execution, so the
-    /// execution identity is the complete key this data-plane owner can and
-    /// must fence.
-    closed_executions: HashSet<QueryExecutionId>,
-}
-
-#[derive(Debug, Default)]
-pub struct TaskInboundCapabilities {
-    state: Mutex<TaskInboundCapabilityState>,
-}
-
-/// The task and the frozen source one admitted frame belongs to.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct InboundFrameAdmission {
-    destination: TaskIdentity,
-    source: ExchangeSource,
-}
-
-impl InboundFrameAdmission {
-    pub const fn destination(self) -> TaskIdentity {
-        self.destination
-    }
-
-    pub const fn source(self) -> ExchangeSource {
-        self.source
-    }
-}
-
-impl TaskInboundCapabilities {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    /// Whether an inbound exchange frame may be admitted.
-    ///
-    /// The parameters are exactly the fields a frame carries. An unknown
-    /// kernel key answers `UnknownDestinationTask`, which is the same refusal
-    /// a live task gives for a frame aimed elsewhere: the data plane must not
-    /// be able to tell "not created yet" from "not yours".
-    pub fn authorize_frame(
-        &self,
-        destination_kernel_key: UniqueId,
-        destination_node_id: FragmentNodeId,
-        source_kernel_key: UniqueId,
-        sender_ordinal: u32,
-        sender_count: u32,
-    ) -> Result<InboundFrameAdmission, IngressRejection> {
-        let descriptor = {
-            let state = self.state.lock().expect(CAPABILITY_LOCK);
-            let descriptor = state
-                .installed
-                .get(&destination_kernel_key)
-                .map(Arc::clone)
-                .ok_or(IngressRejection::UnknownDestinationTask)?;
-            if state
-                .closed_executions
-                .contains(&descriptor.identity().query_execution_id())
-            {
-                return Err(IngressRejection::UnknownDestinationTask);
-            }
-            descriptor
-        };
-        let source = authorize_inbound_frame(
-            &descriptor,
-            destination_kernel_key,
-            destination_node_id,
-            source_kernel_key,
-            sender_ordinal,
-            sender_count,
-        )?;
-        Ok(InboundFrameAdmission {
-            destination: descriptor.identity(),
-            source,
-        })
-    }
-
-    /// Whether this owner holds the frame's destination, and if so whether
-    /// the frame's route is legal.
-    ///
-    /// The data plane composes this with the fragment-based lifecycle owner,
-    /// which is why an unheld kernel key must be answerable as non-ownership
-    /// rather than as a refusal: a refusal here would decide a frame that
-    /// belongs to a query the other owner admitted. The uniform wire text for
-    /// a destination nobody holds is the caller's, so this distinction still
-    /// does not let a sender tell "not created yet" from "not yours".
-    pub fn claim_frame(&self, query: ExchangeRouteQuery) -> ExchangeRouteClaim {
-        let node_id = FragmentNodeId::new(query.destination_node_id);
-        let descriptor = {
-            let state = self.state.lock().expect(CAPABILITY_LOCK);
-            state
-                .installed
-                .get(&query.destination_fragment_instance_id)
-                .map(|descriptor| {
-                    (
-                        Arc::clone(descriptor),
-                        state
-                            .closed_executions
-                            .contains(&descriptor.identity().query_execution_id()),
-                    )
-                })
-        };
-        let Some((descriptor, context_closed)) = descriptor else {
-            return ExchangeRouteClaim::NotHeld;
-        };
-        if context_closed {
-            return ExchangeRouteClaim::Refused(format!(
-                "task {} belongs to a query context whose data-plane admission is closed",
-                descriptor.identity()
-            ));
-        }
-        match authorize_inbound_frame(
-            &descriptor,
-            query.destination_fragment_instance_id,
-            node_id,
-            query.source_fragment_instance_id,
-            query.sender_ordinal,
-            query.sender_count,
-        ) {
-            Ok(_) => ExchangeRouteClaim::Authorized,
-            Err(rejection) => ExchangeRouteClaim::Refused(format!(
-                "task {} froze this destination but {rejection}",
-                descriptor.identity()
-            )),
-        }
-    }
-
-    /// How many tasks currently accept inbound frames.
-    pub fn len(&self) -> usize {
-        self.state.lock().expect(CAPABILITY_LOCK).installed.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    fn install(&self, descriptor: Arc<TaskDescriptor>) -> Result<(), HostRejection> {
-        let key = descriptor.fragment_instance_id();
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        if state
-            .closed_executions
-            .contains(&descriptor.identity().query_execution_id())
-        {
-            return Err(protocol(format!(
-                "task {} cannot install inbound capability after its query context closed",
-                descriptor.identity()
-            )));
-        }
-        if let Some(existing) = state.installed.get(&key) {
-            // Replacing it would silently re-route the other task's frames,
-            // so the second claimant is refused instead.
-            return Err(protocol(format!(
-                "task {} cannot claim kernel key {key}, which task {} already holds",
-                descriptor.identity(),
-                existing.identity()
-            )));
-        }
-        state.installed.insert(key, descriptor);
-        Ok(())
-    }
-
-    fn close_context(&self, context: QueryContextRef) {
-        self.state
-            .lock()
-            .expect(CAPABILITY_LOCK)
-            .closed_executions
-            .insert(context.query_execution_id());
-    }
-
-    fn forget_context(&self, context: QueryContextRef) {
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        debug_assert!(state.installed.values().all(|descriptor| {
-            descriptor.identity().query_execution_id() != context.query_execution_id()
-        }));
-        state
-            .closed_executions
-            .remove(&context.query_execution_id());
-    }
-
-    /// Withdraws exactly this task's capability.
-    ///
-    /// The identity is re-checked because a rollback and a retirement can name
-    /// the same kernel key at different times; removing another task's entry
-    /// would open a hole no later step closes.
-    fn remove(&self, descriptor: &TaskDescriptor) {
-        let mut state = self.state.lock().expect(CAPABILITY_LOCK);
-        let key = descriptor.fragment_instance_id();
-        if state
-            .installed
-            .get(&key)
-            .is_some_and(|held| held.identity() == descriptor.identity())
-        {
-            state.installed.remove(&key);
-        }
-    }
 }
 
 /// The production [`TaskExecutionHost`].
@@ -591,7 +380,6 @@ impl FragmentEventSink for TaskOperatorStatisticsSink {
     }
 }
 
-const CAPABILITY_LOCK: &str = "task inbound capability lock";
 const TASK_LOCK: &str = "native task execution host lock";
 const DORMANT_LOCK: &str = "dormant fragment handle lock";
 
@@ -625,11 +413,6 @@ impl NativeTaskExecutionHost {
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// The frame-admission lookup a data-plane handler consults.
-    pub fn inbound_capabilities(&self) -> Arc<TaskInboundCapabilities> {
-        Arc::clone(&self.capabilities)
     }
 
     fn task_runtime(&self, identity: TaskIdentity) -> Option<Arc<TaskRuntime>> {
@@ -1571,9 +1354,8 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 #[cfg(test)]
 mod tests {
     use super::{
-        CompositeFragmentEventSink, ExchangeRouteClaim, ExchangeRouteQuery, FragmentStandDown,
-        InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
-        StandDown, TaskCompletionSupervisor, TaskInboundCapabilities, TaskOperatorStatisticsSink,
+        CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
+        QueryContextOptions, StandDown, TaskCompletionSupervisor, TaskOperatorStatisticsSink,
         TaskQueryContextFacts, query_options_fingerprint, report_terminal,
     };
 
@@ -1616,23 +1398,26 @@ mod tests {
         common, connector_read as connector_dto, novarocks as proto, plan,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorStorageResolver,
-        ResolvedVendedS3Access, StorageAccessRequest,
+        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
+        ConnectorExecutionWriteBinding, ConnectorStorageResolver, ResolvedVendedS3Access,
+        StorageAccessRequest,
     };
     use novarocks_task_codec::descriptor::WireFragmentPlan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
-    use novarocks_worker::IngressRejection;
+    use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
 
-    use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
+    use novarocks_native_adapter::exchange_data_plane::{
+        ExchangeRouteQuery, NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority,
+    };
+
     use crate::runtime::native_fragment_query::NativeFragmentQueryRuntime;
-    use crate::task_execution::clock::ProcessMonotonicClock;
-    use crate::task_execution::host::{HostRejection, RunnableTask, TaskExecutionHost};
-    use crate::task_execution::observation::TaskStatusSource;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, StatusAdvance, TaskStatusOwner, TaskStatusReporter,
+    use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::{
+        HostRejection, METRIC_PUBLISH_MIN_INTERVAL, RunnableTask, StatusAdvance, TaskExecutionHost,
+        TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
     };
 
     // ------------------------------------------------------------- fixtures
@@ -1794,6 +1579,19 @@ mod tests {
             vec![ExchangeInbound::try_new(node, sources).expect("a legal inbound")],
         )
         .expect("a legal topology")
+    }
+
+    fn claim_frame(
+        capabilities: &TaskInboundCapabilities,
+        query: ExchangeRouteQuery,
+    ) -> InboundFrameClaim {
+        capabilities.claim_frame(
+            query.destination_fragment_instance_id,
+            FragmentNodeId::new(query.destination_node_id),
+            query.source_fragment_instance_id,
+            query.sender_ordinal,
+            query.sender_count,
+        )
     }
 
     fn outbound_topology(edge: ExchangeEdgeId, target: TaskIdentity) -> ExchangeTopology {
@@ -2043,12 +1841,13 @@ mod tests {
         capabilities
             .install(Arc::new(descriptor.clone()))
             .expect("first claim on this kernel key");
+        let admission = capabilities
+            .authorize_frame(kernel_key, node, producer_key, 0, 1)
+            .expect("the frozen route is admitted");
+        assert_eq!(admission.destination(), consumer);
         assert_eq!(
-            capabilities.authorize_frame(kernel_key, node, producer_key, 0, 1),
-            Ok(InboundFrameAdmission {
-                destination: consumer,
-                source: ExchangeSource::new(producer, producer_key, 0),
-            })
+            admission.source(),
+            ExchangeSource::new(producer, producer_key, 0)
         );
 
         // Retirement must actually close the door: a capability that outlives
@@ -2119,14 +1918,17 @@ mod tests {
             .expect("a legal install");
 
         capabilities.close_context(context);
-        let claim = capabilities.claim_frame(ExchangeRouteQuery {
-            destination_fragment_instance_id: kernel_key,
-            destination_node_id: node.get(),
-            source_fragment_instance_id: producer_key,
-            sender_ordinal: 0,
-            sender_count: 1,
-        });
-        let ExchangeRouteClaim::Refused(detail) = claim else {
+        let claim = claim_frame(
+            &capabilities,
+            ExchangeRouteQuery {
+                destination_fragment_instance_id: kernel_key,
+                destination_node_id: node.get(),
+                source_fragment_instance_id: producer_key,
+                sender_ordinal: 0,
+                sender_count: 1,
+            },
+        );
+        let InboundFrameClaim::Refused(detail) = claim else {
             panic!("a closed context must refuse its still-installed destination");
         };
         assert!(
@@ -2195,8 +1997,11 @@ mod tests {
         // With nothing installed this owner holds no destination. It must not
         // refuse, because the fragment lifecycle may hold the same frame.
         assert_eq!(
-            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
-            ExchangeRouteClaim::NotHeld
+            claim_frame(
+                &capabilities,
+                query(kernel_key, node.get(), producer_key, 0, 1)
+            ),
+            InboundFrameClaim::NotHeld
         );
 
         capabilities
@@ -2205,15 +2010,21 @@ mod tests {
 
         // The frozen topology authorizes exactly the route the frontend froze.
         assert_eq!(
-            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
-            ExchangeRouteClaim::Authorized
+            claim_frame(
+                &capabilities,
+                query(kernel_key, node.get(), producer_key, 0, 1)
+            ),
+            InboundFrameClaim::Authorized
         );
 
         // A destination this process never created stays a disclaimer, not a
         // refusal: another owner may hold it.
         assert_eq!(
-            capabilities.claim_frame(query(UniqueId::new(1, 1), node.get(), producer_key, 0, 1)),
-            ExchangeRouteClaim::NotHeld
+            claim_frame(
+                &capabilities,
+                query(UniqueId::new(1, 1), node.get(), producer_key, 0, 1),
+            ),
+            InboundFrameClaim::NotHeld
         );
 
         // Every remaining mismatch is a refusal by this owner, each carrying
@@ -2221,28 +2032,31 @@ mod tests {
         for (case, claim) in [
             (
                 "unknown node",
-                capabilities.claim_frame(query(kernel_key, 12, producer_key, 0, 1)),
+                claim_frame(&capabilities, query(kernel_key, 12, producer_key, 0, 1)),
             ),
             (
                 "unknown source key",
-                capabilities.claim_frame(query(
-                    kernel_key,
-                    node.get(),
-                    UniqueId::new(99, 99),
-                    0,
-                    1,
-                )),
+                claim_frame(
+                    &capabilities,
+                    query(kernel_key, node.get(), UniqueId::new(99, 99), 0, 1),
+                ),
             ),
             (
                 "wrong sender count",
-                capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 2)),
+                claim_frame(
+                    &capabilities,
+                    query(kernel_key, node.get(), producer_key, 0, 2),
+                ),
             ),
             (
                 "ordinal above the frozen count",
-                capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 3, 1)),
+                claim_frame(
+                    &capabilities,
+                    query(kernel_key, node.get(), producer_key, 3, 1),
+                ),
             ),
         ] {
-            let ExchangeRouteClaim::Refused(detail) = claim else {
+            let InboundFrameClaim::Refused(detail) = claim else {
                 panic!("{case} must be refused by the holding owner, got {claim:?}");
             };
             assert!(
@@ -2251,11 +2065,15 @@ mod tests {
             );
         }
 
-        let unknown_node = capabilities.claim_frame(query(kernel_key, 12, producer_key, 0, 1));
-        let unknown_source =
-            capabilities.claim_frame(query(kernel_key, node.get(), UniqueId::new(99, 99), 0, 1));
-        let wrong_count =
-            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 2));
+        let unknown_node = claim_frame(&capabilities, query(kernel_key, 12, producer_key, 0, 1));
+        let unknown_source = claim_frame(
+            &capabilities,
+            query(kernel_key, node.get(), UniqueId::new(99, 99), 0, 1),
+        );
+        let wrong_count = claim_frame(
+            &capabilities,
+            query(kernel_key, node.get(), producer_key, 0, 2),
+        );
         assert_ne!(unknown_node, unknown_source);
         assert_ne!(unknown_source, wrong_count);
         assert_ne!(unknown_node, wrong_count);
@@ -2264,8 +2082,11 @@ mod tests {
         // refusal, so a frame arriving after teardown reads as unowned.
         capabilities.remove(&descriptor);
         assert_eq!(
-            capabilities.claim_frame(query(kernel_key, node.get(), producer_key, 0, 1)),
-            ExchangeRouteClaim::NotHeld
+            claim_frame(
+                &capabilities,
+                query(kernel_key, node.get(), producer_key, 0, 1)
+            ),
+            InboundFrameClaim::NotHeld
         );
     }
 
@@ -2277,8 +2098,6 @@ mod tests {
     /// move a single frame.
     #[test]
     fn the_composed_data_plane_admits_a_frame_only_the_task_substrate_holds() {
-        use crate::rpc::data_plane::BackendDataPlane;
-
         let consumer = identity(15, 1, 1);
         let producer = identity(15, 2, 1);
         let producer_key = UniqueId::new(101, 102);
@@ -2295,9 +2114,11 @@ mod tests {
             )))
             .expect("a legal install");
 
-        let plane = BackendDataPlane::with_exchange_receiver_port(
+        let plane = NativeExchangeDataPlane::new(
             Arc::new(UnavailableExchangeReceiverPort),
-            Arc::clone(&capabilities),
+            vec![Arc::new(TaskInboundCapabilitiesRouteAuthority::new(
+                Arc::clone(&capabilities),
+            ))],
         );
         let request = |destination: UniqueId, source: UniqueId| proto::ExchangeRequest {
             finst_id_hi: destination.high(),
@@ -2317,7 +2138,7 @@ mod tests {
         // The receiver port is deliberately unavailable, so reaching delivery
         // is the proof the route was authorized.
         let status = plane
-            .exchange(request(kernel_key, producer_key))
+            .transmit(request(kernel_key, producer_key))
             .status
             .expect("status");
         assert_eq!(status.code, 1);
@@ -2330,7 +2151,7 @@ mod tests {
         // A destination neither owner holds is still refused, and the refusal
         // names no owner.
         let status = plane
-            .exchange(request(UniqueId::new(1, 1), producer_key))
+            .transmit(request(UniqueId::new(1, 1), producer_key))
             .status
             .expect("status");
         assert_eq!(status.code, 1);

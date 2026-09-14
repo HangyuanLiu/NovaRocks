@@ -32,6 +32,8 @@ use novarocks_execution::exec::chunk::ChunkSchemaRef;
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::scan::{BoundScanRanges, ScanSource};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_scan_output::DecodedScanOutputColumns;
+use novarocks_native_adapter::fragment_variant_path::NativeVariantPathPlan;
 use novarocks_proto_codec::connector_read::{ConnectorRelation, ConnectorRelationKind};
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{connector_read as dto, plan};
@@ -45,13 +47,12 @@ use crate::connector::typed_runtime::{
 };
 
 use super::super::context::NativePlanDecodeContext;
-use super::super::error::NativeFragmentLeafDecodeError;
 use super::super::node::DecodedNode;
 use super::common::{
-    ConnectorVariantPathTransform, DecodedScanOutputColumns, lower_scan_predicate,
-    parse_scan_limit, validate_variant_path_read_slots,
+    ConnectorVariantPathTransform, lower_scan_predicate, parse_scan_limit,
+    validate_variant_path_read_slots,
 };
-use super::variant_path::NativeVariantPathPlan;
+use novarocks_native_adapter::fragment_error::NativeFragmentLeafDecodeError;
 
 /// Lower one `ScanSource.typed_connector_read` into an execution scan node.
 pub(super) fn lower_typed_connector_scan(
@@ -131,7 +132,7 @@ pub(super) fn lower_typed_connector_scan(
             )
         })?;
 
-    let predicate = lower_scan_predicate(scan, arena, &layout, ctx)?;
+    let predicate = lower_scan_predicate(scan, arena, &layout)?;
     // `slot_ids[i]` names page channel `i`, and a page channel exists for each
     // assignment, so both lanes are handed the connector's read column list
     // rather than the node's output schema. Whatever separates the two is the
@@ -567,9 +568,7 @@ mod tests {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
-            r#type: Some(
-                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
-            ),
+            r#type: Some(novarocks_plan_codec::encode_native_type(data_type).expect("encode type")),
             nullable: true,
             is_internal: false,
         }
@@ -579,7 +578,7 @@ mod tests {
         plan::ColumnDef {
             name: name.to_string(),
             data_type: Some(
-                crate::fragment::decode::type_decode::encode_type(data_type).expect("encode type"),
+                novarocks_plan_codec::encode_native_type(data_type).expect("encode type"),
             ),
             nullable: true,
             write_default_json: None,
@@ -643,7 +642,7 @@ mod tests {
                         synthetic_column: "__nr_var_v_0".to_string(),
                         canonical_path: "$.a.b".to_string(),
                         requested_type: Some(
-                            crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
+                            novarocks_plan_codec::encode_native_type(&DataType::Int64)
                                 .expect("encode type"),
                         ),
                         strict: true,
@@ -877,9 +876,12 @@ mod tests {
         let scan = scan_of(&node);
         let table = scan.table.as_ref().expect("fixture table");
         let output_columns =
-            super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
-                .expect("decode scan output columns");
-        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+            novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns(
+                scan,
+                FieldPath::root("scan"),
+            )
+            .expect("decode scan output columns");
+        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
             scan,
             table,
             output_columns.columns(),
@@ -916,9 +918,12 @@ mod tests {
         scan.required_columns = vec!["__nr_var_v_0".to_string(), "id".to_string()];
         let table = scan.table.as_ref().expect("fixture table");
         let output_columns =
-            super::super::common::decode_scan_output_columns(scan, FieldPath::root("scan"))
-                .expect("decode narrowed output columns");
-        let variant_path_plan = super::super::variant_path::parse_native_scan_variant_path_columns(
+            novarocks_native_adapter::fragment_scan_output::decode_scan_output_columns(
+                scan,
+                FieldPath::root("scan"),
+            )
+            .expect("decode narrowed output columns");
+        let variant_path_plan = novarocks_native_adapter::fragment_variant_path::parse_native_scan_variant_path_columns(
             scan,
             table,
             output_columns.columns(),

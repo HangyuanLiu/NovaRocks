@@ -190,11 +190,11 @@ pub fn collect_table_stats_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
     use crate::mv::domain::persistence::definition::{
         MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
+    };
+    use novarocks_query_application::persisted_query_definition::{
+        PersistedQueryDefinition, PersistedQueryDialect,
     };
     use std::collections::BTreeMap;
 

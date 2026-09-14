@@ -23,20 +23,18 @@ mod shaping;
 
 use crate::common::admitted_query_context::RequestContext;
 use crate::query_execution::dml::insert::{
-    IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, InsertValue,
-    PrepareIcebergInsert, ResolveInsertTarget, ResolvedInsertTarget,
+    IcebergInsertSource, InsertEngine, InsertOverwriteMode, InsertTargetName, PrepareIcebergInsert,
+    ResolveInsertTarget, ResolvedInsertTarget,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
-use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::error::DmlError;
 use crate::dml::runner::StatementWriteTransactionRunner;
 use crate::dml::service::DmlService;
-use crate::statistics::{
-    StatisticsInsertObservation, StatisticsInsertSource, StatisticsLiteral, StatisticsOverwriteMode,
-};
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 
-pub use command::{InsertCommand, InsertCommandSource, convert_insert_command};
+pub use command::{InsertCommandSource, convert_insert_command};
 pub use shaping::reorder_insert_rows;
 
 use self::iceberg::{IcebergInsertWriteExecutor, write_transaction_spec};
@@ -69,7 +67,6 @@ impl DmlService {
     ) -> Result<(), DmlError> {
         let mut command = convert_insert_command(statement)
             .map_err(|error| insert_admit_error(source, statement.span, error))?;
-        let statistics_source = statistics_source(&command.source);
         let (target, target_ref) = split_target_ref(&command.target)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
         command.target = target.clone();
@@ -86,8 +83,6 @@ impl DmlService {
             .map_err(DmlError::executor)?;
         validate_target(&target_ref)
             .map_err(|error| insert_admit_error(source, statement.target.span, error))?;
-        let statistics_namespace = resolved.namespace.clone();
-        let statistics_table = resolved.table.clone();
         self.execute_iceberg_source(
             engine,
             resolved,
@@ -100,23 +95,6 @@ impl DmlService {
             query_options,
         )?;
 
-        let statistics_overwrite_mode = match command.overwrite_mode {
-            InsertOverwriteMode::Append => StatisticsOverwriteMode::Append,
-            InsertOverwriteMode::FullTable => StatisticsOverwriteMode::FullTable,
-            InsertOverwriteMode::DynamicPartitions => StatisticsOverwriteMode::DynamicPartitions,
-        };
-        self.statistics()
-            .observe_insert(
-                StatisticsInsertObservation {
-                    database: &statistics_namespace,
-                    table: &statistics_table,
-                    insert_columns: &command.columns,
-                    source: &statistics_source,
-                    overwrite_mode: statistics_overwrite_mode,
-                },
-                self.local_statistics_columns(&statistics_namespace, &statistics_table)?,
-            )
-            .map_err(DmlError::executor)?;
         Ok(())
     }
 
@@ -184,7 +162,7 @@ impl DmlService {
 }
 
 fn insert_admit_error(source: &str, span: novarocks_parser::Span, message: String) -> DmlError {
-    DmlError::admit(AdmitError::InsertUnsupportedForm.to_user_error(source, span, message))
+    DmlError::admit(DmlAdmissionError::InsertUnsupportedForm.to_user_error(source, span, message))
 }
 
 fn split_target_ref(
@@ -221,41 +199,4 @@ fn validate_target(target_ref: &InsertTargetRef) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn statistics_source(source: &InsertCommandSource) -> StatisticsInsertSource {
-    match source {
-        InsertCommandSource::Values(rows) => StatisticsInsertSource::Values(
-            rows.iter()
-                .map(|row| row.iter().map(statistics_literal).collect())
-                .collect(),
-        ),
-        InsertCommandSource::SelectLiteralRow(row) => {
-            StatisticsInsertSource::SelectLiteralRow(row.iter().map(statistics_literal).collect())
-        }
-        InsertCommandSource::FromQuery(query) => StatisticsInsertSource::FromQuery(query.clone()),
-    }
-}
-
-fn statistics_literal(value: &InsertValue) -> StatisticsLiteral {
-    match value {
-        InsertValue::Null => StatisticsLiteral::Null,
-        InsertValue::Bool(value) => StatisticsLiteral::Bool(*value),
-        InsertValue::Int(value) => StatisticsLiteral::Int(*value),
-        InsertValue::Float(value) => StatisticsLiteral::Float(*value),
-        InsertValue::String(value) => StatisticsLiteral::String(value.clone()),
-        InsertValue::Date(value) => StatisticsLiteral::Date(value.clone()),
-        InsertValue::Array(values) => {
-            StatisticsLiteral::Array(values.iter().map(statistics_literal).collect())
-        }
-        InsertValue::Map(values) => StatisticsLiteral::Map(
-            values
-                .iter()
-                .map(|(key, value)| (statistics_literal(key), statistics_literal(value)))
-                .collect(),
-        ),
-        InsertValue::Struct(values) => {
-            StatisticsLiteral::Struct(values.iter().map(statistics_literal).collect())
-        }
-    }
 }

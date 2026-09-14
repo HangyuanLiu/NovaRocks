@@ -18,99 +18,13 @@
 //! Immutable request state captured exactly once at statement admission.
 // Design: ADR-0011 (docs/adr/ADR-0011-immutable-request-execution-context.md)
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::common::query_cancellation::QueryCancellationView;
-pub use novarocks_sql::compiler::SessionOptimizerSettings;
+use novarocks_query_application::cancellation::QueryCancellationView;
+use novarocks_query_application::request_session::RequestSessionContext;
+use novarocks_sql::compiler::SessionOptimizerSettings;
 use novarocks_types::ClusterRole;
-
-/// Startup-frozen temporal boundary shared by every lake publication attempt.
-// Design: ADR-0110 (docs/adr/ADR-0110-lake-publication-crash-only-contract.md)
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct LakePublicationRuntimePolicy {
-    max_attempt_duration: Duration,
-    safe_gc_age: Duration,
-    max_clock_skew: Duration,
-    listing_visibility_delay: Duration,
-    scheduler_margin: Duration,
-}
-
-impl LakePublicationRuntimePolicy {
-    pub fn try_new(
-        max_attempt_duration: Duration,
-        safe_gc_age: Duration,
-        max_clock_skew: Duration,
-        listing_visibility_delay: Duration,
-        scheduler_margin: Duration,
-    ) -> Result<Self, String> {
-        let components = [
-            ("max_attempt_duration", max_attempt_duration),
-            ("safe_gc_age", safe_gc_age),
-            ("max_clock_skew", max_clock_skew),
-            ("listing_visibility_delay", listing_visibility_delay),
-            ("scheduler_margin", scheduler_margin),
-        ];
-        for (name, duration) in components {
-            if duration.is_zero() {
-                return Err(format!("lake publication {name} must be greater than zero"));
-            }
-        }
-        let minimum_safe_gc_age = max_attempt_duration
-            .checked_add(max_clock_skew)
-            .and_then(|value| value.checked_add(listing_visibility_delay))
-            .and_then(|value| value.checked_add(scheduler_margin))
-            .ok_or_else(|| "lake publication safe GC age calculation overflows".to_string())?;
-        if safe_gc_age <= minimum_safe_gc_age {
-            return Err(
-                "lake publication safe GC age must exceed max attempt duration plus clock skew, listing visibility delay, and scheduler margin"
-                    .to_string(),
-            );
-        }
-        Ok(Self {
-            max_attempt_duration,
-            safe_gc_age,
-            max_clock_skew,
-            listing_visibility_delay,
-            scheduler_margin,
-        })
-    }
-
-    pub const fn max_attempt_duration(self) -> Duration {
-        self.max_attempt_duration
-    }
-
-    pub const fn safe_gc_age(self) -> Duration {
-        self.safe_gc_age
-    }
-
-    pub const fn max_clock_skew(self) -> Duration {
-        self.max_clock_skew
-    }
-
-    pub const fn listing_visibility_delay(self) -> Duration {
-        self.listing_visibility_delay
-    }
-
-    pub const fn scheduler_margin(self) -> Duration {
-        self.scheduler_margin
-    }
-
-    /// Clamp a mutating statement's session deadline to the shared attempt
-    /// maximum. Read-only statements must not call this method.
-    pub fn admit_deadline(
-        self,
-        now: Instant,
-        existing_deadline: Option<Instant>,
-    ) -> Result<Instant, String> {
-        let policy_deadline = now
-            .checked_add(self.max_attempt_duration)
-            .ok_or_else(|| "lake publication deadline exceeds monotonic clock range".to_string())?;
-        Ok(existing_deadline
-            .map(|deadline| deadline.min(policy_deadline))
-            .unwrap_or(policy_deadline))
-    }
-}
 
 /// All inputs accepted at the frontend statement-admission boundary.
 ///
@@ -147,14 +61,6 @@ impl RequestAdmission {
             optimizer_settings,
         }
     }
-}
-
-/// Session-derived inputs frozen at the request boundary.
-#[derive(Clone, Debug)]
-pub struct RequestSessionContext {
-    current_catalog: Option<String>,
-    current_database: String,
-    optimizer_settings: SessionOptimizerSettings,
 }
 
 /// Statement-stable inputs retained while a distributed statement may need a
@@ -224,32 +130,6 @@ impl StatementAdmissionContext {
 
     pub fn cancellation(&self) -> &QueryCancellationView {
         &self.cancellation
-    }
-}
-
-impl RequestSessionContext {
-    pub fn new(
-        current_catalog: Option<String>,
-        current_database: String,
-        optimizer_settings: SessionOptimizerSettings,
-    ) -> Self {
-        Self {
-            current_catalog,
-            current_database,
-            optimizer_settings,
-        }
-    }
-
-    pub fn current_catalog(&self) -> Option<&str> {
-        self.current_catalog.as_deref()
-    }
-
-    pub fn current_database(&self) -> &str {
-        &self.current_database
-    }
-
-    pub fn optimizer_settings(&self) -> &SessionOptimizerSettings {
-        &self.optimizer_settings
     }
 }
 
@@ -391,7 +271,7 @@ mod tests {
 
     use super::*;
     use crate::common::backend_topology::LiveBackendTarget;
-    use crate::common::query_cancellation::QueryCancellationSource;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
 
     fn topology(revision: u64, backend_count: usize) -> BackendTopologySnapshot {
         let targets = (0..backend_count)
@@ -418,39 +298,6 @@ mod tests {
             })
             .collect();
         BackendTopologySnapshot::try_new(revision, targets).expect("valid topology")
-    }
-
-    #[test]
-    fn lake_publication_policy_requires_a_strict_gc_age_and_clamps_deadlines() {
-        let policy = LakePublicationRuntimePolicy::try_new(
-            Duration::from_secs(30),
-            Duration::from_secs(36),
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-            Duration::from_secs(2),
-        )
-        .expect("strictly safe policy");
-        let now = Instant::now();
-        assert_eq!(
-            policy.admit_deadline(now, None).unwrap(),
-            now + Duration::from_secs(30)
-        );
-        assert_eq!(
-            policy
-                .admit_deadline(now, Some(now + Duration::from_secs(5)))
-                .unwrap(),
-            now + Duration::from_secs(5)
-        );
-        assert!(
-            LakePublicationRuntimePolicy::try_new(
-                Duration::from_secs(30),
-                Duration::from_secs(35),
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(2),
-            )
-            .is_err()
-        );
     }
 
     #[test]
@@ -494,7 +341,7 @@ mod tests {
         assert_eq!(context.session().current_catalog(), Some("iceberg"));
         assert!(!context.execution().cancellation().is_cancelled());
         cancellation.request(
-            crate::common::query_cancellation::QueryCancellationReason::ClientDisconnected,
+            novarocks_query_application::cancellation::QueryCancellationReason::ClientDisconnected,
         );
         assert!(context.execution().cancellation().is_cancelled());
     }

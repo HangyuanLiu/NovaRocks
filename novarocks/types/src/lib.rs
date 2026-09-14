@@ -47,7 +47,7 @@ pub use coercion::{comparison_common_type, wider_type};
 pub use engine_error_codes::EngineErrorCode;
 pub use field_render::{
     format_mysql_container_value_with_schema, http_json_row_from_arrays_with_primitives,
-    mysql_text_row_from_arrays_with_primitives,
+    is_zero_date_sentinel_date32, mysql_text_row_from_arrays_with_primitives,
 };
 pub use field_render_schema::FieldRenderSchema;
 pub use identity::{

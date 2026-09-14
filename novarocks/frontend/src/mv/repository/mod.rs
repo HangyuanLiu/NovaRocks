@@ -20,6 +20,16 @@ pub mod codec;
 pub mod key;
 mod operation;
 
+#[cfg(test)]
+#[path = "tests_definition.rs"]
+mod tests_definition;
+#[cfg(test)]
+#[path = "tests_dependency.rs"]
+mod tests_dependency;
+#[cfg(test)]
+#[path = "tests_port.rs"]
+mod tests_port;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -37,8 +47,8 @@ use crate::mv::domain::repository::{
     MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTarget,
     MvTargetLookup, ReplaceMvProjectionRequest,
 };
-use crate::state_store::StateStoreRunPolicy;
 use crate::state_store::metrics::{StateStoreConsumer, StateStoreMetrics};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 
 use self::codec::{
     DecodedMvRecord, MvRecordKind, MvSequence, decode_projection, decode_record, encode_projection,

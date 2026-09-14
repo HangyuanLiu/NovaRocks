@@ -77,8 +77,8 @@ pub use admission::{Stage, StageAdmission, StagePermit, StageRequest};
 pub use cancellation::{CancellationReason, CancellationView};
 pub use observation::{
     ControlIntent, ControlIntents, ControlPermit, Obligation, ObligationKey, ObligationKind,
-    ObligationSnapshot, OwnerState, ScopeSnapshot, UsageObservation, WorkloadObservationHandle,
-    WorkloadSnapshot,
+    ObligationSnapshot, OwnerState, RootLifecycleSnapshot, ScopeSnapshot, UsageObservation,
+    WorkClassTotals, WorkloadObservationHandle, WorkloadSnapshot,
 };
 pub use resource::{
     AllocationCharge, LocalResourceAuthority, Reservation, ResourceClass, ResourceConfig,

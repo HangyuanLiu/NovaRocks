@@ -17,37 +17,36 @@
 
 //! Fragment-owned native fragment submission assembly.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec, ScanSourceContract,
+    FragmentContractVersion, FragmentProgramOptions, FragmentSinkSpec,
 };
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
 
-use crate::fragment::decode::envelope::{require_root, require_sink};
-use crate::fragment::decode::exchange::decode_exchange_contracts;
-use crate::fragment::decode::instance::NativeFragmentInstanceInput;
-use crate::fragment::decode::runtime_filter::decode_runtime_filter_contract;
-use crate::fragment::decode::scan_contract::decode_scan_source_contracts;
-use crate::fragment::decode::sink_assignment::decode_fragment_sink_assignment;
-use crate::fragment::decode::submission_validation::{
+use novarocks_native_adapter::fragment_validation::{
     validate_fragment_expressions, validate_node_required_fields,
 };
 
 use super::context::NativePlanDecodeContext;
-use super::error::NativeFragmentDecodeError;
 use super::node::decode_node_with_runtime_filters;
 use super::runtime_filter_binding::NativeRuntimeFilterDecodeLedger;
-use super::sink::decode_fragment_sink_program_with_context;
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_instance::NativeFragmentInstanceInput;
+use novarocks_native_adapter::fragment_layout::decode_exchange_contracts;
+use novarocks_native_adapter::fragment_runtime_filter::decode_runtime_filter_contract;
+use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
+use novarocks_native_adapter::fragment_submission::{
+    decode_fragment_sink_assignment, decode_scan_source_contracts, require_root, require_sink,
+    validate_scan_range_nodes,
+};
 
 pub(crate) struct DecodedNativeFragment {
     submission: FragmentSubmission,
@@ -84,11 +83,12 @@ pub(crate) fn decode_fragment_submission(
 
     let scan_sources = decode_scan_source_contracts(root, root_path.clone())
         .map_err(NativeFragmentDecodeError::from)?;
-    validate_raw_scan_range_nodes(
+    validate_scan_range_nodes(
         &scan_sources,
         &instance.raw_scan_ranges,
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
-    )?;
+    )
+    .map_err(NativeFragmentDecodeError::from)?;
     let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)
         .map_err(NativeFragmentDecodeError::from)?;
 
@@ -113,8 +113,7 @@ pub(crate) fn decode_fragment_submission(
     ledger.finish()?;
     let scan_assignments = ScanAssignments::try_new(context.take_captured_scan_ranges())
         .map_err(NativeFragmentDecodeError::Binding)?;
-    let sink_program =
-        decode_fragment_sink_program_with_context(fragment, &decoded_root.layout, Some(&context))?;
+    let sink_program = decode_fragment_sink_program(fragment, &decoded_root.layout)?;
     let sink_spec =
         FragmentSinkSpec::try_new(sink_program).map_err(NativeFragmentDecodeError::Binding)?;
     let plan = novarocks_execution::exec::node::ExecPlanBuilder::new(arena, decoded_root.node)
@@ -154,31 +153,6 @@ pub(crate) fn decode_fragment_submission(
     })
 }
 
-fn validate_raw_scan_range_nodes(
-    contracts: &BTreeMap<
-        novarocks_execution::exec::fragment::program::FragmentNodeId,
-        ScanSourceContract,
-    >,
-    raw_ranges: &BTreeMap<
-        novarocks_execution::exec::fragment::program::FragmentNodeId,
-        Vec<ScanRangeParams>,
-    >,
-    path: FieldPath,
-) -> Result<(), NativeFragmentDecodeError> {
-    for node_id in raw_ranges.keys() {
-        if !contracts.contains_key(node_id) {
-            return Err(NativeFragmentDecodeError::inconsistent(
-                path.clone().map_key(node_id.get().to_string()),
-                format!(
-                    "scan ranges assigned to unknown scan node {}",
-                    node_id.get()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -194,9 +168,9 @@ mod tests {
     use novarocks_types::UniqueId;
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
-    use crate::fragment::decode::instance::decode_instance_params;
     use crate::fragment::decode::request::NativeFragmentRequest;
-    use crate::fragment::decode::type_decode::encode_type;
+    use novarocks_native_adapter::fragment_instance::decode_instance_params;
+    use novarocks_plan_codec::encode_native_type as encode_type;
 
     struct NeverCancelled;
 
@@ -213,6 +187,18 @@ mod tests {
             r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
             nullable: false,
             is_internal: false,
+        }
+    }
+
+    fn column_ref(column_id: u32) -> expr::Expr {
+        expr::Expr {
+            r#type: Some(encode_type(&DataType::Int32).expect("encode type")),
+            nullable: false,
+            kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {
+                column_id,
+                qualifier: None,
+                column: None,
+            })),
         }
     }
 
@@ -341,6 +327,33 @@ mod tests {
             submission.program().plan().root.kind,
             ExecNodeKind::Values(_)
         ));
+    }
+
+    #[test]
+    fn data_stream_hash_sink_resolves_partition_expression_from_root_layout() {
+        let mut fragment = values_noop_fragment();
+        fragment.sink = Some(plan::DataSink {
+            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                dest_node_id: 17,
+                output_partition: Some(plan::DataPartition {
+                    kind: plan::PartitionKind::Hash as i32,
+                    exprs: vec![column_ref(1)],
+                }),
+                output_columns: vec![1],
+                ..Default::default()
+            })),
+        });
+
+        let decoded = decode(
+            &fragment,
+            &instance_params(UniqueId::new(23, 24), UniqueId::new(25, 26)),
+        )
+        .expect("hash sink expression must resolve through the decoded root layout");
+        let (submission, _) = decoded.into_parts();
+        assert_eq!(
+            submission.program().sink().kind(),
+            FragmentSinkKind::DataStream
+        );
     }
 
     #[test]

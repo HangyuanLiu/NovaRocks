@@ -486,7 +486,9 @@ impl StatisticsCollectionStart {
 }
 
 /// FE-local, single-use publication authority. It has no serialization or
-/// cloning surface, and `finish` consumes the authority even on failure.
+/// cloning surface. Both `finish` and `abort` consume the authority, so a
+/// caller must explicitly converge every session it starts rather than
+/// treating `Drop` as provider cleanup.
 pub trait StatisticsCollectionSession: Send {
     fn descriptor(&self) -> &ConnectorInstanceDescriptor;
     fn incarnation(&self) -> ProviderBindingEpoch;
@@ -496,6 +498,10 @@ pub trait StatisticsCollectionSession: Send {
         self: Box<Self>,
         artifacts: Vec<StatisticsArtifactDraft>,
     ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError>;
+
+    /// Abandons a collection before publication and releases provider-local
+    /// state such as an uncommitted transaction frontier.
+    fn abort(self: Box<Self>) -> Result<(), ConnectorError>;
 }
 
 /// Collection-level fact: whether this measurement observed every visible row
@@ -1084,6 +1090,11 @@ impl StatisticsCollectionSession for LeaseBoundStatisticsSession {
         let Self { inner, _lease } = *self;
         inner.finish(artifacts)
     }
+
+    fn abort(self: Box<Self>) -> Result<(), ConnectorError> {
+        let Self { inner, _lease } = *self;
+        inner.abort()
+    }
 }
 
 impl Drop for StatisticsLeaseRelease {
@@ -1194,6 +1205,10 @@ mod tests {
             _artifacts: Vec<StatisticsArtifactDraft>,
         ) -> Result<ExternalMutationOutcome<StatisticsReceipt>, ConnectorError> {
             unreachable!("contract construction tests never finish the session")
+        }
+
+        fn abort(self: Box<Self>) -> Result<(), ConnectorError> {
+            Ok(())
         }
     }
 

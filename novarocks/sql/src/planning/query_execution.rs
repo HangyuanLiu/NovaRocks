@@ -565,6 +565,7 @@ impl SealedScanContract {
                 source: selection.name().to_string(),
                 publication_id: selection.publication_id()?,
                 definition_fingerprint: selection.definition_fingerprint()?,
+                publication_provenance: Arc::from(selection.publication_provenance()?),
                 input_mapping: selection.input_mapping().to_vec(),
                 publication_inputs: selection.publication_inputs().to_vec(),
                 publication_target: selection.publication_target()?.clone(),
@@ -586,6 +587,7 @@ pub struct SealedMvRewriteAction {
     source: String,
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
+    publication_provenance: Arc<str>,
     input_mapping: Vec<MvRewriteInputSelection>,
     publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
     publication_target: crate::compiler::SqlMvRewritePublicationRelation,
@@ -606,6 +608,10 @@ impl SealedMvRewriteAction {
 
     pub const fn definition_fingerprint(&self) -> [u8; 32] {
         self.definition_fingerprint
+    }
+
+    pub fn publication_provenance(&self) -> &str {
+        &self.publication_provenance
     }
 
     pub fn input_mapping(&self) -> &[MvRewriteInputSelection] {

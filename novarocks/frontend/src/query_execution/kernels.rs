@@ -23,11 +23,9 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::CatalogApplicationPort;
 use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::common::backend_topology::BackendTopologyService;
-use crate::connector::ConnectorControlHost;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::application::MvApplicationService;
 use crate::mv::domain::iceberg_backend::IcebergMvBackend;
@@ -36,6 +34,10 @@ use crate::mv::domain::repository::MvRepository;
 use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
+use novarocks_catalog_application::CatalogApplicationPort;
+use novarocks_catalog_application::ConnectorControlHost;
+use novarocks_query_application::session_error::{QueryServiceError, QueryServiceErrorKind};
+use novarocks_query_application::sql::catalog::SessionCatalogPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::MvStorageObservationPort;
 
@@ -189,7 +191,7 @@ pub struct DmlExecutionKernel {
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
     lake_publication_runtime_policy:
-        Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy>,
+        Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
 }
 
 /// Immutable SQL planning authorities shared by every DML statement.
@@ -249,7 +251,7 @@ impl DmlExecutionKernel {
 
     pub fn with_lake_publication_runtime_policy(
         mut self,
-        policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+        policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         self.lake_publication_runtime_policy = Some(policy);
         self
@@ -281,7 +283,7 @@ impl DmlExecutionKernel {
 
     pub(crate) fn lake_publication_runtime_policy(
         &self,
-    ) -> Option<crate::common::admitted_query_context::LakePublicationRuntimePolicy> {
+    ) -> Option<novarocks_query_application::publication::LakePublicationRuntimePolicy> {
         self.lake_publication_runtime_policy
     }
 }
@@ -573,22 +575,6 @@ impl_kernel_catalog_admission!(MvExecutionKernel);
 impl_kernel_catalog_admission!(ViewExecutionKernel);
 impl_kernel_catalog_admission!(MaintenanceExecutionKernel);
 
-/// FE-owned backend membership is intentionally a separate command capability.
-#[derive(Clone)]
-pub struct BackendManagementKernel {
-    topology: BackendTopologyService,
-}
-
-impl BackendManagementKernel {
-    pub fn new(topology: BackendTopologyService) -> Self {
-        Self { topology }
-    }
-
-    pub(crate) fn topology(&self) -> &BackendTopologyService {
-        &self.topology
-    }
-}
-
 /// Session catalog admission and namespace lookup.
 ///
 /// This is deliberately not part of generic command dispatch: `USE` and
@@ -612,29 +598,34 @@ impl SessionCatalogResolver {
             connector_control,
         }
     }
+}
 
-    pub fn database_exists(&self, database_name: &str) -> Result<bool, String> {
+impl SessionCatalogPort for SessionCatalogResolver {
+    fn database_exists(&self, database_name: &str) -> Result<bool, QueryServiceError> {
         self.catalog_service
             .local()
             .read()
-            .map_err(|_| "query catalog read lock poisoned".to_string())?
+            .map_err(|_| {
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Internal,
+                    "query catalog read lock poisoned",
+                )
+            })?
             .database_exists(database_name)
+            .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
 
-    pub fn require_external_catalog_ready(
-        &self,
-        catalog_name: &str,
-    ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+    fn require_external_catalog_ready(&self, catalog_name: &str) -> Result<(), QueryServiceError> {
         let application = self.catalog_application.as_ref().ok_or_else(|| {
-            crate::catalog_application::CatalogApplicationError::new(
-                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+            QueryServiceError::new(
+                QueryServiceErrorKind::Unavailable,
                 "external catalogs require a configured frontend catalog application",
             )
         })?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
             .map_err(|error| {
-                crate::catalog_application::CatalogApplicationError::new(
-                    crate::catalog_application::CatalogApplicationErrorKind::InvalidRequest,
+                QueryServiceError::new(
+                    QueryServiceErrorKind::BadDatabase,
                     format!("invalid catalog connector instance ID: {error}"),
                 )
             })?;
@@ -642,22 +633,73 @@ impl SessionCatalogResolver {
             .admit_catalog(&instance_id)
             .require_ready(&instance_id)
             .map(|_| ())
+            .map_err(|error| {
+                let kind = match error.kind() {
+                    novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable => {
+                        QueryServiceErrorKind::Unavailable
+                    }
+                    _ => QueryServiceErrorKind::BadDatabase,
+                };
+                QueryServiceError::new(kind, error.to_string())
+            })
     }
 
-    pub fn iceberg_namespace_exists(
+    fn external_namespace_exists(
         &self,
         catalog_name: &str,
         namespace_name: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, QueryServiceError> {
         let context = crate::connector::connector_request_context(
             None,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )?;
+        )
+        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))?;
         crate::connector::metadata_namespace_exists(
             self.connector_control.as_ref(),
             context,
             catalog_name,
             namespace_name,
         )
+        .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
+    }
+}
+
+#[cfg(test)]
+mod session_catalog_tests {
+    use std::sync::Arc;
+
+    use novarocks_query_application::session_error::QueryServiceErrorKind;
+    use novarocks_query_application::sql::catalog::SessionCatalogPort;
+    use novarocks_types::naming::DEFAULT_DATABASE;
+
+    use super::SessionCatalogResolver;
+
+    fn resolver_without_catalog_application() -> SessionCatalogResolver {
+        SessionCatalogResolver::new(
+            Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+            None,
+            Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
+        )
+    }
+
+    #[test]
+    fn local_database_lookup_uses_the_query_catalog_snapshot() {
+        let resolver = resolver_without_catalog_application();
+
+        assert!(
+            resolver
+                .database_exists(DEFAULT_DATABASE)
+                .expect("built-in local database exists")
+        );
+    }
+
+    #[test]
+    fn external_catalog_admission_fails_closed_without_its_frontend_owner() {
+        let resolver = resolver_without_catalog_application();
+
+        let error = resolver
+            .require_external_catalog_ready("warehouse")
+            .expect_err("external catalog cannot bypass frontend catalog admission");
+        assert_eq!(error.kind(), QueryServiceErrorKind::Unavailable);
     }
 }

@@ -22,9 +22,10 @@
 //! the Connector; this module only routes maintenance intents to it and shapes
 //! the neutral outcome the frontend reports.
 
-use super::{MaintenanceActionOutcome, MaintenanceActionRequest};
 use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
-use crate::maintenance::MaintenanceTarget;
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+};
 
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
 /// connector and cache-finalization ports. The caller owns the request context;

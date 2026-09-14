@@ -82,6 +82,9 @@ use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
 
+use crate::task_execution::context_convergence::{
+    ContextConvergenceIntakeHandle, ContextConvergencePublishError,
+};
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationAcknowledgement, OperationIntent,
     TaskOperationQueueAdmission, TaskOperationQueuePermit, TaskOperationSink, TaskOperationSubmit,
@@ -89,7 +92,6 @@ use crate::task_execution::intent::{
 use crate::task_execution::status_intake::{
     StatusEvent, StatusIntakeAdmission, StatusIntakeHandle, StatusIntakeWake,
 };
-use crate::task_execution::{ContextConvergenceIntakeHandle, ContextConvergencePublishError};
 
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
@@ -715,7 +717,7 @@ impl NativeTaskOperationSink {
 impl TaskOperationSink for NativeTaskOperationSink {
     fn try_reserve_queue(
         &self,
-        request: crate::task_execution::TaskOperationQueueRequest,
+        request: crate::task_execution::intent::TaskOperationQueueRequest,
     ) -> TaskOperationQueueAdmission {
         let lane = if request.requires_control_progress() {
             NativeTransportLane::Control
@@ -1495,6 +1497,7 @@ async fn run_subscription(
                                 }
                                 Err(next) => {
                                     set_state(&state, next);
+                                    intake.note_observation_incomplete();
                                     return;
                                 }
                             }
@@ -1508,6 +1511,7 @@ async fn run_subscription(
                                     "SubscribeTaskStatus stream rejected"
                                 );
                                 set_state(&state, SubscriptionState::Rejected);
+                                intake.note_observation_incomplete();
                                 return;
                             }
                             break;
@@ -1529,6 +1533,7 @@ async fn run_subscription(
                     "SubscribeTaskStatus subscription rejected"
                 );
                 set_state(&state, SubscriptionState::Rejected);
+                intake.note_observation_incomplete();
                 return;
             }
             Err(_) => {}
@@ -2106,11 +2111,13 @@ mod tests {
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{Request, Response, Status};
 
-    use crate::native::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
     use crate::native::transport_supervisor::NativeTransportSupervisor;
-    use crate::task_execution::ContextConvergenceIntake;
+    use crate::task_execution::context_convergence::ContextConvergenceIntake;
     use crate::task_execution::dispatch::OperationDispatcher;
     use crate::task_execution::status_intake::{CountingWake, StatusIntake};
+    use novarocks_native_adapter::generated::nova_rocks_grpc_server::{
+        NovaRocksGrpc, NovaRocksGrpcServer,
+    };
     use novarocks_query_application::coordination::{DispatchBudget, MonotonicInstant};
 
     use super::*;
@@ -3568,9 +3575,14 @@ mod tests {
 
         assert_eq!(observed, Some(SubscriptionState::ProcessMismatch));
         assert!(observed.expect("a settled state").is_fatal());
-        assert_eq!(
-            fixture.intake.queued(),
-            0,
+        let mut runner = fixture.intake.try_enter().expect("the runner is available");
+        let (observation_incomplete, statuses) = runner.drain_statuses(8);
+        assert!(
+            observation_incomplete,
+            "a fatal status identity mismatch fences a pending success seal"
+        );
+        assert!(
+            statuses.is_empty(),
             "an event from a replaced process is never published"
         );
     }

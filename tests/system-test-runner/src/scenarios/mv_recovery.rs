@@ -33,6 +33,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(MvStateStoreRestart),
         Box::new(MvSchedulerRecovery),
+        Box::new(MvRewriteBindingBarrier),
         Box::new(MvStagedPublishedRecovery),
         Box::new(MvFirstRefreshStaging),
         Box::new(MvBaseIdentityReplacement),
@@ -279,6 +280,115 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "wait for scheduler recovery to catch up durable MV",
         )?;
         context.action("scheduler recovered the interrupted durable refresh after FE restart");
+        Ok(())
+    }
+}
+
+/// Proves that a distributed rewritten query consumes the M1 target snapshot
+/// whose strict final receipt it froze, even if a normal refresh publishes M2
+/// before the query is dispatched to its backend tasks.
+struct MvRewriteBindingBarrier;
+
+impl Scenario for MvRewriteBindingBarrier {
+    fn name(&self) -> &'static str {
+        "mv/rewrite-final-target-binding"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let barrier_dir = scenario_root.join("mv-rewrite-barrier");
+        fs::create_dir_all(&barrier_dir).with_context(|| {
+            format!(
+                "create MV rewrite barrier directory {}",
+                barrier_dir.display()
+            )
+        })?;
+        let mut child_environment = CrossProcessChildEnvironment::default();
+        child_environment.fe.insert(
+            "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
+            barrier_dir.to_string_lossy().into_owned(),
+        );
+        Ok(ScenarioLaunchConfig {
+            child_environment,
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_rewrite_binding";
+        let warehouse = context.runtime_dir().join("warehouse");
+        let barrier_dir = context.scenario_root().join("mv-rewrite-barrier");
+        let hold_trigger = barrier_dir.join("mvx4-rewrite-hold.trigger");
+        let frozen_marker = barrier_dir.join("mvx4-rewrite-final-target-frozen.marker");
+        let mut conn = connect(context)?;
+        setup_orders_fixture(context, &mut conn, catalog, &warehouse, false)?;
+        execute(
+            context,
+            &mut conn,
+            "seed MV rewrite cost fixture",
+            "INSERT INTO orders SELECT number % 3, CAST(number % 10 AS BIGINT) FROM TABLE(generate_series(1, 1200)) t(number)",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "create aggregate MV for strict target binding",
+            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+        )?;
+        refresh(context, &mut conn, "orders_agg_mv")?;
+
+        let rewritten: Vec<(String,)> = query(
+            context,
+            &mut conn,
+            "EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1",
+            "confirm the query selects the fresh MV target",
+        )?;
+        if !rewritten
+            .iter()
+            .any(|(line,)| line.contains("rewritten with mv: orders_agg_mv"))
+        {
+            bail!(
+                "MV rewrite was not selected before the binding barrier; {}",
+                context.diagnostics()
+            );
+        }
+        context.action("confirmed query selection uses the M1 MV publication");
+
+        let _hold = FileTrigger::create(&hold_trigger, "hold\n")?;
+        let query = spawn_aggregate_query(
+            context.mysql_user().to_string(),
+            context.mysql_port(),
+            catalog,
+            context.remaining("start rewritten query at final target barrier")?,
+        );
+        wait_for_file(
+            context,
+            &frozen_marker,
+            "wait for strict final M1 target receipt to freeze",
+        )?;
+        context.action("observed strict final target proof frozen on M1");
+
+        execute(
+            context,
+            &mut conn,
+            "advance source to S102 while query is held after M1 target freeze",
+            "INSERT INTO orders VALUES (3, 99)",
+        )?;
+        refresh(context, &mut conn, "orders_agg_mv")?;
+        context.action("published the normal M2 MV target before releasing the query");
+
+        _hold.remove()?;
+        context.action("release rewritten query after M2 publication");
+        let rows =
+            receive_aggregate_query(context, query, "wait for rewritten query frozen against M1")?;
+        if rows != [(0, 1800), (1, 1800), (2, 1800)] {
+            bail!(
+                "rewritten query did not consume its frozen M1 target: rows={rows:?}; {}",
+                context.diagnostics()
+            );
+        }
+        context.action(
+            "verified native 1FE+3BE query consumed M1 after concurrent S102/M2 publication",
+        );
         Ok(())
     }
 }
@@ -910,6 +1020,15 @@ fn wait_for_marker_count(
     }
 }
 
+fn wait_for_file(context: &mut ScenarioContext, path: &Path, action: &str) -> Result<()> {
+    context.action(action);
+    while !path.exists() {
+        context.remaining(action)?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
 fn marker_count(directory: &Path) -> Result<usize> {
     let count = fs::read_dir(directory)
         .with_context(|| format!("read scheduler marker directory {}", directory.display()))?
@@ -976,6 +1095,42 @@ fn spawn_refresh(
         let _ = sender.send(result);
     });
     receiver
+}
+
+fn spawn_aggregate_query(
+    user: String,
+    port: u16,
+    catalog: &str,
+    timeout: Duration,
+) -> Receiver<std::result::Result<Vec<(i32, i64)>, String>> {
+    let catalog = catalog.to_string();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (|| -> Result<Vec<(i32, i64)>> {
+            let mut conn = mysql_actor::connect(&user, port, timeout)?;
+            conn.query_drop(format!("SET CATALOG {catalog}"))?;
+            conn.query_drop("USE ns")?;
+            conn.query("SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
+                .context("execute rewritten aggregate query")
+        })()
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+fn receive_aggregate_query(
+    context: &mut ScenarioContext,
+    receiver: Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
+    action: &str,
+) -> Result<Vec<(i32, i64)>> {
+    context.action(action);
+    let timeout = context.remaining(action)?;
+    match receiver.recv_timeout(timeout) {
+        Ok(Ok(rows)) => Ok(rows),
+        Ok(Err(error)) => bail!("{action} failed: {error}"),
+        Err(error) => bail!("{action} did not finish before deadline: {error}"),
+    }
 }
 
 fn expect_refresh_failure(

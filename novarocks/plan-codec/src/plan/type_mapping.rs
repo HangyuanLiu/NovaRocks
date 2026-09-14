@@ -55,7 +55,7 @@ pub(super) fn encode_sql_type(src: &SqlType) -> Result<common::TypeDesc, String>
     })
 }
 
-pub(crate) fn encode_type(dt: &DataType) -> Result<common::TypeDesc, String> {
+pub fn encode_type(dt: &DataType) -> Result<common::TypeDesc, String> {
     encode_type_inner(dt, None)
 }
 

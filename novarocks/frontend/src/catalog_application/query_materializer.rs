@@ -138,7 +138,7 @@ pub struct CatalogServiceMaterializer<'a> {
     /// Frontend-owned attachment admission. The loader still owns the exact
     /// connector lease; this gate preserves Absent versus Unavailable before
     /// Core can materialize an external table.
-    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     /// Request-scoped synthetic relations used by application rewrite flows.
     /// They are intentionally kept next to the binding store instead of the
     /// shared memory catalog: SQL can only observe their projected tokenized
@@ -224,7 +224,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
 
     pub fn with_catalog_application(
         mut self,
-        catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+        catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     ) -> Self {
         self.catalog_application = catalog_application;
         self
@@ -233,7 +233,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
     fn require_catalog_admission(
         &self,
         catalog: &str,
-    ) -> Result<Option<crate::catalog_application::CatalogRuntimeObservation>, String> {
+    ) -> Result<Option<novarocks_catalog_application::CatalogRuntimeObservation>, String> {
         let Some(application) = self.catalog_application else {
             return Ok(None);
         };
@@ -249,7 +249,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
     fn verify_catalog_admission(
         &self,
         catalog: &str,
-        expected: Option<&crate::catalog_application::CatalogRuntimeObservation>,
+        expected: Option<&novarocks_catalog_application::CatalogRuntimeObservation>,
     ) -> Result<(), String> {
         let Some(expected) = expected else {
             return Ok(());
@@ -453,7 +453,7 @@ pub fn build_catalog_service_provider<'a>(
     controls: &'a dyn ConnectorControlResolver,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
-    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
 ) -> CatalogServiceMaterializer<'a> {
     build_catalog_service_provider_with_query_local_overlays(
         current_catalog,
@@ -477,7 +477,7 @@ pub fn build_catalog_service_provider_with_query_local_overlays<'a>(
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     _lookup_mode: TableLookupMode,
     overlays: Vec<QueryLocalTableOverlay>,
-    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
 ) -> CatalogServiceMaterializer<'a> {
     let bindings = Arc::new(
         QueryTableBindingStore::try_new()
@@ -501,7 +501,7 @@ pub fn build_catalog_service_provider_with_bindings_and_query_local_overlays<'a>
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
     bindings: Arc<QueryTableBindingStore>,
     overlays: Vec<QueryLocalTableOverlay>,
-    catalog_application: Option<&'a dyn crate::catalog_application::CatalogApplicationPort>,
+    catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
 ) -> CatalogServiceMaterializer<'a> {
     let loader = iceberg_table_binding_loader(controls, connector_context);
     CatalogServiceMaterializer::new_with_query_local_overlays(
@@ -787,8 +787,10 @@ mod tests {
     }
 
     impl ChangingCatalogApplication {
-        fn observation(generation: u64) -> crate::catalog_application::CatalogRuntimeObservation {
-            crate::catalog_application::CatalogRuntimeObservation {
+        fn observation(
+            generation: u64,
+        ) -> novarocks_catalog_application::CatalogRuntimeObservation {
+            novarocks_catalog_application::CatalogRuntimeObservation {
                 attachment_id: if generation == 1 {
                     uuid::Uuid::from_u128(1)
                 } else {
@@ -803,55 +805,55 @@ mod tests {
         }
     }
 
-    impl crate::catalog_application::CatalogApplicationPort for ChangingCatalogApplication {
+    impl novarocks_catalog_application::CatalogApplicationPort for ChangingCatalogApplication {
         fn create_catalog(
             &self,
-            _command: crate::catalog_application::CatalogCreateCommand,
+            _command: novarocks_catalog_application::CatalogCreateCommand,
         ) -> Result<
-            crate::catalog_application::CatalogRuntimeObservation,
-            crate::catalog_application::CatalogApplicationError,
+            novarocks_catalog_application::CatalogRuntimeObservation,
+            novarocks_catalog_application::CatalogApplicationError,
         > {
             unreachable!("create is not part of this fixture")
         }
 
         fn drop_catalog(
             &self,
-            _command: crate::catalog_application::CatalogDropCommand,
-        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
+            _command: novarocks_catalog_application::CatalogDropCommand,
+        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
             unreachable!("drop is not part of this fixture")
         }
 
         fn admit_catalog(
             &self,
             _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-        ) -> crate::catalog_application::CatalogAdmission {
+        ) -> novarocks_catalog_application::CatalogAdmission {
             let attempt = self.admissions.fetch_add(1, Ordering::SeqCst);
-            crate::catalog_application::CatalogAdmission::Ready(Self::observation(
+            novarocks_catalog_application::CatalogAdmission::Ready(Self::observation(
                 if attempt == 0 { 1 } else { 2 },
             ))
         }
     }
 
-    impl crate::catalog_application::CatalogApplicationPort for UnavailableCatalogApplication {
+    impl novarocks_catalog_application::CatalogApplicationPort for UnavailableCatalogApplication {
         fn create_catalog(
             &self,
-            _command: crate::catalog_application::CatalogCreateCommand,
+            _command: novarocks_catalog_application::CatalogCreateCommand,
         ) -> Result<
-            crate::catalog_application::CatalogRuntimeObservation,
-            crate::catalog_application::CatalogApplicationError,
+            novarocks_catalog_application::CatalogRuntimeObservation,
+            novarocks_catalog_application::CatalogApplicationError,
         > {
-            Err(crate::catalog_application::CatalogApplicationError::new(
-                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+            Err(novarocks_catalog_application::CatalogApplicationError::new(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable,
                 "projection is stale",
             ))
         }
 
         fn drop_catalog(
             &self,
-            _command: crate::catalog_application::CatalogDropCommand,
-        ) -> Result<(), crate::catalog_application::CatalogApplicationError> {
-            Err(crate::catalog_application::CatalogApplicationError::new(
-                crate::catalog_application::CatalogApplicationErrorKind::Unavailable,
+            _command: novarocks_catalog_application::CatalogDropCommand,
+        ) -> Result<(), novarocks_catalog_application::CatalogApplicationError> {
+            Err(novarocks_catalog_application::CatalogApplicationError::new(
+                novarocks_catalog_application::CatalogApplicationErrorKind::Unavailable,
                 "projection is stale",
             ))
         }
@@ -859,8 +861,8 @@ mod tests {
         fn admit_catalog(
             &self,
             _instance_id: &novarocks_spi::connector::ConnectorInstanceId,
-        ) -> crate::catalog_application::CatalogAdmission {
-            crate::catalog_application::CatalogAdmission::Unavailable {
+        ) -> novarocks_catalog_application::CatalogAdmission {
+            novarocks_catalog_application::CatalogAdmission::Unavailable {
                 reason: "projection is stale".to_string(),
             }
         }

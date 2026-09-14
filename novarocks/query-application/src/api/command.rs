@@ -17,7 +17,8 @@
 
 use std::{error::Error, fmt, future::Future, pin::Pin, sync::Arc};
 
-use novarocks_workload_control::WorkOwner;
+use novarocks_spi::connector::ConnectorRequestContext;
+use novarocks_workload_control::WorkScope;
 
 use super::ObjectPath;
 
@@ -25,18 +26,32 @@ pub type CommandFuture =
     Pin<Box<dyn Future<Output = Result<CommandOutput, CommandError>> + Send + 'static>>;
 
 /// Governed command context transferred from the SQL application to a product.
+///
+/// A command consumer can attribute work to the statement and observe its
+/// cancellation state, but it never receives the statement's root owner. The
+/// SQL protocol retains that owner until it has a terminal protocol outcome.
+/// The connector context is frozen at the same admission boundary, so a
+/// consumer cannot rebuild provider requests with a default deadline or a
+/// detached cancellation source.
 pub struct CommandContext {
-    owner: WorkOwner,
+    scope: WorkScope,
+    connector_context: ConnectorRequestContext,
 }
 
 impl CommandContext {
-    #[allow(dead_code)]
-    pub(crate) const fn new(owner: WorkOwner) -> Self {
-        Self { owner }
+    pub fn new(scope: WorkScope, connector_context: ConnectorRequestContext) -> Self {
+        Self {
+            scope,
+            connector_context,
+        }
     }
 
-    pub fn into_work_owner(self) -> WorkOwner {
-        self.owner
+    pub fn scope(&self) -> &WorkScope {
+        &self.scope
+    }
+
+    pub fn connector_context(&self) -> &ConnectorRequestContext {
+        &self.connector_context
     }
 }
 
@@ -347,12 +362,61 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
     use super::*;
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn administrative_rows_require_one_value_per_column() {
         let columns = vec![Arc::<str>::from("job"), Arc::<str>::from("state")];
         let rows = vec![vec![Some(Arc::<str>::from("one"))]];
         assert!(CommandRows::try_new(columns, rows).is_none());
+    }
+
+    #[test]
+    fn command_context_exposes_the_statement_scope() {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024 * 1024,
+                control_bytes: 1024,
+                per_scope_bytes: 1024 * 1024 - 1024,
+            },
+        )
+        .unwrap();
+        control.mark_ready().unwrap();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+
+        let expected_scope = root.owner.scope();
+        let connector_context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            Arc::new(NeverCancelled),
+            4_096,
+            4_096,
+        )
+        .unwrap();
+        let context = CommandContext::new(expected_scope.clone(), connector_context);
+
+        assert_eq!(context.scope().id(), expected_scope.id());
+        assert!(context.scope().check().is_ok());
+        assert!(!context.connector_context().cancellation().is_cancelled());
     }
 }

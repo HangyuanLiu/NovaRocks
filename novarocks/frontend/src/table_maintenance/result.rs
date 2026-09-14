@@ -15,17 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::query_execution::maintenance::MaintenanceStatementResult;
+use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
+use arrow::datatypes::DataType;
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
+};
 use std::sync::Arc;
 
-use crate::query_execution::maintenance::{MaintenanceActionOutcome, MaintenanceStatementResult};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-use arrow::array::{ArrayRef, Int32Array, Int64Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
-use novarocks_types::SlotId;
-
-use super::model::{OptimizeJob, OptimizeJobOutcome};
+use novarocks_table_maintenance::{MaintenanceActionOutcome, OptimizeJob, OptimizeJobOutcome};
 
 pub fn action_result(
     outcome: MaintenanceActionOutcome,
@@ -41,7 +39,7 @@ pub fn action_result(
         } => build_query_result(
             vec![
                 column("rewritten_data_files_count", DataType::Int32, false),
-                column("added_data_files_count", DataType::Int32, false),
+                column("added_data_files_count", DataType::Int32, true),
                 column("rewritten_bytes_count", DataType::Int64, false),
                 column("failed_data_files_count", DataType::Int32, false),
                 column("removed_delete_files_count", DataType::Int32, false),
@@ -120,7 +118,7 @@ pub fn action_result(
         } => build_query_result(
             vec![
                 column("rewritten_delete_files_count", DataType::Int32, false),
-                column("added_delete_files_count", DataType::Int32, false),
+                column("added_delete_files_count", DataType::Int32, true),
                 column("rewritten_bytes_count", DataType::Int64, false),
                 column("added_bytes_count", DataType::Int64, false),
             ],
@@ -184,7 +182,8 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
         );
         values[9].push(
             outcome
-                .map(|value| value.added_data_files.to_string())
+                .and_then(|value| value.added_data_files)
+                .map(|value| value.to_string())
                 .unwrap_or_default(),
         );
         values[10].push(
@@ -192,7 +191,12 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
                 .map(|value| value.deleted_data_files.to_string())
                 .unwrap_or_default(),
         );
-        values[11].push(outcome.map(|_| "0".to_string()).unwrap_or_default());
+        values[11].push(
+            outcome
+                .and_then(|value| value.added_delete_files)
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        );
     }
     let result = build_query_result(
         column_names
@@ -210,11 +214,21 @@ pub fn optimize_jobs_result(jobs: Vec<OptimizeJob>) -> Result<MaintenanceStateme
 
 fn optimize_outcome_message(outcome: &OptimizeJobOutcome) -> String {
     format!(
-        "rewrote {} data files and {} delete files into {} data files ({} rows)",
+        "rewrote {} data files and {} delete files into {} data files and {} delete files ({} rows)",
         outcome.rewritten_data_files,
         outcome.deleted_data_files,
-        outcome.added_data_files,
-        outcome.output_record_count
+        outcome
+            .added_data_files
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        outcome
+            .added_delete_files
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string()),
+        outcome
+            .output_record_count
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     )
 }
 
@@ -223,33 +237,9 @@ fn build_query_result(
     arrays: Vec<ArrayRef>,
     context: &str,
 ) -> Result<QueryResult, String> {
-    let fields = columns
-        .iter()
-        .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|error| format!("{context} failed: {error}"))?;
-    let slot_ids = (1..=batch.num_columns())
-        .map(|index| {
-            u32::try_from(index)
-                .map(SlotId::new)
-                .map_err(|_| "too many output columns".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema =
-        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
-    let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
-    Ok(QueryResult {
-        columns,
-        chunks: vec![chunk],
-    })
+    build_arrow_query_result(columns, arrays).map_err(|error| format!("{context} failed: {error}"))
 }
 
 fn column(name: &str, data_type: DataType, nullable: bool) -> QueryResultColumn {
-    QueryResultColumn {
-        name: name.to_string(),
-        data_type,
-        nullable,
-        logical_type: None,
-    }
+    QueryResultColumn::new(name, data_type, nullable, None)
 }

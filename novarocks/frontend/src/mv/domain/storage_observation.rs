@@ -1809,9 +1809,9 @@ mod tests {
         MvDescriptorV3::from_desired_semantics(
             MvDesiredSemantics::new(
                 "package-1".to_string(),
-                crate::common::persisted_query_definition::PersistedQueryDefinition::new(
+                novarocks_query_application::persisted_query_definition::PersistedQueryDefinition::new(
                     "select 1",
-                    crate::common::persisted_query_definition::PersistedQueryDialect::StarRocks,
+                    novarocks_query_application::persisted_query_definition::PersistedQueryDialect::StarRocks,
                     "iceberg",
                     "db",
                 )

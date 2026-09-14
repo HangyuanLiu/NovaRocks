@@ -1,14 +1,16 @@
 use crate::actors::mysql as mysql_actor;
+use crate::actors::mysql_stream::MysqlStream;
 use crate::scenario::{Scenario, ScenarioContext};
 use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::{
-    QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot, ServerHandle,
+    CrossProcessNativeFaultProxyConfig, QueryExecutionResourceSnapshot,
+    QueryLifecycleStructuredSnapshot, ServerHandle,
+    native_fault_proxy::{ProxyDirection, ProxyMode},
 };
-use std::collections::BTreeSet;
-use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -32,10 +34,174 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedBaseline),
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
+        Box::new(NoEffectReadAfterBackendExit),
+        Box::new(LiveBackendPartition),
         Box::new(Nid2CreateConflict),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),
     ]
+}
+
+/// A live process that becomes unreachable is not a process exit.
+///
+/// The target is selected from the task protocol's own CreateTask marker, so
+/// the partition always applies to a backend the old attempt really uses.
+/// Pausing its advertised Native endpoint must revoke it for *future*
+/// admission without replacing its process identity. The old read is kept
+/// unread and must remain nonterminal until its path is restored; a new read
+/// then proves the revoked backend cannot contaminate a fresh attempt.
+struct LiveBackendPartition;
+
+impl Scenario for LiveBackendPartition {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/live-backend-partition"
+    }
+
+    fn launch_config(
+        &self,
+        _scenario_root: &std::path::Path,
+    ) -> Result<crate::scenario::ScenarioLaunchConfig> {
+        Ok(crate::scenario::ScenarioLaunchConfig {
+            native_fault_proxies: CrossProcessNativeFaultProxyConfig {
+                backend_retained_byte_limits: (0..REQUIRED_BACKENDS)
+                    .map(|index| (index, 64 * 1024))
+                    .collect::<BTreeMap<_, _>>(),
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_snapshot(context)?;
+        let before_old_execution = latest_execution_id(context)?;
+        let create_counts = (0..context.handle().be_count())
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let old_read = start_partitioned_read(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("start the old live-partition read")?,
+        )?;
+        context.action(
+            "started an unread distributed read whose admitted backend will be partitioned",
+        );
+        await_resource_activity(context, &baseline)?;
+        let target = await_fresh_task_create(context, &create_counts)?;
+        let process_before = context.process_ids().backends[target];
+        let proxy = context
+            .handle()
+            .native_fault_proxy(target)
+            .with_context(|| format!("obtain Native fault proxy for admitted BE[{target}]"))?;
+        await_proxy_connection(context, &proxy, target)?;
+        context.action(format!(
+            "observed old attempt TaskCreate and a live Native connection on BE[{target}]"
+        ));
+
+        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Paused);
+        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Paused);
+        context.action(format!(
+            "paused both Native transport directions for admitted, still-running BE[{target}]"
+        ));
+        await_backend_revoked_for_future_admission(context, target, process_before)?;
+        context.action(format!(
+            "confirmed BE[{target}] retained process identity {process_before} while FE revoked it for future admission"
+        ));
+        match old_read.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => {}
+            Ok(outcome) => bail!(
+                "old read became terminal while BE[{target}] remained partitioned: {outcome:?}"
+            ),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("old read actor disconnected while BE[{target}] remained partitioned")
+            }
+        }
+
+        let before_new_execution = latest_execution_id(context)?;
+        let mut independent = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            bounded_io_timeout(context, "connect independent post-partition read")?,
+        )?;
+        execute_baseline_query(&mut independent, "post-partition independent")?;
+        let independent_terminal =
+            await_terminal_snapshot(context, before_new_execution.as_deref())?;
+        let independent_participants = task_evidence::assert_query_completed_across_boundary(
+            context,
+            &independent_terminal,
+            "post-partition independent read",
+        )?;
+        ensure!(
+            !independent_participants.contains(&target),
+            "fresh read used revoked BE[{target}]: {independent_participants:?}"
+        );
+        context.action(format!(
+            "completed a new attempt on live participants {independent_participants:?}, excluding partitioned BE[{target}]"
+        ));
+
+        proxy.set_mode(ProxyDirection::ClientToUpstream, ProxyMode::Forward);
+        proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
+        context.action(format!(
+            "restored both Native transport directions for BE[{target}]"
+        ));
+        let old_rows = old_read
+            .done
+            .recv_timeout(context.remaining("await restored old read")?)
+            .context("old read did not finish after Native transport restoration")??;
+        old_read
+            .thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("old live-partition read actor panicked"))??;
+        ensure!(
+            old_rows == vec![1, 1],
+            "restored old read returned unexpected rows: {old_rows:?}"
+        );
+        let old_terminal = await_terminal_snapshot(context, before_old_execution.as_deref())?;
+        ensure!(
+            old_terminal.attempt_id == 1,
+            "restored old read unexpectedly replaced its attempt: {}",
+            old_terminal.attempt_id
+        );
+        ensure!(
+            context.process_ids().backends[target] == process_before,
+            "BE[{target}] process identity changed during a live transport partition"
+        );
+        context.action(format!(
+            "restored old attempt completed without replacing BE[{target}] process identity"
+        ));
+        await_resource_convergence(context, &baseline)
+    }
+}
+
+struct PendingPartitionedRead {
+    thread: thread::JoinHandle<Result<()>>,
+    done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
+}
+
+fn start_partitioned_read(
+    user: &str,
+    port: u16,
+    connect_timeout: Duration,
+) -> Result<PendingPartitionedRead> {
+    let (done_tx, done) = mpsc::sync_channel(1);
+    let user = user.to_owned();
+    let thread = thread::Builder::new()
+        .name("live-backend-partition-read".to_string())
+        .spawn(move || -> Result<()> {
+            let mut connection =
+                mysql_actor::connect_for_cancellation(&user, port, connect_timeout)?;
+            let outcome = connection.query(NID2_FENCE_QUERY);
+            done_tx
+                .send(outcome)
+                .context("publish live-partition read result")
+        })
+        .context("start live-partition read actor")?;
+    Ok(PendingPartitionedRead { thread, done })
 }
 
 struct DistributedBaseline;
@@ -92,7 +258,7 @@ impl Scenario for MysqlDisconnect {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let stream = send_raw_mysql_query(
+        let stream = MysqlStream::query(
             context.mysql_user(),
             context.mysql_port(),
             "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
@@ -102,9 +268,7 @@ impl Scenario for MysqlDisconnect {
         await_resource_activity(context, &baseline)?;
         context.action("observed in-flight distributed query resources");
 
-        stream
-            .shutdown(Shutdown::Both)
-            .context("close raw public MySQL client connection")?;
+        stream.shutdown()?;
         context.action("closed the raw public MySQL client connection");
 
         await_resource_convergence(context, &baseline)
@@ -123,29 +287,23 @@ impl Scenario for QueryTimeout {
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let mut stream = connect_raw_mysql(
+        let mut stream = MysqlStream::connect(
             context.mysql_user(),
             context.mysql_port(),
             bounded_io_timeout(context, "open timeout MySQL client")?,
         )?;
         context.action("connected timeout client through public MySQL protocol");
-        send_query(&mut stream, "SET query_timeout = 1")?;
-        expect_ok_packet(&mut stream, "SET query_timeout")?;
+        stream.send_query("SET query_timeout = 1")?;
+        stream.expect_ok_packet("SET query_timeout")?;
         context.action("set query_timeout = 1 through the public MySQL protocol");
 
-        send_query(
-            &mut stream,
+        stream.send_query(
             "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v",
         )?;
         context.action("sent a blocking query expected to time out");
         await_resource_activity(context, &baseline)?;
         context.action("observed in-flight distributed query resources before timeout");
-        let (_, response) = read_packet(&mut stream).context("read timed query response")?;
-        ensure!(
-            response.first().copied() == Some(0xff),
-            "expected timed query to return a MySQL error packet, got payload={response:?}"
-        );
-        let error = mysql_error_text(&response)?;
+        let error = stream.read_timeout_query_error()?;
         ensure!(
             error.contains("timed out") || error.contains("timeout"),
             "expected MySQL timeout error, got: {error}"
@@ -153,6 +311,91 @@ impl Scenario for QueryTimeout {
         context.action(format!("received expected MySQL timeout error: {error}"));
 
         await_resource_convergence(context, &baseline)
+    }
+}
+
+/// A read may replace its attempt only before it has made any result visible.
+///
+/// This case deliberately keeps the public MySQL stream unread until after the
+/// selected BE has exited. A fresh task-create marker is the admission witness:
+/// it identifies the process that accepted this exact in-flight attempt without
+/// guessing a scheduler placement. The slow expression is workload, not the
+/// oracle; the marker is what orders the kill after task admission.
+struct NoEffectReadAfterBackendExit;
+
+impl Scenario for NoEffectReadAfterBackendExit {
+    fn name(&self) -> &'static str {
+        "query-lifecycle/no-effect-read-after-backend-exit"
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_snapshot(context)?;
+        let before_execution = latest_execution_id(context)?;
+        let create_counts = (0..context.handle().be_count())
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut stream = MysqlStream::query(
+            context.mysql_user(),
+            context.mysql_port(),
+            NID2_FENCE_QUERY,
+            // The second attempt repeats the deliberate ten-second workload.
+            // A generic ten-second socket cap would therefore abort the public
+            // client before a healthy replacement can send its first row.
+            context.remaining("open no-effect recovery MySQL client")?,
+        )?;
+        context.action(
+            "sent an unread no-effect distributed read through a raw public MySQL connection",
+        );
+
+        let target = await_fresh_task_create(context, &create_counts)?;
+        context.action(format!(
+            "observed a fresh TaskCreate admission for the unread read on BE[{target}]"
+        ));
+        context
+            .handle()
+            .kill_be(target)
+            .with_context(|| format!("kill admitted BE[{target}] without restarting it"))?;
+        await_backend_exit(context, target)?;
+        context.action(format!(
+            "confirmed BE[{target}] exited while the public client had not read a result"
+        ));
+
+        assert_two_sleep_rows(&mut stream)?;
+        let terminal = await_terminal_snapshot(context, before_execution.as_deref())?;
+        ensure!(
+            terminal.attempt_id == 2,
+            "no-effect read after BE exit must complete on replacement attempt 2, got attempt {}",
+            terminal.attempt_id
+        );
+        let participants = task_evidence::assert_query_completed_across_boundary(
+            context,
+            &terminal,
+            "no-effect read after BE exit",
+        )?;
+        ensure!(
+            !participants.contains(&target),
+            "replacement attempt unexpectedly completed through exited BE[{target}]: {participants:?}"
+        );
+        context.action(format!(
+            "verified unread no-effect read completed as attempt=2 on remaining task participants {participants:?}"
+        ));
+
+        await_resource_convergence(context, &baseline)?;
+        let deadline = context.deadline();
+        context
+            .handle()
+            .restart_be_until(target, deadline)
+            .with_context(|| format!("restore BE[{target}] after no-restart recovery assertion"))?;
+        context.action(format!(
+            "restored BE[{target}] only after the no-restart recovery assertion completed"
+        ));
+        Ok(())
     }
 }
 
@@ -452,6 +695,154 @@ fn await_token_scoped_marker(
     }
 }
 
+/// Finds the BE that admitted a task after this scenario captured its own log
+/// counts. The marker is emitted only after the backend has accepted the
+/// CreateTask operation, so a returned index is an actual participant rather
+/// than a scheduler prediction.
+fn await_fresh_task_create(
+    context: &mut ScenarioContext,
+    baseline_counts: &[usize],
+) -> Result<usize> {
+    loop {
+        for (index, baseline) in baseline_counts.iter().copied().enumerate() {
+            let current = context
+                .handle()
+                .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")
+                .with_context(|| format!("read TaskCreate evidence from BE[{index}]"))?;
+            if current > baseline {
+                return Ok(index);
+            }
+        }
+        let remaining =
+            context.remaining("observe a fresh TaskCreate admission for the unread read")?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_backend_exit(context: &mut ScenarioContext, target: usize) -> Result<()> {
+    loop {
+        let snapshot = resource_snapshot(context)?;
+        let backend = snapshot
+            .backends
+            .get(target)
+            .with_context(|| format!("resource snapshot omitted BE[{target}]"))?;
+        if !backend.process_running {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!("observe BE[{target}] process exit"))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_proxy_connection(
+    context: &ScenarioContext,
+    proxy: &novarocks_cluster_harness::native_fault_proxy::NativeFaultProxyControl,
+    target: usize,
+) -> Result<()> {
+    loop {
+        if proxy.active_connections() > 0 {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!(
+            "observe a live Native connection through BE[{target}] proxy"
+        ))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+fn await_backend_revoked_for_future_admission(
+    context: &mut ScenarioContext,
+    target: usize,
+    expected_pid: u32,
+) -> Result<()> {
+    let advertised_port = context.handle().native_be_endpoint(target)?.port();
+    loop {
+        let snapshot = resource_snapshot(context)?;
+        let backend = snapshot
+            .backends
+            .get(target)
+            .with_context(|| format!("resource snapshot omitted BE[{target}]"))?;
+        ensure!(
+            backend.process_running,
+            "BE[{target}] exited while its Native endpoint was partitioned"
+        );
+        ensure!(
+            context.process_ids().backends[target] == expected_pid,
+            "BE[{target}] process identity changed while awaiting transport revocation"
+        );
+        let still_eligible = context
+            .handle()
+            .frontend_backend_topology()?
+            .iter()
+            .any(|row| row.grpc_port == advertised_port && row.is_eligible_live());
+        if !still_eligible {
+            return Ok(());
+        }
+        let remaining = context.remaining(&format!(
+            "observe FE revoke partitioned BE[{target}] from future admission"
+        ))?;
+        thread::sleep(remaining.min(RESOURCE_POLL_INTERVAL));
+    }
+}
+
+/// The delayed read returns two `sleep(10)` values. We intentionally begin
+/// reading only after the BE exit above, so this validates both result delivery
+/// and that no result became visible before recovery was required.
+fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
+    let packets = [
+        stream.read_packet("recovered read column count")?,
+        stream.read_packet("recovered read column definition")?,
+        stream.read_packet("recovered read metadata terminator")?,
+        stream.read_packet("recovered read first row")?,
+        stream.read_packet("recovered read second row")?,
+        stream.read_packet("recovered read terminal")?,
+    ];
+    for (offset, packet) in packets.iter().enumerate() {
+        ensure!(
+            packet.sequence() == offset as u8 + 1,
+            "recovered read packet {} had sequence {}, expected {}",
+            offset + 1,
+            packet.sequence(),
+            offset + 1
+        );
+        ensure!(
+            !packet.is_error(),
+            "recovered read packet {} was a MySQL error: {:?}",
+            offset + 1,
+            packet.payload()
+        );
+    }
+    ensure!(
+        packets[0].payload() == [1],
+        "recovered read expected one result column, got {:?}",
+        packets[0].payload()
+    );
+    ensure!(
+        !packets[1].is_result_terminator(),
+        "recovered read column definition was a terminator: {:?}",
+        packets[1].payload()
+    );
+    ensure!(
+        packets[2].is_result_terminator(),
+        "recovered read metadata did not terminate: {:?}",
+        packets[2].payload()
+    );
+    for (ordinal, packet) in packets[3..5].iter().enumerate() {
+        ensure!(
+            packet.payload() == [1, b'1'],
+            "recovered read row {} expected sleep result 1, got {:?}",
+            ordinal + 1,
+            packet.payload()
+        );
+    }
+    ensure!(
+        packets[5].is_result_terminator() && !packets[5].has_more_results(),
+        "recovered read did not end with one terminal success packet: {:?}",
+        packets[5].payload()
+    );
+    Ok(())
+}
+
 fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     let actual = context.handle().be_count();
     ensure!(
@@ -629,135 +1020,4 @@ fn await_resource_convergence(
 
 fn bounded_io_timeout(context: &ScenarioContext, operation: &str) -> Result<Duration> {
     Ok(context.remaining(operation)?.min(IO_TIMEOUT_CAP))
-}
-
-fn connect_raw_mysql(user: &str, port: u16, timeout: Duration) -> Result<TcpStream> {
-    const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
-    const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
-    const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
-    const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
-    const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
-    const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
-
-    let address = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .with_context(|| format!("connect raw public MySQL client at {address}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .context("set raw MySQL read timeout")?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .context("set raw MySQL write timeout")?;
-
-    let (_, handshake) = read_packet(&mut stream).context("read MySQL handshake")?;
-    ensure!(
-        handshake.first().copied() == Some(10),
-        "expected MySQL protocol v10 handshake, got payload={handshake:?}"
-    );
-
-    let client_flags = CLIENT_LONG_PASSWORD
-        | CLIENT_LONG_FLAG
-        | CLIENT_PROTOCOL_41
-        | CLIENT_TRANSACTIONS
-        | CLIENT_SECURE_CONNECTION
-        | CLIENT_PLUGIN_AUTH;
-    let mut response = Vec::with_capacity(user.len() + 64);
-    response.extend_from_slice(&client_flags.to_le_bytes());
-    response.extend_from_slice(&(16_u32 * 1024 * 1024).to_le_bytes());
-    response.push(45);
-    response.extend_from_slice(&[0u8; 23]);
-    response.extend_from_slice(user.as_bytes());
-    response.push(0);
-    response.push(0);
-    response.extend_from_slice(b"mysql_native_password");
-    response.push(0);
-    write_packet(&mut stream, 1, &response).context("write MySQL handshake response")?;
-
-    let (_, auth_result) = read_packet(&mut stream).context("read MySQL authentication result")?;
-    if auth_result.first().copied() == Some(0xff) {
-        bail!(
-            "raw public MySQL authentication failed: {}",
-            mysql_error_text(&auth_result)?
-        );
-    }
-    ensure!(
-        auth_result.first().copied() == Some(0),
-        "unexpected raw MySQL authentication response: {auth_result:?}"
-    );
-    Ok(stream)
-}
-
-fn send_raw_mysql_query(user: &str, port: u16, sql: &str, timeout: Duration) -> Result<TcpStream> {
-    let mut stream = connect_raw_mysql(user, port, timeout)?;
-    send_query(&mut stream, sql)?;
-    Ok(stream)
-}
-
-fn send_query(stream: &mut TcpStream, sql: &str) -> Result<()> {
-    let mut payload = Vec::with_capacity(sql.len() + 1);
-    payload.push(0x03);
-    payload.extend_from_slice(sql.as_bytes());
-    write_packet(stream, 0, &payload).context("write MySQL COM_QUERY packet")
-}
-
-fn expect_ok_packet(stream: &mut TcpStream, operation: &str) -> Result<()> {
-    let (_, response) =
-        read_packet(stream).with_context(|| format!("read response for {operation}"))?;
-    if response.first().copied() == Some(0xff) {
-        bail!("{operation} failed: {}", mysql_error_text(&response)?);
-    }
-    ensure!(
-        response.first().copied() == Some(0),
-        "{operation} expected a MySQL OK packet, got payload={response:?}"
-    );
-    Ok(())
-}
-
-fn mysql_error_text(payload: &[u8]) -> Result<String> {
-    ensure!(
-        payload.first().copied() == Some(0xff),
-        "expected a MySQL error packet, got payload={payload:?}"
-    );
-    ensure!(
-        payload.len() >= 3,
-        "truncated MySQL error packet: {payload:?}"
-    );
-    let message_offset = if payload.get(3).copied() == Some(b'#') {
-        9
-    } else {
-        3
-    };
-    Ok(String::from_utf8_lossy(&payload[message_offset..]).into_owned())
-}
-
-fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>)> {
-    let mut header = [0u8; 4];
-    stream
-        .read_exact(&mut header)
-        .context("read MySQL packet header")?;
-    let length =
-        usize::from(header[0]) | (usize::from(header[1]) << 8) | (usize::from(header[2]) << 16);
-    let mut payload = vec![0u8; length];
-    stream
-        .read_exact(&mut payload)
-        .context("read MySQL packet payload")?;
-    Ok((header[3], payload))
-}
-
-fn write_packet(stream: &mut TcpStream, sequence: u8, payload: &[u8]) -> Result<()> {
-    let length = u32::try_from(payload.len()).context("MySQL packet payload length fits u32")?;
-    ensure!(length <= 0x00ff_ffff, "MySQL packet payload is too large");
-    let header = [
-        (length & 0xff) as u8,
-        ((length >> 8) & 0xff) as u8,
-        ((length >> 16) & 0xff) as u8,
-        sequence,
-    ];
-    stream
-        .write_all(&header)
-        .context("write MySQL packet header")?;
-    stream
-        .write_all(payload)
-        .context("write MySQL packet payload")?;
-    stream.flush().context("flush MySQL packet")
 }

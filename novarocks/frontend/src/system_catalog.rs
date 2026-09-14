@@ -25,9 +25,9 @@ use std::sync::Arc;
 use crate::catalog_application::system_catalog::{
     SystemCatalog, SystemCatalogInputs, SystemTableData,
 };
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use novarocks_query_application::api::{build_utf8_query_result, build_utf8_table_query_result};
 use novarocks_types::schema::ColumnDef;
 
 const INFORMATION_SCHEMA_DB: &str = "information_schema";
@@ -96,33 +96,30 @@ fn schemata_columns() -> Vec<ColumnDef> {
 /// fixed to `catalog`. Byte-identical to the former core `build_schemata_batch`
 /// (`information_schema.rs`); schema exactly matches `schemata_columns()`.
 fn build_schemata_batch(catalog: &str, databases: &[String]) -> Result<Vec<RecordBatch>, String> {
-    let row_count = databases.len();
-    let catalog_name = StringArray::from(vec![catalog; row_count]);
-    let schema_name = StringArray::from_iter_values(databases.iter().map(String::as_str));
-    let default_charset = StringArray::from(vec!["utf8"; row_count]);
-    let default_collation = StringArray::from(vec!["utf8_general_ci"; row_count]);
-    let sql_path: StringArray = std::iter::repeat_n(None::<&str>, row_count).collect();
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("catalog_name", DataType::Utf8, false),
-        Field::new("schema_name", DataType::Utf8, false),
-        Field::new("default_character_set_name", DataType::Utf8, false),
-        Field::new("default_collation_name", DataType::Utf8, false),
-        Field::new("sql_path", DataType::Utf8, true),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(catalog_name) as ArrayRef,
-            Arc::new(schema_name) as ArrayRef,
-            Arc::new(default_charset) as ArrayRef,
-            Arc::new(default_collation) as ArrayRef,
-            Arc::new(sql_path) as ArrayRef,
+    let rows = databases
+        .iter()
+        .map(|database| {
+            vec![
+                Some(catalog.to_owned()),
+                Some(database.clone()),
+                Some("utf8".to_owned()),
+                Some("utf8_general_ci".to_owned()),
+                None,
+            ]
+        })
+        .collect();
+    build_utf8_table_query_result(
+        &[
+            ("catalog_name", false),
+            ("schema_name", false),
+            ("default_character_set_name", false),
+            ("default_collation_name", false),
+            ("sql_path", true),
         ],
+        rows,
     )
-    .map_err(|e| format!("build information_schema.schemata batch failed: {e}"))?;
-    Ok(vec![batch])
+    .map(|result| result.into_batches())
+    .map_err(|error| format!("build information_schema.schemata batch failed: {error}"))
 }
 
 const TABLES_COLUMNS: &[(&str, bool)] = &[
@@ -155,34 +152,26 @@ fn build_tables_batch(
     catalog: &str,
     tables: &[(String, String)],
 ) -> Result<Vec<RecordBatch>, String> {
-    let row_count = tables.len();
-    let table_catalog = StringArray::from(vec![catalog; row_count]);
-    let table_schema =
-        StringArray::from_iter_values(tables.iter().map(|(schema, _)| schema.as_str()));
-    let table_name = StringArray::from_iter_values(tables.iter().map(|(_, name)| name.as_str()));
     // Every row is a base table: this listing comes from the catalog's table
     // enumeration, and a catalog that also holds views reports those through
     // the view metadata surface instead.
-    let table_type = StringArray::from(vec!["BASE TABLE"; row_count]);
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("table_catalog", DataType::Utf8, false),
-        Field::new("table_schema", DataType::Utf8, false),
-        Field::new("table_name", DataType::Utf8, false),
-        Field::new("table_type", DataType::Utf8, false),
-    ]));
-
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(table_catalog) as ArrayRef,
-            Arc::new(table_schema) as ArrayRef,
-            Arc::new(table_name) as ArrayRef,
-            Arc::new(table_type) as ArrayRef,
-        ],
+    let rows = tables
+        .iter()
+        .map(|(schema, name)| {
+            vec![
+                catalog.to_owned(),
+                schema.clone(),
+                name.clone(),
+                "BASE TABLE".to_owned(),
+            ]
+        })
+        .collect();
+    build_utf8_query_result(
+        &["table_catalog", "table_schema", "table_name", "table_type"],
+        rows,
     )
-    .map_err(|e| format!("build information_schema.tables batch failed: {e}"))?;
-    Ok(vec![batch])
+    .map(|result| result.into_batches())
+    .map_err(|error| format!("build information_schema.tables batch failed: {error}"))
 }
 
 struct TablesProvider;
@@ -252,5 +241,208 @@ impl SystemCatalog for SystemCatalogService {
             })),
             None => Ok(None),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Array, StringArray};
+
+    fn inputs<'a>(catalog_name: &'a str, schema_names: &'a [String]) -> SystemCatalogInputs<'a> {
+        SystemCatalogInputs {
+            catalog_name,
+            schema_names,
+            table_names: &[],
+        }
+    }
+
+    fn table_inputs<'a>(
+        catalog_name: &'a str,
+        table_names: &'a [(String, String)],
+    ) -> SystemCatalogInputs<'a> {
+        SystemCatalogInputs {
+            catalog_name,
+            schema_names: &[],
+            table_names,
+        }
+    }
+
+    #[test]
+    fn resolve_schemata_returns_exact_columns() {
+        let schema_names = vec!["db_a".to_string(), "db_b".to_string()];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "schemata",
+                &inputs("default_catalog", &schema_names),
+            )
+            .expect("schemata resolution must succeed")
+            .expect("schemata must be registered");
+
+        let actual: Vec<_> = resolved
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), &column.data_type, column.nullable))
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                ("catalog_name", &DataType::Utf8, false),
+                ("schema_name", &DataType::Utf8, false),
+                ("default_character_set_name", &DataType::Utf8, false),
+                ("default_collation_name", &DataType::Utf8, false),
+                ("sql_path", &DataType::Utf8, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_schemata_rows_match_inputs() {
+        let schema_names = vec!["db_a".to_string(), "db_b".to_string()];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "schemata",
+                &inputs("default_catalog", &schema_names),
+            )
+            .expect("schemata resolution must succeed")
+            .expect("schemata must be registered");
+
+        assert_eq!(resolved.batches.len(), 1);
+        let batch = &resolved.batches[0];
+        assert_eq!(batch.num_rows(), 2);
+
+        let catalog_names = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("catalog_name must be Utf8");
+        assert_eq!(catalog_names.value(0), "default_catalog");
+        assert_eq!(catalog_names.value(1), "default_catalog");
+
+        let actual_schema_names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("schema_name must be Utf8");
+        assert_eq!(actual_schema_names.value(0), "db_a");
+        assert_eq!(actual_schema_names.value(1), "db_b");
+    }
+
+    #[test]
+    fn resolve_schemata_uses_input_catalog_name() {
+        let schema_names = vec!["analytics".to_string(), "staging".to_string()];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "schemata",
+                &inputs("myice", &schema_names),
+            )
+            .expect("schemata resolution must succeed")
+            .expect("schemata must be registered");
+
+        let catalog_names = resolved.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("catalog_name must be Utf8");
+        assert_eq!(catalog_names.value(0), "myice");
+        assert_eq!(catalog_names.value(1), "myice");
+    }
+
+    #[test]
+    fn resolve_unknown_table_returns_none() {
+        let schema_names = vec!["db_a".to_string()];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "columns",
+                &inputs("default_catalog", &schema_names),
+            )
+            .expect("unknown table resolution must succeed");
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_is_case_insensitive() {
+        let schema_names = vec!["db_a".to_string()];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "INFORMATION_SCHEMA",
+                "SCHEMATA",
+                &inputs("default_catalog", &schema_names),
+            )
+            .expect("schemata resolution must succeed");
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn resolve_tables_reports_one_row_per_table() {
+        let tables = vec![
+            ("db_a".to_string(), "t1".to_string()),
+            ("db_a".to_string(), "t2".to_string()),
+            ("db_b".to_string(), "t3".to_string()),
+        ];
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "tables",
+                &table_inputs("ice_cat", &tables),
+            )
+            .expect("tables resolution must succeed")
+            .expect("tables must be registered");
+
+        let names: Vec<&str> = resolved
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["table_catalog", "table_schema", "table_name", "table_type"]
+        );
+        assert!(
+            resolved
+                .columns
+                .iter()
+                .all(|column| column.data_type == DataType::Utf8)
+        );
+
+        let batch = resolved.batches.first().expect("one batch");
+        assert_eq!(batch.num_rows(), 3);
+        let schema = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("schema column");
+        let table = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("table column");
+        assert_eq!(schema.value(0), "db_a");
+        assert_eq!(table.value(0), "t1");
+        assert_eq!(schema.value(2), "db_b");
+        assert_eq!(table.value(2), "t3");
+    }
+
+    #[test]
+    fn resolve_tables_on_an_empty_namespace_is_an_empty_listing_not_a_failure() {
+        let resolved = SystemCatalogService::with_defaults()
+            .resolve(
+                "information_schema",
+                "tables",
+                &table_inputs("ice_cat", &[]),
+            )
+            .expect("tables resolution must succeed")
+            .expect("tables must be registered");
+        assert_eq!(
+            resolved.batches.first().expect("one batch").num_rows(),
+            0,
+            "a namespace with no tables lists none, which is a real answer"
+        );
     }
 }

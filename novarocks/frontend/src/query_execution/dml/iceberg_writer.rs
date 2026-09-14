@@ -568,14 +568,14 @@ impl PreparedIcebergWrite {
                     Box::new(IcebergWriteRoundFactory {
                         binding: Arc::clone(&self.semantic_binding),
                         effect_tracker:
-                            crate::common::statement_effect::StatementEffectTracker::mutating(
+                            novarocks_query_application::statement_effect::StatementEffectTracker::mutating(
                                 publication_id,
                             ),
                     }),
                 )
                 .with_attempt_reservation(attempt_reservation),
             )
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map_err(|error| error.to_string())?;
         Ok(outcome.into_execution_result())
     }
@@ -701,7 +701,7 @@ impl FrozenIcebergWriteSemanticBinding {
 
 struct IcebergWriteRoundFactory {
     binding: Arc<FrozenIcebergWriteSemanticBinding>,
-    effect_tracker: crate::common::statement_effect::StatementEffectTracker,
+    effect_tracker: novarocks_query_application::statement_effect::StatementEffectTracker,
 }
 
 impl crate::query_execution::completion::PreReadyRetryBoundary for IcebergWriteRoundFactory {
@@ -1354,7 +1354,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_types::schema::ColumnDefault;
 
     fn test_column(

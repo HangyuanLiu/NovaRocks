@@ -66,7 +66,7 @@ impl DistributedRewriteSealing for QueryExecutionService {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
-        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
         table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Self::Sealed, String> {
@@ -225,7 +225,7 @@ impl ConnectorDistributedRewriteSession {
     pub fn try_begin(
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
-        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
         table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {

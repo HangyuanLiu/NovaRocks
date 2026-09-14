@@ -29,7 +29,7 @@
 //! AggregatedMaterializedViewRewriter.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::column_id::ColumnId;
 use crate::common::{LiteralValue, OutputColumn};
@@ -546,6 +546,7 @@ fn selected_candidate_marker(
         mv_name.to_string(),
         selection.publication_id(),
         selection.definition_fingerprint(),
+        Arc::from(selection.publication_provenance()),
         vec![(occurrence, 0)],
         selection.publication_inputs().to_vec(),
         selection.publication_target().clone(),

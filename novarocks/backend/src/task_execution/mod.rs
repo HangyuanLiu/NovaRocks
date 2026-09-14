@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The backend-local owner of the native task protocol.
+//! Backend role adapters for the Worker-owned native task protocol.
 //!
-//! This module owns query context lifecycle, the task registry and its
-//! creation transaction, per-task status, the observation channel, and
-//! terminal retention. It owns no transport: every entry point takes a neutral
-//! typed request from
+//! Worker owns query context lifecycle, the task registry and its creation
+//! transaction, per-task status, the observation channel, and terminal
+//! retention. This Backend module supplies role-local ports and execution hosts
+//! to that owner; it owns no transport. Every entry point takes a neutral typed request from
 //! `novarocks_execution_contract::task_execution::operation` and returns a neutral
 //! typed receipt, so it is fully drivable by an in-process caller and a
 //! transport adapter adds only encoding.
@@ -41,52 +41,19 @@
 //! steps.
 // Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
 
-mod clock;
 mod completion;
 mod context_host;
-mod credential_slot;
-mod domains;
-mod entry;
 mod execution_host;
-mod fault;
 mod feedback;
-mod host;
 pub(crate) mod ingress;
 mod marker;
-mod observation;
-mod receipt;
-mod registry;
-pub(crate) mod shared_facts;
-mod status;
+mod ports;
 
 #[cfg(test)]
 mod tests;
 
-pub use clock::{BackendMonotonicClock, ManualClock, ProcessMonotonicClock};
 pub(crate) use completion::TaskCompletionSupervisor;
-pub use context_host::NativeQueryContextHost;
-pub use credential_slot::QueryContextCredentialSlot;
-pub use execution_host::{
-    InboundFrameAdmission, NativeRunnableTask, NativeTaskExecutionHost, QueryContextOptions,
-    TaskInboundCapabilities, TaskQueryContextFacts,
-};
-pub use host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskDynamicFilterRead, TaskExecutionHost,
-};
+pub(crate) use context_host::NativeQueryContextHost;
+pub(crate) use execution_host::{NativeTaskExecutionHost, TaskQueryContextFacts};
 pub(crate) use ingress::RegistryTaskExecutionIngress;
-pub use observation::{
-    CursorObservation, TaskStatusEvent, TaskStatusSource, TaskStatusSourceStats,
-};
-pub use receipt::{
-    CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome, FinalTaskInfoOutcome,
-    OperationReceipt, QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
-    UpdateTaskOutcome,
-};
-pub use registry::{
-    DeadlineSweep, RegistryCounters, TaskExecutionRegistry, TaskExecutionRegistryConfig,
-};
-pub use status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
-    TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
-};
+pub(crate) use ports::backend_task_execution_ports;

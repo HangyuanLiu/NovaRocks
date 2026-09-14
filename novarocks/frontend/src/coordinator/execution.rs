@@ -37,27 +37,28 @@ use crate::query_execution::artifact::{
 use crate::query_execution::completion::{PreReadyRetryBoundary, QueryAttemptReservation};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
-    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
-    PreReadyTopologyOutcome, ProfileTerminalBuilder,
+    DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
+};
+use crate::query_execution::lifecycle_diagnostics::{
+    FrontendLifecycleDiagnostics, QueryLifecycleConvergenceSnapshot,
+    RuntimeFilterTerminalRollupSnapshot, RuntimeFilterTerminalRollupUnavailable,
 };
 use crate::query_execution::lifecycle_plan::{QueryCredentialLeases, QueryInitOptions};
+use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
+use crate::query_execution::profile::ProfileTerminalBuilder;
 #[cfg(test)]
 use crate::query_execution::split_assignment::DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP;
 use crate::query_execution::split_assignment::TaskUpdateTransport;
-use crate::runtime::statement_result::StatementResult;
 use crate::task_execution::sources::AttemptEstablishFacts;
 use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, TaskId};
 use novarocks_types::{
     AttemptId, LocalQuerySequence, NativeCompatibilityId, QueryExecutionId, QueryId,
     QueryIdAttribution, QueryProcessNamespace,
 };
 
-use super::query_registry::{
-    FrontendQueryRegistry, QueryFailureCause, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
-};
+use super::query_registry::{FrontendQueryRegistry, QueryFailureCause};
 use super::scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
 use super::task_round::{
     AssembledRound, AttemptPumps, AttemptTransport, assemble_round, install_attempt_pumps,
@@ -313,6 +314,7 @@ pub struct FrontendDistributedQueryCoordinator {
     runtime_filter_worker_count: NonZeroUsize,
     query_ids: Arc<dyn QueryIdSource>,
     registry: Arc<FrontendQueryRegistry>,
+    lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     data_runtime: FrontendDataRuntime,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
@@ -327,26 +329,23 @@ pub struct FrontendDistributedQueryCoordinator {
     /// frontend's contexts from a restarted frontend's. Minting it per process
     /// rather than per query is what makes that distinction meaningful.
     frontend_process_id: FrontendProcessId,
-    task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+    task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
     connector_split_initial_dynamic_filter_wait_cap: Duration,
     native_compatibility_id: NativeCompatibilityId,
 }
 
 impl FrontendDistributedQueryCoordinator {
-    #[expect(
-        private_interfaces,
-        reason = "The public composition entrypoint receives the frontend-owned native runtime."
-    )]
-    pub fn new(
+    pub(crate) fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
-        task_update_retry_policy: crate::query_execution::split_assignment::TaskUpdateRetryPolicy,
+        task_update_retry_policy: novarocks_query_application::coordination::TaskUpdateRetryPolicy,
         connector_split_initial_dynamic_filter_wait_cap: Duration,
         coordination_budgets: novarocks_query_application::coordination::CoordinationBudgets,
         transport_budget: novarocks_task_codec::TransportBudget,
         result_fetch_byte_limit: ResultByteLimit,
         backend_topology: crate::common::backend_topology::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
+        lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -354,13 +353,6 @@ impl FrontendDistributedQueryCoordinator {
             query_process_namespace = %query_namespace,
             "frontend query process namespace initialized"
         );
-        if cfg!(debug_assertions)
-            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
-        {
-            eprintln!(
-                "NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={query_namespace}"
-            );
-        }
         Ok(Self {
             backend_topology,
             #[cfg(test)]
@@ -368,6 +360,7 @@ impl FrontendDistributedQueryCoordinator {
             runtime_filter_worker_count,
             query_ids: Arc::new(query_id_source),
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
+            lifecycle_diagnostics,
             data_runtime,
             coordination_budgets,
             transport_budget,
@@ -438,9 +431,10 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
+            lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
-                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
@@ -505,17 +499,14 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(QueryProcessNamespace::new(
                 query_id.high() as u64,
             ))),
+            lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             task_update_retry_policy:
-                crate::query_execution::split_assignment::TaskUpdateRetryPolicy::default(),
+                novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
                 DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,
             native_compatibility_id: NativeCompatibilityId::new([0x71; 32]),
         }
-    }
-
-    pub(crate) fn convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
-        Arc::clone(&self.registry) as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
     pub fn execute(
@@ -1869,8 +1860,8 @@ impl FrontendDistributedQueryCoordinator {
             complete = contributions.is_complete(),
             "task protocol attempt published its runtime filter convergence evidence"
         );
-        self.registry
-            .publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
+        self.lifecycle_diagnostics
+            .publish(QueryLifecycleConvergenceSnapshot {
                 execution_id,
                 error_source: None,
                 primary_error: None,
@@ -2518,7 +2509,6 @@ mod tests {
     use crate::common::backend_topology::{
         BackendTopologyPort, BackendTopologyValidationError, LiveBackendTarget,
     };
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
     };
@@ -2546,6 +2536,9 @@ mod tests {
     };
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
@@ -3806,8 +3799,8 @@ struct RoundHandoff<'a> {
     /// Only the request fields the task round still needs: `artifacts` is consumed
     /// by the preamble that produced `runtime_filter_ready`, so the request
     /// cannot travel whole.
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
-    completion: crate::query_execution::contract::QueryOutcomeFactory,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+    completion: QueryOutcomeFactory,
     topology: BackendTopologySnapshot,
     statistics_decoder: Option<crate::query_execution::statistics::StatisticsRootResultDecoder>,
     write_decoder: Option<crate::query_execution::write_result::RootWriteResultDecoder>,
@@ -3871,7 +3864,7 @@ struct TaskRoundFailureClassification<'a> {
     before_contexts_established: bool,
     captured: &'a BackendTopologySnapshot,
     observation_deadline: Instant,
-    cancellation: &'a crate::common::query_cancellation::QueryCancellationView,
+    cancellation: &'a novarocks_query_application::cancellation::QueryCancellationView,
 }
 
 impl TaskRoundFailureClassification<'_> {

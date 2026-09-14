@@ -191,7 +191,7 @@ pub(crate) fn begin_first_refresh_connector_write_session(
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
 ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
     if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
         return Err("MV first-refresh write lease drifted from prepared binding".to_string());
@@ -387,7 +387,7 @@ pub(crate) fn begin_incremental_connector_write_session(
     connector_context: ConnectorRequestContext,
     exact_lease: &ConnectorWriteLease,
     planning_lease: &ConnectorControlPlanningLease,
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
 ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")

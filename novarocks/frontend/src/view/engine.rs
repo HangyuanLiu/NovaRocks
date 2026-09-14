@@ -26,14 +26,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
-use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::query_execution::kernels::ViewExecutionKernel;
-use crate::runtime::query_result::QueryResult;
 use novarocks_parser::{
     Span,
     ast::{
         Ident, Literal, LiteralKind, ObjectName, Query, StructField, TypeName, TypeNameArgument,
     },
+};
+use novarocks_query_application::api::QueryResult;
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
@@ -156,8 +158,10 @@ pub trait ViewEngine: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct EmptyViewService;
+#[cfg(test)]
+pub(super) struct EmptyViewService;
 
+#[cfg(test)]
 impl ViewService for EmptyViewService {
     fn execute_statement(
         &self,
@@ -190,7 +194,7 @@ trait ViewExecutionContext: CatalogServiceSource + Send + Sync {
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlRegistry;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
 }
 
 impl ViewExecutionContext for ViewExecutionKernel {
@@ -204,7 +208,7 @@ impl ViewExecutionContext for ViewExecutionKernel {
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 }
@@ -590,8 +594,14 @@ fn view_type_name(data_type: &arrow::datatypes::DataType) -> Result<TypeName, St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use novarocks_parser::printer::Printer;
+    use novarocks_parser::{
+        Span,
+        ast::{Ident, ObjectName, TypeName},
+    };
 
     #[derive(Default)]
     struct FakeViewEngine;
@@ -656,6 +666,67 @@ mod tests {
             panic!("expected query");
         };
         query.clone()
+    }
+
+    fn native_bigint_type() -> TypeName {
+        let span = Span::new(0, 0);
+        TypeName {
+            name: ObjectName {
+                parts: vec![Ident {
+                    value: "BIGINT".to_string(),
+                    quoted: false,
+                    quote_style: None,
+                    span,
+                }],
+                span,
+            },
+            arguments: Vec::new(),
+            argument_separator_spaces: Vec::new(),
+            span,
+        }
+    }
+
+    #[test]
+    fn view_ports_and_dtos_are_constructible_by_the_owning_module() {
+        let target = ViewTarget {
+            catalog: "rest".to_string(),
+            database: "analytics".to_string(),
+            view: "daily_sales".to_string(),
+        };
+        let request = CreateExternalViewRequest {
+            target: target.clone(),
+            columns: vec![ViewColumnDefinition {
+                name: "sale_count".to_string(),
+                data_type: native_bigint_type(),
+                nullable: false,
+            }],
+            definition: PersistedQueryDefinition::new(
+                "SELECT COUNT(*) AS sale_count FROM sales",
+                PersistedQueryDialect::StarRocks,
+                "rest",
+                "analytics",
+            )
+            .expect("valid definition"),
+            comment: Some("Daily sales".to_string()),
+            or_replace: false,
+            if_not_exists: false,
+            properties: vec![],
+        };
+        let resolved = ResolvedExternalView {
+            definition: request.definition.clone(),
+            column_names: vec!["sale_count".to_string()],
+            comment: request.comment.clone(),
+            properties: HashMap::new(),
+        };
+        let context = ViewRequestContext {
+            current_catalog: Some("rest"),
+            current_database: "analytics",
+            connector_context: None,
+        };
+
+        fn ports_are_object_safe(_service: &dyn ViewService, _engine: &dyn ViewEngine) {}
+        let _ = ports_are_object_safe;
+        let _ = (request, resolved, context, ViewStatementResult::Ok);
     }
 
     #[test]

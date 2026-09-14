@@ -15,65 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FE-local serving lifecycle and workload admission ownership.
+//! FE-local serving lifecycle and sanitized management observation.
 //!
 //! Design: ADR-0121. This owner deliberately has no knowledge of MySQL,
-//! Native transport, or a particular background scheduler. Its mutex is the
-//! single linearization point for serving-state transitions and admission.
+//! Native transport, a background scheduler, or business-root ownership. Its
+//! query application owns the serving-admission linearization; this owner
+//! retains only sanitized catalog and management observation.
 
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use novarocks_query_application::serving_admission::{
+    FrontendAdmissionError, FrontendServingAdmission, FrontendServingState,
+};
+use novarocks_workload_control::{WorkClass, WorkClassTotals, WorkloadObservationHandle};
 use serde::Serialize;
-use tokio::sync::Notify;
-
-use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
-
-/// Monotonic, FE-local state for workload admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontendServingState {
-    Starting,
-    Ready,
-    Draining,
-    Stopping,
-}
-
-impl FrontendServingState {
-    pub const fn as_metric_label(self) -> &'static str {
-        match self {
-            Self::Starting => "starting",
-            Self::Ready => "ready",
-            Self::Draining => "draining",
-            Self::Stopping => "stopping",
-        }
-    }
-}
-
-/// The closed set of admission sites visible in lifecycle observations.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FrontendWorkloadKind {
-    Session,
-    Statement,
-    Background,
-}
-
-impl FrontendWorkloadKind {
-    pub const fn as_metric_label(self) -> &'static str {
-        match self {
-            Self::Session => "session",
-            Self::Statement => "statement",
-            Self::Background => "background",
-        }
-    }
-
-    const fn is_active_attempt(self) -> bool {
-        matches!(self, Self::Statement | Self::Background)
-    }
-}
 
 /// Closed source labels exposed by the sanitized FE management surface.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -92,15 +48,6 @@ impl FrontendCatalogSourceMode {
             Self::ManagedController => "managed_controller",
         }
     }
-}
-
-/// Typed rejection returned before a workload can mutate session or execution state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FrontendAdmissionError {
-    NotReady { state: FrontendServingState },
-    Draining,
-    Stopping,
-    SessionRequiresRegistration,
 }
 
 /// A sanitized snapshot identity. Catalog names, properties, credential references,
@@ -244,49 +191,99 @@ impl FrontendServingSnapshotReader for LateBoundFrontendServingSnapshotReader {
     }
 }
 
-#[derive(Clone)]
-struct ActiveLease {
-    kind: FrontendWorkloadKind,
-    cancellation: QueryCancellationSource,
+/// Read-only management composition of the FE serving lifecycle and the sole
+/// workload authority. The lifecycle retains only serving/catalog/drain facts;
+/// root admission and cancellation history are observed from WorkloadControl.
+pub struct FrontendServingWorkloadSnapshotReader {
+    lifecycle: Arc<FrontendServingLifecycle>,
+    workload: WorkloadObservationHandle,
+}
+
+impl FrontendServingWorkloadSnapshotReader {
+    pub fn new(
+        lifecycle: Arc<FrontendServingLifecycle>,
+        workload: WorkloadObservationHandle,
+    ) -> Self {
+        Self {
+            lifecycle,
+            workload,
+        }
+    }
+}
+
+impl FrontendServingSnapshotReader for FrontendServingWorkloadSnapshotReader {
+    fn frontend_serving_snapshot(&self) -> FrontendServingSnapshot {
+        let mut serving = self.lifecycle.frontend_serving_snapshot();
+        serving.workload = frontend_workload_snapshot(
+            self.workload.snapshot(),
+            serving.workload.rejected_admissions.session,
+        );
+        serving
+    }
+}
+
+fn frontend_workload_snapshot(
+    workload: novarocks_workload_control::WorkloadSnapshot,
+    rejected_sessions: u64,
+) -> FrontendWorkloadServingSnapshot {
+    let mut active = FrontendActiveWorkloads::default();
+    for scope in workload.scopes {
+        if scope.parent.is_none() {
+            match scope.class {
+                WorkClass::Query | WorkClass::Management => active.statement += 1,
+                WorkClass::MaterializedView
+                | WorkClass::Statistics
+                | WorkClass::TableMaintenance => active.background += 1,
+            }
+        }
+    }
+    let mut rejected_admissions =
+        frontend_totals_from_root(&workload.root_lifecycle.rejected_admissions);
+    rejected_admissions.session = rejected_sessions;
+    FrontendWorkloadServingSnapshot {
+        active,
+        rejected_admissions,
+        completed_during_drain: frontend_totals_from_root(
+            &workload.root_lifecycle.completed_after_admission_closed,
+        ),
+        deadline_cancelled: frontend_totals_from_root(
+            &workload.root_lifecycle.frontend_drain_deadline_cancelled,
+        ),
+    }
+}
+
+fn frontend_totals_from_root(totals: &WorkClassTotals) -> FrontendWorkloadTotals {
+    FrontendWorkloadTotals {
+        session: 0,
+        statement: totals.query.saturating_add(totals.management),
+        background: totals
+            .materialized_view
+            .saturating_add(totals.statistics)
+            .saturating_add(totals.table_maintenance),
+    }
 }
 
 struct Inner {
-    state: FrontendServingState,
-    next_lease_id: u64,
-    active: BTreeMap<u64, ActiveLease>,
     catalog: FrontendCatalogServingSnapshot,
-    rejected: FrontendWorkloadTotals,
-    completed_during_drain: FrontendWorkloadTotals,
-    deadline_cancelled: FrontendWorkloadTotals,
-    drain_started_at: Option<SystemTime>,
-    drain_deadline: Option<SystemTime>,
 }
 
 impl Default for Inner {
     fn default() -> Self {
         Self {
-            state: FrontendServingState::Starting,
-            next_lease_id: 0,
-            active: BTreeMap::new(),
             catalog: FrontendCatalogServingSnapshot::default(),
-            rejected: FrontendWorkloadTotals::default(),
-            completed_during_drain: FrontendWorkloadTotals::default(),
-            deadline_cancelled: FrontendWorkloadTotals::default(),
-            drain_started_at: None,
-            drain_deadline: None,
         }
     }
 }
 
 struct LifecycleShared {
     inner: Mutex<Inner>,
-    active_changed: Notify,
 }
 
-/// Process-runtime authority for serving state and admission leases.
+/// Role-local management observation around the query application's admission owner.
 // Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
 #[derive(Clone)]
 pub struct FrontendServingLifecycle {
+    admission: FrontendServingAdmission,
     shared: Arc<LifecycleShared>,
 }
 
@@ -299,13 +296,18 @@ impl Default for FrontendServingLifecycle {
 impl FrontendServingLifecycle {
     pub fn new() -> Self {
         let lifecycle = Self {
+            admission: FrontendServingAdmission::new(),
             shared: Arc::new(LifecycleShared {
                 inner: Mutex::new(Inner::default()),
-                active_changed: Notify::new(),
             }),
         };
         lifecycle.publish_metrics();
         lifecycle
+    }
+
+    /// The query application's exact session-admission owner.
+    pub fn admission(&self) -> FrontendServingAdmission {
+        self.admission.clone()
     }
 
     /// Publishes sanitized catalog bootstrap facts. The caller owns catalog
@@ -335,18 +337,7 @@ impl FrontendServingLifecycle {
     /// Transitions only from Starting to Ready after the bootstrap owner has
     /// completed its exact snapshot/materialization barrier.
     pub fn mark_ready(&self) -> Result<(), FrontendAdmissionError> {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        match inner.state {
-            FrontendServingState::Starting => inner.state = FrontendServingState::Ready,
-            FrontendServingState::Ready => return Ok(()),
-            FrontendServingState::Draining => return Err(FrontendAdmissionError::Draining),
-            FrontendServingState::Stopping => return Err(FrontendAdmissionError::Stopping),
-        }
-        drop(inner);
+        self.admission.mark_ready()?;
         self.publish_metrics();
         Ok(())
     }
@@ -354,164 +345,14 @@ impl FrontendServingLifecycle {
     /// Atomically closes admission and records the one-way drain deadline.
     /// Repeated calls preserve the original deadline and are idempotent.
     pub fn begin_drain(&self, timeout: Duration) -> FrontendServingState {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        if inner.state == FrontendServingState::Ready {
-            let started = SystemTime::now();
-            inner.state = FrontendServingState::Draining;
-            inner.drain_started_at = Some(started);
-            inner.drain_deadline = Some(started + timeout);
-        }
-        let state = inner.state;
-        drop(inner);
+        let state = self.admission.begin_drain(timeout);
         self.publish_metrics();
         state
     }
 
     /// Marks final teardown without creating a path back to Ready.
     pub fn mark_stopping(&self) {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        if inner.state != FrontendServingState::Stopping {
-            inner.state = FrontendServingState::Stopping;
-        }
-        drop(inner);
-        self.publish_metrics();
-    }
-
-    /// Runs session registration in the same mutex domain as drain. Sessions
-    /// are not active attempts and do not receive a lease.
-    pub fn register_session<T>(
-        &self,
-        registration: impl FnOnce() -> T,
-    ) -> Result<T, FrontendAdmissionError> {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        let result = match inner.state {
-            FrontendServingState::Ready => Ok(registration()),
-            state => {
-                increment_total(&mut inner.rejected, FrontendWorkloadKind::Session);
-                Err(admission_error(state))
-            }
-        };
-        drop(inner);
-        self.publish_metrics();
-        result
-    }
-
-    /// Acquires a statement or background attempt lease. `Session` must use
-    /// [`Self::register_session`] so it cannot accidentally become active work.
-    pub fn try_admit(
-        &self,
-        kind: FrontendWorkloadKind,
-    ) -> Result<FrontendWorkloadLease, FrontendAdmissionError> {
-        if !kind.is_active_attempt() {
-            return Err(FrontendAdmissionError::SessionRequiresRegistration);
-        }
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        let result = match inner.state {
-            FrontendServingState::Ready => {
-                let id = inner.next_lease_id;
-                inner.next_lease_id = inner.next_lease_id.wrapping_add(1);
-                let cancellation = QueryCancellationSource::new();
-                inner.active.insert(
-                    id,
-                    ActiveLease {
-                        kind,
-                        cancellation: cancellation.clone(),
-                    },
-                );
-                Ok(FrontendWorkloadLease {
-                    shared: Arc::clone(&self.shared),
-                    id,
-                    kind,
-                    cancellation,
-                    released: AtomicBool::new(false),
-                })
-            }
-            state => {
-                increment_total(&mut inner.rejected, kind);
-                Err(admission_error(state))
-            }
-        };
-        drop(inner);
-        self.publish_metrics();
-        result
-    }
-
-    /// First-wins cancellation for all leases still held at the drain deadline.
-    pub fn cancel_active_at_drain_deadline(&self, timeout_ms: u64) -> usize {
-        let (sources, cancelled) = {
-            let mut inner = self
-                .shared
-                .inner
-                .lock()
-                .expect("frontend lifecycle lock poisoned");
-            let sources = inner.active.values().cloned().collect::<Vec<_>>();
-            let mut cancelled = 0;
-            for lease in &sources {
-                if matches!(
-                    lease.cancellation.request(
-                        QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms },
-                    ),
-                    crate::common::query_cancellation::QueryCancellationRequestResult::Requested
-                ) {
-                    increment_total(&mut inner.deadline_cancelled, lease.kind);
-                    cancelled += 1;
-                }
-            }
-            (sources, cancelled)
-        };
-        drop(sources);
-        self.publish_metrics();
-        cancelled
-    }
-
-    /// Waits for all active statement/background work to finish. Notify only
-    /// wakes waiters; the mutex-protected count decides the result.
-    pub async fn wait_for_no_active_work(&self) {
-        loop {
-            let notified = self.shared.active_changed.notified();
-            if self
-                .shared
-                .inner
-                .lock()
-                .expect("frontend lifecycle lock poisoned")
-                .active
-                .is_empty()
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
-
-    fn release(&self, id: u64, kind: FrontendWorkloadKind) {
-        let mut inner = self
-            .shared
-            .inner
-            .lock()
-            .expect("frontend lifecycle lock poisoned");
-        if inner.active.remove(&id).is_some() {
-            if inner.state == FrontendServingState::Draining {
-                increment_total(&mut inner.completed_during_drain, kind);
-            }
-            self.shared.active_changed.notify_waiters();
-        }
-        drop(inner);
+        self.admission.mark_stopping();
         self.publish_metrics();
     }
 
@@ -527,33 +368,25 @@ impl FrontendServingSnapshotReader for FrontendServingLifecycle {
             .inner
             .lock()
             .expect("frontend lifecycle lock poisoned");
-        let active = FrontendActiveWorkloads {
-            statement: inner
-                .active
-                .values()
-                .filter(|lease| lease.kind == FrontendWorkloadKind::Statement)
-                .count(),
-            background: inner
-                .active
-                .values()
-                .filter(|lease| lease.kind == FrontendWorkloadKind::Background)
-                .count(),
-        };
+        let admission = self.admission.snapshot();
         let now = SystemTime::now();
         FrontendServingSnapshot {
             schema_version: 1,
-            serving_state: inner.state,
+            serving_state: admission.state,
             catalog: inner.catalog.clone(),
             workload: FrontendWorkloadServingSnapshot {
-                active,
-                rejected_admissions: inner.rejected.clone(),
-                completed_during_drain: inner.completed_during_drain.clone(),
-                deadline_cancelled: inner.deadline_cancelled.clone(),
+                active: FrontendActiveWorkloads::default(),
+                rejected_admissions: FrontendWorkloadTotals {
+                    session: admission.rejected_sessions,
+                    ..FrontendWorkloadTotals::default()
+                },
+                completed_during_drain: FrontendWorkloadTotals::default(),
+                deadline_cancelled: FrontendWorkloadTotals::default(),
             },
             drain: FrontendDrainServingSnapshot {
-                started_at_unix_ms: inner.drain_started_at.and_then(unix_millis),
-                deadline_unix_ms: inner.drain_deadline.and_then(unix_millis),
-                elapsed_ms: inner
+                started_at_unix_ms: admission.drain_started_at.and_then(unix_millis),
+                deadline_unix_ms: admission.drain_deadline.and_then(unix_millis),
+                elapsed_ms: admission
                     .drain_started_at
                     .and_then(|started| now.duration_since(started).ok())
                     .map_or(0, |elapsed| {
@@ -561,53 +394,6 @@ impl FrontendServingSnapshotReader for FrontendServingLifecycle {
                     }),
             },
         }
-    }
-}
-
-/// RAII ownership of one admitted attempt and its cancellation source.
-pub struct FrontendWorkloadLease {
-    shared: Arc<LifecycleShared>,
-    id: u64,
-    kind: FrontendWorkloadKind,
-    cancellation: QueryCancellationSource,
-    released: AtomicBool,
-}
-
-impl FrontendWorkloadLease {
-    pub fn cancellation_source(&self) -> QueryCancellationSource {
-        self.cancellation.clone()
-    }
-
-    pub fn release(&self) {
-        if self.released.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let lifecycle = FrontendServingLifecycle {
-            shared: Arc::clone(&self.shared),
-        };
-        lifecycle.release(self.id, self.kind);
-    }
-}
-
-impl Drop for FrontendWorkloadLease {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-fn admission_error(state: FrontendServingState) -> FrontendAdmissionError {
-    match state {
-        FrontendServingState::Draining => FrontendAdmissionError::Draining,
-        FrontendServingState::Stopping => FrontendAdmissionError::Stopping,
-        state => FrontendAdmissionError::NotReady { state },
-    }
-}
-
-fn increment_total(totals: &mut FrontendWorkloadTotals, kind: FrontendWorkloadKind) {
-    match kind {
-        FrontendWorkloadKind::Session => totals.session += 1,
-        FrontendWorkloadKind::Statement => totals.statement += 1,
-        FrontendWorkloadKind::Background => totals.background += 1,
     }
 }
 
@@ -622,40 +408,63 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use novarocks_workload_control::{
+        CancellationReason, ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
     use super::*;
 
     #[test]
-    fn admission_and_drain_are_linearly_ordered() {
-        let lifecycle = FrontendServingLifecycle::new();
+    fn serving_state_and_governed_workload_observation_share_one_drain_boundary() {
+        let lifecycle = Arc::new(FrontendServingLifecycle::new());
         lifecycle.mark_ready().expect("mark ready");
-        let lease = lifecycle
-            .try_admit(FrontendWorkloadKind::Statement)
-            .expect("admit before drain");
+        let control = WorkloadControl::try_new_split(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 128,
+                control_bytes: 16,
+                per_scope_bytes: 112,
+            },
+        )
+        .expect("valid workload control")
+        .owner;
+        control.mark_ready().expect("workload ready");
+        let reader = FrontendServingWorkloadSnapshotReader::new(
+            Arc::clone(&lifecycle),
+            control.observation(),
+        );
+        let work = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit query root");
+        assert_eq!(
+            reader.frontend_serving_snapshot().workload.active.statement,
+            1
+        );
+
         assert_eq!(
             lifecycle.begin_drain(Duration::from_secs(1)),
             FrontendServingState::Draining
         );
+        control.close_admission();
         assert!(matches!(
-            lifecycle.try_admit(FrontendWorkloadKind::Statement),
-            Err(FrontendAdmissionError::Draining)
+            control.try_begin_root(WorkRequest::new(WorkClass::Management)),
+            Err(novarocks_workload_control::WorkError::Closed)
         ));
         assert_eq!(
-            lifecycle
-                .frontend_serving_snapshot()
-                .workload
-                .active
-                .statement,
+            control.cancel_active_roots(CancellationReason::FrontendDrainDeadlineExceeded),
             1
         );
-        drop(lease);
+        drop(work.business);
+        work.owner.complete();
+
+        let snapshot = reader.frontend_serving_snapshot();
         assert_eq!(
-            lifecycle
-                .frontend_serving_snapshot()
-                .workload
-                .active
-                .statement,
-            0
+            snapshot.workload.active.statement, 1,
+            "a requested cancellation retains its real root responsibility until control settles"
         );
+        assert_eq!(snapshot.workload.rejected_admissions.statement, 1);
+        assert_eq!(snapshot.workload.completed_during_drain.statement, 1);
+        assert_eq!(snapshot.workload.deadline_cancelled.statement, 1);
     }
 
     #[test]
@@ -664,7 +473,7 @@ mod tests {
         lifecycle.mark_ready().expect("mark ready");
         lifecycle.begin_drain(Duration::from_secs(1));
         assert_eq!(
-            lifecycle.register_session(|| 7),
+            lifecycle.admission().register_session(|| 7),
             Err(FrontendAdmissionError::Draining)
         );
     }
@@ -672,12 +481,6 @@ mod tests {
     #[test]
     fn only_starting_can_become_ready_and_drain_is_idempotent() {
         let lifecycle = FrontendServingLifecycle::new();
-        assert!(matches!(
-            lifecycle.try_admit(FrontendWorkloadKind::Statement),
-            Err(FrontendAdmissionError::NotReady {
-                state: FrontendServingState::Starting
-            })
-        ));
         lifecycle.mark_ready().expect("mark ready");
         lifecycle.begin_drain(Duration::from_secs(2));
         lifecycle.begin_drain(Duration::from_secs(30));
@@ -689,27 +492,6 @@ mod tests {
         assert_eq!(snapshot.serving_state, FrontendServingState::Draining);
         assert!(snapshot.drain.started_at_unix_ms.is_some());
         assert!(snapshot.drain.deadline_unix_ms.is_some());
-    }
-
-    #[tokio::test]
-    async fn deadline_cancellation_is_first_wins_and_drop_wakes_waiters() {
-        let lifecycle = FrontendServingLifecycle::new();
-        lifecycle.mark_ready().expect("mark ready");
-        let lease = lifecycle
-            .try_admit(FrontendWorkloadKind::Background)
-            .expect("admit background");
-        lifecycle.begin_drain(Duration::from_secs(1));
-        assert_eq!(lifecycle.cancel_active_at_drain_deadline(1_000), 1);
-        assert_eq!(lifecycle.cancel_active_at_drain_deadline(1_000), 0);
-        assert_eq!(
-            lease.cancellation_source().view().reason(),
-            Some(QueryCancellationReason::FrontendDrainDeadlineExceeded { timeout_ms: 1_000 })
-        );
-        lease.release();
-        lifecycle.wait_for_no_active_work().await;
-        let snapshot = lifecycle.frontend_serving_snapshot();
-        assert_eq!(snapshot.workload.completed_during_drain.background, 1);
-        assert_eq!(snapshot.workload.deadline_cancelled.background, 1);
     }
 
     #[test]

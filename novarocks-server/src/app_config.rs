@@ -29,9 +29,9 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
-use novarocks_frontend::{
+use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-    StateStoreRunPolicy,
+    connector_blocking_io::ConnectorBlockingIoBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_query_application::coordination::{
@@ -39,6 +39,7 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_types::{ClusterRole, NativeEndpoint};
 use novarocks_worker::LeaseBounds;
 
@@ -626,6 +627,8 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_connector_blocking_io_config(&cfg.runtime)?;
+    validate_query_cpu_config(&cfg.runtime)?;
+    validate_query_blocking_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
@@ -1271,6 +1274,21 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    /// Fixed FE CPU preparation workers. `0` derives the deployment's
+    /// configured execution parallelism.
+    #[serde(default = "default_query_cpu_worker_threads")]
+    pub query_cpu_worker_threads: usize,
+    /// Maximum queued FE CPU preparation jobs; zero is rejected at preflight.
+    #[serde(default = "default_query_cpu_queue_capacity")]
+    pub query_cpu_queue_capacity: usize,
+    /// Fixed FE workers for synchronous query command edges. `0` derives the
+    /// configured execution parallelism.
+    #[serde(default = "default_query_blocking_worker_threads")]
+    pub query_blocking_worker_threads: usize,
+    /// Maximum queued synchronous query command jobs; zero is rejected at
+    /// startup preflight.
+    #[serde(default = "default_query_blocking_queue_capacity")]
+    pub query_blocking_queue_capacity: usize,
     #[serde(default = "default_connector_blocking_io_max_inflight")]
     pub connector_blocking_io_max_inflight: usize,
     #[serde(default = "default_connector_split_blocking_io_max_inflight")]
@@ -1688,7 +1706,7 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
 }
 
 fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> {
-    let budget = novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+    let budget = ConnectorBlockingIoBudget::try_new(
         runtime.connector_blocking_io_max_inflight,
         runtime.connector_split_blocking_io_max_inflight,
     )
@@ -1702,8 +1720,28 @@ fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> 
     Ok(())
 }
 
+fn validate_query_cpu_config(runtime: &RuntimeConfig) -> Result<()> {
+    if runtime.actual_query_cpu_workers() == 0 {
+        bail!("runtime.query_cpu_worker_threads must resolve to a nonzero value");
+    }
+    if runtime.query_cpu_queue_capacity == 0 {
+        bail!("runtime.query_cpu_queue_capacity must be nonzero");
+    }
+    Ok(())
+}
+
+fn validate_query_blocking_config(runtime: &RuntimeConfig) -> Result<()> {
+    if runtime.actual_query_blocking_workers() == 0 {
+        bail!("runtime.query_blocking_worker_threads must resolve to a nonzero value");
+    }
+    if runtime.query_blocking_queue_capacity == 0 {
+        bail!("runtime.query_blocking_queue_capacity must be nonzero");
+    }
+    Ok(())
+}
+
 fn validate_result_retained_config(runtime: &RuntimeConfig) -> Result<()> {
-    novarocks_backend::BackendResultRetainedLimits::try_new(
+    novarocks_worker::WorkerResultRetainedLimits::try_new(
         runtime.result_retained_bytes_per_root,
         runtime.result_retained_bytes_per_process,
     )
@@ -1948,6 +1986,22 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
+fn default_query_cpu_worker_threads() -> usize {
+    0
+}
+
+fn default_query_cpu_queue_capacity() -> usize {
+    64
+}
+
+fn default_query_blocking_worker_threads() -> usize {
+    0
+}
+
+fn default_query_blocking_queue_capacity() -> usize {
+    64
+}
+
 fn default_connector_blocking_io_max_inflight() -> usize {
     16
 }
@@ -2108,6 +2162,10 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            query_cpu_worker_threads: default_query_cpu_worker_threads(),
+            query_cpu_queue_capacity: default_query_cpu_queue_capacity(),
+            query_blocking_worker_threads: default_query_blocking_worker_threads(),
+            query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
             connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
             connector_split_blocking_io_max_inflight:
                 default_connector_split_blocking_io_max_inflight(),
@@ -2270,6 +2328,22 @@ impl RuntimeConfig {
                 .unwrap_or(1)
         }
     }
+
+    pub fn actual_query_cpu_workers(&self) -> usize {
+        if self.query_cpu_worker_threads > 0 {
+            self.query_cpu_worker_threads
+        } else {
+            self.actual_exec_threads()
+        }
+    }
+
+    pub fn actual_query_blocking_workers(&self) -> usize {
+        if self.query_blocking_worker_threads > 0 {
+            self.query_blocking_worker_threads
+        } else {
+            self.actual_exec_threads()
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -2406,14 +2480,28 @@ impl Default for CacheConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES,
-        FrontendTaskTransportBudget, LeaseBounds, LeaseValidFor, MaxWait, NovaRocksConfig,
-        RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        validate_connector_blocking_io_config, validate_query_control_config,
-        validate_result_retained_config, validate_task_execution_config,
+        DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
+        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
+        validate_connector_blocking_io_config, validate_query_blocking_config,
+        validate_query_control_config, validate_result_retained_config,
+        validate_task_execution_config,
+    };
+    use novarocks_native_adapter::{
+        FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
     };
     use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
     use novarocks_types::ClusterRole;
+
+    #[test]
+    fn query_blocking_config_derives_workers_and_rejects_zero_queue() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.pipeline_exec_thread_pool_thread_num = 3;
+        assert_eq!(runtime.actual_query_blocking_workers(), 3);
+        validate_query_blocking_config(&runtime).expect("derived workers and queue are valid");
+
+        runtime.query_blocking_queue_capacity = 0;
+        assert!(validate_query_blocking_config(&runtime).is_err());
+    }
 
     #[test]
     fn starrocks_connector_configuration_is_explicitly_rejected() {

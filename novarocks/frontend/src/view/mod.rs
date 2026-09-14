@@ -18,30 +18,28 @@
 //! Frontend-owned view DDL, metadata, and query rewrite service.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Mutex, RwLock};
 
-use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_parser::{
     ast::{CreateView, Query, Statement, ViewStatement},
     printer,
 };
-use novarocks_types::SlotId;
+use novarocks_query_application::api::{QueryResult, build_utf8_query_result};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
+};
 use novarocks_types::naming::normalize_identifier;
 
 pub(crate) mod command;
 pub mod engine;
 mod iceberg;
 mod rewrite;
+#[cfg(test)]
+mod tests;
 
 pub use engine::{
-    CreateExternalViewRequest, EmptyViewService, ExternalViewResolution, ResolvedExternalView,
-    ViewColumnDefinition, ViewEngine, ViewRequestContext, ViewService, ViewStatementResult,
-    ViewTarget,
+    CreateExternalViewRequest, ExternalViewResolution, ResolvedExternalView, ViewColumnDefinition,
+    ViewEngine, ViewRequestContext, ViewService, ViewStatementResult, ViewTarget,
 };
 
 const DEFAULT_CATALOG: &str = "default_catalog";
@@ -325,36 +323,18 @@ fn build_query_result(columns: Vec<(String, Vec<String>)>) -> Result<QueryResult
     if columns.iter().any(|(_, rows)| rows.len() != row_count) {
         return Err("view query result columns have different row counts".to_string());
     }
-    let fields = columns
+    let names = columns
         .iter()
-        .map(|(name, _)| Field::new(name, DataType::Utf8, false))
+        .map(|(name, _)| name.as_str())
         .collect::<Vec<_>>();
-    let arrays = columns
-        .iter()
-        .map(|(_, rows)| Arc::new(StringArray::from(rows.clone())) as ArrayRef)
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(fields));
-    let batch = RecordBatch::try_new(schema.clone(), arrays)
-        .map_err(|error| format!("build view query result failed: {error}"))?;
-    let slot_ids = (1..=columns.len())
-        .map(|index| {
-            u32::try_from(index)
-                .map(SlotId::new)
-                .map_err(|_| "too many view query result columns".to_string())
+    let rows = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|(_, values)| values[row].clone())
+                .collect()
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &slot_ids)?;
-    let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema)?;
-    Ok(QueryResult {
-        columns: columns
-            .into_iter()
-            .map(|(name, _)| QueryResultColumn {
-                name,
-                data_type: DataType::Utf8,
-                nullable: false,
-                logical_type: None,
-            })
-            .collect(),
-        chunks: vec![chunk],
-    })
+        .collect();
+    build_utf8_query_result(&names, rows)
+        .map_err(|error| format!("build view query result failed: {error}"))
 }

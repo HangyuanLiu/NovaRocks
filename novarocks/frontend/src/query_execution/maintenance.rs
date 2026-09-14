@@ -21,7 +21,6 @@
 //! capabilities and application results needed by the frontend owner. It does
 //! not expose standalone engine state or connector handles.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub mod command;
@@ -29,16 +28,15 @@ pub(crate) mod iceberg;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::connector::cleanup_maintenance::{CleanupBatchExecution, CleanupMaintenanceSession};
 use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
 use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
-use crate::maintenance::MaintenanceTarget;
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
 use crate::query_execution::preparation::scan::ScanBindingResolver;
-use crate::runtime::query_result::QueryResult;
+use novarocks_query_application::api::QueryResult;
+use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
     CandidatePage, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
     ConnectorControlResolver, ConnectorDistributedRewriteReceipt, ConnectorError,
@@ -47,6 +45,11 @@ use novarocks_spi::connector::{
     ConnectorTableObjectSelector, ConnectorTableResolution, ConnectorWriteAbortOutcome,
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
+};
+use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
+    OptimizeSubmission,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -113,7 +116,7 @@ impl PreparedDistributedRewriteCohort {
         let session_completion = self
             .query_execution
             .execute(request)
-            .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+            .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
             .map(crate::query_execution::outcome::WriteExecutionOutcome::into_write_session)
             .map_err(|error| error.to_string())?;
         // The dual barrier is what produces a session completion, so its
@@ -266,110 +269,6 @@ impl novarocks_spi::connector::ConnectorCancellation for MaintenanceAttemptConne
 pub enum MaintenanceStatementResult {
     Ok,
     Query(QueryResult),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MaintenanceActionRequest {
-    RewriteDataFiles {
-        target: MaintenanceTarget,
-        base_snapshot_id: i64,
-        job_id: Option<i64>,
-        options: BTreeMap<String, String>,
-        branch: Option<String>,
-        where_clause: Option<String>,
-    },
-    RewriteManifests {
-        target: MaintenanceTarget,
-        use_caching: Option<bool>,
-        spec_id: Option<i32>,
-    },
-    ExpireSnapshots {
-        target: MaintenanceTarget,
-        older_than_ms: Option<i64>,
-        retain_last: Option<u32>,
-    },
-    RemoveOrphanFiles {
-        target: MaintenanceTarget,
-        older_than_ms: i64,
-    },
-    RewritePositionDeleteFiles {
-        target: MaintenanceTarget,
-        options: BTreeMap<String, String>,
-        where_clause: Option<String>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum MaintenanceActionOutcome {
-    RewriteDataFiles {
-        target_snapshot_id: Option<i64>,
-        rewritten_data_files_count: i32,
-        added_data_files_count: i32,
-        rewritten_bytes_count: i64,
-        failed_data_files_count: i32,
-        removed_delete_files_count: i32,
-        output_record_count: i64,
-    },
-    RewriteManifests {
-        rewritten_manifests_count: i32,
-        added_manifests_count: i32,
-    },
-    ExpireSnapshots {
-        deleted_data_files_count: Option<i64>,
-        deleted_position_delete_files_count: Option<i64>,
-        deleted_equality_delete_files_count: Option<i64>,
-        deleted_manifest_files_count: Option<i64>,
-        deleted_manifest_lists_count: Option<i64>,
-        deleted_statistics_files_count: Option<i64>,
-    },
-    RemoveOrphanFiles {
-        orphan_file_locations: Vec<String>,
-    },
-    RewritePositionDeleteFiles {
-        rewritten_delete_files_count: i32,
-        added_delete_files_count: i32,
-        rewritten_bytes_count: i64,
-        added_bytes_count: i64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum OptimizeJobState {
-    Pending,
-    Running,
-    Finished,
-    Failed,
-    TargetReplaced,
-}
-
-/// Result of rebinding a durable maintenance target to its current table.
-///
-/// `Bound` is the only result that permits an attempt to continue. A missing
-/// target and a same-name replacement are distinct terminal outcomes; provider
-/// capability and transport errors remain errors and must not be reclassified.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaintenanceTargetRebind {
-    Bound,
-    Replaced,
-    Missing,
-}
-
-impl OptimizeJobState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "PENDING",
-            Self::Running => "RUNNING",
-            Self::Finished => "FINISHED",
-            Self::Failed => "FAILED",
-            Self::TargetReplaced => "TARGET_REPLACED",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum OptimizeSubmission {
-    Submitted { job_id: i64 },
-    AlreadyActive,
 }
 
 /// CLS-R2 boundary: the implementation moves to the frontend with the rest of
@@ -631,6 +530,15 @@ pub trait TableMaintenanceService: Send + Sync {
         engine: &dyn TableMaintenanceEngine,
         target: MaintenanceTarget,
     ) -> Result<OptimizeSubmission, String>;
+
+    /// Wait for the exact job named by a prior `Submitted` result. A completed
+    /// job is returned even if it completed before the caller subscribed.
+    async fn wait_for_automatic_optimize(
+        &self,
+        _handle: JobHandle,
+    ) -> Result<MaintenanceJobState, String> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_owned())
+    }
 
     /// Execute an automatic OPTIMIZE as one complete durable job lifecycle.
     /// Unlike submission, success means the job was claimed, executed and
@@ -1484,7 +1392,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 /// assembly remains a Frontend-only step after this sealed Core preparation.
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     function_catalog: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
@@ -1664,10 +1572,11 @@ mod maintenance_attempt_context_tests {
     };
 
     use super::{
-        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceTargetRebind,
-        OptimizeJobState, captured_target_object_id_from_connector_result,
+        MaintenanceAttemptCancellationSource, MaintenanceAttemptContext, MaintenanceJobState,
+        captured_target_object_id_from_connector_result,
         maintenance_target_rebind_from_connector_result,
     };
+    use novarocks_table_maintenance::MaintenanceTargetRebind;
 
     #[test]
     fn source_context_and_connector_request_share_one_cancellation_flag() {
@@ -1796,6 +1705,9 @@ mod maintenance_attempt_context_tests {
 
     #[test]
     fn optimize_target_replacement_has_a_stable_show_value() {
-        assert_eq!(OptimizeJobState::TargetReplaced.as_str(), "TARGET_REPLACED");
+        assert_eq!(
+            MaintenanceJobState::TargetReplaced.as_str(),
+            "TARGET_REPLACED"
+        );
     }
 }

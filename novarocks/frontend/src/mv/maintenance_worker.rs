@@ -29,25 +29,29 @@
 //! lifecycle route.  That route must claim, execute, and terminally persist a
 //! job before this worker releases its activity lease and maintenance permit.
 
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::{Arc, Mutex};
+use novarocks_workload_control::{
+    BusinessPermit, RootAdmissionHandle, RootWork, WorkClass, WorkOwner, WorkRequest,
+};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::background::{MvBackgroundEngine, MvBackgroundEngineError, MvBackgroundEngineErrorKind};
-use crate::maintenance::MaintenanceTarget;
+use super::background::MvBackgroundEngine;
 use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::repository::MvRepositoryError;
 use crate::query_execution::maintenance::{
-    AutomaticMaintenanceContext, MaintenanceActionOutcome, MaintenanceActionRequest,
-    OptimizeSubmission, TableMaintenanceEngine, TableMaintenanceService,
+    AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
-use crate::workload_lifecycle::{FrontendServingLifecycle, FrontendWorkloadKind};
-
-use super::activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner};
-use super::maintenance::{
-    AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
-    MaintenanceCoordinatorConfig, MaintenanceExecutionReport,
+use novarocks_mv_application::{
+    activity::{CanonicalMvTarget, MvActivityGate, MvActivityGateError, MvActivityOwner},
+    maintenance::{
+        AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
+        MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
+        MvBackgroundEngineErrorKind, MvMaintenanceRuntime,
+    },
+};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
 };
 
 /// Dependencies bound by the frontend host after Core has completed restore,
@@ -59,7 +63,7 @@ pub(crate) struct FrontendMaintenanceWorkerDependencies {
     pub(crate) table_maintenance_engine: Arc<dyn TableMaintenanceEngine>,
     pub(crate) table_maintenance_service: Arc<dyn TableMaintenanceService>,
     pub(crate) activity_gate: MvActivityGate,
-    pub(crate) workload_lifecycle: FrontendServingLifecycle,
+    pub(crate) root_admission: RootAdmissionHandle,
     pub(crate) coordinator_config: MaintenanceCoordinatorConfig,
     pub(crate) attempt_timeout: Duration,
     /// Captured at construction because the worker runs on bare threads that
@@ -115,22 +119,19 @@ pub(crate) enum FrontendMaintenanceSkip {
     },
 }
 
-/// A frontend-owned, synchronous automatic-maintenance runtime.  A host may
-/// call [`Self::run_once`] from its bounded worker executor or use
-/// [`Self::run_until_stopped`] from a dedicated worker thread.  The latter is
-/// intentionally only a loop helper: it does not hide lifecycle ownership or
-/// manufacture an all-in-one execution path.
+/// Frontend repository/provider/native adapter for automatic maintenance.
+/// The MV product owns its coordinator, permits, cooldown and backoff state;
+/// this adapter only inventories definitions and invokes durable effects.
 pub(crate) struct FrontendMaintenanceWorker {
     dependencies: FrontendMaintenanceWorkerDependencies,
-    coordinator: Mutex<MaintenanceCoordinator>,
+    runtime: MvMaintenanceRuntime,
 }
 
 impl FrontendMaintenanceWorker {
     pub(crate) fn new(dependencies: FrontendMaintenanceWorkerDependencies) -> Self {
-        let coordinator = MaintenanceCoordinator::new(dependencies.coordinator_config.clone());
         Self {
+            runtime: MvMaintenanceRuntime::new(dependencies.coordinator_config.clone()),
             dependencies,
-            coordinator: Mutex::new(coordinator),
         }
     }
 
@@ -139,11 +140,7 @@ impl FrontendMaintenanceWorker {
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
     pub(crate) fn config(&self) -> MaintenanceCoordinatorConfig {
-        self.coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
-            .config()
-            .clone()
+        self.runtime.config()
     }
 
     /// Evaluate every current frontend MV definition once.  A ticket waiting
@@ -161,69 +158,26 @@ impl FrontendMaintenanceWorker {
             .into_iter()
             .map(|projection| projection.definition)
             .collect::<Vec<_>>();
-        let pass = Mutex::new(FrontendMaintenancePassReport::default());
-        // Admission is synchronized inside `MaintenanceCoordinator`, but the
-        // durable operations run outside that lock.  The coordinator's active
-        // set therefore bounds real concurrent work across different MVs.
-        std::thread::scope(|scope| {
-            for definition in definitions {
-                let pass = &pass;
-                scope.spawn(move || self.run_definition(definition, now_ms, pass));
-            }
-        });
-        Ok(pass
-            .into_inner()
-            .expect("frontend MV maintenance pass lock poisoned"))
-    }
-
-    /// A simple process-local runtime loop.  Shutdown is owned by the host:
-    /// it calls `MvActivityGate::begin_stopping`, signals `stop_rx`, and joins
-    /// this thread with the application shutdown deadline.
-    pub(crate) fn run_until_stopped(
-        &self,
-        stop_rx: &Receiver<()>,
-        wake_rx: &Receiver<()>,
-        interval: Duration,
-    ) {
-        loop {
-            if stop_rx.try_recv().is_ok() {
-                return;
-            }
-            let now_ms = now_unix_millis();
-            if let Err(error) = self.run_once(now_ms) {
-                tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
-            }
-            let wait_until = std::time::Instant::now() + interval.max(Duration::from_millis(1));
-            loop {
-                if stop_rx.try_recv().is_ok() {
-                    return;
-                }
-                match wake_rx.try_recv() {
-                    Ok(()) => break,
-                    Err(TryRecvError::Disconnected) => return,
-                    Err(TryRecvError::Empty) => {}
-                }
-                let remaining = wait_until.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                std::thread::sleep(remaining.min(Duration::from_millis(25)));
-            }
+        // One frontend event loop owns the pass.  The coordinator still owns
+        // admission policy, but no definition creates its own OS thread; each
+        // terminal transition completes before the next event is admitted.
+        let mut pass = FrontendMaintenancePassReport::default();
+        for definition in definitions {
+            self.run_definition(definition, now_ms, &mut pass);
         }
+        Ok(pass)
     }
 
     fn run_definition(
         &self,
         definition: StoredMvDefinition,
         now_ms: i64,
-        pass: &Mutex<FrontendMaintenancePassReport>,
+        pass: &mut FrontendMaintenancePassReport,
     ) {
         let target = match canonical_target(&definition) {
             Some(target) => target,
             None => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
+                pass.skipped
                     .push(FrontendMaintenanceSkip::MissingCanonicalTarget {
                         mv_id: definition.mv_id,
                     });
@@ -237,30 +191,36 @@ impl FrontendMaintenanceWorker {
         {
             Ok(facts) => facts,
             Err(error) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::FactsFailed {
-                        mv_id: definition.mv_id,
-                        kind: error.kind(),
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::FactsFailed {
+                    mv_id: definition.mv_id,
+                    kind: error.kind(),
+                });
                 return;
             }
         };
 
-        let workload_lease = match self
+        let RootWork { owner, business } = match self
             .dependencies
-            .workload_lifecycle
-            .try_admit(FrontendWorkloadKind::Background)
+            .root_admission
+            .try_begin_root(WorkRequest::new(WorkClass::MaterializedView))
         {
-            Ok(lease) => lease,
+            Ok(work) => work,
             Err(_) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
+                return;
+            }
+        };
+        let cancellation = match owner.scope().cancellation() {
+            Ok(view) => novarocks_query_application::cancellation::QueryCancellationView::governed(
+                view, None,
+            ),
+            Err(_) => {
+                finish_automatic_root(owner, business);
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
@@ -270,33 +230,27 @@ impl FrontendMaintenanceWorker {
         ) {
             Ok(ticket) => ticket,
             Err(MvActivityGateError::Stopping) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                finish_automatic_root(owner, business);
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
         let lease = match ticket.try_acquire() {
             Ok(Some(lease)) => lease,
             Ok(None) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::GateBusy {
-                        mv_id: definition.mv_id,
-                    });
+                finish_automatic_root(owner, business);
+                pass.skipped.push(FrontendMaintenanceSkip::GateBusy {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
             Err(MvActivityGateError::Stopping) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Stopping {
-                        mv_id: definition.mv_id,
-                    });
+                finish_automatic_root(owner, business);
+                pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                    mv_id: definition.mv_id,
+                });
                 return;
             }
         };
@@ -304,34 +258,31 @@ impl FrontendMaintenanceWorker {
         // Reject pre-dispatch cancellation before acquiring the durable route.
         // A cancellation that races an external commit is retained by that
         // route as recovery evidence rather than turned into a retry.
-        if lease
-            .cancellation()
-            .is_some_and(|cancellation| cancellation.is_cancelled())
+        if cancellation.is_cancelled()
+            || lease
+                .cancellation()
+                .is_some_and(|cancellation| cancellation.is_cancelled())
         {
-            pass.lock()
-                .expect("frontend MV maintenance pass lock poisoned")
-                .skipped
-                .push(FrontendMaintenanceSkip::Stopping {
-                    mv_id: definition.mv_id,
-                });
+            drop(lease);
+            finish_automatic_root(owner, business);
+            pass.skipped.push(FrontendMaintenanceSkip::Stopping {
+                mv_id: definition.mv_id,
+            });
             return;
         }
 
         let attempt = match self
-            .coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
+            .runtime
             .try_begin(definition.mv_id, target.clone(), &facts, now_ms)
         {
             Ok(attempt) => attempt,
             Err(admission) => {
-                pass.lock()
-                    .expect("frontend MV maintenance pass lock poisoned")
-                    .skipped
-                    .push(FrontendMaintenanceSkip::Admission {
-                        mv_id: definition.mv_id,
-                        admission,
-                    });
+                drop(lease);
+                finish_automatic_root(owner, business);
+                pass.skipped.push(FrontendMaintenanceSkip::Admission {
+                    mv_id: definition.mv_id,
+                    admission,
+                });
                 return;
             }
         };
@@ -339,30 +290,29 @@ impl FrontendMaintenanceWorker {
             engine: Arc::clone(&self.dependencies.table_maintenance_engine),
             service: Arc::clone(&self.dependencies.table_maintenance_service),
             context: AutomaticMaintenanceContext::with_deadline(
-                workload_lease.cancellation_source().view(),
+                cancellation,
                 Instant::now() + self.dependencies.attempt_timeout,
             ),
             handle: self.dependencies.runtime.clone(),
         };
         let execution = MaintenanceCoordinator::execute_attempt(&attempt, &mut runner);
-        self.coordinator
-            .lock()
-            .expect("frontend MV maintenance coordinator lock poisoned")
-            .finish_attempt(attempt, &execution, now_ms);
-        // Keep `lease` live until all durable calls and the coordinator's
-        // terminal transition have completed.  Its Drop wakes the next FIFO
-        // request for this MV target.
-        let _lease = lease;
-        let _workload_lease = workload_lease;
-        pass.lock()
-            .expect("frontend MV maintenance pass lock poisoned")
-            .attempts
-            .push(FrontendMaintenanceAttemptReport {
-                mv_id: definition.mv_id,
-                target,
-                execution,
-            });
+        self.runtime.finish(attempt, &execution, now_ms);
+        // Release the activity lease only after all durable calls and the
+        // coordinator's terminal transition have completed, then finish the
+        // governed root.
+        drop(lease);
+        finish_automatic_root(owner, business);
+        pass.attempts.push(FrontendMaintenanceAttemptReport {
+            mv_id: definition.mv_id,
+            target,
+            execution,
+        });
     }
+}
+
+fn finish_automatic_root(owner: WorkOwner, business: BusinessPermit) {
+    drop(business);
+    owner.complete();
 }
 
 /// Narrow adapter from automatic policy actions to the existing frontend

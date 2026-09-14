@@ -39,12 +39,11 @@ use novarocks_spi::connector::write_stack::{
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
     ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind,
-    ConnectorFieldPath, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
-    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
+    ConnectorExecutionWriteBinding, ConnectorFieldPath, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorWriteFragmentWireEncoder,
+    ConnectorWriteHandleWireDecoder,
 };
 use novarocks_types::{QueryExecutionId, UniqueId};
-
-use crate::connector::ConnectorExecutionWriteBinding;
 
 pub(crate) const TEST_WRITE_CATALOG: &str = "write_catalog";
 const TEST_WRITE_PROVIDER: &str = "test";

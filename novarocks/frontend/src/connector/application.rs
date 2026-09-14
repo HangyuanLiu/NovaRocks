@@ -174,7 +174,7 @@ impl ConnectorCancellation for RequestConnectorCancellation {
 }
 
 struct QueryConnectorCancellation {
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 }
 
 impl ConnectorCancellation for QueryConnectorCancellation {
@@ -216,7 +216,7 @@ pub fn connector_request_context(
 /// provider requests share the statement cancellation identity and options.
 pub fn connector_request_context_for_query(
     query_options: Option<&QueryOptions>,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     build_connector_request_context(
         query_options,
@@ -228,7 +228,7 @@ pub fn connector_request_context_for_query(
 /// scan negotiation. This path has no execution-attempt credential collector.
 pub fn connector_planning_context_for_query(
     query_options: Option<&QueryOptions>,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<ConnectorPlanningContext, String> {
     ConnectorPlanningContext::try_from_request(connector_request_context_for_query(
         query_options,
@@ -247,7 +247,7 @@ pub fn connector_attempt_context(request: ConnectorRequestContext) -> ConnectorA
 /// statement deadline and cancellation identity.
 pub fn connector_request_context_for_deadline(
     deadline: std::time::Instant,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
     ConnectorRequestContext::try_new(
         deadline,
@@ -324,7 +324,9 @@ mod request_context_tests {
     };
     use crate::common::admitted_query_context::{RequestAdmission, RequestContext};
     use crate::common::backend_topology::BackendTopologySnapshot;
-    use crate::common::query_cancellation::{QueryCancellationReason, QueryCancellationSource};
+    use novarocks_query_application::cancellation::{
+        QueryCancellationReason, QueryCancellationSource,
+    };
     use novarocks_spi::connector::{
         ConnectorErrorKind, ConnectorResourceClass, ConnectorResourceLedger,
     };

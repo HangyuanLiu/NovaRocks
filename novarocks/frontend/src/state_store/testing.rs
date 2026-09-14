@@ -19,17 +19,25 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use novarocks_state_store_api::{
-    StateStoreLimits, StateStoreProviderDescriptor, StateStoreProviderId,
+    StateStore, StateStoreError, StateStoreLimits, StateStoreOpenRequest,
+    StateStoreProviderDescriptor, StateStoreProviderId, StateStoreProviderInstance,
+    StateStoreProviderLifecycle,
 };
-use novarocks_state_store_testkit::testing::InMemoryStateStoreProviderFactory;
+use novarocks_state_store_testkit::testing::{
+    InMemoryStateStore, InMemoryStateStoreProviderFactory,
+};
 
-use super::{StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreRunPolicy};
-use super::{StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry};
+use novarocks_state_store_runtime::{
+    StateStoreHost as FrontendStateStoreHost, StateStoreHostError, StateStoreHostInput,
+    StateStoreProviderRegistration, StateStoreProviderRegistry, StateStoreRunPolicy,
+};
 
 pub const TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
     StateStoreProviderId::new("frontend-unit-test");
@@ -62,6 +70,108 @@ pub fn input(cluster_id: impl Into<String>) -> StateStoreHostInput {
         limits: StateStoreLimits::default(),
         run_policy: StateStoreRunPolicy::default(),
     }
+}
+
+/// Test-only provider that preserves a store by cluster ID across host reopen.
+/// It lets lifecycle tests prove restart behavior without a disk-backed
+/// provider and without treating a newly allocated empty store as a reopen.
+pub const PERSISTENT_TEST_STATE_STORE_PROVIDER_ID: StateStoreProviderId =
+    StateStoreProviderId::new("frontend-persistent-unit-test");
+
+const PERSISTENT_TEST_STATE_STORE_DESCRIPTOR: StateStoreProviderDescriptor =
+    StateStoreProviderDescriptor::new(
+        PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+        novarocks_state_store_api::MAX_KEY_BYTES,
+    );
+
+type PersistentStores = Arc<Mutex<HashMap<String, Arc<InMemoryStateStore>>>>;
+
+fn persistent_stores() -> PersistentStores {
+    static STORES: OnceLock<PersistentStores> = OnceLock::new();
+    Arc::clone(STORES.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))))
+}
+
+struct PersistentInMemoryFactory;
+
+#[async_trait::async_trait]
+impl novarocks_state_store_api::StateStoreProviderFactory for PersistentInMemoryFactory {
+    fn descriptor(&self) -> &StateStoreProviderDescriptor {
+        &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
+    }
+
+    async fn open(
+        self: Box<Self>,
+        request: StateStoreOpenRequest,
+    ) -> Result<Box<dyn StateStoreProviderInstance>, StateStoreError> {
+        let stores = persistent_stores();
+        let mut stores = stores
+            .lock()
+            .expect("persistent Frontend test StateStore map");
+        let state_store = stores
+            .entry(request.cluster_id.clone())
+            .or_insert_with(|| {
+                Arc::new(InMemoryStateStore::with_limits(
+                    request.cluster_id,
+                    request.limits,
+                ))
+            })
+            .clone();
+        Ok(Box::new(PersistentInMemoryInstance { state_store }))
+    }
+}
+
+struct PersistentInMemoryInstance {
+    state_store: Arc<InMemoryStateStore>,
+}
+
+#[async_trait::async_trait]
+impl StateStoreProviderInstance for PersistentInMemoryInstance {
+    fn descriptor(&self) -> &StateStoreProviderDescriptor {
+        &PERSISTENT_TEST_STATE_STORE_DESCRIPTOR
+    }
+
+    fn lifecycle(&self) -> StateStoreProviderLifecycle {
+        StateStoreProviderLifecycle::Ready
+    }
+
+    fn state_store(&self) -> Option<Arc<dyn StateStore>> {
+        Some(Arc::clone(&self.state_store) as Arc<dyn StateStore>)
+    }
+
+    async fn shutdown(&mut self, _deadline: Instant) -> Result<(), StateStoreError> {
+        Ok(())
+    }
+}
+
+pub(crate) fn persistent_registry() -> StateStoreProviderRegistry {
+    let mut registry = StateStoreProviderRegistry::new();
+    registry
+        .register(StateStoreProviderRegistration::new(
+            PERSISTENT_TEST_STATE_STORE_DESCRIPTOR,
+            |_| Ok(Box::new(PersistentInMemoryFactory)),
+        ))
+        .expect("register persistent Frontend unit-test StateStore provider");
+    registry
+}
+
+pub(crate) fn persistent_input(cluster_id: impl Into<String>) -> StateStoreHostInput {
+    StateStoreHostInput {
+        cluster_id: cluster_id.into(),
+        provider_id: PERSISTENT_TEST_STATE_STORE_PROVIDER_ID,
+        limits: StateStoreLimits::default(),
+        run_policy: StateStoreRunPolicy::default(),
+    }
+}
+
+pub(crate) async fn open_persistent(cluster_id: impl Into<String>) -> FrontendStateStoreHost {
+    let registry = persistent_registry();
+    FrontendStateStoreHost::open(
+        &registry,
+        persistent_input(cluster_id),
+        Instant::now() + std::time::Duration::from_secs(5),
+    )
+    .await
+    .expect("open persistent Frontend test StateStore")
 }
 
 /// Compatibility-free test fixture input. It represents only test data; the

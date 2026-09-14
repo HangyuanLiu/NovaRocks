@@ -10,7 +10,7 @@ use crate::query_execution::artifact::RuntimeFilterScheduledView;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, RuntimeFilterLifecycleView,
 };
-use crate::query_execution::{
+use crate::query_execution::preparation::runtime_filter_view::{
     RuntimeFilterArtifactCapability, RuntimeFilterCompletionRequirement,
     RuntimeFilterConsumerActivation, RuntimeFilterContributionKind, RuntimeFilterCoverageFacts,
     RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
@@ -244,7 +244,7 @@ impl DeploymentInput {
         let join_progress = facts
             .join_progress()
             .filter_map(|progress| match progress {
-                crate::query_execution::RuntimeFilterJoinProgressFacts::Proven {
+                crate::query_execution::preparation::runtime_filter_view::RuntimeFilterJoinProgressFacts::Proven {
                     channel_id,
                     producer_binding_id,
                     producer_fragment_id,
@@ -265,7 +265,7 @@ impl DeploymentInput {
                         .map(|edge| (edge.source_fragment_id, edge.target_exchange_node_id))
                         .collect(),
                 }),
-                crate::query_execution::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
+                crate::query_execution::preparation::runtime_filter_view::RuntimeFilterJoinProgressFacts::Skipped { .. } => None,
             })
             .map(|proof| {
                 (
@@ -577,16 +577,16 @@ fn materialize_bindings(
                     capabilities: unique_capabilities(capabilities)?,
                     activation: activation_wire(activation),
                     scan_domain: match target {
-                        crate::query_execution::RuntimeFilterConsumerTarget::SourceBoundary {
+                        crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::SourceBoundary {
                             scan_domain_target: Some(target),
                         } => Some(ScanDomainBindingSpec {
                             data_type: target.data_type,
                             nullable: target.nullable,
                         }),
-                        crate::query_execution::RuntimeFilterConsumerTarget::SourceBoundary {
+                        crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::SourceBoundary {
                             scan_domain_target: None,
                         }
-                        | crate::query_execution::RuntimeFilterConsumerTarget::DirectInputOrdinal(
+                        | crate::query_execution::preparation::runtime_filter_view::RuntimeFilterConsumerTarget::DirectInputOrdinal(
                             _,
                         ) => None,
                     },

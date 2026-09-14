@@ -23,12 +23,11 @@
 //! publication evidence reports `CommitUnknown`.
 
 use crate::common::admitted_query_context::RequestContext;
-use crate::common::engine_error::EngineErrorCode;
 use crate::dml::attempt::{
     DmlPublicationAdjudicationOutcome, DmlPublicationAttempt, DmlPublicationAttemptError,
     DmlPublicationFinalization,
 };
-use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::error::DmlError;
 use crate::dml::service::DmlService;
 use crate::query_execution::dml::ctas::{
     CtasCommand, CtasEngine, CtasFailure, CtasFailureKind, CtasTargetPreflightFacts,
@@ -38,6 +37,8 @@ use crate::query_execution::dml::ctas::{
     StandardCtasStageOutcome, StandardCtasTargetFacts, StandardCtasWriteOutcome,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::engine_error::EngineErrorCode;
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_spi::connector::{
     CreatePolicy, ExternalMutationFinalization, LakePublicationFamily, LakePublicationId,
     LakePublicationStatementTag, LakePublicationTarget,
@@ -64,7 +65,7 @@ impl DmlService {
     ) -> Result<(), DmlError> {
         let _ = self;
         let command = CtasCommand::from_typed(statement, source).map_err(|error| {
-            DmlError::admit(AdmitError::CreateTableUnsupportedForm.to_user_error(
+            DmlError::admit(DmlAdmissionError::CreateTableUnsupportedForm.to_user_error(
                 source,
                 error.span,
                 error.message,

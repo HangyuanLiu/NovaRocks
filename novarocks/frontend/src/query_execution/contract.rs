@@ -22,29 +22,21 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
-use crate::common::query_cancellation::QueryCancellationView;
 use crate::query_execution::artifact::{
     PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
 };
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-pub use crate::query_execution::outcome::DistributedQueryOutcome;
-pub use crate::query_execution::outcome::FragmentProfileSet;
-pub use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
 use crate::query_execution::post_compile::NativeFragmentEncodingInput;
-pub use crate::query_execution::profile::ProfileTerminalBuilder;
-pub use crate::query_execution::statistics::StatisticsCollectionProgram;
-pub use crate::query_execution::statistics::StatisticsExecutionMode;
-pub use crate::query_execution::statistics::StatisticsExecutionPolicy;
+use crate::query_execution::statistics::StatisticsCollectionProgram;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
     QueryCacheOptions, QueryOptions as RuntimeQueryOptions,
 };
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::preparation::FrozenExecutionDescription;
 use novarocks_types::BackendProcessId;
-
-#[cfg(test)]
-pub(crate) use novarocks_types::QueryId;
 
 /// Query options resolved by core before ownership crosses into frontend.
 ///
@@ -706,7 +698,10 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
     fn execute_prepared(
         &self,
         operation: crate::query_execution::completion::PreparedDistributedQuery,
-    ) -> Result<crate::runtime::statement_result::StatementResult, DistributedQueryError> {
+    ) -> Result<
+        novarocks_query_application::protocol_delivery::QuerySessionOutput,
+        DistributedQueryError,
+    > {
         let (request, completion, attempt_factory, _logical_reservation) = operation.into_parts();
         if attempt_factory.is_some() {
             return Err(DistributedQueryError::new(

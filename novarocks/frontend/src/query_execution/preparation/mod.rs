@@ -43,8 +43,7 @@ pub(crate) use attempt_access::{
     ConnectorAttemptAccessEntry, ConnectorAttemptAccessPlan, FrozenDescriptionInputs,
 };
 pub use native_encoding_view::{
-    NativeConnectorReadView, NativeRequiredReadReason, NativeRequiredReadView,
-    NativeScanBindingView, NativeScanColumnKind, NativeScanColumnView, NativeScanExecutionKind,
+    NativeConnectorReadView, NativeScanBindingView, NativeScanColumnKind, NativeScanExecutionKind,
     NativeScanFactsView,
 };
 pub use projection::PreparedFragmentSet;

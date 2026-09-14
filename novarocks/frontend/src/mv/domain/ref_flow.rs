@@ -22,11 +22,11 @@
 
 use std::sync::Arc;
 
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{
     AlterIcebergTable, IcebergReferenceAction, IcebergReferenceKind, IcebergTableAction,
     ObjectName, ReferenceAnchor,
 };
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
     ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
@@ -111,7 +111,7 @@ pub(crate) fn execute_with_ports(
         crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
             if let ExternalMutationFinalization::Failed(failure) = completed.finalization {
                 return Err(
-                    crate::common::engine_error::EngineError::commit_known_committed_finalize_failed(
+                    novarocks_query_application::engine_error::EngineError::commit_known_committed_finalize_failed(
                         failure.to_string(),
                     )
                     .to_string(),
@@ -120,17 +120,19 @@ pub(crate) fn execute_with_ports(
         }
         crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
             return Err(
-                crate::common::engine_error::EngineError::commit_known_uncommitted(
+                novarocks_query_application::engine_error::EngineError::commit_known_uncommitted(
                     failure.to_string(),
                 )
                 .to_string(),
             );
         }
         crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            return Err(crate::common::engine_error::EngineError::commit_unknown(
-                failure.to_string(),
-            )
-            .to_string());
+            return Err(
+                novarocks_query_application::engine_error::EngineError::commit_unknown(
+                    failure.to_string(),
+                )
+                .to_string(),
+            );
         }
         crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
             return Err(error.to_string());

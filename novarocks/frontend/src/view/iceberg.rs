@@ -15,13 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::common::persisted_query_definition::{PersistedQueryDefinition, PersistedQueryDialect};
 use crate::view::{
     CreateExternalViewRequest, ViewEngine, ViewRequestContext, ViewStatementResult, ViewTarget,
 };
 use novarocks_parser::{
     ast::{CreateView, ObjectName},
     printer,
+};
+use novarocks_query_application::persisted_query_definition::{
+    PersistedQueryDefinition, PersistedQueryDialect,
 };
 use novarocks_spi::connector::DropPolicy;
 use novarocks_types::naming::normalize_identifier;

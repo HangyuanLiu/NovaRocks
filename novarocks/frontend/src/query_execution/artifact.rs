@@ -35,8 +35,8 @@ pub(crate) use task_manifest_binding::{
 };
 
 pub use native_submission::{
-    NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentFacts,
-    NativeSubmissionFragmentRole, NativeSubmissionKey,
+    NativeSubmissionAttachment, NativeSubmissionEncodingView, NativeSubmissionFragmentRole,
+    NativeSubmissionKey,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,24 +49,26 @@ use sha2::{Digest, Sha256};
 
 use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
-#[cfg(test)]
-use crate::query_execution::contract::QueryId;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
+use crate::query_execution::preparation::runtime_filter_view::{
+    RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView,
+};
 use crate::query_execution::preparation::{
     PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
-use crate::query_execution::{RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView};
-use crate::runtime::query_result::{QueryResult, QueryResultColumn};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
 use novarocks_proto_models::plan::RuntimeFilterBindingTable;
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
+#[cfg(test)]
+use novarocks_types::QueryId;
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
 pub type FragmentId = u32;
@@ -330,6 +332,10 @@ impl std::fmt::Debug for ManifestBoundNativeAttemptInputs {
 }
 
 impl ManifestBoundNativeAttemptInputs {
+    pub(crate) const fn execution_id(&self) -> QueryExecutionId {
+        self.manifest.execution()
+    }
+
     /// Starts a borrowed activation transaction.
     ///
     /// The exact manifest and Connector access capability remain in this
@@ -2164,14 +2170,11 @@ impl ExpectedOutputSchema {
             columns: self
                 .output_columns
                 .into_iter()
-                .map(|column| QueryResultColumn {
-                    name: column.name,
-                    data_type: column.data_type,
-                    nullable: column.nullable,
-                    logical_type: None,
+                .map(|column| {
+                    QueryResultColumn::new(column.name, column.data_type, column.nullable, None)
                 })
                 .collect(),
-            chunks,
+            batches: chunks.into_iter().map(|chunk| chunk.batch).collect(),
         })
     }
 }
@@ -2284,7 +2287,6 @@ mod tests {
         merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
         validate_prepared_template_affinity,
     };
-    use crate::query_execution::contract::QueryId;
     use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_codec::catalog::CatalogSet;
@@ -2294,6 +2296,7 @@ mod tests {
     };
     use novarocks_sql::planning::query_execution::SealedPreparationPlan;
     use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
+    use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
 
     fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {

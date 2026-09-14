@@ -18,134 +18,61 @@
 //! Fragment-native protocol plan-node decoding.
 
 mod aggregate;
-mod assert;
+#[cfg(test)]
 mod change_event_expand;
-mod common;
 mod exchange;
+#[cfg(test)]
 mod filter;
-mod generate_series;
 mod hash_join;
-mod limit;
+#[cfg(test)]
 mod nestloop_join;
+#[cfg(test)]
 mod project;
-mod redistribute;
-mod repeat;
-mod set_op;
+#[cfg(test)]
 mod sort;
+#[cfg(test)]
 mod table_function;
 mod table_write;
+#[cfg(test)]
 mod topn;
+#[cfg(test)]
 mod unpivot;
-mod values;
 mod window;
 
-use self::common::*;
 use novarocks_execution::runtime_filter as execution;
 use std::collections::BTreeMap;
 
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
 use crate::fragment::decode::plan::runtime_filter_binding::{
     DecodedBindingRole, DecodedConsumerBindingTarget, DecodedRuntimeFilterBinding,
     NativeRuntimeFilterDecodeLedger, ProducerBindingTarget,
 };
 use novarocks_execution::exec::chunk::ChunkSchemaRef;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::ExprArena;
-use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
 use novarocks_execution::exec::node::aggregate::{
     AggregateRuntimeFilterSpec, AggregateTopNRuntimeFilterProducerBinding,
 };
 use novarocks_execution::exec::node::join::{
     JoinRuntimeFilterExecution, JoinRuntimeFilterProducerBinding,
 };
-use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::runtime_filter::{
     RuntimeFilterConsumerBinding, RuntimeFilterConsumerNode,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_plan_node::{
+    NativeLoweredPlanNode, apply_distributed_limit, lower_assert_one_row_node,
+    lower_change_event_expand_node, lower_filter_node, lower_generate_series_node,
+    lower_limit_node, lower_nest_loop_join_node, lower_project_node, lower_redistribute_node,
+    lower_repeat_node, lower_set_op_node, lower_sort_node, lower_table_function_node,
+    lower_topn_node, lower_unpivot_node, lower_values_node, validate_distributed_node_children,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
-#[derive(Clone, Debug)]
-pub(crate) struct DecodedNode {
-    pub(crate) node: ExecNode,
-    pub(crate) layout: Layout,
-    pub(crate) output_schema: ChunkSchemaRef,
-}
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-pub(super) fn collect_scan_assignment_kinds(
-    root: &plan::DistributedNode,
-    root_path: FieldPath,
-) -> Result<BTreeMap<FragmentNodeId, ScanAssignmentKind>, NativeFragmentDecodeError> {
-    fn visit(
-        node: &plan::DistributedNode,
-        path: FieldPath,
-        assignments: &mut BTreeMap<FragmentNodeId, ScanAssignmentKind>,
-    ) -> Result<(), NativeFragmentDecodeError> {
-        if let Some(plan::distributed_node::Payload::Physical(physical)) = node.payload.as_ref()
-            && let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref()
-        {
-            let scan_path = path
-                .clone()
-                .field("payload")
-                .field("physical")
-                .field("scan");
-            let table = scan.table.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path.clone().field("table"),
-                    format!("native ScanNode node_id={} requires table", node.node_id),
-                )
-            })?;
-            let source = table.source.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path.clone().field("table").field("source"),
-                    format!("native ScanNode node_id={} requires source", node.node_id),
-                )
-            })?;
-            let source = source.kind.as_ref().ok_or_else(|| {
-                NativeFragmentDecodeError::missing(
-                    scan_path
-                        .clone()
-                        .field("table")
-                        .field("source")
-                        .field("kind"),
-                    format!(
-                        "native ScanNode node_id={} requires source kind",
-                        node.node_id
-                    ),
-                )
-            })?;
-            let _ = source;
-            let kind = ScanAssignmentKind::File;
-            if assignments
-                .insert(FragmentNodeId::new(node.node_id), kind)
-                .is_some()
-            {
-                return Err(NativeFragmentDecodeError::inconsistent(
-                    path.clone().field("node_id"),
-                    format!("native plan has duplicate scan node_id={}", node.node_id),
-                ));
-            }
-        }
-        for (index, child) in node.children.iter().enumerate() {
-            visit(
-                child,
-                path.clone().field("children").index(index),
-                assignments,
-            )?;
-        }
-        Ok(())
-    }
-
-    let mut assignments = BTreeMap::new();
-    visit(root, root_path, &mut assignments)?;
-    Ok(assignments)
-}
-
+pub(crate) type DecodedNode = NativeLoweredPlanNode;
 #[allow(dead_code)]
 pub(crate) fn decode_node(
     node: &plan::DistributedNode,
@@ -221,7 +148,6 @@ fn decode_node_inner(
             &mut children,
             arena,
             path.clone().field("runtime_filter_binding_ids"),
-            ctx,
         )?;
     }
 
@@ -273,16 +199,9 @@ fn decode_node_inner(
         }
     }?;
     if children_are_absent(node) && !consumer_bindings.is_empty() {
-        attach_leaf_consumers(
-            node,
-            &consumer_bindings,
-            &mut lowered,
-            arena,
-            path.clone(),
-            ctx,
-        )?;
+        attach_leaf_consumers(node, &consumer_bindings, &mut lowered, arena, path.clone())?;
     }
-    let mut lowered = apply_distributed_limit_if_needed(node, lowered, path.clone())?;
+    let mut lowered = apply_distributed_limit(node, lowered, path.clone())?;
     if !producer_bindings.is_empty() {
         attach_producers(
             node,
@@ -301,99 +220,6 @@ fn decode_node_inner(
     Ok(lowered)
 }
 
-fn validate_distributed_node_children(
-    node: &plan::DistributedNode,
-    node_path: FieldPath,
-) -> Result<(), NativeFragmentDecodeError> {
-    let actual = node.children.len();
-    let Some(payload) = node.payload.as_ref() else {
-        return Ok(());
-    };
-    match payload {
-        plan::distributed_node::Payload::Exchange(_) => {
-            require_exact_children(node_path, "ExchangeReceiver", 0, actual)
-        }
-        // A writer is an ordinary unary processor.
-        plan::distributed_node::Payload::TableWriter(_) => {
-            require_exact_children(node_path, "TableWriterNode", 1, actual)
-        }
-        // The finish node is n-ary: the planner gives it one exchange receiver
-        // per writer fragment, because a receiver names exactly one source
-        // fragment and therefore cannot be shared between senders.
-        plan::distributed_node::Payload::TableFinish(_) => {
-            require_min_children(node_path, "TableFinishNode", 1, actual)
-        }
-        plan::distributed_node::Payload::Physical(physical) => {
-            let Some(kind) = physical.kind.as_ref() else {
-                return Ok(());
-            };
-            match kind {
-                plan::plan_node::Kind::Values(_) => {
-                    require_exact_children(node_path, "ValuesNode", 0, actual)
-                }
-                plan::plan_node::Kind::Project(_) => {
-                    require_exact_children(node_path, "ProjectNode", 1, actual)
-                }
-                plan::plan_node::Kind::Unpivot(_) => {
-                    require_exact_children(node_path, "UnpivotNode", 1, actual)
-                }
-                plan::plan_node::Kind::Filter(_) => {
-                    require_exact_children(node_path, "FilterNode", 1, actual)
-                }
-                plan::plan_node::Kind::Limit(_) => {
-                    require_exact_children(node_path, "LimitNode", 1, actual)
-                }
-                plan::plan_node::Kind::Sort(_) => {
-                    require_exact_children(node_path, "SortNode", 1, actual)
-                }
-                plan::plan_node::Kind::Topn(_) => {
-                    require_exact_children(node_path, "TopNNode", 1, actual)
-                }
-                plan::plan_node::Kind::SetOp(_) => {
-                    require_min_children(node_path, "SetOpNode", 2, actual)
-                }
-                plan::plan_node::Kind::AssertOneRow(_) => {
-                    require_exact_children(node_path, "AssertOneRowNode", 1, actual)
-                }
-                plan::plan_node::Kind::Scan(_) => {
-                    require_exact_children(node_path, "ScanNode", 0, actual)
-                }
-                plan::plan_node::Kind::HashAggregate(_) => {
-                    require_exact_children(node_path, "HashAggregateNode", 1, actual)
-                }
-                plan::plan_node::Kind::HashJoin(_) => {
-                    require_exact_children(node_path, "HashJoinNode", 2, actual)
-                }
-                plan::plan_node::Kind::NestLoopJoin(_) => {
-                    require_exact_children(node_path, "NestLoopJoinNode", 2, actual)
-                }
-                plan::plan_node::Kind::Window(_) => {
-                    require_exact_children(node_path, "WindowNode", 1, actual)
-                }
-                plan::plan_node::Kind::Repeat(_) => {
-                    require_exact_children(node_path, "RepeatNode", 1, actual)
-                }
-                plan::plan_node::Kind::GenerateSeries(_) => {
-                    require_exact_children(node_path, "GenerateSeriesNode", 0, actual)
-                }
-                plan::plan_node::Kind::TableFunction(_) => {
-                    require_exact_children(node_path, "TableFunctionNode", 1, actual)
-                }
-                plan::plan_node::Kind::ChangeEventExpand(_) => {
-                    require_exact_children(node_path, "ChangeEventExpandNode", 1, actual)
-                }
-                plan::plan_node::Kind::Redistribute(_) => {
-                    require_exact_children(node_path, "RedistributeNode", 1, actual)
-                }
-                plan::plan_node::Kind::Decode(_)
-                | plan::plan_node::Kind::CteAnchor(_)
-                | plan::plan_node::Kind::CteProduce(_)
-                | plan::plan_node::Kind::CteConsume(_) => Ok(()),
-            }
-        }
-    }
-}
-
 fn children_are_absent(node: &plan::DistributedNode) -> bool {
     node.children.is_empty()
 }
@@ -404,7 +230,6 @@ fn attach_direct_input_consumers(
     children: &mut [DecodedNode],
     arena: &mut ExprArena,
     path: FieldPath,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<(), NativeFragmentDecodeError> {
     let mut grouped = BTreeMap::<usize, Vec<RuntimeFilterConsumerBinding>>::new();
     for binding in bindings {
@@ -440,7 +265,7 @@ fn attach_direct_input_consumers(
             )
         })?;
         let expr_id =
-            lower_binding_expression(binding, &child.layout, &child.output_schema, arena, ctx)?;
+            lower_binding_expression(binding, &child.layout, &child.output_schema, arena)?;
         grouped
             .entry(*index)
             .or_default()
@@ -469,7 +294,6 @@ fn attach_leaf_consumers(
     lowered: &mut DecodedNode,
     arena: &mut ExprArena,
     path: FieldPath,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<(), NativeFragmentDecodeError> {
     for binding in bindings {
         let DecodedBindingRole::Consumer { target, .. } = &binding.role else {
@@ -512,13 +336,8 @@ fn attach_leaf_consumers(
     let specs = bindings
         .iter()
         .map(|binding| {
-            let expr_id = lower_binding_expression(
-                binding,
-                &lowered.layout,
-                &lowered.output_schema,
-                arena,
-                ctx,
-            )?;
+            let expr_id =
+                lower_binding_expression(binding, &lowered.layout, &lowered.output_schema, arena)?;
             consumer_spec(binding, expr_id).map_err(|error| {
                 NativeFragmentDecodeError::inconsistent(
                     path.clone().field("runtime_filter_binding_ids"),
@@ -623,7 +442,7 @@ fn validate_scan_domain_target(
             ),
         )
     })?;
-    let expression_type = crate::fragment::decode::type_decode::decode_type(expression_type).map_err(|error| {
+    let expression_type = novarocks_plan_codec::native_type::decode_type(expression_type).map_err(|error| {
         NativeFragmentDecodeError::invalid_value(
             binding.expression_path.clone().field("type"),
             format!(
@@ -1153,7 +972,6 @@ fn lower_binding_expression(
     layout: &Layout,
     schema: &ChunkSchemaRef,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<novarocks_execution::exec::expr::ExprId, NativeFragmentDecodeError> {
     let expression_path = binding.expression_path.clone();
     validate_column_refs_exact(
@@ -1163,7 +981,7 @@ fn lower_binding_expression(
         schema,
         expression_path.clone(),
     )?;
-    ctx.decode_expression(&binding.expression, expression_path, arena, layout)
+    decode_expr_for_slot_layout(&binding.expression, expression_path, arena, layout)
 }
 
 fn validate_column_refs_exact(
@@ -1185,10 +1003,13 @@ fn validate_column_refs_exact(
         let column_path = path.clone().field("column_ref");
         let slot_id = layout
             .resolve_column_id(column.column_id)
-            .map_err(|error| {
+            .ok_or_else(|| {
                 NativeFragmentDecodeError::invalid_value(
                     column_path.clone().field("column_id"),
-                    format!("native runtime-filter binding_id={binding_id}: {error}"),
+                    format!(
+                        "native runtime-filter binding_id={binding_id}: ColumnRef column_id={} not found in input layout",
+                        column.column_id
+                    ),
                 )
             })?;
         let expected = schema.field_by_slot(slot_id).ok_or_else(|| {
@@ -1209,7 +1030,7 @@ fn validate_column_refs_exact(
                 ),
             )
         })?;
-        let actual = crate::fragment::decode::type_decode::decode_field_type(
+        let actual = novarocks_plan_codec::native_type::decode_field_type(
             "_runtime_filter_column",
             expression.nullable,
             type_desc,
@@ -1479,53 +1300,6 @@ fn validate_column_refs_exact(
     }
 }
 
-fn apply_distributed_limit_if_needed(
-    node: &plan::DistributedNode,
-    mut lowered: DecodedNode,
-    path: FieldPath,
-) -> Result<DecodedNode, NativeFragmentDecodeError> {
-    let Some(limit) = NativeFragmentDecodeError::map_invalid(
-        path.field("limit"),
-        parse_distributed_limit(node.limit, "DistributedNode.limit"),
-    )?
-    else {
-        return Ok(lowered);
-    };
-    // A limit over a write dataflow node would truncate the write relation, and
-    // the rows it dropped would be commit fragments the frontend must commit.
-    // Refuse it instead of silently losing staged artifacts.
-    if matches!(
-        node.payload.as_ref(),
-        Some(
-            plan::distributed_node::Payload::TableWriter(_)
-                | plan::distributed_node::Payload::TableFinish(_)
-        )
-    ) {
-        return Err(NativeFragmentDecodeError::inconsistent(
-            path.field("limit"),
-            format!(
-                "native node_id={} is a write dataflow node and cannot carry a limit",
-                node.node_id
-            ),
-        ));
-    }
-    if matches!(
-        lowered.node.kind,
-        ExecNodeKind::Limit(_) | ExecNodeKind::Sort(_)
-    ) {
-        return Ok(lowered);
-    }
-    lowered.node = ExecNode {
-        kind: ExecNodeKind::Limit(LimitNode {
-            input: Box::new(lowered.node),
-            node_id: node.node_id,
-            limit: Some(limit),
-            offset: 0,
-        }),
-    };
-    Ok(lowered)
-}
-
 fn lower_physical_node(
     node: &plan::DistributedNode,
     physical: &plan::PlanNode,
@@ -1543,7 +1317,7 @@ fn lower_physical_node(
         )
     })?;
     match kind {
-        plan::plan_node::Kind::Values(values) => values::lower_values_node(
+        plan::plan_node::Kind::Values(values) => lower_values_node(
             node,
             physical,
             values,
@@ -1551,17 +1325,15 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
-        plan::plan_node::Kind::Project(project) => project::lower_project_node(
+        plan::plan_node::Kind::Project(project) => lower_project_node(
             node,
             project,
             path.clone().field("project"),
             children,
             arena,
-            ctx,
         ),
-        plan::plan_node::Kind::Unpivot(unpivot) => unpivot::lower_unpivot_node(
+        plan::plan_node::Kind::Unpivot(unpivot) => lower_unpivot_node(
             node,
             physical,
             unpivot,
@@ -1569,24 +1341,18 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
-        plan::plan_node::Kind::Filter(filter) => filter::lower_filter_node(
-            node,
-            filter,
-            path.clone().field("filter"),
-            children,
-            arena,
-            ctx,
-        ),
-        plan::plan_node::Kind::Limit(limit) => limit::lower_limit_node(
+        plan::plan_node::Kind::Filter(filter) => {
+            lower_filter_node(node, filter, path.clone().field("filter"), children, arena)
+        }
+        plan::plan_node::Kind::Limit(limit) => lower_limit_node(
             node,
             limit,
             path.clone().field("limit"),
             node_path,
             children,
         ),
-        plan::plan_node::Kind::Sort(sort) => sort::lower_sort_node(
+        plan::plan_node::Kind::Sort(sort) => lower_sort_node(
             node,
             physical,
             sort,
@@ -1594,12 +1360,11 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Topn(topn) => {
-            topn::lower_topn_node(node, topn, path.clone().field("topn"), children, arena, ctx)
+            lower_topn_node(node, topn, path.clone().field("topn"), children, arena)
         }
-        plan::plan_node::Kind::SetOp(set_op) => set_op::lower_set_op_node(
+        plan::plan_node::Kind::SetOp(set_op) => lower_set_op_node(
             node,
             physical,
             set_op,
@@ -1607,14 +1372,10 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
-        plan::plan_node::Kind::AssertOneRow(assert) => assert::lower_assert_one_row_node(
-            node,
-            assert,
-            path.clone().field("assert_one_row"),
-            children,
-        ),
+        plan::plan_node::Kind::AssertOneRow(assert) => {
+            lower_assert_one_row_node(node, assert, path.clone().field("assert_one_row"), children)
+        }
         plan::plan_node::Kind::Scan(scan) => super::scan::lower_scan_node(
             node,
             physical,
@@ -1642,9 +1403,8 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
-        plan::plan_node::Kind::NestLoopJoin(join) => nestloop_join::lower_nest_loop_join_node(
+        plan::plan_node::Kind::NestLoopJoin(join) => lower_nest_loop_join_node(
             node,
             physical,
             join,
@@ -1653,7 +1413,6 @@ fn lower_physical_node(
             physical_output_path.clone(),
             children,
             arena,
-            ctx,
         ),
         plan::plan_node::Kind::Window(window) => window::lower_window_node(
             node,
@@ -1666,44 +1425,35 @@ fn lower_physical_node(
             ctx,
         ),
         plan::plan_node::Kind::Repeat(repeat) => {
-            repeat::lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
+            lower_repeat_node(node, repeat, path.clone().field("repeat"), children)
         }
-        plan::plan_node::Kind::GenerateSeries(generate_series) => {
-            generate_series::lower_generate_series_node(
-                node,
-                generate_series,
-                path.clone().field("generate_series"),
-                children,
-                arena,
-                ctx,
-            )
-        }
-        plan::plan_node::Kind::TableFunction(table_function) => {
-            table_function::lower_table_function_node(
-                node,
-                table_function,
-                path.clone().field("table_function"),
-                children,
-                arena,
-                ctx,
-            )
-        }
+        plan::plan_node::Kind::GenerateSeries(generate_series) => lower_generate_series_node(
+            node,
+            generate_series,
+            path.clone().field("generate_series"),
+            children,
+            arena,
+        ),
+        plan::plan_node::Kind::TableFunction(table_function) => lower_table_function_node(
+            node,
+            table_function,
+            path.clone().field("table_function"),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::Decode(_) => Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("decode"),
             "native physical node kind Decode is unsupported",
         )),
-        plan::plan_node::Kind::ChangeEventExpand(expand) => {
-            change_event_expand::lower_change_event_expand_node(
-                node,
-                physical,
-                expand,
-                path.clone().field("change_event_expand"),
-                physical_output_path.clone(),
-                children,
-                arena,
-                ctx,
-            )
-        }
+        plan::plan_node::Kind::ChangeEventExpand(expand) => lower_change_event_expand_node(
+            node,
+            physical,
+            expand,
+            path.clone().field("change_event_expand"),
+            physical_output_path.clone(),
+            children,
+            arena,
+        ),
         plan::plan_node::Kind::CteAnchor(_) => Err(NativeFragmentDecodeError::unsupported(
             path.clone().field("cte_anchor"),
             "native physical node kind CTEAnchor is unsupported",
@@ -1716,14 +1466,13 @@ fn lower_physical_node(
             path.clone().field("cte_consume"),
             "native physical node kind CTEConsume is unsupported",
         )),
-        plan::plan_node::Kind::Redistribute(redistribute) => redistribute::lower_redistribute_node(
+        plan::plan_node::Kind::Redistribute(redistribute) => lower_redistribute_node(
             physical,
             redistribute,
             path.clone().field("redistribute"),
             physical_output_path,
             children,
             arena,
-            ctx,
         ),
     }
 }
@@ -1735,12 +1484,12 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::*;
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::assert::{AssertNumRowsMode, Assertion};
     use novarocks_execution::exec::node::set_op::SetOpKind;
     use novarocks_execution::runtime_filter as execution;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
@@ -2026,24 +1775,6 @@ mod tests {
         )
     }
 
-    pub(super) fn two_col_values_node(node_id: i32) -> plan::DistributedNode {
-        let columns = vec![
-            output_column(1, "a", DataType::Int64),
-            output_column(2, "b", DataType::Int64),
-        ];
-        physical_node(
-            node_id,
-            plan::plan_node::Kind::Values(plan::ValuesNode {
-                rows: vec![plan::ExprList {
-                    values: vec![int_literal(10), int_literal(20)],
-                }],
-                columns: columns.clone(),
-            }),
-            columns,
-            Vec::new(),
-        )
-    }
-
     pub(super) fn three_col_values_node(node_id: i32) -> plan::DistributedNode {
         let columns = vec![
             output_column(1, "a", DataType::Int64),
@@ -2077,9 +1808,7 @@ mod tests {
         dead_code,
         reason = "Retained for target-specific native integration and regression coverage."
     )]
-    fn decode_error(
-        node: &plan::DistributedNode,
-    ) -> crate::fragment::decode::plan::error::NativeFragmentDecodeError {
+    fn decode_error(node: &plan::DistributedNode) -> NativeFragmentDecodeError {
         decode_node(
             node,
             &mut ExprArena::default(),

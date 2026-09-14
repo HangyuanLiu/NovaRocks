@@ -29,6 +29,7 @@ pub mod native_trust;
 pub mod network;
 mod paimon_access;
 pub mod provider_manifest;
+pub mod roles;
 pub mod state_store_config;
 mod state_store_limits;
 pub mod supervisor;

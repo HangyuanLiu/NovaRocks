@@ -27,12 +27,13 @@ use crate::query_execution::dml::mutation::{
 use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
-use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::error::DmlError;
 use crate::dml::runner::{
     CoordinatedWriteReport, StatementWriteTransactionRunner, WriteExecutor, WriteTarget,
     WriteTransactionSpec,
 };
 use crate::dml::service::DmlService;
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_spi::connector::{LakePublicationFamily, LakePublicationId};
 
 struct MutationWriteExecutor<'a> {
@@ -211,7 +212,7 @@ fn admit_mutation(
                 )
             {
                 return Err(DmlError::admit(
-                    AdmitError::UpdateUnsupportedForm.to_user_error(
+                    DmlAdmissionError::UpdateUnsupportedForm.to_user_error(
                         source,
                         statement.span,
                         "UPDATE form is not supported by the current frontend capability",
@@ -232,7 +233,7 @@ fn admit_mutation(
                 )
             {
                 return Err(DmlError::admit(
-                    AdmitError::MergeUnsupportedForm.to_user_error(
+                    DmlAdmissionError::MergeUnsupportedForm.to_user_error(
                         source,
                         statement.span,
                         "MERGE form is not supported by the current frontend capability",
@@ -253,7 +254,7 @@ fn admit_mutation(
                         );
                         if matched || qualified_assignment {
                             return Err(DmlError::admit(
-                                AdmitError::MergeUnsupportedForm.to_user_error(
+                                DmlAdmissionError::MergeUnsupportedForm.to_user_error(
                                     source,
                                     *span,
                                     "MERGE WHEN MATCHED form is not supported",
@@ -268,7 +269,7 @@ fn admit_mutation(
                                 && action.columns.len() != action.values.len())
                         {
                             return Err(DmlError::admit(
-                                AdmitError::MergeUnsupportedForm.to_user_error(
+                                DmlAdmissionError::MergeUnsupportedForm.to_user_error(
                                     source,
                                     *span,
                                     "MERGE WHEN NOT MATCHED form is not supported",
@@ -279,7 +280,7 @@ fn admit_mutation(
                     }
                     MergeClause::NotMatchedBySource { span, .. } => {
                         return Err(DmlError::admit(
-                            AdmitError::MergeUnsupportedForm.to_user_error(
+                            DmlAdmissionError::MergeUnsupportedForm.to_user_error(
                                 source,
                                 *span,
                                 "MERGE WHEN NOT MATCHED BY SOURCE is not supported",
@@ -290,7 +291,7 @@ fn admit_mutation(
             }
             if !matched && !not_matched {
                 return Err(DmlError::admit(
-                    AdmitError::MergeUnsupportedForm.to_user_error(
+                    DmlAdmissionError::MergeUnsupportedForm.to_user_error(
                         source,
                         statement.span,
                         "MERGE requires at least one WHEN clause",
@@ -300,7 +301,7 @@ fn admit_mutation(
             Ok((MutationStatementKind::Merge, "MERGE"))
         }
         other => Err(DmlError::admit(
-            AdmitError::UpdateUnsupportedForm.to_user_error(
+            DmlAdmissionError::UpdateUnsupportedForm.to_user_error(
                 source,
                 other.span(),
                 "typed mutation entry requires UPDATE or MERGE",

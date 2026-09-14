@@ -23,70 +23,72 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::{MaxWait, ResultByteLimit};
+use novarocks_native_adapter::{
+    FrontendTaskTransportBudget, connector_blocking_io::ConnectorBlockingIoBudget,
+};
 use novarocks_query_application::api::{QueryExecutionClient, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
     LogicalExecutionSupervisorConfig, LogicalExecutionSupervisorShutdownError,
     RootResultDecodeRuntime, RootResultDecodeRuntimeOwner,
 };
-use novarocks_task_codec::TransportBudget;
+use novarocks_query_application::cpu::{
+    QueryBlockingExecutor, QueryBlockingExecutorConfig, QueryBlockingExecutorOwner,
+    QueryCpuExecutor, QueryCpuExecutorConfig, QueryCpuExecutorOwner,
+};
 use novarocks_workload_control::{
-    LocalResourceAuthority, ResourceConfig, RootAdmissionHandle, WorkloadConfig, WorkloadControl,
-    WorkloadObservationHandle, WorkloadShutdownError,
+    CancellationReason, LocalResourceAuthority, ResourceConfig, RootAdmissionHandle,
+    WorkloadConfig, WorkloadControl, WorkloadObservationHandle, WorkloadShutdownError,
 };
 
-use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
-use crate::state_store::{StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry};
-use crate::task_execution::ConnectorBlockingIoBudget;
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use novarocks_catalog_application::CatalogAttachmentRepository;
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_trust::NativeTrust;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_state_store_api::{StateStore, StateStoreProviderId};
+use novarocks_state_store_runtime::{
+    StateStoreHost, StateStoreHostInput, StateStoreProviderRegistry, StateStoreRunPolicy,
+    validate_persistent_state_families,
+};
 use novarocks_types::{FrontendProcessId, NativeCompatibilityId, QueryProcessNamespace};
 
-use crate::catalog_application::desired_state::{
-    CatalogDesiredStateSource, CatalogDesiredStateSourceMode,
-};
-use crate::catalog_application::{
-    CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, FrontendCatalogApplicationPort,
-    frontend_port::CatalogMaterializationConfig,
-};
-use crate::catalog_attachment::CatalogAttachmentRepository;
+use crate::catalog_application::MvCatalogReferenceReader;
 use crate::catalog_controller::{CatalogProjectionConfig, FrontendCatalogController};
 use crate::catalog_prune::{CatalogPruneConfig, FrontendCatalogPruneService};
-use crate::common::admitted_query_context::LakePublicationRuntimePolicy;
-use crate::connector::ConnectorControlHost;
-use crate::coordinator::{FrontendDistributedQueryCoordinator, QueryLifecycleConvergenceReader};
-use crate::dml::DmlService;
-use crate::mv::maintenance::MaintenanceCoordinatorConfig;
-use crate::mv::scheduler::FrontendMvSchedulerConfig;
-use crate::mv::{
-    FrontendMvRefreshProviderActivationPort, FrontendMvService, repository::StateStoreMvRepository,
-};
+use crate::coordinator::FrontendDistributedQueryCoordinator;
+use crate::mv::repository::StateStoreMvRepository;
 use crate::native::data_runtime::FrontendDataRuntime;
-use crate::native::transport::FrontendNativeTransport;
-use crate::query_control::FrontendQueryControl;
+use crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics;
+use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::query_execution::logical_read::LogicalReadLauncher;
-use crate::query_execution::maintenance::TableMaintenanceService;
 use crate::query_execution::native_execution_adapter::{
     FrontendLogicalExecutionNativePort, FrontendNativeLogicalExecutionRuntime,
     FrontendNativeLogicalReadLauncher,
 };
-use crate::statistics::FrontendStatisticsService;
-use crate::statistics_jobs::service::{
-    FrontendStatisticsApplicationPort, StatisticsApplicationService,
-};
-use crate::table_maintenance::FrontendTableMaintenanceService;
 use crate::topology::{ClusterBackendOpenConfig, ClusterBackendService};
-use crate::view::FrontendViewService;
 use crate::workload_lifecycle::{
     FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,
-    FrontendServingLifecycle,
+    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingWorkloadSnapshotReader,
 };
+use novarocks_catalog_application::ConnectorControlHost;
+use novarocks_catalog_application::{
+    CatalogApplicationService, CatalogDesiredStateSnapshot, CatalogDesiredStateSource,
+    CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode, CatalogMaterializationConfig,
+};
+use novarocks_native_adapter::FrontendNativeTransport;
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 
 const STATE_STORE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 const STATE_STORE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_RESULT_DECODE_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
 const DEFAULT_RESULT_DECODE_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+const DEFAULT_QUERY_CPU_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+const DEFAULT_QUERY_CPU_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
+const DEFAULT_QUERY_BLOCKING_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(2).unwrap();
+const DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_RESULT_DELIVERY_CAPACITY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 const DEFAULT_LOGICAL_EXECUTION_MAX_ATTEMPTS: NonZeroU32 = NonZeroU32::new(3).unwrap();
 const DEFAULT_REPLACEMENT_RESERVATION_VALID_FOR: Duration = Duration::from_secs(30);
@@ -99,97 +101,6 @@ const DEFAULT_LOGICAL_ABORT_EFFECT_CAPACITY: NonZeroUsize = NonZeroUsize::new(16
 const TEST_WORKLOAD_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const TEST_WORKLOAD_CONTROL_BYTES: u64 = 64 * 1024 * 1024;
 const TEST_WORKLOAD_PER_SCOPE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-/// Frontend-owned startup configuration for the Native Task transport.
-///
-/// Server composition supplies primitive deployment limits through this
-/// application boundary. The Frontend alone materializes the private wire
-/// codec budget consumed by its Native adapter.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct FrontendTaskTransportBudget(TransportBudget);
-
-impl FrontendTaskTransportBudget {
-    pub const DEFAULT: Self = Self(TransportBudget::DEFAULT);
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each deployment limit is independently configurable"
-    )]
-    pub fn try_new(
-        max_batch_items: usize,
-        max_batch_encoded_bytes: usize,
-        max_descriptor_encoded_bytes: usize,
-        max_query_backend_queued_operations: usize,
-        max_query_backend_queued_bytes: usize,
-        max_backend_queued_operations: usize,
-        max_backend_queued_bytes: usize,
-        max_tasks_per_context: usize,
-        max_active_tasks_per_backend: usize,
-        frontend_queue_residence: Duration,
-    ) -> Option<Self> {
-        TransportBudget::new(
-            max_batch_items,
-            max_batch_encoded_bytes,
-            max_descriptor_encoded_bytes,
-            max_query_backend_queued_operations,
-            max_query_backend_queued_bytes,
-            max_backend_queued_operations,
-            max_backend_queued_bytes,
-            max_tasks_per_context,
-            max_active_tasks_per_backend,
-            frontend_queue_residence,
-        )
-        .map(Self)
-    }
-
-    pub const fn max_batch_items(self) -> usize {
-        self.0.max_batch_items()
-    }
-
-    pub const fn max_batch_encoded_bytes(self) -> usize {
-        self.0.max_batch_encoded_bytes()
-    }
-
-    pub const fn max_descriptor_encoded_bytes(self) -> usize {
-        self.0.max_descriptor_encoded_bytes()
-    }
-
-    pub const fn max_query_backend_queued_operations(self) -> usize {
-        self.0.max_query_backend_queued_operations()
-    }
-
-    pub const fn max_query_backend_queued_bytes(self) -> usize {
-        self.0.max_query_backend_queued_bytes()
-    }
-
-    pub const fn max_backend_queued_operations(self) -> usize {
-        self.0.max_backend_queued_operations()
-    }
-
-    pub const fn max_backend_queued_bytes(self) -> usize {
-        self.0.max_backend_queued_bytes()
-    }
-
-    pub const fn max_tasks_per_context(self) -> usize {
-        self.0.max_tasks_per_context()
-    }
-
-    pub const fn max_active_tasks_per_backend(self) -> usize {
-        self.0.max_active_tasks_per_backend()
-    }
-
-    pub const fn frontend_queue_residence(self) -> Duration {
-        self.0.frontend_queue_residence()
-    }
-
-    const fn into_codec(self) -> TransportBudget {
-        self.0
-    }
-}
-
-/// Largest root-result payload accepted by the Frontend Native adapter.
-pub const FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES: u64 =
-    novarocks_task_codec::operation::MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES;
 
 #[cfg(test)]
 fn test_native_trust() -> Arc<NativeTrust> {
@@ -211,6 +122,7 @@ fn test_native_trust() -> Arc<NativeTrust> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FrontendApplicationErrorKind {
     DeploymentSource,
+    StateFamilyRegistration,
     StateStoreHost,
     ViewServiceOpen,
     TableMaintenanceServiceOpen,
@@ -221,6 +133,8 @@ pub enum FrontendApplicationErrorKind {
     ConnectorControlHost,
     ClusterBackendOpen,
     CoordinatorOpen,
+    QueryCpuExecutorOpen,
+    QueryBlockingExecutorOpen,
     ResultDecodeRuntimeOpen,
     WorkloadControlOpen,
     Server,
@@ -241,11 +155,13 @@ impl FrontendApplicationError {
         }
     }
 
-    pub(crate) fn server(error: impl fmt::Display) -> Self {
+    /// Constructs a role-composition failure for the outer Server owner.
+    pub fn server(error: impl fmt::Display) -> Self {
         Self::new(FrontendApplicationErrorKind::Server, error)
     }
 
-    pub(crate) fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
+    /// Retains the first role failure while recording bounded cleanup failure.
+    pub fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup_error}"));
         self
@@ -273,14 +189,37 @@ impl std::error::Error for FrontendApplicationError {}
 struct FrontendExecutionRuntimeOwner {
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
+    lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     workload: Option<WorkloadControl>,
     root_admission: RootAdmissionHandle,
     workload_observation: WorkloadObservationHandle,
     resources: LocalResourceAuthority,
+    query_cpu: QueryCpuExecutorOwner,
+    query_cpu_executor: QueryCpuExecutor,
+    query_blocking: QueryBlockingExecutorOwner,
+    query_blocking_executor: QueryBlockingExecutor,
     decode: RootResultDecodeRuntimeOwner,
     decode_runtime: RootResultDecodeRuntime,
     terminal_error: Option<String>,
     shutdown_complete: bool,
+}
+
+/// Frozen native-read policy consumed while Server composes one Frontend role
+/// graph.
+///
+/// This belongs with the process execution runtime that supplies the client,
+/// decode owner and lifecycle diagnostics. The resulting launcher is held by
+/// the immutable role-product graph, never by the lifecycle Host.
+#[derive(Clone, Copy)]
+struct FrontendQueryRuntimeConfig {
+    native_compatibility_id: NativeCompatibilityId,
+    runtime_filter_worker_count: NonZeroUsize,
+    task_update_retry_policy: TaskUpdateRetryPolicy,
+    split_initial_wait_cap: Duration,
+    coordination_budgets: CoordinationBudgets,
+    transport_budget: FrontendTaskTransportBudget,
+    result_fetch_byte_limit: ResultByteLimit,
+    abort_capacity: NonZeroUsize,
 }
 
 impl FrontendExecutionRuntimeOwner {
@@ -289,6 +228,8 @@ impl FrontendExecutionRuntimeOwner {
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
         resource_config: ResourceConfig,
+        query_cpu_config: QueryCpuExecutorConfig,
+        query_blocking_config: QueryBlockingExecutorConfig,
         decode_worker_count: NonZeroUsize,
         decode_queue_capacity: NonZeroUsize,
     ) -> Result<Self, FrontendApplicationError> {
@@ -299,6 +240,18 @@ impl FrontendExecutionRuntimeOwner {
                     error,
                 )
             })?;
+        let query_cpu = QueryCpuExecutorOwner::try_new(query_cpu_config).map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::QueryCpuExecutorOpen, error)
+        })?;
+        let query_cpu_executor = query_cpu.executor();
+        let query_blocking =
+            QueryBlockingExecutorOwner::try_new(query_blocking_config).map_err(|error| {
+                FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::QueryBlockingExecutorOpen,
+                    error,
+                )
+            })?;
+        let query_blocking_executor = query_blocking.executor();
         let decode =
             RootResultDecodeRuntimeOwner::try_new(decode_worker_count, decode_queue_capacity)
                 .map_err(|error| {
@@ -319,6 +272,12 @@ impl FrontendExecutionRuntimeOwner {
             frontend_process_id = %frontend_process_id,
             "frontend logical execution runtime initialized"
         );
+        if cfg!(debug_assertions)
+            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
+        {
+            eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
+        }
+        let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime,
             Arc::new(FrontendLogicalExecutionNativePort),
@@ -330,10 +289,15 @@ impl FrontendExecutionRuntimeOwner {
         Ok(Self {
             supervisor,
             logical_execution_client,
+            lifecycle_diagnostics,
             workload: Some(workload.owner),
             root_admission: workload.root_admission,
             workload_observation: workload.observation,
             resources: workload.resources,
+            query_cpu,
+            query_cpu_executor,
+            query_blocking,
+            query_blocking_executor,
             decode,
             decode_runtime,
             terminal_error: None,
@@ -352,6 +316,12 @@ impl FrontendExecutionRuntimeOwner {
         if let Some(workload) = self.workload.as_ref() {
             workload.close_admission();
         }
+    }
+
+    fn cancel_active_roots_at_drain_deadline(&self) -> usize {
+        self.workload.as_ref().map_or(0, |workload| {
+            workload.cancel_active_roots(CancellationReason::FrontendDrainDeadlineExceeded)
+        })
     }
 
     async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
@@ -398,6 +368,14 @@ impl FrontendExecutionRuntimeOwner {
             self.shutdown_workload_until(deadline).await?;
         }
 
+        if let Err(error) = self.query_cpu.shutdown_until(deadline).await {
+            return Err(error);
+        }
+
+        if let Err(error) = self.query_blocking.shutdown_until(deadline).await {
+            return Err(error);
+        }
+
         if let Err(error) = self.decode.shutdown_until(deadline).await {
             if error.kind() == QueryExecutionErrorKind::DeadlineExceeded {
                 return Err(error.to_string());
@@ -412,6 +390,8 @@ impl FrontendExecutionRuntimeOwner {
     fn abandon_for_process_exit(&mut self) {
         self.close_admission();
         self.supervisor.abandon_for_process_exit();
+        self.query_cpu.request_shutdown_for_process_exit();
+        self.query_blocking.request_shutdown_for_process_exit();
         self.decode.request_shutdown_for_process_exit();
         self.workload.take();
         self.shutdown_complete = true;
@@ -448,7 +428,31 @@ impl FrontendExecutionRuntimeOwner {
                             "frontend workload admission remained open during shutdown".to_string()
                         );
                     }
+                    // `wait_progress` may resolve immediately when a
+                    // concurrent owner/control transition advanced the
+                    // revision. Check the shared deadline between shutdown
+                    // attempts as well, so a stream of immediate revisions
+                    // cannot bypass the bounded process-exit contract.
+                    if Instant::now() >= deadline {
+                        return Err(
+                            "frontend workload shutdown deadline exceeded before drain".to_string()
+                        );
+                    }
                 }
+            }
+
+            // The logical supervisor has already driven every query owner to
+            // its terminal boundary before workload teardown begins. Consume
+            // the matching role-owned control notifications now: they record
+            // that cancellation was delivered, but cannot manufacture task,
+            // context, or resource-release facts.
+            while let Some(control) = self
+                .workload
+                .as_ref()
+                .expect("failed workload shutdown returns the exact owner")
+                .next_control()
+            {
+                control.acknowledge();
             }
 
             let wait = self
@@ -469,6 +473,10 @@ impl FrontendExecutionRuntimeOwner {
         self.logical_execution_client.clone()
     }
 
+    fn lifecycle_diagnostics(&self) -> Arc<FrontendLifecycleDiagnostics> {
+        Arc::clone(&self.lifecycle_diagnostics)
+    }
+
     fn root_admission(&self) -> RootAdmissionHandle {
         self.root_admission.clone()
     }
@@ -481,6 +489,14 @@ impl FrontendExecutionRuntimeOwner {
         self.resources.clone()
     }
 
+    fn query_cpu_executor(&self) -> QueryCpuExecutor {
+        self.query_cpu_executor.clone()
+    }
+
+    fn query_blocking_executor(&self) -> QueryBlockingExecutor {
+        self.query_blocking_executor.clone()
+    }
+
     fn decode_runtime(&self) -> RootResultDecodeRuntime {
         self.decode_runtime.clone()
     }
@@ -490,38 +506,121 @@ impl FrontendExecutionRuntimeOwner {
     }
 }
 
-pub struct FrontendApplicationHost {
+/// The catalog-specific mutable role state that is transferred to the
+/// completed Frontend role graph before SQL admission opens.
+///
+/// Bootstrap installs this owner while the Host still owns reverse cleanup.
+/// Once Server has assembled every other role product, the owner moves as one
+/// value into that graph.  The query catalog projection deliberately remains
+/// outside: it is query-side state bound through the publisher port below.
+pub(crate) struct FrontendCatalogRoleRuntime {
     connector_control: Arc<ConnectorControlHost>,
+    application: Arc<CatalogApplicationService>,
+    controller: Option<Arc<FrontendCatalogController>>,
+    prune: Option<Arc<FrontendCatalogPruneService>>,
+}
+
+impl FrontendCatalogRoleRuntime {
+    fn new(
+        connector_control: Arc<ConnectorControlHost>,
+        application: Arc<CatalogApplicationService>,
+    ) -> Self {
+        Self {
+            connector_control,
+            application,
+            controller: None,
+            prune: None,
+        }
+    }
+
+    pub(crate) fn catalog_application_port(
+        &self,
+    ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
+        Arc::clone(&self.application)
+            as Arc<dyn novarocks_catalog_application::CatalogApplicationPort>
+    }
+
+    pub(crate) fn connector_control_registry(
+        &self,
+    ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
+        Arc::clone(&self.connector_control)
+            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+    }
+
+    pub(crate) fn typed_connector_control(&self) -> Arc<ConnectorControlHost> {
+        Arc::clone(&self.connector_control)
+    }
+
+    pub(crate) async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
+        let had_catalog_controller = self.controller.is_some();
+        let catalog_controller_error = match self.controller.as_ref() {
+            Some(controller) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    Some(
+                        "frontend cleanup deadline elapsed before catalog controller shutdown"
+                            .to_string(),
+                    )
+                } else {
+                    tokio::time::timeout(remaining, controller.shutdown())
+                        .await
+                        .map_err(|_| {
+                            "frontend cleanup deadline elapsed shutting down catalog controller"
+                                .to_string()
+                        })
+                        .and_then(|result| result)
+                        .err()
+                }
+            }
+            None => None,
+        };
+        if had_catalog_controller && catalog_controller_error.is_none() {
+            self.controller.take();
+        }
+        // The controller owns the durable desired-state projection. The prune
+        // worker is best effort and may be asleep between rounds, so it must
+        // not consume the whole shared cleanup deadline before the controller
+        // gets a chance to stop and unpublish that projection.
+        if let Some(prune) = self.prune.take() {
+            prune
+                .shutdown(deadline.saturating_duration_since(Instant::now()))
+                .await;
+        }
+        if let Some(error) = catalog_controller_error {
+            Err(format!("shutdown catalog controller failed: {error}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn request_stop_for_process_exit(&self) {
+        if let Some(controller) = self.controller.as_ref() {
+            controller.request_stop_for_process_exit();
+        }
+        if let Some(prune) = self.prune.as_ref() {
+            prune.request_stop_for_process_exit();
+        }
+    }
+}
+
+pub struct FrontendApplicationHost {
+    catalog_role_runtime: Option<FrontendCatalogRoleRuntime>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
-    statistics_service: Option<Arc<FrontendStatisticsService>>,
-    dml_service: Option<Arc<DmlService>>,
-    statistics_application_service: Option<Arc<StatisticsApplicationService>>,
-    statistics_application_port: Option<Arc<FrontendStatisticsApplicationPort>>,
-    catalog_application_port: Option<Arc<FrontendCatalogApplicationPort>>,
     /// Meets the attempt contract's host obligation to return abandoned
     /// attempts; see `state_store::sweeper`.
     abandoned_attempt_sweeper: Option<Arc<crate::state_store::AbandonedAttemptSweeper>>,
-    catalog_controller: Option<Arc<FrontendCatalogController>>,
-    catalog_prune: Option<Arc<FrontendCatalogPruneService>>,
-    view_service: Option<Arc<dyn crate::view::ViewService>>,
-    table_maintenance_service: Option<Arc<dyn TableMaintenanceService>>,
     mv_repository: Option<Arc<dyn crate::mv::domain::repository::MvRepository>>,
-    mv_application_service: Option<Arc<dyn crate::mv::domain::application::MvApplicationService>>,
-    mv_service: Option<Arc<FrontendMvService>>,
-    mv_refresh_provider_activation: Option<Arc<FrontendMvRefreshProviderActivationPort>>,
-    mv_background_engine_sink: Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>>,
     state_store_host: Option<StateStoreHost>,
-    query_execution: Option<QueryExecutionService>,
-    logical_read_launcher: Option<Arc<FrontendNativeLogicalReadLauncher>>,
-    query_control: crate::query_execution::control::QueryControlService,
-    coordinator: Option<Arc<FrontendDistributedQueryCoordinator>>,
+    query_runtime: FrontendQueryRuntimeConfig,
     execution_runtime_owner: FrontendExecutionRuntimeOwner,
     execution_role: novarocks_types::ClusterRole,
     data_runtime: FrontendDataRuntime,
     topology: Option<Arc<ClusterBackendService>>,
     optimizer_query_mem_limit_bytes: u64,
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
+    mv_scheduler_config: MvSchedulerConfig,
+    mv_maintenance_config: MaintenanceCoordinatorConfig,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
 
@@ -613,7 +712,7 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    mv_scheduler: FrontendMvSchedulerConfig,
+    mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
     ///
@@ -635,6 +734,10 @@ pub struct FrontendExecutionConfig {
     connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
+    /// Fixed process-wide CPU preparation workers and bounded waiting queue.
+    query_cpu_executor_config: QueryCpuExecutorConfig,
+    /// Fixed process-wide workers for legacy synchronous query command edges.
+    query_blocking_executor_config: QueryBlockingExecutorConfig,
     /// Fixed process-wide worker and waiting bounds for synchronous result decode.
     result_decode_worker_count: NonZeroUsize,
     result_decode_queue_capacity: NonZeroUsize,
@@ -673,7 +776,7 @@ impl FrontendExecutionConfig {
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
-            mv_scheduler: FrontendMvSchedulerConfig::default(),
+            mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
@@ -683,6 +786,14 @@ impl FrontendExecutionConfig {
             connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
+            query_cpu_executor_config: QueryCpuExecutorConfig::new(
+                DEFAULT_QUERY_CPU_WORKER_COUNT,
+                DEFAULT_QUERY_CPU_QUEUE_CAPACITY,
+            ),
+            query_blocking_executor_config: QueryBlockingExecutorConfig::new(
+                DEFAULT_QUERY_BLOCKING_WORKER_COUNT,
+                DEFAULT_QUERY_BLOCKING_QUEUE_CAPACITY,
+            ),
             result_decode_worker_count: logical_runtime.decode_worker_count,
             result_decode_queue_capacity: logical_runtime.decode_queue_capacity,
             logical_execution_supervisor: logical_runtime.supervisor,
@@ -735,10 +846,6 @@ impl FrontendExecutionConfig {
         )
     }
 
-    pub(crate) const fn native_compatibility_id(&self) -> NativeCompatibilityId {
-        self.native_compatibility_id
-    }
-
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
     }
@@ -773,6 +880,23 @@ impl FrontendExecutionConfig {
         self
     }
 
+    /// Server composition freezes query preparation CPU capacity before the
+    /// Frontend opens any process runtime.
+    pub fn with_query_cpu_executor_config(mut self, config: QueryCpuExecutorConfig) -> Self {
+        self.query_cpu_executor_config = config;
+        self
+    }
+
+    /// Server composition freezes the bounded legacy command-worker capacity
+    /// before opening any Frontend runtime.
+    pub fn with_query_blocking_executor_config(
+        mut self,
+        config: QueryBlockingExecutorConfig,
+    ) -> Self {
+        self.query_blocking_executor_config = config;
+        self
+    }
+
     pub fn with_connector_split_initial_dynamic_filter_wait_cap(mut self, cap: Duration) -> Self {
         self.connector_split_initial_dynamic_filter_wait_cap = cap;
         self
@@ -799,7 +923,7 @@ impl FrontendExecutionConfig {
         self.optimizer_query_mem_limit_bytes
     }
 
-    pub fn with_mv_scheduler_config(mut self, config: FrontendMvSchedulerConfig) -> Self {
+    pub fn with_mv_scheduler_config(mut self, config: MvSchedulerConfig) -> Self {
         self.mv_scheduler = config;
         self
     }
@@ -829,9 +953,17 @@ impl FrontendExecutionConfig {
         self
     }
 
-    pub fn with_catalog_prune_config(mut self, config: CatalogPruneConfig) -> Self {
-        self.catalog_prune = config;
-        self
+    /// Validates the Server-resolved catalog-prune policy before the FE role
+    /// opens its role-local worker. The concrete policy type stays internal to
+    /// the Frontend owner; Server supplies only configuration values.
+    pub fn try_with_catalog_prune_config(
+        mut self,
+        interval: Duration,
+        rpc_timeout: Duration,
+        max_inflight: usize,
+    ) -> Result<Self, String> {
+        self.catalog_prune = CatalogPruneConfig::try_new(interval, rpc_timeout, max_inflight)?;
+        Ok(self)
     }
 
     /// Supplies the already preflighted, closed desired-state source input.
@@ -915,6 +1047,19 @@ impl FrontendApplicationHost {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, FrontendApplicationError> {
+        let mut durable_families =
+            vec![novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY];
+        durable_families.push(novarocks_catalog_application::CATALOG_DESIRED_STATE_FAMILY);
+        durable_families.push(
+            novarocks_table_maintenance::gc_observation::GC_OWNED_REF_OBSERVATION_STATE_FAMILY,
+        );
+        validate_persistent_state_families(&durable_families).map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::StateFamilyRegistration,
+                error,
+            )
+        })?;
+
         // The selected catalog desired-state source mode is decided here, ahead
         // of every startup side effect: nothing is open yet, no StateStore host
         // exists, no controller is running, so a mode this build implements no
@@ -946,41 +1091,38 @@ impl FrontendApplicationHost {
             execution.logical_execution_supervisor,
             execution.workload.clone(),
             execution.workload_resources.clone(),
+            execution.query_cpu_executor_config,
+            execution.query_blocking_executor_config,
             execution.result_decode_worker_count,
             execution.result_decode_queue_capacity,
         )?;
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
-            connector_control,
+            catalog_role_runtime: None,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
-            statistics_service: None,
-            dml_service: None,
-            statistics_application_service: None,
-            statistics_application_port: None,
-            catalog_application_port: None,
             abandoned_attempt_sweeper: None,
-            catalog_controller: None,
-            catalog_prune: None,
-            view_service: None,
-            table_maintenance_service: None,
             mv_repository: None,
-            mv_application_service: None,
-            mv_service: None,
-            mv_refresh_provider_activation: None,
-            mv_background_engine_sink: None,
             state_store_host: None,
-            query_execution: None,
-            logical_read_launcher: None,
-            query_control: FrontendQueryControl::service(),
-            coordinator: None,
+            query_runtime: FrontendQueryRuntimeConfig {
+                native_compatibility_id: execution.native_compatibility_id,
+                runtime_filter_worker_count: execution.runtime_filter_worker_count,
+                task_update_retry_policy: execution.task_update_retry_policy,
+                split_initial_wait_cap: execution.connector_split_initial_dynamic_filter_wait_cap,
+                coordination_budgets: execution.coordination_budgets,
+                transport_budget: execution.transport_budget,
+                result_fetch_byte_limit: execution.result_fetch_byte_limit,
+                abort_capacity: execution.logical_abort_effect_capacity,
+            },
             execution_runtime_owner,
             execution_role: backend.role(),
             data_runtime: data_runtime.clone(),
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
+            mv_scheduler_config: execution.mv_scheduler.clone(),
+            mv_maintenance_config: execution.mv_maintenance.clone(),
             function_catalog: execution.function_catalog(),
         };
 
@@ -1030,14 +1172,18 @@ impl FrontendApplicationHost {
                         .await);
                 }
             };
-        host.catalog_application_port = Some(Arc::new(
-            FrontendCatalogApplicationPort::new_with_materialization_config(
+        let catalog_application =
+            Arc::new(CatalogApplicationService::new_with_materialization_config(
                 catalog_source,
-                Arc::clone(&host.connector_control),
+                Arc::clone(&connector_control),
                 host.catalog_runtime_projection.publisher(),
                 tokio::runtime::Handle::current(),
                 execution.catalog_materialization,
-            ),
+                Arc::new(MvCatalogReferenceReader),
+            ));
+        host.catalog_role_runtime = Some(FrontendCatalogRoleRuntime::new(
+            connector_control,
+            catalog_application,
         ));
         if catalog_source_mode == CatalogDesiredStateSourceMode::DynamicStateStore {
             let store = host
@@ -1045,11 +1191,7 @@ impl FrontendApplicationHost {
                 .expect("dynamic catalog source required a StateStore above");
             let controller = match FrontendCatalogController::new(
                 store,
-                Arc::clone(
-                    host.catalog_application_port
-                        .as_ref()
-                        .expect("catalog application port is installed"),
-                ),
+                Arc::clone(&host.catalog_role_runtime().application),
                 execution.catalog_projection.clone(),
             ) {
                 Ok(controller) => controller,
@@ -1070,11 +1212,7 @@ impl FrontendApplicationHost {
                     ))
                     .await);
             }
-            let counts = host
-                .catalog_application_port
-                .as_ref()
-                .expect("catalog application port is installed")
-                .projection_counts();
+            let counts = host.catalog_role_runtime().application.projection_counts();
             host.serving_lifecycle.publish_catalog_bootstrap(
                 FrontendCatalogSourceMode::DynamicStateStore,
                 true,
@@ -1093,13 +1231,9 @@ impl FrontendApplicationHost {
                     ))
                     .await);
             }
-            host.catalog_controller = Some(controller);
+            host.catalog_role_runtime_mut().controller = Some(controller);
         } else if catalog_source_mode == CatalogDesiredStateSourceMode::StaticFile {
-            let projection = Arc::clone(
-                host.catalog_application_port
-                    .as_ref()
-                    .expect("catalog application port is installed"),
-            );
+            let projection = Arc::clone(&host.catalog_role_runtime().application);
             match projection
                 .reconcile_snapshot_with_page_size(
                     execution.catalog_projection.page_size,
@@ -1148,30 +1282,8 @@ impl FrontendApplicationHost {
                     .await);
             }
         }
-        let topology = Arc::clone(host.topology());
-        let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
-            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
-            topology as crate::common::backend_topology::BackendProcessObservationService,
-            host.data_runtime.clone(),
-            host.result_decode_runtime(),
-            execution.native_compatibility_id,
-            execution.runtime_filter_worker_count,
-            execution.task_update_retry_policy,
-            execution.connector_split_initial_dynamic_filter_wait_cap,
-            execution.coordination_budgets,
-            execution.transport_budget.into_codec(),
-            execution.logical_abort_effect_capacity,
-        );
-        host.logical_read_launcher = Some(Arc::new(FrontendNativeLogicalReadLauncher::new(
-            host.logical_execution_client(),
-            native_runtime,
-        )));
         let catalog_prune = FrontendCatalogPruneService::new(
-            Arc::clone(
-                host.catalog_application_port
-                    .as_ref()
-                    .expect("catalog application is installed"),
-            ),
+            Arc::clone(&host.catalog_role_runtime().application),
             host.backend_topology_port(),
             host.data_runtime.clone(),
             execution.catalog_prune.clone(),
@@ -1184,7 +1296,7 @@ impl FrontendApplicationHost {
                 ))
                 .await);
         }
-        host.catalog_prune = Some(catalog_prune);
+        host.catalog_role_runtime_mut().prune = Some(catalog_prune);
 
         // Abandoned write attempts hold a capacity slot and a row of provider
         // evidence until someone hands them back. The attempt contract makes
@@ -1203,75 +1315,16 @@ impl FrontendApplicationHost {
             }
             host.abandoned_attempt_sweeper = Some(sweeper);
         }
-        host.statistics_service = Some(Arc::new(FrontendStatisticsService::new()));
-        let statistics = host.statistics_service();
-        host.dml_service = Some(Arc::new(DmlService::new(statistics)));
-        // Local views are process runtime state, so this service has nothing to
-        // load and no store to fail against.
-        host.view_service = Some(Arc::new(FrontendViewService::new()));
-        let table_maintenance_open = FrontendTableMaintenanceService::open(
-            host.durable(),
-            tokio::runtime::Handle::current(),
-        )
-        .await
-        .map(|service| {
-            service
-                .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy())
-                .with_workload_lifecycle((*host.serving_lifecycle()).clone())
-        });
-        match table_maintenance_open {
-            Ok(service) => host.table_maintenance_service = Some(Arc::new(service)),
-            Err(error) => {
-                let error = FrontendApplicationError::new(
-                    FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
-                    error,
-                );
-                return Err(host.cleanup_open_error(error).await);
-            }
-        }
-        // The coordinator owns the immutable execution and connector-control
-        // context consumed by frontend application services. Install it before
-        // constructing those services so MV refresh never observes an
+        // Freeze the policy consumed by the role-product coordinator before
+        // constructing any product service, so no path can observe an
         // all-in-one-only direct execution fallback.
         host.optimizer_query_mem_limit_bytes = execution.optimizer_query_mem_limit_bytes();
         host.lake_publication_runtime_policy = execution.lake_publication_runtime_policy();
-        if let Err(error) = host.open_coordinator(execution.clone()) {
-            return Err(host.cleanup_open_error(error).await);
-        }
         match host.state_store() {
             Some(store) => match StateStoreMvRepository::open(store, host.run_policy()).await {
                 Ok(repository) => {
                     let repository: Arc<dyn crate::mv::domain::repository::MvRepository> =
                         repository;
-                    let provider_activation =
-                        Arc::new(FrontendMvRefreshProviderActivationPort::new());
-                    let service = Arc::new(
-                        FrontendMvService::with_refresh_dependencies(
-                            Arc::clone(&repository),
-                            host.query_execution_service(),
-                            Arc::clone(&host.connector_control)
-                                as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
-                            Arc::clone(&provider_activation),
-                            host.execution_role,
-                            host.backend_topology_port(),
-                            execution.mv_scheduler.clone(),
-                            execution.mv_maintenance.clone(),
-                            host.table_maintenance_service(),
-                            host.optimizer_query_mem_limit_bytes,
-                            Duration::from_secs(30 * 60),
-                        )
-                        .with_workload_lifecycle((*host.serving_lifecycle()).clone()),
-                    );
-                    let application_service: Arc<
-                        dyn crate::mv::domain::application::MvApplicationService,
-                    > = Arc::clone(&service)
-                        as Arc<dyn crate::mv::domain::application::MvApplicationService>;
-                    host.mv_background_engine_sink = Some(
-                        FrontendMvService::background_engine_sink(Arc::clone(&service)),
-                    );
-                    host.mv_refresh_provider_activation = Some(provider_activation);
-                    host.mv_application_service = Some(application_service);
-                    host.mv_service = Some(service);
                     host.mv_repository = Some(repository);
                 }
                 Err(error) => {
@@ -1297,69 +1350,40 @@ impl FrontendApplicationHost {
         }) {
             return Err(host.cleanup_open_error(error).await);
         }
-        host.statistics_application_service = Some(Arc::new(StatisticsApplicationService::new()));
-        let statistics_application_port = Ok(FrontendStatisticsApplicationPort::new(
-            host.statistics_application_service().as_ref().clone(),
-            tokio::runtime::Handle::current(),
-        )
-        .with_workload_lifecycle((*host.serving_lifecycle()).clone()));
-        match statistics_application_port {
-            Ok(port) => host.statistics_application_port = Some(Arc::new(port)),
-            Err(error) => return Err(host.cleanup_open_error(error).await),
-        }
-
         Ok(host)
-    }
-
-    pub fn view_service(&self) -> Arc<dyn crate::view::ViewService> {
-        Arc::clone(
-            self.view_service
-                .as_ref()
-                .expect("frontend view service is installed before host open returns"),
-        )
-    }
-
-    pub fn statistics_service(&self) -> Arc<FrontendStatisticsService> {
-        self.statistics_service
-            .as_ref()
-            .expect("frontend statistics service is installed before host open returns")
-            .clone()
-    }
-
-    pub fn dml_service(&self) -> Arc<DmlService> {
-        Arc::clone(
-            self.dml_service
-                .as_ref()
-                .expect("frontend DML service is installed before host open returns"),
-        )
-    }
-
-    pub fn statistics_application_service(&self) -> Arc<StatisticsApplicationService> {
-        Arc::clone(
-            self.statistics_application_service
-                .as_ref()
-                .expect("statistics application service is installed before host open returns"),
-        )
-    }
-
-    pub fn statistics_application_port(&self) -> Arc<FrontendStatisticsApplicationPort> {
-        Arc::clone(
-            self.statistics_application_port
-                .as_ref()
-                .expect("statistics application port is installed before host open returns"),
-        )
     }
 
     pub fn catalog_application_port(
         &self,
-    ) -> Arc<dyn crate::catalog_application::CatalogApplicationPort> {
-        let application = Arc::clone(
-            self.catalog_application_port
-                .as_ref()
-                .expect("catalog application port is installed before host open returns"),
-        ) as Arc<dyn crate::catalog_application::CatalogApplicationPort>;
+    ) -> Arc<dyn novarocks_catalog_application::CatalogApplicationPort> {
+        let application = self.catalog_role_runtime().catalog_application_port();
         self.catalog_runtime_projection
             .bind_application(application)
+    }
+
+    fn catalog_role_runtime(&self) -> &FrontendCatalogRoleRuntime {
+        self.catalog_role_runtime
+            .as_ref()
+            .expect("catalog role runtime is installed before host open returns")
+    }
+
+    fn catalog_role_runtime_mut(&mut self) -> &mut FrontendCatalogRoleRuntime {
+        self.catalog_role_runtime
+            .as_mut()
+            .expect("catalog role runtime is installed before host open returns")
+    }
+
+    /// Transfers the complete catalog lifecycle owner only after Server has
+    /// built every fallible role product. Until this point, Host cleanup keeps
+    /// the same owner for startup rollback.
+    pub(crate) fn take_catalog_role_runtime(
+        &mut self,
+    ) -> Result<FrontendCatalogRoleRuntime, FrontendApplicationError> {
+        self.catalog_role_runtime.take().ok_or_else(|| {
+            FrontendApplicationError::server(
+                "frontend catalog role runtime was already transferred or was never installed",
+            )
+        })
     }
 
     /// The publication set Core binds its query catalog registry to.
@@ -1379,6 +1403,32 @@ impl FrontendApplicationHost {
         Arc::clone(&self.serving_lifecycle)
     }
 
+    /// The sanitized management reader joins lifecycle facts with the sole
+    /// workload authority's read-only observation. It grants neither owner
+    /// the other's mutation authority.
+    pub fn serving_snapshot_reader(&self) -> Arc<dyn FrontendServingSnapshotReader> {
+        Arc::new(FrontendServingWorkloadSnapshotReader::new(
+            Arc::clone(&self.serving_lifecycle),
+            self.workload_observation(),
+        ))
+    }
+
+    /// Begins the one-way serving drain. Close governed-root admission before
+    /// publishing Draining so no new workload root can enter after the role
+    /// has started refusing statements.
+    pub fn begin_serving_drain(&self, timeout: Duration) {
+        self.execution_runtime_owner.close_admission();
+        self.serving_lifecycle.begin_drain(timeout);
+    }
+
+    /// Requests drain-deadline cancellation through the sole governed
+    /// workload authority. The serving lifecycle observes the transition but
+    /// never owns a business root or cancellation bridge.
+    pub fn cancel_governed_work_at_drain_deadline(&self) -> usize {
+        self.execution_runtime_owner
+            .cancel_active_roots_at_drain_deadline()
+    }
+
     /// Opens both the legacy serving gate and the new governed root gate after
     /// Server composition has installed every required service.
     pub(crate) fn mark_ready(&self) -> Result<(), FrontendApplicationError> {
@@ -1396,15 +1446,13 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
-    pub fn table_maintenance_service(&self) -> Arc<dyn TableMaintenanceService> {
-        Arc::clone(
-            self.table_maintenance_service
-                .as_ref()
-                .expect("frontend table-maintenance service is installed before host open returns"),
-        )
-    }
-
-    pub fn mv_repository(&self) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
+    /// Borrows the repository only while Server is constructing the immutable
+    /// role-product graph. The final product owner is transferred separately
+    /// after every fallible constructor has succeeded, so Host still owns
+    /// startup rollback.
+    pub(crate) fn mv_repository_for_role_product_construction(
+        &self,
+    ) -> Arc<dyn crate::mv::domain::repository::MvRepository> {
         Arc::clone(
             self.mv_repository
                 .as_ref()
@@ -1412,37 +1460,27 @@ impl FrontendApplicationHost {
         )
     }
 
-    pub fn mv_application_service(
-        &self,
-    ) -> Arc<dyn crate::mv::domain::application::MvApplicationService> {
-        Arc::clone(
-            self.mv_application_service
-                .as_ref()
-                .expect("frontend MV application service is installed before host open returns"),
-        )
-    }
-
-    pub fn mv_service(&self) -> Arc<FrontendMvService> {
-        Arc::clone(
-            self.mv_service
-                .as_ref()
-                .expect("frontend MV service is installed before host open returns"),
-        )
-    }
-
-    pub fn mv_refresh_provider_activation_sink(
-        &self,
-    ) -> Option<Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>>
+    /// Transfers the durable MV repository to the immutable role graph after
+    /// its complete construction. The repository remains backed by the
+    /// Host-owned StateStore, which is released only after role products have
+    /// converged and been dropped.
+    pub(crate) fn take_mv_repository(
+        &mut self,
+    ) -> Result<Arc<dyn crate::mv::domain::repository::MvRepository>, FrontendApplicationError>
     {
-        self.mv_refresh_provider_activation.as_ref().map(|port| {
-            Arc::clone(port) as Arc<dyn crate::query_execution::mv_native_write::MvRefreshProviderActivationSink>
+        self.mv_repository.take().ok_or_else(|| {
+            FrontendApplicationError::server(
+                "frontend MV repository was already transferred or was never installed",
+            )
         })
     }
 
-    pub(crate) fn mv_background_engine_sink(
-        &self,
-    ) -> Option<Arc<dyn crate::mv::background::MvBackgroundEngineSink>> {
-        self.mv_background_engine_sink.as_ref().map(Arc::clone)
+    pub(crate) fn mv_scheduler_config(&self) -> MvSchedulerConfig {
+        self.mv_scheduler_config.clone()
+    }
+
+    pub(crate) fn mv_maintenance_config(&self) -> MaintenanceCoordinatorConfig {
+        self.mv_maintenance_config.clone()
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {
@@ -1456,7 +1494,7 @@ impl FrontendApplicationHost {
     /// Falls back to the built-in default when no store is configured, so a
     /// consumer built without durable storage still has a coherent policy
     /// rather than an absent one.
-    pub fn run_policy(&self) -> crate::state_store::StateStoreRunPolicy {
+    pub fn run_policy(&self) -> StateStoreRunPolicy {
         self.state_store_host
             .as_ref()
             .map(StateStoreHost::run_policy)
@@ -1467,9 +1505,7 @@ impl FrontendApplicationHost {
     ///
     /// Durable consumers take the pair, so none of them can be constructed
     /// holding storage without an agreed retry budget for it.
-    pub fn durable(
-        &self,
-    ) -> Option<(Arc<dyn StateStore>, crate::state_store::StateStoreRunPolicy)> {
+    pub fn durable(&self) -> Option<(Arc<dyn StateStore>, StateStoreRunPolicy)> {
         self.state_store_host
             .as_ref()
             .and_then(StateStoreHost::durable)
@@ -1495,14 +1531,13 @@ impl FrontendApplicationHost {
     pub fn connector_control_registry(
         &self,
     ) -> Arc<dyn novarocks_spi::connector::ConnectorControlRegistry> {
-        Arc::clone(&self.connector_control)
-            as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>
+        self.catalog_role_runtime().connector_control_registry()
     }
 
     /// Typed-read planning is carried by the same complete control host
     /// generation as generic planning. There is no parallel registry.
     pub fn typed_connector_control(&self) -> Arc<ConnectorControlHost> {
-        Arc::clone(&self.connector_control)
+        self.catalog_role_runtime().typed_connector_control()
     }
 
     pub fn state_store_provider_id(&self) -> Option<StateStoreProviderId> {
@@ -1511,11 +1546,30 @@ impl FrontendApplicationHost {
             .map(StateStoreHost::provider_id)
     }
 
-    pub fn query_execution_service(&self) -> QueryExecutionService {
-        self.query_execution
-            .as_ref()
-            .expect("frontend query execution service is installed before host open returns")
-            .clone()
+    /// Materializes the query-execution service while Server constructs the
+    /// immutable role products. The coordinator has no independent process
+    /// lifecycle: its runtime is the Host-owned execution supervisor and its
+    /// only production consumer is the role graph.
+    pub(crate) fn build_query_execution_service(
+        &self,
+    ) -> Result<QueryExecutionService, FrontendApplicationError> {
+        let config = self.query_runtime;
+        let coordinator = Arc::new(
+            FrontendDistributedQueryCoordinator::new(
+                config.runtime_filter_worker_count,
+                config.native_compatibility_id,
+                config.task_update_retry_policy,
+                config.split_initial_wait_cap,
+                config.coordination_budgets,
+                config.transport_budget.into_codec(),
+                config.result_fetch_byte_limit,
+                self.backend_topology_port(),
+                self.data_runtime.clone(),
+                self.execution_runtime_owner.lifecycle_diagnostics(),
+            )
+            .map_err(FrontendApplicationError::server)?,
+        );
+        Ok(QueryExecutionService::new(coordinator))
     }
 
     /// Cloneable query handle for the one process-owned result decode runtime.
@@ -1527,6 +1581,24 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.decode_runtime()
     }
 
+    /// Cloneable submission handle for the process-owned CPU preparation pool.
+    pub(crate) fn query_cpu_executor(&self) -> QueryCpuExecutor {
+        self.execution_runtime_owner.query_cpu_executor()
+    }
+
+    /// Cloneable submission handle for synchronous command edges whose
+    /// provider contracts are not asynchronous yet.
+    pub(crate) fn query_blocking_executor(&self) -> QueryBlockingExecutor {
+        self.execution_runtime_owner.query_blocking_executor()
+    }
+
+    /// Cloneable handle for the one process-owned Connector blocking-I/O
+    /// supervisor. SQL session initialization uses its ordinary lane only for
+    /// external catalog metadata, never for local catalog lookups.
+    pub(crate) fn connector_blocking_io_supervisor(&self) -> ConnectorBlockingIoSupervisor {
+        self.data_runtime.connector_blocking_io().clone()
+    }
+
     #[allow(
         dead_code,
         reason = "The application host retains this bounded start handle for role integration."
@@ -1535,12 +1607,31 @@ impl FrontendApplicationHost {
         self.execution_runtime_owner.logical_execution_client()
     }
 
-    pub(crate) fn logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
-        Arc::clone(
-            self.logical_read_launcher
-                .as_ref()
-                .expect("frontend logical read launcher is installed before host open returns"),
-        ) as Arc<dyn LogicalReadLauncher>
+    /// Materializes the native-read launcher while Server constructs its
+    /// immutable role products. The returned launcher owns no process
+    /// lifecycle state; it only joins the Host-owned execution runtime with
+    /// the role's fixed topology and data-plane capabilities.
+    pub(crate) fn build_logical_read_launcher(&self) -> Arc<dyn LogicalReadLauncher> {
+        let topology = Arc::clone(self.topology());
+        let config = self.query_runtime;
+        let native_runtime = FrontendNativeLogicalExecutionRuntime::new(
+            Arc::clone(&topology) as crate::common::backend_topology::BackendTopologyService,
+            topology as crate::common::backend_topology::BackendProcessObservationService,
+            self.data_runtime.clone(),
+            self.result_decode_runtime(),
+            config.native_compatibility_id,
+            config.runtime_filter_worker_count,
+            config.task_update_retry_policy,
+            config.split_initial_wait_cap,
+            config.coordination_budgets,
+            config.transport_budget.into_codec(),
+            config.abort_capacity,
+            self.execution_runtime_owner.lifecycle_diagnostics(),
+        );
+        Arc::new(FrontendNativeLogicalReadLauncher::new(
+            self.logical_execution_client(),
+            native_runtime,
+        )) as Arc<dyn LogicalReadLauncher>
     }
 
     #[allow(
@@ -1555,7 +1646,9 @@ impl FrontendApplicationHost {
         dead_code,
         reason = "Management integrations consume this read-only observation handle."
     )]
-    pub(crate) fn workload_observation(&self) -> WorkloadObservationHandle {
+    /// Read-only governed-root observation consumed by the Server role runner
+    /// while it drains admitted Frontend work.
+    pub fn workload_observation(&self) -> WorkloadObservationHandle {
         self.execution_runtime_owner.workload_observation()
     }
 
@@ -1565,10 +1658,6 @@ impl FrontendApplicationHost {
     )]
     pub(crate) fn workload_resources(&self) -> LocalResourceAuthority {
         self.execution_runtime_owner.resources()
-    }
-
-    pub fn query_control_service(&self) -> crate::query_execution::control::QueryControlService {
-        self.query_control.clone()
     }
 
     pub(crate) fn backend_membership_ingress(&self) -> Arc<ClusterBackendService> {
@@ -1598,7 +1687,9 @@ impl FrontendApplicationHost {
         .map_err(FrontendApplicationError::server)
     }
 
-    pub(crate) fn start_report_server_from_host(
+    /// Starts the Frontend report listener from Server-composed bind and trust
+    /// material.
+    pub fn start_report_server_from_host(
         &self,
         host: &str,
         port: u16,
@@ -1618,36 +1709,21 @@ impl FrontendApplicationHost {
     }
 
     pub(crate) fn lifecycle_convergence_reader(&self) -> Arc<dyn QueryLifecycleConvergenceReader> {
-        self.coordinator
-            .as_ref()
-            .expect("frontend coordinator is installed before host open returns")
-            .convergence_reader()
-    }
-
-    #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "Retained as the integration-test entry point for the frontend coordinator."
-    )]
-    pub(crate) fn execute_distributed_query_for_test(
-        &self,
-        request: crate::query_execution::contract::DistributedQueryRequest,
-    ) -> Result<
-        crate::query_execution::contract::DistributedQueryOutcome,
-        crate::query_execution::contract::DistributedQueryError,
-    > {
-        crate::query_execution::contract::DistributedQueryCoordinator::execute(
-            self.coordinator
-                .as_ref()
-                .expect("frontend coordinator is installed before host open returns")
-                .as_ref(),
-            request,
-        )
+        self.execution_runtime_owner.lifecycle_diagnostics()
+            as Arc<dyn QueryLifecycleConvergenceReader>
     }
 
     /// Frontend composition-time topology leaf used by FE-owned services.
     pub fn backend_topology_port(&self) -> crate::common::backend_topology::BackendTopologyService {
         Arc::clone(self.topology()) as crate::common::backend_topology::BackendTopologyService
+    }
+
+    /// Frontend composition-time read-only backend command leaf.
+    pub fn backend_topology_command_port(
+        &self,
+    ) -> Arc<dyn novarocks_query_application::api::BackendTopologyCommandPort> {
+        Arc::clone(self.topology())
+            as Arc<dyn novarocks_query_application::api::BackendTopologyCommandPort>
     }
 
     pub async fn shutdown(&mut self) -> Result<(), FrontendApplicationError> {
@@ -1673,17 +1749,10 @@ impl FrontendApplicationHost {
     /// failed and the production runner has irrevocably committed to FE process
     /// exit. This is not a reusable shutdown path: admission remains closed and
     /// the Host must be dropped immediately after the runner returns.
-    pub(crate) fn abandon_for_process_exit(&mut self) {
+    /// Releases process-local join ownership only after the Server role runner
+    /// has exhausted its bounded convergence attempts and committed to exit.
+    pub fn abandon_for_process_exit(&mut self) {
         self.serving_lifecycle.mark_stopping();
-        if let Some(service) = self.mv_service.as_ref() {
-            service.request_background_stop_for_process_exit();
-        }
-        if let Some(port) = self.statistics_application_port.as_ref() {
-            port.request_worker_stop_for_process_exit();
-        }
-        if let Some(service) = self.table_maintenance_service.as_ref() {
-            service.request_shutdown_for_process_exit();
-        }
         if let Some(topology) = self.topology.as_ref() {
             if let Err(error) = topology.request_heartbeat_stop_for_process_exit() {
                 tracing::error!(
@@ -1714,30 +1783,6 @@ impl FrontendApplicationHost {
         Ok(())
     }
 
-    fn open_coordinator(
-        &mut self,
-        execution: FrontendExecutionConfig,
-    ) -> Result<(), FrontendApplicationError> {
-        let native_compatibility_id = execution.native_compatibility_id();
-        let coordinator = Arc::new(
-            FrontendDistributedQueryCoordinator::new(
-                execution.runtime_filter_worker_count,
-                native_compatibility_id,
-                execution.task_update_retry_policy,
-                execution.connector_split_initial_dynamic_filter_wait_cap,
-                execution.coordination_budgets,
-                execution.transport_budget.into_codec(),
-                execution.result_fetch_byte_limit,
-                self.backend_topology_port(),
-                self.data_runtime.clone(),
-            )
-            .map_err(FrontendApplicationError::server)?,
-        );
-        self.query_execution = Some(QueryExecutionService::new(coordinator.clone()));
-        self.coordinator = Some(coordinator);
-        Ok(())
-    }
-
     async fn cleanup_open_error(
         &mut self,
         primary: FrontendApplicationError,
@@ -1754,41 +1799,7 @@ impl FrontendApplicationHost {
     async fn release_resources_until(&mut self, deadline: Instant) -> Result<(), String> {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
-        // The worker owns durable attempt activity and must stop before the
-        // coordinator/topology/StateStore it depends on are released.
-        let mv_worker_error = match self.mv_service.as_ref() {
-            Some(service) => service
-                .shutdown_background_workers_until(deadline)
-                .await
-                .err()
-                .map(|error| format!("shutdown frontend MV background workers failed: {error}")),
-            None => None,
-        };
-        let statistics_worker_error = match self.statistics_application_port.as_ref() {
-            Some(port) => port
-                .shutdown_worker_until(deadline)
-                .await
-                .err()
-                .map(|error| format!("shutdown statistics analyze worker failed: {error}")),
-            None => None,
-        };
-        let preserve_background_owners =
-            mv_worker_error.is_some() || statistics_worker_error.is_some();
-        let mut primary_error = mv_worker_error;
-        if let Some(statistics_worker_error) = statistics_worker_error {
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {statistics_worker_error}"));
-            } else {
-                primary_error = Some(statistics_worker_error);
-            }
-        }
-        if preserve_background_owners {
-            // Background workers still own request/topology/StateStore references.
-            // Preserve those owners so a caller sees the explicit shutdown
-            // failure rather than pretending teardown completed. Query intake
-            // is already closed; a later call resumes this same owner graph.
-            return Err(primary_error.expect("the MV shutdown error is retained"));
-        }
+        let mut primary_error: Option<String> = None;
         if let Err(error) = self.execution_runtime_owner.shutdown_until(deadline).await {
             if !self.execution_runtime_owner.is_shutdown_complete() {
                 return match primary_error {
@@ -1801,22 +1812,6 @@ impl FrontendApplicationHost {
             } else {
                 primary_error = Some(error);
             }
-        }
-        self.query_execution.take();
-        self.coordinator.take();
-        let table_maintenance_error = match self.table_maintenance_service.as_ref() {
-            Some(service) => service.shutdown_until(deadline).await.err().map(|error| {
-                format!("shutdown frontend table-maintenance service failed: {error}")
-            }),
-            None => None,
-        };
-        if let Some(table_maintenance_error) = table_maintenance_error {
-            if let Some(primary) = primary_error.as_mut() {
-                primary.push_str(&format!("; cleanup failed: {table_maintenance_error}"));
-            } else {
-                primary_error = Some(table_maintenance_error);
-            }
-            return Err(primary_error.expect("table-maintenance shutdown error is retained"));
         }
         let heartbeat_error = match self.topology.as_ref() {
             Some(topology) => topology.stop_heartbeat_manager_until(deadline).await.err(),
@@ -1831,69 +1826,28 @@ impl FrontendApplicationHost {
             return Err(primary_error.expect("heartbeat shutdown error is retained"));
         }
         self.topology.take();
-        self.dml_service.take();
-        self.table_maintenance_service.take();
-        self.statistics_service.take();
-        // Process-local job services do not own StateStore job records. Release
-        // their workers before closing the host's remaining durable owners.
-        self.statistics_application_port.take();
-        self.statistics_application_service.take();
         // Stop the cadence before the store closes. The store host performs one
         // final drain of its own, so nothing is lost here and no sweep races the
         // instance going away.
         if let Some(sweeper) = self.abandoned_attempt_sweeper.take() {
             sweeper.shutdown().await;
         }
-        let had_catalog_controller = self.catalog_controller.is_some();
-        let catalog_controller_error = match self.catalog_controller.as_ref() {
-            Some(controller) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    Some(
-                        "frontend cleanup deadline elapsed before catalog controller shutdown"
-                            .to_string(),
-                    )
-                } else {
-                    tokio::time::timeout(remaining, controller.shutdown())
-                        .await
-                        .map_err(|_| {
-                            "frontend cleanup deadline elapsed shutting down catalog controller"
-                                .to_string()
-                        })
-                        .and_then(|result| result)
-                        .err()
-                }
-            }
+        let catalog_runtime_error = match self.catalog_role_runtime.as_mut() {
+            Some(runtime) => runtime.shutdown_until(deadline).await.err(),
             None => None,
         };
-        if had_catalog_controller && catalog_controller_error.is_none() {
-            self.catalog_controller.take();
+        if catalog_runtime_error.is_none() {
+            self.catalog_role_runtime.take();
         }
-        // The controller owns the durable desired-state projection. The prune
-        // worker is best effort and may be asleep between rounds, so it must
-        // not consume the whole shared cleanup deadline before the controller
-        // gets a chance to stop and unpublish that projection.
-        if let Some(prune) = self.catalog_prune.take() {
-            prune
-                .shutdown(deadline.saturating_duration_since(Instant::now()))
-                .await;
-        }
-        if let Some(catalog_controller_error) = catalog_controller_error {
-            let error = format!("shutdown catalog controller failed: {catalog_controller_error}");
+        if let Some(catalog_runtime_error) = catalog_runtime_error {
+            let error = catalog_runtime_error;
             if let Some(primary) = primary_error.as_mut() {
                 primary.push_str(&format!("; cleanup failed: {error}"));
             } else {
                 primary_error = Some(error);
             }
-            return Err(primary_error.expect("catalog controller shutdown error is retained"));
+            return Err(primary_error.expect("catalog role runtime shutdown error is retained"));
         }
-        self.catalog_application_port.take();
-        self.view_service.take();
-        self.mv_application_service.take();
-        self.mv_service.take();
-        self.mv_refresh_provider_activation.take();
-        self.mv_background_engine_sink.take();
-        self.mv_repository.take();
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {
                 Ok(()) => {
@@ -1920,30 +1874,39 @@ impl FrontendApplicationHost {
 }
 
 #[cfg(test)]
+#[path = "application/tests_host.rs"]
+mod host_tests;
+
+#[cfg(test)]
+#[path = "application/tests_mv_host.rs"]
+mod mv_host_tests;
+
+#[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::time::{Duration, Instant};
 
-    use crate::state_store::{
-        StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
-        testing::{
-            TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
-            registry as test_state_store_registry,
-        },
+    use crate::state_store::testing::{
+        TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
+        registry as test_state_store_registry,
     };
     use async_trait::async_trait;
+    use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
     use novarocks_state_store_api::{
         StateStoreError, StateStoreErrorKind, StateStoreOpenRequest, StateStoreProviderDescriptor,
         StateStoreProviderFactory, StateStoreProviderInstance,
+    };
+    use novarocks_state_store_runtime::{
+        StateStoreHost, StateStoreProviderRegistration, StateStoreProviderRegistry,
     };
     use novarocks_workload_control::{ResourceConfig, WorkClass, WorkRequest, WorkloadConfig};
 
     use super::{
         FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
-        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, FrontendNativeTransport,
-        LogicalExecutionRowsConfig, LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit,
-        test_native_trust,
+        FrontendExecutionConfig, FrontendExecutionRuntimeOwner, LogicalExecutionRowsConfig,
+        LogicalExecutionSupervisorConfig, MaxWait, ResultByteLimit, test_native_trust,
     };
+    use novarocks_native_adapter::FrontendNativeTransport;
 
     const DESCRIPTOR: StateStoreProviderDescriptor = StateStoreProviderDescriptor::new(
         TEST_STATE_STORE_PROVIDER_ID,
@@ -1975,6 +1938,14 @@ mod tests {
                 control_bytes: 1 << 10,
                 per_scope_bytes: 1 << 18,
             },
+            QueryCpuExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
             NonZeroUsize::new(1).unwrap(),
             NonZeroUsize::new(1).unwrap(),
         )
@@ -1997,6 +1968,57 @@ mod tests {
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await
             .expect("retry converges the exact retained owner graph");
+    }
+
+    #[tokio::test]
+    async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
+        let mut runtime = FrontendExecutionRuntimeOwner::try_new(
+            tokio::runtime::Handle::current(),
+            LogicalExecutionSupervisorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                LogicalExecutionRowsConfig::new(
+                    NonZeroUsize::new(1).unwrap(),
+                    NonZeroU32::new(1).unwrap(),
+                    Duration::from_secs(1),
+                    MaxWait::new(Duration::from_millis(20)).unwrap(),
+                    ResultByteLimit::new(1024).unwrap(),
+                ),
+            ),
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1 << 20,
+                control_bytes: 1 << 10,
+                per_scope_bytes: 1 << 18,
+            },
+            QueryCpuExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            QueryBlockingExecutorConfig::new(
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+            ),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .expect("execution runtime opens");
+        runtime.mark_ready().expect("workload authority ready");
+        let work = runtime
+            .root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("root work admitted");
+        work.owner
+            .cancel(novarocks_workload_control::CancellationReason::Requested);
+        work.owner.complete();
+        work.business.release();
+
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("terminal control notification cannot retain a completed root");
     }
 
     #[async_trait]
@@ -2089,11 +2111,11 @@ mod tests {
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance id");
         assert!(matches!(
-            crate::catalog_application::CatalogApplicationPort::admit_catalog(
+            novarocks_catalog_application::CatalogApplicationPort::admit_catalog(
                 host.catalog_application_port().as_ref(),
                 &instance_id,
             ),
-            crate::catalog_application::CatalogAdmission::Absent
+            novarocks_catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
     }

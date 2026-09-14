@@ -33,7 +33,24 @@ use novarocks_query_application::coordination::{
 };
 use novarocks_types::identity::{BackendProcessId, TaskId};
 
-use crate::query_execution::FragmentInstancePlacement;
+use crate::query_execution::schedule::FragmentInstancePlacement;
+
+/// Why a task-status subscription can no longer represent its frozen
+/// participant. Identity violations are not transport uncertainty and must
+/// never select attempt recovery.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ParticipantObservationFailure {
+    Transport(&'static str),
+    IdentityViolation(&'static str),
+}
+
+impl ParticipantObservationFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Transport(state) | Self::IdentityViolation(state) => state,
+        }
+    }
+}
 
 /// Why the frontend task-protocol owners refuse to continue.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,6 +76,11 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         waited: Duration,
     },
+    /// The first Establish request for this frozen backend process crossed
+    /// transport but its Worker outcome was lost. The attempt has not reached
+    /// ControlReady, so the whole-attempt recovery owner must observe whether
+    /// this exact process was replaced before deciding a successor schedule.
+    PreReadyEstablishTransportUnknown { backend: BackendProcessId },
     /// An acknowledgement named an operation this owner never sent, or named
     /// one that is already settled.
     UnknownOperation,
@@ -119,7 +141,7 @@ pub enum TaskExecutionError {
     /// deadline whenever the killed process did not host the root task.
     ParticipantUnobservable {
         backend: BackendProcessId,
-        state: &'static str,
+        state: ParticipantObservationFailure,
     },
 }
 
@@ -236,6 +258,10 @@ impl fmt::Display for TaskExecutionError {
                 formatter,
                 "{kind} operation {operation_id} waited {waited:?} in the frontend queue and expired before transport acceptance"
             ),
+            Self::PreReadyEstablishTransportUnknown { backend } => write!(
+                formatter,
+                "EstablishQueryContext for backend {backend} lost its Worker outcome before ControlReady"
+            ),
             Self::UnknownOperation => {
                 formatter.write_str("acknowledgement names an operation this owner did not send")
             }
@@ -282,7 +308,8 @@ impl fmt::Display for TaskExecutionError {
             Self::FinalInfo(disagreement) => write!(formatter, "{disagreement}"),
             Self::ParticipantUnobservable { backend, state } => write!(
                 formatter,
-                "backend {backend} is no longer observable: task status subscription {state}"
+                "backend {backend} is no longer observable: task status subscription {}",
+                state.as_str()
             ),
         }
     }

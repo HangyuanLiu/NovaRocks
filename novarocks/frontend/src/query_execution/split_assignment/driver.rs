@@ -31,6 +31,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;
@@ -44,60 +45,6 @@ use super::transport::{
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 /// Largest number of splits one update may carry, matching the wire bound.
 pub(crate) const MAX_SPLITS_PER_UPDATE: usize = 4096;
-
-/// Server-frozen retry policy for one TaskUpdate request. The driver receives
-/// this value through the coordinator and never consults process-global config.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TaskUpdateRetryPolicy {
-    pub(crate) rpc_timeout: Duration,
-    pub(crate) error_duration: Duration,
-    pub(crate) initial_backoff: Duration,
-    pub(crate) max_backoff: Duration,
-}
-
-impl TaskUpdateRetryPolicy {
-    pub fn try_new(
-        rpc_timeout: Duration,
-        error_duration: Duration,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-    ) -> Result<Self, String> {
-        if rpc_timeout.is_zero()
-            || error_duration.is_zero()
-            || initial_backoff.is_zero()
-            || max_backoff.is_zero()
-        {
-            return Err("task update retry durations must be greater than zero".to_owned());
-        }
-        if initial_backoff > max_backoff {
-            return Err("task update retry initial backoff must not exceed max backoff".to_owned());
-        }
-        if rpc_timeout > error_duration {
-            return Err("task update rpc timeout must not exceed error duration".to_owned());
-        }
-        if max_backoff > error_duration {
-            return Err("task update retry max backoff must not exceed error duration".to_owned());
-        }
-        Ok(Self {
-            rpc_timeout,
-            error_duration,
-            initial_backoff,
-            max_backoff,
-        })
-    }
-}
-
-impl Default for TaskUpdateRetryPolicy {
-    fn default() -> Self {
-        Self::try_new(
-            Duration::from_secs(5),
-            Duration::from_secs(30),
-            Duration::from_millis(100),
-            Duration::from_secs(1),
-        )
-        .expect("default task update retry policy is valid")
-    }
-}
 
 /// The one round-owned stop authority. Its atomic keeps every event-driven
 /// owner on the same monotonic stop fact without adding a blocking waiter.
@@ -514,12 +461,12 @@ impl SplitAssignmentDriver {
                     return Ok(false);
                 }
                 let remaining = current.first_retryable_error.map_or(
-                    self.retry_policy.rpc_timeout,
+                    self.retry_policy.rpc_timeout(),
                     |started| {
                         self.retry_policy
-                            .error_duration
+                            .error_duration()
                             .saturating_sub(started.elapsed())
-                            .min(self.retry_policy.rpc_timeout)
+                            .min(self.retry_policy.rpc_timeout())
                     },
                 );
                 if remaining.is_zero() {
@@ -562,7 +509,7 @@ impl SplitAssignmentDriver {
                     Some(Err(TaskUpdateTransportError::retryable_network(format!(
                         "task update to backend {} was not acknowledged within {} ms",
                         current.target.backend_idx,
-                        self.retry_policy.rpc_timeout.as_millis(),
+                        self.retry_policy.rpc_timeout().as_millis(),
                     ))))
                 }
                 None => {
@@ -608,7 +555,7 @@ impl SplitAssignmentDriver {
                     current.last_retryable_error = Some(error.clone());
                     let remaining = self
                         .retry_policy
-                        .error_duration
+                        .error_duration()
                         .saturating_sub(started.elapsed());
                     if remaining.is_zero() {
                         return Err(SplitAssignmentDriverError::Transport {
@@ -648,7 +595,7 @@ impl SplitAssignmentDriver {
                     current.backoff = current
                         .backoff
                         .saturating_mul(2)
-                        .min(self.retry_policy.max_backoff);
+                        .min(self.retry_policy.max_backoff());
                     delivery.current = Some(current);
                     self.delivery = Some(delivery);
                     return Ok(true);
@@ -718,11 +665,11 @@ impl SplitAssignmentDriver {
                 target,
                 request,
                 ticket,
-                poll_deadline: sent_at + self.retry_policy.rpc_timeout,
+                poll_deadline: sent_at + self.retry_policy.rpc_timeout(),
                 first_retryable_error: None,
                 last_retryable_error: None,
                 retryable_attempts: 0,
-                backoff: self.retry_policy.initial_backoff,
+                backoff: self.retry_policy.initial_backoff(),
                 next_attempt_at: None,
             });
             self.delivery = Some(delivery);
@@ -761,7 +708,7 @@ impl SplitAssignmentDriver {
         let mut first_retryable_error = None;
         let mut last_retryable_error = None;
         let mut retryable_attempts = 0_u64;
-        let mut backoff = self.retry_policy.initial_backoff;
+        let mut backoff = self.retry_policy.initial_backoff();
         loop {
             if self.stop.is_stopped() || self.closed {
                 return Err(TaskUpdateTransportError::closed(
@@ -770,7 +717,7 @@ impl SplitAssignmentDriver {
             }
             let remaining = first_retryable_error.map(|started: Instant| {
                 self.retry_policy
-                    .error_duration
+                    .error_duration()
                     .saturating_sub(started.elapsed())
             });
             if remaining.is_some_and(|remaining| remaining.is_zero()) {
@@ -786,8 +733,8 @@ impl SplitAssignmentDriver {
                 ));
             }
             let rpc_timeout = remaining
-                .map(|remaining| remaining.min(self.retry_policy.rpc_timeout))
-                .unwrap_or(self.retry_policy.rpc_timeout);
+                .map(|remaining| remaining.min(self.retry_policy.rpc_timeout()))
+                .unwrap_or(self.retry_policy.rpc_timeout());
             let ticket = self.transport.begin(self.execution_id, target, request)?;
             let rpc_deadline = Instant::now() + rpc_timeout;
             let outcome = loop {
@@ -811,7 +758,7 @@ impl SplitAssignmentDriver {
                     last_retryable_error = Some(error.clone());
                     let remaining = self
                         .retry_policy
-                        .error_duration
+                        .error_duration()
                         .saturating_sub(started.elapsed());
                     if remaining.is_zero() {
                         return Err(retry_budget_exhausted(
@@ -848,7 +795,9 @@ impl SplitAssignmentDriver {
                             "split assignment round stopped during task update retry",
                         ));
                     }
-                    backoff = backoff.saturating_mul(2).min(self.retry_policy.max_backoff);
+                    backoff = backoff
+                        .saturating_mul(2)
+                        .min(self.retry_policy.max_backoff());
                 }
                 Err(error) => return Err(error),
             }

@@ -21,11 +21,9 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Fields};
 
-use super::common::build_slot_projection;
 use super::{DecodedNode, NativePlanDecodeContext};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
 use novarocks_execution::exec::chunk::ChunkSchema;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
@@ -34,6 +32,10 @@ use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_functions::{
     AggregateOverloadIdentity, AggregateStateFormatIdentity, ResolvedAggregateSignature,
 };
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
+use novarocks_native_adapter::fragment_plan_node::build_slot_projection;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 use novarocks_types::SlotId;
@@ -91,8 +93,8 @@ pub(super) fn lower_hash_aggregate_node(
         .field("output_layout")
         .field("aggregate_columns");
     let decoded_group_key_columns =
-        ctx.decode_output_layout(&output_layout.group_key_columns, group_key_path.clone())?;
-    let decoded_aggregate_columns = ctx.decode_output_layout(
+        decode_fragment_output_layout(&output_layout.group_key_columns, group_key_path.clone())?;
+    let decoded_aggregate_columns = decode_fragment_output_layout(
         &output_layout.aggregate_columns,
         aggregate_columns_path.clone(),
     )?;
@@ -133,7 +135,7 @@ pub(super) fn lower_hash_aggregate_node(
         .iter()
         .enumerate()
         .map(|(idx, expr)| {
-            ctx.decode_expression(
+            decode_expr_for_slot_layout(
                 expr,
                 path.clone().field("group_by").index(idx),
                 arena,
@@ -206,7 +208,7 @@ pub(super) fn lower_hash_aggregate_node(
                 .field("aggregates")
                 .index(idx)
                 .field("result_type"),
-            crate::fragment::decode::type_decode::decode_type(result_type),
+            novarocks_plan_codec::native_type::decode_type(result_type),
         )?;
         let function_name = aggregate_function_name(call);
         let call_path = path.clone().field("aggregates").index(idx);
@@ -307,7 +309,6 @@ pub(super) fn lower_hash_aggregate_node(
                 path.clone().field("aggregates").index(idx),
                 &child,
                 arena,
-                ctx,
             )?
         };
         let inputs = NativeFragmentDecodeError::map_invalid(
@@ -360,7 +361,7 @@ pub(super) fn lower_hash_aggregate_node(
         return Ok(aggregate_node);
     };
     let visible_layout = Layout::for_slots(
-        ctx.decode_output_layout(visible_output_columns, visible_path.clone())?
+        decode_fragment_output_layout(visible_output_columns, visible_path.clone())?
             .slot_ids()
             .iter()
             .copied(),
@@ -375,7 +376,6 @@ pub(super) fn lower_hash_aggregate_node(
         visible_path,
         node.node_id,
         arena,
-        ctx,
     )
 }
 
@@ -410,7 +410,7 @@ pub(super) fn decode_resolved_aggregate_signature(
         .map(|(idx, data_type)| {
             NativeFragmentDecodeError::map_invalid(
                 signature_path.clone().field("argument_types").index(idx),
-                crate::fragment::decode::type_decode::decode_type(data_type),
+                novarocks_plan_codec::native_type::decode_type(data_type),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -422,7 +422,7 @@ pub(super) fn decode_resolved_aggregate_signature(
     })?;
     let intermediate_type = NativeFragmentDecodeError::map_invalid(
         signature_path.clone().field("intermediate_type"),
-        crate::fragment::decode::type_decode::decode_type(intermediate_type),
+        novarocks_plan_codec::native_type::decode_type(intermediate_type),
     )?;
     let output_type = signature.output_type.as_ref().ok_or_else(|| {
         NativeFragmentDecodeError::missing(
@@ -432,7 +432,7 @@ pub(super) fn decode_resolved_aggregate_signature(
     })?;
     let output_type = NativeFragmentDecodeError::map_invalid(
         signature_path.clone().field("output_type"),
-        crate::fragment::decode::type_decode::decode_type(output_type),
+        novarocks_plan_codec::native_type::decode_type(output_type),
     )?;
     let state_format = AggregateStateFormatIdentity::try_new(&signature.state_format_identity)
         .map_err(|error| {
@@ -467,7 +467,7 @@ fn aggregate_signature_arg_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 path.clone().field("args").index(idx).field("type"),
-                crate::fragment::decode::type_decode::decode_type(ty),
+                novarocks_plan_codec::native_type::decode_type(ty),
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -494,7 +494,7 @@ fn aggregate_signature_arg_types(
                 .index(idx)
                 .field("expr")
                 .field("type"),
-            crate::fragment::decode::type_decode::decode_type(data_type),
+            novarocks_plan_codec::native_type::decode_type(data_type),
         )?);
     }
     Ok(types)
@@ -516,7 +516,7 @@ fn aggregate_logical_arg_types(
             })?;
             NativeFragmentDecodeError::map_invalid(
                 path.clone().field("args").index(idx).field("type"),
-                crate::fragment::decode::type_decode::decode_type(ty),
+                novarocks_plan_codec::native_type::decode_type(ty),
             )
         })
         .collect()
@@ -528,7 +528,6 @@ fn lower_aggregate_update_inputs(
     path: FieldPath,
     child: &DecodedNode,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<Vec<novarocks_execution::exec::expr::ExprId>, NativeFragmentDecodeError> {
     if call.name.eq_ignore_ascii_case("count_if") && !call.order_by.is_empty() {
         return Err(NativeFragmentDecodeError::unsupported(
@@ -540,7 +539,7 @@ fn lower_aggregate_update_inputs(
     }
     let mut inputs = Vec::with_capacity(call.args.len() + call.order_by.len());
     for (arg_idx, expr) in call.args.iter().enumerate() {
-        inputs.push(ctx.decode_expression(
+        inputs.push(decode_expr_for_slot_layout(
             expr,
             path.clone().field("args").index(arg_idx),
             arena,
@@ -557,7 +556,12 @@ fn lower_aggregate_update_inputs(
                 ),
             )
         })?;
-        inputs.push(ctx.decode_expression(expr, item_path.field("expr"), arena, &child.layout)?);
+        inputs.push(decode_expr_for_slot_layout(
+            expr,
+            item_path.field("expr"),
+            arena,
+            &child.layout,
+        )?);
     }
     Ok(inputs)
 }
@@ -1056,7 +1060,7 @@ mod tests {
             &[DataType::Utf8, DataType::Utf8],
             &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         );
-        let intermediate_type = crate::fragment::decode::type_decode::decode_type(
+        let intermediate_type = novarocks_plan_codec::native_type::decode_type(
             resolved_signature
                 .as_ref()
                 .and_then(|signature| signature.intermediate_type.as_ref())

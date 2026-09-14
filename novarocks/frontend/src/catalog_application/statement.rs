@@ -25,8 +25,8 @@ use std::sync::Arc;
 
 use crate::catalog_application::model::{CatalogCreateTableKind, CatalogCreateTableRequest};
 use crate::catalog_application::query_catalog::drop_local_table_registration_if_exists;
-use crate::runtime::statement_result::StatementResult;
 use bytes::Bytes;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::ConnectorControlRegistry;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorColumnAggregation, ConnectorColumnDefinition,
@@ -685,7 +685,7 @@ pub(crate) fn execute_drop_catalog_statement(
     // dependency scan that fences it, both inside one serializable StateStore
     // transaction. Core must not pre-check dependencies outside that fence.
     application
-        .drop_catalog(crate::catalog_application::CatalogDropCommand {
+        .drop_catalog(novarocks_catalog_application::CatalogDropCommand {
             instance_id,
             if_exists,
         })

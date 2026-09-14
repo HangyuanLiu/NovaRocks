@@ -53,7 +53,7 @@ use novarocks_proto_codec::lifecycle::{
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 
 use crate::{invalid, missing, out_of_range};
-use novarocks_spi::connector::{CredentialLeaseDescriptor, CredentialLeaseSecretEnvelope};
+use novarocks_spi::connector::VendedCredentialLease;
 
 /// Largest number of domain changes one operation may carry.
 pub const MAX_DOMAIN_UPDATES: usize = 256;
@@ -203,24 +203,6 @@ impl fmt::Debug for WireCredential {
     }
 }
 
-/// One validated descriptor and its exact secret envelope.
-pub struct VendedCredentialLease {
-    descriptor: CredentialLeaseDescriptor,
-    envelope: CredentialLeaseSecretEnvelope,
-}
-
-impl VendedCredentialLease {
-    pub const fn descriptor(&self) -> &CredentialLeaseDescriptor {
-        &self.descriptor
-    }
-
-    /// The secret envelope. Both this type and the envelope render redacted,
-    /// so holding it does not make it printable.
-    pub const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
-        &self.envelope
-    }
-}
-
 impl WireCredential {
     /// Decodes and validates one rotation's descriptor and envelope lists.
     ///
@@ -238,16 +220,21 @@ impl WireCredential {
         validate_initial_credential_lease_envelopes(descriptors, envelopes, path.clone())?;
         let mut pairs = Vec::with_capacity(descriptors.len());
         for (index, (descriptor, envelope)) in descriptors.iter().zip(envelopes).enumerate() {
-            pairs.push(VendedCredentialLease {
-                descriptor: decode_credential_lease_descriptor(
-                    descriptor.clone(),
-                    path.clone().field("descriptors").index(index),
-                )?,
-                envelope: decode_credential_lease_secret_envelope(
-                    envelope.clone(),
-                    path.clone().field("envelopes").index(index),
-                )?,
-            });
+            let descriptor_path = path.clone().field("descriptors").index(index);
+            let descriptor =
+                decode_credential_lease_descriptor(descriptor.clone(), descriptor_path.clone())?;
+            let envelope = decode_credential_lease_secret_envelope(
+                envelope.clone(),
+                path.clone().field("envelopes").index(index),
+            )?;
+            pairs.push(
+                VendedCredentialLease::try_new(descriptor, envelope).map_err(|error| {
+                    invalid(
+                        descriptor_path,
+                        format!("credential lease pair is inconsistent: {error}"),
+                    )
+                })?,
+            );
         }
         Ok(Self {
             pairs,

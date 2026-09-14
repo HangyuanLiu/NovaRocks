@@ -20,20 +20,20 @@ use std::io::Cursor;
 
 use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 use bytes::Bytes;
+use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{Key, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::common::persisted_query_definition::PersistedQueryDefinition;
 use crate::mv::domain::persistence::definition::{
     MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
     StoredMvDefinition,
 };
 use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
-use crate::state_family::StateFamily;
+use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 use super::catalog::schema_catalog;
 use super::key::{MvKeyKind, expected_record_kind};
@@ -41,12 +41,9 @@ use super::key::{MvKeyKind, expected_record_kind};
 const MAGIC: &[u8; 4] = b"NRMA";
 /// Record version of the MV accelerator family.
 ///
-/// Declared by the manifest, not here: a second literal could disagree with
-/// the version the manifest publishes and nothing would catch it.
-const ENVELOPE_VERSION: u8 = match StateFamily::MvAccelerator.record_version() {
-    Some(version) => version,
-    None => panic!("MV accelerator is a durable accelerator family"),
-};
+/// Declared by the MV product descriptor, not here: a second literal could
+/// disagree with the version the product publishes and orphan deployed data.
+const ENVELOPE_VERSION: u8 = MV_ACCELERATOR_STATE_FAMILY.record_version();
 const HEADER_BYTES_BEFORE_FINGERPRINT: usize = 12;
 const OPERATION_ID_BYTES: usize = 16;
 const PAYLOAD_LENGTH_BYTES: usize = 4;
@@ -372,3 +369,7 @@ where
         value,
     })
 }
+
+#[cfg(test)]
+#[path = "codec_tests.rs"]
+mod codec_tests;

@@ -11,10 +11,10 @@ use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::transport::Channel;
 
-use super::transport::FrontendNativeTransport;
 use super::transport_supervisor::NativeTransportSupervisor;
-use crate::task_execution::blocking_io::{
-    ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor,
+use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
+use novarocks_native_adapter::{
+    FrontendNativeTransport, connector_blocking_io::ConnectorBlockingIoBudget,
 };
 
 /// Process-wide root-result I/O concurrency. Long polls are parked async, but
@@ -161,8 +161,8 @@ mod tests {
     use novarocks_types::NativeEndpoint;
 
     use super::FrontendDataRuntime;
-    use crate::native::transport::FrontendNativeTransport;
-    use crate::task_execution::ConnectorBlockingIoBudget;
+    use novarocks_native_adapter::FrontendNativeTransport;
+    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 
     fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
         let trust = NativeTrust::new(

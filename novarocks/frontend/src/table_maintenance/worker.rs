@@ -15,284 +15,488 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Current-process OPTIMIZE worker.
-//!
-//! It only consumes work submitted to this process runtime. It never scans a
-//! previous process, retries an attempt, or reconciles a historical mutation.
+//! Frontend adapters for the product-owned OPTIMIZE worker.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, Weak};
 
 use bytes::Bytes;
-use novarocks_spi::connector::ConnectorTableObjectId;
-use tokio::runtime::Handle;
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
-
-use crate::query_execution::maintenance::{
-    MaintenanceActionOutcome, MaintenanceTargetRebind, TableMaintenanceEngine,
+use novarocks_spi::connector::{
+    ConnectorCleanupCandidate, ConnectorCleanupOperationId, ConnectorCleanupOwnedRefSelection,
+    ConnectorTableObjectId, ConnectorWriteOperationId, ExternalMutationFinalization,
+    ExternalMutationOutcome,
 };
-use crate::workload_lifecycle::{
-    FrontendServingLifecycle, FrontendServingSnapshotReader, FrontendServingState,
-    FrontendWorkloadKind,
+use novarocks_table_maintenance::job_service::{CapturedOptimizeTarget, OptimizeTargetCapturePort};
+use novarocks_table_maintenance::product::TableMaintenanceProduct;
+use novarocks_table_maintenance::product::{
+    CleanupCandidate, CleanupOwnedRefFact, CleanupSession, CleanupTerminal,
+    DistributedRewriteSession, RewriteCommit, RewriteIntent, RewritePlanFacts, RewriteReceiptFacts,
+    TableMaintenanceEffectPort,
+};
+use novarocks_table_maintenance::runtime::TerminalError as OptimizeTerminalError;
+use novarocks_table_maintenance::worker::{
+    OptimizeJobAdmission, OptimizeJobAdmissionPort, OptimizeJobExecution, OptimizeJobExecutionPort,
+    OptimizeJobScope,
+};
+use novarocks_table_maintenance::{
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
+    OptimizeJob,
+};
+use novarocks_workload_control::{
+    RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
 };
 
-use super::model::OptimizeJob;
-use super::now_unix_millis;
-use super::runtime::{OptimizeProcessRuntime, OptimizeTerminalError};
+use crate::query_execution::maintenance::TableMaintenanceEngine;
+
+use crate::connector::distributed_rewrite_application::DistributedRewriteIntent;
+
+/// Frontend provider/native-query adapter for the neutral maintenance product.
+/// It keeps opaque connector sessions and fragment encoding here, while the
+/// product crate owns all target-gate, cohort and terminal business decisions.
+pub(crate) struct FrontendMaintenanceEffectPort<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+}
+
+impl<'a> FrontendMaintenanceEffectPort<'a> {
+    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
+    fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
+        self.engine.reject_user_action_on_mv(target)
+    }
+
+    fn execute_metadata(
+        &self,
+        request: MaintenanceActionRequest,
+    ) -> Result<MaintenanceActionOutcome, String> {
+        self.engine.execute_action(request)
+    }
+
+    fn begin_rewrite<'a>(
+        &'a self,
+        target: &MaintenanceTarget,
+        intent: RewriteIntent,
+    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, String> {
+        let intent = match intent {
+            RewriteIntent::DataFiles { rewrite_all } => {
+                DistributedRewriteIntent::DataFiles { rewrite_all }
+            }
+            RewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            } => DistributedRewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            },
+        };
+        let session = self.engine.plan_distributed_rewrite(
+            target,
+            ConnectorWriteOperationId::new(),
+            intent,
+        )?;
+        Ok(Box::new(FrontendDistributedRewriteSession {
+            engine: self.engine,
+            session,
+            committed_receipt: None,
+        }))
+    }
+
+    fn begin_cleanup<'a>(
+        &'a self,
+        target: &MaintenanceTarget,
+        older_than_ms: i64,
+    ) -> Result<Box<dyn CleanupSession + 'a>, String> {
+        let session = self.engine.plan_cleanup_maintenance(
+            target,
+            ConnectorCleanupOperationId::new(),
+            older_than_ms,
+        )?;
+        let raw_candidates = cleanup_candidates_first_page(self.engine, &session)?;
+        let candidates = raw_candidates
+            .iter()
+            .map(cleanup_candidate_fact)
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Box::new(FrontendCleanupSession {
+            engine: self.engine,
+            target: target.clone(),
+            older_than_ms,
+            session,
+            raw_candidates,
+            candidates,
+        }))
+    }
+}
+
+struct FrontendDistributedRewriteSession<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+    session: crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession,
+    committed_receipt: Option<novarocks_spi::connector::ConnectorWriteReceipt>,
+}
+
+impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
+    fn plan_facts(&self) -> RewritePlanFacts {
+        RewritePlanFacts {
+            noop: self.session.is_noop(),
+            cohort_count: self.session.plan().cohorts().len(),
+            input_bytes: self.session.plan().summary().input_bytes,
+        }
+    }
+
+    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), String> {
+        let cohort =
+            self.session.plan().cohorts().get(ordinal).ok_or_else(|| {
+                format!("rewrite cohort ordinal {ordinal} is not in the frozen plan")
+            })?;
+        let prepared = self
+            .engine
+            .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())?;
+        let bundle = crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
+            prepared.encoding(),
+        )
+        .map_err(|error| format!("encode distributed rewrite fragments: {error}"))?;
+        let completion = prepared.finish(bundle)?;
+        self.engine
+            .accumulate_distributed_rewrite_group(&self.session, completion)
+    }
+
+    fn commit(&mut self) -> Result<RewriteCommit, String> {
+        match self.engine.commit_distributed_rewrite(&self.session)? {
+            ExternalMutationOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => {
+                self.committed_receipt = Some(receipt);
+                Ok(RewriteCommit::KnownCommitted {
+                    finalization_failed: match finalization {
+                        ExternalMutationFinalization::Failed(error) => Some(error.to_string()),
+                        _ => None,
+                    },
+                })
+            }
+            ExternalMutationOutcome::KnownUncommitted { failure } => {
+                Ok(RewriteCommit::KnownUncommitted {
+                    failure: failure.to_string(),
+                })
+            }
+            ExternalMutationOutcome::CommitUnknown { failure, .. } => {
+                Ok(RewriteCommit::CommitUnknown {
+                    failure: failure.to_string(),
+                })
+            }
+        }
+    }
+
+    fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
+        let receipt = self.committed_receipt.as_ref().ok_or_else(|| {
+            "distributed rewrite has no committed receipt to finalize".to_string()
+        })?;
+        let receipt = self
+            .engine
+            .finalize_distributed_rewrite(&self.session, receipt)?;
+        let summary = receipt.summary();
+        Ok(RewriteReceiptFacts {
+            target_snapshot_id: summary.target_version,
+            input_data_files: summary.input_data_files,
+            input_delete_files: summary.input_delete_files,
+            output_data_files: summary.output_data_files,
+            output_delete_files: summary.output_delete_files,
+            output_rows: summary.output_rows,
+        })
+    }
+
+    fn abort(&mut self, _reason: String) -> Result<(), String> {
+        self.engine
+            .abort_distributed_rewrite(&self.session)
+            .map(|_| ())
+    }
+}
+
+struct FrontendCleanupSession<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+    target: MaintenanceTarget,
+    older_than_ms: i64,
+    session: crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+    raw_candidates: Vec<ConnectorCleanupCandidate>,
+    candidates: Vec<CleanupCandidate>,
+}
+
+impl CleanupSession for FrontendCleanupSession<'_> {
+    fn candidates(&self) -> &[CleanupCandidate] {
+        &self.candidates
+    }
+
+    fn select_owned_refs(&mut self, candidate_indexes: &[usize]) -> Result<(), String> {
+        let identities = candidate_indexes
+            .iter()
+            .map(|index| {
+                self.raw_candidates
+                    .get(*index)
+                    .and_then(ConnectorCleanupCandidate::owned_ref_identity)
+                    .ok_or_else(|| "owned-ref candidate has no valid exact identity".to_string())
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let selection = ConnectorCleanupOwnedRefSelection::try_new(identities)
+            .map_err(|error| format!("build mature owned-ref cleanup selection failed: {error}"))?;
+        self.session = self.engine.plan_selected_owned_ref_cleanup_maintenance(
+            &self.target,
+            ConnectorCleanupOperationId::new(),
+            self.older_than_ms,
+            selection,
+        )?;
+        Ok(())
+    }
+
+    fn execute(&mut self) -> Result<CleanupTerminal, String> {
+        let batches = self.session.plan_ref().summary().batch_count();
+        for ordinal in 0..batches {
+            let prepared = self.engine.prepare_cleanup_batch(&self.session, ordinal)?;
+            match self.engine.execute_cleanup_batch(&self.session, prepared)? {
+                crate::connector::cleanup_maintenance::CleanupBatchExecution::Receipt(receipt) => {
+                    if receipt.summary().unknown() != 0 {
+                        return Ok(CleanupTerminal::CommitUnknown {
+                            failure: "provider reported an unknown cleanup batch outcome"
+                                .to_string(),
+                        });
+                    }
+                }
+                crate::connector::cleanup_maintenance::CleanupBatchExecution::Uncertain(error) => {
+                    return Ok(CleanupTerminal::CommitUnknown {
+                        failure: error.to_string(),
+                    });
+                }
+            }
+        }
+        let locations = cleanup_candidate_locations(self.engine, &self.session)?;
+        match self.engine.finalize_cleanup_terminal(&self.session) {
+            Ok(()) => Ok(CleanupTerminal::KnownCommitted { locations }),
+            Err(error) => Ok(CleanupTerminal::KnownCommittedFinalizationFailed { failure: error }),
+        }
+    }
+}
+
+fn cleanup_candidate_fact(
+    candidate: &ConnectorCleanupCandidate,
+) -> Result<CleanupCandidate, String> {
+    match candidate {
+        ConnectorCleanupCandidate::Object { .. } => Ok(CleanupCandidate::Object),
+        ConnectorCleanupCandidate::OwnedRef {
+            table_uuid,
+            name,
+            head_snapshot_id,
+            provenance_version,
+            provenance_digest,
+            ..
+        } => Ok(CleanupCandidate::OwnedRef(CleanupOwnedRefFact {
+            table_uuid: *table_uuid,
+            ref_name: name.to_string(),
+            head_snapshot_id: *head_snapshot_id,
+            provenance_version: *provenance_version,
+            provenance_digest: *provenance_digest,
+        })),
+    }
+}
+
+fn cleanup_candidates_first_page(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<ConnectorCleanupCandidate>, String> {
+    let page = engine.read_cleanup_candidate_page(session, 0, 1024)?;
+    if page.candidates().is_empty() && !page.complete() {
+        return Err("cleanup discovery returned a non-terminal empty candidate page".to_string());
+    }
+    Ok(page.candidates().to_vec())
+}
+
+fn cleanup_candidate_locations(
+    engine: &dyn TableMaintenanceEngine,
+    session: &crate::connector::cleanup_maintenance::CleanupMaintenanceSession,
+) -> Result<Vec<String>, String> {
+    let mut offset = 0_u64;
+    let mut locations = Vec::new();
+    loop {
+        let page = engine.read_cleanup_candidate_page(session, offset, 1024)?;
+        locations.extend(page.display_keys().iter().map(ToString::to_string));
+        if page.complete() {
+            return Ok(locations);
+        }
+        offset = offset
+            .checked_add(page.candidates().len() as u64)
+            .ok_or_else(|| "orphan cleanup candidate page offset overflow".to_string())?;
+    }
+}
+
+/// Frontend-only provider binding capture for a product-gated OPTIMIZE job.
+pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
+    engine: &'a dyn TableMaintenanceEngine,
+}
+
+impl<'a> FrontendOptimizeTargetCapturePort<'a> {
+    pub(crate) fn new(engine: &'a dyn TableMaintenanceEngine) -> Self {
+        Self { engine }
+    }
+}
+
+impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
+    fn capture(
+        &self,
+        target: &novarocks_table_maintenance::MaintenanceTarget,
+    ) -> Result<CapturedOptimizeTarget, String> {
+        let object_id = self.engine.capture_target_object_id(target)?;
+        Ok(CapturedOptimizeTarget {
+            object_id: object_id.as_bytes().to_vec(),
+            base_snapshot_id: self.engine.current_snapshot_id(target)?,
+        })
+    }
+}
+
+pub(crate) struct FrontendOptimizeJobAdmissionPort {
+    root_admission: RootAdmissionHandle,
+}
+
+impl FrontendOptimizeJobAdmissionPort {
+    pub(crate) fn new(root_admission: RootAdmissionHandle) -> Self {
+        Self { root_admission }
+    }
+}
+
+impl OptimizeJobAdmissionPort for FrontendOptimizeJobAdmissionPort {
+    fn try_begin(&self) -> Result<OptimizeJobAdmission, String> {
+        match self
+            .root_admission
+            .try_begin_root(WorkRequest::new(WorkClass::TableMaintenance))
+        {
+            Ok(work) => Ok(OptimizeJobAdmission::Acquired(Box::new(
+                FrontendOptimizeJobScope::new(work),
+            ))),
+            Err(WorkError::NotReady)
+            | Err(WorkError::Capacity(_))
+            | Err(WorkError::CapacityWaitTimeout) => Ok(OptimizeJobAdmission::RetryLater),
+            Err(WorkError::Closed) => Ok(OptimizeJobAdmission::Closed),
+            Err(error) => Err(format!("admit governed optimize root failed: {error}")),
+        }
+    }
+}
+
+struct FrontendOptimizeJobScope {
+    work: Mutex<Option<RootWork>>,
+}
+
+impl FrontendOptimizeJobScope {
+    fn new(work: RootWork) -> Self {
+        Self {
+            work: Mutex::new(Some(work)),
+        }
+    }
+}
+
+impl OptimizeJobScope for FrontendOptimizeJobScope {
+    fn is_cancelled(&self) -> Result<bool, String> {
+        let work = self
+            .work
+            .lock()
+            .map_err(|error| format!("lock governed optimize root scope: {error}"))?;
+        let work = work
+            .as_ref()
+            .ok_or_else(|| "governed optimize root scope was released".to_string())?;
+        let cancellation =
+            work.owner.scope().cancellation().map_err(|error| {
+                format!("observe governed optimize cancellation failed: {error}")
+            })?;
+        Ok(cancellation.reason().is_some())
+    }
+}
+
+impl Drop for FrontendOptimizeJobScope {
+    fn drop(&mut self) {
+        let Some(RootWork { owner, business }) = self
+            .work
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        else {
+            return;
+        };
+        drop(business);
+        owner.complete();
+    }
+}
+
+pub(crate) struct FrontendOptimizeJobExecutionPort {
+    engine: Weak<dyn TableMaintenanceEngine>,
+    product: Weak<TableMaintenanceProduct>,
+}
+
+impl FrontendOptimizeJobExecutionPort {
+    pub(crate) fn new(
+        engine: Weak<dyn TableMaintenanceEngine>,
+        product: Weak<TableMaintenanceProduct>,
+    ) -> Self {
+        Self { engine, product }
+    }
+}
+
+impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
+    fn is_available(&self) -> bool {
+        self.engine.strong_count() != 0 && self.product.strong_count() != 0
+    }
+
+    fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
+        self.engine
+            .upgrade()
+            .zip(self.product.upgrade())
+            .map(|(engine, product)| {
+                Box::new(FrontendOptimizeJobExecution { engine, product })
+                    as Box<dyn OptimizeJobExecution>
+            })
+    }
+}
+
+struct FrontendOptimizeJobExecution {
+    engine: Arc<dyn TableMaintenanceEngine>,
+    product: Arc<TableMaintenanceProduct>,
+}
+
+impl OptimizeJobExecution for FrontendOptimizeJobExecution {
+    fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
+        stat2f_before_rebind_barrier(job.job_id)?;
+        let expected_object_id = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
+            &job.object_id,
+        ))
+        .map_err(|error| {
+            format!(
+                "restore optimize job {} target object ID failed: {error}",
+                job.job_id
+            )
+        })?;
+        self.engine
+            .rebind_target_object(&job.target, &expected_object_id)
+    }
+
+    fn execute(
+        &self,
+        job: &OptimizeJob,
+    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+        stat2f_record_provider_dispatch(job.job_id).map_err(OptimizeTerminalError::failed)?;
+        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
+            format!("maintenance-job:{}", job.job_id),
+            format!("maintenance-job:{}", job.job_id),
+        );
+        self.product.execute_rewrite_terminal(
+            &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
+            &job.target,
+            RewriteIntent::DataFiles { rewrite_all: true },
+        )
+    }
+}
 
 /// Runner-owned test root for the STAT-2F cross-process maintenance race.
-///
-/// When configured in a debug build, a claimed optimize job reports its durable
-/// in-process claim before target rebind and waits for the system runner to
-/// replace the table incarnation. This is not compiled into release builds.
 #[cfg(debug_assertions)]
 const STAT2F_TEST_ROOT_ENV: &str = "NOVAROCKS_STAT2F_MAINTENANCE_TEST_DIR";
 #[cfg(debug_assertions)]
 const STAT2F_TEST_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-pub struct OptimizeWorker {
-    runtime: Arc<OptimizeProcessRuntime>,
-    stop: Arc<AtomicBool>,
-    wakeup: Arc<Notify>,
-    join: Option<JoinHandle<Result<(), String>>>,
-}
-
-/// Worker-local execution adapter. It receives one fresh current-process job;
-/// a provider terminal is returned exactly once and never becomes retry input.
-pub trait OptimizeJobExecutor: Send + Sync {
-    fn execute(
-        &self,
-        runtime: &Handle,
-        engine: &dyn TableMaintenanceEngine,
-        job: &OptimizeJob,
-    ) -> Result<MaintenanceActionOutcome, String>;
-}
-
-impl OptimizeWorker {
-    pub fn start_with_executor(
-        runtime: &Handle,
-        jobs: Arc<OptimizeProcessRuntime>,
-        engine: Weak<dyn TableMaintenanceEngine>,
-        executor: Arc<dyn OptimizeJobExecutor>,
-        workload_lifecycle: FrontendServingLifecycle,
-    ) -> Result<Self, String> {
-        let stop = Arc::new(AtomicBool::new(false));
-        let wakeup = Arc::new(Notify::new());
-        let worker_runtime = runtime.clone();
-        let worker_stop = Arc::clone(&stop);
-        let worker_wakeup = Arc::clone(&wakeup);
-        let worker_jobs = Arc::clone(&jobs);
-        let join = runtime.spawn(async move {
-            run_worker(
-                worker_runtime,
-                worker_jobs,
-                engine,
-                executor,
-                worker_stop,
-                worker_wakeup,
-                workload_lifecycle,
-            )
-            .await
-        });
-        Ok(Self {
-            runtime: jobs,
-            stop,
-            wakeup,
-            join: Some(join),
-        })
-    }
-
-    pub fn wakeup(&self) {
-        self.wakeup.notify_one();
-    }
-
-    pub fn request_stop(&self) {
-        self.runtime.stop_admission();
-        self.stop.store(true, Ordering::Release);
-        self.wakeup();
-    }
-
-    pub async fn shutdown_until(&mut self, deadline: Instant) -> Result<(), String> {
-        self.request_stop();
-        let Some(join) = self.join.as_mut() else {
-            return Ok(());
-        };
-        let joined = tokio::time::timeout_at(deadline.into(), join)
-            .await
-            .map_err(|_| {
-                "table maintenance worker did not stop before the shared shutdown deadline"
-                    .to_string()
-            })?;
-        self.join.take();
-        joined.map_err(|error| format!("table maintenance worker join failed: {error}"))?
-    }
-
-    pub(crate) fn has_join_owner(&self) -> bool {
-        self.join.is_some()
-    }
-}
-
-async fn run_worker(
-    runtime: Handle,
-    jobs: Arc<OptimizeProcessRuntime>,
-    engine: Weak<dyn TableMaintenanceEngine>,
-    executor: Arc<dyn OptimizeJobExecutor>,
-    stop: Arc<AtomicBool>,
-    wakeup: Arc<Notify>,
-    workload_lifecycle: FrontendServingLifecycle,
-) -> Result<(), String> {
-    loop {
-        if stop.load(Ordering::Acquire) {
-            jobs.request_shutdown_cancellation()
-                .await
-                .map_err(|error| {
-                    format!("request optimize shutdown cancellation failed: {error}")
-                })?;
-            return Ok(());
-        }
-        let Some(engine) = engine.upgrade() else {
-            jobs.request_shutdown_cancellation()
-                .await
-                .map_err(|error| {
-                    format!("cancel optimize jobs after engine drop failed: {error}")
-                })?;
-            return Ok(());
-        };
-        match workload_lifecycle.frontend_serving_snapshot().serving_state {
-            FrontendServingState::Starting => {
-                tokio::select! {
-                    _ = wakeup.notified() => {}
-                    _ = jobs.wait_for_change() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                }
-                continue;
-            }
-            FrontendServingState::Ready => {}
-            FrontendServingState::Draining | FrontendServingState::Stopping => return Ok(()),
-        }
-        let workload_lease = match workload_lifecycle.try_admit(FrontendWorkloadKind::Background) {
-            Ok(lease) => lease,
-            Err(_) => return Ok(()),
-        };
-        let Some(job) = jobs
-            .claim_next(now_unix_millis())
-            .await
-            .map_err(|error| format!("claim current optimize job failed: {error}"))?
-        else {
-            drop(workload_lease);
-            tokio::select! {
-                _ = wakeup.notified() => {}
-                _ = jobs.wait_for_change() => {}
-            }
-            continue;
-        };
-        execute_claimed_job(
-            &runtime,
-            jobs.as_ref(),
-            engine,
-            Arc::clone(&executor),
-            job,
-            workload_lease.cancellation_source().view(),
-        )
-        .await?;
-    }
-}
-
-async fn execute_claimed_job(
-    runtime: &Handle,
-    jobs: &OptimizeProcessRuntime,
-    engine: Arc<dyn TableMaintenanceEngine>,
-    executor: Arc<dyn OptimizeJobExecutor>,
-    job: OptimizeJob,
-    cancellation: crate::common::query_cancellation::QueryCancellationView,
-) -> Result<(), String> {
-    let job_id = job.job_id;
-    if cancellation.is_cancelled() {
-        jobs.finish(
-            job_id,
-            Err(OptimizeTerminalError::failed(
-                "optimize job cancelled before target rebind",
-            )),
-            now_unix_millis(),
-        )
-        .await
-        .map_err(|error| format!("record cancelled optimize job failed: {error}"))?;
-        return Ok(());
-    }
-    stat2f_before_rebind_barrier(job_id)?;
-    if cancellation.is_cancelled() {
-        jobs.finish(
-            job_id,
-            Err(OptimizeTerminalError::failed(
-                "optimize job cancelled before target rebind",
-            )),
-            now_unix_millis(),
-        )
-        .await
-        .map_err(|error| format!("record cancelled optimize job failed: {error}"))?;
-        return Ok(());
-    }
-    let expected_object_id = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
-        &job.object_id,
-    ))
-    .map_err(|error| format!("restore optimize job {job_id} target object ID failed: {error}"))?;
-    let terminal = match engine.rebind_target_object(&job.target, &expected_object_id) {
-        Ok(MaintenanceTargetRebind::Bound) => None,
-        Ok(MaintenanceTargetRebind::Replaced) => Some(Err(OptimizeTerminalError::target_replaced(
-            "optimize target was replaced before provider dispatch",
-        ))),
-        Ok(MaintenanceTargetRebind::Missing) => Some(Err(OptimizeTerminalError::failed(
-            "optimize target is missing before provider dispatch",
-        ))),
-        Err(error) => Some(Err(OptimizeTerminalError::failed(format!(
-            "optimize target rebind failed before provider dispatch: {error}"
-        )))),
-    };
-    if let Some(terminal) = terminal {
-        jobs.finish(job_id, terminal, now_unix_millis())
-            .await
-            .map_err(|error| format!("record optimize pre-dispatch terminal failed: {error}"))?;
-        return Ok(());
-    }
-    if cancellation.is_cancelled()
-        || jobs
-            .cancellation_requested(job_id)
-            .await
-            .map_err(|error| format!("read optimize cancellation failed: {error}"))?
-    {
-        jobs.finish(
-            job_id,
-            Err(OptimizeTerminalError::failed(
-                "optimize job cancelled before provider dispatch",
-            )),
-            now_unix_millis(),
-        )
-        .await
-        .map_err(|error| format!("record cancelled optimize job failed: {error}"))?;
-        return Ok(());
-    }
-
-    stat2f_record_provider_dispatch(job_id)?;
-    let worker_runtime = runtime.clone();
-    let execution = tokio::task::spawn_blocking(move || {
-        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
-            format!("maintenance-job:{job_id}"),
-            format!("maintenance-job:{job_id}"),
-        );
-        executor.execute(&worker_runtime, engine.as_ref(), &job)
-    })
-    .await
-    .map_err(|error| format!("optimize job {job_id} engine task failed: {error}"))
-    .and_then(|result| result)
-    .and_then(optimize_outcome)
-    .map_err(OptimizeTerminalError::failed);
-    jobs.finish(job_id, execution, now_unix_millis())
-        .await
-        .map_err(|error| format!("record optimize terminal failed: {error}"))?;
-    Ok(())
-}
 
 #[cfg(debug_assertions)]
 fn stat2f_before_rebind_barrier(job_id: i64) -> Result<(), String> {
@@ -392,164 +596,6 @@ fn stat2f_test_paths(root: &std::path::Path, job_id: i64) -> Stat2fTestPaths {
     }
 }
 
-pub(crate) fn optimize_outcome(
-    outcome: MaintenanceActionOutcome,
-) -> Result<super::model::OptimizeJobOutcome, String> {
-    let MaintenanceActionOutcome::RewriteDataFiles {
-        target_snapshot_id,
-        rewritten_data_files_count,
-        added_data_files_count,
-        removed_delete_files_count,
-        output_record_count,
-        ..
-    } = outcome
-    else {
-        return Err("optimize worker expected a RewriteDataFiles outcome".to_string());
-    };
-    Ok(super::model::OptimizeJobOutcome {
-        target_snapshot_id,
-        rewritten_data_files: i64::from(rewritten_data_files_count),
-        deleted_data_files: i64::from(removed_delete_files_count),
-        added_data_files: i64::from(added_data_files_count),
-        output_record_count,
-    })
-}
-
-#[cfg(test)]
-mod lifecycle_tests {
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
-    use std::time::{Duration, Instant};
-
-    use novarocks_spi::connector::ConnectorTableObjectId;
-
-    use super::{OptimizeJobExecutor, OptimizeWorker, run_worker};
-    use crate::maintenance::MaintenanceTarget;
-    use crate::query_execution::maintenance::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceRequestContext,
-        MaintenanceTargetRebind, TableMaintenanceEngine,
-    };
-    use crate::table_maintenance::model::OptimizeJob;
-    use crate::table_maintenance::runtime::OptimizeProcessRuntime;
-    use crate::workload_lifecycle::FrontendServingLifecycle;
-
-    struct NeverRunEngine;
-
-    impl TableMaintenanceEngine for NeverRunEngine {
-        fn resolve_target(
-            &self,
-            _name_parts: &[String],
-            _context: MaintenanceRequestContext<'_>,
-        ) -> Result<MaintenanceTarget, String> {
-            Err("never run".to_string())
-        }
-
-        fn capture_target_object_id(
-            &self,
-            _target: &MaintenanceTarget,
-        ) -> Result<ConnectorTableObjectId, String> {
-            Err("never run".to_string())
-        }
-
-        fn rebind_target_object(
-            &self,
-            _target: &MaintenanceTarget,
-            _expected_object_id: &ConnectorTableObjectId,
-        ) -> Result<MaintenanceTargetRebind, String> {
-            Err("never run".to_string())
-        }
-
-        fn reject_user_action_on_mv(&self, _target: &MaintenanceTarget) -> Result<(), String> {
-            Err("never run".to_string())
-        }
-
-        fn current_snapshot_id(&self, _target: &MaintenanceTarget) -> Result<i64, String> {
-            Err("never run".to_string())
-        }
-
-        fn execute_action(
-            &self,
-            _request: MaintenanceActionRequest,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            Err("never run".to_string())
-        }
-    }
-
-    struct NeverRunExecutor;
-
-    impl OptimizeJobExecutor for NeverRunExecutor {
-        fn execute(
-            &self,
-            _runtime: &tokio::runtime::Handle,
-            _engine: &dyn TableMaintenanceEngine,
-            _job: &OptimizeJob,
-        ) -> Result<MaintenanceActionOutcome, String> {
-            Err("never run".to_string())
-        }
-    }
-
-    #[tokio::test]
-    async fn starting_worker_waits_for_the_serving_lifecycle() {
-        let lifecycle = FrontendServingLifecycle::new();
-        let jobs = Arc::new(OptimizeProcessRuntime::new());
-        let engine: Arc<dyn TableMaintenanceEngine> = Arc::new(NeverRunEngine);
-        let executor: Arc<dyn OptimizeJobExecutor> = Arc::new(NeverRunExecutor);
-        let worker = tokio::spawn(run_worker(
-            tokio::runtime::Handle::current(),
-            Arc::clone(&jobs),
-            Arc::downgrade(&engine),
-            executor,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(tokio::sync::Notify::new()),
-            lifecycle.clone(),
-        ));
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(
-            !worker.is_finished(),
-            "the optimize worker must not exit while the frontend is starting"
-        );
-
-        lifecycle.mark_ready().expect("mark lifecycle ready");
-        lifecycle.begin_drain(Duration::from_secs(1));
-        tokio::time::timeout(Duration::from_secs(1), worker)
-            .await
-            .expect("worker observes the terminal serving state")
-            .expect("worker task joins")
-            .expect("worker exits without claiming a job");
-    }
-
-    #[tokio::test]
-    async fn shared_deadline_retains_the_same_optimize_join_for_retry() {
-        let release = Arc::new(tokio::sync::Notify::new());
-        let wait = Arc::clone(&release);
-        let join = tokio::spawn(async move {
-            wait.notified().await;
-            Ok(())
-        });
-        let mut worker = OptimizeWorker {
-            runtime: Arc::new(OptimizeProcessRuntime::new()),
-            stop: Arc::new(AtomicBool::new(false)),
-            wakeup: Arc::new(tokio::sync::Notify::new()),
-            join: Some(join),
-        };
-
-        let error = worker
-            .shutdown_until(Instant::now() + Duration::from_millis(10))
-            .await
-            .expect_err("blocked optimize worker must respect the shared deadline");
-        assert!(error.contains("shared shutdown deadline"));
-        assert!(worker.has_join_owner());
-
-        release.notify_one();
-        worker
-            .shutdown_until(Instant::now() + Duration::from_secs(1))
-            .await
-            .expect("the retained optimize join remains retryable");
-        assert!(!worker.has_join_owner());
-    }
-}
-
 #[cfg(all(test, debug_assertions))]
 mod stat2f_test_hook_tests {
     use std::ffi::OsString;
@@ -600,29 +646,28 @@ mod stat2f_test_hook_tests {
         let temporary = TempDir::new().expect("create test root");
         let root = temporary.path().join("stat2f-hook");
         std::fs::create_dir(&root).expect("create hook directory");
-        let _hook_environment = ScopedTestEnv::set(&root);
-        let job_id = 42;
+        let _scope = ScopedTestEnv::set(&root);
+        let job_id = 19;
         let paths = stat2f_test_paths(&root, job_id);
 
-        let barrier = std::thread::spawn(move || stat2f_before_rebind_barrier(job_id));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let waiter = std::thread::spawn(move || stat2f_before_rebind_barrier(job_id));
+        let deadline = Instant::now() + Duration::from_secs(1);
         while !paths.ready.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(5));
         }
-        assert!(paths.ready.exists(), "barrier never reported readiness");
+        assert!(paths.ready.exists(), "the barrier exposes its ready marker");
         assert_eq!(
-            std::fs::read_to_string(&paths.dispatch_count).expect("read zero counter"),
+            std::fs::read_to_string(&paths.dispatch_count).unwrap(),
             "0\n"
         );
-
-        std::fs::write(&paths.resume, "resume\n").expect("create resume trigger");
-        barrier
+        std::fs::write(&paths.resume, "resume\n").expect("release barrier");
+        waiter
             .join()
-            .expect("join barrier thread")
-            .expect("resume barrier");
-        stat2f_record_provider_dispatch(job_id).expect("record provider dispatch");
+            .expect("barrier joins")
+            .expect("barrier resumes");
+        stat2f_record_provider_dispatch(job_id).expect("record first provider dispatch");
         assert_eq!(
-            std::fs::read_to_string(&paths.dispatch_count).expect("read dispatch counter"),
+            std::fs::read_to_string(&paths.dispatch_count).unwrap(),
             "1\n"
         );
     }

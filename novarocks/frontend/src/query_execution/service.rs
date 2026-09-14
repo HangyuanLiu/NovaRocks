@@ -24,11 +24,11 @@ use crate::query_execution::completion::{
     QueryAttemptReservation,
 };
 use crate::query_execution::contract::{
-    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryOutcome,
-    DistributedQueryRequest,
+    DistributedQueryCoordinator, DistributedQueryError, DistributedQueryRequest,
 };
 use crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession;
-use crate::runtime::statement_result::StatementResult;
+use crate::query_execution::outcome::DistributedQueryOutcome;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorDistributedRewriteLease, ConnectorDistributedRewritePlan, ConnectorRequestContext,
 };
@@ -103,7 +103,7 @@ impl QueryExecutionService {
         &self,
         plan: ConnectorDistributedRewritePlan,
         lease: ConnectorDistributedRewriteLease,
-        write_stack: crate::connector::control_host::ConnectorWriteStackLease,
+        write_stack: novarocks_catalog_application::ConnectorWriteStackLease,
         table: &novarocks_spi::connector::ConnectorTableMetadata,
         context: ConnectorRequestContext,
     ) -> Result<ConnectorDistributedRewriteSession, DistributedQueryError> {

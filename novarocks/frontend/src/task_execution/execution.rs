@@ -781,6 +781,22 @@ impl QueryTaskExecution {
         Ok(())
     }
 
+    /// Applies the positive closure fact from a definitive actor-owned Abort
+    /// receipt. The actor owns the Abort issue and settlement; this method
+    /// only projects that already-validated Worker fact to the matching
+    /// context owner so normal attempt convergence can observe it.
+    pub(crate) fn observe_actor_abort_context_closed(
+        &mut self,
+        context: QueryContextRef,
+    ) -> Result<(), TaskExecutionError> {
+        let owner = self
+            .owners
+            .get_mut(&context)
+            .ok_or(TaskExecutionError::UnknownOperation)?;
+        owner.observe_actor_abort_closure();
+        Ok(())
+    }
+
     /// Forces one context down, ahead of everything queued for it.
     pub fn abort_context(
         &mut self,

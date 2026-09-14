@@ -17,15 +17,19 @@
 
 //! Fragment exchange-node decoding.
 
-use super::common::parse_optional_nonnegative_i64;
-use super::{DecodedNode, NativePlanDecodeContext, sort};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::expr::{ExprArena, ExprId};
 use novarocks_execution::exec::node::exchange_source::ExchangeSourceNode;
 use novarocks_execution::exec::node::limit::LimitNode;
 use novarocks_execution::exec::node::sort::{SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
+use novarocks_native_adapter::fragment_plan_node::{
+    lower_sort_items_for_layout, parse_optional_nonnegative_i64,
+};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
 
@@ -64,7 +68,7 @@ pub(super) fn lower_exchange_receiver(
     // The instance-scoped ExchangeKey and sender count are materialized into the
     // per-node ExchangeBinding at execution time, not baked into the static node.
     NativeFragmentDecodeError::map_invalid(path.clone(), ctx.exchange_input(node.node_id))?;
-    let output_layout = ctx.decode_output_layout(
+    let output_layout = decode_fragment_output_layout(
         &exchange.output_columns,
         path.clone().field("output_columns"),
     )?;
@@ -80,7 +84,6 @@ pub(super) fn lower_exchange_receiver(
         path.clone().field("partition_exprs"),
         arena,
         &layout,
-        ctx,
     )?;
     let mut lowered = DecodedNode {
         node: ExecNode {
@@ -134,7 +137,7 @@ pub(super) fn lower_exchange_receiver(
             }
         }
         plan::exchange_flavor::Kind::TopnSplit(topn) => {
-            let order_by = sort::lower_sort_items_with_context(
+            let order_by = lower_sort_items_for_layout(
                 "ExchangeReceiver TopNSplit",
                 &topn.items,
                 path.clone()
@@ -143,7 +146,6 @@ pub(super) fn lower_exchange_receiver(
                     .field("items"),
                 arena,
                 &lowered.layout,
-                ctx,
             )?;
             let limit = NativeFragmentDecodeError::map_invalid(
                 path.clone()
@@ -194,7 +196,6 @@ fn decode_hash_partition_exprs(
     path: FieldPath,
     arena: &mut ExprArena,
     layout: &Layout,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<Vec<ExprId>, NativeFragmentDecodeError> {
     if !matches!(
         plan::PartitionType::try_from(exchange.partition_type),
@@ -206,7 +207,9 @@ fn decode_hash_partition_exprs(
         .partition_exprs
         .iter()
         .enumerate()
-        .map(|(index, expr)| ctx.decode_expression(expr, path.clone().index(index), arena, layout))
+        .map(|(index, expr)| {
+            decode_expr_for_slot_layout(expr, path.clone().index(index), arena, layout)
+        })
         .collect()
 }
 
@@ -215,10 +218,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::exchange::ExchangeKey;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 

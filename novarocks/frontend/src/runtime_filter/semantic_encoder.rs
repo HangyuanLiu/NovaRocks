@@ -5,7 +5,7 @@
 //! bindings and participant deployment/install contributions.
 
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::{
+use crate::query_execution::preparation::runtime_filter_view::{
     RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
     RuntimeFilterReductionFacts, RuntimeFilterSortDirection,
 };
@@ -354,7 +354,7 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::RuntimeFilterOrderKeyFacts;
+    use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterOrderKeyFacts;
 
     fn digest(hex: &str) -> [u8; 32] {
         hex::decode(hex)

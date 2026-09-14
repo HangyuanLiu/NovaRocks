@@ -72,7 +72,10 @@ fn artifact_properties_type() -> DataType {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatisticsExecutionMode {
     SynchronousWait,
-    ProcessJobAttempt,
+    /// A process-owned statistics job has reached its collection query
+    /// attempt. This is intentionally not the business job identity and not
+    /// the provider publication identity.
+    BackgroundCollectionAttempt,
 }
 
 impl StatisticsExecutionMode {
@@ -274,14 +277,14 @@ impl PreparedStatisticsCollectionRequest {
 /// program into an ordinary distributed query.
 pub struct StatisticsPlanningServices<'a> {
     controls: &'a dyn ConnectorControlResolver,
-    typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
     functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
 }
 
 impl<'a> StatisticsPlanningServices<'a> {
     pub fn new(
         controls: &'a dyn ConnectorControlResolver,
-        typed_connector_control: &'a Arc<crate::connector::ConnectorControlHost>,
+        typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
         functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
     ) -> Self {
         Self {

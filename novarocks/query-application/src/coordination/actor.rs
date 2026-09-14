@@ -2214,9 +2214,13 @@ async fn run_actor(
             && result_runtime.as_ref().is_some_and(|runtime| {
                 matches!(runtime.in_flight, Some(InFlightResult::End { .. }))
             });
+        let finish_establish_ready =
+            settle_finish_establish_readiness(state, &mut attempts, result_runtime.as_mut());
         if state.conclusion().is_some() && !committed_end_awaiting_transport {
             fail_result_runtime(state, result_runtime.as_mut());
-        } else if drive_root_success(state, result_runtime.as_mut()).is_err() {
+        } else if drive_root_success(state, result_runtime.as_mut(), finish_establish_ready)
+            .is_err()
+        {
             conclude_failed(state);
             fail_result_runtime(state, result_runtime.as_mut());
         }
@@ -2319,7 +2323,14 @@ async fn run_actor(
                 }
             }
             event = wait_for_attempt_ledger_event(&mut attempts, clock.as_ref()) => {
-                apply_attempt_ledger_event(state, &mut attempts, event, &mut establish_error, &mut stand_down_error);
+                apply_attempt_ledger_event(
+                    state,
+                    &mut attempts,
+                    event,
+                    &mut establish_error,
+                    &mut stand_down_error,
+                    result_runtime.as_mut(),
+                );
             }
             receipt = replacement_receipt_rx.recv(), if replacement_effect_pending => {
                 apply_replacement_receipt(
@@ -2513,6 +2524,7 @@ fn apply_attempt_ledger_event(
     event: AttemptLedgerEvent,
     establish_error: &mut Option<EstablishIssueError>,
     stand_down_error: &mut Option<ContextStandDownError>,
+    result_runtime: Option<&mut ResultRuntime>,
 ) {
     match event {
         AttemptLedgerEvent::Establish(execution, result) => {
@@ -2532,6 +2544,12 @@ fn apply_attempt_ledger_event(
                 attempt.establish.revoke_issue_authority();
                 if matches!(state.phase(), ExecutionPhase::Running { execution: current, .. } if current == execution)
                 {
+                    if let Some(runtime) = result_runtime {
+                        runtime.terminal_error = Some(QueryExecutionError::new(
+                            crate::api::QueryExecutionErrorKind::Failed,
+                            format!("logical execution Establish issue failed: {error}"),
+                        ));
+                    }
                     conclude_failed(state);
                 }
             }
@@ -3101,14 +3119,54 @@ fn apply_root_terminal_observation(
     );
 }
 
+/// The native Task round may observe its root success seal before the actor
+/// has consumed the matching Establish settlement. Success EOF is therefore
+/// gated on the actor ledger, not on incidental scheduling order between the
+/// Task round and this mailbox.
+fn settle_finish_establish_readiness(
+    state: &mut LogicalExecutionState,
+    attempts: &mut BTreeMap<QueryExecutionId, AttemptLedgers>,
+    runtime: Option<&mut ResultRuntime>,
+) -> bool {
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    let Some(finish) = runtime.finish_waiter.as_ref() else {
+        return true;
+    };
+    let execution = finish.permit.identity().execution();
+    let result = attempts
+        .get_mut(&execution)
+        .ok_or(EstablishIssueError::UnknownContext)
+        .and_then(|attempt| attempt.establish.ensure_success_ready());
+    match result {
+        Ok(()) => true,
+        Err(EstablishIssueError::EstablishNotSettled) => false,
+        Err(error) => {
+            runtime.terminal_error = Some(QueryExecutionError::new(
+                crate::api::QueryExecutionErrorKind::Failed,
+                format!(
+                    "logical execution cannot emit success EOF because Establish settlement failed: {error}"
+                ),
+            ));
+            conclude_failed(state);
+            false
+        }
+    }
+}
+
 fn drive_root_success(
     state: &LogicalExecutionState,
     runtime: Option<&mut ResultRuntime>,
+    finish_establish_ready: bool,
 ) -> Result<(), LogicalExecutionActorError> {
     let Some(runtime) = runtime else {
         return Ok(());
     };
     if runtime.finish_waiter.is_none() || runtime.pending.is_some() || runtime.in_flight.is_some() {
+        return Ok(());
+    }
+    if !finish_establish_ready {
         return Ok(());
     }
     let Some(gate) = runtime.root_success.as_ref() else {
@@ -3815,12 +3873,8 @@ fn handle_command(
                 conclude_consumed_handoff_as_failed(state, permit, reply);
                 return;
             };
-            let success_ready = attempts
-                .get_mut(&activation.execution())
-                .ok_or(LogicalExecutionActorError::WrongExecution)
-                .and_then(|attempt| attempt.establish.ensure_success_ready().map_err(Into::into));
             if verify_running_activation(state, activation).is_err()
-                || success_ready.is_err()
+                || !attempts.contains_key(&activation.execution())
                 || !matches!(
                     runtime.root_success.as_ref(),
                     Some(gate) if gate.activation == activation
@@ -6398,6 +6452,181 @@ mod tests {
             actor.fail_attempt(successor).await.unwrap(),
             LogicalConclusion::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn current_establish_rejection_preserves_the_result_stream_cause() {
+        let runtime = Handle::current();
+        let execution = execution(822);
+        let frontend = FrontendProcessId::new_v7();
+        let context = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let (work_owner, stage) = test_governed_work();
+        let config = LogicalExecutionActorConfig::single_attempt_read_rows(
+            execution,
+            NonZeroUsize::new(4).unwrap(),
+            vec![context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+            result_schema(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(
+            super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("row execution must expose its result stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(context, 22);
+        let admission = running
+            .begin_admission_issue(admission_request(context, 22))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(context, ticket, 22),
+                NativeCompatibilityId::new([22; 32]),
+            )
+            .await
+            .unwrap();
+        let transport = HoldingEstablishTransport::default();
+        assert_eq!(
+            establish.try_submit(&transport).unwrap(),
+            EstablishIssueSubmit::Accepted
+        );
+        transport
+            .take()
+            .worker_settled(OperationOutcome::ContextConflict)
+            .unwrap();
+
+        wait_for_conclusion(&actor, LogicalConclusion::Failed).await;
+        let error = match stream.next().await {
+            Err(error) => error,
+            Ok(_) => panic!("failed Establish must terminate the result stream"),
+        };
+        assert_eq!(error.kind(), QueryExecutionErrorKind::Failed);
+        assert_eq!(
+            error.message(),
+            "logical execution Establish issue failed: logical execution completed after a Worker rejected Establish"
+        );
+        drop(running);
+        drop(stream);
+        drop(actor);
+        drop(owner);
+    }
+
+    #[tokio::test]
+    async fn finish_waits_for_the_establish_settlement_that_precedes_success_eof() {
+        let runtime = Handle::current();
+        let execution = execution(823);
+        let frontend = FrontendProcessId::new_v7();
+        let context = QueryContextRef::new(execution, frontend, BackendProcessId::new_v7());
+        let (work_owner, stage) = test_governed_work();
+        let config = LogicalExecutionActorConfig::single_attempt_read_rows(
+            execution,
+            NonZeroUsize::new(4).unwrap(),
+            vec![context],
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            work_owner,
+            stage,
+            result_schema(),
+            NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap()
+        .with_abort_query_context_effect_port(
+            super::super::PermanentlyBackpressuredAbortEffectPort::shared(),
+            NonZeroUsize::new(2).unwrap(),
+        );
+        let (owner, initial, output) = spawn_logical_execution_actor(&runtime, config)
+            .unwrap()
+            .into_parts();
+        let ExecutionOutput::Rows(mut stream) = output.into_output() else {
+            panic!("row execution must expose its result stream");
+        };
+        stream.begin_schema().unwrap().complete();
+        let actor = owner.actor().clone();
+        let running = actor.activate(initial.ready()).await.unwrap();
+        let ticket = admission_ticket(context, 23);
+        let admission = running
+            .begin_admission_issue(admission_request(context, 23))
+            .await
+            .unwrap();
+        running
+            .settle_admission_issue(
+                admission,
+                AdmissionIssueSettlement::applied(
+                    admission.operation_id(),
+                    OperationOutcome::Accepted,
+                    ticket,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let establish = running
+            .authorize_establish(
+                establish_request(context, ticket, 23),
+                NativeCompatibilityId::new([23; 32]),
+            )
+            .await
+            .unwrap();
+        let transport = HoldingEstablishTransport::default();
+        assert_eq!(
+            establish.try_submit(&transport).unwrap(),
+            EstablishIssueSubmit::Accepted
+        );
+
+        let root = root_task(execution, 23);
+        let observer = running.bind_root_result(root).await.unwrap();
+        observer
+            .observe_status(root_status(root, 1, TaskState::Finished))
+            .await
+            .unwrap();
+        observer
+            .observe_final_worker_eos_ack(root, ResultPacketSequence::new(0))
+            .await
+            .unwrap();
+        let finish = tokio::spawn(async move { running.finish_result_stream().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !finish.is_finished(),
+            "success EOF must wait for the exact Establish Worker settlement"
+        );
+
+        transport
+            .take()
+            .worker_settled(OperationOutcome::Accepted)
+            .unwrap();
+        let ResultDelivery::End(end) = stream.next().await.unwrap().unwrap() else {
+            panic!("settled Establish must permit success EOF");
+        };
+        end.complete();
+        assert_eq!(finish.await.unwrap().unwrap(), LogicalConclusion::Succeeded);
+        drop(stream);
+        drop(actor);
+        drop(owner);
     }
 
     #[tokio::test]

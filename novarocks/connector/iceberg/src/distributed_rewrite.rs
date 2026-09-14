@@ -240,7 +240,10 @@ impl IcebergDistributedRewriteControl {
                 .flat_map(|group| &group.data_files)
                 .map(|file| file.size.max(0) as u64)
                 .sum(),
-            expected_output_files: 0,
+            // Planning proves the frozen inputs, not how many writer files a
+            // future execution will publish. `None` is deliberately distinct
+            // from a proven no-op's `Some(0)`.
+            expected_output_files: None,
         };
         let payload = canonical_json(&IcebergRewritePlanPayloadV1 {
             version: 1,
@@ -329,13 +332,31 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
         self.runtime
             .control_state()
             .invalidate_table_cache(&target.namespace, &target.table);
+        let output_facts =
+            crate::write_codec::decode_write_receipt_output_facts(receipt).map_err(invalid)?;
+        let (output_data_files, output_delete_files, output_rows) = match output_facts {
+            Some(facts) => (
+                Some(facts.data_files),
+                Some(
+                    facts
+                        .position_delete_files
+                        .checked_add(facts.deletion_vectors)
+                        .and_then(|count| count.checked_add(facts.equality_delete_files))
+                        .ok_or_else(|| {
+                            invalid("Iceberg rewrite output delete file count overflow")
+                        })?,
+                ),
+                Some(facts.data_rows),
+            ),
+            None => (None, None, None),
+        };
         ConnectorDistributedRewriteReceipt::try_new(
             ConnectorDistributedRewriteReceiptSummary {
                 input_data_files: plan.summary().input_data_files,
                 input_delete_files: plan.summary().input_delete_files,
-                output_data_files: 0,
-                output_delete_files: 0,
-                output_rows: receipt.resulting_row_count().unwrap_or(0),
+                output_data_files,
+                output_delete_files,
+                output_rows,
                 target_version: receipt
                     .committed_version()
                     .and_then(|version| version.snapshot_id()),

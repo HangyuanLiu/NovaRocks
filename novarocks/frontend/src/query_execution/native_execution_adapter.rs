@@ -73,7 +73,6 @@ use crate::query_execution::completion::PreparedLogicalRead;
 use crate::query_execution::contract::{DistributedQueryError, ResolvedQueryOptions};
 use crate::query_execution::lifecycle_plan::QueryInitOptions;
 use crate::query_execution::logical_read::LogicalReadLauncher;
-use crate::query_execution::split_assignment::TaskUpdateRetryPolicy;
 use crate::query_execution::split_assignment_round::SplitAssignmentRoundGuard;
 use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
@@ -90,6 +89,7 @@ use crate::task_execution::intent::{
 use crate::task_execution::manifest_round::{ManifestAssembledRound, ManifestAttemptCompletion};
 use crate::task_execution::sources::AttemptEstablishFacts;
 use crate::task_execution::status_intake::{NotifyWake, StatusIntakeWake};
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
 /// One logical execution's Abort port. Every physical attempt installs one
 /// exact route and retains its registration through residual convergence.
@@ -808,6 +808,8 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     coordination_budgets: CoordinationBudgets,
     transport_budget: TransportBudget,
     abort_capacity: NonZeroUsize,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
@@ -843,6 +845,9 @@ impl FrontendNativeLogicalExecutionRuntime {
         coordination_budgets: CoordinationBudgets,
         transport_budget: TransportBudget,
         abort_capacity: NonZeroUsize,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
     ) -> Self {
         Self {
             topology,
@@ -856,6 +861,7 @@ impl FrontendNativeLogicalExecutionRuntime {
             coordination_budgets,
             transport_budget,
             abort_capacity,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1119,6 +1125,7 @@ impl FrontendDormantAttemptFactory for ProductionDormantAttemptFactory {
         Ok(FrontendTaskProtocolDormantBehavior::new(
             self.projection.clone(),
             ManifestAttemptCompletion::AcceptedRootSuccessSeal,
+            Arc::clone(&self.projection.runtime.lifecycle_diagnostics),
         ))
     }
 
@@ -1400,6 +1407,8 @@ fn projection_message(message: impl Into<String>) -> NativeAttemptActivationFail
 pub(crate) struct FrontendTaskProtocolDormantBehavior<P> {
     projection: P,
     completion: ManifestAttemptCompletion,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl<P> std::fmt::Debug for FrontendTaskProtocolDormantBehavior<P>
@@ -1416,10 +1425,17 @@ where
 }
 
 impl<P> FrontendTaskProtocolDormantBehavior<P> {
-    pub(crate) const fn new(projection: P, completion: ManifestAttemptCompletion) -> Self {
+    pub(crate) fn new(
+        projection: P,
+        completion: ManifestAttemptCompletion,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
+    ) -> Self {
         Self {
             projection,
             completion,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1462,6 +1478,7 @@ where
             Ok(FrontendTaskProtocolActiveBehavior::new(
                 attempt,
                 self.completion,
+                Arc::clone(&self.lifecycle_diagnostics),
             ))
         })
     }
@@ -1489,6 +1506,8 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     split_assignment: Option<SplitAssignmentRoundGuard>,
     credential_rotation: Option<Arc<CredentialRotationPump>>,
     abort_route: Option<LogicalAbortRoute>,
+    lifecycle_diagnostics:
+        Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
 }
 
 impl std::fmt::Debug for FrontendTaskProtocolActiveBehavior {
@@ -1504,6 +1523,9 @@ impl FrontendTaskProtocolActiveBehavior {
     pub(crate) fn new(
         attempt: ProjectedManifestAttempt,
         completion: ManifestAttemptCompletion,
+        lifecycle_diagnostics: Arc<
+            crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
+        >,
     ) -> Self {
         let ProjectedManifestAttempt {
             round,
@@ -1521,6 +1543,7 @@ impl FrontendTaskProtocolActiveBehavior {
             split_assignment,
             credential_rotation,
             abort_route,
+            lifecycle_diagnostics,
         }
     }
 }
@@ -1541,10 +1564,39 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
 
     fn converge<'a>(
         &'a mut self,
-        _inputs: &'a mut ManifestBoundNativeAttemptInputs,
+        inputs: &'a mut ManifestBoundNativeAttemptInputs,
         cancellation: CancellationView,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        Box::pin(self.attempt.converge(cancellation))
+        let execution_id = inputs.execution_id();
+        Box::pin(async move {
+            let convergence = self.attempt.converge(cancellation).await;
+            let contributions = self
+                .attempt
+                .round
+                .execution()
+                .released_runtime_filter_contributions();
+            let runtime_filter = if contributions.is_complete() {
+                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Available(
+                    crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions(
+                        contributions.contributions(),
+                    ),
+                )
+            } else {
+                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
+                )
+            };
+            self.lifecycle_diagnostics.publish(
+                crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+                    execution_id,
+                    error_source: None,
+                    primary_error: None,
+                    runtime_filter,
+                    metrics: crate::metrics::FrontendProcessQueryCountersSnapshot::default(),
+                },
+            );
+            convergence
+        })
     }
 }
 
@@ -1902,6 +1954,13 @@ where
                 }
             };
             state.last_topology_revision = Some(snapshot.revision());
+            bind_query_lifecycle_fault_scopes(request.execution(), &snapshot).map_err(|error| {
+                attempt_failure(
+                    AttemptFailureClass::ContractViolation,
+                    QueryExecutionErrorKind::InvalidRequest,
+                    error,
+                )
+            })?;
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
@@ -1928,6 +1987,64 @@ where
                 .map_err(NativeAttemptPreparationError::from)
         })
     }
+}
+
+/// Bind every runner-armed lifecycle fault to the exact attempt and immutable
+/// backend generations that this Native preparation captured. This belongs at
+/// the process adapter, not Query Application: the fault files are test-only
+/// process instrumentation and are not a logical query capability.
+#[cfg(debug_assertions)]
+fn bind_query_lifecycle_fault_scopes(
+    execution_id: novarocks_types::QueryExecutionId,
+    snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+) -> Result<(), String> {
+    use novarocks_failpoint::{QueryLifecycleFaultKind, bind_armed_fault};
+
+    let Some(root) = novarocks_failpoint::configured_root() else {
+        return Ok(());
+    };
+    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
+        .map_err(|error| error.to_string())?;
+    let protocol_execution_id =
+        novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
+            .map_err(|error| error.to_string())?;
+    for target in snapshot.targets() {
+        let backend_index = target.backend_idx();
+        let process_id = target.process_id().map_err(|error| error.to_string())?;
+        // Bind the manifest-wide set instead of naming individual kinds. A
+        // new runner arm must become reachable through this adapter by default.
+        for kind in QueryLifecycleFaultKind::ALL {
+            if let Some(scope) = bind_armed_fault(
+                &root,
+                kind,
+                protocol_execution_id,
+                backend_index,
+                process_id,
+            )
+            .map_err(|error| error.to_string())?
+            {
+                eprintln!(
+                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
+                    kind.file_stem(),
+                    execution_id.query_id().high(),
+                    execution_id.query_id().low(),
+                    execution_id.attempt_id().get(),
+                    scope.backend_index,
+                    scope.process_id,
+                    scope.token
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn bind_query_lifecycle_fault_scopes(
+    _execution_id: novarocks_types::QueryExecutionId,
+    _snapshot: &crate::common::backend_topology::BackendTopologySnapshot,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn attempt_failure(

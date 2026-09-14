@@ -22,115 +22,14 @@
 //! the runtime handle and channel cache instance-owned; no Core or process
 //! global runtime participates in Backend transport work.
 
-use std::collections::HashMap;
-use std::future::Future;
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 
-use novarocks_native_trust::{
-    AutomaticTlsMaterial, NativeEndpointConnector, NativeIncomingAdapter, NativeTlsMaterial,
-    NativeTrust,
-};
-use novarocks_task_codec::domain::ConfidentialTransport;
-use novarocks_types::NativeEndpoint;
-use tokio::runtime::Handle;
-use tonic::transport::Channel;
+#[cfg(test)]
+use novarocks_native_trust::NativeTrust;
 
-/// Server-resolved transport material for the Backend-owned Native listener
-/// and outbound connections. The backend receives this capability only; it
-/// never reads configuration files, credentials, or PEM paths.
-#[derive(Clone, Debug)]
-pub enum BackendNativeTransport {
-    Plaintext,
-    Automatic(AutomaticTlsMaterial),
-    Pem(NativeTlsMaterial),
-}
-
-impl BackendNativeTransport {
-    /// The confidentiality fact shared by this process's Native listener and
-    /// its raw RPC admission adapters.
-    ///
-    /// This is derived from the Server-resolved transport mode rather than
-    /// inferred from a request or endpoint. Automatic and PEM listeners both
-    /// terminate TLS before the RPC service sees a request; plaintext h2c does
-    /// not protect the payload in transit.
-    pub(crate) const fn confidentiality(&self) -> ConfidentialTransport {
-        match self {
-            Self::Plaintext => ConfidentialTransport::Plaintext,
-            Self::Automatic(_) | Self::Pem(_) => ConfidentialTransport::Confidential,
-        }
-    }
-
-    pub(crate) fn connector_for(
-        &self,
-        endpoint: NativeEndpoint,
-    ) -> Result<NativeEndpointConnector, String> {
-        match self {
-            Self::Plaintext => Ok(NativeEndpointConnector::plaintext(endpoint)),
-            Self::Automatic(material) => NativeEndpointConnector::automatic(endpoint, material)
-                .map_err(|error| format!("construct automatic native connector: {error}")),
-            Self::Pem(material) => Ok(NativeEndpointConnector::pem(endpoint, material)),
-        }
-    }
-
-    pub(crate) fn incoming_adapter(&self) -> NativeIncomingAdapter {
-        match self {
-            Self::Plaintext => NativeIncomingAdapter::plaintext(),
-            Self::Automatic(material) => NativeIncomingAdapter::automatic(material),
-            Self::Pem(material) => NativeIncomingAdapter::pem(material),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct BackendDataRuntime {
-    handle: Handle,
-    native_trust: Arc<NativeTrust>,
-    native_transport: BackendNativeTransport,
-    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
-}
-
-impl BackendDataRuntime {
-    pub fn new(
-        handle: Handle,
-        native_trust: Arc<NativeTrust>,
-        native_transport: BackendNativeTransport,
-    ) -> Self {
-        Self {
-            handle,
-            native_trust,
-            native_transport,
-            channels: Arc::new(Mutex::new(HashMap::new())),
-        }
-    }
-
-    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send,
-        F::Output: Send,
-    {
-        if Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.handle.block_on(future))
-        } else {
-            self.handle.block_on(future)
-        }
-    }
-
-    pub(crate) fn handle(&self) -> &Handle {
-        &self.handle
-    }
-
-    pub(crate) fn native_trust(&self) -> &Arc<NativeTrust> {
-        &self.native_trust
-    }
-
-    pub(crate) fn native_transport(&self) -> &BackendNativeTransport {
-        &self.native_transport
-    }
-
-    pub(crate) fn channels(&self) -> &Arc<Mutex<HashMap<NativeEndpoint, Channel>>> {
-        &self.channels
-    }
-}
+#[cfg(test)]
+use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
 
 #[cfg(test)]
 pub(crate) fn test_backend_data_runtime() -> BackendDataRuntime {

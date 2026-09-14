@@ -61,35 +61,37 @@ use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContribution
 use novarocks_proto_codec::lifecycle::{QueryTerminationReason, RuntimeFilterContribution};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::ConnectorMaterializationErrorClass;
-use novarocks_spi::connector::{CatalogProperties, ConnectorStorageResolver};
+use novarocks_spi::connector::{
+    CatalogProperties, ConnectorExecutionRoleBinding, ConnectorStorageResolver,
+};
 use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::QueryExecutionId;
 use tracing::error;
 
-use super::credential_slot::QueryContextCredentialSlot;
 use super::execution_host::QueryContextOptions;
 use super::feedback::TaskRuntimeFilterFeedbackEgress;
-use super::host::{HostRejection, QueryContextHost, ReleasedContextEvidence, SharedFactsRequest};
-use super::shared_facts::{
-    catalog_bindings, credential_material, query_options, runtime_filter_install,
+use crate::runtime_filter::participant::RuntimeFilterParticipantFactory;
+use novarocks_native_adapter::{
+    BackendDataRuntime,
+    runtime_filter_install::{
+        DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
+    },
+    runtime_filter_participant::RuntimeFilterParticipant,
+    runtime_filter_terminal::{
+        RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_runtime_filter_terminal_profile_contribution,
+    },
+    task_shared_facts::{
+        catalog_bindings, credential_material, query_options, runtime_filter_install,
+        sealed_runtime_filter_evidence,
+    },
 };
-use super::status::TaskStatusReporter;
-use crate::BackendDataRuntime;
-use crate::connector::ConnectorExecutionRoleBinding;
-use crate::connector::catalog_manager::{
-    CatalogManager, CatalogManagerError, ConnectorExecutionRoleBindingFactorySet,
+use novarocks_worker::runtime_filter::domain::BackendFrontendFeedbackSink;
+use novarocks_worker::{
+    CatalogManager, CatalogManagerError, CatalogPruneResult,
+    ConnectorExecutionRoleBindingFactorySet, HostRejection, QueryContextCredentialSlot,
+    QueryContextHost, ReleasedContextEvidence, SharedFactsRequest, TaskStatusReporter,
 };
-use crate::runtime_filter::domain::BackendFrontendFeedbackSink;
-use crate::runtime_filter::error::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
-use crate::runtime_filter::install_decode::{
-    DecodedRuntimeFilterContribution, decode_runtime_filter_contribution,
-};
-use crate::runtime_filter::participant::{
-    RuntimeFilterParticipant, RuntimeFilterParticipantFactory,
-};
-use crate::runtime_filter::terminal_contribution::{
-    RUNTIME_FILTER_TERMINAL_CAPTURE_STAGE, capture_terminal_profile_contribution,
-};
+use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
 /// The mutable half of one context's installed facts.
 ///
@@ -323,7 +325,7 @@ impl NativeQueryContextHost {
     /// consumer waits out its whole wait cap before scanning unfiltered.
     pub(crate) fn claim_runtime_filter_participant(
         &self,
-        participant: crate::runtime_filter::domain::BackendParticipantIdentity,
+        participant: novarocks_worker::runtime_filter::domain::BackendParticipantIdentity,
     ) -> Option<Arc<RuntimeFilterParticipant>> {
         let execution = {
             let contexts = self
@@ -487,7 +489,7 @@ impl NativeQueryContextHost {
         // Credentials first: a catalog runtime is the thing most likely to need
         // scoped storage access, so the authority has to exist before the
         // binding that may reach for it.
-        installed.credentials.install(material)?;
+        installed.credentials.install(material.leases())?;
         self.still_establishing(installed)?;
 
         {
@@ -600,7 +602,10 @@ impl NativeQueryContextHost {
                     || !installed.is_released(),
                     move |properties| {
                         factories
-                            .bind(properties)
+                            .bind(
+                                properties,
+                                crate::config::debug_emit_catalog_materialization_marker(),
+                            )
                             .map_err(CatalogManagerError::from_materialization)
                     },
                 )
@@ -646,11 +651,13 @@ impl Drop for PublishCatalogLeasesOnExit<'_> {
 /// This host reconciles catalog reachability because it is this process's only
 /// catalog lease owner: it takes the leases on establish and drops them on
 /// release, so it is the only owner that can decide what is still needed.
-impl crate::rpc::server::CatalogReachabilityAuthority for NativeQueryContextHost {
+impl novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority
+    for NativeQueryContextHost
+{
     fn prune_unreachable_catalogs(
         &self,
         reachable: std::collections::BTreeSet<novarocks_spi::connector::CatalogHandle>,
-    ) -> crate::connector::catalog_manager::CatalogPruneResult {
+    ) -> CatalogPruneResult {
         let result = self.catalog_manager.prune_unreachable(&reachable);
         self.publish_catalog_lease_metrics();
         result
@@ -832,7 +839,7 @@ impl QueryContextHost for NativeQueryContextHost {
                 // this rotation as the exact next epoch, and this backend mints
                 // nothing: there is no prepare, no commit, and no catalog call.
                 let material = credential_material(update)?;
-                installed.credentials.install(material)
+                installed.credentials.install(material.leases())
             }
         }
     }
@@ -895,9 +902,9 @@ fn seal_runtime_filter_evidence(
 ) -> ReleasedContextEvidence {
     let snapshot = participant
         .prepare_terminal_capture(QueryTerminationReason::QueryTerminationCoordinatorFinalize);
-    match capture_terminal_profile_contribution(Some(snapshot), true) {
+    match capture_runtime_filter_terminal_profile_contribution(Some(snapshot), true) {
         Ok(telemetry) => match QueryTerminalProfileContributionTelemetry::parse(telemetry) {
-            Ok(telemetry) => ReleasedContextEvidence::with_runtime_filter(telemetry),
+            Ok(telemetry) => sealed_runtime_filter_evidence(telemetry),
             Err(error) => {
                 // The projection produced a value this process cannot vouch
                 // for. Reporting it anyway would make the frontend the first
@@ -909,9 +916,7 @@ fn seal_runtime_filter_evidence(
                     "sealed runtime filter contribution does not satisfy the terminal contract; \
                      the release reports it as unavailable"
                 );
-                ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
-                    "CONTRIBUTION_INVALID",
-                ))
+                sealed_runtime_filter_evidence(runtime_filter_unavailable("CONTRIBUTION_INVALID"))
             }
         },
         Err(error) => {
@@ -924,7 +929,7 @@ fn seal_runtime_filter_evidence(
                 error = %error,
                 "runtime filter observation failed its correctness check at release"
             );
-            ReleasedContextEvidence::with_runtime_filter(runtime_filter_unavailable(
+            sealed_runtime_filter_evidence(runtime_filter_unavailable(
                 "OBSERVATION_CORRECTNESS_FAILURE",
             ))
         }
@@ -1190,26 +1195,24 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId,
     };
 
-    use crate::connector::catalog_manager::{
-        CatalogManager, ConnectorExecutionRoleBindingFactorySet,
-    };
     use crate::rpc::runtime::test_backend_data_runtime;
-    use crate::runtime_filter::error::{
-        RuntimeFilterContractError, RuntimeFilterContractErrorCode,
-    };
-    use crate::runtime_filter::install_decode::DecodedRuntimeFilterContribution;
     use crate::runtime_filter::participant::{
-        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipant,
-        RuntimeFilterParticipantFactory,
+        BackendRuntimeFilterParticipantFactory, RuntimeFilterParticipantFactory,
     };
-    use crate::task_execution::clock::ProcessMonotonicClock;
     use crate::task_execution::execution_host::TaskQueryContextFacts;
-    use crate::task_execution::host::{QueryContextHost, SharedFactsRequest};
-    use crate::task_execution::observation::TaskStatusSource;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
-    };
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
+    use novarocks_native_adapter::runtime_filter_install::DecodedRuntimeFilterContribution;
+    use novarocks_native_adapter::runtime_filter_participant::RuntimeFilterParticipant;
+    use novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry;
+    use novarocks_worker::QueryContextHost;
+    use novarocks_worker::{
+        CatalogManager, ConnectorExecutionRoleBindingFactorySet, ProcessMonotonicClock,
+    };
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, SharedFactsRequest, TaskStatusOwner, TaskStatusReporter,
+        TaskStatusSource,
+    };
+    use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
 
@@ -1678,8 +1681,8 @@ mod tests {
             .expect("a complete establish");
 
         let evidence = fixture.host.release(context);
-        let telemetry = evidence
-            .runtime_filter()
+        let telemetry = release_runtime_filter_telemetry(&evidence)
+            .expect("the sealed content has a Backend projection")
             .expect("a release that held a participant reports its observation");
         assert!(
             telemetry.available().is_some(),
@@ -2502,9 +2505,10 @@ use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;
 
-use crate::connector::{ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding};
 use crate::task_execution::execution_host::TaskQueryContextFacts;
-use novarocks_spi::connector::CatalogHandle;
+use novarocks_spi::connector::{
+    CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
+};
 
 impl TaskQueryContextFacts for NativeQueryContextHost {
     fn query_options(
@@ -2647,8 +2651,8 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         // The one decoder that turns a wire envelope into a backend one lives
         // in the runtime-filter transport. Reusing it is what keeps this from
         // becoming a second authority over the same wire shape.
-        let response = crate::runtime_filter::rpc::handle_runtime_filter_envelope(
-            participant as Arc<dyn crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress>,
+        let response = novarocks_native_adapter::runtime_filter_rpc::handle_runtime_filter_envelope(
+            participant as Arc<dyn novarocks_native_adapter::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress>,
             envelope,
         )
         .map_err(|status| protocol(&format!("task dynamic filter was refused: {status}")))?;

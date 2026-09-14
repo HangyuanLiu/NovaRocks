@@ -231,7 +231,9 @@ pub struct ConnectorDistributedRewritePlanSummary {
     pub input_data_files: u64,
     pub input_delete_files: u64,
     pub input_bytes: u64,
-    pub expected_output_files: u64,
+    /// A provider may know that a rewrite is a no-op, but a planned rewrite
+    /// must not present an unavailable output cardinality as zero.
+    pub expected_output_files: Option<u64>,
 }
 
 impl ConnectorDistributedRewritePlanSummary {
@@ -241,10 +243,10 @@ impl ConnectorDistributedRewritePlanSummary {
             self.input_data_files,
             self.input_delete_files,
             self.input_bytes,
-            self.expected_output_files,
         ] {
             hash.update(value.to_be_bytes());
         }
+        digest_optional_u64(hash, self.expected_output_files);
     }
 }
 
@@ -611,9 +613,15 @@ impl fmt::Debug for ConnectorDistributedRewritePlan {
 pub struct ConnectorDistributedRewriteReceiptSummary {
     pub input_data_files: u64,
     pub input_delete_files: u64,
-    pub output_data_files: u64,
-    pub output_delete_files: u64,
-    pub output_rows: u64,
+    /// `None` means the provider committed successfully but did not publish
+    /// this fact. It is deliberately distinct from a known zero.
+    pub output_data_files: Option<u64>,
+    /// `None` means the provider committed successfully but did not publish
+    /// this fact. It is deliberately distinct from a known zero.
+    pub output_delete_files: Option<u64>,
+    /// `None` means the provider committed successfully but did not publish
+    /// this fact. It is deliberately distinct from a known zero.
+    pub output_rows: Option<u64>,
     pub target_version: Option<i64>,
 }
 
@@ -933,6 +941,16 @@ fn plan_digest(
 fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update((value.len() as u64).to_be_bytes());
     hash.update(value);
+}
+
+fn digest_optional_u64(hash: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value.to_be_bytes());
+        }
+        None => hash.update([0]),
+    }
 }
 fn validate_payload(value: &Bytes, kind: &str) -> Result<(), ConnectorError> {
     if value.len() > MAX_CONNECTOR_DISTRIBUTED_REWRITE_PROVIDER_PAYLOAD_BYTES {

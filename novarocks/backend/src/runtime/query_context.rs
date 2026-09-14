@@ -27,10 +27,7 @@ use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
-use novarocks_types::SlotId;
-use novarocks_types::UniqueId;
-
-pub(crate) use novarocks_types::QueryId;
+use novarocks_types::{QueryId, SlotId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum QueryExecutionGeneration {

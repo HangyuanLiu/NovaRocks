@@ -1,6 +1,8 @@
 use crate::cli::Cli;
 use crate::config::RunnerConfig;
-use crate::scenario::{Scenario, ScenarioContext, resolve_backend_binaries, resolve_binary};
+use crate::scenario::{
+    Scenario, ScenarioContext, ScenarioEvidenceOutcome, resolve_backend_binaries, resolve_binary,
+};
 use crate::scenarios;
 use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{CrossProcessClusterOptions, CrossProcessServerHandle};
@@ -77,30 +79,36 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         .fe
         .get("NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET")
         .cloned();
-    let handle = CrossProcessServerHandle::launch(CrossProcessClusterOptions {
-        binary: config.binary.clone(),
-        fe_binary: resolve_binary(
-            launch_config.binary_layout.frontend,
-            config.compatible_binary.as_ref(),
-            config.other_island_binary.as_ref(),
-        )?,
-        be_binaries: resolve_backend_binaries(
-            &launch_config.binary_layout.backends,
-            &config.binary,
-            config.compatible_binary.as_ref(),
-            config.other_island_binary.as_ref(),
-            config.cluster_size,
-        )?,
-        expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
-        base_config_path: config.base_config_path.clone(),
-        runtime_root: scenario_root.clone(),
-        cluster_size: config.cluster_size,
-        launch_profile: config.launch_profile,
-        startup_timeout: config.timeout,
-        child_environment: launch_config.child_environment,
-        config_overlay: launch_config.config_overlay,
-        native_trust_fixture: launch_config.native_trust_fixture,
-    })
+    let handle = CrossProcessServerHandle::launch_with_native_fault_proxies(
+        CrossProcessClusterOptions {
+            binary: config.binary.clone(),
+            fe_binary: resolve_binary(
+                launch_config.binary_layout.frontend,
+                config.compatible_binary.as_ref(),
+                config.other_island_binary.as_ref(),
+            )?,
+            be_binaries: resolve_backend_binaries(
+                &launch_config.binary_layout.backends,
+                &config.binary,
+                config.compatible_binary.as_ref(),
+                config.other_island_binary.as_ref(),
+                config.cluster_size,
+            )?,
+            expected_eligible_backend_count: launch_config.expected_eligible_backend_count,
+            base_config_path: config.base_config_path.clone(),
+            // Reports and the retained scenario evidence live at `scenario_root`.
+            // The harness may remove only this disposable child directory after a
+            // successful scenario, while a failure keeps it for log inspection.
+            runtime_root: scenario_root.join("runtime"),
+            cluster_size: config.cluster_size,
+            launch_profile: config.launch_profile,
+            startup_timeout: config.timeout,
+            child_environment: launch_config.child_environment,
+            config_overlay: launch_config.config_overlay,
+            native_trust_fixture: launch_config.native_trust_fixture,
+        },
+        launch_config.native_fault_proxies,
+    )
     .with_context(|| format!("launch system scenario {}", scenario.name()));
     let handle = match handle {
         Ok(handle) => handle,
@@ -131,11 +139,16 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let result = scenario.run(&mut context);
     if let Err(error) = &result {
         context.retain_artifacts();
+        let evidence_path = match context.write_evidence(ScenarioEvidenceOutcome::Failed) {
+            Ok(path) => path.display().to_string(),
+            Err(evidence_error) => format!("unavailable ({evidence_error:#})"),
+        };
         eprintln!(
-            "scenario={} failed; actions={:?}; runtime_dir={}; diagnostics={}",
+            "scenario={} failed; actions={:?}; runtime_dir={}; evidence={}; diagnostics={}",
             context.name(),
             context.actions(),
             context.runtime_dir().display(),
+            evidence_path,
             context.diagnostics()
         );
         let launch_profile = match config.launch_profile {
@@ -197,7 +210,15 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             ));
         }
     }
-    println!("scenario={} PASS", scenario.name());
+    context.action("cluster and fixture cleanup passed");
+    let evidence_path = context
+        .write_evidence(ScenarioEvidenceOutcome::Passed)
+        .with_context(|| format!("write passing scenario evidence for {}", context.name()))?;
+    println!(
+        "scenario={} PASS evidence={}",
+        scenario.name(),
+        evidence_path.display()
+    );
     Ok(())
 }
 
@@ -250,5 +271,24 @@ mod tests {
                 .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn startup_baseline_requires_the_performance_profile_before_launch() {
+        let scenarios = crate::scenarios::all();
+        let selected = select(&scenarios, &["task-execution/startup-baseline".to_string()])
+            .expect("select startup baseline scenario");
+        let scenario = selected[0];
+        assert!(
+            scenario
+                .validate_runner_inputs(
+                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                    None
+                )
+                .is_err()
+        );
+        scenario
+            .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
+            .expect("performance profile is accepted before startup");
     }
 }

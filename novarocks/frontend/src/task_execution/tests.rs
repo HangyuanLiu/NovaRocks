@@ -52,7 +52,7 @@ use novarocks_types::identity::{
 };
 use novarocks_types::{AttemptId, NativeCompatibilityId, QueryId};
 
-use super::blocking_io::{ConnectorBlockingIoBudget, ConnectorBlockingIoSupervisor};
+use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::clock::{ManualClock, TaskProtocolClock};
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
@@ -73,10 +73,11 @@ use super::split_domain::{assignment_targets, delivery_action};
 use super::status_intake::{
     CountingWake, StatusEvent, StatusIntake, StatusIntakeAdmission, StatusIntakeWake,
 };
-use crate::query_execution::FragmentInstancePlacement;
 use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
+use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
+use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 
 const LEAF_FRAGMENT: FragmentId = 1;
 const MIDDLE_FRAGMENT: FragmentId = 2;
@@ -3232,6 +3233,7 @@ fn a_context_is_subscribed_only_after_its_own_establish_is_acknowledged() {
 #[test]
 fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
     use crate::native::task_transport::{SubscriptionState, TaskAckIntake};
+    use crate::task_execution::error::ParticipantObservationFailure;
     use crate::task_execution::round::TaskRound;
 
     let processes = backends(2);
@@ -3240,6 +3242,7 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
     let harness = Harness::from_graph(graph);
     let sink = Arc::clone(&harness.sink);
     let wake = Arc::clone(&harness.wake);
+    let status_intake = harness.execution.intake().handle();
     let subscriptions = Arc::new(RecordingSubscriptions::default());
     let intake = TaskAckIntake::new(wake as Arc<dyn StatusIntakeWake>);
     let acks = intake.handle();
@@ -3274,18 +3277,31 @@ fn a_backend_whose_subscription_settled_fatally_fails_the_attempt_by_name() {
         .turn()
         .expect("a recoverable subscription decides nothing");
 
-    // One that has settled is.
-    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::BudgetExhausted);
+    // A fatal state discovered while reconciling an observation boundary must
+    // fail before the round submits another task operation.
+    *subscriptions.settled.lock().expect("settled") = Some(SubscriptionState::ProcessMismatch);
+    status_intake.note_observation_incomplete();
     let error = round
         .turn()
         .expect_err("a backend out of observation fails the attempt");
     let TaskExecutionError::ParticipantUnobservable { backend, state } = error else {
         panic!("expected an unobservable participant, got {error:?}");
     };
-    assert_eq!(state, "budget_exhausted");
+    assert_eq!(
+        state,
+        ParticipantObservationFailure::IdentityViolation("process_mismatch")
+    );
     assert!(
         processes.values().any(|process| *process == backend),
         "the failure has to name a backend of this attempt, got {backend}"
+    );
+    assert!(
+        !subscriptions
+            .resubscribed
+            .lock()
+            .expect("resubscription ledger")
+            .is_empty(),
+        "the fatal state was checked at the observation-loss reconciliation boundary"
     );
 }
 
@@ -4212,6 +4228,10 @@ async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
         .turn()
         .expect("the original receipt closes the in-flight exact replay");
     assert_eq!(closed.acknowledgements, 1);
+    assert!(
+        round.execution().context_released(exact_context),
+        "a definitive actor Abort receipt is positive context closure evidence"
+    );
     ack_handle.publish(OperationAcknowledgement::transport_unknown(
         operation_id,
         OperationKind::AbortQueryContext,

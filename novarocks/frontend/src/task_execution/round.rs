@@ -46,7 +46,7 @@ use super::abort_effect::{
 };
 use super::blocking_io::ConnectorBlockingIoSupervisor;
 use super::context_owner::{ContextEstablishSource, QueryContextOwner};
-use super::error::TaskExecutionError;
+use super::error::{ParticipantObservationFailure, TaskExecutionError};
 use super::execution::{ActorAbortDispatchState, QueryTaskExecution, QueuedContextAcknowledgement};
 use super::intent::{AckPayload, OperationAcknowledgement};
 use crate::native::task_transport::{SubscriptionState, TaskAckIntake, TaskStatusSubscriber};
@@ -454,6 +454,12 @@ impl TaskRound {
                     .resubscribe(context, self.execution.status_cursors(context))
                     .map_err(TaskExecutionError::Schedule)?;
                 report.resubscriptions += 1;
+                if let Some(state) = self.subscriber.settled_fatally(context) {
+                    return Err(TaskExecutionError::ParticipantUnobservable {
+                        backend: context.backend_process_id(),
+                        state: participant_observation_failure(state),
+                    });
+                }
             }
         }
 
@@ -502,7 +508,7 @@ impl TaskRound {
             if let Some(state) = self.subscriber.settled_fatally(context) {
                 return Err(TaskExecutionError::ParticipantUnobservable {
                     backend: context.backend_process_id(),
-                    state: state.as_str(),
+                    state: participant_observation_failure(state),
                 });
             }
         }
@@ -534,12 +540,14 @@ impl TaskRound {
                     "closed Native Abort replay disappeared from its adapter: {error}"
                 ))
             })?;
+            let context = actor_abort_context(effect.intent())?;
             let settlement = effect.settle(&receipt).map_err(Self::abort_settle_error)?;
             if !matches!(settlement, NativeAbortEffectSettlement::WorkerSettled) {
                 return Err(TaskExecutionError::Schedule(
                     "closed Native Abort replay did not produce a Worker settlement".to_owned(),
                 ));
             }
+            self.execution.observe_actor_abort_context_closed(context)?;
             return Ok(1);
         }
         let Some(reservation) = self.execution.try_reserve_actor_abort(&preview)? else {
@@ -677,11 +685,13 @@ impl TaskRound {
                 .abort_effects
                 .remove(&operation_id)
                 .expect("settled dispatcher retains the same Native Abort effect");
+            let context = actor_abort_context(effect.intent())?;
             match effect
                 .settle(acknowledgement)
                 .map_err(Self::abort_settle_error)?
             {
                 NativeAbortEffectSettlement::WorkerSettled => {
+                    self.execution.observe_actor_abort_context_closed(context)?;
                     if let Some(settlements) = self.late_abort_settlements.remove(&operation_id) {
                         for settlement in settlements {
                             settlement.resolved_by_other_generation();
@@ -741,6 +751,8 @@ impl TaskRound {
         for settlement in settlements {
             settlement.resolved_by_other_generation();
         }
+        self.execution
+            .observe_actor_abort_context_closed(actor_abort_receipt_context(acknowledgement)?)?;
         self.abort_closing_receipts
             .insert(operation_id, acknowledgement.clone());
         Ok(())
@@ -1007,5 +1019,36 @@ impl TaskRound {
 
     pub(crate) const fn execution_mut(&mut self) -> &mut QueryTaskExecution {
         &mut self.execution
+    }
+}
+
+fn actor_abort_context(
+    intent: &super::intent::OperationIntent,
+) -> Result<novarocks_execution::task_execution::QueryContextRef, TaskExecutionError> {
+    match intent {
+        super::intent::OperationIntent::AbortQueryContext(request) => Ok(request.context()),
+        _ => Err(TaskExecutionError::Schedule(
+            "actor Abort effect retained a non-Abort intent".to_owned(),
+        )),
+    }
+}
+
+fn actor_abort_receipt_context(
+    acknowledgement: &OperationAcknowledgement,
+) -> Result<novarocks_execution::task_execution::QueryContextRef, TaskExecutionError> {
+    match acknowledgement.payload() {
+        AckPayload::Context(receipt) => Ok(receipt.context()),
+        _ => Err(TaskExecutionError::Schedule(
+            "definitive actor Abort acknowledgement omitted its context receipt".to_owned(),
+        )),
+    }
+}
+
+fn participant_observation_failure(state: SubscriptionState) -> ParticipantObservationFailure {
+    match state {
+        SubscriptionState::ProcessMismatch | SubscriptionState::QueryMismatch => {
+            ParticipantObservationFailure::IdentityViolation(state.as_str())
+        }
+        _ => ParticipantObservationFailure::Transport(state.as_str()),
     }
 }

@@ -129,7 +129,7 @@ fn run_frontend(
     provider_manifest: Arc<ServerProviderManifest>,
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
-    let frontend = composition::compose_frontend_server_config(
+    let frontend = composition::compose_frontend_role_config(
         &role.config,
         &role.native_trust,
         None,
@@ -139,7 +139,7 @@ fn run_frontend(
         runtime.handle().clone(),
     )?;
     runtime
-        .block_on(novarocks_frontend::run_frontend_server_until_shutdown(
+        .block_on(novarocks_server::roles::frontend::run_until_shutdown(
             frontend,
             runtime.handle().clone(),
             termination_signal(),
@@ -163,13 +163,13 @@ fn run_backend(
         provider_manifest,
         runtime.handle().clone(),
     )?;
-    let data_runtime = novarocks_backend::BackendDataRuntime::new(
+    let data_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.handle().clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
     );
     runtime
-        .block_on(novarocks_backend::run_backend_server_until_shutdown(
+        .block_on(novarocks_server::roles::backend::run_until_shutdown(
             backend,
             data_runtime,
             termination_signal(),
@@ -194,7 +194,7 @@ async fn run_all_in_one(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&be.config);
-    let frontend = composition::compose_frontend_server_config(
+    let frontend = composition::compose_frontend_role_config(
         &fe.config,
         &fe.native_trust,
         None,
@@ -211,7 +211,7 @@ async fn run_all_in_one(
         provider_manifest,
         runtime.clone(),
     )?;
-    let backend_runtime = novarocks_backend::BackendDataRuntime::new(
+    let backend_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
@@ -220,7 +220,7 @@ async fn run_all_in_one(
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
     let frontend_run = async move {
-        novarocks_frontend::run_frontend_server_until_shutdown(
+        novarocks_server::roles::frontend::run_until_shutdown(
             frontend,
             frontend_runtime,
             wait_for_stop(frontend_stop_rx),
@@ -229,7 +229,7 @@ async fn run_all_in_one(
         .map_err(|error| anyhow::anyhow!("{error}"))
     };
     let backend_run = async move {
-        novarocks_backend::run_backend_server_until_shutdown(
+        novarocks_server::roles::backend::run_until_shutdown(
             backend,
             backend_runtime,
             wait_for_stop(backend_stop_rx),

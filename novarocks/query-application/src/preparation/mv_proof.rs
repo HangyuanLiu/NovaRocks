@@ -153,7 +153,7 @@ pub fn prove_selected_mv_target(
     let candidate = MvCandidateFactInput::try_new(
         publication_id,
         selected.rewrite_action.definition_fingerprint(),
-        selected.rewrite_action.source(),
+        selected.rewrite_action.publication_provenance(),
         &selected.inputs,
         target.binding(),
     )
@@ -254,6 +254,7 @@ mod tests {
         let strict = prove_selected_mv_target(selected, &target).unwrap();
         assert_eq!(strict.publication_id().bytes(), [7; 16]);
         assert_eq!(strict.target_scan(), action.target());
+        assert_eq!(action.publication_provenance(), "test-provider-provenance");
     }
 
     #[test]

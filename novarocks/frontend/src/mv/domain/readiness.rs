@@ -11,10 +11,15 @@
 
 use std::sync::Arc;
 
+use novarocks_mv_application::{
+    activity::CanonicalMvTarget,
+    process_runtime::{ProcessRuntime, TargetReadiness},
+};
 use uuid::Uuid;
 
-use crate::mv::activity::CanonicalMvTarget;
+use crate::mv::activity::canonical_mv_target;
 use crate::mv::domain::dependency::model::MvDependencyObjectRef;
+use crate::mv::domain::persistence::definition::StoredMvDefinition;
 use crate::mv::domain::persistence::dependency::StoredMvDependency;
 use crate::mv::domain::projector::MvAcceleratorProjector;
 use crate::mv::domain::repository::{
@@ -22,7 +27,7 @@ use crate::mv::domain::repository::{
     MvRepositoryErrorKind, MvTarget,
 };
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
-use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
+use novarocks_spi::connector::LakePublicationId;
 
 /// The synchronous face of an asynchronous MV projection store.
 ///
@@ -40,7 +45,20 @@ use crate::mv::process_runtime::{MvTargetReadiness, ProcessRuntime};
 pub struct MvReadinessPort {
     repository: Arc<dyn MvRepository>,
     projector: MvAcceleratorProjector,
-    runtime: Arc<ProcessRuntime>,
+    runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
+    handle: tokio::runtime::Handle,
+}
+
+/// Read-only inventory for query-local MV candidate discovery.
+///
+/// A query freezes and validates every returned lake publication before it can
+/// substitute a scan. It therefore must not inherit the refresh executor's
+/// process-local readiness state: that state controls effect-capable refresh
+/// and DDL consumers, not whether a retained candidate can be independently
+/// proven against its exact publication.
+#[derive(Clone)]
+pub(crate) struct MvCandidateReader {
+    repository: Arc<dyn MvRepository>,
     handle: tokio::runtime::Handle,
 }
 
@@ -48,7 +66,7 @@ pub struct MvReadinessPort {
 ///
 /// It has no durable representation: process loss intentionally forgets it.
 pub(crate) struct MvRuntimePublicationLease {
-    runtime: Arc<ProcessRuntime>,
+    runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
     target: CanonicalMvTarget,
     publication_id: novarocks_spi::connector::LakePublicationId,
 }
@@ -62,7 +80,7 @@ impl Drop for MvRuntimePublicationLease {
 impl MvReadinessPort {
     pub(crate) fn new(
         repository: Arc<dyn MvRepository>,
-        runtime: Arc<ProcessRuntime>,
+        runtime: Arc<ProcessRuntime<CanonicalMvTarget, LakePublicationId>>,
         handle: tokio::runtime::Handle,
     ) -> Self {
         Self {
@@ -71,6 +89,14 @@ impl MvReadinessPort {
             runtime,
             handle,
         }
+    }
+
+    /// Test-only convenience for constructing the separate query inventory
+    /// from the same repository fixture. Production composition constructs
+    /// the reader directly as an independent query leaf port.
+    #[cfg(test)]
+    pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
+        MvCandidateReader::new(Arc::clone(&self.repository), self.handle.clone())
     }
 
     /// Drives one durable MV operation from a synchronous caller. Confined to
@@ -139,8 +165,8 @@ impl MvReadinessPort {
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        let canonical = CanonicalMvTarget::from_mv_target(target);
-        if let MvTargetReadiness::Unavailable(reason) = self.runtime.readiness(&canonical) {
+        let canonical = canonical_mv_target(target);
+        if let TargetReadiness::Unavailable(reason) = self.runtime.readiness(&canonical) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Unavailable,
                 format!("MV target is unavailable: {reason}"),
@@ -176,9 +202,8 @@ impl MvReadinessPort {
                 !target.database.is_empty()
                     && !target.name.is_empty()
                     && !matches!(
-                        self.runtime
-                            .readiness(&CanonicalMvTarget::from_mv_target(&target)),
-                        MvTargetReadiness::Unavailable(_)
+                        self.runtime.readiness(&canonical_mv_target(&target)),
+                        TargetReadiness::Unavailable(_)
                     )
             })
             .collect::<Vec<_>>();
@@ -281,7 +306,7 @@ impl MvReadinessPort {
         target: &MvTarget,
         publication_id: novarocks_spi::connector::LakePublicationId,
     ) -> Result<MvRuntimePublicationLease, MvRepositoryError> {
-        let canonical = CanonicalMvTarget::from_mv_target(target);
+        let canonical = canonical_mv_target(target);
         if !self.runtime.begin(canonical.clone(), publication_id) {
             return Err(MvRepositoryError::new(
                 MvRepositoryErrorKind::Conflict,
@@ -328,6 +353,45 @@ impl MvReadinessPort {
             self.repository
                 .wipe_projection_by_target(operation_id, target),
         )
+    }
+}
+
+impl MvCandidateReader {
+    /// Construct the read-only query candidate inventory from its durable
+    /// discovery dependency. This intentionally accepts neither process
+    /// readiness nor any refresh executor capability.
+    pub(crate) fn new(repository: Arc<dyn MvRepository>, handle: tokio::runtime::Handle) -> Self {
+        Self { repository, handle }
+    }
+
+    /// Enumerate retained candidate definitions without exposing a loaded
+    /// projection's CAS version to query discovery. Every member remains
+    /// optional until its exact lake publication and every frozen input/output
+    /// revision are verified.
+    pub(crate) fn list_candidate_definitions(
+        &self,
+    ) -> Result<Vec<StoredMvDefinition>, MvRepositoryError> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| {
+                self.handle
+                    .block_on(self.repository.list_projections())
+                    .map(|projections| {
+                        projections
+                            .into_iter()
+                            .map(|projection| projection.definition)
+                            .collect()
+                    })
+            }),
+            Err(_) => self
+                .handle
+                .block_on(self.repository.list_projections())
+                .map(|projections| {
+                    projections
+                        .into_iter()
+                        .map(|projection| projection.definition)
+                        .collect()
+                }),
+        }
     }
 }
 

@@ -71,14 +71,16 @@ const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
 use super::aggregate::decode_resolved_aggregate_signature;
-use super::unpivot::decode_unpivot_constant;
 use crate::connector::write_data_plane::{
     ObservedConnectorWriteExecution, RoleBoundCommitFragmentEncoder,
     RootCommitFragmentCarrierValidator,
 };
 use crate::fragment::decode::plan::context::NativePlanDecodeContext;
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
+use novarocks_native_adapter::fragment_plan_node::decode_unpivot_constant;
 
 fn decode_writer_multiplex_schema(
     wire: Option<&plan::WriterMultiplexSchema>,
@@ -456,7 +458,6 @@ fn decode_final_aggregate_plan(
             &final_slots,
             path.clone().field("unpivot"),
             arena,
-            ctx,
         )?),
     };
     Ok(WriterFinalAggregatePlan { calls, unpivot })
@@ -474,7 +475,6 @@ fn decode_writer_grouped_unpivot(
     final_slots: &BTreeSet<SlotId>,
     path: FieldPath,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<WriterGroupedUnpivotPlan, NativeFragmentDecodeError> {
     if wire.mappings.is_empty() || wire.mappings.len() > MAX_WRITE_UNPIVOT_MAPPINGS {
         return Err(NativeFragmentDecodeError::out_of_range(
@@ -617,7 +617,6 @@ fn decode_writer_grouped_unpivot(
                 constant,
                 constant_path.clone(),
                 arena,
-                ctx,
                 &mut decoded_nested_elements,
                 &mut decoded_constant_bytes,
             )?;
@@ -747,7 +746,7 @@ pub(super) fn lower_table_writer_node(
         ));
     }
     let projected_input_layout =
-        ctx.decode_output_layout(&writer.target_schema, path.clone().field("target_schema"))?;
+        decode_fragment_output_layout(&writer.target_schema, path.clone().field("target_schema"))?;
     let expected_slot_ids = (0..writer.target_schema.len())
         .map(|ordinal| {
             ordinal
@@ -794,7 +793,7 @@ pub(super) fn lower_table_writer_node(
     }
     let mut exprs = Vec::with_capacity(writer.output_exprs.len());
     for (index, expression) in writer.output_exprs.iter().enumerate() {
-        exprs.push(ctx.decode_expression(
+        exprs.push(decode_expr_for_slot_layout(
             expression,
             path.clone().field("output_exprs").index(index),
             &mut projection_arena,
@@ -1176,7 +1175,7 @@ mod tests {
         test_write_catalog_handle, test_write_scan_runtime, wire_catalog_handle,
         writer_multiplex_schema, writer_node,
     };
-    use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
+    use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
 
     const CHILD_COLUMN_ID: u32 = 1;
 
@@ -1900,10 +1899,8 @@ mod tests {
             |columns| columns[0].column_id -= 1,
             |columns| columns[0].name = "wrong_kind".to_string(),
             |columns| {
-                columns[0].r#type = Some(
-                    crate::fragment::decode::type_decode::encode_type(&DataType::Int64)
-                        .expect("type"),
-                )
+                columns[0].r#type =
+                    Some(novarocks_plan_codec::encode_native_type(&DataType::Int64).expect("type"))
             },
             |columns| columns[0].nullable = true,
         ];

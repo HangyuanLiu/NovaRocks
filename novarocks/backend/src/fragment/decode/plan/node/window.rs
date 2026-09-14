@@ -23,9 +23,8 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, Fields};
 
 use super::aggregate::decode_resolved_aggregate_signature;
-use super::{DecodedNode, NativePlanDecodeContext, sort};
-use crate::fragment::decode::plan::error::NativeFragmentDecodeError;
-use crate::fragment::decode::plan::layout::Layout;
+use super::{DecodedNode, NativePlanDecodeContext};
+use novarocks_execution::exec::chunk::SlotLayout as Layout;
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::exec::expr::{ExprArena, ExprNode};
 use novarocks_execution::exec::node::analytic::{
@@ -34,6 +33,10 @@ use novarocks_execution::exec::node::analytic::{
 };
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_native_adapter::fragment_error::NativeFragmentDecodeError;
+use novarocks_native_adapter::fragment_expression::decode_expr_for_slot_layout;
+use novarocks_native_adapter::fragment_layout::decode_fragment_output_layout;
+use novarocks_native_adapter::fragment_plan_node::lower_sort_items_for_layout;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
@@ -74,7 +77,7 @@ pub(super) fn lower_window_node(
             "WindowNode output_columns missing",
         ));
     }
-    let output_layout = ctx.decode_output_layout(output_columns, output_columns_path)?;
+    let output_layout = decode_fragment_output_layout(output_columns, output_columns_path)?;
     let final_layout = Layout::for_slots(output_layout.slot_ids().iter().copied());
     let final_output_schema = output_layout.chunk_schema();
 
@@ -106,7 +109,6 @@ pub(super) fn lower_window_node(
                 path.clone().field("window_exprs").index(first_idx),
                 current,
                 arena,
-                ctx,
             )?;
             next_node_id = next_node_id.checked_add(1).ok_or_else(|| {
                 NativeFragmentDecodeError::out_of_range(
@@ -135,7 +137,7 @@ pub(super) fn lower_window_node(
             .iter()
             .enumerate()
             .map(|(idx, expr)| {
-                ctx.decode_expression(
+                decode_expr_for_slot_layout(
                     expr,
                     path.clone()
                         .field("window_exprs")
@@ -164,7 +166,7 @@ pub(super) fn lower_window_node(
                         format!("WindowNode group {group_idx} order_by[{idx}] expr missing"),
                     )
                 })?;
-                ctx.decode_expression(expr, item_path.field("expr"), arena, &current.layout)
+                decode_expr_for_slot_layout(expr, item_path.field("expr"), arena, &current.layout)
             })
             .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
         let frame = first
@@ -263,11 +265,10 @@ fn sort_window_group_input(
     path: FieldPath,
     input: DecodedNode,
     arena: &mut ExprArena,
-    ctx: &NativePlanDecodeContext,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     let mut order_by = Vec::with_capacity(first.partition_by.len() + first.order_by.len());
     for (idx, expr) in first.partition_by.iter().enumerate() {
-        let expr = ctx.decode_expression(
+        let expr = decode_expr_for_slot_layout(
             expr,
             path.clone().field("partition_by").index(idx),
             arena,
@@ -279,13 +280,12 @@ fn sort_window_group_input(
             nulls_first: true,
         });
     }
-    order_by.extend(sort::lower_sort_items_with_context(
+    order_by.extend(lower_sort_items_for_layout(
         &format!("WindowNode group {group_idx} sort"),
         &first.order_by,
         path.field("order_by"),
         arena,
         &input.layout,
-        ctx,
     )?);
 
     Ok(DecodedNode {
@@ -384,7 +384,7 @@ fn window_expr_slot_schema(
     })?;
     let data_type = NativeFragmentDecodeError::map_invalid(
         path.clone().field("result_type"),
-        crate::fragment::decode::type_decode::decode_type(type_desc),
+        novarocks_plan_codec::native_type::decode_type(type_desc),
     )?;
     let field = Field::new(&expr.output_name, data_type, true);
     NativeFragmentDecodeError::map_invalid(
@@ -448,14 +448,14 @@ fn lower_window_function(
     })?;
     let return_type = NativeFragmentDecodeError::map_invalid(
         path.clone().field("result_type"),
-        crate::fragment::decode::type_decode::decode_type(return_type),
+        novarocks_plan_codec::native_type::decode_type(return_type),
     )?;
     let logical_args = expr
         .args
         .iter()
         .enumerate()
         .map(|(idx, arg)| {
-            ctx.decode_expression(
+            decode_expr_for_slot_layout(
                 arg,
                 path.clone().field("args").index(idx),
                 arena,
@@ -481,7 +481,7 @@ fn lower_window_function(
                     format!("window aggregate {name} function_order_by[{idx}] expr missing"),
                 )
             })?;
-            ctx.decode_expression(order_expr, item_path.field("expr"), arena, input_layout)
+            decode_expr_for_slot_layout(order_expr, item_path.field("expr"), arena, input_layout)
         })
         .collect::<Result<Vec<_>, NativeFragmentDecodeError>>()?;
     let aggregate_binding = if is_aggregate_window_kind(&kind) {
@@ -784,10 +784,10 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::{NativePlanDecodeContext, decode_node};
-    use crate::fragment::decode::type_decode::encode_type;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::analytic::WindowFunctionKind;
+    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 

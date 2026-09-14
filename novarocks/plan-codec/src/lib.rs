@@ -39,9 +39,11 @@
 //! that unwraps the frontend's prepared encoding view remain in the frontend.
 
 mod expr;
+pub mod native_type;
 mod plan;
 
 pub use expr::encode_expr;
+pub use plan::encode_type as encode_native_type;
 pub use plan::scan_facts::{
     NativeConnectorRead, NativeScanBinding, NativeScanColumn, NativeScanColumnKind,
     NativeScanExecutionKind, NativeScanFacts, NoScanFacts,

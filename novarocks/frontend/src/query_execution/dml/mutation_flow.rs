@@ -35,7 +35,7 @@ use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
-use crate::runtime::query_result::QueryResult;
+use novarocks_query_application::api::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
@@ -835,14 +835,13 @@ fn cow_selection_from_query_result(
             Arc::clone(&schema),
         )
         .map_err(|error| format!("create bounded COW match collector: {error}"))?;
-    for chunk in result.chunks {
-        if chunk.batch.num_columns() != schema.fields().len() {
+    for batch in result.batches {
+        if batch.num_columns() != schema.fields().len() {
             return Err(
                 "COW match query output width differs from its signed contract".to_string(),
             );
         }
-        let columns = chunk
-            .batch
+        let columns = batch
             .columns()
             .iter()
             .zip(schema.fields())
@@ -3068,7 +3067,7 @@ fn execute_exact_cow_match_query(
     Ok(state
         .query_execution()
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
         .map_err(|error| error.to_string())?)
 }
@@ -3082,8 +3081,8 @@ fn matched_update_batch_from_query_result(
     result: QueryResult,
 ) -> Result<MatchedUpdateBatch, String> {
     let mut merged = empty_matched_update_batch()?;
-    for chunk in result.chunks {
-        merged.append(matched_update_batch_from_record_batch(&chunk.batch)?);
+    for batch in result.batches {
+        merged.append(matched_update_batch_from_record_batch(&batch)?);
     }
     Ok(merged)
 }
@@ -4526,7 +4525,7 @@ mod tests {
             ),
             None,
             Arc::clone(&connector_control),
-            std::sync::Arc::new(crate::connector::ConnectorControlHost::new()),
+            std::sync::Arc::new(novarocks_catalog_application::ConnectorControlHost::new()),
             Arc::new(crate::connector::unified_statistics::UnifiedStatisticsResolver::default()),
             Arc::new(novarocks_spi::connector::UnavailableMvStorageObservationPort),
             crate::query_execution::compiler::test_query_execution_service(),
@@ -5175,7 +5174,7 @@ mod tests {
         let selection = cow_selection_from_query_result(
             QueryResult {
                 columns: Vec::new(),
-                chunks: Vec::new(),
+                batches: Vec::new(),
             },
             &fixture.preparation,
             connector_context_for_test(),
@@ -5736,7 +5735,7 @@ mod tests {
             calls: Arc::clone(&calls),
             finish_outcome: Mutex::new(Some(outcome)),
         });
-        let lease = crate::connector::control_host::ConnectorWriteStackLease::new(
+        let lease = novarocks_catalog_application::test_support::write_stack_lease(
             novarocks_spi::connector::ConnectorControlRuntimeId::new(),
             novarocks_spi::connector::ConnectorControlWriteBinding::new(
                 Arc::new(UnusedLegacyWriteControl),
@@ -5804,7 +5803,7 @@ mod tests {
                 novarocks_types::ClusterRole::Fe,
                 crate::common::backend_topology::BackendTopologySnapshot::empty(3),
                 None,
-                crate::common::query_cancellation::QueryCancellationSource::new().view(),
+                novarocks_query_application::cancellation::QueryCancellationSource::new().view(),
                 novarocks_sql::compiler::SessionOptimizerSettings::default(),
             ),
             connector_context: connector_context_for_test(),

@@ -1,13 +1,8 @@
 //! Frontend-owned report-only native endpoint.
 
 use std::collections::BTreeMap;
-use std::io;
-use std::net::{SocketAddr, TcpListener};
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
-use std::task::{Context, Poll};
-use std::thread::JoinHandle;
+use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::topology::ClusterBackendService;
 use novarocks_proto_codec::membership::{
@@ -15,13 +10,8 @@ use novarocks_proto_codec::membership::{
 };
 use novarocks_proto_codec::{ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpListener as TokioTcpListener;
-use tokio::sync::watch;
-use tokio_stream::wrappers::ReceiverStream;
-use tonic::transport::server::Connected;
 
-use crate::coordinator::{
+use crate::query_execution::lifecycle_diagnostics::{
     QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
     QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
     RuntimeFilterTerminalRollupUnavailable,
@@ -32,50 +22,9 @@ use crate::query_execution::runtime_filter_terminal_rollup::{
     RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
 };
 
-use super::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
-use super::transport::FrontendNativeTransport;
-use novarocks_native_trust::{BoxedNativeIo, NativeServerAdmission, NativeTrust};
-
-const GRPC_MAX_MESSAGE_BYTES: usize =
-    novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
-
-/// Role-local wrapper supplying the connection marker Tonic requires after
-/// the trust adapter has selected plaintext or completed TLS.
-struct FrontendReportNativeIo(BoxedNativeIo);
-
-impl AsyncRead for FrontendReportNativeIo {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        buffer: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(self.0.as_mut()).poll_read(context, buffer)
-    }
-}
-
-impl AsyncWrite for FrontendReportNativeIo {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-        bytes: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(self.0.as_mut()).poll_write(context, bytes)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.0.as_mut()).poll_flush(context)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(self.0.as_mut()).poll_shutdown(context)
-    }
-}
-
-impl Connected for FrontendReportNativeIo {
-    type ConnectInfo = ();
-
-    fn connect_info(&self) -> Self::ConnectInfo {}
-}
+use novarocks_native_adapter::generated::nova_rocks_grpc_server::NovaRocksGrpc;
+use novarocks_native_adapter::{FrontendNativeTransport, NativeRpcServerHandle};
+use novarocks_native_trust::NativeTrust;
 
 pub(crate) const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
@@ -799,15 +748,12 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use super::super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
-    use super::{
-        FrontendNativeTransport, FrontendReportServerHandle, lifecycle_convergence_debug_snapshot,
-    };
-    use crate::coordinator::{
+    use super::{FrontendReportServerHandle, lifecycle_convergence_debug_snapshot};
+    use crate::metrics::FrontendProcessQueryCountersSnapshot;
+    use crate::query_execution::lifecycle_diagnostics::{
         QueryLifecycleConvergenceReader, RuntimeFilterTerminalRollupSnapshot,
         RuntimeFilterTerminalRollupUnavailable,
     };
-    use crate::metrics::FrontendProcessQueryCountersSnapshot;
     use crate::query_execution::runtime_filter_terminal_rollup::{
         RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
         RuntimeFilterParticipantTerminalTelemetryValue, RuntimeFilterTerminalParticipant,
@@ -815,6 +761,8 @@ mod tests {
         RuntimeFilterTerminalTotalsTelemetry, RuntimeFilterTerminalTotalsUnavailable,
     };
     use crate::topology::ClusterBackendService;
+    use novarocks_native_adapter::FrontendNativeTransport;
+    use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
@@ -838,15 +786,16 @@ mod tests {
     impl QueryLifecycleConvergenceReader for EmptyConvergenceReader {
         fn latest_convergence_snapshot(
             &self,
-        ) -> Option<crate::coordinator::QueryLifecycleConvergenceSnapshot> {
+        ) -> Option<crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot>
+        {
             None
         }
     }
 
     fn debug_snapshot_with_runtime_filter(
         runtime_filter: RuntimeFilterTerminalRollupSnapshot,
-    ) -> crate::coordinator::QueryLifecycleConvergenceSnapshot {
-        crate::coordinator::QueryLifecycleConvergenceSnapshot {
+    ) -> crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
+        crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
             execution_id: QueryExecutionId::new(
                 QueryId::new(51, 52),
                 AttemptId::new(1).expect("nonzero attempt"),
@@ -1105,11 +1054,7 @@ mod tests {
 /// Instance-owned report listener. The host exposes only lifecycle methods,
 /// never a Tonic service or a Core listener handle.
 pub struct FrontendReportServerHandle {
-    bound_addr: SocketAddr,
-    shutdown_tx: Option<watch::Sender<bool>>,
-    failure_rx: mpsc::Receiver<String>,
-    join_handle: Option<JoinHandle<()>>,
-    stop_requested: Arc<AtomicBool>,
+    inner: NativeRpcServerHandle,
 }
 
 impl FrontendReportServerHandle {
@@ -1120,190 +1065,60 @@ impl FrontendReportServerHandle {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, String> {
-        let listener = TcpListener::bind(address).map_err(|error| {
-            format!("bind frontend report endpoint on {address} failed: {error}")
-        })?;
-        listener.set_nonblocking(true).map_err(|error| {
-            format!("set frontend report endpoint on {address} nonblocking failed: {error}")
-        })?;
-        let bound_addr = listener.local_addr().map_err(|error| {
-            format!("read frontend report endpoint bound address failed: {error}")
-        })?;
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let thread_stop_requested = Arc::clone(&stop_requested);
-        let join_handle = std::thread::Builder::new()
-            .name("frontend-report-grpc".to_string())
-            .spawn(move || {
-                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let runtime = tokio::runtime::Builder::new_multi_thread()
-                        .enable_all()
-                        .worker_threads(8)
-                        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-                        .build()
-                        .map_err(|error| {
-                            format!("build frontend report endpoint runtime failed: {error}")
-                        })?;
-                    runtime.block_on(async move {
-                        let listener = TokioTcpListener::from_std(listener).map_err(|error| {
-                            format!("create frontend report Tokio listener failed: {error}")
-                        })?;
-                        let incoming_adapter = native_transport.incoming_adapter();
-                        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::channel(64);
-                        let accept_task = tokio::spawn(async move {
-                            loop {
-                                let (stream, _) = match listener.accept().await {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        let _ = incoming_tx
-                                            .send(Err(io::Error::other(format!(
-                                                "accept frontend report connection failed: {error}"
-                                            ))))
-                                            .await;
-                                        return;
-                                    }
-                                };
-                                match incoming_adapter.accept(stream).await {
-                                    Ok(stream) => {
-                                        if incoming_tx
-                                            .send(Ok(FrontendReportNativeIo(stream)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                    }
-                                    Err(_) => {
-                                        crate::metrics::observe_native_trust_transport_rejection(
-                                            "report_listener",
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                        let service = NovaRocksGrpcServer::new(FrontendReportService {
-                            membership,
-                            deployment_id: native_trust.deployment_id().as_str().to_string(),
-                        })
-                        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                        .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
-                        let serve = tonic::transport::Server::builder()
-                            .layer(
-                                NativeServerAdmission::new(native_trust.as_ref().clone())
-                                    .listener_layer(),
-                            )
-                            .add_service(service)
-                            .serve_with_incoming(ReceiverStream::new(incoming_rx));
-                        tokio::pin!(serve);
-                        let mut shutdown_rx = shutdown_rx;
-                        let result = tokio::select! {
-                            result = &mut serve => result.map_err(|error| {
-                                format!("frontend report endpoint serve future failed: {error}")
-                            }),
-                            _ = async {
-                                while !*shutdown_rx.borrow() {
-                                    if shutdown_rx.changed().await.is_err() {
-                                        break;
-                                    }
-                                }
-                            } => Ok(()),
-                        };
-                        accept_task.abort();
-                        result
-                    })
-                }));
-                if thread_stop_requested.load(Ordering::Acquire) {
-                    return;
-                }
-                let error = match outcome {
-                    Ok(Ok(())) => "frontend report endpoint exited unexpectedly".to_string(),
-                    Ok(Err(error)) => error,
-                    Err(payload) => payload
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| {
-                            payload
-                                .downcast_ref::<&str>()
-                                .map(|value| (*value).to_string())
-                        })
-                        .unwrap_or_else(|| "frontend report endpoint panicked".to_string()),
-                };
-                let _ = failure_tx.send(error);
-            })
-            .map_err(|error| format!("spawn frontend report endpoint: {error}"))?;
-        Ok(Self {
-            bound_addr,
-            shutdown_tx: Some(shutdown_tx),
-            failure_rx,
-            join_handle: Some(join_handle),
-            stop_requested,
-        })
+        Self::start_at_host(
+            &address.ip().to_string(),
+            address.port(),
+            membership,
+            native_trust,
+            native_transport,
+        )
     }
 
     pub(crate) fn start_from_host(
         host: &str,
         port: u16,
         membership: Arc<ClusterBackendService>,
-        convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
+        _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
     ) -> Result<Self, String> {
-        Self::start(
-            parse_bind_addr(host, port)?,
-            membership,
-            convergence_reader,
+        Self::start_at_host(host, port, membership, native_trust, native_transport)
+    }
+
+    fn start_at_host(
+        host: &str,
+        port: u16,
+        membership: Arc<ClusterBackendService>,
+        native_trust: Arc<NativeTrust>,
+        native_transport: FrontendNativeTransport,
+    ) -> Result<Self, String> {
+        let deployment_id = native_trust.deployment_id().as_str().to_string();
+        let inner = NativeRpcServerHandle::start(
+            host,
+            port,
+            FrontendReportService {
+                membership,
+                deployment_id,
+            },
             native_trust,
-            native_transport,
-        )
+            native_transport.incoming_adapter(),
+            "frontend report endpoint",
+            "frontend-report-grpc",
+            || {},
+            || crate::metrics::observe_native_trust_transport_rejection("report_listener"),
+        )?;
+        Ok(Self { inner })
     }
 
     pub const fn bound_addr(&self) -> SocketAddr {
-        self.bound_addr
+        self.inner.bound_addr()
     }
 
     pub fn poll_failure(&mut self) -> Result<Option<String>, String> {
-        match self.failure_rx.try_recv() {
-            Ok(error) => Ok(Some(error)),
-            Err(mpsc::TryRecvError::Empty) | Err(mpsc::TryRecvError::Disconnected) => Ok(None),
-        }
+        self.inner.poll_failure()
     }
 
     pub fn stop(&mut self) -> Result<(), String> {
-        self.stop_requested.store(true, Ordering::Release);
-        if let Some(shutdown_tx) = self.shutdown_tx.take() {
-            let _ = shutdown_tx.send(true);
-        }
-        if let Some(join_handle) = self.join_handle.take() {
-            join_handle
-                .join()
-                .map_err(|_| "frontend report endpoint thread panicked".to_string())?;
-        }
-        Ok(())
+        self.inner.stop()
     }
-}
-
-impl Drop for FrontendReportServerHandle {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-fn parse_bind_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
-    let bare = if host.starts_with('[') && host.ends_with(']') {
-        &host[1..host.len() - 1]
-    } else {
-        host
-    };
-    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
-        return Ok(SocketAddr::new(ip, port));
-    }
-    let formatted = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    formatted
-        .parse::<SocketAddr>()
-        .map_err(|error| format!("parse frontend report bind addr '{formatted}' failed: {error}"))
 }

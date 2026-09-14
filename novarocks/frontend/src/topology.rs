@@ -27,9 +27,6 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
@@ -46,7 +43,9 @@ use crate::common::backend_topology::{
 use crate::metrics::{record_backend_announce, record_backend_heartbeat};
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::heartbeat as native_heartbeat;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_query_application::api::{
+    BackendTopologyCommandPort, QueryResult, build_utf8_query_result,
+};
 
 #[derive(Clone, Debug)]
 pub struct ClusterBackendOpenConfig {
@@ -991,6 +990,9 @@ impl BackendTopologyPort for ClusterBackendService {
         }
         crate::common::backend_topology::record_successful_stage(backend_idx, fragment_count);
     }
+}
+
+impl BackendTopologyCommandPort for ClusterBackendService {
     fn show_backends(&self) -> Result<QueryResult, String> {
         self.refresh_expired_announce_leases(std::time::Instant::now());
         let state = self
@@ -1047,30 +1049,11 @@ impl BackendTopologyPort for ClusterBackendService {
                     .unwrap_or_else(|| facts.compatibility.detail().to_string()),
             );
         }
-        let arrays = columns
-            .into_iter()
-            .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+        let rows = (0..state.processes.len())
+            .map(|row| columns.iter().map(|column| column[row].clone()).collect())
             .collect();
-        let schema = Schema::new(
-            names
-                .iter()
-                .map(|name| Field::new(*name, DataType::Utf8, false))
-                .collect::<Vec<_>>(),
-        );
-        let batch = RecordBatch::try_new(Arc::new(schema), arrays)
-            .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))?;
-        Ok(QueryResult {
-            columns: names
-                .iter()
-                .map(|name| QueryResultColumn {
-                    name: (*name).to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                    logical_type: None,
-                })
-                .collect(),
-            chunks: vec![record_batch_to_chunk(batch)?],
-        })
+        build_utf8_query_result(&names, rows)
+            .map_err(|error| format!("build SHOW BACKENDS result failed: {error}"))
     }
 }
 
@@ -1284,6 +1267,7 @@ mod tests {
     use novarocks_execution::task_execution::AdmissionEpochCapability;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::{BackendProcessDescriptor, BackendReportedState};
+    use novarocks_query_application::api::BackendTopologyCommandPort;
     use novarocks_types::BackendProcessId;
     use novarocks_version::native_build_identity;
     use std::net::SocketAddr;
@@ -1708,7 +1692,7 @@ mod tests {
         let names = result
             .columns
             .iter()
-            .map(|column| column.name.clone())
+            .map(|column| column.name().to_string())
             .collect::<Vec<_>>();
         let index = |name: &str| {
             names
@@ -1717,10 +1701,9 @@ mod tests {
                 .unwrap_or_else(|| panic!("SHOW BACKENDS has no {name} column"))
         };
         let mut rows = Vec::new();
-        for chunk in &result.chunks {
+        for batch in &result.batches {
             let column = |name: &str| {
-                chunk
-                    .batch
+                batch
                     .column(index(name))
                     .as_any()
                     .downcast_ref::<arrow::array::StringArray>()
@@ -1733,7 +1716,7 @@ mod tests {
             let build_identity = column("BuildIdentity");
             let compatibility_id = column("NativeCompatibilityId");
             let status_detail = column("StatusDetail");
-            for row in 0..chunk.batch.num_rows() {
+            for row in 0..batch.num_rows() {
                 rows.push(BarrierRow {
                     process_id: process_id.value(row).to_string(),
                     diagnostic_status: diagnostic_status.value(row).to_string(),
@@ -1883,7 +1866,7 @@ mod tests {
             .unwrap()
             .columns
             .into_iter()
-            .map(|column| column.name)
+            .map(|column| column.name().to_string())
             .collect::<Vec<_>>();
         assert!(columns.contains(&"LeaseValid".to_string()));
         assert!(columns.contains(&"IdentityVerified".to_string()));

@@ -17,11 +17,7 @@
 
 //! Stateful materialized-view analysis and display adapter.
 
-use std::sync::Arc;
-
-use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 
 use crate::mv::domain::analysis::{MvAnalysis, prepare_mv_select_for_catalog_provider};
 use crate::mv::domain::application::MvShowStatement;
@@ -29,7 +25,7 @@ use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
+use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 
 /// Lightweight projection of the iceberg base table that
 /// `validate_ivm_primary_key` needs. Built once at the top of `create_mv`
@@ -248,197 +244,45 @@ pub fn analyze_mv_select_with_provider(
 }
 
 pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, String> {
-    let columns = vec![
-        QueryResultColumn {
-            name: "Name".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "Database".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "StorageEngine".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshMode".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastRefreshTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastRefreshRows".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "BaseTables".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "SelectText".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "Dependencies".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshPaused".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "NextRefreshTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "LastSchedulerError".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "MaxStalenessMs".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RefreshState".to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: None,
-        },
-        QueryResultColumn {
-            name: "RetryAfterTime".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        },
+    const COLUMNS: &[(&str, bool)] = &[
+        ("Name", false),
+        ("Database", false),
+        ("StorageEngine", false),
+        ("RefreshMode", false),
+        ("LastRefreshTime", true),
+        ("LastRefreshRows", true),
+        ("BaseTables", false),
+        ("SelectText", false),
+        ("Dependencies", false),
+        ("RefreshPaused", false),
+        ("NextRefreshTime", true),
+        ("LastSchedulerError", true),
+        ("MaxStalenessMs", true),
+        ("RefreshState", false),
+        ("RetryAfterTime", true),
     ];
-
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("Name", DataType::Utf8, false),
-        Field::new("Database", DataType::Utf8, false),
-        Field::new("StorageEngine", DataType::Utf8, false),
-        Field::new("RefreshMode", DataType::Utf8, false),
-        Field::new("LastRefreshTime", DataType::Utf8, true),
-        Field::new("LastRefreshRows", DataType::Utf8, true),
-        Field::new("BaseTables", DataType::Utf8, false),
-        Field::new("SelectText", DataType::Utf8, false),
-        Field::new("Dependencies", DataType::Utf8, false),
-        Field::new("RefreshPaused", DataType::Utf8, false),
-        Field::new("NextRefreshTime", DataType::Utf8, true),
-        Field::new("LastSchedulerError", DataType::Utf8, true),
-        Field::new("MaxStalenessMs", DataType::Utf8, true),
-        Field::new("RefreshState", DataType::Utf8, false),
-        Field::new("RetryAfterTime", DataType::Utf8, true),
-    ]));
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.name.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.database.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.storage_engine.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.refresh_mode.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.last_refresh_time.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.last_refresh_rows.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.base_tables.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.select_text.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.dependencies.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.refresh_paused.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.next_refresh_time.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.last_scheduler_error.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.max_staleness_ms.clone())
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| Some(row.refresh_state.clone()))
-                .collect::<Vec<_>>(),
-        )),
-        Arc::new(StringArray::from(
-            rows.iter()
-                .map(|row| row.retry_after_time.clone())
-                .collect::<Vec<_>>(),
-        )),
-    ];
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|e| format!("build SHOW MATERIALIZED VIEWS batch failed: {e}"))?;
-    Ok(QueryResult {
-        columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
-    })
+    let rows = rows
+        .iter()
+        .map(|row| {
+            vec![
+                Some(row.name.clone()),
+                Some(row.database.clone()),
+                Some(row.storage_engine.clone()),
+                Some(row.refresh_mode.clone()),
+                row.last_refresh_time.clone(),
+                row.last_refresh_rows.clone(),
+                Some(row.base_tables.clone()),
+                Some(row.select_text.clone()),
+                Some(row.dependencies.clone()),
+                Some(row.refresh_paused.clone()),
+                row.next_refresh_time.clone(),
+                row.last_scheduler_error.clone(),
+                row.max_staleness_ms.clone(),
+                Some(row.refresh_state.clone()),
+                row.retry_after_time.clone(),
+            ]
+        })
+        .collect();
+    build_utf8_table_query_result(COLUMNS, rows)
+        .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))
 }

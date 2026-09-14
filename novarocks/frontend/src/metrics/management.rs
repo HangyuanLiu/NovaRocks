@@ -26,13 +26,13 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::coordinator::QueryLifecycleConvergenceReader;
+use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
 use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
-    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendServingState,
-    FrontendWorkloadServingSnapshot,
+    FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
 };
+use novarocks_query_application::serving_admission::FrontendServingState;
 
 use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
 
@@ -251,10 +251,9 @@ async fn island_readyz(State(state): State<FrontendManagementState>) -> axum::re
 }
 
 fn management_snapshot(state: &FrontendManagementState) -> FrontendManagementSnapshot {
-    FrontendManagementSnapshot::compose(
-        state.serving_reader.frontend_serving_snapshot(),
-        state.island_reader.backend_island_snapshot(),
-    )
+    let serving = state.serving_reader.frontend_serving_snapshot();
+    super::publish_frontend_serving_metrics(serving.clone());
+    FrontendManagementSnapshot::compose(serving, state.island_reader.backend_island_snapshot())
 }
 
 async fn latest_lifecycle_convergence_snapshot(
@@ -275,7 +274,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{FrontendMetricsRegistry, frontend_management_router_with_readers};
-    use crate::coordinator::{QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot};
+    use crate::query_execution::lifecycle_diagnostics::{
+        QueryLifecycleConvergenceReader, QueryLifecycleConvergenceSnapshot,
+    };
     use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
     use crate::workload_lifecycle::{
         FrontendCatalogCounts, FrontendCatalogSnapshotIdentity, FrontendCatalogSourceMode,

@@ -19,17 +19,13 @@
 
 use std::sync::Arc;
 
-use arrow::array::StringArray;
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-
-use crate::query_execution::StatementResult;
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
 use crate::statistics_jobs::application::{
     StatisticsApplicationCommand, StatisticsApplicationPort, StatisticsApplicationResult,
     StatisticsColumnIntent, StatisticsTableTarget,
 };
 use novarocks_parser::ast::{AnalyzeMode, StatisticsStatement};
+use novarocks_query_application::api::build_nullable_utf8_query_result;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone)]
@@ -61,42 +57,12 @@ fn statistics_application_target(
     })
 }
 
-/// The state a statistics job reaches when its work actually happened.
-const SUCCEEDED_STATISTICS_JOB_STATE: &str = "SUCCEEDED";
-
-/// Report a waited statistics job as the statement's own outcome.
-///
-/// The statement waited for this job precisely so the client would learn what
-/// happened to it. Answering `OK` for a job that ended `FAILED` would report
-/// success for work that never ran and leave the table's statistics silently
-/// absent, which is worse than a loud failure: the next query plans on missing
-/// statistics with nothing to explain why.
-fn completed_statistics_job_result(
-    job: crate::statistics_jobs::application::StatisticsJobView,
-) -> Result<StatementResult, String> {
-    if job.state == SUCCEEDED_STATISTICS_JOB_STATE {
-        return Ok(StatementResult::Ok);
-    }
-    let mut message = format!(
-        "statistics job {} for `{}`.`{}`.`{}` ended in state {}",
-        job.job_id, job.target.catalog, job.target.namespace, job.target.table, job.state
-    );
-    if let Some(kind) = job.error_kind {
-        message.push_str(&format!(" ({kind})"));
-    }
-    if let Some(detail) = job.error_message {
-        message.push_str(&format!(": {detail}"));
-    }
-    Err(message)
-}
-
 fn statistics_application_result(
     result: StatisticsApplicationResult,
 ) -> Result<StatementResult, String> {
     match result {
         StatisticsApplicationResult::JobSubmitted(_)
         | StatisticsApplicationResult::JobCancellationRequested(_) => Ok(StatementResult::Ok),
-        StatisticsApplicationResult::JobCompleted(job) => completed_statistics_job_result(job),
         StatisticsApplicationResult::AnalyzeJobs(jobs) => statistics_string_result(
             &[
                 "job_id",
@@ -157,38 +123,9 @@ fn statistics_string_result(
     rows: Vec<Vec<Option<String>>>,
 ) -> Result<StatementResult, String> {
     if rows.iter().any(|row| row.len() != names.len()) {
-        return Err("statistics application returned malformed tabular result".to_string());
+        return Err("statistics application returned malformed tabular result".to_owned());
     }
-    let columns = names
-        .iter()
-        .map(|name| QueryResultColumn {
-            name: (*name).to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
-            logical_type: None,
-        })
-        .collect::<Vec<_>>();
-    let schema = Arc::new(Schema::new(
-        names
-            .iter()
-            .map(|name| Field::new(*name, DataType::Utf8, true))
-            .collect::<Vec<_>>(),
-    ));
-    let arrays = (0..names.len())
-        .map(|column| {
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row[column].clone())
-                    .collect::<Vec<_>>(),
-            )) as arrow::array::ArrayRef
-        })
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(schema, arrays)
-        .map_err(|error| format!("build statistics application result failed: {error}"))?;
-    Ok(StatementResult::Query(QueryResult {
-        columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
-    }))
+    build_nullable_utf8_query_result(names, rows).map(StatementResult::Query)
 }
 
 impl StatisticsCommandExecutor {
@@ -283,7 +220,7 @@ mod tests {
     use arrow::array::{Array, StringArray};
     use uuid::Uuid;
 
-    use super::{StatementResult, StatisticsCommandExecutor};
+    use super::StatisticsCommandExecutor;
     use crate::statistics_jobs::application::{
         StatisticsApplicationCommand, StatisticsApplicationError, StatisticsApplicationPort,
         StatisticsApplicationResult, StatisticsJobView, StatisticsTableStatView,
@@ -366,13 +303,14 @@ mod tests {
         let show_stats = executor
             .execute(statement, None, "default", None)
             .expect("show typed table stats");
-        let crate::runtime::statement_result::StatementResult::Query(show_stats) = show_stats
+        let novarocks_query_application::protocol_delivery::QuerySessionOutput::Query(show_stats) =
+            show_stats
         else {
             panic!("SHOW TABLE STATS must return a query result");
         };
-        assert_eq!(show_stats.columns[0].name, "metric");
-        assert_eq!(show_stats.columns[1].name, "value");
-        let value = show_stats.chunks[0].batch.column(1);
+        assert_eq!(show_stats.columns[0].name(), "metric");
+        assert_eq!(show_stats.columns[1].name(), "value");
+        let value = show_stats.batches[0].column(1);
         let value = value
             .as_any()
             .downcast_ref::<StringArray>()
@@ -403,89 +341,16 @@ mod tests {
         );
     }
 
-    /// A statistics job whose terminal state the caller waited for.
-    struct TerminalStatisticsApplicationPort {
-        state: &'static str,
-        error_kind: Option<&'static str>,
-        error_message: Option<&'static str>,
-    }
-
-    impl StatisticsApplicationPort for TerminalStatisticsApplicationPort {
-        fn execute(
-            &self,
-            command: StatisticsApplicationCommand,
-            _execution: Option<&crate::common::admitted_query_context::QueryExecutionContext>,
-        ) -> Result<StatisticsApplicationResult, StatisticsApplicationError> {
-            let StatisticsApplicationCommand::AnalyzeTable { target, .. } = command else {
-                panic!("this fixture answers only ANALYZE TABLE");
-            };
-            Ok(StatisticsApplicationResult::JobCompleted(
-                StatisticsJobView {
-                    job_id: Uuid::nil(),
-                    operation_id: novarocks_spi::connector::LakePublicationId::new_v7(),
-                    state: self.state.into(),
-                    attempt: 1,
-                    target,
-                    error_kind: self.error_kind.map(Into::into),
-                    error_message: self.error_message.map(Into::into),
-                },
-            ))
-        }
-    }
-
-    fn analyze_against(port: TerminalStatisticsApplicationPort) -> Result<StatementResult, String> {
-        let executor = StatisticsCommandExecutor::new(Arc::new(port));
-        let statements =
-            novarocks_parser::parse("ANALYZE TABLE ice.analytics.orders").expect("parse analyze");
-        let [novarocks_parser::ast::Statement::Statistics(statement)] = statements.as_slice()
-        else {
-            panic!("expected statistics statement");
-        };
-        executor.execute(statement, None, "default", None)
-    }
-
-    /// ANALYZE waits for its collection job, so the statement is the only
-    /// place the client can learn that the collection did not happen.
-    /// Answering `OK` there leaves the table with no statistics and nothing
-    /// to explain why every later plan is estimating blind.
     #[test]
-    fn a_failed_collection_fails_its_analyze_statement() {
-        let error = analyze_against(TerminalStatisticsApplicationPort {
-            state: "FAILED",
-            error_kind: Some("COLLECTION"),
-            error_message: Some("scan source is a pre-pinned opaque connector read"),
-        })
-        .expect_err("a failed collection must not report success");
-        assert!(error.contains("FAILED"), "{error}");
-        assert!(error.contains("COLLECTION"), "{error}");
-        assert!(
-            error.contains("scan source is a pre-pinned opaque connector read"),
-            "{error}"
+    fn malformed_statistics_rows_keep_the_product_diagnostic() {
+        let error = super::statistics_string_result(
+            &["job_id", "state"],
+            vec![vec![Some("job-1".to_owned())]],
+        )
+        .expect_err("statistics rows must match their declared columns");
+        assert_eq!(
+            error,
+            "statistics application returned malformed tabular result"
         );
-        assert!(error.contains("orders"), "{error}");
-    }
-
-    /// A publish whose commit outcome is unknown is not a success either: the
-    /// caller must be told the statistics may or may not be there.
-    #[test]
-    fn a_commit_unknown_collection_fails_its_analyze_statement() {
-        let error = analyze_against(TerminalStatisticsApplicationPort {
-            state: "COMMIT_UNKNOWN",
-            error_kind: Some("COMMIT_UNKNOWN"),
-            error_message: None,
-        })
-        .expect_err("an unknown commit outcome must not report success");
-        assert!(error.contains("COMMIT_UNKNOWN"), "{error}");
-    }
-
-    #[test]
-    fn a_succeeded_collection_reports_statement_success() {
-        let result = analyze_against(TerminalStatisticsApplicationPort {
-            state: "SUCCEEDED",
-            error_kind: None,
-            error_message: None,
-        })
-        .expect("a succeeded collection reports success");
-        assert!(matches!(result, StatementResult::Ok));
     }
 }

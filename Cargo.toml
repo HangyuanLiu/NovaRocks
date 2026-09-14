@@ -22,7 +22,7 @@
 # `novarocks-server/` (executable is still `novarocks`).
 [workspace]
 resolver = "2"
-members = ["novarocks/backend", "novarocks/catalog-application", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/memory", "novarocks/memory-arrow", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/runtime", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support", "tests/sql/runner", "tools", "tools/arrow-pool-bench", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
+members = ["novarocks/backend", "novarocks/catalog-application", "novarocks/connector/iceberg", "novarocks/connector/iceberg-functions", "novarocks/connector/paimon", "novarocks/connector/starrocks", "novarocks/execution", "novarocks/execution-contract", "novarocks/failpoint", "novarocks/frontend", "novarocks/fs", "novarocks/functions", "novarocks/memory", "novarocks/memory-arrow", "novarocks/mv-application", "novarocks/mysql-adapter", "novarocks/native-adapter", "novarocks/native-trust", "novarocks/parser", "novarocks/plan-codec", "novarocks/proto-codec", "novarocks/proto-models", "novarocks/query-application", "novarocks/secret", "novarocks/spi", "novarocks/sql", "novarocks/state-store/api", "novarocks/state-store/runtime", "novarocks/state-store/testkit", "novarocks/state-store/sqlite", "novarocks/state-store/foundationdb", "novarocks/state-store/mysql", "novarocks/statistics-application", "novarocks/table-maintenance", "novarocks/task-codec", "novarocks/types", "novarocks/user-error", "novarocks/version", "novarocks/worker", "novarocks/workload-control", "novarocks-server", "tests/cluster-harness", "tests/datasketches-tck", "tests/system-test-runner", "tests/test-support", "tests/sql/runner", "tools", "tools/arrow-pool-bench", "tools/connector-binding-bench", "tools/datasketches-bench", "tools/error-manifest"]
 # Native development defaults to the server package.
 default-members = ["novarocks-server"]
 # Vendored upstream packages keep their own workspace and lock authority.
@@ -117,6 +117,8 @@ novarocks-frontend = { path = "novarocks/frontend", version = "0.1.0" }
 novarocks-fs = { path = "novarocks/fs", version = "0.1.0" }
 novarocks-memory = { path = "novarocks/memory", version = "0.1.0" }
 novarocks-memory-arrow = { path = "novarocks/memory-arrow", version = "0.1.0" }
+novarocks-mysql-adapter = { path = "novarocks/mysql-adapter", version = "0.1.0" }
+novarocks-native-adapter = { path = "novarocks/native-adapter", version = "0.1.0" }
 novarocks-functions = { path = "novarocks/functions", version = "0.1.0" }
 novarocks-native-trust = { path = "novarocks/native-trust", version = "0.1.0" }
 novarocks-parser = { path = "novarocks/parser", version = "0.1.0" }
@@ -128,7 +130,10 @@ novarocks-secret = { path = "novarocks/secret", version = "0.1.0" }
 novarocks-server = { path = "novarocks-server", version = "0.1.0" }
 novarocks-spi = { path = "novarocks/spi", version = "0.1.0" }
 novarocks-sql = { path = "novarocks/sql", version = "0.1.0" }
+novarocks-mv-application = { path = "novarocks/mv-application", version = "0.1.0" }
+novarocks-statistics-application = { path = "novarocks/statistics-application", version = "0.1.0" }
 novarocks-state-store-api = { path = "novarocks/state-store/api", version = "0.1.0" }
+novarocks-table-maintenance = { path = "novarocks/table-maintenance", version = "0.1.0" }
 novarocks-state-store-runtime = { path = "novarocks/state-store/runtime", version = "0.1.0" }
 novarocks-state-store-sqlite = { path = "novarocks/state-store/sqlite", version = "0.1.0" }
 novarocks-state-store-testkit = { path = "novarocks/state-store/testkit", version = "0.1.0" }
@@ -180,3 +185,8 @@ iceberg-catalog-rest = { path = "vendor/iceberg-catalog-rest-0.9.0" }
 # against it. See vendor/iceberg-catalog-hms-0.9.0/PATCH.md.
 iceberg-catalog-hms = { path = "vendor/iceberg-catalog-hms-0.9.0" }
 paimon = { path = "vendor/paimon-0.3.0" }
+# Vendored to advertise and enforce negotiated COM_QUERY multi-statement /
+# multi-result capability. NovaRocks consumes the negotiated bits to preserve
+# fail-closed behavior for clients that did not request this protocol surface.
+# See vendor/opensrv-mysql-0.7.0/PATCH.md.
+opensrv-mysql = { path = "vendor/opensrv-mysql-0.7.0" }

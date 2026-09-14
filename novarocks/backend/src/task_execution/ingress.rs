@@ -35,7 +35,7 @@
 //!
 //! `FetchTaskDynamicFiltersResponse` carries the filter domains themselves,
 //! but a retained payload reaches this adapter as
-//! [`TaskDynamicFilterRead`](super::host::TaskDynamicFilterRead), whose
+//! [`TaskDynamicFilterRead`](novarocks_worker::TaskDynamicFilterRead), whose
 //! content sits behind `CodecOwnedContent` and exposes only a fingerprint and
 //! a size — no wire projection. So a read that really has a payload is refused
 //! as an internal invariant violation instead of being answered with an empty
@@ -44,48 +44,31 @@
 //! refusal is unreachable today and becomes loud the moment a producer is
 //! wired.
 
-use std::collections::VecDeque;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
+use std::sync::Arc;
 
-use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
-use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskOperationId};
 use novarocks_execution_contract::task_execution::operation::{
     OperationOutcome, TaskDomainReceipt, UpdateQueryContext,
 };
-use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailureCategory};
-use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::domain::{
-    ConfidentialTransport, refuse_confidential_material_in_the_clear,
-};
+use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_task_codec::operation::{
-    DecodedOperation, DecodedUpdateQueryContext, decode_context_aware_subscribe_task_status,
-    decode_fetch_dynamic_filters, decode_get_final_task_info, decode_operation_batch,
-    encode_abort_cause_field, encode_context_convergence_event, encode_create_task_ack,
-    encode_operation_outcome, encode_query_context_ack, encode_query_context_admission_ticket_ack,
-    encode_receipt, encode_release_ack, encode_status_event, encode_task_gone_event,
-    encode_update_task_ack,
+    DecodedOperation, DecodedUpdateQueryContext, encode_abort_cause_field, encode_create_task_ack,
+    encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
+    encode_release_ack, encode_update_task_ack,
 };
-use novarocks_task_codec::status::{encode_final_task_info, encode_task_status};
+use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
-use tokio_stream::Stream;
 
-use super::fault;
-use super::host::HostRejection;
-use super::observation::{
-    ContextConvergenceCursorError, TaskStatusEvent, TaskStatusSource,
-    TaskStatusSubscriptionPosition,
+use novarocks_native_adapter::task_protocol::{
+    TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
+    TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
+    TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
+    apply_task_operations, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
+    get_final_task_info, host_rejection_status, subscribe_task_status,
 };
-use super::receipt::OperationReceipt;
-use super::registry::TaskExecutionRegistry;
-use super::shared_facts::encode_dynamic_filter_read;
-use crate::rpc::task_execution::{TaskExecutionIngress, TaskStatusEventStream};
-
-type ReceiptAck = proto::task_operation_receipt::Ack;
+use novarocks_native_adapter::task_protocol_fault as fault;
+use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
 
 /// The wire adapter of one backend's task protocol owner.
 pub(crate) struct RegistryTaskExecutionIngress {
@@ -100,6 +83,11 @@ impl RegistryTaskExecutionIngress {
         native_compatibility_id: NativeCompatibilityId,
         native_transport_confidentiality: ConfidentialTransport,
     ) -> Arc<Self> {
+        assert!(
+            registry.config().max_tasks_per_context
+                <= TransportBudget::DEFAULT.max_tasks_per_context(),
+            "task registry context bound exceeds the native transport contract"
+        );
         Arc::new(Self {
             registry,
             native_compatibility_id,
@@ -143,7 +131,7 @@ impl RegistryTaskExecutionIngress {
                 let receipt = self
                     .registry
                     .acquire_query_context_admission_ticket(*request);
-                encode_item(&receipt, |ack| {
+                encode_operation_receipt(&receipt, |ack| {
                     Some(ReceiptAck::QueryContextAdmissionTicket(
                         encode_query_context_admission_ticket_ack(*ack),
                     ))
@@ -155,7 +143,7 @@ impl RegistryTaskExecutionIngress {
                 // Claimed after the owner applied it: the task is admitted and
                 // running, and only this answer is lost.
                 fault::create_task_ack_dropped(identity, receipt.outcome())?;
-                let mut encoded = encode_item(&receipt, |ack| {
+                let mut encoded = encode_operation_receipt(&receipt, |ack| {
                     encode_create_task_ack(ack).map(ReceiptAck::CreateTask)
                 })?;
                 // The two wire-value faults are claimed on the encoded answer,
@@ -194,7 +182,7 @@ impl RegistryTaskExecutionIngress {
                     receipt.outcome(),
                     terminal_nonempty,
                 )?;
-                encode_item(&receipt, |ack| {
+                encode_operation_receipt(&receipt, |ack| {
                     encode_update_task_ack(ack).map(ReceiptAck::UpdateTask)
                 })
             }
@@ -216,6 +204,12 @@ impl RegistryTaskExecutionIngress {
                         "runner-owned lease renewal refused so the lease expires",
                     ));
                 }
+                if matches!(&neutral, UpdateQueryContext::Establish(_)) {
+                    // Arm before the registry releases its creation gate. A
+                    // create may already be waiting there, and must observe
+                    // the runner-owned process-loss rendezvous when it wakes.
+                    fault::arm_restart_after_establish_context(context)?;
+                }
                 let receipt = self.registry.update_query_context(&neutral);
                 match &neutral {
                     UpdateQueryContext::Establish(_) => {
@@ -234,20 +228,20 @@ impl RegistryTaskExecutionIngress {
                 // Read after the operation: an establish that lost the latch
                 // to an abort reports the cause that abort installed.
                 let cause = self.registry.termination_cause(context);
-                encode_item(&receipt, |ack| {
+                encode_operation_receipt(&receipt, |ack| {
                     encode_query_context_ack(ack, cause).map(ReceiptAck::QueryContext)
                 })
             }
             DecodedOperation::CancelTask(request) => {
                 let receipt = self.registry.cancel_task(request);
-                encode_item(&receipt, |ack| {
+                encode_operation_receipt(&receipt, |ack| {
                     Some(ReceiptAck::CancelTask(encode_task_status(ack)))
                 })
             }
             DecodedOperation::AbortQueryContext(request) => {
                 let receipt = self.registry.abort_query_context(request);
                 let cause = self.registry.termination_cause(request.context());
-                encode_item(&receipt, |ack| {
+                encode_operation_receipt(&receipt, |ack| {
                     encode_query_context_ack(ack, cause).map(ReceiptAck::QueryContext)
                 })
             }
@@ -257,12 +251,17 @@ impl RegistryTaskExecutionIngress {
                 // it is what hands the shared facts back to the host and seals
                 // this evidence.
                 let evidence = self.registry.released_context_evidence(request.context());
-                encode_item(&receipt, |ack| {
+                let runtime_filter =
+                    novarocks_native_adapter::task_shared_facts::release_runtime_filter_telemetry(
+                        &evidence,
+                    )
+                    .map_err(host_rejection_status)?;
+                encode_operation_receipt(&receipt, |ack| {
                     let mut encoded = encode_release_ack(
                         ack.context(),
                         ack.release(),
                         ack.state(),
-                        evidence.runtime_filter(),
+                        runtime_filter.as_ref(),
                     )?;
                     encoded.termination_cause =
                         ack.termination_cause().map(encode_abort_cause_field);
@@ -273,42 +272,136 @@ impl RegistryTaskExecutionIngress {
     }
 }
 
-/// Maps a host rejection onto a status code for a read that has no in-band
-/// outcome field.
-///
-/// The category matters to the caller: a protocol refusal is the reader's own
-/// request to fix, while anything else is this process failing to answer a
-/// legal question and must not read as "your request was wrong".
-fn rejection_status(rejection: HostRejection) -> tonic::Status {
-    let detail = rejection.detail().as_str().to_owned();
-    match rejection.category() {
-        TaskFailureCategory::Protocol => tonic::Status::invalid_argument(detail),
-        TaskFailureCategory::ResourceExhausted => tonic::Status::resource_exhausted(detail),
-        TaskFailureCategory::Execution
-        | TaskFailureCategory::Exchange
-        | TaskFailureCategory::Internal => tonic::Status::internal(detail),
+#[tonic::async_trait]
+impl TaskResultReader for RegistryTaskExecutionIngress {
+    async fn read_task_result(
+        &self,
+        request: TaskResultReadRequest,
+    ) -> Result<TaskResultRead, TaskResultReadError> {
+        use crate::rpc::data_plane::emit_task_fetch_marker;
+        use crate::runtime::result_buffer::{
+            TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
+        };
+        use proto::fetch_result_response::Status as FetchStatus;
+
+        let identity = request.identity();
+        let acknowledged = request.acknowledged_packet_sequence();
+        let route = self.registry.root_result_route(identity);
+        let binding = match route {
+            RootResultRoute::Serve(binding) => binding,
+            RootResultRoute::TerminalResultOwner(_)
+                if replays_task_terminal_ack(identity, acknowledged) =>
+            {
+                let packet_sequence =
+                    acknowledged.expect("an exact terminal replay carries its sequence");
+                emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                return Ok(TaskResultRead::EndOfStream { packet_sequence });
+            }
+            route => {
+                let detail = route
+                    .refusal_detail()
+                    .expect("only a served route has no refusal detail");
+                // A refusal fails the frontend's read, and the frontend sees only this
+                // text. Recording it here is what attributes it to a backend process
+                // and to the route that produced it: a coordinator log alone cannot
+                // say which of this backend's task states the poll landed in.
+                tracing::warn!(
+                    task = %identity,
+                    route = ?route,
+                    "root result poll refused"
+                );
+                emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                return Ok(TaskResultRead::Error { detail });
+            }
+        };
+        Ok(
+            match wait_fetch_task_typed(
+                identity,
+                acknowledged,
+                request.max_wait(),
+                request.max_result_bytes(),
+            )
+            .await
+            {
+                TryFetchTypedResult::Ready(result) => {
+                    emit_task_fetch_marker(
+                        identity,
+                        FetchStatus::Ready,
+                        result.packet_seq,
+                        result.eos,
+                        result.payload.len(),
+                    );
+                    TaskResultRead::Ready {
+                        packet_sequence: result.packet_seq,
+                        end_of_stream: result.eos,
+                        payload: result.payload,
+                    }
+                }
+                TryFetchTypedResult::EndAcknowledged => {
+                    let advance = binding.note_result_stream_drained();
+                    if matches!(
+                        advance,
+                        StatusAdvance::Illegal { .. }
+                            | StatusAdvance::Rejected(_)
+                            | StatusAdvance::VersionExhausted
+                    ) {
+                        return Err(TaskResultReadError::new(format!(
+                            "root task {identity} could not record its acknowledged result drain: {advance:?}"
+                        )));
+                    }
+                    let packet_sequence =
+                        acknowledged.expect("an acknowledged end carries its packet sequence");
+                    emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                    TaskResultRead::EndOfStream { packet_sequence }
+                }
+                TryFetchTypedResult::NotReady => TaskResultRead::NotReady,
+                TryFetchTypedResult::Error(error) => {
+                    emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                    TaskResultRead::Error {
+                        detail: error.message,
+                    }
+                }
+            },
+        )
     }
 }
 
-/// Encodes one receipt, refusing to substitute anything the wire cannot say.
-fn encode_item<T>(
-    receipt: &OperationReceipt<T>,
-    encode_ack: impl FnOnce(&T) -> Option<ReceiptAck>,
-) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-    let ack = match receipt.acknowledgement() {
-        Some(body) => Some(encode_ack(body).ok_or_else(|| {
-            tonic::Status::internal(
-                "operation acknowledgement reports a state with no wire representation",
-            )
-        })?),
-        None => None,
-    };
-    Ok(encode_receipt(
-        receipt.operation_id(),
-        receipt.outcome(),
-        receipt.detail().map_or("", SafeDetail::as_str),
-        ack,
-    ))
+impl TaskObservationReader for RegistryTaskExecutionIngress {
+    fn read_task_dynamic_filters(
+        &self,
+        request: &novarocks_execution_contract::task_execution::operation::FetchTaskDynamicFilters,
+    ) -> novarocks_worker::DynamicFilterReadOutcome {
+        self.registry.fetch_task_dynamic_filters(request)
+    }
+
+    fn read_final_task_info(
+        &self,
+        request: &novarocks_execution_contract::task_execution::operation::GetFinalTaskInfo,
+    ) -> novarocks_worker::FinalTaskInfoOutcome {
+        self.registry.get_final_task_info(request)
+    }
+}
+
+impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
+    fn task_status_source(
+        &self,
+        context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
+    ) -> Option<Arc<novarocks_worker::TaskStatusSource>> {
+        self.registry.status_source(context)
+    }
+}
+
+impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
+    fn native_transport_confidentiality(&self) -> ConfidentialTransport {
+        self.native_transport_confidentiality
+    }
+
+    fn apply_task_operation(
+        &self,
+        operation: &DecodedOperation,
+    ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
+        self.apply_one(operation)
+    }
 }
 
 #[tonic::async_trait]
@@ -317,251 +410,36 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         &self,
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
-        // Confidential bytes are refused on the raw request, before any
-        // domain decoder can project or retain them and before any registry
-        // operation can take effect. The fact comes from the same
-        // Server-resolved transport mode that configured this BE listener.
-        refuse_confidential_material_in_the_clear(
-            &request,
-            self.native_transport_confidentiality,
-            FieldPath::root("apply_task_operations"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        // The transport budget is checked over the whole batch before any
-        // item is decoded, so an oversized batch never reaches the owner.
-        let operations = decode_operation_batch(
-            &request,
-            TransportBudget::DEFAULT,
-            FieldPath::root("apply_task_operations"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let mut receipts = Vec::with_capacity(operations.len());
-        for operation in &operations {
-            receipts.push(self.apply_one(operation)?);
-        }
-        Ok(proto::ApplyTaskOperationsResponse { receipts })
+        apply_task_operations(self, request)
     }
 
     fn subscribe_task_status(
         &self,
         request: proto::SubscribeTaskStatusRequest,
     ) -> Result<TaskStatusEventStream, tonic::Status> {
-        let (context, cursors, context_convergence_cursor) =
-            decode_context_aware_subscribe_task_status(
-                &request,
-                FieldPath::root("subscribe_task_status"),
-            )
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let source = self.registry.status_source(context).ok_or_else(|| {
-            tonic::Status::failed_precondition(
-                "subscribe names a query context this backend does not hold",
-            )
-        })?;
-        // The catch-up frames are taken before the stream exists, so a cursor
-        // that is behind cannot miss a version published between the two.
-        let catch_up = source
-            .subscribe_context_aware(context, &cursors, context_convergence_cursor)
-            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        if fault::task_status_subscription_dropped(context)? {
-            // The subscription was established and is then torn down from the
-            // stream body, which is what a lost stream looks like. Cursors are
-            // read-only, so the resubscription loses no frame.
-            return Ok(Box::pin(tokio_stream::once(Err(
-                tonic::Status::unavailable(
-                    "runner-owned task status stream dropped after the subscription was established",
-                ),
-            ))));
-        }
-        Ok(Box::pin(TaskStatusSubscription::new(
-            source,
-            catch_up,
-            context,
-            cursors,
-            context_convergence_cursor,
-        )))
+        subscribe_task_status(self, request)
     }
 
     fn fetch_task_dynamic_filters(
         &self,
         request: proto::FetchTaskDynamicFiltersRequest,
     ) -> Result<proto::FetchTaskDynamicFiltersResponse, tonic::Status> {
-        // An observation read carries no envelope on the wire, so its
-        // operation identity is minted here and never replayed.
-        let read = decode_fetch_dynamic_filters(
-            &request,
-            TaskOperationId::new_v7(),
-            FieldPath::root("fetch_task_dynamic_filters"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let identity = read.identity();
-        let receipt = self.registry.fetch_task_dynamic_filters(&read);
-        // `Accepted` carries a version newer than the caller acknowledged and
-        // `Idempotent` says it is already current; both are settled answers,
-        // with or without a payload. This response has no outcome field, so
-        // anything else is a refusal that must not be dressed as an empty
-        // answer.
-        if !matches!(
-            receipt.outcome(),
-            OperationOutcome::Accepted | OperationOutcome::Idempotent
-        ) {
-            return Err(tonic::Status::failed_precondition(
-                receipt.detail().map_or("", SafeDetail::as_str).to_owned(),
-            ));
-        }
-        // A settled read with nothing advertised answers version zero, which
-        // is this field family's "nothing": `DomainVersion` is nonzero, so it
-        // cannot collide with a version a task published.
-        encode_dynamic_filter_read(identity, receipt.acknowledgement()).map_err(rejection_status)
+        fetch_task_dynamic_filters(self, request)
     }
 
     fn get_final_task_info(
         &self,
         request: proto::GetFinalTaskInfoRequest,
     ) -> Result<proto::GetFinalTaskInfoResponse, tonic::Status> {
-        let read = decode_get_final_task_info(
-            &request,
-            TaskOperationId::new_v7(),
-            FieldPath::root("get_final_task_info"),
-        )
-        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-        let receipt = self.registry.get_final_task_info(&read);
-        let result = match receipt.acknowledgement() {
-            Some(info) => {
-                proto::get_final_task_info_response::Result::Info(encode_final_task_info(info))
-            }
-            // Losing final info costs diagnostics only, so why it is missing
-            // is reported as an outcome rather than as an error.
-            None => proto::get_final_task_info_response::Result::Unavailable(
-                encode_operation_outcome(receipt.outcome()),
-            ),
-        };
-        Ok(proto::GetFinalTaskInfoResponse {
-            result: Some(result),
-        })
+        get_final_task_info(self, request)
     }
 
     async fn fetch_task_result(
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
-        // The semantics live with the result plane, beside the buffer they
-        // read. Two implementations of one RPC drift, and the one that drifts
-        // is always the one nobody is looking at.
-        crate::rpc::data_plane::fetch_task_result(&self.registry, request).await
+        fetch_task_result(self, request).await
     }
-}
-
-/// The server side of one logical status subscription.
-///
-/// It holds the context's observation channel and nothing else, so dropping it
-/// — a client that went away, a coordinator that will resubscribe by cursor —
-/// cancels no task, aborts no context, and changes no owner state. Waiting is
-/// parked on the channel's own notify rather than sampled on a timer, because
-/// terminal delivery is on the critical path of every query's completion.
-///
-/// It never completes on its own. Only the observer knows when it has seen
-/// every terminal it was waiting for, so the server keeps the channel open
-/// until the client closes it rather than guessing that a subscription is
-/// finished.
-struct TaskStatusSubscription {
-    source: Arc<TaskStatusSource>,
-    catch_up: VecDeque<TaskStatusEvent>,
-    context: QueryContextRef,
-    position: Arc<Mutex<TaskStatusSubscriptionPosition>>,
-    /// The parked wait for the next frame. It owns its own handle to the
-    /// source, so polling never borrows across the await.
-    pending: Option<
-        Pin<
-            Box<
-                dyn Future<Output = Result<Option<TaskStatusEvent>, ContextConvergenceCursorError>>
-                    + Send,
-            >,
-        >,
-    >,
-}
-
-impl TaskStatusSubscription {
-    fn new(
-        source: Arc<TaskStatusSource>,
-        catch_up: Vec<TaskStatusEvent>,
-        context: QueryContextRef,
-        task_cursors: Vec<novarocks_execution_contract::task_execution::status::TaskStatusCursor>,
-        context_convergence_cursor: Option<QueryContextConvergenceCursor>,
-    ) -> Self {
-        Self {
-            source,
-            catch_up: catch_up.into(),
-            context,
-            position: Arc::new(Mutex::new(TaskStatusSubscriptionPosition::new(
-                &task_cursors,
-                context_convergence_cursor,
-            ))),
-            pending: None,
-        }
-    }
-
-    fn note_delivered(&mut self, event: &TaskStatusEvent) {
-        self.position
-            .lock()
-            .expect("task status subscription position")
-            .note_delivered(event);
-    }
-}
-
-impl Stream for TaskStatusSubscription {
-    type Item = Result<proto::TaskStatusStreamEvent, tonic::Status>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if let Some(event) = this.catch_up.pop_front() {
-            this.note_delivered(&event);
-            return Poll::Ready(Some(Ok(encode_event(&event))));
-        }
-        if this.pending.is_none() {
-            let source = Arc::clone(&this.source);
-            let context = this.context;
-            let position = Arc::clone(&this.position);
-            this.pending = Some(Box::pin(async move {
-                source
-                    .next_subscription_event_owned(context, &position)
-                    .await
-            }));
-        }
-        let pending = this.pending.as_mut().expect("a wait was just installed");
-        match pending.as_mut().poll(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(event)) => {
-                this.pending = None;
-                Poll::Ready(event.map(|event| {
-                    this.note_delivered(&event);
-                    Ok(encode_event(&event))
-                }))
-            }
-            Poll::Ready(Err(error)) => {
-                this.pending = None;
-                Poll::Ready(Some(Err(tonic::Status::invalid_argument(
-                    error.to_string(),
-                ))))
-            }
-        }
-    }
-}
-
-fn encode_event(event: &TaskStatusEvent) -> proto::TaskStatusStreamEvent {
-    if let TaskStatusEvent::ContextConvergence(receipt) = event {
-        return encode_context_convergence_event(*receipt);
-    }
-    let (identity, mut encoded) = match event {
-        TaskStatusEvent::Status(status) => (status.identity(), encode_status_event(status)),
-        TaskStatusEvent::Gone(identity) => (*identity, encode_task_gone_event(*identity)),
-        TaskStatusEvent::ContextConvergence(_) => unreachable!("handled above"),
-    };
-    // Claimed on the frame that is about to leave this process, which is the
-    // only place the observation names a backend process the frontend will
-    // check. Both the catch-up frames and the live ones are encoded here, so
-    // no delivery path escapes it.
-    fault::task_status_foreign_process(identity, &mut encoded);
-    encoded
 }
 
 #[cfg(test)]
@@ -585,7 +463,7 @@ mod tests {
         CodecOwnedContent, ContentFingerprint, DomainVersion,
     };
     use novarocks_execution_contract::task_execution::identity::{
-        AdmissionTicketId, QueryContextRef, TaskIdentity,
+        AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
     };
     use novarocks_execution_contract::task_execution::operation::{
         QueryContextDomainUpdate, TaskDomainUpdate,
@@ -595,6 +473,7 @@ mod tests {
         TaskStatusVersion,
     };
     use novarocks_execution_contract::task_execution::transition::QueryContextState;
+    use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{catalog, common, plan};
     use novarocks_task_codec::identity::{
         encode_query_context_ref, encode_task_identity, encode_task_operation_id,
@@ -604,14 +483,12 @@ mod tests {
     };
     use tokio_stream::StreamExt;
 
-    use super::super::clock::{BackendMonotonicClock, ManualClock};
-    use super::super::host::{
-        HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-        TaskExecutionHost,
-    };
-    use super::super::registry::TaskExecutionRegistryConfig;
-    use super::super::status::TaskStatusReporter;
     use super::*;
+    use novarocks_worker::{
+        HostRejection, ManualClock, QueryContextHost, ReleasedContextEvidence, RunnableTask,
+        SharedFactsRequest, TaskExecutionHost, TaskStatusReporter, WorkerMonotonicClock,
+    };
+    use novarocks_worker::{TaskExecutionRegistryConfig, TaskStatusEvent};
 
     /// An execution side that accepts everything, so these cases fail only on
     /// the protocol boundary they are about.
@@ -734,7 +611,11 @@ mod tests {
 
         fn with_transport(native_transport_confidentiality: ConfidentialTransport) -> Self {
             let backend = BackendProcessId::new_v7();
-            let mut config = TaskExecutionRegistryConfig::for_process(backend);
+            let mut config = TaskExecutionRegistryConfig::for_process(
+                backend,
+                novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+                novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+            );
             // Nothing here waits on a gate, and no case may depend on
             // elapsed wall time.
             config.gate_poll_interval = Duration::from_secs(3600);
@@ -742,9 +623,10 @@ mod tests {
             let native_compatibility_id = NativeCompatibilityId::new([0x71; 32]);
             let registry = TaskExecutionRegistry::new(
                 config,
-                Arc::new(ManualClock::new()) as Arc<dyn BackendMonotonicClock>,
+                Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+                super::super::backend_task_execution_ports(),
             );
             Self {
                 ingress: RegistryTaskExecutionIngress::new(

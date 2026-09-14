@@ -1,7 +1,9 @@
 //! Sealed distributed-write dispatch for DML reverse ports.
 
-use crate::query_execution::contract::{DistributedQueryOutcome, DistributedQueryRequest};
-use crate::query_execution::outcome::{QueryExecutionResult, WriteExecutionOutcome};
+use crate::query_execution::contract::DistributedQueryRequest;
+use crate::query_execution::outcome::{
+    DistributedQueryOutcome, QueryExecutionResult, WriteExecutionOutcome,
+};
 use crate::query_execution::service::QueryExecutionService;
 
 pub(crate) fn execute_bound_distributed_write_request(
@@ -16,7 +18,7 @@ pub(crate) fn execute_bound_distributed_write_request(
 }
 
 pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     Ok(

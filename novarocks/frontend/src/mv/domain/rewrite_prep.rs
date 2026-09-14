@@ -21,9 +21,9 @@
 //! compiler receives the resulting immutable definition index and owns all
 //! candidate parse/analyze/statistics/selection work.
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
-use crate::mv::domain::readiness::MvReadinessPort;
+use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
@@ -33,24 +33,44 @@ use novarocks_sql::compiler::{
 
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
 /// remains request-local.
-pub fn freeze_mv_rewrite_definition_index_with_ports(
-    readiness: &MvReadinessPort,
+pub(crate) fn freeze_mv_rewrite_definition_index_with_ports(
+    candidate_reader: &MvCandidateReader,
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
 ) -> Result<MvRewriteDefinitionIndex, String> {
-    let definitions = readiness
-        .list_ready_projections()
-        .map_err(|error| format!("list mv definitions: {error}"))?;
+    let definitions = optional_candidate_inventory(candidate_reader.list_candidate_definitions());
 
-    MvRewriteDefinitionIndex::try_new(
-        definitions
-            .into_iter()
-            .map(|projection| {
-                let definition = projection.definition;
-                freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    )
+    let report = novarocks_mv_application::candidate::inspect_candidates(
+        definitions,
+        |definition| definition.mv_id.to_string(),
+        |definition| {
+            freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
+        },
+    );
+    for diagnostic in report.diagnostics() {
+        tracing::debug!(
+            candidate = diagnostic.identity(),
+            error = diagnostic.message(),
+            "skip unavailable MV rewrite candidate"
+        );
+    }
+    MvRewriteDefinitionIndex::try_new(report.into_accepted())
+}
+
+/// An MV inventory is an optional rewrite input.  Losing it must only remove
+/// rewrite candidates; it cannot prevent the required base-table query from
+/// being planned.
+fn optional_candidate_inventory<T, E>(inventory: Result<Vec<T>, E>) -> Vec<T>
+where
+    E: fmt::Display,
+{
+    match inventory {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
+            Vec::new()
+        }
+    }
 }
 
 fn freeze_mv_rewrite_definition(
@@ -166,6 +186,7 @@ fn freeze_mv_rewrite_selection(
     SqlMvRewriteSelectionFacts::try_new_with_publication(
         *publication.publication_id.as_uuid().as_bytes(),
         fingerprint,
+        Arc::from(publication.provenance_hash.as_str()),
         publication_inputs,
         publication_target,
     )
@@ -229,4 +250,16 @@ fn freeze_base_table_state(
         reference_facts.current_snapshot_id(),
         Some(captured.object_id),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::optional_candidate_inventory;
+
+    #[test]
+    fn unavailable_inventory_becomes_an_empty_optional_candidate_set() {
+        let candidates = optional_candidate_inventory::<u8, _>(Err("StateStore unavailable"));
+
+        assert!(candidates.is_empty());
+    }
 }

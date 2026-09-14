@@ -23,8 +23,53 @@
 
 pub mod api;
 
+/// First-wins statement cancellation shared by query application consumers.
+pub mod cancellation;
+
+/// Bounded process-local execution of CPU-bound query application work.
+pub mod cpu;
+
+/// Stable query and mutation error model, without wire-specific encoding.
+pub mod engine_error;
+
+/// Exact client-session identity and protocol-owned termination contracts.
+pub mod client_connection;
+
+/// Session registry and cancellation implementation owned by the query application.
+pub mod query_control;
+
+/// Session-derived facts frozen before role-local request assembly.
+pub mod request_session;
+
+/// Query-session errors before protocol-specific encoding.
+pub mod session_error;
+
+/// Session-local deadline and terminal-error interpretation.
+pub mod session_outcome;
+
+/// Query-session admission requests independent of a wire protocol.
+pub mod session;
+
+/// Process-local serving admission whose transitions are driven by role composition.
+pub mod serving_admission;
+/// Session generations, governed statement control, and protocol settlement.
+pub mod session_control;
+/// Statement-local external-effect boundary for safe topology retry.
+pub mod statement_effect;
+
+/// SQL source parsing and statement-shape admission owned by the query
+/// application before role adapters route a statement to a product consumer.
+pub mod sql;
+
 /// Query-scoped acquisition of immutable metadata and optional optimization facts.
 pub mod observation;
+
+/// Move-only settlement of governed protocol output and streaming rows.
+pub mod protocol_delivery;
+
+pub mod persisted_query_definition;
+/// Startup-frozen admission policy for lake-publication attempts.
+pub mod publication;
 
 /// Pure, topology-free preparation and its immutable execution handoff.
 pub mod preparation;

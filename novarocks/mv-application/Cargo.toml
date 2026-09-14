@@ -1,0 +1,15 @@
+[package]
+name = "novarocks-mv-application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+novarocks-query-application.workspace = true
+novarocks-state-store-runtime.workspace = true
+novarocks-table-maintenance.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }

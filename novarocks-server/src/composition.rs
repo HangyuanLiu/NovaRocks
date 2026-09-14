@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use crate::app_config::NovaRocksConfig;
 use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
+use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
-use novarocks_backend::BackendServerConfig;
+use novarocks_backend::application::BackendServerConfig;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
@@ -34,21 +35,27 @@ use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
 use novarocks_frontend::{
-    CatalogPruneConfig, ClusterBackendOpenConfig, FrontendExecutionConfig,
-    FrontendQueryControlTimeouts, FrontendServerConfig, FrontendTaskTransportBudget,
-    LakePublicationRuntimePolicy, TaskUpdateRetryPolicy,
-    state_store::{
-        StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
+    application::{
+        FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
+        FrontendQueryControlTimeouts,
     },
+    server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
+    topology::ClusterBackendOpenConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
     TokioFileIoRuntime, TokioFileTaskSpawner,
 };
+use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
+use novarocks_mv_application::scheduler::MvSchedulerConfig;
+use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
-    LogicalExecutionSupervisorConfig,
+    LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
 };
+use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
+use novarocks_query_application::publication::LakePublicationRuntimePolicy;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
     ConnectorTableMetadata, MvCreatedTargetObservation, MvLakeDescriptorProjection,
@@ -61,6 +68,9 @@ use novarocks_spi::connector::{
     WriteCommitEvidenceLimits,
 };
 use novarocks_state_store_api::{MAX_KEY_BYTES, StateStoreProviderDescriptor};
+use novarocks_state_store_runtime::{
+    StateStoreHostInput, StateStoreProviderRegistration, StateStoreProviderRegistry,
+};
 use novarocks_state_store_sqlite::SqliteStateStoreContribution;
 use novarocks_types::{ClusterRole, NativeCompatibilityId};
 use novarocks_worker::{LeaseBounds, OperationWaitCaps};
@@ -424,35 +434,33 @@ pub fn compose_backend_server_config(
             runtime_config.write_commit_evidence_max_entries,
         )
         .map_err(|error| anyhow::anyhow!("resolve write commit evidence limits: {error}"))?,
-        result_retained_limits: novarocks_backend::BackendResultRetainedLimits::try_new(
+        result_retained_limits: novarocks_worker::WorkerResultRetainedLimits::try_new(
             runtime_config.result_retained_bytes_per_root,
             runtime_config.result_retained_bytes_per_process,
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
-        catalog_manager_config:
-            novarocks_backend::connector::catalog_manager::CatalogManagerConfig {
-                max_retained_catalogs:
-                    novarocks_backend::connector::catalog_manager::DEFAULT_MAX_RETAINED_CATALOGS,
-                max_failed_catalogs: runtime_config.catalog_bind_max_failed,
-                failed_retention: Duration::from_millis(
-                    runtime_config.catalog_bind_failed_retention_ms,
-                ),
-                transient_retry_cooldown: Duration::from_millis(
-                    runtime_config.catalog_bind_transient_retry_cooldown_ms,
-                ),
-                provider_max_concurrent_binds: runtime_config.catalog_bind_provider_max_concurrent,
-                provider_min_bind_interval: Duration::from_millis(
-                    runtime_config.catalog_bind_provider_min_interval_ms,
-                ),
-            },
+        catalog_manager_config: novarocks_worker::CatalogManagerConfig {
+            max_retained_catalogs: novarocks_worker::DEFAULT_MAX_RETAINED_CATALOGS,
+            max_failed_catalogs: runtime_config.catalog_bind_max_failed,
+            failed_retention: Duration::from_millis(
+                runtime_config.catalog_bind_failed_retention_ms,
+            ),
+            transient_retry_cooldown: Duration::from_millis(
+                runtime_config.catalog_bind_transient_retry_cooldown_ms,
+            ),
+            provider_max_concurrent_binds: runtime_config.catalog_bind_provider_max_concurrent,
+            provider_min_bind_interval: Duration::from_millis(
+                runtime_config.catalog_bind_provider_min_interval_ms,
+            ),
+        },
         execution_role_binding_factories: provider_manifest
             .compose_execution_factories(config, runtime)?,
     })
 }
 
 /// Resolve every Frontend startup input from the application wire configuration.
-pub fn compose_frontend_server_config(
+pub fn compose_frontend_role_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
@@ -460,10 +468,18 @@ pub fn compose_frontend_server_config(
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     runtime: tokio::runtime::Handle,
-) -> anyhow::Result<FrontendServerConfig> {
+) -> anyhow::Result<FrontendRoleConfig> {
     let runtime_config = &config.runtime;
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
+    let query_cpu_workers = NonZeroUsize::new(runtime_config.actual_query_cpu_workers())
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_worker_threads must be nonzero"))?;
+    let query_cpu_queue = NonZeroUsize::new(runtime_config.query_cpu_queue_capacity)
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_cpu_queue_capacity must be nonzero"))?;
+    let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_worker_threads must be nonzero"))?;
+    let query_blocking_queue = NonZeroUsize::new(runtime_config.query_blocking_queue_capacity)
+        .ok_or_else(|| anyhow::anyhow!("runtime.query_blocking_queue_capacity must be nonzero"))?;
     let failure_backoff_ms = config
         .standalone_server
         .as_ref()
@@ -480,12 +496,12 @@ pub fn compose_frontend_server_config(
     )
     .map_err(|error| anyhow::anyhow!("construct result fetch byte limit: {error}"))?;
     if result_fetch_byte_limit.get()
-        > novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
+        > novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
     {
         anyhow::bail!(
             "runtime.result_retained_bytes_per_root {} exceeds the Native root-result payload limit {}",
             result_fetch_byte_limit.get(),
-            novarocks_frontend::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
+            novarocks_native_adapter::FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES
         );
     }
     let (
@@ -496,7 +512,7 @@ pub fn compose_frontend_server_config(
         decode_queue,
         abort_capacity,
     ) = compose_frontend_workload_runtime(runtime_config, result_fetch_byte_limit)?;
-    let logical_runtime = novarocks_frontend::FrontendLogicalExecutionRuntimeConfig::new(
+    let logical_runtime = FrontendLogicalExecutionRuntimeConfig::new(
         logical_supervisor,
         workload,
         workload_resources,
@@ -513,14 +529,12 @@ pub fn compose_frontend_server_config(
         logical_runtime,
     )
     .with_catalog_desired_state_source(catalog_source)
-    .with_catalog_prune_config(
-        CatalogPruneConfig::try_new(
-            Duration::from_millis(runtime_config.catalog_prune_interval_ms),
-            Duration::from_millis(runtime_config.catalog_prune_rpc_timeout_ms),
-            runtime_config.catalog_prune_max_inflight,
-        )
-        .map_err(|error| anyhow::anyhow!("construct catalog prune configuration: {error}"))?,
+    .try_with_catalog_prune_config(
+        Duration::from_millis(runtime_config.catalog_prune_interval_ms),
+        Duration::from_millis(runtime_config.catalog_prune_rpc_timeout_ms),
+        runtime_config.catalog_prune_max_inflight,
     )
+    .map_err(|error| anyhow::anyhow!("construct catalog prune configuration: {error}"))?
     .with_lake_publication_runtime_policy(
         LakePublicationRuntimePolicy::try_new(
             Duration::from_millis(runtime_config.lake_publication_max_attempt_duration_ms),
@@ -536,13 +550,15 @@ pub fn compose_frontend_server_config(
         runtime_config.connector_split_initial_dynamic_filter_wait_cap_ms,
     ))
     .with_catalog_materialization_config(
-        novarocks_frontend::catalog_application::frontend_port::CatalogMaterializationConfig::try_new(
+        novarocks_catalog_application::CatalogMaterializationConfig::try_new(
             Duration::from_millis(runtime_config.catalog_materialization_attempt_timeout_ms),
             Duration::from_millis(runtime_config.catalog_materialization_retry_initial_backoff_ms),
             Duration::from_millis(runtime_config.catalog_materialization_retry_max_backoff_ms),
             runtime_config.catalog_materialization_max_inflight,
         )
-        .map_err(|error| anyhow::anyhow!("construct catalog materialization configuration: {error}"))?,
+        .map_err(|error| {
+            anyhow::anyhow!("construct catalog materialization configuration: {error}")
+        })?,
     )
     .with_query_control_timeouts(FrontendQueryControlTimeouts {
         pre_start_timeout_ms: runtime_config.query_control_pre_start_timeout_ms,
@@ -565,42 +581,47 @@ pub fn compose_frontend_server_config(
         task_execution_budgets.transport,
     )
     .with_connector_blocking_io_budget(
-        novarocks_frontend::task_execution::ConnectorBlockingIoBudget::try_new(
+        ConnectorBlockingIoBudget::try_new(
             runtime_config.connector_blocking_io_max_inflight,
             runtime_config.connector_split_blocking_io_max_inflight,
         )
         .map_err(|error| anyhow::anyhow!("construct Connector blocking-I/O budget: {error}"))?,
     )
+    .with_query_cpu_executor_config(QueryCpuExecutorConfig::new(
+        query_cpu_workers,
+        query_cpu_queue,
+    ))
+    .with_query_blocking_executor_config(QueryBlockingExecutorConfig::new(
+        query_blocking_workers,
+        query_blocking_queue,
+    ))
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
-        execution =
-            execution.with_mv_scheduler_config(novarocks_frontend::FrontendMvSchedulerConfig::new(
-                standalone.mv_refresh_scheduler_enabled,
-                standalone.mv_refresh_scheduler_interval_ms.max(1),
-                standalone.mv_refresh_scheduler_max_concurrent.max(1),
-                failure_backoff_ms,
-                standalone
-                    .mv_refresh_scheduler_max_failure_backoff_ms
-                    .max(failure_backoff_ms),
-            ));
-        execution = execution.with_mv_maintenance_config(
-            novarocks_frontend::MaintenanceCoordinatorConfig::new(
-                standalone.iceberg_maintenance_enabled,
-                standalone.iceberg_maintenance_tick_interval_ms.max(1),
-                standalone.iceberg_maintenance_max_concurrent.max(1),
-                standalone
-                    .iceberg_maintenance_compaction_min_data_files
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-                standalone
-                    .iceberg_maintenance_dv_min_delete_files
-                    .try_into()
-                    .unwrap_or(i64::MAX),
-                standalone.iceberg_maintenance_action_cooldown_ms,
-                standalone.iceberg_maintenance_max_consecutive_failures,
-            ),
-        );
+        execution = execution.with_mv_scheduler_config(MvSchedulerConfig::new(
+            standalone.mv_refresh_scheduler_enabled,
+            standalone.mv_refresh_scheduler_interval_ms.max(1),
+            standalone.mv_refresh_scheduler_max_concurrent.max(1),
+            failure_backoff_ms,
+            standalone
+                .mv_refresh_scheduler_max_failure_backoff_ms
+                .max(failure_backoff_ms),
+        ));
+        execution = execution.with_mv_maintenance_config(MaintenanceCoordinatorConfig::new(
+            standalone.iceberg_maintenance_enabled,
+            standalone.iceberg_maintenance_tick_interval_ms.max(1),
+            standalone.iceberg_maintenance_max_concurrent.max(1),
+            standalone
+                .iceberg_maintenance_compaction_min_data_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            standalone
+                .iceberg_maintenance_dv_min_delete_files
+                .try_into()
+                .unwrap_or(i64::MAX),
+            standalone.iceberg_maintenance_action_cooldown_ms,
+            standalone.iceberg_maintenance_max_consecutive_failures,
+        ));
     }
     let backend_open = ClusterBackendOpenConfig::new(
         config.cluster.role,
@@ -610,7 +631,7 @@ pub fn compose_frontend_server_config(
         Duration::from_millis(config.cluster.backend_announce_lease_ttl_ms()),
     )
     .map_err(|error| anyhow::anyhow!("open frontend backend cluster configuration: {error}"))?;
-    let mysql_listener = novarocks_frontend::resolve_mysql_listener_settings(
+    let mysql_listener = novarocks_mysql_adapter::resolve_mysql_listener_settings(
         config
             .standalone_server
             .as_ref()
@@ -624,22 +645,34 @@ pub fn compose_frontend_server_config(
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
-    Ok(FrontendServerConfig {
-        execution,
-        backend_open,
-        report_bind_host: config.server.host.clone(),
-        report_grpc_port: config.server.grpc_port,
-        metrics_http_port: config.server.http_port,
-        frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
-        frontend_cleanup_timeout: Duration::from_millis(config.server.frontend_cleanup_timeout_ms),
-        mysql_listener,
-        connector_control_role_factories: provider_manifest
-            .compose_control_factories(config, runtime)?,
+    Ok(FrontendRoleConfig {
+        application: FrontendApplicationOpenConfig {
+            execution,
+            backend_open,
+            connector_control_role_factories: provider_manifest
+                .compose_control_factories(config, runtime)?,
+            state_store_input,
+            state_store_provider_registry,
+            native_trust: std::sync::Arc::clone(native_trust.trust()),
+            native_transport: frontend_native_transport(native_trust.transport()),
+        },
+        management: FrontendManagementConfig {
+            bind_host: config.server.host.clone(),
+            http_port: config.server.http_port,
+            native_compatibility_id,
+        },
+        serving: FrontendServingConfig {
+            report_bind_host: config.server.host.clone(),
+            report_grpc_port: config.server.grpc_port,
+            frontend_drain_timeout: Duration::from_millis(config.server.frontend_drain_timeout_ms),
+            frontend_cleanup_timeout: Duration::from_millis(
+                config.server.frontend_cleanup_timeout_ms,
+            ),
+            mysql_listener,
+            native_trust: std::sync::Arc::clone(native_trust.trust()),
+            native_transport: frontend_native_transport(native_trust.transport()),
+        },
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
-        state_store_input,
-        state_store_provider_registry,
-        native_trust: std::sync::Arc::clone(native_trust.trust()),
-        native_transport: frontend_native_transport(native_trust.transport()),
     })
 }
 
@@ -831,28 +864,32 @@ fn compose_task_execution_budgets(
 
 fn backend_native_transport(
     transport: &NativeTrustTransport,
-) -> novarocks_backend::BackendNativeTransport {
+) -> novarocks_native_adapter::BackendNativeTransport {
     match transport {
-        NativeTrustTransport::Plaintext => novarocks_backend::BackendNativeTransport::Plaintext,
+        NativeTrustTransport::Plaintext => {
+            novarocks_native_adapter::BackendNativeTransport::Plaintext
+        }
         NativeTrustTransport::Automatic(material) => {
-            novarocks_backend::BackendNativeTransport::Automatic(material.clone())
+            novarocks_native_adapter::BackendNativeTransport::Automatic(material.clone())
         }
         NativeTrustTransport::Pem(material) => {
-            novarocks_backend::BackendNativeTransport::Pem(material.clone())
+            novarocks_native_adapter::BackendNativeTransport::Pem(material.clone())
         }
     }
 }
 
 fn frontend_native_transport(
     transport: &NativeTrustTransport,
-) -> novarocks_frontend::FrontendNativeTransport {
+) -> novarocks_native_adapter::FrontendNativeTransport {
     match transport {
-        NativeTrustTransport::Plaintext => novarocks_frontend::FrontendNativeTransport::plaintext(),
+        NativeTrustTransport::Plaintext => {
+            novarocks_native_adapter::FrontendNativeTransport::plaintext()
+        }
         NativeTrustTransport::Automatic(material) => {
-            novarocks_frontend::FrontendNativeTransport::automatic(material.clone())
+            novarocks_native_adapter::FrontendNativeTransport::automatic(material.clone())
         }
         NativeTrustTransport::Pem(material) => {
-            novarocks_frontend::FrontendNativeTransport::pem(material.clone())
+            novarocks_native_adapter::FrontendNativeTransport::pem(material.clone())
         }
     }
 }
@@ -1029,7 +1066,7 @@ mod tests {
         compose_task_execution_budgets, mv_lake_target_snapshot_observation,
     };
     use novarocks_execution_contract::{MaxWait, OperationKind};
-    use novarocks_frontend::FrontendTaskTransportBudget;
+    use novarocks_native_adapter::FrontendTaskTransportBudget;
     use novarocks_query_application::coordination::DispatchBudget;
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;

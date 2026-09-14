@@ -48,7 +48,6 @@ use std::time::{Duration, Instant};
 
 use crate::connector::batch_transform::ConnectorBatchTransform;
 use crate::fragment::decode::plan::context::RuntimeFilterSessionResolver;
-use crate::runtime_filter::typed_dynamic_filter::scan_dynamic_filter_spi;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
     TaskAttemptSplitQueues,
@@ -62,6 +61,7 @@ use novarocks_execution::exec::node::scan::{
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
+use novarocks_native_adapter::runtime_filter_typed_scan::scan_dynamic_filter_spi;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
     CompleteAllDynamicFilter, ConnectorReadColumnHandle, ConnectorReadDynamicFilter,
@@ -1061,6 +1061,7 @@ pub(crate) mod test_support {
     use novarocks_proto_codec::connector_common::encode_connector_payload_message;
     use novarocks_proto_codec::connector_read::{ConnectorReadDecoder, encode_value_type};
     use novarocks_proto_models::connector_read as dto;
+    use novarocks_spi::connector::ConnectorExecutionReadBinding;
     use novarocks_spi::connector::read_stack::ConnectorValueType;
 
     pub(crate) fn encoded_payload(
@@ -1190,8 +1191,8 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn installed_read_execution() -> crate::connector::ConnectorExecutionReadBinding {
-        crate::connector::ConnectorExecutionReadBinding::new(
+    pub(crate) fn installed_read_execution() -> ConnectorExecutionReadBinding {
+        ConnectorExecutionReadBinding::new(
             std::sync::Arc::new(FixtureFactory),
             std::sync::Arc::new(fixture_codec()),
         )

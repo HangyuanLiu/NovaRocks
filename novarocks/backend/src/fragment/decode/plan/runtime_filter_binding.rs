@@ -21,13 +21,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use super::error::{NativeFragmentDecodeError, NativeFragmentLeafDecodeError};
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter as execution;
+use novarocks_native_adapter::fragment_error::{
+    NativeFragmentDecodeError, NativeFragmentLeafDecodeError,
+};
 use novarocks_proto_codec::{FieldPath, ProtocolErrorKind};
 use novarocks_proto_models::{expr, plan};
 
-use crate::runtime_filter::membership_contract_decode::{
+use novarocks_native_adapter::runtime_filter_membership::{
     MembershipContractDecodeError, decode_membership_contract,
 };
 
@@ -343,12 +345,12 @@ fn decode_binding(
             "runtime-filter binding requires expression",
         )
     })?;
-    crate::fragment::decode::expression::validate_proto_expr_shape_at(
+    novarocks_native_adapter::fragment_expression::validate_proto_expr_shape_at(
         &expression,
         expression_path.clone(),
     )
     .map_err(|error| NativeFragmentDecodeError::from(error.into_protocol()))?;
-    let expression_type = crate::fragment::decode::type_decode::decode_type(
+    let expression_type = novarocks_plan_codec::native_type::decode_type(
         expression.r#type.as_ref().expect("checked"),
     )
     .map_err(|error| {
@@ -617,8 +619,8 @@ fn decode_contract(
                         ),
                     )
                 })?;
-                let data_type = crate::fragment::decode::type_decode::decode_type(wire_type)
-                    .map_err(|error| {
+                let data_type =
+                    novarocks_plan_codec::native_type::decode_type(wire_type).map_err(|error| {
                         NativeFragmentDecodeError::invalid_value(
                             key_path.clone().field("type"),
                             error,
@@ -941,7 +943,7 @@ fn decode_wire_role(
                                 ),
                             )
                         })?;
-                        let data_type = crate::fragment::decode::type_decode::decode_type(wire_type).map_err(|error| {
+                        let data_type = novarocks_plan_codec::native_type::decode_type(wire_type).map_err(|error| {
                             NativeFragmentDecodeError::invalid_value(
                                 path.clone().field("type"),
                                 format!(
@@ -1424,7 +1426,7 @@ mod tests {
                             .iter()
                             .map(|key| plan::RuntimeFilterOrderKey {
                                 r#type: Some(
-                                    crate::fragment::decode::type_decode::encode_type(key.data_type())
+                                    novarocks_plan_codec::encode_native_type(key.data_type())
                                         .expect("test key type"),
                                 ),
                                 direction: i32::from(match key.direction() {

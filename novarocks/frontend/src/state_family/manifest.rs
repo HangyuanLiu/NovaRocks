@@ -18,46 +18,23 @@
 //! The registry: every frontend state family and the contract it declares.
 
 use super::classification::{
-    AcceleratorContract, AcceleratorRebuildAuthority, AcceleratorResidence, BootstrapFailureScope,
-    ClonePolicy, DurabilityAdmission, ExternalProjectionContract, ExternalProjectionSource,
-    PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract, RebuildDeterminism,
-    SnapshotIdentity, StateFamilyClassification,
+    AcceleratorContract, AcceleratorRebuildAuthority, AcceleratorResidence, ClonePolicy,
+    DurabilityAdmission, PersistentKeyPrefix, ProcessRuntimeAuthority, ProcessRuntimeContract,
+    RebuildDeterminism, StateFamilyClassification,
 };
-
-// Frozen key prefixes.  These bytes are already in deployed stores, so they are
-// literals rather than anything composed: the whole point of moving them here
-// is that they now have exactly one definition point, not that they became
-// derivable.  `prefix_literals_are_byte_stable` is the tripwire against an
-// edit that silently orphans existing records.
-//
-// The prefixes are deliberately not uniform.  Catalog attachment and GC
-// observation end in `/` because their owners append a record path directly;
-// backend desired state has no separator because the prefix *is* the single
-// key; MV has none because its owner joins with `/` itself.  Normalizing them
-// would rewrite live keys, so the manifest preserves each as frozen.
-const CATALOG_ATTACHMENT_PREFIX: &str = "novarocks/frontend/catalog/v1/attachment/by-instance/";
-const MV_ACCELERATOR_PREFIX: &str = "novarocks/frontend/mv/accelerator/v1";
-const GC_OWNED_REF_OBSERVATION_PREFIX: &str =
-    "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/";
 
 /// Every frontend state family, registered exactly once.
 ///
 /// Retired families are absent by deletion, not by a tombstone entry: this
 /// binary has no reader for them, so registering them would be the compatibility
 /// surface the hard cut exists to remove.
+///
+/// Maintenance, statistics, and MV process state are likewise absent: their
+/// product crates own those lifetimes and their durable descriptors. Frontend
+/// must not retain a nominal ownership entry after a product becomes the only
+/// authority.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum StateFamily {
-    /// External catalog attachments: the logical configuration of every
-    /// attached catalog.
-    CatalogDesiredState,
-    /// Cluster backend membership as an operator declared it, through
-    /// configuration seeds and SQL.
-    /// MV definitions, target and dependency indexes, and the aggregate
-    /// published waterline.
-    MvAccelerator,
-    /// The time at which one exact provider-proven owned-ref tuple was first
-    /// observed by GC.
-    GcOwnedRefObservation,
     /// Resolved connector table metadata, validated against the connector's
     /// current schema version.
     SchemaCache,
@@ -67,12 +44,6 @@ pub enum StateFamily {
     LocalViewRegistry,
     /// DML operations, side records and their coordination state.
     DmlRuntime,
-    /// Maintenance jobs, attempts, transactions and their indexes.
-    MaintenanceRuntime,
-    /// Statistics jobs, worker leases and cursors.
-    StatisticsJobRuntime,
-    /// MV refresh attempts, leases, scheduler backoff and cursors.
-    MvRefreshRuntime,
     /// Backend liveness, generation and fragment activity as this frontend
     /// observed it.
     BackendObservedRuntime,
@@ -82,7 +53,7 @@ impl StateFamily {
     /// The number of registered families.
     ///
     /// Hand-written, and checked against the chain below at compile time.
-    pub const COUNT: usize = 11;
+    pub const COUNT: usize = 5;
 
     /// Every registered family, in manifest order.
     ///
@@ -92,7 +63,7 @@ impl StateFamily {
     /// automatically.
     pub const ALL: [Self; Self::COUNT] = Self::enumerate();
 
-    const FIRST: Self = Self::CatalogDesiredState;
+    const FIRST: Self = Self::SchemaCache;
 
     /// The contract this family declares.
     ///
@@ -101,48 +72,6 @@ impl StateFamily {
     /// before it can exist.
     pub const fn classification(self) -> StateFamilyClassification {
         match self {
-            Self::CatalogDesiredState => {
-                StateFamilyClassification::ExternalProjection(ExternalProjectionContract::new(
-                    ExternalProjectionSource::SelectedCatalogSourceMode,
-                    // A partial enumeration of attachments is indistinguishable
-                    // from a smaller desired state, so identity is the complete
-                    // enumeration and nothing less.
-                    SnapshotIdentity::CompleteEnumeration,
-                    BootstrapFailureScope::GlobalEnumerationPerEntryMaterialization,
-                    PersistentKeyPrefix::new(CATALOG_ATTACHMENT_PREFIX),
-                    3,
-                    ClonePolicy::SemanticRebind,
-                ))
-            }
-            Self::MvAccelerator => {
-                StateFamilyClassification::Accelerator(AcceleratorContract::new(
-                    AcceleratorResidence::Durable {
-                        prefix: PersistentKeyPrefix::new(MV_ACCELERATOR_PREFIX),
-                        record_version: 1,
-                    },
-                    AcceleratorRebuildAuthority::MvLakeDescriptorAndPublicationFacts,
-                    RebuildDeterminism::UserVisibleIdentical,
-                    true,
-                    ClonePolicy::RevalidateSourceRevisionOrWipe,
-                ))
-            }
-            Self::GcOwnedRefObservation => {
-                StateFamilyClassification::Accelerator(AcceleratorContract::new(
-                    AcceleratorResidence::Durable {
-                        prefix: PersistentKeyPrefix::new(GC_OWNED_REF_OBSERVATION_PREFIX),
-                        record_version: 7,
-                    },
-                    AcceleratorRebuildAuthority::ProvenOwnedRefWithSafetyAgeWindow,
-                    // A rebuilt observation carries today's timestamp, not the
-                    // discarded one, so the safety window restarts.  That
-                    // defers deletion; it never authorizes an early one.
-                    RebuildDeterminism::ConservativeRestart,
-                    true,
-                    // A clone must not inherit a matured safety window it did
-                    // not observe.
-                    ClonePolicy::WipeAndRebuild,
-                ))
-            }
             Self::SchemaCache => StateFamilyClassification::Accelerator(AcceleratorContract::new(
                 AcceleratorResidence::InProcess,
                 AcceleratorRebuildAuthority::ConnectorSchemaVersion,
@@ -168,18 +97,6 @@ impl StateFamily {
             Self::DmlRuntime => StateFamilyClassification::ProcessRuntime(
                 ProcessRuntimeContract::new(ProcessRuntimeAuthority::Statement),
             ),
-            Self::MaintenanceRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::Attempt),
-            ),
-            Self::StatisticsJobRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::Attempt),
-            ),
-            // Attempt records die with their attempt, but scheduler backoff and
-            // cursors outlive individual attempts, so the family as a whole is
-            // bounded by the incarnation.
-            Self::MvRefreshRuntime => StateFamilyClassification::ProcessRuntime(
-                ProcessRuntimeContract::new(ProcessRuntimeAuthority::FrontendIncarnation),
-            ),
             Self::BackendObservedRuntime => StateFamilyClassification::ProcessRuntime(
                 ProcessRuntimeContract::new(ProcessRuntimeAuthority::FrontendIncarnation),
             ),
@@ -192,25 +109,20 @@ impl StateFamily {
     /// spelled out rather than derived from the variant name.
     pub const fn family_id(self) -> &'static str {
         match self {
-            Self::CatalogDesiredState => "frontend/catalog/desired-state",
-            Self::MvAccelerator => "frontend/mv/accelerator",
-            Self::GcOwnedRefObservation => "frontend/table-maintenance/gc-owned-ref-observation",
             Self::SchemaCache => "frontend/catalog/schema-cache",
             Self::StatisticsArtifactCache => "frontend/statistics/immutable-artifact-cache",
             Self::LocalViewRegistry => "frontend/view/local-registry",
             Self::DmlRuntime => "frontend/dml/runtime",
-            Self::MaintenanceRuntime => "frontend/table-maintenance/runtime",
-            Self::StatisticsJobRuntime => "frontend/statistics/job-runtime",
-            Self::MvRefreshRuntime => "frontend/mv/refresh-runtime",
             Self::BackendObservedRuntime => "frontend/cluster-backends/observed-runtime",
         }
     }
 
-    /// This family's persistent key prefix, or `None` when it owns no StateStore
-    /// records.
+    /// This frontend family's persistent key prefix, or `None` when it owns no
+    /// StateStore records.
     ///
-    /// Owner modules read their prefix from here; there is no second definition
-    /// point to drift from.
+    /// Frontend currently owns no durable family. Product-owned descriptors
+    /// intentionally live in their product crates instead of being projected
+    /// into this local manifest.
     pub const fn persistent_prefix(self) -> Option<PersistentKeyPrefix> {
         self.classification().persistent_prefix()
     }
@@ -238,8 +150,8 @@ impl StateFamily {
 
     /// The registered family that owns `key`, or `None` when no family does.
     ///
-    /// Attribution is by persistent prefix, and only the two persistent
-    /// classifications can carry one, so a `Some` answer already implies the
+    /// Attribution is by persistent prefix, and only the durable accelerator
+    /// classification can carry one, so a `Some` answer already implies the
     /// owner is allowed to be durable.  The store-content gate still asks
     /// [`StateFamily::durability_admission`] separately, so "the key is
     /// attributable" and "its owner may persist" stay two independent
@@ -263,16 +175,10 @@ impl StateFamily {
     /// and rejects a length that disagrees with [`StateFamily::COUNT`].
     const fn next_in_manifest(self) -> Option<Self> {
         match self {
-            Self::CatalogDesiredState => Some(Self::MvAccelerator),
-            Self::MvAccelerator => Some(Self::GcOwnedRefObservation),
-            Self::GcOwnedRefObservation => Some(Self::SchemaCache),
             Self::SchemaCache => Some(Self::StatisticsArtifactCache),
             Self::StatisticsArtifactCache => Some(Self::LocalViewRegistry),
             Self::LocalViewRegistry => Some(Self::DmlRuntime),
-            Self::DmlRuntime => Some(Self::MaintenanceRuntime),
-            Self::MaintenanceRuntime => Some(Self::StatisticsJobRuntime),
-            Self::StatisticsJobRuntime => Some(Self::MvRefreshRuntime),
-            Self::MvRefreshRuntime => Some(Self::BackendObservedRuntime),
+            Self::DmlRuntime => Some(Self::BackendObservedRuntime),
             Self::BackendObservedRuntime => None,
         }
     }
@@ -305,11 +211,11 @@ impl StateFamily {
 mod tests {
     use std::collections::BTreeSet;
 
+    use super::super::classification::WipeEntry;
     use super::*;
-    use crate::state_family::WipeEntry;
 
-    /// Eleven families: one `ExternalProjection` (catalog desired state), four
-    /// `Accelerator` (two of them in-process) and six `ProcessRuntime`.
+    /// Five Frontend families: two in-process `Accelerator` and
+    /// three `ProcessRuntime`.
     ///
     /// Backend desired state is deliberately absent. It was registered while
     /// the frontend still carried a durable membership record; backend
@@ -320,32 +226,23 @@ mod tests {
     fn manifest_registers_exactly_the_spec_family_table() {
         assert_eq!(
             StateFamily::ALL.len(),
-            11,
-            "the manifest registers eleven frontend state families"
+            5,
+            "the manifest registers five frontend state families"
         );
 
-        let mut external_projection = 0;
         let mut process_runtime = 0;
         let mut accelerator = 0;
         for family in StateFamily::ALL {
             // Exhaustive over the closed classification: a fourth variant makes
             // this match, and every other consumer, fail to compile.
             match family.classification() {
-                StateFamilyClassification::ExternalProjection(_) => external_projection += 1,
                 StateFamilyClassification::ProcessRuntime(_) => process_runtime += 1,
                 StateFamilyClassification::Accelerator(_) => accelerator += 1,
             }
         }
 
-        assert_eq!(external_projection, 1, "catalog desired state");
-        assert_eq!(
-            accelerator, 4,
-            "MV, GC observation, schema cache, statistics artifact cache"
-        );
-        assert_eq!(
-            process_runtime, 6,
-            "local views, DML, maintenance, statistics jobs, MV refresh, backend observations"
-        );
+        assert_eq!(accelerator, 2, "schema cache, statistics artifact cache");
+        assert_eq!(process_runtime, 3, "local views, DML, backend observations");
     }
 
     #[test]
@@ -381,13 +278,13 @@ mod tests {
                     .map(|prefix| (family, prefix.as_str()))
             })
             .collect();
-        assert_eq!(prefixes.len(), 3, "three families are durable today");
+        assert!(prefixes.is_empty(), "Frontend owns no durable family today");
 
         let distinct: BTreeSet<&str> = prefixes.iter().map(|(_, prefix)| *prefix).collect();
         assert_eq!(
             distinct.len(),
             prefixes.len(),
-            "two families must never share a prefix"
+            "Frontend durable families must never share a prefix"
         );
 
         for (left_family, left) in &prefixes {
@@ -405,40 +302,6 @@ mod tests {
         }
     }
 
-    /// These bytes are already in deployed stores.  The literals are repeated
-    /// here on purpose: reading them from the manifest constants would make the
-    /// assertion vacuous, and the whole value of this test is that an edit to a
-    /// prefix has to be made twice, deliberately.
-    #[test]
-    fn prefix_literals_are_byte_stable() {
-        let expected: [(StateFamily, &[u8]); 3] = [
-            (
-                StateFamily::CatalogDesiredState,
-                b"novarocks/frontend/catalog/v1/attachment/by-instance/",
-            ),
-            (
-                StateFamily::MvAccelerator,
-                b"novarocks/frontend/mv/accelerator/v1",
-            ),
-            (
-                StateFamily::GcOwnedRefObservation,
-                b"novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
-            ),
-        ];
-
-        for (family, bytes) in expected {
-            let prefix = family
-                .persistent_prefix()
-                .expect("registered durable family");
-            assert_eq!(
-                prefix.as_bytes(),
-                bytes,
-                "{} prefix must stay byte-identical",
-                family.family_id()
-            );
-        }
-    }
-
     /// A `ProcessRuntime` family cannot yield a persistent prefix, and this test
     /// shows it by *shape* rather than by assertion.
     ///
@@ -452,9 +315,6 @@ mod tests {
     fn process_runtime_cannot_express_a_persistent_prefix() {
         fn prefix_of(classification: StateFamilyClassification) -> Option<&'static str> {
             match classification {
-                StateFamilyClassification::ExternalProjection(contract) => {
-                    Some(contract.persistent_prefix().as_str())
-                }
                 StateFamilyClassification::Accelerator(contract) => contract
                     .persistent_prefix()
                     .map(PersistentKeyPrefix::as_str),
@@ -553,38 +413,14 @@ mod tests {
                 }
             }
 
-            // Every accelerator states what a rebuild reproduces, so a wipe's
-            // cost is a recorded fact and not a guess made during an incident.
-            // GC observation is the one family whose rebuild is deliberately
-            // not identical: it restarts a safety window instead.
-            let expected_determinism = match family {
-                StateFamily::GcOwnedRefObservation => RebuildDeterminism::ConservativeRestart,
-                _ => RebuildDeterminism::UserVisibleIdentical,
-            };
-            assert_eq!(determinism, expected_determinism, "{}", family.family_id());
+            assert_eq!(
+                determinism,
+                RebuildDeterminism::UserVisibleIdentical,
+                "{}",
+                family.family_id()
+            );
         }
-        assert_eq!(accelerators, 4);
-    }
-
-    #[test]
-    fn external_projections_declare_source_snapshot_and_failure_scope() {
-        let catalog = StateFamily::CatalogDesiredState.classification();
-        let StateFamilyClassification::ExternalProjection(catalog) = catalog else {
-            panic!("catalog desired state is an external projection");
-        };
-        assert_eq!(
-            catalog.source(),
-            ExternalProjectionSource::SelectedCatalogSourceMode
-        );
-        assert_eq!(
-            catalog.snapshot_identity(),
-            SnapshotIdentity::CompleteEnumeration
-        );
-        assert_eq!(
-            catalog.bootstrap_failure_scope(),
-            BootstrapFailureScope::GlobalEnumerationPerEntryMaterialization
-        );
-        assert_eq!(catalog.clone_policy(), ClonePolicy::SemanticRebind);
+        assert_eq!(accelerators, 2);
     }
 
     #[test]
@@ -595,25 +431,13 @@ mod tests {
                 authorities.push((family, contract.authority()));
             }
         }
-        assert_eq!(authorities.len(), 6);
+        assert_eq!(authorities.len(), 3);
 
         assert!(
             authorities.contains(&(StateFamily::DmlRuntime, ProcessRuntimeAuthority::Statement))
         );
         assert!(authorities.contains(&(
-            StateFamily::MaintenanceRuntime,
-            ProcessRuntimeAuthority::Attempt
-        )));
-        assert!(authorities.contains(&(
-            StateFamily::StatisticsJobRuntime,
-            ProcessRuntimeAuthority::Attempt
-        )));
-        assert!(authorities.contains(&(
             StateFamily::LocalViewRegistry,
-            ProcessRuntimeAuthority::FrontendIncarnation
-        )));
-        assert!(authorities.contains(&(
-            StateFamily::MvRefreshRuntime,
             ProcessRuntimeAuthority::FrontendIncarnation
         )));
         assert!(authorities.contains(&(
@@ -622,70 +446,17 @@ mod tests {
         )));
     }
 
-    /// The prefix API has to serve all four current owners without any of them
-    /// re-declaring a prefix.  These are the exact keys those owners build
-    /// today, reproduced through the manifest.
-    #[test]
-    fn prefix_api_reproduces_every_owner_key_scheme() {
-        // catalog_attachment: prefix ends in `/`, suffix is the hex-encoded
-        // normalized instance id.
-        let prefix = StateFamily::CatalogDesiredState
-            .persistent_prefix()
-            .expect("durable family");
-        assert_eq!(
-            prefix.key().expect("prefix key").as_bytes(),
-            b"novarocks/frontend/catalog/v1/attachment/by-instance/"
-        );
-        assert_eq!(
-            prefix
-                .key_with_suffix("77617265686f7573652e6d61696e")
-                .expect("attachment key")
-                .as_bytes(),
-            b"novarocks/frontend/catalog/v1/attachment/by-instance/77617265686f7573652e6d61696e"
-        );
-
-        // mv: the prefix carries no trailing separator, so the owner joins with
-        // its own `/`.
-        assert_eq!(
-            StateFamily::MvAccelerator
-                .persistent_prefix()
-                .expect("durable family")
-                .key_with_suffix("/sequence/mv-id")
-                .expect("mv sequence key")
-                .as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
-        );
-
-        // gc observation: prefix ends in `/`, suffix is `<table uuid>/<hex ref>`.
-        assert_eq!(
-            StateFamily::GcOwnedRefObservation
-                .persistent_prefix()
-                .expect("durable family")
-                .key_with_suffix("019205ff-0000-7000-8000-000000000001/6d61696e")
-                .expect("gc observation key")
-                .as_bytes(),
-            concat!(
-                "novarocks/frontend/table-maintenance/v7/gc-owned-ref-observations/",
-                "019205ff-0000-7000-8000-000000000001/6d61696e"
-            )
-            .as_bytes()
-        );
-    }
-
     #[test]
     fn key_attribution_names_the_owning_family_or_nothing() {
-        assert_eq!(
-            StateFamily::for_key(
-                b"novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000001"
-            ),
-            Some(StateFamily::MvAccelerator)
-        );
-
         // Retired families are unattributable by construction: they are absent
         // from the manifest, so the store-content gate reports them instead of
         // finding an owner willing to claim them.
         assert_eq!(StateFamily::for_key(b"\0novarocks/cp/v1/control"), None);
         assert_eq!(StateFamily::for_key(b"novarocks/frontend/views/v2/x"), None);
+        assert_eq!(
+            StateFamily::for_key(b"novarocks/frontend/mv/accelerator/v1/projection/by-id/1"),
+            None
+        );
         assert_eq!(StateFamily::for_key(b""), None);
 
         for family in StateFamily::ALL {

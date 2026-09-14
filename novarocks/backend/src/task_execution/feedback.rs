@@ -52,12 +52,12 @@ use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_models::filter;
 use novarocks_task_codec::domain::wire_task_dynamic_filter;
 
-use crate::runtime_filter::domain::{
+use novarocks_worker::runtime_filter::domain::{
     BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication, BackendFrontendFeedbackSink,
 };
 
-use super::fault;
-use super::status::TaskStatusReporter;
+use novarocks_native_adapter::task_protocol_fault as fault;
+use novarocks_worker::TaskStatusReporter;
 
 /// Publishes one query context's terminal logical feedback through one task.
 pub(crate) struct TaskRuntimeFilterFeedbackEgress {
@@ -233,15 +233,14 @@ mod tests {
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use crate::runtime_filter::domain::{
+    use novarocks_native_adapter::task_protocol::encode_dynamic_filter_read;
+    use novarocks_worker::ProcessMonotonicClock;
+    use novarocks_worker::runtime_filter::domain::{
         BackendFrontendFeedbackOutcome, BackendFrontendFeedbackPublication,
         BackendFrontendFeedbackSink, BackendMaterializationOwner,
     };
-    use crate::task_execution::clock::ProcessMonotonicClock;
-    use crate::task_execution::observation::TaskStatusSource;
-    use crate::task_execution::shared_facts::encode_dynamic_filter_read;
-    use crate::task_execution::status::{
-        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter,
+    use novarocks_worker::{
+        METRIC_PUBLISH_MIN_INTERVAL, TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
     };
 
     fn identity() -> TaskIdentity {

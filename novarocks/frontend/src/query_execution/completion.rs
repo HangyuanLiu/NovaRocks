@@ -24,8 +24,8 @@
 use crate::query_execution::lifecycle_plan::{
     AttemptCredentialLeaseCollector, QueryCredentialLeases,
 };
-use crate::runtime::query_result::build_string_query_result;
-use crate::runtime::statement_result::StatementResult;
+use novarocks_query_application::api::build_string_query_result;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
 use novarocks_types::{AttemptId, QueryExecutionId, QueryId};
 use std::sync::Arc;
@@ -447,7 +447,7 @@ impl PreparedQueryCompletion {
 
     pub fn complete(
         self,
-        outcome: crate::query_execution::contract::DistributedQueryOutcome,
+        outcome: crate::query_execution::outcome::DistributedQueryOutcome,
     ) -> Result<StatementResult, String> {
         match self.formatter {
             PreparedQueryFormatter::Result => outcome
@@ -462,7 +462,7 @@ impl PreparedQueryCompletion {
 
 fn complete_profile(
     formatter: PreparedProfileFormatter,
-    outcome: crate::query_execution::contract::DistributedQueryOutcome,
+    outcome: crate::query_execution::outcome::DistributedQueryOutcome,
 ) -> Result<StatementResult, String> {
     let outcome = outcome
         .into_profile()

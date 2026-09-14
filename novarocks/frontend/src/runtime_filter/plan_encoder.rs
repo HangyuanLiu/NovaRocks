@@ -4,7 +4,7 @@ use crate::query_execution::artifact::{
     RuntimeFilterBindingAttachment, RuntimeFilterBindingEncodingView,
 };
 use crate::query_execution::contract::DistributedQueryError;
-use crate::query_execution::{
+use crate::query_execution::preparation::runtime_filter_view::{
     RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
     RuntimeFilterBindingFragmentFactsView, RuntimeFilterBindingRoleFacts,
     RuntimeFilterCompletionRequirement, RuntimeFilterConsumerActivation,
@@ -73,7 +73,9 @@ fn validate_binding_order(
 }
 
 fn encode_binding(
-    binding: crate::query_execution::RuntimeFilterBindingFacts<'_>,
+    binding: crate::query_execution::preparation::runtime_filter_view::RuntimeFilterBindingFacts<
+        '_,
+    >,
 ) -> Result<plan::RuntimeFilterBinding, DistributedQueryError> {
     let logical_domain = semantic_encoder::encode_logical_domain(binding.logical_domain())?;
     Ok(plan::RuntimeFilterBinding {
@@ -223,7 +225,7 @@ fn encode_role(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_execution::{
+    use crate::query_execution::preparation::runtime_filter_view::{
         RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
         RuntimeFilterOrderKeyFacts, RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget,
         RuntimeFilterSortDirection,

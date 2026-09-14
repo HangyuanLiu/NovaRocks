@@ -31,8 +31,8 @@ use crate::mv::domain::model::{MvStorageEngine, MvTarget};
 use crate::mv::domain::persistence::definition::{MvDesiredRefreshPolicy, StoredMvDefinition};
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::Visit;
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_types::naming::normalize_identifier;
 
 fn default_mv_storage_engine() -> &'static str {

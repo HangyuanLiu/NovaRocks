@@ -17,96 +17,10 @@
 
 use std::fmt;
 
-use crate::common::engine_error::EngineErrorCode;
-use novarocks_parser::Span;
+use novarocks_query_application::engine_error::EngineErrorCode;
 use novarocks_spi::connector::{LakePublicationDisposition, LakePublicationTerminal};
 use novarocks_sql::analyze_error::AnalyzeError;
-use novarocks_user_error::{
-    ErrorCodeDescriptor, ErrorCodeId, ErrorCodeStatus, ErrorPhase, RetryClass, UserError,
-};
-
-const ADMIT_DELETE_REQUIRES_WHERE: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.delete_requires_where"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-const ADMIT_DELETE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.delete_unsupported_form"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-const ADMIT_UPDATE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.update_unsupported_form"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-const ADMIT_MERGE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.merge_unsupported_form"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-const ADMIT_INSERT_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.insert_unsupported_form"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-const ADMIT_CREATE_TABLE_UNSUPPORTED_FORM: ErrorCodeDescriptor = ErrorCodeDescriptor {
-    code: ErrorCodeId::new("sql.admit.create_table_unsupported_form"),
-    phase: ErrorPhase::Admit,
-    status: ErrorCodeStatus::Active,
-};
-
-/// DML capability descriptors, exported only for the independent manifest tool.
-pub const ERROR_CODE_DESCRIPTORS: &[ErrorCodeDescriptor] = &[
-    ADMIT_DELETE_REQUIRES_WHERE,
-    ADMIT_DELETE_UNSUPPORTED_FORM,
-    ADMIT_UPDATE_UNSUPPORTED_FORM,
-    ADMIT_MERGE_UNSUPPORTED_FORM,
-    ADMIT_INSERT_UNSUPPORTED_FORM,
-    ADMIT_CREATE_TABLE_UNSUPPORTED_FORM,
-];
-
-/// Capability failures are owned by the frontend DML application, never by the parser.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum AdmitError {
-    DeleteRequiresWhere,
-    #[allow(
-        dead_code,
-        reason = "The manifest keeps this typed capability code while parser validation owns the form rejection."
-    )]
-    DeleteUnsupportedForm,
-    UpdateUnsupportedForm,
-    MergeUnsupportedForm,
-    InsertUnsupportedForm,
-    CreateTableUnsupportedForm,
-}
-
-impl AdmitError {
-    const fn descriptor(self) -> ErrorCodeDescriptor {
-        match self {
-            Self::DeleteRequiresWhere => ADMIT_DELETE_REQUIRES_WHERE,
-            Self::DeleteUnsupportedForm => ADMIT_DELETE_UNSUPPORTED_FORM,
-            Self::UpdateUnsupportedForm => ADMIT_UPDATE_UNSUPPORTED_FORM,
-            Self::MergeUnsupportedForm => ADMIT_MERGE_UNSUPPORTED_FORM,
-            Self::InsertUnsupportedForm => ADMIT_INSERT_UNSUPPORTED_FORM,
-            Self::CreateTableUnsupportedForm => ADMIT_CREATE_TABLE_UNSUPPORTED_FORM,
-        }
-    }
-
-    pub(crate) fn to_user_error(
-        self,
-        source: &str,
-        span: Span,
-        message: impl Into<String>,
-    ) -> UserError {
-        UserError::from_descriptor(
-            self.descriptor(),
-            message,
-            Some(span.to_user_error_location(source)),
-            RetryClass::Never,
-        )
-    }
-}
+use novarocks_user_error::UserError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DmlErrorKind {

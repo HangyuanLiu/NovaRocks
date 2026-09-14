@@ -31,7 +31,7 @@ use novarocks_spi::connector::{
     ExternalMutationOutcome,
 };
 
-use crate::common::engine_error::EngineError;
+use novarocks_query_application::engine_error::EngineError;
 
 /// The statement-level operation before its provider-owned table handle is
 /// loaded through the exact-generation metadata capability.

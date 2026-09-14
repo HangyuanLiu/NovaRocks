@@ -17,41 +17,49 @@
 
 use novarocks_native_trust::NativeTrust;
 use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::{sync::Mutex, task::Poll};
 use tokio::runtime::Handle;
+use tracing::info;
 
 use crate::capabilities as core_capabilities;
-use crate::common::query_cancellation::QueryCancellationReason;
-use crate::native::transport::FrontendNativeTransport;
-use crate::state_store::{StateStoreHostInput, StateStoreProviderRegistry};
 use crate::workload_lifecycle::{
     FrontendServingSnapshotReader, LateBoundFrontendServingSnapshotReader,
 };
-use crate::{
-    ClientConnectionControlPort, ClientConnectionTerminationReason, MysqlClientConnectionRegistry,
-    QuerySessionFactory, ResolvedMysqlListenerSettings,
+use novarocks_mysql_adapter::{MysqlClientConnectionRegistry, ResolvedMysqlListenerSettings};
+use novarocks_native_adapter::FrontendNativeTransport;
+use novarocks_query_application::cancellation::QueryCancellationReason;
+use novarocks_query_application::client_connection::{
+    ClientConnectionControlPort, ClientConnectionTerminationReason,
 };
+use novarocks_query_application::session::QuerySessionFactory;
 use novarocks_spi::connector::ConnectorControlRoleBindingFactory;
 use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_state_store_runtime::{StateStoreHostInput, StateStoreProviderRegistry};
+use novarocks_types::naming::DEFAULT_DATABASE;
+use novarocks_version as version;
 
 use crate::query_execution::maintenance::{
     BackgroundMaintenanceAttempt, BackgroundMaintenanceAttemptFactory,
 };
 use crate::{
-    ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationHost,
-    FrontendExecutionConfig,
+    application::{
+        FrontendApplicationError, FrontendApplicationHost, FrontendCatalogRoleRuntime,
+        FrontendExecutionConfig,
+    },
+    topology::ClusterBackendOpenConfig,
 };
 
-type ShutdownSignal = Pin<Box<dyn Future<Output = ()> + Send>>;
+#[cfg(test)]
+type ShutdownSignal = std::pin::Pin<Box<dyn Future<Output = ()> + Send>>;
 
 #[derive(Clone)]
 struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
     topology: crate::common::backend_topology::BackendTopologyService,
-    runtime_policy: crate::common::admitted_query_context::LakePublicationRuntimePolicy,
+    runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
@@ -64,24 +72,16 @@ impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemp
     }
 }
 
+/// Inputs required to open the Frontend application owner.
+///
+/// The Server role composes these inputs; this type deliberately excludes
+/// listeners and process supervision policy.
 #[derive(Clone)]
-pub struct FrontendServerConfig {
+pub struct FrontendApplicationOpenConfig {
     pub execution: FrontendExecutionConfig,
     pub backend_open: ClusterBackendOpenConfig,
-    pub report_bind_host: String,
-    pub report_grpc_port: u16,
-    /// Dedicated role=fe management HTTP endpoint.
-    pub metrics_http_port: u16,
-    /// Maximum time admitted FE workload leases may continue after drain starts.
-    pub frontend_drain_timeout: Duration,
-    /// Upper bound for terminal resource cleanup after graceful/deadline drain.
-    pub frontend_cleanup_timeout: Duration,
-    pub mysql_listener: ResolvedMysqlListenerSettings,
     /// Provider-owned FE control role factories composed by the server root.
     pub connector_control_role_factories: Vec<Arc<dyn ConnectorControlRoleBindingFactory>>,
-    /// Application-owned storage observation composed by the server role.
-    /// Frontend and Core never decode provider table handles directly.
-    pub mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     /// Typed StateStore host input. The FE remains the owner of opening and
     /// shutting down this host; the server only supplies the composition data.
     pub state_store_input: Option<StateStoreHostInput>,
@@ -95,9 +95,151 @@ pub struct FrontendServerConfig {
     pub native_transport: FrontendNativeTransport,
 }
 
+/// Inputs for the Frontend-owned management listener.
+#[derive(Clone)]
+pub struct FrontendManagementConfig {
+    pub bind_host: String,
+    pub http_port: u16,
+    pub native_compatibility_id: novarocks_types::NativeCompatibilityId,
+}
+
+/// Inputs for serving one ready Frontend application through native and MySQL
+/// listeners. The Server role owns their process supervision.
+#[derive(Clone)]
+pub struct FrontendServingConfig {
+    pub report_bind_host: String,
+    pub report_grpc_port: u16,
+    /// Maximum time admitted FE workload leases may continue after drain starts.
+    pub frontend_drain_timeout: Duration,
+    /// Upper bound for terminal resource cleanup after graceful/deadline drain.
+    pub frontend_cleanup_timeout: Duration,
+    pub mysql_listener: ResolvedMysqlListenerSettings,
+    pub native_trust: Arc<NativeTrust>,
+    pub native_transport: FrontendNativeTransport,
+}
+
+/// Immutable Frontend role products constructed before SQL session assembly.
+///
+/// The Server composition creates this graph after the Native report endpoint
+/// has a concrete port and before it opens MySQL admission.  Query-session
+/// assembly consumes these products; it does not start maintenance or MV
+/// workers as a side effect of creating a client-facing factory.
+struct FrontendRoleProducts {
+    /// The complete catalog lifecycle moves here only after all fallible
+    /// product construction has succeeded, so Host retains it for startup
+    /// rollback and role products retain it for serving shutdown.
+    catalog_runtime: FrontendCatalogRoleRuntime,
+    catalog_service: Arc<crate::catalog_application::query_catalog::QueryCatalogService>,
+    unified_statistics: Arc<crate::connector::UnifiedStatisticsResolver>,
+    catalog_application: Arc<dyn novarocks_catalog_application::CatalogApplicationPort>,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    connector_control: Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>,
+    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
+    query_control: novarocks_query_application::session_control::QueryControlService,
+    query_execution: crate::query_execution::service::QueryExecutionService,
+    logical_read_launcher: Arc<dyn crate::query_execution::logical_read::LogicalReadLauncher>,
+    topology: crate::common::backend_topology::BackendTopologyService,
+    role: novarocks_types::ClusterRole,
+    mv_repository: Arc<dyn crate::mv::domain::repository::MvRepository>,
+    view_service: Arc<dyn crate::view::ViewService>,
+    dml_service: Arc<crate::dml::DmlService>,
+    statistics_application: Arc<crate::statistics_jobs::service::FrontendStatisticsApplicationPort>,
+    maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService>,
+    maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
+    mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
+    mv_service: Arc<crate::mv::FrontendMvService>,
+    maintenance_ports: core_capabilities::MaintenanceCommandPorts,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    exchange_port: u16,
+}
+
+impl FrontendRoleProducts {
+    /// Starts the two product-owned background domains only after the complete
+    /// immutable role graph exists. SQL/session assembly never starts either
+    /// worker as a side effect.
+    fn start_background_workers(&self) -> Result<(), FrontendApplicationError> {
+        self.maintenance_service
+            .start(Arc::clone(&self.maintenance_engine))
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "start table maintenance service failed: {error}"
+                ))
+            })?;
+        self.mv_service
+            .start_background_workers(core_capabilities::mv_background_bindings(
+                core_capabilities::MvBackgroundPorts::new(
+                    Arc::clone(&self.function_catalog),
+                    Arc::clone(&self.catalog_service),
+                    Some(Arc::clone(&self.catalog_application)),
+                    Arc::clone(&self.connector_control),
+                    Arc::clone(&self.mv_repository),
+                    Arc::clone(&self.mv_readiness),
+                    Arc::clone(&self.mv_storage_observation),
+                ),
+                Arc::clone(&self.maintenance_engine),
+            ))
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "start frontend MV background workers failed: {error}"
+                ))
+            })
+    }
+
+    async fn shutdown_background_workers_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), FrontendApplicationError> {
+        let mut first_error = None;
+        if let Err(error) = self
+            .statistics_application
+            .shutdown_worker_until(deadline)
+            .await
+        {
+            first_error = Some(FrontendApplicationError::server(format!(
+                "shutdown statistics analyze worker failed: {error}"
+            )));
+        }
+        if let Err(error) = self
+            .mv_service
+            .shutdown_background_workers_until(deadline)
+            .await
+        {
+            first_error.get_or_insert_with(|| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend MV background workers failed: {error}"
+                ))
+            });
+        }
+        if let Err(error) = self.maintenance_service.shutdown_until(deadline).await {
+            first_error.get_or_insert_with(|| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend table-maintenance service failed: {error}"
+                ))
+            });
+        }
+        if let Err(error) = self.catalog_runtime.shutdown_until(deadline).await {
+            first_error.get_or_insert_with(|| {
+                FrontendApplicationError::server(format!(
+                    "shutdown frontend catalog role runtime failed: {error}"
+                ))
+            });
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn request_background_stop_for_process_exit(&self) {
+        self.statistics_application
+            .request_worker_stop_for_process_exit();
+        self.mv_service.request_background_stop_for_process_exit();
+        self.maintenance_service.request_shutdown_for_process_exit();
+        self.catalog_runtime.request_stop_for_process_exit();
+    }
+}
+
 /// Opens the frontend services once for an externally composed server.
 pub async fn open_frontend_application_for_server(
-    config: &FrontendServerConfig,
+    config: &FrontendApplicationOpenConfig,
     data_runtime: Handle,
 ) -> Result<FrontendApplicationHost, FrontendApplicationError> {
     FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
@@ -117,13 +259,11 @@ pub async fn open_frontend_application_for_server(
 /// session factory.  Every Core value constructed here is a closed domain
 /// capability; this function never creates an application aggregate or lets a
 /// request resolve services from the lifecycle host.
-pub fn build_frontend_query_session_factory(
-    host: &FrontendApplicationHost,
-    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+async fn build_frontend_role_products(
+    host: &mut FrontendApplicationHost,
     exchange_port: u16,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
-    client_connection_control: Arc<dyn ClientConnectionControlPort>,
-) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+) -> Result<FrontendRoleProducts, FrontendApplicationError> {
     let catalog_service =
         Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service());
     let unified_statistics = Arc::new(crate::connector::UnifiedStatisticsResolver::default());
@@ -134,16 +274,32 @@ pub fn build_frontend_query_session_factory(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
-    let query_execution = host.query_execution_service();
+    let query_control =
+        novarocks_query_application::query_control::QueryApplicationControl::service();
+    let query_execution = host.build_query_execution_service()?;
+    let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
     let role = host.execution_role();
-    let mv_repository = host.mv_repository();
-    let mv_application = host.mv_application_service();
-    let mv_service = host.mv_service();
-    let mv_readiness = mv_service.readiness_port();
-    let view_service = host.view_service();
-    let statistics_application = host.statistics_application_port();
-    let maintenance_service = host.table_maintenance_service();
+    let mv_repository = host.mv_repository_for_role_product_construction();
+    let view_service: Arc<dyn crate::view::ViewService> =
+        Arc::new(crate::view::FrontendViewService::new());
+    let dml_service = Arc::new(crate::dml::DmlService::new());
+    let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
+        Arc::new(
+            crate::table_maintenance::FrontendTableMaintenanceService::open(
+                host.durable(),
+                Handle::current(),
+                host.workload_root_admission(),
+            )
+            .await
+            .map_err(|error| {
+                FrontendApplicationError::new(
+                    crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
+                    error,
+                )
+            })?
+            .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy()),
+        );
 
     core_capabilities::bind_catalog_runtime_projection(
         catalog_projection.as_ref(),
@@ -152,61 +308,55 @@ pub fn build_frontend_query_session_factory(
     )
     .map_err(FrontendApplicationError::server)?;
 
-    if let Some(sink) = host.mv_refresh_provider_activation_sink() {
-        core_capabilities::bind_mv_refresh_provider_activation(
-            sink.as_ref(),
-            core_capabilities::MvRefreshProviderActivationPorts::new(
-                Arc::clone(&function_catalog),
-                Arc::clone(&catalog_service),
-                Some(Arc::clone(&catalog_application)),
-                Arc::clone(&connector_control),
-                Arc::clone(&typed_connector_control),
-                Arc::clone(&unified_statistics),
-                query_execution.clone(),
-                topology.clone(),
-                exchange_port,
-                Arc::clone(&mv_repository),
-                Arc::clone(&mv_readiness),
-                Arc::clone(&mv_storage_observation),
-            ),
-        )
-        .map_err(FrontendApplicationError::server)?;
-    }
-
+    let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::new(
+        Arc::clone(&mv_repository),
+        Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+        tokio::runtime::Handle::current(),
+    ));
+    let mv_candidate_reader = crate::mv::domain::readiness::MvCandidateReader::new(
+        Arc::clone(&mv_repository),
+        tokio::runtime::Handle::current(),
+    );
+    let mv_activation = core_capabilities::mv_refresh_provider_activation(
+        core_capabilities::MvRefreshProviderActivationPorts::new(
+            Arc::clone(&function_catalog),
+            Arc::clone(&catalog_service),
+            Arc::clone(&catalog_application),
+            Arc::clone(&connector_control),
+            Arc::clone(&typed_connector_control),
+            Arc::clone(&unified_statistics),
+            query_execution.clone(),
+            topology.clone(),
+            exchange_port,
+            Arc::clone(&mv_repository),
+            Arc::clone(&mv_readiness),
+            Arc::clone(&mv_storage_observation),
+        ),
+    );
+    let mv_service = Arc::new(crate::mv::FrontendMvService::with_refresh_dependencies(
+        Arc::clone(&mv_readiness),
+        query_execution.clone(),
+        Arc::clone(&connector_control),
+        mv_activation,
+        role,
+        topology.clone(),
+        host.mv_scheduler_config(),
+        host.mv_maintenance_config(),
+        Arc::clone(&maintenance_service),
+        host.optimizer_query_mem_limit_bytes(),
+        host.lake_publication_runtime_policy()
+            .max_attempt_duration(),
+        host.workload_root_admission(),
+    ));
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_storage_observation),
-        mv_service.readiness_port(),
+        Arc::clone(&mv_readiness),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
-
-    core_capabilities::bind_statistics_target_resolver(
-        statistics_application.as_ref(),
-        Arc::clone(&connector_control),
-    )
-    .map_err(FrontendApplicationError::server)?;
-    core_capabilities::bind_statistics_table_reader(
-        statistics_application.as_ref(),
-        Arc::clone(&connector_control),
-    )
-    .map_err(FrontendApplicationError::server)?;
-    core_capabilities::bind_statistics_attempt_executor(
-        statistics_application.as_ref(),
-        core_capabilities::StatisticsAttemptExecutorPorts::new(
-            role,
-            Arc::clone(&connector_control),
-            Arc::clone(&typed_connector_control),
-            topology.clone(),
-            query_execution.clone(),
-            Arc::clone(&function_catalog),
-            host.lake_publication_runtime_policy()
-                .max_attempt_duration(),
-        ),
-    )
-    .map_err(FrontendApplicationError::server)?;
 
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
         Arc::clone(&function_catalog),
@@ -217,6 +367,7 @@ pub fn build_frontend_query_session_factory(
         Arc::clone(&mv_storage_observation),
         query_execution.clone(),
         Arc::clone(&maintenance_service),
+        Handle::current(),
     );
     let maintenance_engine = core_capabilities::background_maintenance_engine(
         maintenance_ports.clone(),
@@ -226,34 +377,104 @@ pub fn build_frontend_query_session_factory(
             runtime_policy: host.lake_publication_runtime_policy(),
         }),
     );
-    if let Err(error) = maintenance_service.start(Arc::clone(&maintenance_engine)) {
-        // The application Host owns this worker lifecycle. Its caller drives
-        // the same owner through the shared bounded shutdown path.
-        return Err(FrontendApplicationError::server(format!(
-            "start table maintenance service failed: {error}"
-        )));
-    }
-    if let Some(sink) = host.mv_background_engine_sink()
-        && let Err(error) = core_capabilities::bind_mv_background_engine(
-            sink.as_ref(),
-            core_capabilities::MvBackgroundPorts::new(
-                Arc::clone(&function_catalog),
-                Arc::clone(&catalog_service),
-                Some(Arc::clone(&catalog_application)),
-                Arc::clone(&connector_control),
-                Arc::clone(&mv_repository),
-                Arc::clone(&mv_readiness),
-                Arc::clone(&mv_storage_observation),
+    let statistics_connector_control = Arc::clone(&connector_control)
+        as Arc<dyn novarocks_spi::connector::ConnectorControlRegistry>;
+    let statistics_application = Arc::new(
+        crate::statistics_jobs::service::FrontendStatisticsApplicationPort::new(
+            novarocks_statistics_application::StatisticsJobService::new(),
+            Arc::new(
+                crate::statistics_jobs::application::ConnectorStatisticsTargetResolver::new(
+                    Arc::clone(&statistics_connector_control),
+                ),
             ),
-            Arc::clone(&maintenance_engine),
-        )
-    {
-        // Do not start a private blocking join here. Returning preserves the
-        // exact worker owner for the Host's deadline-aware cleanup.
-        return Err(FrontendApplicationError::server(format!(
-            "bind frontend MV background engine failed: {error}"
-        )));
-    }
+            Arc::new(
+                crate::statistics_jobs::service::RootAdmissionStatisticsJobSource::new(
+                    host.workload_root_admission(),
+                ),
+            ),
+            crate::statistics_jobs::service::table_statistics_reader_for_role(Arc::clone(
+                &statistics_connector_control,
+            )),
+            core_capabilities::statistics_three_phase_attempt_executor(
+                core_capabilities::StatisticsAttemptExecutorPorts::new(
+                    role,
+                    statistics_connector_control,
+                    Arc::clone(&typed_connector_control),
+                    topology.clone(),
+                    query_execution.clone(),
+                    Arc::clone(&function_catalog),
+                    host.lake_publication_runtime_policy()
+                        .max_attempt_duration(),
+                ),
+            ),
+            Handle::current(),
+        ),
+    );
+    // No fallible product construction follows these transfers. Keeping them
+    // at the tail means an earlier failure still reaches Host's exact reverse
+    // cleanup path, while a serving role owns the catalog lifecycle and its
+    // durable MV repository.
+    let catalog_runtime = host.take_catalog_role_runtime()?;
+    let mv_repository = host.take_mv_repository()?;
+    Ok(FrontendRoleProducts {
+        catalog_runtime,
+        catalog_service,
+        unified_statistics,
+        catalog_application,
+        function_catalog,
+        connector_control,
+        typed_connector_control,
+        query_control,
+        query_execution,
+        logical_read_launcher,
+        topology,
+        role,
+        mv_repository,
+        view_service,
+        dml_service,
+        statistics_application,
+        maintenance_service,
+        maintenance_engine,
+        mv_readiness,
+        mv_candidate_reader,
+        mv_service,
+        maintenance_ports,
+        mv_storage_observation,
+        exchange_port,
+    })
+}
+
+/// Assemble SQL/session adapters from an already-started, immutable role
+/// product graph. This intentionally has no worker-start or product-lifecycle
+/// side effect.
+fn build_frontend_query_session_factory_from_role_products(
+    host: &FrontendApplicationHost,
+    products: &FrontendRoleProducts,
+    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
+) -> Result<Arc<dyn QuerySessionFactory>, FrontendApplicationError> {
+    let catalog_service = Arc::clone(&products.catalog_service);
+    let unified_statistics = Arc::clone(&products.unified_statistics);
+    let catalog_application = Arc::clone(&products.catalog_application);
+    let function_catalog = Arc::clone(&products.function_catalog);
+    let connector_control = Arc::clone(&products.connector_control);
+    let typed_connector_control = Arc::clone(&products.typed_connector_control);
+    let query_execution = products.query_execution.clone();
+    let topology = products.topology.clone();
+    let role = products.role;
+    let mv_repository = Arc::clone(&products.mv_repository);
+    let view_service = Arc::clone(&products.view_service);
+    let statistics_application = Arc::clone(&products.statistics_application);
+    let maintenance_service = Arc::clone(&products.maintenance_service);
+    let mv_readiness = Arc::clone(&products.mv_readiness);
+    let mv_candidate_reader = products.mv_candidate_reader.clone();
+    let mv_service = Arc::clone(&products.mv_service);
+    let mv_application_service = Arc::clone(&mv_service);
+    let mv_application: Arc<dyn crate::mv::domain::application::MvApplicationService> =
+        mv_application_service;
+    let maintenance_ports = products.maintenance_ports.clone();
+    let mv_storage_observation = Arc::clone(&products.mv_storage_observation);
+    let exchange_port = products.exchange_port;
 
     let query_compiler =
         core_capabilities::query_compiler(core_capabilities::QueryCompilerPorts::new(
@@ -269,6 +490,7 @@ pub fn build_frontend_query_session_factory(
             view_service.clone(),
             system_catalog,
             Arc::clone(&mv_readiness),
+            mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
         ));
     let session_catalog_resolver =
@@ -289,7 +511,7 @@ pub fn build_frontend_query_session_factory(
     let statistics_command_executor =
         core_capabilities::statistics_command_executor(statistics_application);
     let backend_command_executor = core_capabilities::backend_command_executor(
-        core_capabilities::BackendCommandPorts::new(topology.clone()),
+        core_capabilities::BackendCommandPorts::new(host.backend_topology_command_port()),
     );
     let view_command_executor =
         core_capabilities::view_command_executor(core_capabilities::ViewCommandPorts::new(
@@ -297,7 +519,7 @@ pub fn build_frontend_query_session_factory(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
-            host.view_service(),
+            Arc::clone(&products.view_service),
         ));
     let iceberg_ref_command_executor = core_capabilities::iceberg_ref_command_executor(
         core_capabilities::IcebergRefCommandPorts::new(
@@ -332,221 +554,96 @@ pub fn build_frontend_query_session_factory(
         query_execution.clone(),
         host.lake_publication_runtime_policy(),
     ));
-    host.dml_service()
-        .install_local_catalog(Arc::clone(&catalog_service));
-
-    let query_service = Arc::new(
-        crate::query::FrontendQueryService::new(
-            session_catalog_resolver,
-            query_compiler,
-            catalog_command_executor,
-            statistics_command_executor,
-            backend_command_executor,
-            view_command_executor,
-            iceberg_ref_command_executor,
-            mv_command_executor,
-            maintenance_command_executor,
-            maintenance_read_command_executor,
-            host.query_control_service(),
-            client_connection_control,
-            query_execution,
-            host.logical_read_launcher(),
-            host.workload_root_admission(),
-            host.workload_resources(),
-            role,
-            topology,
-            host.dml_service(),
-            dml_engines.insert,
-            dml_engines.delete,
-            dml_engines.mutation,
-            dml_engines.add_files,
-            dml_engines.ctas,
-            dml_engines.truncate,
-            host.optimizer_query_mem_limit_bytes(),
-            host.lake_publication_runtime_policy(),
-        )
-        .with_serving_lifecycle((*host.serving_lifecycle()).clone()),
-    );
+    let query_service = Arc::new(crate::query::FrontendQueryService::new(
+        session_catalog_resolver,
+        query_compiler,
+        catalog_command_executor,
+        statistics_command_executor,
+        backend_command_executor,
+        view_command_executor,
+        iceberg_ref_command_executor,
+        mv_command_executor,
+        maintenance_command_executor,
+        maintenance_read_command_executor,
+        products.query_control.clone(),
+        client_connection_control,
+        query_execution,
+        Arc::clone(&products.logical_read_launcher),
+        host.workload_root_admission(),
+        host.workload_resources(),
+        role,
+        topology,
+        Arc::clone(&products.dml_service),
+        dml_engines.insert,
+        dml_engines.delete,
+        dml_engines.mutation,
+        dml_engines.add_files,
+        dml_engines.ctas,
+        dml_engines.truncate,
+        host.query_cpu_executor(),
+        host.query_blocking_executor(),
+        host.connector_blocking_io_supervisor(),
+        host.optimizer_query_mem_limit_bytes(),
+        host.lake_publication_runtime_policy(),
+        host.serving_lifecycle().admission(),
+    ));
     host.mark_ready()?;
     Ok(query_service)
 }
 
-pub fn run_frontend_server(config: FrontendServerConfig) -> Result<(), FrontendApplicationError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|error| {
-            FrontendApplicationError::server(format!(
-                "build frontend Tokio runtime failed: {error}"
-            ))
-        })?;
-
-    runtime.block_on(run_frontend_server_with_signal(
-        config,
-        tokio::signal::ctrl_c(),
-    ))
+#[cfg(test)]
+async fn build_frontend_query_session_factory(
+    host: &mut FrontendApplicationHost,
+    system_catalog: Arc<dyn crate::catalog_application::system_catalog::SystemCatalog>,
+    exchange_port: u16,
+    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    client_connection_control: Arc<dyn ClientConnectionControlPort>,
+) -> Result<(Arc<dyn QuerySessionFactory>, FrontendRoleProducts), FrontendApplicationError> {
+    let products =
+        build_frontend_role_products(host, exchange_port, mv_storage_observation).await?;
+    products.start_background_workers()?;
+    let session_factory = build_frontend_query_session_factory_from_role_products(
+        host,
+        &products,
+        system_catalog,
+        client_connection_control,
+    )?;
+    Ok((session_factory, products))
 }
 
-// Design: ADR-0121 (docs/adr/ADR-0121-frontend-serving-lifecycle-and-admission-drain.md)
-pub async fn run_frontend_server_until_shutdown<F>(
-    config: FrontendServerConfig,
-    data_runtime: Handle,
-    shutdown: F,
-) -> Result<(), FrontendApplicationError>
-where
-    F: Future<Output = ()> + Send,
-{
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
-        start_early_management_server(&config)?;
-    let mut host = match open_frontend_application_for_server(&config, data_runtime).await {
-        Ok(host) => host,
-        Err(error) => {
-            let cleanup = metrics_http_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), cleanup);
-        }
+/// Drives the product-owned runtimes to convergence before the Host releases
+/// the coordinator, topology, or StateStore they reach through immutable ports.
+async fn shutdown_frontend_role_products_to_convergence(
+    products: &mut FrontendRoleProducts,
+    attempt_timeout: Duration,
+) -> Result<(), FrontendApplicationError> {
+    let first_error = match products
+        .shutdown_background_workers_until(Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
     };
-    if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend serving reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend island reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend lifecycle convergence reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    let server_result = serve_ready_frontend_session_factory(
-        config,
-        &host,
-        mv_storage_observation,
-        shutdown,
-        &mut metrics_http_server,
-    )
-    .await;
-    let shutdown_result =
-        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-    let metrics_stop = metrics_http_server
-        .stop()
-        .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(
-        combine_server_and_shutdown(server_result, shutdown_result),
-        metrics_stop,
-    )
-}
-
-async fn run_frontend_server_with_signal<S, E>(
-    config: FrontendServerConfig,
-    signal: S,
-) -> Result<(), FrontendApplicationError>
-where
-    S: Future<Output = Result<(), E>> + Send + 'static,
-    E: std::fmt::Display + Send + 'static,
-{
-    let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
-    let cleanup_timeout = config.frontend_cleanup_timeout;
-    let (serving_reader, island_reader, convergence_reader, mut metrics_http_server) =
-        start_early_management_server(&config)?;
-    let mut host = match open_frontend_application_for_server(&config, Handle::current()).await {
-        Ok(host) => host,
-        Err(error) => {
-            let cleanup = metrics_http_server
-                .stop()
-                .map_err(FrontendApplicationError::server);
-            return combine_server_and_shutdown(Err(error), cleanup);
+    tracing::warn!(
+        error = %first_error,
+        ?attempt_timeout,
+        "frontend role-product shutdown did not converge; retaining the exact MV owner for one final pass"
+    );
+    match products
+        .shutdown_background_workers_until(Instant::now() + attempt_timeout)
+        .await
+    {
+        Ok(()) => Err(first_error),
+        Err(final_error) => {
+            tracing::error!(
+                error = %final_error,
+                ?attempt_timeout,
+                "frontend role products remained unconverged; committing the runner to process exit"
+            );
+            products.request_background_stop_for_process_exit();
+            Err(first_error.with_cleanup_context(final_error))
         }
-    };
-    if let Err(error) = serving_reader.install(host.serving_lifecycle()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend serving reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
     }
-    if let Err(error) = island_reader.install(host.backend_island_snapshot_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend island reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    if let Err(error) = convergence_reader.install(host.lifecycle_convergence_reader()) {
-        let shutdown =
-            shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-        let cleanup = metrics_http_server
-            .stop()
-            .map_err(FrontendApplicationError::server);
-        return combine_server_and_shutdown(
-            Err(FrontendApplicationError::server(format!(
-                "install frontend lifecycle convergence reader after application open: {error}"
-            ))),
-            combine_server_and_shutdown(shutdown, cleanup),
-        );
-    }
-    let server_result = run_server_until_signal(config, (), signal, |config, (), shutdown| {
-        serve_ready_frontend_session_factory(
-            config,
-            &host,
-            mv_storage_observation,
-            shutdown,
-            &mut metrics_http_server,
-        )
-    })
-    .await;
-    let shutdown_result =
-        shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
-    let metrics_stop = metrics_http_server
-        .stop()
-        .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(
-        combine_server_and_shutdown(server_result, shutdown_result),
-        metrics_stop,
-    )
 }
 
 /// Drives the exact Frontend owner graph to convergence before the production
@@ -557,7 +654,7 @@ where
 /// cannot converge on the second pass, the runner explicitly commits to
 /// process exit and releases process-local joins through the Host's final-exit
 /// boundary. That boundary is never available to a reusable application Host.
-async fn shutdown_frontend_application_to_convergence(
+pub async fn shutdown_frontend_application_to_convergence(
     host: &mut FrontendApplicationHost,
     attempt_timeout: Duration,
 ) -> Result<(), FrontendApplicationError> {
@@ -591,22 +688,23 @@ async fn shutdown_frontend_application_to_convergence(
     }
 }
 
-fn start_early_management_server(
-    config: &FrontendServerConfig,
-) -> Result<
-    (
-        Arc<LateBoundFrontendServingSnapshotReader>,
-        Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
-        Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
-        crate::metrics::MetricsHttpServer,
-    ),
-    FrontendApplicationError,
-> {
+/// Frontend-owned management listener construction. The Server role runner
+/// owns when this listener starts, receives failures, and is torn down.
+pub struct FrontendManagementServer {
+    serving_reader: Arc<LateBoundFrontendServingSnapshotReader>,
+    island_reader: Arc<crate::topology::LateBoundBackendIslandSnapshotReader>,
+    convergence_reader: Arc<crate::metrics::LateBoundQueryLifecycleConvergenceReader>,
+    metrics_http_server: crate::metrics::MetricsHttpServer,
+}
+
+pub fn start_frontend_management_server(
+    config: &FrontendManagementConfig,
+) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::new().map_err(FrontendApplicationError::server)?;
     let serving_reader = Arc::new(LateBoundFrontendServingSnapshotReader::default());
     let island_reader = Arc::new(crate::topology::LateBoundBackendIslandSnapshotReader::new(
-        config.backend_open.native_compatibility_id(),
+        config.native_compatibility_id,
     ));
     let convergence_reader =
         Arc::new(crate::metrics::LateBoundQueryLifecycleConvergenceReader::default());
@@ -614,31 +712,67 @@ fn start_early_management_server(
     let management_island_reader: Arc<dyn crate::topology::BackendIslandSnapshotReader> =
         island_reader.clone();
     let management_convergence_reader: Arc<
-        dyn crate::coordinator::QueryLifecycleConvergenceReader,
+        dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
-        &config.report_bind_host,
-        config.metrics_http_port,
+        &config.bind_host,
+        config.http_port,
         Arc::clone(&metrics_registry),
         management_reader,
         management_island_reader,
         Some(management_convergence_reader),
     )
     .map_err(FrontendApplicationError::server)?;
-    Ok((
+    Ok(FrontendManagementServer {
         serving_reader,
         island_reader,
         convergence_reader,
         metrics_http_server,
-    ))
+    })
 }
 
-async fn serve_ready_frontend_session_factory<F>(
-    config: FrontendServerConfig,
-    host: &FrontendApplicationHost,
+impl FrontendManagementServer {
+    pub fn install(&self, host: &FrontendApplicationHost) -> Result<(), FrontendApplicationError> {
+        self.serving_reader
+            .install(host.serving_snapshot_reader())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend serving reader after application open: {error}"
+                ))
+            })?;
+        self.island_reader
+            .install(host.backend_island_snapshot_reader())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend island reader after application open: {error}"
+                ))
+            })?;
+        self.convergence_reader
+            .install(host.lifecycle_convergence_reader())
+            .map_err(|error| {
+                FrontendApplicationError::server(format!(
+                    "install frontend lifecycle convergence reader after application open: {error}"
+                ))
+            })
+    }
+
+    pub fn poll_failure(&mut self) -> Result<Option<String>, FrontendApplicationError> {
+        self.metrics_http_server
+            .poll_failure()
+            .map_err(FrontendApplicationError::server)
+    }
+
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.metrics_http_server.stop()
+    }
+}
+
+pub async fn serve_ready_frontend_session_factory<F>(
+    config: FrontendServingConfig,
+    host: &mut FrontendApplicationHost,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     shutdown: F,
-    metrics_http_server: &mut crate::metrics::MetricsHttpServer,
+    management_server: &mut FrontendManagementServer,
 ) -> Result<(), FrontendApplicationError>
 where
     F: Future<Output = ()> + Send,
@@ -655,21 +789,49 @@ where
     let client_connections = Arc::new(MysqlClientConnectionRegistry::new());
     let client_connection_control: Arc<dyn ClientConnectionControlPort> =
         client_connections.clone();
-    let session_factory = match build_frontend_query_session_factory(
+    let mut products =
+        match build_frontend_role_products(host, exchange_port, mv_storage_observation).await {
+            Ok(products) => products,
+            Err(error) => {
+                let stop_result = report_server
+                    .stop()
+                    .map_err(FrontendApplicationError::server);
+                return combine_server_and_shutdown(Err(error), stop_result);
+            }
+        };
+    if let Err(error) = products.start_background_workers() {
+        let product_shutdown = shutdown_frontend_role_products_to_convergence(
+            &mut products,
+            config.frontend_cleanup_timeout,
+        )
+        .await;
+        let stop_result = report_server
+            .stop()
+            .map_err(FrontendApplicationError::server);
+        return combine_server_and_shutdown(
+            combine_server_and_shutdown(Err(error), product_shutdown),
+            stop_result,
+        );
+    }
+    let session_factory = match build_frontend_query_session_factory_from_role_products(
         host,
+        &products,
         system_catalog,
-        exchange_port,
-        mv_storage_observation,
         client_connection_control,
     ) {
         Ok(factory) => factory,
         Err(error) => {
+            let product_shutdown = shutdown_frontend_role_products_to_convergence(
+                &mut products,
+                config.frontend_cleanup_timeout,
+            )
+            .await;
             let stop_result = report_server
                 .stop()
                 .map_err(FrontendApplicationError::server);
             return combine_server_and_shutdown(
-                combine_server_and_shutdown(Err(error), stop_result),
-                Ok(()),
+                combine_server_and_shutdown(Err(error), product_shutdown),
+                stop_result,
             );
         }
     };
@@ -679,16 +841,24 @@ where
         client_connections,
         shutdown,
         &mut report_server,
-        metrics_http_server,
-        host.serving_lifecycle(),
+        management_server,
+        host,
         config.frontend_drain_timeout,
+        config.frontend_cleanup_timeout,
+    )
+    .await;
+    let product_shutdown = shutdown_frontend_role_products_to_convergence(
+        &mut products,
         config.frontend_cleanup_timeout,
     )
     .await;
     let stop_result = report_server
         .stop()
         .map_err(FrontendApplicationError::server);
-    combine_server_and_shutdown(server_result, stop_result)
+    combine_server_and_shutdown(
+        combine_server_and_shutdown(server_result, product_shutdown),
+        stop_result,
+    )
 }
 
 async fn run_mysql_with_listener_supervision<F>(
@@ -697,8 +867,8 @@ async fn run_mysql_with_listener_supervision<F>(
     client_connections: Arc<MysqlClientConnectionRegistry>,
     shutdown: F,
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
-    management_server: &mut crate::metrics::MetricsHttpServer,
-    lifecycle: Arc<crate::workload_lifecycle::FrontendServingLifecycle>,
+    management_server: &mut FrontendManagementServer,
+    host: &FrontendApplicationHost,
     drain_timeout: Duration,
     cleanup_timeout: Duration,
 ) -> Result<(), FrontendApplicationError>
@@ -714,44 +884,56 @@ where
             }
         }
     };
-    let mysql_server = crate::mysql::run_mysql_server_until_drain_then_shutdown(
-        mysql_listener,
-        Arc::clone(&session_factory),
-        Arc::clone(&client_connections),
-        wait_for_signal(drain_rx),
-        wait_for_signal(finalize_rx),
-        cleanup_timeout,
-    );
+    let ready_user = mysql_listener.user().to_string();
+    let mysql_server =
+        novarocks_mysql_adapter::serve_query_application_mysql_until_drain_then_shutdown(
+            mysql_listener,
+            version::short_version().to_string(),
+            Arc::clone(&session_factory),
+            Arc::clone(&client_connections),
+            wait_for_signal(drain_rx),
+            wait_for_signal(finalize_rx),
+            cleanup_timeout,
+            move |bound_addr| emit_frontend_mysql_ready(bound_addr, &ready_user),
+        );
     tokio::pin!(mysql_server);
 
     tokio::select! {
         result = &mut mysql_server => result.map_err(FrontendApplicationError::server),
         _ = shutdown => {
-            lifecycle.begin_drain(drain_timeout);
+            host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
-            let graceful = tokio::time::timeout(drain_timeout, lifecycle.wait_for_no_active_work()).await;
+            let graceful = tokio::time::timeout(
+                drain_timeout,
+                host.workload_observation().wait_until_no_root_responsibilities(),
+            )
+            .await;
             if graceful.is_err() {
-                lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
+                host.cancel_governed_work_at_drain_deadline();
                 // Keep the admitted protocol tasks alive long enough to
                 // observe the first-wins deadline cancellation and return
                 // its typed error. Final connection termination remains the
                 // fallback when a cancelled attempt does not converge inside
                 // the configured bounded cleanup window.
-                let _ = tokio::time::timeout(cleanup_timeout, lifecycle.wait_for_no_active_work()).await;
+                let _ = tokio::time::timeout(
+                    cleanup_timeout,
+                    host.workload_observation().wait_until_no_root_responsibilities(),
+                )
+                .await;
             }
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            lifecycle.mark_stopping();
+            host.serving_lifecycle().mark_stopping();
             let _ = finalize_tx.send(true);
             mysql_server.await.map_err(FrontendApplicationError::server)
         }
         error = wait_for_frontend_listener_failure(report_server, management_server) => {
-            lifecycle.begin_drain(drain_timeout);
+            host.begin_serving_drain(drain_timeout);
             let _ = drain_tx.send(true);
-            lifecycle.cancel_active_at_drain_deadline(drain_timeout.as_millis().min(u64::MAX as u128) as u64);
+            host.cancel_governed_work_at_drain_deadline();
             session_factory.cancel_all(QueryCancellationReason::ServerShutdown);
             client_connections.terminate_all(ClientConnectionTerminationReason::ServerShutdown);
-            lifecycle.mark_stopping();
+            host.serving_lifecycle().mark_stopping();
             let _ = finalize_tx.send(true);
             let mysql_result = mysql_server.await.map_err(FrontendApplicationError::server);
             match mysql_result {
@@ -763,9 +945,25 @@ where
     }
 }
 
+fn emit_frontend_mysql_ready(bind_addr: std::net::SocketAddr, user: &str) {
+    info!(
+        "standalone mysql server listening on {} (user={}, db={})",
+        bind_addr, user, DEFAULT_DATABASE
+    );
+    // Emit a parser-friendly readiness marker on stdout. Orchestration
+    // scripts must wait for this exact line before connecting; probing the
+    // mysql port alone cannot distinguish a freshly-bound server from a
+    // pre-existing process that already owned the port.
+    println!(
+        "NOVAROCKS_READY mysql_port={} pid={}",
+        bind_addr.port(),
+        std::process::id()
+    );
+}
+
 async fn wait_for_frontend_listener_failure(
     report_server: &mut crate::native::report_server::FrontendReportServerHandle,
-    management_server: &mut crate::metrics::MetricsHttpServer,
+    management_server: &mut FrontendManagementServer,
 ) -> String {
     loop {
         match report_server.poll_failure() {
@@ -783,6 +981,12 @@ async fn wait_for_frontend_listener_failure(
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+struct FrontendTestServerConfig {
+    state_store_input: Option<StateStoreHostInput>,
+}
+
+#[cfg(test)]
 async fn run_frontend_server_until_shutdown_with_ports<
     F,
     Host,
@@ -795,7 +999,7 @@ async fn run_frontend_server_until_shutdown_with_ports<
     ShutdownHost,
     ShutdownHostFuture,
 >(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     shutdown: F,
     open_host: OpenHost,
     extract_service: ExtractService,
@@ -807,7 +1011,7 @@ where
     OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
-    Serve: FnOnce(FrontendServerConfig, Service, F) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, F) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
@@ -835,7 +1039,7 @@ async fn run_frontend_server_with_signal_and_ports<
     ShutdownHost,
     ShutdownHostFuture,
 >(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     signal: S,
     open_host: OpenHost,
     extract_service: ExtractService,
@@ -848,7 +1052,7 @@ where
     OpenHost: FnOnce(Option<StateStoreHostInput>) -> OpenHostFuture,
     OpenHostFuture: Future<Output = Result<Host, FrontendApplicationError>>,
     ExtractService: FnOnce(&Host) -> Service,
-    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
     ShutdownHost: FnOnce(Host) -> ShutdownHostFuture,
     ShutdownHostFuture: Future<Output = Result<(), FrontendApplicationError>>,
@@ -876,8 +1080,9 @@ fn combine_server_and_shutdown(
     }
 }
 
+#[cfg(test)]
 async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
-    config: FrontendServerConfig,
+    config: FrontendTestServerConfig,
     service: Service,
     signal: S,
     serve: Serve,
@@ -885,7 +1090,7 @@ async fn run_server_until_signal<S, E, Service, Serve, ServeFuture>(
 where
     S: Future<Output = Result<(), E>> + Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    Serve: FnOnce(FrontendServerConfig, Service, ShutdownSignal) -> ServeFuture,
+    Serve: FnOnce(FrontendTestServerConfig, Service, ShutdownSignal) -> ServeFuture,
     ServeFuture: Future<Output = Result<(), FrontendApplicationError>>,
 {
     let mut signal = Box::pin(signal);
@@ -950,7 +1155,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::num::NonZeroUsize;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -958,26 +1162,55 @@ mod tests {
     use novarocks_native_trust::{
         DeploymentId, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
     };
+    use novarocks_query_application::client_connection::ClientConnectionToken;
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::UnavailableMvStorageObservationPort;
     use novarocks_workload_control::{WorkClass, WorkRequest};
 
     use super::{
-        FrontendServerConfig, build_frontend_query_session_factory, run_frontend_server,
-        run_frontend_server_until_shutdown, run_frontend_server_until_shutdown_with_ports,
-        run_frontend_server_with_signal_and_ports, shutdown_frontend_application_to_convergence,
+        FrontendTestServerConfig, build_frontend_query_session_factory,
+        run_frontend_server_until_shutdown_with_ports, run_frontend_server_with_signal_and_ports,
+        shutdown_frontend_application_to_convergence,
+        shutdown_frontend_role_products_to_convergence,
     };
-    use crate::catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
-    use crate::native::transport::FrontendNativeTransport;
-    use crate::state_store::{
-        StateStoreProviderRegistry,
-        testing::{input as test_state_store_input, registry as test_state_store_registry},
+    use crate::state_store::testing::{
+        input as test_state_store_input, registry as test_state_store_registry,
     };
     use crate::{
-        ClusterBackendOpenConfig, FrontendApplicationError, FrontendApplicationErrorKind,
-        FrontendApplicationHost, FrontendExecutionConfig, MysqlClientConnectionRegistry,
+        application::{
+            FrontendApplicationError, FrontendApplicationErrorKind, FrontendApplicationHost,
+            FrontendExecutionConfig,
+        },
+        topology::ClusterBackendOpenConfig,
     };
-    use crate::{QueryServiceErrorKind, QuerySessionOpenRequest, ResolvedMysqlListenerSettings};
+    use novarocks_catalog_application::{CatalogAdmission, CatalogDesiredStateSourceInput};
+    use novarocks_mysql_adapter::MysqlClientConnectionRegistry;
+    use novarocks_native_adapter::FrontendNativeTransport;
+    use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
+    use novarocks_query_application::session::{QuerySessionOpenRequest, QuerySessionStatement};
+    use novarocks_query_application::session_error::QueryServiceErrorKind;
+
+    fn settle_governed_completion(statement: QuerySessionStatement) {
+        let (result, terminal) = statement.into_parts();
+        let StatementResult::GovernedCompletion(result) = result else {
+            panic!("successful statement must retain its owner through terminal OK");
+        };
+        let mut protocol = result.into_protocol();
+        let _ = protocol.seal_success_visibility();
+        let _ = protocol.complete();
+        terminal.complete();
+    }
+
+    fn settle_governed_query(statement: QuerySessionStatement) {
+        let (result, terminal) = statement.into_parts();
+        let StatementResult::GovernedQuery(result) = result else {
+            panic!("query result must retain its owner through terminal EOF");
+        };
+        let (_result, mut protocol) = result.into_parts();
+        let _ = protocol.seal_success_visibility();
+        let _ = protocol.complete();
+        terminal.complete();
+    }
 
     fn test_native_trust() -> Arc<NativeTrust> {
         Arc::new(NativeTrust::new(
@@ -1014,31 +1247,9 @@ mod tests {
         }
     }
 
-    fn frontend_config() -> FrontendServerConfig {
-        FrontendServerConfig {
-            execution: FrontendExecutionConfig::new_for_test(
-                "127.0.0.1",
-                0,
-                NonZeroUsize::new(1).expect("non-zero runtime-filter workers"),
-                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-                builtin_function_catalog(),
-            ),
-            backend_open: frontend_backend_open_config(),
-            report_bind_host: "127.0.0.1".to_string(),
-            report_grpc_port: 0,
-            metrics_http_port: 0,
-            frontend_drain_timeout: Duration::from_secs(1),
-            frontend_cleanup_timeout: Duration::from_secs(1),
-            mysql_listener: ResolvedMysqlListenerSettings::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                "root",
-            ),
-            connector_control_role_factories: Vec::new(),
-            mv_storage_observation: Arc::new(UnavailableMvStorageObservationPort),
+    fn frontend_config() -> FrontendTestServerConfig {
+        FrontendTestServerConfig {
             state_store_input: None,
-            state_store_provider_registry: StateStoreProviderRegistry::new(),
-            native_trust: test_native_trust(),
-            native_transport: FrontendNativeTransport::plaintext(),
         }
     }
 
@@ -1094,12 +1305,13 @@ mod tests {
             use futures::FutureExt;
 
             async move {
-                let control = crate::connector::control_host::tests::test_control_binding_for(
-                    properties.handle().catalog_name().clone(),
-                    1,
-                )
-                .with_catalog_properties(properties.as_catalog_properties().clone())
-                .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
+                let control =
+                    novarocks_catalog_application::test_support::test_control_binding_for(
+                        properties.handle().catalog_name().clone(),
+                        1,
+                    )
+                    .with_catalog_properties(properties.as_catalog_properties().clone())
+                    .map_err(novarocks_spi::connector::ConnectorMaterializationError::from)?;
                 novarocks_spi::connector::ConnectorControlRoleBinding::try_new(
                     properties,
                     Arc::new(control),
@@ -1139,34 +1351,36 @@ mod tests {
         .await
         .expect("open frontend application host");
         let store = host.state_store().expect("frontend StateStore");
-        let attachments = crate::catalog_attachment::CatalogAttachmentRepository::open(
+        let attachments = novarocks_catalog_application::CatalogAttachmentRepository::open(
             Arc::clone(&store),
             host.run_policy(),
         )
         .await
         .expect("open catalog attachment repository");
 
-        let session_factory = build_frontend_query_session_factory(
-            &host,
+        let (session_factory, mut products) = build_frontend_query_session_factory(
+            &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),
         )
+        .await
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
-                crate::ClientConnectionToken::new(1, 1).expect("valid connection token"),
+                ClientConnectionToken::new(1, 1).expect("valid connection token"),
                 "cp2-cutover",
             ))
             .expect("open frontend query session");
         let instance_id =
             novarocks_spi::connector::ConnectorInstanceId::parse("warehouse").expect("instance ID");
 
-        session
+        let result = session
             .execute_batch(r#"CREATE EXTERNAL CATALOG warehouse PROPERTIES("type"="iceberg")"#)
             .await
             .expect("CREATE CATALOG commits a durable StateStore attachment");
+        settle_governed_completion(result);
         let created = attachments
             .get(&instance_id)
             .await
@@ -1175,18 +1389,20 @@ mod tests {
         assert_eq!(created.attachment.provider_id.as_str(), "iceberg");
         assert_eq!(created.attachment.display_name, "warehouse");
         assert!(matches!(
-            host.catalog_application_port().admit_catalog(&instance_id),
+            products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Ready(_)
         ));
-        session
+        let result = session
             .execute_batch("SET CATALOG warehouse")
             .await
             .expect("the committed attachment is admitted by this frontend session");
+        settle_governed_completion(result);
 
-        session
+        let result = session
             .execute_batch("DROP CATALOG warehouse")
             .await
             .expect("DROP CATALOG deletes the durable StateStore attachment");
+        settle_governed_completion(result);
         assert!(
             attachments
                 .get(&instance_id)
@@ -1196,17 +1412,21 @@ mod tests {
             "DROP CATALOG must remove the durable attachment"
         );
         assert!(matches!(
-            host.catalog_application_port().admit_catalog(&instance_id),
+            products.catalog_application.admit_catalog(&instance_id),
             CatalogAdmission::Absent
         ));
-        assert_eq!(
-            session
-                .execute_batch("SET CATALOG warehouse")
-                .await
-                .expect_err("a dropped catalog stops being admitted")
-                .kind(),
-            QueryServiceErrorKind::BadDatabase
-        );
+        let result = session
+            .execute_batch("SET CATALOG warehouse")
+            .await
+            .expect("admission error is retained until the protocol terminal error");
+        let (result, terminal) = result.into_parts();
+        let StatementResult::GovernedError(result) = result else {
+            panic!("a dropped catalog must produce a governed terminal error");
+        };
+        let (error, mut protocol) = result.into_parts();
+        assert_eq!(error.kind(), QueryServiceErrorKind::BadDatabase);
+        let _ = protocol.fail();
+        terminal.complete();
 
         // The ready session factory and this test's probe both hold StateStore references; the
         // host owns closing the deployment lock, so release them first.
@@ -1215,6 +1435,9 @@ mod tests {
         session.close();
         drop(session);
         drop(session_factory);
+        shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
+            .await
+            .expect("shutdown frontend role products");
         host.shutdown().await.expect("host shutdown");
     }
 
@@ -1289,52 +1512,36 @@ mod tests {
         )
         .await
         .expect("open frontend application host");
-        let session_factory = build_frontend_query_session_factory(
-            &host,
+        let (session_factory, mut products) = build_frontend_query_session_factory(
+            &mut host,
             Arc::new(crate::system_catalog::SystemCatalogService::with_defaults()),
             0,
             Arc::new(UnavailableMvStorageObservationPort),
             Arc::new(MysqlClientConnectionRegistry::new()),
         )
+        .await
         .expect("build ready frontend session factory");
         let session = session_factory
             .open_session(QuerySessionOpenRequest::new(
-                crate::ClientConnectionToken::new(2, 1).expect("valid connection token"),
+                ClientConnectionToken::new(2, 1).expect("valid connection token"),
                 "statistics-binding",
             ))
             .expect("open frontend query session");
-        session
+        let result = session
             .execute_batch("SHOW ANALYZE JOBS")
             .await
             .expect("configured Frontend statistics application port handles SHOW ANALYZE JOBS");
+        settle_governed_query(result);
 
         session.close();
         drop(session);
         drop(session_factory);
+        shutdown_frontend_role_products_to_convergence(&mut products, Duration::from_secs(1))
+            .await
+            .expect("shutdown frontend role products");
         host.shutdown()
             .await
             .expect("shutdown frontend application host");
-    }
-
-    #[test]
-    fn runner_exports_typed_application_errors() {
-        fn accepts_sync_runner(
-            _: fn(FrontendServerConfig) -> Result<(), FrontendApplicationError>,
-        ) {
-        }
-        fn accepts_async_runner<F>(_: F)
-        where
-            F: Future<Output = Result<(), FrontendApplicationError>>,
-        {
-        }
-
-        accepts_sync_runner(run_frontend_server);
-        let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
-        accepts_async_runner(run_frontend_server_until_shutdown(
-            frontend_config(),
-            data_runtime.handle().clone(),
-            async {},
-        ));
     }
 
     #[tokio::test]
@@ -1446,6 +1653,46 @@ mod tests {
         // The explicit process-exit boundary makes every fail-closed local
         // owner drop-safe without waiting forever for the held responsibility.
         drop(host);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn serving_drain_refuses_new_governed_roots() {
+        let registry = test_state_store_registry();
+        let mut host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(test_state_store_input("server-drain-closes-root-admission")),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                "127.0.0.1",
+                0,
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                builtin_function_catalog(),
+            ),
+            frontend_backend_open_config(),
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .expect("open frontend application host");
+        host.mark_ready().expect("mark frontend host ready");
+
+        let active = host
+            .workload_root_admission()
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("admit one root before drain");
+        host.begin_serving_drain(Duration::from_secs(1));
+        assert!(
+            host.workload_root_admission()
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .is_err(),
+            "serving drain must close the one governed root-admission authority"
+        );
+        drop(active.business);
+        active.owner.complete();
+
+        host.shutdown().await.expect("shutdown drained host");
     }
 
     #[tokio::test]

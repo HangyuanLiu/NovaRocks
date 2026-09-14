@@ -28,16 +28,16 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
 use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
-use crate::runtime::query_result::{QueryResult, record_batch_to_chunk};
-use novarocks_execution::exec::chunk::Chunk;
+use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
 use novarocks_parser::{ast, printer};
+use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
 use novarocks_sql::planning::mv::VisibleAggregateOutput;
 use novarocks_sql::planning::mv::{
     MV_BRANCH_ID_COLUMN_NAME, SqlMvAggregateCalls as AggregateSqlCalls, extract_aggregate_sql_calls,
 };
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
-use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
+use novarocks_types::{SlotId, mv_aggregate_layout::MvAggregateStateRole};
 
 #[allow(
     dead_code,
@@ -336,7 +336,7 @@ fn append_branch_id_to_chunk(chunk: Chunk, branch_id: i32) -> Result<Chunk, Stri
             "append branch id to branch UNION ALL aggregate first refresh chunk failed: {error}"
         )
     })?;
-    record_batch_to_chunk(batch)
+    chunk_from_record_batch(batch)
 }
 
 #[allow(
@@ -384,7 +384,7 @@ fn normalize_and_materialize_aggregate_read(
         .result
         .columns
         .iter()
-        .map(|column| column.name.as_str())
+        .map(QueryResultColumn::name)
         .collect::<Vec<_>>();
     let metadata_permutation = exact_name_permutation(
         &metadata_names,
@@ -396,18 +396,22 @@ fn normalize_and_materialize_aggregate_read(
         .iter()
         .zip(target_names.iter())
         .map(|(source_index, target_name)| {
-            let mut column = old_columns[*source_index].clone();
-            column.name.clone_from(target_name);
-            column
+            let column = &old_columns[*source_index];
+            QueryResultColumn::new(
+                target_name.as_str(),
+                column.data_type().clone(),
+                column.nullable(),
+                column.logical_type().cloned(),
+            )
         })
         .collect();
 
-    read.result.chunks = read
+    let chunks = read
         .result
-        .chunks
+        .batches
         .into_iter()
-        .map(|chunk| {
-            let schema = chunk.batch.schema();
+        .map(|batch| {
+            let schema = batch.schema();
             let actual_names = schema
                 .fields()
                 .iter()
@@ -418,10 +422,14 @@ fn normalize_and_materialize_aggregate_read(
                 &source_names,
                 "aggregate MV state result chunk",
             )?;
-            reorder_and_rename_chunk_columns(chunk, &target_names, &permutation)
+            reorder_and_rename_chunk_columns(
+                chunk_from_record_batch(batch)?,
+                &target_names,
+                &permutation,
+            )
         })
         .collect::<Result<Vec<_>, String>>()?;
-    materialize_aggregate_result_chunks(read.result.chunks, target_layout.runtime_layout())
+    materialize_aggregate_result_chunks(chunks, target_layout.runtime_layout())
 }
 
 #[allow(
@@ -774,7 +782,19 @@ fn reorder_and_rename_chunk_columns(
         .collect::<Vec<_>>();
     let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
         .map_err(|error| format!("reorder aggregate MV state result columns failed: {error}"))?;
-    record_batch_to_chunk(batch)
+    chunk_from_record_batch(batch)
+}
+
+fn chunk_from_record_batch(batch: RecordBatch) -> Result<Chunk, String> {
+    let slot_ids = (1..=batch.num_columns())
+        .map(|index| {
+            u32::try_from(index)
+                .map(SlotId::new)
+                .map_err(|_| "too many aggregate result columns".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &slot_ids)?;
+    Chunk::try_new_with_chunk_schema(batch, schema)
 }
 
 #[cfg(test)]
@@ -786,8 +806,8 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
-    use crate::runtime::query_result::{QueryResultColumn, record_batch_to_chunk};
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
+    use novarocks_query_application::api::ResultField as QueryResultColumn;
     use novarocks_sql::plan_read::{ColumnId, OutputColumn};
     use novarocks_sql::planning::mv::SqlMvAggregateLayoutFacts;
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
@@ -850,20 +870,15 @@ mod tests {
         .expect("state-shaped result batch");
         QueryResult {
             columns: vec![
-                QueryResultColumn {
-                    name: "__agg_state_c".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
-                    logical_type: Some(SqlType::Binary),
-                },
-                QueryResultColumn {
-                    name: group_key.to_string(),
-                    data_type: DataType::Utf8,
-                    nullable: true,
-                    logical_type: Some(SqlType::String),
-                },
+                QueryResultColumn::new(
+                    "__agg_state_c",
+                    DataType::Binary,
+                    false,
+                    Some(SqlType::Binary),
+                ),
+                QueryResultColumn::new(group_key, DataType::Utf8, true, Some(SqlType::String)),
             ],
-            chunks: vec![record_batch_to_chunk(batch).expect("chunk")],
+            batches: vec![batch],
         }
     }
 
@@ -997,7 +1012,12 @@ mod tests {
         for names in [["unexpected", "region"], ["region", "region"]] {
             let mut result = reordered_count_result();
             for (column, name) in result.columns.iter_mut().zip(names) {
-                column.name = name.to_string();
+                *column = QueryResultColumn::new(
+                    name,
+                    column.data_type().clone(),
+                    column.nullable(),
+                    column.logical_type().cloned(),
+                );
             }
 
             let error = prepare_with_result(result).expect_err("metadata names must be exact");
@@ -1013,18 +1033,16 @@ mod tests {
     #[test]
     fn single_chunk_name_mismatch_fails_fast() {
         let mut result = reordered_count_result();
-        let old = result.chunks.pop().expect("chunk");
+        let old = result.batches.pop().expect("batch");
         let batch = RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("unexpected", DataType::Binary, false),
                 Field::new("region", DataType::Utf8, true),
             ])),
-            old.batch.columns().to_vec(),
+            old.columns().to_vec(),
         )
         .expect("mismatched chunk");
-        result
-            .chunks
-            .push(record_batch_to_chunk(batch).expect("chunk"));
+        result.batches.push(batch);
 
         let error = prepare_with_result(result).expect_err("chunk names must be exact");
 

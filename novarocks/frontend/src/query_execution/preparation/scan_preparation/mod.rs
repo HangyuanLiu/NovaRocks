@@ -30,7 +30,6 @@ use crate::catalog_application::query_bindings::{
     QueryScanMaterialization, QueryTableBindingStore,
 };
 use crate::catalog_application::query_materializer::metadata_table_alias_suffix;
-use crate::connector::ConnectorControlHost;
 use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, ConnectorAttemptAccessPlanBuilder, FrozenDescriptionInputs,
     FrozenDescriptionInputsBuilder,
@@ -43,6 +42,7 @@ use crate::query_execution::preparation::scan::{
     ResolvedScanColumn, ResolvedScanExecution, ScanBindingResolver, ScanExecutionBindings,
 };
 use crate::query_execution::preparation::typed_scan::{TypedRelationFreeze, prepare_typed_scan};
+use novarocks_catalog_application::ConnectorControlHost;
 use novarocks_query_application::observation::{
     PreparationBudget, PreparationByteLimits, PreparationCountLimits, PreparationLimits,
 };
@@ -966,7 +966,7 @@ fn prepare_typed_relation_scan(
                     novarocks_spi::connector::ConnectorPlanningContext::try_from_request(
                         request_context
                             .clone()
-                            .without_vended_credential_lease_sink(),
+                            .without_attempt_capabilities(),
                     )?;
                 factory.for_planning(&planning_context)
             },

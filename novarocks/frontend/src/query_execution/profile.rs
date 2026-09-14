@@ -1193,7 +1193,6 @@ mod tests {
         collect_distributed_profile_summary_from_profile_trees,
         collect_per_fragment_profile_summaries, merge_actual_metrics, native_counter,
     };
-    use crate::query_execution::contract::QueryId;
     use novarocks_execution::runtime::profile::{ProfileUnit, Profiler};
     use novarocks_execution::task_execution::{
         FinalTaskInfo, OperatorStatistics, SafeDetail, TaskIdentity, TaskOutputFacts, TaskState,
@@ -1204,6 +1203,7 @@ mod tests {
     };
     use novarocks_proto_models::{common, novarocks};
     use novarocks_spi::connector::read_stack::SplitSourceProfile;
+    use novarocks_types::QueryId;
     use novarocks_types::identity::{
         AttemptId as NativeAttemptId, BackendProcessId, QueryExecutionId as NativeQueryExecutionId,
         QueryId as NativeQueryId, StageId, TaskId,

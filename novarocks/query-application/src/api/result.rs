@@ -27,7 +27,7 @@
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::{
-    array::ArrayData,
+    array::{ArrayData, ArrayRef, StringArray},
     buffer::Buffer,
     datatypes::{DataType, Field, Schema},
     record_batch::RecordBatch,
@@ -86,6 +86,14 @@ fn unique_arrow_backing_bytes(batch: &RecordBatch) -> usize {
     batch.columns().iter().fold(0usize, |total, column| {
         total.saturating_add(array_backing_bytes(&column.to_data(), &mut seen))
     })
+}
+
+/// Return the exact governance charge required while this decoded Arrow batch
+/// remains owned by an application or protocol consumer.
+pub fn decoded_result_batch_governance_charge(
+    batch: &RecordBatch,
+) -> Result<u64, QueryExecutionError> {
+    Ok(DecodedResultBatch::try_new(batch.clone())?.governance_charge_bytes())
 }
 
 fn array_backing_bytes(data: &ArrayData, seen: &mut HashSet<usize>) -> usize {
@@ -153,6 +161,159 @@ impl ResultField {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResultSchema {
     fields: Arc<[ResultField]>,
+}
+
+/// Fully materialized immediate query output owned by the query application.
+///
+/// Unlike distributed [`QueryResultStream`] delivery, an immediate result has
+/// already been produced by a synchronous application command. It retains
+/// only Arrow batches and application-visible column metadata: execution
+/// chunks and their slot mappings are an execution implementation detail and
+/// must not escape into a client-session contract.
+#[derive(Clone, Debug)]
+pub struct QueryResult {
+    pub columns: Vec<ResultField>,
+    pub batches: Vec<RecordBatch>,
+}
+
+impl QueryResult {
+    pub fn row_count(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    pub fn into_batches(self) -> Vec<RecordBatch> {
+        self.batches
+    }
+
+    /// Empty schema, empty batches. Used as the no-op output when an IVM
+    /// branch (insert or delete) has zero input files or rows.
+    pub fn empty() -> Self {
+        Self {
+            columns: Vec::new(),
+            batches: Vec::new(),
+        }
+    }
+}
+
+/// Builds one bounded, fully materialized immediate result from product-owned
+/// columns and Arrow arrays. Product adapters retain the meaning of their
+/// columns and cells; this function owns the shared query-session schema and
+/// batch projection.
+pub fn build_arrow_query_result(
+    columns: Vec<ResultField>,
+    arrays: Vec<ArrayRef>,
+) -> Result<QueryResult, String> {
+    if columns.len() != arrays.len() {
+        return Err("immediate result column and array counts must match".to_owned());
+    }
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|column| Field::new(column.name(), column.data_type().clone(), column.nullable()))
+            .collect::<Vec<_>>(),
+    ));
+    let batch = RecordBatch::try_new(schema, arrays)
+        .map_err(|error| format!("build immediate result batch failed: {error}"))?;
+    Ok(QueryResult {
+        columns,
+        batches: vec![batch],
+    })
+}
+
+pub fn build_string_query_result(
+    column_name: &str,
+    rows: Vec<String>,
+) -> Result<QueryResult, String> {
+    let column = ResultField::new(column_name, DataType::Utf8, false, None);
+    build_arrow_query_result(
+        vec![column],
+        vec![Arc::new(StringArray::from(
+            rows.into_iter().map(Some).collect::<Vec<_>>(),
+        ))],
+    )
+    .map_err(|error| format!("build immediate text result failed: {error}"))
+}
+
+/// Builds a bounded immediate table whose protocol-visible cells are required
+/// UTF-8 values.
+///
+/// Command adapters retain their row semantics; this helper owns only the
+/// common Arrow/schema projection into the query-session result contract.
+/// It rejects ragged rows before constructing any batch, so a product cannot
+/// publish a schema that disagrees with its visible cells.
+pub fn build_utf8_query_result(
+    column_names: &[&str],
+    rows: Vec<Vec<String>>,
+) -> Result<QueryResult, String> {
+    let columns = column_names
+        .iter()
+        .map(|name| (*name, false))
+        .collect::<Vec<_>>();
+    let rows = rows
+        .into_iter()
+        .map(|row| row.into_iter().map(Some).collect())
+        .collect();
+    build_utf8_table_query_result(&columns, rows)
+}
+
+/// Builds a bounded immediate UTF-8 table with the supplied per-column
+/// nullability. Product command adapters retain ownership of the row and
+/// column semantics; this helper owns the common Arrow/schema projection.
+pub fn build_utf8_table_query_result(
+    columns: &[(&str, bool)],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<QueryResult, String> {
+    if columns.is_empty() {
+        return Err("immediate tabular result requires at least one column".to_owned());
+    }
+    if columns.iter().any(|(name, _)| name.is_empty()) {
+        return Err("immediate tabular result column names must be nonempty".to_owned());
+    }
+    if rows.iter().any(|row| row.len() != columns.len()) {
+        return Err(
+            "immediate tabular result contains a row with the wrong column count".to_owned(),
+        );
+    }
+    if rows.iter().any(|row| {
+        row.iter()
+            .enumerate()
+            .any(|(column_index, value)| value.is_none() && !columns[column_index].1)
+    }) {
+        return Err("immediate tabular result contains null in a required column".to_owned());
+    }
+    let result_columns = columns
+        .iter()
+        .map(|(name, nullable)| ResultField::new(*name, DataType::Utf8, *nullable, None))
+        .collect::<Vec<_>>();
+    let arrays = (0..columns.len())
+        .map(|column| {
+            Arc::new(StringArray::from(
+                rows.iter()
+                    .map(|row| row[column].clone())
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef
+        })
+        .collect::<Vec<_>>();
+    build_arrow_query_result(result_columns, arrays)
+        .map_err(|error| format!("build immediate tabular result failed: {error}"))
+}
+
+/// Builds a bounded immediate table whose protocol-visible cells are nullable
+/// UTF-8 values.
+///
+/// Product command adapters retain ownership of their row semantics; this
+/// helper owns only the common Arrow/schema projection into the query-session
+/// result contract. It rejects ragged rows before constructing any batch, so a
+/// product cannot publish a schema that disagrees with its visible cells.
+pub fn build_nullable_utf8_query_result(
+    column_names: &[&str],
+    rows: Vec<Vec<Option<String>>>,
+) -> Result<QueryResult, String> {
+    let columns = column_names
+        .iter()
+        .map(|name| (*name, true))
+        .collect::<Vec<_>>();
+    build_utf8_table_query_result(&columns, rows)
 }
 
 impl ResultSchema {
@@ -833,6 +994,140 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![11_i64, 13]))],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn immediate_query_result_retains_arrow_batches_without_execution_chunks() {
+        let result = build_string_query_result(
+            "Explain String",
+            vec!["first".to_string(), "second".to_string()],
+        )
+        .expect("build immediate result");
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name(), "Explain String");
+        assert_eq!(result.row_count(), 2);
+        let values = result.batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("string output");
+        assert_eq!(values.value(0), "first");
+        assert_eq!(values.value(1), "second");
+    }
+
+    #[test]
+    fn generic_immediate_result_projection_preserves_typed_columns() {
+        let result = build_arrow_query_result(
+            vec![
+                ResultField::new("count", DataType::Int64, false, None),
+                ResultField::new("active", DataType::Boolean, true, None),
+            ],
+            vec![
+                Arc::new(Int64Array::from(vec![3_i64])) as ArrayRef,
+                Arc::new(arrow::array::BooleanArray::from(vec![Some(true)])) as ArrayRef,
+            ],
+        )
+        .expect("build typed immediate result");
+
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(result.batches[0].num_rows(), 1);
+        assert_eq!(
+            result.batches[0].schema().field(0).data_type(),
+            &DataType::Int64
+        );
+        assert_eq!(
+            result.batches[0].schema().field(1).data_type(),
+            &DataType::Boolean
+        );
+    }
+
+    #[test]
+    fn generic_immediate_result_projection_rejects_mismatched_columns_and_arrays() {
+        let error = build_arrow_query_result(
+            vec![ResultField::new("count", DataType::Int64, false, None)],
+            Vec::new(),
+        )
+        .expect_err("mismatched immediate result must fail");
+
+        assert_eq!(error, "immediate result column and array counts must match");
+    }
+
+    #[test]
+    fn nullable_text_table_projection_preserves_schema_cells_and_nulls() {
+        let result = build_nullable_utf8_query_result(
+            &["job_id", "detail"],
+            vec![
+                vec![Some("job-1".to_owned()), None],
+                vec![Some("job-2".to_owned()), Some("complete".to_owned())],
+            ],
+        )
+        .expect("build nullable text table");
+
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.columns.iter().all(ResultField::nullable));
+        let detail = result.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("nullable string output");
+        assert!(detail.is_null(0));
+        assert_eq!(detail.value(1), "complete");
+    }
+
+    #[test]
+    fn required_text_table_projection_preserves_schema_cells() {
+        let result = build_utf8_query_result(
+            &["name", "state"],
+            vec![vec!["be-1".to_owned(), "Live".to_owned()]],
+        )
+        .expect("build required text table");
+
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.columns.iter().all(|column| !column.nullable()));
+        let state = result.batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("required string output");
+        assert_eq!(state.value(0), "Live");
+    }
+
+    #[test]
+    fn nullable_text_table_projection_rejects_ragged_rows() {
+        let error = build_nullable_utf8_query_result(
+            &["job_id", "detail"],
+            vec![vec![Some("job-1".to_owned())]],
+        )
+        .expect_err("ragged rows must not produce a visible schema");
+        assert_eq!(
+            error,
+            "immediate tabular result contains a row with the wrong column count"
+        );
+    }
+
+    #[test]
+    fn mixed_text_table_projection_preserves_per_column_nullability() {
+        let result = build_utf8_table_query_result(
+            &[("catalog_name", false), ("sql_path", true)],
+            vec![vec![Some("lake".to_owned()), None]],
+        )
+        .expect("build mixed-nullability text table");
+
+        assert!(!result.columns[0].nullable());
+        assert!(result.columns[1].nullable());
+        assert!(!result.batches[0].schema().field(0).is_nullable());
+        assert!(result.batches[0].schema().field(1).is_nullable());
+    }
+
+    #[test]
+    fn mixed_text_table_projection_rejects_null_in_required_column() {
+        let error = build_utf8_table_query_result(&[("catalog_name", false)], vec![vec![None]])
+            .expect_err("required column must reject null");
+        assert_eq!(
+            error,
+            "immediate tabular result contains null in a required column"
+        );
     }
 
     fn decoded(batch: RecordBatch) -> DecodedResultBatch {

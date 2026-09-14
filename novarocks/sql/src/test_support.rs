@@ -23,6 +23,7 @@
 
 use arrow::datatypes::DataType;
 use std::num::NonZeroU64;
+use std::sync::Arc;
 
 use crate::analysis::cte::CteId;
 use crate::analysis::{ExprKind, OutputColumn, SubqueryKind, TypedExpr};
@@ -523,6 +524,7 @@ pub fn native_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
+        Arc::from(publication.publication_provenance()),
         vec![(occurrence, 0)],
         publication.publication_inputs().to_vec(),
         publication.publication_target().clone(),
@@ -580,6 +582,7 @@ pub fn native_mv_rewritten_scan_plan_with_inputs(
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
+        Arc::from(publication.publication_provenance()),
         input_mapping,
         publication.publication_inputs().to_vec(),
         publication.publication_target().clone(),

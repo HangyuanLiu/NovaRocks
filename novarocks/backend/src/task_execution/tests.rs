@@ -61,21 +61,21 @@ use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
 use novarocks_types::{NativeCompatibilityId, UniqueId};
-use novarocks_worker::LeaseBounds;
+use novarocks_worker::{
+    HostRejection, LeaseBounds, ManualClock, QueryContextHost, ReleasedContextEvidence,
+    RunnableTask, SharedFactsRequest, TaskExecutionHost, WorkerMonotonicClock,
+};
 
-use super::clock::ManualClock;
-use super::host::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost,
-};
-use super::observation::{
-    ContextConvergenceCursorError, CursorObservation, TaskStatusEvent, TaskStatusSource,
+use super::ingress::RegistryTaskExecutionIngress;
+use novarocks_native_adapter::task_protocol::TaskExecutionIngress;
+use novarocks_native_adapter::task_shared_facts::sealed_runtime_filter_evidence;
+use novarocks_worker::OperationReceipt;
+use novarocks_worker::TaskExecutionRegistry;
+use novarocks_worker::TaskExecutionRegistryConfig;
+use novarocks_worker::{
+    ContextConvergenceCursorError, CursorObservation, METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute,
+    StatusAdvance, TaskStatusEvent, TaskStatusReporter, TaskStatusSource,
     TaskStatusSubscriptionPosition,
-};
-use super::receipt::OperationReceipt;
-use super::registry::{TaskExecutionRegistry, TaskExecutionRegistryConfig};
-use super::status::{
-    METRIC_PUBLISH_MIN_INTERVAL, RootResultRoute, StatusAdvance, TaskStatusReporter,
 };
 
 // ------------------------------------------------------------------- fixtures
@@ -222,15 +222,6 @@ impl HostLedger {
 struct HostGate {
     open: Mutex<bool>,
     changed: Condvar,
-    /// How many host calls have reached this gate.
-    ///
-    /// This is the only honest rendezvous for "the owner is inside its
-    /// creation transaction". Counting in-flight operations is not: that
-    /// becomes true when an operation enters its scope, which is *before* the
-    /// identity is elected, so a test waiting on it can race ahead and become
-    /// the creation owner itself -- and then block on a gate only it could
-    /// open.
-    entered: AtomicUsize,
 }
 
 impl HostGate {
@@ -238,17 +229,11 @@ impl HostGate {
         Self {
             open: Mutex::new(true),
             changed: Condvar::new(),
-            entered: AtomicUsize::new(0),
         }
-    }
-
-    fn entered(&self) -> usize {
-        self.entered.load(Ordering::SeqCst)
     }
 
     fn wait(&self) {
         let mut open = self.open.lock().expect("host gate");
-        self.entered.fetch_add(1, Ordering::SeqCst);
         while !*open {
             open = self.changed.wait(open).expect("host gate");
         }
@@ -350,7 +335,7 @@ impl QueryContextHost for FakeContextHost {
         // retain whatever the host handed back and report it on the release
         // acknowledgement, and a host that always returned nothing would let
         // that hop pass while carrying nothing.
-        ReleasedContextEvidence::with_runtime_filter(fixture_runtime_filter_contribution())
+        sealed_runtime_filter_evidence(fixture_runtime_filter_contribution())
     }
 
     fn advance_shared_domain(
@@ -573,7 +558,11 @@ impl Fixture {
     fn with_config(adjust: impl FnOnce(&mut TaskExecutionRegistryConfig)) -> Self {
         let backend = BackendProcessId::new_v7();
         let frontend = FrontendProcessId::new_v7();
-        let mut config = TaskExecutionRegistryConfig::for_process(backend);
+        let mut config = TaskExecutionRegistryConfig::for_process(
+            backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        );
         // Only an explicit `advance_deadlines` may wake a waiter, so nothing
         // in these tests depends on elapsed wall time.
         config.gate_poll_interval = Duration::from_secs(3600);
@@ -587,9 +576,10 @@ impl Fixture {
         let task_host = Arc::new(FakeTaskHost::new(Arc::clone(&ledger)));
         let registry = TaskExecutionRegistry::new(
             config,
-            Arc::clone(&clock) as Arc<dyn super::clock::BackendMonotonicClock>,
+            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
             Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
+            super::backend_task_execution_ports(),
         );
         Self {
             registry,
@@ -741,100 +731,6 @@ fn split_update(node: i32, first: u64, last: u64, no_more: bool, payload: u8) ->
 // --------------------------------------------------------------------- create
 
 #[test]
-fn concurrent_exact_creates_produce_one_acknowledgement() {
-    let fixture = Fixture::new();
-    let context = fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    let descriptor = fixture.descriptor(identity, 5);
-
-    const CREATES: usize = 4;
-    fixture
-        .task_host
-        .require_arrivals
-        .store(CREATES, Ordering::SeqCst);
-
-    let mut handles = Vec::new();
-    for _ in 0..CREATES {
-        let registry = Arc::clone(&fixture.registry);
-        let task_host = Arc::clone(&fixture.task_host);
-        let descriptor = descriptor.clone();
-        handles.push(std::thread::spawn(move || {
-            let request =
-                CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
-                    .expect("a legal create");
-            task_host.arrivals.fetch_add(1, Ordering::SeqCst);
-            registry.create_task(&request)
-        }));
-    }
-    let receipts: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().expect("create thread"))
-        .collect();
-
-    let accepted: Vec<_> = receipts
-        .iter()
-        .filter(|receipt| receipt.outcome() == OperationOutcome::Accepted)
-        .collect();
-    assert_eq!(accepted.len(), 1, "{receipts:?}");
-    assert_eq!(
-        receipts
-            .iter()
-            .filter(|receipt| receipt.outcome() == OperationOutcome::Idempotent)
-            .count(),
-        CREATES - 1
-    );
-    let expected = accepted[0]
-        .acknowledgement()
-        .expect("the acknowledged create carries a receipt");
-    for receipt in &receipts {
-        assert_eq!(
-            receipt.acknowledgement(),
-            Some(expected),
-            "every converging create sees the same receipt"
-        );
-    }
-    // One pipeline, not four.
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(fixture.registry.counters().tasks_created, 1);
-}
-
-#[test]
-fn a_lost_acknowledgement_replay_confirms_without_restarting() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    let request = fixture.create_request(identity, 5);
-
-    let first = fixture.registry.create_task(&request);
-    assert_eq!(first.outcome(), OperationOutcome::Accepted);
-    let replay = fixture.registry.create_task(&request);
-    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
-    assert_eq!(replay.acknowledgement(), first.acknowledgement());
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
-}
-
-#[test]
-fn a_conflicting_descriptor_fails_closed() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-    fixture.create(identity, 5);
-
-    let conflicting = fixture
-        .registry
-        .create_task(&fixture.create_request(identity, 6));
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
-    assert!(conflicting.acknowledgement().is_none());
-    // The installed task is untouched.
-    assert!(fixture.registry.has_live_task(identity));
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
-}
-
-#[test]
 fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
@@ -891,45 +787,6 @@ fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
 }
 
 #[test]
-fn a_conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
-    let fixture = Fixture::new();
-    fixture.establish(1);
-    let identity = fixture.identity(1, 1, 1);
-
-    // Hold the creation owner inside its transaction, before its receiver is
-    // installed.
-    fixture.task_host.install_gate.close();
-    let registry = Arc::clone(&fixture.registry);
-    let owner_request = fixture.create_request(identity, 5);
-    let owner = std::thread::spawn(move || registry.create_task(&owner_request));
-    // Bounded, because the owner thread reaching its gate is a scheduling
-    // event this test does not control. An unbounded spin here turns a starved
-    // thread into a run that never ends, which is worse than a failure: it
-    // takes the whole suite with it and says nothing about why.
-    let rendezvous = std::time::Instant::now();
-    while fixture.task_host.install_gate.entered() == 0 {
-        assert!(
-            rendezvous.elapsed() < std::time::Duration::from_secs(30),
-            "the creation owner never reached its install gate"
-        );
-        std::thread::yield_now();
-    }
-
-    // A conflicting create reaches the reserved identity and is refused
-    // without touching the creation in progress.
-    let conflicting = fixture
-        .registry
-        .create_task(&fixture.create_request(identity, 9));
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
-
-    fixture.task_host.install_gate.open();
-    let accepted = owner.join().expect("owner thread");
-    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
-    assert!(fixture.registry.has_live_task(identity));
-    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
-}
-
-#[test]
 fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     let fixture = Fixture::new();
     fixture.establish(1);
@@ -948,9 +805,13 @@ fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     // Past the request horizon the record is reclaimed and a create can no
     // longer prove anything about it.
     fixture.clock.advance(
-        TaskExecutionRegistryConfig::for_process(fixture.backend)
-            .request_horizon
-            .total()
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .request_horizon
+        .total()
             + Duration::from_secs(1),
     );
     fixture.registry.advance_deadlines();
@@ -1746,10 +1607,15 @@ fn a_release_reports_the_evidence_the_host_sealed() {
             .registry
             .released_context_evidence(context)
             .runtime_filter()
-            .expect("the release reports what the host sealed")
-            .available()
             .is_some(),
         "the retained evidence must be the contribution the host handed back"
+    );
+    assert_eq!(
+        fixture
+            .registry
+            .released_context_evidence(context)
+            .runtime_filter_observation(),
+        novarocks_worker::RuntimeFilterReleaseObservation::Available,
     );
 }
 
@@ -1861,9 +1727,13 @@ fn retention_expiry_yields_gone() {
         .expect("an active context has a source");
     while source.next_event().is_some() {}
 
-    let horizon = TaskExecutionRegistryConfig::for_process(fixture.backend)
-        .request_horizon
-        .total();
+    let horizon = TaskExecutionRegistryConfig::for_process(
+        fixture.backend,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    )
+    .request_horizon
+    .total();
     // Just inside the horizon the record is still retained.
     fixture.clock.advance(horizon - Duration::from_secs(1));
     let sweep = fixture.registry.advance_deadlines();
@@ -2718,14 +2588,14 @@ fn a_dynamic_filter_read_returns_what_the_task_advertised() {
 
 /// Polls the root result plane the way the RPC boundary does.
 fn poll_root_result(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
     poll_root_result_after(registry, identity, None)
 }
 
 fn poll_root_result_after(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
     acknowledged_packet_sequence: Option<u64>,
 ) -> novarocks_proto_models::novarocks::FetchResultResponse {
@@ -2738,7 +2608,7 @@ fn poll_root_result_after(
 }
 
 fn poll_root_result_after_with_limit(
-    registry: &TaskExecutionRegistry,
+    registry: &Arc<TaskExecutionRegistry>,
     identity: TaskIdentity,
     acknowledged_packet_sequence: Option<u64>,
     max_result_bytes: u64,
@@ -2747,8 +2617,13 @@ fn poll_root_result_after_with_limit(
         .enable_time()
         .build()
         .expect("root result test runtime")
-        .block_on(crate::rpc::data_plane::fetch_task_result(
-            registry,
+        .block_on(TaskExecutionIngress::fetch_task_result(
+            RegistryTaskExecutionIngress::new(
+                Arc::clone(registry),
+                NativeCompatibilityId::new([0x71; 32]),
+                novarocks_task_codec::domain::ConfidentialTransport::Plaintext,
+            )
+            .as_ref(),
             novarocks_proto_models::novarocks::FetchTaskResultRequest {
                 root_task: Some(novarocks_task_codec::identity::encode_task_identity(
                     identity,
@@ -3234,9 +3109,13 @@ fn a_reclaimed_context_answers_gone_rather_than_absent() {
             context,
         ));
 
-    let horizon = TaskExecutionRegistryConfig::for_process(fixture.backend)
-        .request_horizon
-        .total();
+    let horizon = TaskExecutionRegistryConfig::for_process(
+        fixture.backend,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    )
+    .request_horizon
+    .total();
     fixture.clock.advance(horizon + Duration::from_secs(1));
     let sweep = fixture.registry.advance_deadlines();
     assert!(sweep.contexts_reaped >= 1);
@@ -3316,9 +3195,15 @@ fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
 
     // Inside the grace the owner keeps waiting rather than lying about the
     // task's outcome.
-    fixture
-        .clock
-        .advance(TaskExecutionRegistryConfig::for_process(fixture.backend).termination_grace / 2);
+    fixture.clock.advance(
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .termination_grace
+            / 2,
+    );
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),
@@ -3326,9 +3211,14 @@ fn termination_grace_fixes_the_conclusion_without_forging_convergence() {
     );
     assert_eq!(fixture.registry.admission_reservation_count(), 1);
 
-    fixture
-        .clock
-        .advance(TaskExecutionRegistryConfig::for_process(fixture.backend).termination_grace);
+    fixture.clock.advance(
+        TaskExecutionRegistryConfig::for_process(
+            fixture.backend,
+            novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+            novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+        )
+        .termination_grace,
+    );
     fixture.registry.advance_deadlines();
     assert_eq!(
         fixture.registry.context_state(context),

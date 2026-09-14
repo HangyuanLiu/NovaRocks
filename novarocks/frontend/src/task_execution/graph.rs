@@ -49,8 +49,8 @@ use novarocks_types::identity::{
 };
 
 use super::error::{CapacityBound, TaskExecutionError, schedule_error};
-use crate::query_execution::FragmentInstancePlacement;
 use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestBinding};
+use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::query_execution::schedule::SchedulingPlan;
 
 /// The plan facts a fragment's tasks are created with.

@@ -150,8 +150,8 @@ impl ConnectorWriteTargetBinding {
     /// staged work to a runtime that never admitted it.
     pub(crate) fn derive_write_stack_lease(
         &self,
-        host: &crate::connector::control_host::ConnectorControlHost,
-    ) -> Result<crate::connector::control_host::ConnectorWriteStackLease, String> {
+        host: &novarocks_catalog_application::ConnectorControlHost,
+    ) -> Result<novarocks_catalog_application::ConnectorWriteStackLease, String> {
         derive_write_stack_lease(host, &self.lease)
     }
 
@@ -246,9 +246,9 @@ pub fn load_write_target_binding(
 /// through the incarnation that planned it rather than through whichever one
 /// happens to be active at commit time.
 pub(crate) fn derive_write_stack_lease(
-    host: &crate::connector::control_host::ConnectorControlHost,
+    host: &novarocks_catalog_application::ConnectorControlHost,
     planning_lease: &ConnectorControlPlanningLease,
-) -> Result<crate::connector::control_host::ConnectorWriteStackLease, String> {
+) -> Result<novarocks_catalog_application::ConnectorWriteStackLease, String> {
     host.acquire_exact_write_stack(planning_lease.control_runtime_id())
         .map_err(|error| format!("derive connector write-stack lease: {error}"))
 }

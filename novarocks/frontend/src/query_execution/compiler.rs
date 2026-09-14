@@ -17,18 +17,19 @@
 
 use std::sync::Arc;
 
+use crate::query_execution::completion::{PreparedImmediateQuery, PreparedQueryCompletion};
 use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
-#[cfg(test)]
-use crate::query_execution::{PreparedImmediateQuery, PreparedQueryCompletion, StatementResult};
-use crate::runtime::query_result::QueryResult;
-#[cfg(test)]
-use crate::runtime::query_result::build_string_query_result;
 use novarocks_parser::ast::Query;
 use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::api::QueryResult;
+#[cfg(test)]
+use novarocks_query_application::api::build_string_query_result;
+#[cfg(test)]
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
 #[cfg(test)]
@@ -75,13 +76,13 @@ pub fn query_catalog_service_snapshot(
 /// Freeze optional MV rewrite candidates through the request's exact Core
 /// ports.  Frontend chooses whether an unavailable repository means no
 /// candidates; it never gains connector-control access directly.
-pub fn freeze_query_mv_rewrite_definition_index(
+pub(crate) fn freeze_query_mv_rewrite_definition_index(
     query_kernel: &domain::QueryPreparationKernel,
-    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    candidate_reader: &crate::mv::domain::readiness::MvCandidateReader,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
 ) -> Result<novarocks_sql::compiler::MvRewriteDefinitionIndex, String> {
     crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-        readiness,
+        candidate_reader,
         query_kernel.connector_control().as_ref(),
         storage_observation,
     )
@@ -117,10 +118,12 @@ pub(crate) trait DmlQueryExecutionKernel:
     fn connector_control(&self) -> &dyn novarocks_spi::connector::ConnectorControlResolver;
     /// The statement's typed connector control registry, supplied once when
     /// the kernel was composed.
-    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost>;
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>;
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort>;
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort>;
     fn query_execution(&self) -> &crate::query_execution::service::QueryExecutionService;
     fn capture_dml_fallback_execution(
         &self,
@@ -136,13 +139,15 @@ impl DmlQueryExecutionKernel for domain::DmlExecutionKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
@@ -169,13 +174,15 @@ impl DmlQueryExecutionKernel for domain::QueryPreparationKernel {
         self.connector_control().as_ref()
     }
 
-    fn typed_connector_control(&self) -> &std::sync::Arc<crate::connector::ConnectorControlHost> {
+    fn typed_connector_control(
+        &self,
+    ) -> &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost> {
         self.typed_connector_control()
     }
 
     fn catalog_application(
         &self,
-    ) -> Option<&dyn crate::catalog_application::CatalogApplicationPort> {
+    ) -> Option<&dyn novarocks_catalog_application::CatalogApplicationPort> {
         self.catalog_application().map(Arc::as_ref)
     }
 
@@ -862,7 +869,7 @@ impl crate::query_execution::contract::DistributedQueryCoordinator
         &self,
         request: crate::query_execution::contract::DistributedQueryRequest,
     ) -> Result<
-        crate::query_execution::contract::DistributedQueryOutcome,
+        crate::query_execution::outcome::DistributedQueryOutcome,
         crate::query_execution::contract::DistributedQueryError,
     > {
         let intent = request.intent();
@@ -1246,13 +1253,12 @@ fn test_request_context_with_role(
     current_database: &str,
     role: novarocks_types::ClusterRole,
 ) -> crate::common::admitted_query_context::RequestContext {
-    use crate::common::admitted_query_context::{
-        QueryExecutionContext, RequestContext, RequestSessionContext,
-    };
+    use crate::common::admitted_query_context::{QueryExecutionContext, RequestContext};
     use crate::common::backend_topology::{BackendTopologySnapshot, LiveBackendTarget};
-    use crate::common::query_cancellation::QueryCancellationSource;
     use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
     use novarocks_proto_codec::membership::BackendProcessDescriptor;
+    use novarocks_query_application::cancellation::QueryCancellationSource;
+    use novarocks_query_application::request_session::RequestSessionContext;
     use novarocks_types::BackendProcessId;
 
     let cancellation = QueryCancellationSource::new();
@@ -1375,7 +1381,7 @@ pub(crate) fn ensure_mainline_distributed_execution(
 /// The typed control registry is the composition root's single instance, so
 /// planning resolves exactly the generation the control factory installed.
 pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     settings: &novarocks_sql::compiler::SessionOptimizerSettings,
 ) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
     Ok(
@@ -1882,7 +1888,7 @@ pub(crate) fn observe_change_stream_write_build_for_test(
         });
     if observer.short_circuit_after_build {
         Some(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: QueryResult::empty(),
             write_session: None,
             fragment_profiles: Vec::new(),
         })
@@ -1905,7 +1911,7 @@ pub(crate) struct PlannedIcebergChangeStreamWrite {
 /// the resulting writer/cohort map for application-owned operation fencing.
 pub(crate) fn prepare_dml_change_stream_write(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
@@ -1941,7 +1947,7 @@ pub(crate) fn prepare_dml_change_stream_write(
 /// recipes the plan carries drift from the ones the writer nodes were built for.
 pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<crate::connector::ConnectorControlHost>,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
     execution: &crate::common::admitted_query_context::QueryExecutionContext,
     distributed_plan: novarocks_sql::plan_read::DistributedPlan,
     query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
@@ -1980,7 +1986,7 @@ fn execute_bound_distributed_write_request(
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
 }
@@ -2030,12 +2036,14 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
     // MV rewrite is an optional SQL optimization. An application composition
-    // without an MV repository supplies no snapshot; a repository that is
-    // available but fails to freeze remains a planning error.
+    // without an MV repository supplies no snapshot. An unavailable optional
+    // MV inventory likewise supplies no candidates; required table bindings
+    // still fail through their own preparation path.
     let mv_definitions = if allow_mv_rewrite_candidates {
+        let candidate_reader = mv_readiness.candidate_reader();
         Some(
             crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-                mv_readiness,
+                &candidate_reader,
                 query_kernel.connector_control().as_ref(),
                 mv_storage_observation,
             )?,
@@ -2132,9 +2140,10 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
 ) -> Result<QueryResult, TestQueryCompilerError> {
     let table_bindings = analyzer_catalog.query_table_bindings();
     let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
+    let candidate_reader = mv_readiness.candidate_reader();
     let mv_definitions =
         crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            mv_readiness,
+            &candidate_reader,
             query_kernel.connector_control().as_ref(),
             mv_storage_observation,
         )?;
@@ -2220,7 +2229,7 @@ fn execute_distributed_result_with_execution(
     .map_err(|error| error.to_string())?;
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_result)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
         .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
         .map_err(|error| error.to_string())
 }
@@ -2251,7 +2260,7 @@ fn execute_distributed_write_request(
 ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
     query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_write)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
 }
@@ -2277,7 +2286,7 @@ fn execute_distributed_profile_with_execution(
     .map_err(|error| error.to_string())?;
     let (query_result, fragment_profiles) = query_execution
         .execute(request)
-        .and_then(crate::query_execution::contract::DistributedQueryOutcome::into_profile)
+        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_profile)
         .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
         .map_err(|error| error.to_string())?;
     Ok(crate::query_execution::outcome::QueryExecutionResult {

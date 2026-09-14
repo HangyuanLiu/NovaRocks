@@ -20,7 +20,6 @@ pub mod artifact;
 /// Frontend-owned native submission mapper.
 pub mod assembly;
 pub(crate) mod attempt_initialization;
-pub mod backend_command;
 pub mod completion;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 #[allow(
@@ -31,11 +30,11 @@ pub mod completion;
 pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
-pub mod control;
 mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;
 pub mod kernels;
+pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
 pub(crate) mod logical_read;
 pub mod maintenance;
@@ -46,33 +45,11 @@ pub mod native_fragment;
 pub(crate) mod outcome;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
-pub(crate) mod rewrite_group_read;
-pub use crate::runtime::statement_result::StatementResult;
-pub use completion::{
-    PreparedDistributedQuery as PreparedQueryDistributedOperation, PreparedImmediateQuery,
-    PreparedLogicalRead, PreparedQueryCompletion, PreparedQueryOperation,
-};
-pub use outcome::WriteExecutionOutcome;
+pub mod post_compile;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
 pub mod preparation;
-pub use preparation::runtime_filter_view::{
-    RuntimeFilterApplyPoint, RuntimeFilterArtifactCapability, RuntimeFilterBindingFacts,
-    RuntimeFilterBindingFactsView, RuntimeFilterBindingFragmentFactsView,
-    RuntimeFilterBindingRoleFacts, RuntimeFilterCompletionRequirement,
-    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
-    RuntimeFilterCoverageFacts, RuntimeFilterDeploymentBindingFacts,
-    RuntimeFilterDeploymentBindingRoleFacts, RuntimeFilterDeploymentFactsView,
-    RuntimeFilterDeploymentLifecycleFacts, RuntimeFilterFragmentEdgeFacts,
-    RuntimeFilterFrontierEdgeFacts, RuntimeFilterJoinProgressFacts,
-    RuntimeFilterJoinProgressSkipReason, RuntimeFilterLateApplyGranularity,
-    RuntimeFilterLogicalDomainFacts, RuntimeFilterNullOrder, RuntimeFilterNullSemantics,
-    RuntimeFilterOrderKeyFacts, RuntimeFilterPolicyFacts, RuntimeFilterProducerTarget,
-    RuntimeFilterReductionFacts, RuntimeFilterScanDomainTarget, RuntimeFilterSortDirection,
-    RuntimeFilterValidatedPlacementFacts,
-};
-pub use schedule::FragmentInstancePlacement;
-pub mod post_compile;
 pub(crate) mod profile;
+pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;

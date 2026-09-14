@@ -15,10 +15,10 @@ use novarocks_proto_codec::catalog::PruneCatalogsRequest;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
 
-use crate::catalog_application::FrontendCatalogApplicationPort;
 use crate::common::backend_topology::BackendTopologyService;
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::native::transport::{CatalogPruneDispatchOutcome, prune_catalogs};
+use novarocks_catalog_application::CatalogApplicationService;
 
 #[derive(Clone, Debug)]
 pub struct CatalogPruneConfig {
@@ -46,7 +46,7 @@ impl CatalogPruneConfig {
 
 /// A best-effort worker: no failed or late prune changes query correctness.
 pub(crate) struct FrontendCatalogPruneService {
-    catalogs: Arc<FrontendCatalogApplicationPort>,
+    catalogs: Arc<CatalogApplicationService>,
     topology: BackendTopologyService,
     data_runtime: FrontendDataRuntime,
     config: CatalogPruneConfig,
@@ -57,7 +57,7 @@ pub(crate) struct FrontendCatalogPruneService {
 
 impl FrontendCatalogPruneService {
     pub(crate) fn new(
-        catalogs: Arc<FrontendCatalogApplicationPort>,
+        catalogs: Arc<CatalogApplicationService>,
         topology: BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         config: CatalogPruneConfig,
@@ -90,8 +90,7 @@ impl FrontendCatalogPruneService {
     }
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
-        self.stopping.store(true, Ordering::Release);
-        self.wake.notify_one();
+        self.request_stop_for_process_exit();
         let handle = self.worker.lock().ok().and_then(|mut worker| worker.take());
         if let Some(mut handle) = handle {
             if tokio::time::timeout(timeout, &mut handle).await.is_err() {
@@ -99,6 +98,13 @@ impl FrontendCatalogPruneService {
                 let _ = handle.await;
             }
         }
+    }
+
+    /// Wakes a sleeping best-effort worker when the enclosing role has
+    /// committed to process exit. Joining remains owned by bounded shutdown.
+    pub(crate) fn request_stop_for_process_exit(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.wake.notify_one();
     }
 
     async fn run(&self) {

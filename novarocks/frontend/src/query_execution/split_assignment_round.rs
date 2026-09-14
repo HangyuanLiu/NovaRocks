@@ -35,14 +35,15 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
-    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError,
-    TaskUpdateRetryPolicy, TaskUpdateTransport, emit_split_source_close_marker,
+    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError, TaskUpdateTransport,
+    emit_split_source_close_marker,
 };
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::round::{TaskRound, TurnPump};
 use crate::task_execution::status_intake::StatusIntakeWake;
+use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 use novarocks_sql::plan_read::FragmentId;
 
 /// How many splits one task may hold before the driver stops pulling for it.
@@ -769,6 +770,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_spi::connector::ConnectorError;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
@@ -886,7 +888,7 @@ mod tests {
             Vec::new(),
             ConnectorBlockingIoSupervisor::new(
                 tokio::runtime::Handle::current(),
-                crate::task_execution::ConnectorBlockingIoBudget::default(),
+                ConnectorBlockingIoBudget::default(),
             ),
         );
         assert_eq!(plan.plan_node_ids().count(), 0);
@@ -896,7 +898,7 @@ mod tests {
     async fn partially_opened_sources_close_through_protected_capacity() {
         let supervisor = ConnectorBlockingIoSupervisor::new(
             tokio::runtime::Handle::current(),
-            crate::task_execution::ConnectorBlockingIoBudget::try_new(2, 1)
+            ConnectorBlockingIoBudget::try_new(2, 1)
                 .expect("one ordinary and one protected permit"),
         );
         let (release, released) = mpsc::channel();

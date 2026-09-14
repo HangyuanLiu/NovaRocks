@@ -40,7 +40,7 @@ use novarocks_types::naming::TableIdentity;
 use std::sync::Arc;
 
 fn derive_rebind_query_source(
-    query_definition: &crate::common::persisted_query_definition::PersistedQueryDefinition,
+    query_definition: &novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
 ) -> Result<String, String> {
     let query = parse_mv_select_query(&query_definition.raw_query_source)?;
     Ok(novarocks_parser::printer::print_query(
@@ -248,10 +248,10 @@ pub(crate) fn rebind_mv_definition_before_refresh_derivation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::persisted_query_definition::{
+    use crate::mv::domain::analysis::rebind::RebindColumn;
+    use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
     };
-    use crate::mv::domain::analysis::rebind::RebindColumn;
 
     #[test]
     fn rebind_source_uses_frozen_context_without_rewriting_raw_definition() {

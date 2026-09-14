@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use crate::catalog_application::CatalogApplicationPort;
+use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::{
     ConnectorInstanceId, ConnectorProviderId, ConnectorTableHandle, ConnectorTableIdentity,
     ConnectorTableRequest, ConnectorTableResolution, ConnectorWriteLease,

@@ -29,8 +29,8 @@ use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 
 use crate::common::admitted_query_context::QueryExecutionContext;
+use crate::query_execution::completion::{PreparedQueryCompletion, PreparedQueryOperation};
 use crate::query_execution::preparation::{PreparedFragmentHandoff, PreparedFragmentSet};
-use crate::query_execution::{PreparedQueryCompletion, PreparedQueryOperation};
 use novarocks_sql::compiler::{SqlPlanCostFacts, SqlPlanCostUnknownReason, SqlPlanCostValue};
 use novarocks_sql::plan_read::DistributedPlan;
 use novarocks_sql::planning::query_execution::SealedPreparationPlan;
@@ -285,7 +285,7 @@ impl PreparedDistributedQueryAssembly {
     pub(crate) fn finish_logical_read(
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<crate::query_execution::PreparedLogicalRead, String> {
+    ) -> Result<crate::query_execution::completion::PreparedLogicalRead, String> {
         let (finalized, query_options, intent, _execution) =
             self.finalize_execution(native_attachment)?;
         if intent != crate::query_execution::contract::DistributedQueryIntent::Result {
@@ -297,11 +297,13 @@ impl PreparedDistributedQueryAssembly {
         let options = Arc::new(
             crate::query_execution::contract::ResolvedQueryOptions::from_upstream(query_options),
         );
-        Ok(crate::query_execution::PreparedLogicalRead::new(
-            description,
-            attempt_template,
-            options,
-        ))
+        Ok(
+            crate::query_execution::completion::PreparedLogicalRead::new(
+                description,
+                attempt_template,
+                options,
+            ),
+        )
     }
 
     fn finalize_execution(
@@ -362,6 +364,7 @@ impl PreparedDistributedQueryAssembly {
         };
         let mv_candidate_match =
             finalize_selected_mv_candidate(&sealed_plan, selected_mv_query_inputs, &receipts)?;
+        mv_rewrite_test_barrier(mv_candidate_match.as_ref());
         let cost = sql_cost.map(map_sql_cost).unwrap_or_else(|| {
             novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                 novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
@@ -401,7 +404,7 @@ impl PreparedDistributedQueryAssembly {
     ) -> Result<PreparedQueryOperation, String> {
         let request = self.finish(native_attachment)?;
         Ok(PreparedQueryOperation::Distributed(
-            crate::query_execution::PreparedQueryDistributedOperation::new(
+            crate::query_execution::completion::PreparedDistributedQuery::new(
                 request,
                 completion,
                 logical_reservation,
@@ -455,6 +458,38 @@ fn finalize_selected_mv_candidate(
         target.lineage().occurrence(),
     )
     .map(Some)
+}
+
+/// Debug-only, scenario-scoped system-test seam. The barrier sits immediately
+/// after strict proof binds the selected rewrite to its exact final target
+/// receipt, and before that proof becomes part of the frozen description.
+/// Production builds do not inspect the environment variable.
+#[cfg(debug_assertions)]
+fn mv_rewrite_test_barrier(
+    candidate: Option<&novarocks_query_application::preparation::StrictMvCandidateMatch>,
+) {
+    if candidate.is_none() {
+        return;
+    }
+    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_REWRITE_TEST_DIR") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let hold = directory.join("mvx4-rewrite-hold.trigger");
+    if !hold.exists() {
+        return;
+    }
+    let marker = directory.join("mvx4-rewrite-final-target-frozen.marker");
+    let _ = std::fs::write(marker, "strict-final-target-proof\n");
+    while hold.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn mv_rewrite_test_barrier(
+    _candidate: Option<&novarocks_query_application::preparation::StrictMvCandidateMatch>,
+) {
 }
 
 fn map_sql_cost(

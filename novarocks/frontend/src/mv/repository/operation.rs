@@ -24,8 +24,8 @@
 
 use crate::mv::domain::repository::{MvRepositoryError, MvRepositoryErrorKind};
 use crate::state_store::metrics::StateStoreMetrics;
-use crate::state_store::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 use novarocks_state_store_api::{StateStore, StateStoreError, StateStoreErrorKind};
+use novarocks_state_store_runtime::{RunFailure, StateStoreRunPolicy, run_side_effect_free};
 
 pub(crate) fn state_store_error(error: StateStoreError) -> MvRepositoryError {
     let kind = match error.kind() {

@@ -18,6 +18,10 @@
 use crate::cluster::ServerHandle;
 use crate::types::QueryMeta;
 use anyhow::{Context, Result, bail};
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, sleep};
@@ -75,6 +79,94 @@ const TASK_RESTART_CONTRACT: RestartNonRestoreContract = RestartNonRestoreContra
 const QUERY_RUNNING: u8 = 0;
 const FAULT_CLAIMED: u8 = 1;
 const QUERY_DONE: u8 = 2;
+
+/// Runner side of the debug-only establish-before-restart rendezvous.
+///
+/// The listener exists before the query starts. A BE can therefore block its
+/// accepted Establish RPC until the runner has received the exact token and
+/// completed the replacement action; no log polling interval sits between
+/// those two causally related events.
+struct RestartAfterEstablishRendezvous {
+    path: PathBuf,
+    token: String,
+    listener: UnixListener,
+}
+
+impl RestartAfterEstablishRendezvous {
+    const QUERY_COMPLETED: &'static [u8] = b"query-completed";
+
+    fn bind(token: &str) -> Result<Self> {
+        let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(token)
+            .map_err(anyhow::Error::msg)?;
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("remove stale restart rendezvous {}", path.display()))?;
+        }
+        let listener = UnixListener::bind(&path)
+            .with_context(|| format!("bind restart rendezvous {}", path.display()))?;
+        Ok(Self {
+            path,
+            token: token.to_owned(),
+            listener,
+        })
+    }
+
+    /// Waits for either the BE's exact lifecycle-fault token or the parent
+    /// thread's query-completed wakeup. The blocking accept has no polling
+    /// window; a deadline still fail-closes an accidentally untriggered fault.
+    fn wait_for_trigger(&self, deadline: Instant) -> Result<Option<UnixStream>> {
+        let listener = self
+            .listener
+            .try_clone()
+            .context("clone restart rendezvous listener")?;
+        let token = self.token.clone();
+        std::thread::scope(|scope| -> Result<Option<UnixStream>> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let result = (|| -> Result<Option<UnixStream>> {
+                    let (mut stream, _) = listener.accept().context("accept restart rendezvous")?;
+                    let mut payload = Vec::new();
+                    stream
+                        .read_to_end(&mut payload)
+                        .context("read restart rendezvous token")?;
+                    if payload == token.as_bytes() {
+                        return Ok(Some(stream));
+                    }
+                    if payload == Self::QUERY_COMPLETED {
+                        return Ok(None);
+                    }
+                    bail!("restart rendezvous received an unexpected token")
+                })();
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(result) => result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    Self::cancel_path(&self.path);
+                    let _ = receiver.recv();
+                    bail!("timed out waiting for establish-before-restart rendezvous")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("restart rendezvous worker disconnected before an arrival")
+                }
+            }
+        })
+    }
+
+    fn cancel_path(path: &Path) {
+        let Ok(mut stream) = UnixStream::connect(path) else {
+            return;
+        };
+        let _ = stream.write_all(Self::QUERY_COMPLETED);
+        let _ = stream.shutdown(Shutdown::Write);
+    }
+}
+
+impl Drop for RestartAfterEstablishRendezvous {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
 
 struct ActiveQueryFaultState {
     state: AtomicU8,
@@ -531,6 +623,16 @@ where
             }
         }
     };
+    let restart_rendezvous = match (&fault, &baseline) {
+        (
+            PostQueryFault::RestartBackendAfterEstablishContext(_),
+            FaultBaseline::BackendInit { token, .. },
+        ) => Some(RestartAfterEstablishRendezvous::bind(token)?),
+        _ => None,
+    };
+    let restart_rendezvous_cancel = restart_rendezvous
+        .as_ref()
+        .map(|rendezvous| rendezvous.path.clone());
     let fault_state = Arc::new(ActiveQueryFaultState::new());
     let worker_server = Arc::clone(server);
     let worker_fault_state = Arc::clone(&fault_state);
@@ -538,6 +640,7 @@ where
         let deadline =
             shared_deadline.unwrap_or_else(|| Instant::now() + POST_FRAGMENT_START_TIMEOUT);
         let mut deadline_cancel_sent = false;
+        let mut restart_rendezvous_stream = None;
         loop {
             if Instant::now() >= deadline {
                 let server = worker_server
@@ -560,7 +663,15 @@ where
                 deadline,
                 &mut deadline_cancel_sent,
             )?;
-            let ready = {
+            let ready = if let Some(rendezvous) = restart_rendezvous.as_ref() {
+                match rendezvous.wait_for_trigger(deadline)? {
+                    Some(stream) => {
+                        restart_rendezvous_stream = Some(stream);
+                        true
+                    }
+                    None => bail!("query completed before the establish-before-restart rendezvous"),
+                }
+            } else {
                 let server = worker_server
                     .lock()
                     .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?;
@@ -702,6 +813,10 @@ where
                         bes.iter().map(|log| log_tail(log)).collect::<Vec<_>>()
                     );
                 }
+                // The BE is deliberately parked in its Establish handler
+                // until the runner completes this action. Dropping the socket
+                // only afterwards acknowledges that causal boundary.
+                drop(restart_rendezvous_stream.take());
                 if matches!(
                     &fault,
                     PostQueryFault::KillQueryAfterBeLogContains { .. }
@@ -752,6 +867,9 @@ where
 
     let query_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(execute_query));
     fault_state.mark_query_done();
+    if let Some(path) = restart_rendezvous_cancel.as_deref() {
+        RestartAfterEstablishRendezvous::cancel_path(path);
+    }
     let worker_result = worker
         .join()
         .map_err(|_| anyhow::anyhow!("post-fragment-start fault worker panicked"));

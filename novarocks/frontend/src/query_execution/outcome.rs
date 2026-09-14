@@ -21,7 +21,7 @@ use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
 use crate::query_execution::profile::FragmentProfileTree;
-use crate::runtime::query_result::QueryResult;
+use novarocks_query_application::api::QueryResult;
 
 /// Role-neutral execution data assembled by core engine flows before intent
 /// validation seals the public distributed-query outcome.
@@ -138,7 +138,7 @@ impl WriteExecutionOutcome {
         QueryExecutionResult {
             query_result: QueryResult {
                 columns: Vec::new(),
-                chunks: Vec::new(),
+                batches: Vec::new(),
             },
             write_session: self.write_session,
             fragment_profiles: Vec::new(),

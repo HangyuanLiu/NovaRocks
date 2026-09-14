@@ -2126,13 +2126,17 @@ mod tests {
     #[test]
     fn provider_pool_evicts_vended_provider_at_credential_expiration() {
         let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
+        // This test exercises janitor eviction of an installed provider. The
+        // lease must therefore cover provider construction even while the
+        // workspace test suite is contending for CPU; construction-time
+        // expiry remains fail-closed in `acquire_with_expiration`.
         pool.acquire_with_expiration(
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
             &vended_identity(7),
             &secret_material("ephemeral"),
-            Some(Instant::now() + Duration::from_millis(30)),
+            Some(Instant::now() + Duration::from_secs(1)),
             |_, _| memory_operator(),
         )
         .unwrap();

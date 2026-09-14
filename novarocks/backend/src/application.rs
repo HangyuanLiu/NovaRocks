@@ -1,46 +1,30 @@
 use std::fmt;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
-
-use crate::drain::BackendDrainState;
 use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
 use novarocks_native_trust::NativeTrust;
 use novarocks_proto_codec::lifecycle::QueryControlEndpoint;
 use novarocks_proto_codec::membership::BackendProcessDescriptor;
-use novarocks_proto_codec::membership::{
-    BackendAnnounceRequest, BackendAnnounceResult, BackendReportedState,
-};
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
 use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
+use novarocks_worker::{
+    CatalogManager, CatalogManagerConfig, ConnectorExecutionRoleBindingFactorySet,
+    WorkerAdmissionEpochAuthority, WorkerDeadlineSupervisor, WorkerDrainState,
+    WorkerResultRetainedLimits,
+};
 
-use crate::BackendDataRuntime;
-use crate::exchange_receiver::BackendExchangeReceiverPort;
 use crate::fragment::{grpc_exchange_transmitter, native_result_writer};
-use crate::metrics::{BackendMetricsRegistry, MetricsHttpServer};
-use crate::rpc::client::BackendRpcClient;
-use crate::rpc::runtime::BackendNativeTransport;
-use crate::rpc::server::{BackendRpcServerHandle, BackendRpcService};
-use crate::rpc::task_execution::TaskExecutionIngress;
+use crate::metrics::BackendMetricsRegistry;
+use crate::rpc::server::BackendRpcService;
 use crate::runtime_filter::ingress::native_runtime_filter_envelope_ingress;
-use crate::runtime_filter::rpc::BackendRuntimeFilterEnvelopeIngress;
-use crate::task_execution::{
-    RegistryTaskExecutionIngress, TaskExecutionRegistry, TaskExecutionRegistryConfig,
-};
-// Only the refusing hosts below name these, and they exist for one test.
-#[cfg(test)]
-use crate::task_execution::{
-    HostRejection, QueryContextHost, ReleasedContextEvidence, RunnableTask, SharedFactsRequest,
-    TaskExecutionHost, TaskStatusReporter,
-};
+use crate::task_execution::{RegistryTaskExecutionIngress, backend_task_execution_ports};
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
-use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
+use novarocks_execution::runtime::fragment::io::{
+    ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
+};
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
@@ -51,11 +35,24 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
+use novarocks_native_adapter::management_http::MetricsHttpServer;
+use novarocks_native_adapter::{
+    BackendDataRuntime, BackendNativeTransport, NativeRpcServerHandle,
+    backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
+    backend_readiness::wait_for_backend_native_endpoint_ready,
+    runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
+    task_protocol_fault::RestartAfterEstablishTaskCreationGate,
+};
 use novarocks_spi::connector::WriteCommitEvidenceLimits;
+#[cfg(test)]
+use novarocks_worker::ReleasedContextEvidence;
+#[cfg(test)]
+use novarocks_worker::TaskStatusReporter;
+#[cfg(test)]
+use novarocks_worker::{HostRejection, RunnableTask, SharedFactsRequest, TaskExecutionHost};
+use novarocks_worker::{QueryContextHost, TaskExecutionRegistry, TaskExecutionRegistryConfig};
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
-const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const ANNOUNCE_RPC_TIMEOUT: Duration = Duration::from_secs(3);
 /// How often the task protocol owner re-evaluates its own deadlines.
 ///
 /// Nothing in that protocol expires by itself: a lease expiry, a creation-gate
@@ -91,54 +88,14 @@ pub struct BackendServerConfig {
     /// Server-resolved per-fragment terminal write evidence budget.
     pub write_commit_evidence_limits: WriteCommitEvidenceLimits,
     /// Server-validated hierarchy for retained native query results.
-    pub result_retained_limits: BackendResultRetainedLimits,
+    pub result_retained_limits: WorkerResultRetainedLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
-    pub catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    pub catalog_manager_config: CatalogManagerConfig,
     /// Provider-owned complete BE role factories. The backend seals exactly
     /// one factory per provider kind before query lifecycle admission.
     pub execution_role_binding_factories: Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>,
-}
-
-/// Positive, ordered joint result-memory limits injected by Server composition.
-///
-/// During publication the limits cover the simultaneously live Arrow input and
-/// encoded output. After publication they cover the encoded retained backing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BackendResultRetainedLimits {
-    per_root: NonZeroUsize,
-    per_process: NonZeroUsize,
-}
-
-impl BackendResultRetainedLimits {
-    pub fn try_new(per_root: usize, per_process: usize) -> Result<Self, String> {
-        let per_root = NonZeroUsize::new(per_root).ok_or_else(|| {
-            "per-root joint result retained-byte cap must be greater than 0".to_string()
-        })?;
-        let per_process = NonZeroUsize::new(per_process).ok_or_else(|| {
-            "per-process joint result retained-byte cap must be greater than 0".to_string()
-        })?;
-        if per_root > per_process {
-            return Err(format!(
-                "per-root joint result retained-byte cap {} must not exceed per-process cap {}",
-                per_root.get(),
-                per_process.get()
-            ));
-        }
-        Ok(Self {
-            per_root,
-            per_process,
-        })
-    }
-
-    pub fn per_root(self) -> NonZeroUsize {
-        self.per_root
-    }
-
-    pub fn per_process(self) -> NonZeroUsize {
-        self.per_process
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,7 +122,7 @@ impl BackendApplicationError {
         }
     }
 
-    fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
+    pub fn with_cleanup_context(mut self, cleanup_error: impl fmt::Display) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup_error}"));
         self
@@ -186,148 +143,14 @@ impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
     ready_marker: String,
-    grpc_server: BackendRpcServerHandle,
+    grpc_server: NativeRpcServerHandle,
     execution_runtime: Arc<ExecutionRuntime>,
     task_completion_supervisor: Arc<crate::task_execution::TaskCompletionSupervisor>,
-    task_deadline_tick: TaskDeadlineTickTask,
+    task_deadline_tick: WorkerDeadlineSupervisor,
     metrics_http_server: MetricsHttpServer,
     process_descriptor: BackendProcessDescriptor,
-    drain: Arc<BackendDrainState>,
-    announce_task: BackendAnnounceTask,
-}
-
-struct BackendAnnounceTask {
-    stop: Arc<AtomicBool>,
-    wake: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-    join: Option<std::thread::JoinHandle<()>>,
-    data_runtime: BackendDataRuntime,
-    frontend_endpoint: NativeEndpoint,
-    descriptor: BackendProcessDescriptor,
-}
-
-impl BackendAnnounceTask {
-    fn start(
-        data_runtime: BackendDataRuntime,
-        frontend_endpoint: NativeEndpoint,
-        descriptor: BackendProcessDescriptor,
-        drain: Arc<BackendDrainState>,
-        interval: Duration,
-        initial_backoff: Duration,
-        max_backoff: Duration,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let wake = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        let thread_stop = Arc::clone(&stop);
-        let thread_drain = drain;
-        let thread_wake = Arc::clone(&wake);
-        let thread_runtime = data_runtime.clone();
-        let thread_frontend_endpoint = frontend_endpoint.clone();
-        let thread_descriptor = descriptor.clone();
-        let join = std::thread::Builder::new()
-            .name("backend-announce".to_string())
-            .spawn(move || {
-                let client = BackendRpcClient::new_native_endpoint(
-                    thread_runtime,
-                    thread_frontend_endpoint,
-                );
-                let initial_backoff = initial_backoff.max(Duration::from_millis(1));
-                let max_backoff = max_backoff.max(initial_backoff);
-                let mut retry_delay = initial_backoff;
-                while !thread_stop.load(Ordering::Acquire) {
-                    let reported_state = if thread_drain.is_draining() {
-                        BackendReportedState::Draining
-                    } else {
-                        BackendReportedState::Running
-                    };
-                    let request = BackendAnnounceRequest::new(
-                        thread_descriptor.clone(),
-                        reported_state,
-                    )
-                        .expect("backend process descriptor remains validated");
-                    let next_delay = match client.blocking_announce_backend_with_timeout(
-                        request.as_proto().clone(),
-                        ANNOUNCE_RPC_TIMEOUT,
-                    ) {
-                        Ok(BackendAnnounceResult::Accepted { lease_ttl_ms }) => {
-                            retry_delay = initial_backoff;
-                            interval.min(Duration::from_millis(lease_ttl_ms.saturating_div(3).max(1)))
-                        }
-                        Ok(BackendAnnounceResult::Rejected { reason, safe_detail }) => {
-                            tracing::error!(?reason, %safe_detail, "backend announce rejected by frontend");
-                            let delay = retry_delay;
-                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
-                            delay
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "backend announce attempt failed");
-                            let delay = retry_delay;
-                            retry_delay = retry_delay.saturating_mul(2).min(max_backoff);
-                            delay
-                        }
-                    };
-                    let (pending, signal) = &*thread_wake;
-                    let mut pending = pending.lock().expect("backend announce wake lock");
-                    if !*pending && !thread_stop.load(Ordering::Acquire) {
-                        let (next, _) = signal
-                            .wait_timeout(pending, next_delay)
-                            .expect("backend announce wake wait");
-                        pending = next;
-                    }
-                    *pending = false;
-                }
-            })
-            .expect("spawn backend announce task");
-        Self {
-            stop,
-            wake,
-            join: Some(join),
-            data_runtime,
-            frontend_endpoint,
-            descriptor,
-        }
-    }
-
-    /// Reports the drain the process has already entered.
-    ///
-    /// The flag itself belongs to `BackendDrainState`; the composition root
-    /// sets it before calling this, so the announce below and the heartbeat
-    /// this BE answers cannot disagree about the same process.
-    fn announce_drain(&self) {
-        let client = BackendRpcClient::new_native_endpoint(
-            self.data_runtime.clone(),
-            self.frontend_endpoint.clone(),
-        );
-        let request =
-            BackendAnnounceRequest::new(self.descriptor.clone(), BackendReportedState::Draining)
-                .expect("backend process descriptor remains validated");
-        match client.blocking_announce_backend_with_timeout(
-            request.as_proto().clone(),
-            ANNOUNCE_RPC_TIMEOUT,
-        ) {
-            Ok(BackendAnnounceResult::Accepted { .. }) => {}
-            Ok(BackendAnnounceResult::Rejected {
-                reason,
-                safe_detail,
-            }) => {
-                tracing::error!(?reason, %safe_detail, "backend drain announce rejected by frontend");
-            }
-            Err(error) => {
-                tracing::warn!(%error, "backend drain announce attempt failed");
-            }
-        }
-        let (pending, signal) = &*self.wake;
-        *pending.lock().expect("backend announce wake lock") = true;
-        signal.notify_one();
-    }
-
-    fn stop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let (_, signal) = &*self.wake;
-        signal.notify_one();
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
+    drain: Arc<WorkerDrainState>,
+    announce_task: BackendAnnounceSupervisor,
 }
 
 impl fmt::Debug for BackendApplicationHost {
@@ -343,7 +166,7 @@ struct BackendApplicationServices {
     /// This process's immutable identity, minted once by the composition root
     /// below. Every owner that stamps or checks it reads this one value.
     backend_process_id: BackendProcessId,
-    drain: Arc<BackendDrainState>,
+    drain: Arc<WorkerDrainState>,
     execution_runtime: Arc<ExecutionRuntime>,
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     task_execution_registry: Arc<TaskExecutionRegistry>,
@@ -353,7 +176,7 @@ struct BackendApplicationServices {
     /// plane needs it directly: without it no created task can receive an
     /// exchange frame, because the frozen descriptor is the only place a
     /// task's inbound topology exists.
-    task_inbound_capabilities: Arc<crate::task_execution::TaskInboundCapabilities>,
+    task_inbound_capabilities: Arc<novarocks_worker::TaskInboundCapabilities>,
     /// The task substrate's runtime-filter participant owner. The RPC ingress
     /// needs it directly, for the same reason: an `EstablishQueryContext`
     /// install is the only place a task-protocol query's participant exists.
@@ -458,83 +281,6 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
     }
 }
 
-/// The maintenance tick of the task protocol owner.
-///
-/// The owner never sleeps against a wall clock, so elapsed time becomes a
-/// decision only when something calls `advance_deadlines`. This is that
-/// something: without it no lease ever expires, no creation gate ever times
-/// out, and no retained record is ever reclaimed.
-struct TaskDeadlineTickTask {
-    stop: watch::Sender<bool>,
-    failure_rx: mpsc::Receiver<String>,
-    join: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl TaskDeadlineTickTask {
-    fn start(
-        runtime: &BackendDataRuntime,
-        registry: Arc<TaskExecutionRegistry>,
-        interval: Duration,
-    ) -> Self {
-        let (stop, mut stopped) = watch::channel(false);
-        let (failure_tx, failure_rx) = mpsc::channel();
-        let join = runtime.handle().spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            // The first tick of a Tokio interval completes immediately and
-            // there is nothing to sweep at composition time.
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = stopped.changed() => return,
-                    _ = ticker.tick() => {}
-                }
-                let registry = Arc::clone(&registry);
-                // One sweep takes the owner's mutex, so it runs on the
-                // blocking pool rather than on a runtime worker.
-                if let Err(error) =
-                    tokio::task::spawn_blocking(move || registry.advance_deadlines()).await
-                {
-                    // Nothing else re-evaluates a deadline, so a dead sweep is
-                    // a supervision failure rather than a missed tick.
-                    let _ = failure_tx.send(format!(
-                        "task execution deadline sweep stopped running: {error}"
-                    ));
-                    return;
-                }
-            }
-        });
-        Self {
-            stop,
-            failure_rx,
-            join: Some(join),
-        }
-    }
-
-    fn poll_failure(&mut self) -> Option<String> {
-        self.failure_rx.try_recv().ok()
-    }
-
-    /// Asks the tick to return, then drops it.
-    ///
-    /// The abort is a backstop for a runtime that is already winding down: the
-    /// loop's only await points are the tick, the stop signal, and the join of
-    /// one sweep, and a sweep that has already started runs to completion on
-    /// the blocking pool, so nothing is left half applied.
-    fn stop(&mut self) {
-        let _ = self.stop.send(true);
-        if let Some(join) = self.join.take() {
-            join.abort();
-        }
-    }
-}
-
-impl Drop for TaskDeadlineTickTask {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
 struct BackendExecutionRuntimeInput {
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
@@ -555,8 +301,8 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
-    result_retained_limits: BackendResultRetainedLimits,
-    catalog_manager_config: crate::connector::catalog_manager::CatalogManagerConfig,
+    result_retained_limits: WorkerResultRetainedLimits,
+    catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let BackendExecutionRuntimeInput {
@@ -573,12 +319,12 @@ fn compose_backend_application_services(
     // stamp their work with, so it is minted by the composition root rather
     // than by whichever owner happens to be constructed first.
     let backend_process_id = BackendProcessId::new_v7();
-    let drain = Arc::new(BackendDrainState::new());
+    let drain = Arc::new(WorkerDrainState::new());
     let exchange_receiver_port: Arc<dyn ExchangeReceiverPort> = Arc::new(
-        BackendExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
+        ExecutionRuntimeExchangeReceiverPort::new(Arc::clone(&execution_runtime)),
     );
     let execution_role_binding_factories = Arc::new(
-        crate::connector::catalog_manager::ConnectorExecutionRoleBindingFactorySet::try_new(
+        ConnectorExecutionRoleBindingFactorySet::try_new(
             execution_role_binding_factories.iter().cloned(),
         )
         .map_err(|error| {
@@ -590,15 +336,14 @@ fn compose_backend_application_services(
     );
     // One catalog manager per process: a catalog lease belongs to the process,
     // and two managers would be two authorities over the same leases.
-    let catalog_manager = Arc::new(
-        crate::connector::catalog_manager::CatalogManager::try_new(catalog_manager_config)
-            .map_err(|error| {
-                BackendApplicationError::new(
-                    BackendApplicationErrorKind::Configuration,
-                    format!("compose backend catalog manager: {error}"),
-                )
-            })?,
-    );
+    let catalog_manager = Arc::new(CatalogManager::try_new(catalog_manager_config).map_err(
+        |error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("compose backend catalog manager: {error}"),
+            )
+        },
+    )?);
     crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
         .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
@@ -613,12 +358,15 @@ fn compose_backend_application_services(
         ),
         data_runtime.clone(),
     ));
-    let inbound_capabilities = crate::task_execution::TaskInboundCapabilities::new();
+    let inbound_capabilities = novarocks_worker::TaskInboundCapabilities::new();
     let result_retained_budget = crate::runtime::result_buffer::ResultRetainedBudget::new(
         result_retained_limits.per_process(),
     );
-    let task_execution_registry_config =
-        TaskExecutionRegistryConfig::for_process(backend_process_id);
+    let task_execution_registry_config = TaskExecutionRegistryConfig::for_process(
+        backend_process_id,
+        novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+        novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+    );
     let task_completion_supervisor = crate::task_execution::TaskCompletionSupervisor::start(
         data_runtime.clone(),
         task_execution_registry_config.max_active_tasks_per_backend,
@@ -638,10 +386,12 @@ fn compose_backend_application_services(
         Arc::clone(&execution_runtime),
         Arc::clone(&task_completion_supervisor),
     ));
-    let task_execution_registry = TaskExecutionRegistry::with_process_clock(
+    let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
         task_execution_registry_config,
-        Arc::clone(&context_host) as Arc<dyn crate::task_execution::QueryContextHost>,
+        Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
         execution_host,
+        backend_task_execution_ports(),
+        Arc::new(RestartAfterEstablishTaskCreationGate),
     );
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),
@@ -775,14 +525,16 @@ impl BackendApplicationHost {
             catalog_manager_config,
             execution_role_binding_factories,
         } = config;
-        let readiness_endpoint =
-            NativeEndpoint::from_host_port(&advertise_endpoint.host, advertise_endpoint.port)
-                .map_err(|error| {
-                    BackendApplicationError::new(
-                        BackendApplicationErrorKind::Configuration,
-                        format!("invalid advertised Native readiness endpoint: {error}"),
-                    )
-                })?;
+        let readiness_endpoint = novarocks_types::NativeEndpoint::from_host_port(
+            &advertise_endpoint.host,
+            advertise_endpoint.port,
+        )
+        .map_err(|error| {
+            BackendApplicationError::new(
+                BackendApplicationErrorKind::Configuration,
+                format!("invalid advertised Native readiness endpoint: {error}"),
+            )
+        })?;
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
@@ -822,9 +574,10 @@ impl BackendApplicationHost {
             )?;
         // Started before the listener: the owner is reachable the moment its
         // RPCs are, and a deadline that elapses must already be decidable.
-        let task_deadline_tick = TaskDeadlineTickTask::start(
-            &readiness_runtime,
-            Arc::clone(&services.task_execution_registry),
+        let task_deadline_tick = WorkerDeadlineSupervisor::start(
+            readiness_runtime.handle(),
+            Arc::clone(&services.task_execution_registry)
+                as Arc<dyn novarocks_worker::WorkerDeadlineAuthority>,
             TASK_DEADLINE_TICK_INTERVAL,
         );
 
@@ -833,25 +586,30 @@ impl BackendApplicationHost {
         // installed by the query-context host.
         let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
             native_runtime_filter_envelope_ingress(Arc::clone(&services.query_context_host));
-        let mut grpc_server = match BackendRpcServerHandle::start(
+        let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
+            services.task_execution_registry.clone();
+        let mut grpc_server = match NativeRpcServerHandle::start(
             &bind_host,
             grpc_port,
             BackendRpcService::new(
                 Arc::clone(&services.task_execution_ingress),
                 Arc::clone(&services.query_context_host)
-                    as Arc<dyn crate::rpc::server::CatalogReachabilityAuthority>,
+                    as Arc<dyn novarocks_native_adapter::catalog_prune_rpc::CatalogReachabilityAuthority>,
                 runtime_filter_ingress,
                 Arc::clone(&services.exchange_receiver_port),
                 Arc::clone(&services.task_inbound_capabilities),
-                crate::rpc::server::BackendProcessFacts {
-                    process_id: services.backend_process_id,
-                    descriptor: process_descriptor.clone(),
-                    drain: Arc::clone(&services.drain),
-                    task_execution_registry: Arc::clone(&services.task_execution_registry),
-                },
+                BackendHeartbeatResponder::new(
+                    process_descriptor.clone(),
+                    Arc::clone(&services.drain),
+                    admission_epoch,
+                ),
             ),
             native_trust,
-            native_transport,
+            native_transport.incoming_adapter(),
+            "backend",
+            "native-backend-grpc",
+            crate::metrics::record_backend_native_authentication_failure,
+            crate::metrics::record_backend_native_tls_handshake_failure,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -867,9 +625,11 @@ impl BackendApplicationHost {
             }
         };
 
-        if let Err(error) =
-            wait_for_native_ready(&readiness_runtime, readiness_endpoint, readiness_timeout)
-        {
+        if let Err(error) = wait_for_backend_native_endpoint_ready(
+            &readiness_runtime,
+            readiness_endpoint,
+            readiness_timeout,
+        ) {
             let listener_result = grpc_server.stop();
             let metrics_result = metrics_http_server.stop();
             let primary = BackendApplicationError::new(
@@ -882,7 +642,7 @@ impl BackendApplicationHost {
             ));
         }
 
-        let announce_task = BackendAnnounceTask::start(
+        let announce_task = BackendAnnounceSupervisor::start(
             readiness_runtime,
             frontend_endpoint,
             process_descriptor.clone(),
@@ -910,109 +670,7 @@ impl BackendApplicationHost {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "This library entrypoint is invoked by the backend server binary, not backend lib tests."
-)]
-pub fn run_backend_server(config: BackendServerConfig) -> Result<(), BackendApplicationError> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
-        .build()
-        .map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Start,
-                format!("build backend Tokio runtime failed: {error}"),
-            )
-        })?;
-    let data_runtime = BackendDataRuntime::new(
-        runtime.handle().clone(),
-        Arc::clone(&config.native_trust),
-        config.native_transport.clone(),
-    );
-    runtime.block_on(run_backend_server_until_signal(config, data_runtime))
-}
-pub async fn run_backend_server_until_shutdown<F>(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-    shutdown: F,
-) -> Result<(), BackendApplicationError>
-where
-    F: Future<Output = ()> + Send,
-{
-    run_backend_server_until(config, data_runtime, async move {
-        shutdown.await;
-        Ok(())
-    })
-    .await
-}
-
-pub async fn run_backend_server_until_signal(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-) -> Result<(), BackendApplicationError> {
-    #[cfg(unix)]
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-        .map_err(|error| {
-        BackendApplicationError::new(
-            BackendApplicationErrorKind::Signal,
-            format!("install SIGINT listener failed: {error}"),
-        )
-    })?;
-
-    run_backend_server_until(config, data_runtime, async {
-        #[cfg(unix)]
-        {
-            // Register the OS handler before the host emits its ready marker.
-            // A supervisor can otherwise deliver SIGINT in the narrow window
-            // between readiness and the first poll of `tokio::signal::ctrl_c`.
-            interrupt.recv().await;
-            Ok(())
-        }
-        #[cfg(not(unix))]
-        tokio::signal::ctrl_c().await.map_err(|error| {
-            BackendApplicationError::new(
-                BackendApplicationErrorKind::Signal,
-                format!("Ctrl-C listener failed: {error}"),
-            )
-        })
-    })
-    .await
-}
-
-async fn run_backend_server_until<F>(
-    config: BackendServerConfig,
-    data_runtime: BackendDataRuntime,
-    shutdown: F,
-) -> Result<(), BackendApplicationError>
-where
-    F: Future<Output = Result<(), BackendApplicationError>> + Send,
-{
-    let mut host = BackendApplicationHost::open(config, data_runtime)?;
-    println!("{}", host.ready_marker());
-    tokio::pin!(shutdown);
-
-    let primary = loop {
-        tokio::select! {
-            signal_result = &mut shutdown => break signal_result,
-            _ = tokio::time::sleep(SUPERVISION_POLL_INTERVAL) => match host.poll_failure() {
-                Ok(Some(error)) | Err(error) => break Err(error),
-                Ok(None) => {}
-            },
-        }
-    };
-
-    let primary = match primary {
-        Ok(()) => match host.poll_failure() {
-            Ok(Some(error)) | Err(error) => Err(error),
-            Ok(None) => Ok(()),
-        },
-        Err(error) => Err(error),
-    };
-    host.begin_drain();
-    combine_primary_and_shutdown(primary, host.shutdown())
-}
-
+#[cfg(test)]
 fn combine_primary_and_shutdown(
     primary: Result<(), BackendApplicationError>,
     shutdown: Result<(), BackendApplicationError>,
@@ -1048,27 +706,9 @@ fn combine_shutdown_results(
     }
 }
 
-fn wait_for_native_ready(
-    runtime: &BackendDataRuntime,
-    endpoint: NativeEndpoint,
-    timeout: Duration,
-) -> Result<(), String> {
-    let connector = runtime.native_transport().connector_for(endpoint.clone())?;
-    runtime.block_on(async move {
-        tokio::time::timeout(timeout, connector.connect())
-            .await
-            .map_err(|_| {
-                format!(
-                    "advertised Native endpoint {endpoint} did not become ready within {}ms",
-                    timeout.as_millis()
-                )
-            })?
-            .map(|_| ())
-            .map_err(|error| {
-                format!("advertised Native endpoint {endpoint} readiness failed: {error}")
-            })
-    })
-}
+#[cfg(test)]
+#[path = "application_host_tests.rs"]
+mod application_host_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1079,21 +719,26 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendResultRetainedLimits, BackendServerConfig,
-        ConfidentialTransport, QueryContextRef, TaskDeadlineTickTask, TaskExecutionRegistryConfig,
+        BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
         UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
     use crate::rpc::runtime::test_backend_native_trust;
-    use crate::rpc::transport::nova_rocks_grpc_client::NovaRocksGrpcClient;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::{
         ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
     };
+    use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+    use novarocks_native_adapter::{BackendDataRuntime, BackendNativeTransport};
     use novarocks_proto_models::novarocks as protocol;
     use novarocks_proto_models::novarocks::{HeartbeatRequest, HeartbeatResponse};
     use novarocks_spi::connector::WriteCommitEvidenceLimits;
     use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeEndpoint};
+    use novarocks_worker::{
+        CatalogManagerConfig, TaskExecutionRegistry, TaskExecutionRegistryConfig,
+        WorkerResultRetainedLimits,
+    };
+    use novarocks_worker::{ManualClock, WorkerDeadlineSupervisor, WorkerMonotonicClock};
 
     static LIVE_HOST_TEST: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1143,7 +788,7 @@ mod tests {
         Arc::new(builder.seal().expect("builtin execution function set"))
     }
 
-    fn test_data_runtime() -> crate::BackendDataRuntime {
+    fn test_data_runtime() -> BackendDataRuntime {
         crate::rpc::runtime::test_backend_data_runtime()
     }
 
@@ -1162,12 +807,17 @@ mod tests {
         use novarocks_types::identity::{FrontendProcessId, QueryExecutionId, QueryId};
 
         let backend = novarocks_types::BackendProcessId::new_v7();
-        let clock = Arc::new(crate::task_execution::ManualClock::new());
-        let registry = crate::task_execution::TaskExecutionRegistry::new(
-            TaskExecutionRegistryConfig::for_process(backend),
-            Arc::clone(&clock) as Arc<dyn crate::task_execution::BackendMonotonicClock>,
+        let clock = Arc::new(ManualClock::new());
+        let registry = TaskExecutionRegistry::new(
+            TaskExecutionRegistryConfig::for_process(
+                backend,
+                novarocks_task_codec::TransportBudget::DEFAULT.max_tasks_per_context(),
+                novarocks_task_codec::TransportBudget::DEFAULT.max_active_tasks_per_backend(),
+            ),
+            Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
+            crate::task_execution::backend_task_execution_ports(),
         );
         let context = QueryContextRef::new(
             QueryExecutionId::new(
@@ -1188,9 +838,9 @@ mod tests {
             QueryContextState::TerminalRetained
         );
 
-        let mut tick = TaskDeadlineTickTask::start(
-            &test_data_runtime(),
-            Arc::clone(&registry),
+        let mut tick = WorkerDeadlineSupervisor::start(
+            test_data_runtime().handle(),
+            Arc::clone(&registry) as Arc<dyn novarocks_worker::WorkerDeadlineAuthority>,
             Duration::from_millis(5),
         );
         clock.advance(Duration::from_secs(600));
@@ -1238,21 +888,20 @@ mod tests {
             native_trust: crate::rpc::runtime::test_backend_native_trust(),
             native_compatibility_id: novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             function_set: test_execution_function_set(),
-            native_transport: crate::rpc::runtime::BackendNativeTransport::Plaintext,
+            native_transport: BackendNativeTransport::Plaintext,
             frontend_endpoint: NativeEndpoint::from_host_port("127.0.0.1", unused_port())
                 .expect("valid frontend endpoint"),
             announce_interval: Duration::from_secs(60),
             announce_initial_backoff: Duration::from_millis(100),
             announce_max_backoff: Duration::from_secs(2),
             write_commit_evidence_limits: WriteCommitEvidenceLimits::default(),
-            result_retained_limits: BackendResultRetainedLimits::try_new(
+            result_retained_limits: WorkerResultRetainedLimits::try_new(
                 16 * 1024 * 1024,
                 32 * 1024 * 1024,
             )
             .expect("valid test result retained-byte limits"),
             execution_runtime_config: execution_runtime_config(),
-            catalog_manager_config:
-                crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
         }
     }
@@ -1279,9 +928,7 @@ mod tests {
     #[test]
     fn the_composed_runtime_filter_ingress_reaches_a_task_protocol_participant() {
         use super::native_runtime_filter_envelope_ingress;
-        use crate::runtime_filter::domain::BackendEnvelopeKind;
         use crate::runtime_filter::test_support::delivery_envelope_for_test;
-        use crate::task_execution::{QueryContextHost, SharedFactsRequest};
         use novarocks_execution_contract::CredentialUpdate;
         use novarocks_execution_contract::task_execution::domain::{
             CodecOwnedContent, CredentialEpoch, CredentialLeaseId,
@@ -1291,6 +938,9 @@ mod tests {
         use novarocks_proto_models::filter;
         use novarocks_task_codec::domain::{WireContent, WireCredential};
         use novarocks_types::identity::FrontendProcessId;
+        use novarocks_worker::QueryContextHost;
+        use novarocks_worker::SharedFactsRequest;
+        use novarocks_worker::runtime_filter::domain::BackendEnvelopeKind;
 
         let services = compose_backend_application_services(
             test_data_runtime(),
@@ -1301,9 +951,9 @@ mod tests {
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
             ConfidentialTransport::Plaintext,
             WriteCommitEvidenceLimits::default(),
-            BackendResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
+            WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
-            crate::connector::catalog_manager::CatalogManagerConfig::default(),
+            CatalogManagerConfig::default(),
             &[],
         )
         .expect("compose backend application services");

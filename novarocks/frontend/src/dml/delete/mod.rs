@@ -28,12 +28,13 @@ use crate::query_execution::dml::delete::{
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::LakePublicationId;
 
-use crate::dml::error::{AdmitError, DmlError};
+use crate::dml::error::DmlError;
 use crate::dml::runner::{
     CoordinatedWriteReport, StatementWriteTransactionRunner, WriteExecutor, WriteTarget,
     WriteTransactionSpec,
 };
 use crate::dml::service::DmlService;
+use novarocks_query_application::sql::dml_admission::DmlAdmissionError;
 use novarocks_spi::connector::LakePublicationFamily;
 
 struct DeleteWriteExecutor<'a> {
@@ -148,7 +149,7 @@ impl DmlService {
         if let DeleteStatement::Predicate(delete) = statement
             && delete.selection.is_none()
         {
-            return Err(DmlError::admit(AdmitError::DeleteRequiresWhere.to_user_error(
+            return Err(DmlError::admit(DmlAdmissionError::DeleteRequiresWhere.to_user_error(
                 source,
                 delete.span,
                 "DELETE requires a WHERE clause; for full table replacement use INSERT OVERWRITE t SELECT * FROM t WHERE FALSE",

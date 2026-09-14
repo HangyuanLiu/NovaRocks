@@ -15,23 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Consumer-owned catalog control and admission contracts.
+//! Frontend-local catalog runtime projection and query bindings.
 //!
-//! Core consumes these facts but never owns the durable attachment record,
-//! provider factory, or a provider-concrete catalog handle. Frontend owns
-//! those control-plane concerns and projects Ready observations into this
-//! boundary.
+//! The Catalog application owns catalog commands, desired-state truth, and
+//! admission contracts. Frontend only projects an admitted runtime into its
+//! local query catalog.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use novarocks_spi::connector::{ConnectorInstanceId, ConnectorProviderId};
+use futures::future::BoxFuture;
+use novarocks_catalog_application::{
+    CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
+    CatalogCreateCommand, CatalogDropCommand, CatalogReferenceReader, CatalogRuntimeObservation,
+    CatalogRuntimePublisherSink,
+};
+use novarocks_spi::connector::ConnectorInstanceId;
+use novarocks_state_store_api::StateStore;
+#[cfg(test)]
 use uuid::Uuid;
 
 pub mod command;
 pub mod create_table_ddl;
-pub mod desired_state;
 pub mod iceberg_ref_command;
 pub mod information_schema;
 pub mod model;
@@ -40,166 +45,30 @@ pub mod query_catalog;
 pub mod query_materializer;
 pub mod resolver;
 pub mod statement;
-pub mod static_file;
 pub mod system_catalog;
 pub mod virtual_table;
 
-pub mod frontend_port;
-pub use desired_state::{
-    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSnapshotIdentity,
-    CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
-    CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
-};
-pub use frontend_port::FrontendCatalogApplicationPort;
-pub use static_file::load_static_file_snapshot;
+/// Frontend's narrow best-effort observation of its MV accelerator state.
+pub struct MvCatalogReferenceReader;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatalogCreateCommand {
-    pub instance_id: ConnectorInstanceId,
-    pub display_name: String,
-    pub properties: Vec<(String, String)>,
-    pub if_not_exists: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatalogDropCommand {
-    pub instance_id: ConnectorInstanceId,
-    pub if_exists: bool,
-}
-
-/// The exact identity that Core may admit into a query/runtime path.
-///
-/// `attachment_id` distinguishes a catalog recreated under the same SQL
-/// name; `generation` distinguishes locally retired and republished runtime
-/// projections of that durable attachment.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatalogRuntimeObservation {
-    pub attachment_id: Uuid,
-    pub instance_id: ConnectorInstanceId,
-    pub provider_id: ConnectorProviderId,
-    pub generation: u64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CatalogAdmission {
-    Absent,
-    Unavailable { reason: String },
-    Ready(CatalogRuntimeObservation),
-}
-
-impl CatalogAdmission {
-    /// Resolves the admission, naming the catalog in both failure messages.
-    ///
-    /// Operators and tests match on the catalog name, so an absent attachment
-    /// must not surface as an anonymous "not found".
-    pub fn require_ready(
-        self,
-        instance_id: &ConnectorInstanceId,
-    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError> {
-        match self {
-            Self::Ready(observation) => Ok(observation),
-            Self::Absent => Err(CatalogApplicationError::new(
-                CatalogApplicationErrorKind::NotFound,
-                format!("unknown catalog `{}`", instance_id.as_str()),
-            )),
-            Self::Unavailable { reason } => Err(CatalogApplicationError::new(
-                CatalogApplicationErrorKind::Unavailable,
-                format!(
-                    "catalog `{}` is unavailable on this frontend: {reason}",
-                    instance_id.as_str()
-                ),
-            )),
-        }
+impl CatalogReferenceReader for MvCatalogReferenceReader {
+    fn observe_references<'a>(
+        &'a self,
+        store: &'a dyn StateStore,
+        instance_id: &'a ConnectorInstanceId,
+        page_size: usize,
+    ) -> BoxFuture<'a, Result<Option<&'static str>, String>> {
+        Box::pin(async move {
+            crate::mv::repository::observe_catalog_references(
+                store,
+                instance_id.as_str(),
+                page_size,
+            )
+            .await
+            .map(|reference| reference.map(|reference| reference.describe()))
+            .map_err(|error| error.to_string())
+        })
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CatalogApplicationErrorKind {
-    InvalidRequest,
-    NotFound,
-    AlreadyExists,
-    Conflict,
-    Unavailable,
-    Internal,
-    /// The selected catalog desired-state source mode does not admit the
-    /// requested operation.
-    ///
-    /// Distinct from `InvalidRequest` because the request is well formed and
-    /// would be admitted by another deployment: what refuses it is this
-    /// deployment's choice of desired-state authority. Retrying, rephrasing, or
-    /// waiting cannot help — either the operator reconfigures the source or the
-    /// change goes to whichever authority owns it.
-    UnsupportedSourceMode,
-    /// The selected source could not deliver one complete, trustworthy
-    /// enumeration of catalog desired state.
-    ///
-    /// Deliberately its own kind, and deliberately never reported as a snapshot
-    /// holding zero catalogs: a reconcile treats every catalog missing from a
-    /// snapshot as no longer wanted, so an enumeration failure that degraded
-    /// into an empty snapshot would retire every catalog in the deployment. The
-    /// blast radius is global — the frontend must not become serviceable — as
-    /// opposed to one catalog failing to materialize, which reports
-    /// `Unavailable` for that catalog alone.
-    DesiredStateEnumerationIncomplete,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CatalogApplicationError {
-    kind: CatalogApplicationErrorKind,
-    message: String,
-}
-
-impl CatalogApplicationError {
-    pub fn new(kind: CatalogApplicationErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    pub const fn kind(&self) -> CatalogApplicationErrorKind {
-        self.kind
-    }
-}
-
-impl fmt::Display for CatalogApplicationError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CatalogApplicationError {}
-
-/// Frontend's catalog command and admission dependency.
-///
-/// Implemented by Frontend. Core must not downcast this port to access an
-/// attachment repository, control host, registry, or provider handle.
-// Design: ADR-0115 (docs/adr/ADR-0115-catalog-desired-state-source-modes.md)
-pub trait CatalogApplicationPort: Send + Sync {
-    fn create_catalog(
-        &self,
-        command: CatalogCreateCommand,
-    ) -> Result<CatalogRuntimeObservation, CatalogApplicationError>;
-
-    fn drop_catalog(&self, command: CatalogDropCommand) -> Result<(), CatalogApplicationError>;
-
-    fn admit_catalog(&self, instance_id: &ConnectorInstanceId) -> CatalogAdmission;
-}
-
-/// The provider-neutral sink Frontend uses to project a Ready catalog runtime
-/// into Core. It deliberately exposes only exact observations and retirement,
-/// never a concrete registry or provider handle.
-pub trait CatalogRuntimePublisherSink: Send + Sync {
-    fn publish_catalog_runtime(
-        &self,
-        observation: CatalogRuntimeObservation,
-    ) -> Result<(), CatalogApplicationError>;
-
-    fn unpublish_catalog_runtime(
-        &self,
-        instance_id: &ConnectorInstanceId,
-        generation: u64,
-    ) -> Result<(), CatalogApplicationError>;
 }
 
 /// The query catalog registry this projection publishes admitted runtimes into.
@@ -470,8 +339,14 @@ pub fn publish_catalog_projection_metrics(snapshot: CatalogProjectionMetricsSnap
 }
 
 #[cfg(test)]
+#[path = "catalog_drop_reference_tests.rs"]
+mod drop_reference_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use novarocks_spi::connector::ConnectorProviderId;
 
     use super::*;
 

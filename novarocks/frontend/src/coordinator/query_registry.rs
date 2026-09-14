@@ -19,11 +19,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::common::backend_topology::LiveBackendTarget;
-use crate::metrics::FrontendProcessQueryCountersSnapshot;
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryIntent,
 };
-use crate::query_execution::runtime_filter_terminal_rollup::RuntimeFilterTerminalRollup;
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceReceipt, QueryContextConvergenceState,
 };
@@ -35,49 +33,6 @@ use novarocks_query_application::coordination::{
 use novarocks_types::{BackendProcessId, QueryId, QueryProcessNamespace};
 
 type QueryKey = (i64, i64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum QueryLifecycleConvergenceErrorSource {
-    BackendAttestation,
-    FrontendLiveness,
-    NoOutcome,
-}
-
-/// Immutable, query-scoped terminal convergence evidence.  It is intentionally
-/// produced by the attempt that owns the execution id, never reconstructed
-/// from process metrics or logs.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct QueryLifecycleConvergenceSnapshot {
-    pub(crate) execution_id: QueryExecutionId,
-    pub(crate) error_source: Option<QueryLifecycleConvergenceErrorSource>,
-    pub(crate) primary_error: Option<String>,
-    /// Runtime Filter terminal facts are normalized only from a complete set
-    /// of participant contributions.  The unavailable variant records why no
-    /// such set existed for this attempt.
-    pub(crate) runtime_filter: RuntimeFilterTerminalRollupSnapshot,
-    pub(crate) metrics: FrontendProcessQueryCountersSnapshot,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The available variant owns the complete terminal runtime-filter snapshot."
-)]
-pub(crate) enum RuntimeFilterTerminalRollupSnapshot {
-    Available(RuntimeFilterTerminalRollup),
-    Unavailable(RuntimeFilterTerminalRollupUnavailable),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RuntimeFilterTerminalRollupUnavailable {
-    TerminalOutcomesIncomplete,
-}
-
-/// Read-only diagnostic seam for the immutable terminal evidence retained by
-/// the query registry.  It deliberately has no access to attempt mutation.
-pub(crate) trait QueryLifecycleConvergenceReader: Send + Sync {
-    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot>;
-}
 
 /// Typed origin of a query failure retained by the FE query owner.
 ///
@@ -449,10 +404,6 @@ pub(crate) struct FrontendQueryRegistry {
     /// one attempt, so the slot never becomes a place where a reader chooses
     /// between two candidates for the same attempt.
     ///
-    /// The evidence is published frozen: the task protocol has no late
-    /// ingress, so an attempt's contribution set is complete when its last
-    /// query context releases.
-    latest_convergence: Mutex<Option<Box<QueryLifecycleConvergenceSnapshot>>>,
     backend_topology: Mutex<BackendTopologyState>,
 }
 
@@ -468,7 +419,6 @@ impl FrontendQueryRegistry {
                 next_terminal_registration_generation: 1,
                 ..RegistryState::default()
             }),
-            latest_convergence: Mutex::new(None),
             backend_topology: Mutex::new(BackendTopologyState::default()),
         }
     }
@@ -1307,31 +1257,6 @@ impl FrontendQueryRegistry {
             })
     }
 
-    fn latest_retained_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        self.latest_convergence
-            .lock()
-            .expect("frontend latest convergence evidence lock")
-            .as_deref()
-            .cloned()
-    }
-
-    /// Publishes the immutable convergence evidence of one task-protocol
-    /// attempt.
-    ///
-    /// Called once per attempt, after its last query context released: that is
-    /// the point at which every participant's contribution is either in hand
-    /// or will never arrive. Nothing reads a partial attempt here, so the
-    /// evidence is frozen rather than recomputed on read.
-    pub(crate) fn publish_task_round_convergence(
-        &self,
-        snapshot: QueryLifecycleConvergenceSnapshot,
-    ) {
-        *self
-            .latest_convergence
-            .lock()
-            .expect("frontend latest convergence evidence lock") = Some(Box::new(snapshot));
-    }
-
     /// Records why this query failed and returns the primary cause the
     /// registry selected.
     ///
@@ -1638,12 +1563,6 @@ impl FrontendQueryRegistry {
     }
 }
 
-impl QueryLifecycleConvergenceReader for FrontendQueryRegistry {
-    fn latest_convergence_snapshot(&self) -> Option<QueryLifecycleConvergenceSnapshot> {
-        self.latest_retained_convergence_snapshot()
-    }
-}
-
 pub(crate) struct ActiveQueryGuard {
     registry: Arc<FrontendQueryRegistry>,
     key: QueryKey,
@@ -1831,49 +1750,6 @@ mod tests {
             AdmissionEpochCapability::try_from_bytes([0x61; 16])
                 .expect("admission epoch capability"),
         )
-    }
-
-    /// The one convergence slot answers with the evidence the latest attempt
-    /// published.
-    ///
-    /// The defect this catches: a reader wired to a producer that no longer
-    /// exists. Every query then leaves the endpoint reporting nothing, which
-    /// reads as "this attempt produced no evidence" rather than as a missing
-    /// publisher.
-    #[test]
-    fn the_convergence_reader_answers_with_the_latest_published_attempt() {
-        let registry = FrontendQueryRegistry::new(QueryProcessNamespace::new(41));
-        let first =
-            QueryExecutionId::new(QueryId::new(41, 42), AttemptId::new(1).expect("attempt"))
-                .expect("execution id");
-        let second =
-            QueryExecutionId::new(QueryId::new(41, 43), AttemptId::new(1).expect("attempt"))
-                .expect("execution id");
-
-        assert!(
-            QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry).is_none(),
-            "a registry that has published nothing reports no evidence"
-        );
-
-        for execution_id in [first, second] {
-            registry.publish_task_round_convergence(QueryLifecycleConvergenceSnapshot {
-                execution_id,
-                error_source: None,
-                primary_error: None,
-                runtime_filter: RuntimeFilterTerminalRollupSnapshot::Unavailable(
-                    RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
-                ),
-                metrics: FrontendProcessQueryCountersSnapshot::default(),
-            });
-        }
-
-        let latest = QueryLifecycleConvergenceReader::latest_convergence_snapshot(&registry)
-            .expect("a published attempt is readable");
-        assert_eq!(latest.execution_id, second);
-        assert!(
-            latest.primary_error.is_none(),
-            "a published attempt reached this point already linearized as a success"
-        );
     }
 
     #[test]

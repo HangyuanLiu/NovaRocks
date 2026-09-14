@@ -15,9 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_frontend::StateStoreRunPolicy;
 use novarocks_server::app_config::{ApplicationConfig, NovaRocksConfig};
 use novarocks_spi::connector::{CatalogCredentialPurpose, StaticCredentialReference};
+use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_types::ClusterRole;
 use std::process::Command;
 use std::time::Duration;

@@ -895,7 +895,7 @@ impl CtasPreparedTarget for CoreStandardCtasTargetSession {
 trait CtasWriteTarget: Send + Sync {
     fn begin_write_session(
         &self,
-        host: &crate::connector::control_host::ConnectorControlHost,
+        host: &novarocks_catalog_application::ConnectorControlHost,
         output_schema: &arrow::datatypes::SchemaRef,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>;
@@ -914,7 +914,7 @@ trait CtasWriteTarget: Send + Sync {
 impl CtasWriteTarget for CoreStandardCtasTargetSession {
     fn begin_write_session(
         &self,
-        host: &crate::connector::control_host::ConnectorControlHost,
+        host: &novarocks_catalog_application::ConnectorControlHost,
         output_schema: &arrow::datatypes::SchemaRef,
         context: novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>
@@ -2103,7 +2103,7 @@ mod tests {
     impl CtasWriteTarget for RecordingTarget {
         fn begin_write_session(
             &self,
-            _host: &crate::connector::control_host::ConnectorControlHost,
+            _host: &novarocks_catalog_application::ConnectorControlHost,
             _output_schema: &arrow::datatypes::SchemaRef,
             _context: novarocks_spi::connector::ConnectorRequestContext,
         ) -> Result<Arc<crate::query_execution::write_session::ConnectorWriteSession>, CtasFailure>

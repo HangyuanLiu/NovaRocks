@@ -21,9 +21,41 @@
 //! Query-local compiler mappings and Connector execution instances belong to
 //! their respective application domains and are intentionally absent.
 
+mod application;
+pub mod attachment;
+mod control_host;
+pub mod desired_state;
 mod generation;
+mod service;
+pub mod static_file;
 
+pub use application::{
+    CatalogAdmission, CatalogApplicationError, CatalogApplicationErrorKind, CatalogApplicationPort,
+    CatalogCreateCommand, CatalogDropCommand, CatalogRuntimeObservation,
+    CatalogRuntimePublisherSink,
+};
+pub use attachment::CatalogReferenceReader;
+pub use attachment::{
+    CATALOG_DESIRED_STATE_FAMILY, CatalogAttachment, CatalogAttachmentError,
+    CatalogAttachmentErrorKind, CatalogAttachmentRepository, CatalogAttachmentVersioned,
+    CatalogAttachmentWakeup, CatalogAttachmentWakeupSignal,
+};
+pub use control_host::{
+    ConnectorControlHost, ConnectorControlRetirement, ConnectorWriteStackLease,
+};
+pub use desired_state::{
+    CatalogDesiredStateEntry, CatalogDesiredStateSnapshot, CatalogDesiredStateSnapshotIdentity,
+    CatalogDesiredStateSource, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
+    CatalogLogicalConfig, CatalogSourceEntryIdentity, CatalogSqlMutationAdmission,
+};
 pub use generation::{
     CatalogGenerationError, CatalogGenerationLease, CatalogGenerationOwner,
     PreparedCatalogGeneration,
 };
+pub use service::{
+    CatalogApplicationService, CatalogMaterializationConfig, CatalogProjectionCounts,
+};
+pub use static_file::load_static_file_snapshot;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;

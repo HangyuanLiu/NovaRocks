@@ -25,10 +25,4 @@ mod scheduler;
 )]
 pub(crate) mod task_round;
 
-pub use execution::FrontendDistributedQueryCoordinator;
-pub(crate) use query_registry::{
-    QueryLifecycleConvergenceErrorSource, QueryLifecycleConvergenceReader,
-    QueryLifecycleConvergenceSnapshot, RuntimeFilterTerminalRollupSnapshot,
-    RuntimeFilterTerminalRollupUnavailable,
-};
-pub use scheduler::{FrontendBackendSnapshot, FrontendFragmentScheduler};
+pub(crate) use execution::FrontendDistributedQueryCoordinator;

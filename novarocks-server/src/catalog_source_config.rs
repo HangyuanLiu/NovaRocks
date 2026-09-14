@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use novarocks_frontend::catalog_application::{
+use novarocks_catalog_application::{
     CatalogDesiredStateSnapshot, CatalogDesiredStateSourceInput, CatalogDesiredStateSourceMode,
     load_static_file_snapshot,
 };

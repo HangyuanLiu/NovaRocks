@@ -17,18 +17,18 @@
 
 use crate::common::admitted_query_context::QueryExecutionContext;
 use crate::common::backend_topology::BackendTopologySnapshot;
-use crate::common::query_cancellation::{
-    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
-};
 use crate::query_execution::contract::{
     DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
-    DistributedQueryIntent, DistributedQueryOutcome, DistributedQueryRequest,
+    DistributedQueryIntent, DistributedQueryRequest,
     build_distributed_query_request_with_execution,
 };
-use crate::query_execution::outcome::QueryOutcomeFactory;
+use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::statistics::{StatisticsExecutionMode, StatisticsExecutionPolicy};
 use novarocks_proto_codec::lifecycle::QueryOptions;
+use novarocks_query_application::cancellation::{
+    QueryCancellationReason, QueryCancellationSource, QueryCancellationView,
+};
 use novarocks_sql::test_support::{
     NativePreparationFixture, NativeWriteDataflowFixture, native_preparation_plan,
     native_write_dataflow_plan,
@@ -288,7 +288,7 @@ fn cancellation_view_observes_injected_flag() {
 fn outcome_factory_rejects_intent_mismatch() {
     let result = QueryOutcomeFactory::new(DistributedQueryIntent::Result).from_execution_result(
         crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::QueryResult::empty(),
+            query_result: novarocks_query_application::api::QueryResult::empty(),
             write_session: None,
             fragment_profiles: vec![
                 crate::query_execution::profile::FragmentProfileTree::unattributed(
@@ -312,7 +312,7 @@ fn outcome_factory_rejects_intent_mismatch() {
 #[test]
 fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     let policy = StatisticsExecutionPolicy::try_new(
-        StatisticsExecutionMode::ProcessJobAttempt,
+        StatisticsExecutionMode::BackgroundCollectionAttempt,
         std::time::Duration::from_secs(30 * 60),
     )
     .expect("maximum durable policy");
@@ -323,7 +323,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::ProcessJobAttempt,
+            StatisticsExecutionMode::BackgroundCollectionAttempt,
             std::time::Duration::from_secs(30 * 60 + 1),
         )
         .is_ok(),
@@ -331,7 +331,7 @@ fn durable_statistics_attempt_ignores_statement_cancellation_and_is_bounded() {
     );
     assert!(
         StatisticsExecutionPolicy::try_new(
-            StatisticsExecutionMode::ProcessJobAttempt,
+            StatisticsExecutionMode::BackgroundCollectionAttempt,
             std::time::Duration::ZERO,
         )
         .is_err()
@@ -347,7 +347,7 @@ fn profile_outcome_preserves_fragment_profiles() {
     );
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Profile)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: novarocks_query_application::api::build_string_query_result(
                 "status",
                 vec!["profiled".to_string()],
             )
@@ -369,7 +369,7 @@ fn profile_outcome_preserves_fragment_profiles() {
 fn result_outcome_preserves_query_result() {
     let outcome = QueryOutcomeFactory::new(DistributedQueryIntent::Result)
         .from_execution_result(crate::query_execution::outcome::QueryExecutionResult {
-            query_result: crate::runtime::query_result::build_string_query_result(
+            query_result: novarocks_query_application::api::build_string_query_result(
                 "value",
                 vec!["kept".to_string()],
             )
@@ -402,7 +402,7 @@ impl DistributedQueryCoordinator for RecordingCoordinator {
         request
             .into_parts()
             .completion
-            .result(crate::runtime::query_result::QueryResult::empty())
+            .result(novarocks_query_application::api::QueryResult::empty())
     }
 }
 

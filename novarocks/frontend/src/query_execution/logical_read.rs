@@ -20,7 +20,7 @@
 use novarocks_query_application::api::QueryExecutionFuture;
 use novarocks_workload_control::WorkOwner;
 
-use crate::query_execution::PreparedLogicalRead;
+use crate::query_execution::completion::PreparedLogicalRead;
 
 /// Production composition injects one implementation backed by the process
 /// Query Application runtime. The SQL session transfers the complete prepared

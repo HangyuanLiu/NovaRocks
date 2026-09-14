@@ -51,17 +51,18 @@
 use std::sync::{Arc, atomic::AtomicBool};
 
 use arrow::array::{ArrayRef, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::DataType;
 
 use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::storage_observation::{
     MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
 };
-use crate::runtime::query_result::{QueryResult, QueryResultColumn, record_batch_to_chunk};
-use crate::runtime::statement_result::StatementResult;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
+use novarocks_query_application::api::{
+    QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
+};
+use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
@@ -132,7 +133,8 @@ pub(crate) struct ImvStatelessRebuildRequest {
 /// versions and next-run bookkeeping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MvRebuildEquivalenceSnapshot {
-    query_definition: crate::common::persisted_query_definition::PersistedQueryDefinition,
+    query_definition:
+        novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
     base_table_refs: Vec<String>,
     primary_key_columns: Vec<String>,
     schema_contract: crate::mv::domain::persistence::schema::MvSchemaContract,
@@ -538,25 +540,12 @@ fn build_query_result(
     columns: Vec<QueryResultColumn>,
     arrays: Vec<ArrayRef>,
 ) -> Result<QueryResult, String> {
-    let fields = columns
-        .iter()
-        .map(|column| Field::new(&column.name, column.data_type.clone(), column.nullable))
-        .collect::<Vec<_>>();
-    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
-        .map_err(|e| format!("build stateless rebuild result failed: {e}"))?;
-    Ok(QueryResult {
-        columns,
-        chunks: vec![record_batch_to_chunk(batch)?],
-    })
+    build_arrow_query_result(columns, arrays)
+        .map_err(|e| format!("build stateless rebuild result failed: {e}"))
 }
 
 fn column(name: &str, nullable: bool) -> QueryResultColumn {
-    QueryResultColumn {
-        name: name.to_string(),
-        data_type: DataType::Utf8,
-        nullable,
-        logical_type: None,
-    }
+    QueryResultColumn::new(name, DataType::Utf8, nullable, None)
 }
 
 #[cfg(test)]

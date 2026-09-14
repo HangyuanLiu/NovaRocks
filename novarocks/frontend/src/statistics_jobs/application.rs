@@ -18,7 +18,9 @@
 //! Typed frontend application contract for unified statistics commands.
 //!
 //! This module deliberately contains no parser AST or raw-SQL interception.
-//! The frontend owns target resolution, current-process job state, and worker composition.
+//! The frontend owns SQL/connector adaptation and target resolution. The
+//! statistics application crate owns current-process job state and worker
+//! composition.
 
 use std::fmt;
 use std::sync::Arc;
@@ -37,6 +39,8 @@ use novarocks_spi::connector::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+
+use novarocks_statistics_application::StatisticsPublicationTerminal;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatisticsTableTarget {
@@ -98,16 +102,6 @@ pub trait StatisticsTargetResolver: Send + Sync {
     ) -> Result<StatisticsTargetCapture, StatisticsApplicationError>;
 }
 
-/// Frontend composition sink installed before engine open. Frontend composition calls it once
-/// after connector control is ready, so ANALYZE submission can resolve and
-/// persist a pin without giving the durable worker a resolver.
-pub trait StatisticsTargetResolverSink: Send + Sync {
-    fn bind_statistics_target_resolver(
-        &self,
-        resolver: Arc<dyn StatisticsTargetResolver>,
-    ) -> Result<(), String>;
-}
-
 /// Read-only frontend table-statistics surface. Unlike ANALYZE submission, it is
 /// intentionally short-lived and resolves its latest table
 /// metadata only for this one short-lived read.
@@ -117,36 +111,6 @@ pub trait StatisticsTableReader: Send + Sync {
         target: &StatisticsTableTarget,
         context: ConnectorRequestContext,
     ) -> Result<Vec<StatisticsTableStatView>, StatisticsApplicationError>;
-}
-
-/// Frontend composition sink installed alongside the target resolver. The
-/// frontend adapts this typed result for the SQL application port; it never
-/// receives a raw SQL string or an optimizer/provider handle.
-pub trait StatisticsTableReaderSink: Send + Sync {
-    fn bind_statistics_table_reader(
-        &self,
-        reader: Arc<dyn StatisticsTableReader>,
-    ) -> Result<(), String>;
-}
-
-/// Frontend-owned implementation of provider-native collection and
-/// publication. One consuming call owns the session from provider begin through
-/// ordinary distributed execution and the single external finish attempt.
-pub trait StatisticsAttemptExecutor: Send + Sync {
-    fn execute(
-        &self,
-        request: &StatisticsAttemptRequest,
-        cancellation: crate::common::query_cancellation::QueryCancellationView,
-    ) -> Result<(), StatisticsApplicationError>;
-}
-
-/// Composition sink used after the frontend has installed connector control and the
-/// native coordinator.
-pub trait StatisticsAttemptExecutorSink: Send + Sync {
-    fn bind_statistics_attempt_executor(
-        &self,
-        executor: Arc<dyn StatisticsAttemptExecutor>,
-    ) -> Result<(), String>;
 }
 
 pub struct ConnectorStatisticsTargetResolver {
@@ -523,12 +487,6 @@ pub enum StatisticsApplicationResult {
     /// The job was accepted and left running: the statement did not wait for
     /// it, so its outcome is not known yet.
     JobSubmitted(StatisticsJobView),
-    /// The statement waited and the job reached a terminal state.
-    ///
-    /// This is deliberately not the same answer as `JobSubmitted`. A waited
-    /// statement knows whether the work succeeded, and collapsing the two
-    /// would report a job that failed as a statement that worked.
-    JobCompleted(StatisticsJobView),
     JobCancellationRequested(StatisticsJobView),
     AnalyzeJobs(Vec<StatisticsJobView>),
     TableStats(Vec<StatisticsTableStatView>),
@@ -562,15 +520,6 @@ pub struct StatisticsApplicationError {
     message: String,
     publication_terminal: Option<StatisticsPublicationTerminal>,
     target_binding_failure: Option<ConnectorTableObjectBindingFailure>,
-}
-
-/// Exact publication classification carried across the current attempt only.
-/// It is terminal diagnostics, never a request to recover or reconcile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StatisticsPublicationTerminal {
-    KnownUncommitted,
-    KnownCommittedFinalization,
-    CommitUnknown,
 }
 
 impl StatisticsApplicationError {

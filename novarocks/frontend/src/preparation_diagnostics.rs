@@ -30,7 +30,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::query_execution::control::StatementToken;
+use novarocks_query_application::session_control::StatementToken;
 use novarocks_types::{QueryExecutionId, QueryId};
 
 pub(crate) const CONTROL_SECRET_ENV: &str = "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET";

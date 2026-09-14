@@ -57,8 +57,8 @@ pub(crate) fn cancel_with_manager(finst_id: UniqueId, mgr: std::sync::Arc<QueryC
 #[cfg(test)]
 mod tests {
     use super::cancel_runtime_fragment;
-    use crate::runtime::query_context::{QueryId, query_context_manager};
-    use novarocks_types::UniqueId;
+    use crate::runtime::query_context::query_context_manager;
+    use novarocks_types::{QueryId, UniqueId};
 
     #[test]
     fn cancel_fans_out_to_query_fragment_peers() {

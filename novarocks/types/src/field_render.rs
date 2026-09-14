@@ -32,6 +32,15 @@ use crate::largeint;
 use crate::value::variant::VariantValue;
 use crate::{FieldRenderSchema, PrimitiveType};
 
+/// Returns whether an Arrow `Date32` value carries NovaRocks's zero-date sentinel.
+///
+/// The sentinel is a rendering fact shared by every protocol adapter; it is not
+/// an execution-kernel capability.
+pub fn is_zero_date_sentinel_date32(days: i32) -> bool {
+    NaiveDate::from_num_days_from_ce_opt(719163 + days)
+        .is_some_and(|date| date.year() == -1 && date.month() == 11 && date.day() == 30)
+}
+
 fn format_date32_for_mysql(days: i32) -> String {
     let Some(date) = NaiveDate::from_num_days_from_ce_opt(719163 + days) else {
         return NaiveDate::from_ymd_opt(1970, 1, 1)
@@ -41,7 +50,7 @@ fn format_date32_for_mysql(days: i32) -> String {
     };
 
     // StarRocks renders the zero-date sentinel as 0000-00-00.
-    if date.year() == -1 && date.month() == 11 && date.day() == 30 {
+    if is_zero_date_sentinel_date32(days) {
         "0000-00-00".to_string()
     } else {
         date.format("%Y-%m-%d").to_string()

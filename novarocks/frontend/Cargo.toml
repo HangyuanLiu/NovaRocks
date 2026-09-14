@@ -3,7 +3,6 @@ name = "novarocks-frontend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-build = "build.rs"
 
 [lints]
 workspace = true
@@ -25,7 +24,6 @@ bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
-libc.workspace = true
 novarocks-catalog-application.workspace = true
 novarocks-fs.workspace = true
 novarocks-functions.workspace = true
@@ -41,14 +39,17 @@ novarocks-plan-codec.workspace = true
 novarocks-spi.workspace = true
 novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
+novarocks-mv-application.workspace = true
+novarocks-mysql-adapter.workspace = true
+novarocks-native-adapter.workspace = true
+novarocks-statistics-application.workspace = true
+novarocks-table-maintenance.workspace = true
 novarocks-sql.workspace = true
 novarocks-task-codec.workspace = true
 novarocks-types.workspace = true
 novarocks-user-error.workspace = true
 novarocks-version.workspace = true
 novarocks-workload-control.workspace = true
-mysql_common = "0.32"
-opensrv-mysql = { version = "0.7", default-features = false }
 prost.workspace = true
 regex.workspace = true
 serde = { workspace = true, features = ["derive"] }
@@ -62,6 +63,7 @@ toml.workspace = true
 uuid = { workspace = true, features = ["v7", "serde"] }
 
 [dev-dependencies]
+novarocks-catalog-application = { workspace = true, features = ["test-support"] }
 novarocks-connector-starrocks.workspace = true
 novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-secret.workspace = true
@@ -70,7 +72,3 @@ novarocks-sql = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
-
-[build-dependencies]
-protoc-bin-vendored.workspace = true
-tonic-build.workspace = true

@@ -25,10 +25,10 @@ use crate::mv::domain::persistence::definition::CreateMvDefinitionRequest;
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::persistence::descriptor::MvDescriptorV3;
 use crate::mv::domain::repository::{InitialMvRefreshConfiguration, MvTarget};
-use crate::runtime::query_result::QueryResult;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
 };
+use novarocks_query_application::api::QueryResult;
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
 
 /// Join refresh shape retained until query assembly admits exact connector
@@ -307,6 +307,9 @@ pub enum MvApplicationErrorKind {
     Engine,
     Repository,
     Unavailable,
+    /// The exact pre-dispatch target binding changed before any provider
+    /// effect was emitted. A fresh preparation may be attempted.
+    BindingInvalidated,
     AlreadyActive,
     TargetGone,
     Corruption,

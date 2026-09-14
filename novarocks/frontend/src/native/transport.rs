@@ -14,10 +14,7 @@ use crate::native::fragment_transport::{
     ExpectedOutputSchemaView, FetchOutcome, FragmentDispatcher, decode_fetched_query_batch,
 };
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_native_trust::{
-    AutomaticTlsMaterial, NativeClientAuthInterceptor, NativeEndpointConnector,
-    NativeIncomingAdapter, NativeTlsMaterial,
-};
+use novarocks_native_trust::NativeClientAuthInterceptor;
 use novarocks_proto_codec::catalog::{
     PruneCatalogsOutcome, PruneCatalogsRequest, PruneCatalogsResponse,
 };
@@ -31,7 +28,7 @@ use novarocks_proto_models::novarocks::{
 use novarocks_types::{BackendProcessId, NativeEndpoint, UniqueId};
 
 use super::data_runtime::FrontendDataRuntime;
-use super::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
+use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
@@ -71,61 +68,6 @@ pub(crate) fn prune_catalogs(
         PruneCatalogsOutcome::Accepted => Ok(CatalogPruneDispatchOutcome::Accepted),
         PruneCatalogsOutcome::Rejected { safe_detail } => {
             Ok(CatalogPruneDispatchOutcome::Rejected { safe_detail })
-        }
-    }
-}
-
-/// Server-materialized transport capability consumed by the Frontend role.
-///
-/// It contains no source configuration or filesystem path.  The Server builds
-/// it before role startup and Frontend uses it for every Native dial and the
-/// report listener's incoming stream.
-#[derive(Clone)]
-pub enum FrontendNativeTransport {
-    Plaintext,
-    Automatic(AutomaticTlsMaterial),
-    Pem(NativeTlsMaterial),
-}
-
-impl FrontendNativeTransport {
-    pub fn plaintext() -> Self {
-        Self::Plaintext
-    }
-
-    pub fn automatic(material: AutomaticTlsMaterial) -> Self {
-        Self::Automatic(material)
-    }
-
-    pub fn pem(material: NativeTlsMaterial) -> Self {
-        Self::Pem(material)
-    }
-
-    /// Whether this concrete role-local Native transport encrypts the wire.
-    /// Confidential query-attempt lease material is admitted only through this
-    /// capability, never through an untrusted protobuf claim.
-    pub(crate) const fn permits_confidential_credential_leases(&self) -> bool {
-        matches!(self, Self::Automatic(_) | Self::Pem(_))
-    }
-
-    pub(crate) fn connector(
-        &self,
-        endpoint: NativeEndpoint,
-    ) -> Result<NativeEndpointConnector, String> {
-        match self {
-            Self::Plaintext => Ok(NativeEndpointConnector::plaintext(endpoint)),
-            Self::Automatic(material) => NativeEndpointConnector::automatic(endpoint, material)
-                .map_err(|error| {
-                    format!("construct automatic Native TLS connector failed: {error}")
-                }),
-            Self::Pem(material) => Ok(NativeEndpointConnector::pem(endpoint, material)),
-        }
-    }
-
-    pub(crate) fn incoming_adapter(&self) -> NativeIncomingAdapter {
-        match self {
-            Self::Plaintext => NativeIncomingAdapter::plaintext(),
-            Self::Automatic(material) => NativeIncomingAdapter::automatic(material),
-            Self::Pem(material) => NativeIncomingAdapter::pem(material),
         }
     }
 }
@@ -208,7 +150,7 @@ async fn channel(
     let origin = format!("http://{endpoint}");
     let connector = data_runtime
         .native_transport()
-        .connector(endpoint.clone())
+        .connector_for(endpoint.clone())
         .map_err(|error| {
             ChannelAcquisitionError::fatal(format!(
                 "construct Native endpoint connector failed: {error}"
