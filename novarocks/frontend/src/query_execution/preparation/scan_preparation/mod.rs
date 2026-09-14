@@ -407,10 +407,13 @@ fn prepare_scan_node(
                 )
             })?;
             let materialization = query_table_bindings
-                .scan_materialization(facts.binding())?
-                .ok_or_else(|| {
+                .frozen_read_input(
+                    facts.binding(),
+                    crate::catalog_application::query_bindings::QueryFrozenReadInput::Current,
+                )
+                .map_err(|error| {
                     format!(
-                        "SQL scan binding for '{}.{}.{}' has no scan materialization",
+                        "SQL scan binding for '{}.{}.{}': {error}",
                         facts.identity().catalog(),
                         facts.identity().namespace(),
                         facts.identity().table()
@@ -427,8 +430,12 @@ fn prepare_scan_node(
             let snapshot_id = facts.frozen_snapshot_id().ok_or_else(|| {
                 format!("SQL frozen scan node_id={node_id} has no admitted snapshot file set")
             })?;
-            let materialization = query_table_bindings
-                .frozen_snapshot_materialization(facts.binding(), snapshot_id)?;
+            let materialization = query_table_bindings.frozen_read_input(
+                facts.binding(),
+                crate::catalog_application::query_bindings::QueryFrozenReadInput::Snapshot(
+                    snapshot_id,
+                ),
+            )?;
             ResolvedScanExecution::AdmittedConnectorRead(materialization)
         }
         SqlScanPreparationCategory::FrozenTimestampWithoutAdmittedSnapshot => {
