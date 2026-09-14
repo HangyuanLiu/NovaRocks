@@ -23,6 +23,8 @@ use novarocks_spi::connector::{
     ConnectorTableObjectId,
 };
 
+use super::EffectIdentity;
+
 const MAX_IDENTITY_BYTES: usize = 128;
 const MANAGED_MV_KIND: &str = "materialized-view";
 
@@ -116,6 +118,62 @@ impl ManagedMvTarget {
             return Err(ManagementOwnershipError::WrongObjectKind);
         }
         Ok(())
+    }
+}
+
+/// The responsibility identity minted before a provider can return the
+/// physical object identity for a staged MV CREATE.  Absence is intentional:
+/// this is an exact catalog and logical-table assertion, not a synthetic UUID
+/// for an object the provider has not created yet.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateIntent {
+    catalog: CatalogHandle,
+    table: ConnectorTableIdentity,
+    operation_id: EffectIdentity,
+}
+
+impl CreateIntent {
+    pub fn try_new(
+        catalog: CatalogHandle,
+        table: ConnectorTableIdentity,
+        operation_id: EffectIdentity,
+    ) -> Result<Self, ManagementOwnershipError> {
+        if catalog.catalog_name() != &table.instance_id {
+            return Err(ManagementOwnershipError::TargetCatalogMismatch);
+        }
+        Ok(Self {
+            catalog,
+            table,
+            operation_id,
+        })
+    }
+
+    pub const fn catalog(&self) -> &CatalogHandle {
+        &self.catalog
+    }
+
+    pub const fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    /// A CREATE intent always asserts that the logical target was absent when
+    /// it entered the management FIFO.
+    pub const fn expects_absent(&self) -> bool {
+        true
+    }
+
+    pub const fn operation_id(&self) -> EffectIdentity {
+        self.operation_id
+    }
+
+    pub fn bind_target(
+        &self,
+        target: ManagedMvTarget,
+    ) -> Result<ManagedMvTarget, ManagementOwnershipError> {
+        if target.catalog() != &self.catalog || target.table() != &self.table {
+            return Err(ManagementOwnershipError::TargetReplaced);
+        }
+        Ok(target)
     }
 }
 

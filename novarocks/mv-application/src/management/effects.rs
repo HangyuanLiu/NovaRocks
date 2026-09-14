@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{ManagedMvTarget, ManagementTimestamp, ProcessIncarnation};
+use super::{
+    CreateIntent, ManagedMvTarget, ManagementOwnershipError, ManagementTimestamp,
+    ProcessIncarnation,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EffectIdentity([u8; 16]);
@@ -134,6 +137,71 @@ impl EffectResponsibility {
                 })
             }
         }
+    }
+}
+
+/// A dispatched staged CREATE before the provider has returned its real
+/// object identity. It is deliberately not an `EffectResponsibility`: the
+/// latter requires an exact physical target and callers must not fabricate one
+/// merely to satisfy management bookkeeping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateIntentResponsibility {
+    intent: CreateIntent,
+    dispatching_incarnation: ProcessIncarnation,
+    scope: EffectScope,
+    last_possible_dispatch_at: ManagementTimestamp,
+}
+
+impl CreateIntentResponsibility {
+    pub const fn new(
+        intent: CreateIntent,
+        dispatching_incarnation: ProcessIncarnation,
+        scope: EffectScope,
+        last_possible_dispatch_at: ManagementTimestamp,
+    ) -> Self {
+        Self {
+            intent,
+            dispatching_incarnation,
+            scope,
+            last_possible_dispatch_at,
+        }
+    }
+
+    pub const fn intent(&self) -> &CreateIntent {
+        &self.intent
+    }
+
+    pub const fn identity(&self) -> EffectIdentity {
+        self.intent.operation_id()
+    }
+
+    pub const fn dispatching_incarnation(&self) -> &ProcessIncarnation {
+        &self.dispatching_incarnation
+    }
+
+    pub const fn scope(&self) -> EffectScope {
+        self.scope
+    }
+
+    pub const fn last_possible_dispatch_at(&self) -> ManagementTimestamp {
+        self.last_possible_dispatch_at
+    }
+
+    /// Narrow the pre-object responsibility only after the provider has
+    /// returned its exact target. The operation identity, scope and dispatch
+    /// timestamp remain unchanged.
+    pub fn late_bind(
+        self,
+        target: ManagedMvTarget,
+    ) -> Result<EffectResponsibility, ManagementOwnershipError> {
+        let target = self.intent.bind_target(target)?;
+        Ok(EffectResponsibility::new(
+            self.identity(),
+            target,
+            self.dispatching_incarnation,
+            self.scope,
+            self.last_possible_dispatch_at,
+        ))
     }
 }
 

@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use novarocks_spi::connector::{ConnectorCommittedVersion, ConnectorDocumentManagementObservation};
 
 use super::{
-    DeploymentOwner, EffectIdentity, ManagedMvTarget, ManagementOwnershipError, ProcessIncarnation,
-    ReadmissionPermit, UnsettledEffect,
+    CreateIntent, DeploymentOwner, EffectIdentity, ManagedMvTarget, ManagementOwnershipError,
+    ProcessIncarnation, ReadmissionPermit, UnsettledEffect,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -162,6 +162,59 @@ impl FreshManagementObservation {
 pub struct PendingManagementObservation {
     request_id: ManagementObservationRequestId,
     target: ManagedMvTarget,
+}
+
+/// A one-shot observation capability issued only for a CREATE responsibility
+/// whose stage request was dispatched before a physical object identity was
+/// available. It does not accept a raw target: completion must consume a
+/// sealed provider management observation and verify the original logical
+/// create intent.
+pub struct PendingCreateIntentObservation {
+    intent: CreateIntent,
+}
+
+impl PendingCreateIntentObservation {
+    pub(super) const fn for_intent(intent: CreateIntent) -> Self {
+        Self { intent }
+    }
+
+    pub fn complete(
+        self,
+        observation: &ConnectorDocumentManagementObservation,
+    ) -> Result<FreshCreateIntentObservation, ManagementObservationError> {
+        observation
+            .validate_sealed()
+            .map_err(|_| ManagementObservationError::UnsealedObservation)?;
+        let target = ManagedMvTarget::from_observation(observation)?;
+        let target = self.intent.bind_target(target)?;
+        Ok(FreshCreateIntentObservation {
+            intent: self.intent,
+            target,
+        })
+    }
+}
+
+/// Exact provider observation that may narrow one previously unbound CREATE
+/// intent. It is intentionally consumable and cannot be constructed from a
+/// caller-supplied object id.
+pub struct FreshCreateIntentObservation {
+    intent: CreateIntent,
+    target: ManagedMvTarget,
+}
+
+impl FreshCreateIntentObservation {
+    pub const fn target(&self) -> &ManagedMvTarget {
+        &self.target
+    }
+
+    pub(crate) fn into_parts(self) -> (CreateIntent, ManagedMvTarget) {
+        (self.intent, self.target)
+    }
+
+    #[cfg(test)]
+    pub(super) const fn for_test(intent: CreateIntent, target: ManagedMvTarget) -> Self {
+        Self { intent, target }
+    }
 }
 
 impl PendingManagementObservation {

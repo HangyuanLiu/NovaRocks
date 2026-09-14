@@ -23,8 +23,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::persistence::codec::{
     ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
-    InterpretationDocument, PhysicalFieldLogicalIdentity, PublicationDocument, RefreshPolicy,
-    StateRole,
+    INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY, InterpretationDocument,
+    PhysicalFieldLogicalIdentity, PublicationDocument, RefreshPolicy, StateRole,
+    internal_retraction_count_aggregate_identity,
 };
 use crate::persistence::identity::{
     ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
@@ -375,6 +376,8 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             ));
         }
     }
+    validate_retraction_count_owner(document, &slots)?;
+
     let referenced_slots = document
         .aggregates
         .iter()
@@ -517,6 +520,71 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             .map(|value| value.source_fields.len() + value.state_slot_ids.len())
             .sum::<usize>();
     enforce_item_budget("interpretation", item_count)
+}
+
+fn validate_retraction_count_owner(
+    document: &InterpretationDocument,
+    slots: &BTreeMap<
+        &crate::persistence::identity::StateSlotIdentity,
+        &crate::persistence::codec::StateSlot,
+    >,
+) -> Result<(), ValidationError> {
+    let retraction_slots = slots
+        .values()
+        .filter(|slot| slot.role == StateRole::RetractionCount)
+        .copied()
+        .collect::<Vec<_>>();
+    if retraction_slots.len() > 1 {
+        return Err(ValidationError::new(
+            "interpretation.state_slots",
+            "contains more than one automatic retraction-count state slot",
+        ));
+    }
+
+    let internal_identity = internal_retraction_count_aggregate_identity();
+    let internal_aggregate = document
+        .aggregates
+        .iter()
+        .find(|aggregate| aggregate.aggregate_id == internal_identity);
+
+    let Some(retraction_slot) = retraction_slots.first() else {
+        if internal_aggregate.is_some() {
+            return Err(ValidationError::new(
+                "interpretation.aggregates",
+                "the canonical internal retraction-count aggregate requires an automatic retraction-count state slot",
+            ));
+        }
+        return Ok(());
+    };
+
+    let internal_aggregate = internal_aggregate.ok_or_else(|| {
+        ValidationError::new(
+            "interpretation.aggregates",
+            "an automatic retraction-count state slot requires the canonical internal count aggregate owner",
+        )
+    })?;
+    if internal_aggregate.function_identity != INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY
+        || !internal_aggregate.source_fields.is_empty()
+        || internal_aggregate.state_slot_ids.as_slice() != [retraction_slot.slot_id.clone()]
+    {
+        return Err(ValidationError::new(
+            "interpretation.aggregates",
+            "the canonical internal retraction-count aggregate must be COUNT(*) and own exactly its automatic retraction-count state slot",
+        ));
+    }
+    if document.aggregates.iter().any(|aggregate| {
+        aggregate.aggregate_id != internal_identity
+            && aggregate
+                .state_slot_ids
+                .iter()
+                .any(|slot_id| slot_id == &retraction_slot.slot_id)
+    }) {
+        return Err(ValidationError::new(
+            "interpretation.aggregate.state_slot_ids",
+            "only the canonical internal retraction-count aggregate may reference the automatic retraction-count state slot",
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_publication(document: &PublicationDocument) -> Result<(), ValidationError> {

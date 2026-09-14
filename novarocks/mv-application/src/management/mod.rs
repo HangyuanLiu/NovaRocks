@@ -28,20 +28,21 @@ mod ownership;
 mod readmission;
 
 pub use admission::{
-    ManagementAdmissionError, ManagementDependencySet, ManagementEntrance, ManagementEntranceLease,
-    ManagementEntranceTicket, ManagementRequest,
+    AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
+    ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
 };
 pub use effects::{
-    EffectDisposition, EffectIdentity, EffectPath, EffectResponsibility, EffectScope,
-    EffectTerminalFact, UnsettledEffect,
+    CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,
+    EffectResponsibility, EffectScope, EffectTerminalFact, UnsettledEffect,
 };
 pub use observation::{
-    FreshManagementObservation, ManagementContinuation, ManagementObservationError,
-    ManagementObservationPhase, ManagementObservationRequestId, ManagementObservationState,
-    PendingManagementObservation, RegistrationRequirement,
+    FreshCreateIntentObservation, FreshManagementObservation, ManagementContinuation,
+    ManagementObservationError, ManagementObservationPhase, ManagementObservationRequestId,
+    ManagementObservationState, PendingCreateIntentObservation, PendingManagementObservation,
+    RegistrationRequirement,
 };
 pub use ownership::{
-    DeploymentOwner, ManagedMvTarget, ManagementOwnershipError, ProcessIncarnation,
+    CreateIntent, DeploymentOwner, ManagedMvTarget, ManagementOwnershipError, ProcessIncarnation,
 };
 pub use readmission::{
     ActualCompletionEvidence, GarbageCollectionSafetyPolicy, IsolationEvidence, ManagementClock,

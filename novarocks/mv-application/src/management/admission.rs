@@ -29,11 +29,15 @@ use crate::activity::{
     MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
 
-use super::observation::{ManagementObservationAuthorization, ManagementObservationLiveness};
+use super::observation::{
+    FreshCreateIntentObservation, ManagementObservationAuthorization,
+    ManagementObservationLiveness, PendingCreateIntentObservation,
+};
 use super::{
-    DeploymentOwner, EffectDisposition, EffectResponsibility, EffectScope, ManagedMvTarget,
-    ManagementContinuation, ManagementObservationError, ManagementObservationPhase,
-    ManagementObservationState, ProcessIncarnation, UnsettledEffect,
+    CreateIntent, CreateIntentResponsibility, DeploymentOwner, EffectDisposition, EffectIdentity,
+    EffectResponsibility, EffectScope, ManagedMvTarget, ManagementContinuation,
+    ManagementObservationError, ManagementObservationPhase, ManagementObservationState,
+    ProcessIncarnation, UnsettledEffect,
 };
 
 /// Exact MV-domain dependencies frozen before a long computation. Reacquiring
@@ -70,6 +74,8 @@ pub struct ManagementRequest {
     operation: ConnectorDocumentManagementOperation,
     expected_dependencies: Option<ManagementDependencySet>,
     effect_scope: EffectScope,
+    frozen_effect_identity: Option<EffectIdentity>,
+    create_intent: Option<CreateIntent>,
 }
 
 impl ManagementRequest {
@@ -81,11 +87,10 @@ impl ManagementRequest {
         expected_dependencies: Option<ManagementDependencySet>,
         effect_scope: EffectScope,
     ) -> Result<Self, ManagementAdmissionError> {
-        if catalog.catalog_name() != &table.instance_id
-            || (operation == ConnectorDocumentManagementOperation::Create)
-                == expected_object_id.is_some()
-            || (operation == ConnectorDocumentManagementOperation::Create)
-                == expected_dependencies.is_some()
+        if operation == ConnectorDocumentManagementOperation::Create
+            || catalog.catalog_name() != &table.instance_id
+            || expected_object_id.is_none()
+            || expected_dependencies.is_none()
         {
             return Err(ManagementAdmissionError::InvalidRequest);
         }
@@ -96,7 +101,42 @@ impl ManagementRequest {
             operation,
             expected_dependencies,
             effect_scope,
+            frozen_effect_identity: None,
+            create_intent: None,
         })
+    }
+
+    /// Construct the only admission request that can cross the first staged
+    /// CREATE side effect. The caller owns the identity before any provider
+    /// call; no physical object identity is guessed here.
+    pub fn for_create_intent(intent: CreateIntent, effect_scope: EffectScope) -> Self {
+        Self {
+            catalog: intent.catalog().clone(),
+            table: intent.table().clone(),
+            expected_object_id: None,
+            operation: ConnectorDocumentManagementOperation::Create,
+            expected_dependencies: None,
+            effect_scope,
+            frozen_effect_identity: Some(intent.operation_id()),
+            create_intent: Some(intent),
+        }
+    }
+
+    /// One automatic-maintenance action is one management effect. Its exact
+    /// current observation/dependencies and caller-frozen identity must be
+    /// reacquired for every action; it cannot be reused as an attempt-wide
+    /// composite lease.
+    pub fn for_automatic_maintenance(effect: AutomaticMaintenanceEffect) -> Self {
+        Self {
+            catalog: effect.target.catalog().clone(),
+            table: effect.target.table().clone(),
+            expected_object_id: Some(effect.target.object_id().clone()),
+            operation: ConnectorDocumentManagementOperation::SingleTargetUpdate,
+            expected_dependencies: Some(effect.dependencies),
+            effect_scope: effect.scope,
+            frozen_effect_identity: Some(effect.operation_id),
+            create_intent: None,
+        }
     }
 
     pub const fn catalog(&self) -> &CatalogHandle {
@@ -112,6 +152,40 @@ impl ManagementRequest {
     }
 }
 
+/// Typed exact input for one automatic durable action. The frontend adapter
+/// supplies a newly observed target and dependencies for each action.
+#[derive(Clone, Debug)]
+pub struct AutomaticMaintenanceEffect {
+    target: ManagedMvTarget,
+    dependencies: ManagementDependencySet,
+    operation_id: EffectIdentity,
+    scope: EffectScope,
+}
+
+impl AutomaticMaintenanceEffect {
+    pub const fn new(
+        target: ManagedMvTarget,
+        dependencies: ManagementDependencySet,
+        operation_id: EffectIdentity,
+        scope: EffectScope,
+    ) -> Self {
+        Self {
+            target,
+            dependencies,
+            operation_id,
+            scope,
+        }
+    }
+
+    pub const fn target(&self) -> &ManagedMvTarget {
+        &self.target
+    }
+
+    pub const fn operation_id(&self) -> EffectIdentity {
+        self.operation_id
+    }
+}
+
 #[derive(Clone)]
 pub struct ManagementEntrance {
     inner: Arc<EntranceInner>,
@@ -122,6 +196,7 @@ struct EntranceInner {
     incarnation: ProcessIncarnation,
     activity: MvActivityGate,
     state: Mutex<HashMap<ConnectorTableIdentity, TargetAdmissionState>>,
+    unbound_create: Mutex<HashMap<ConnectorTableIdentity, CreateIntentResponsibility>>,
 }
 
 struct TargetAdmissionState {
@@ -143,6 +218,7 @@ impl ManagementEntrance {
                 incarnation,
                 activity: MvActivityGate::new(),
                 state: Mutex::new(HashMap::new()),
+                unbound_create: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -421,6 +497,23 @@ impl ManagementEntrance {
             .ok_or(ManagementAdmissionError::Cancelled)
     }
 
+    /// Acquire one automatic action through the same FIFO as every other MV
+    /// management effect. The action carrier is intentionally consumed here so
+    /// callers must construct a fresh exact observation and operation identity
+    /// before attempting the next durable action.
+    pub fn acquire_automatic_maintenance(
+        &self,
+        effect: AutomaticMaintenanceEffect,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<ManagementEntranceLease, ManagementAdmissionError> {
+        self.request(
+            ManagementRequest::for_automatic_maintenance(effect),
+            MvActivityOwner::AutomaticMaintenance,
+        )?
+        .acquire_waiting(cancelled)?
+        .ok_or(ManagementAdmissionError::Cancelled)
+    }
+
     pub fn begin_stopping(&self) {
         self.inner.activity.begin_stopping();
     }
@@ -432,6 +525,56 @@ impl ManagementEntrance {
             .get(table)
             .map(|state| state.unsettled.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Issue the only capability that can turn an unbound staged CREATE into
+    /// an exact target. The caller must perform a fresh provider observation
+    /// and complete this token; a raw object id cannot resolve a lost staged
+    /// response.
+    pub fn begin_unbound_create_observation(
+        &self,
+        intent: &CreateIntent,
+    ) -> Result<PendingCreateIntentObservation, ManagementObservationError> {
+        match lock(&self.inner.unbound_create).get(intent.table()) {
+            Some(responsibility) if responsibility.intent() == intent => {
+                Ok(PendingCreateIntentObservation::for_intent(intent.clone()))
+            }
+            _ => Err(ManagementObservationError::ObservationNotAllowed),
+        }
+    }
+
+    /// Convert a fresh, matching observation of a previously unbound CREATE
+    /// into the same exact Unknown responsibility used by normal readmission.
+    /// The original operation id, scope, incarnation, and dispatch timestamp
+    /// are retained; this does not invent a new create attempt.
+    pub fn resolve_unbound_create_as_unknown(
+        &self,
+        observation: FreshCreateIntentObservation,
+    ) -> Result<ManagedMvTarget, ManagementAdmissionError> {
+        let (intent, target) = observation.into_parts();
+        let responsibility = {
+            let unbound = lock(&self.inner.unbound_create);
+            match unbound.get(intent.table()) {
+                Some(responsibility) if responsibility.intent() == &intent => {
+                    responsibility.clone()
+                }
+                _ => return Err(ManagementAdmissionError::ReadmissionIncomplete),
+            }
+        };
+        let exact = responsibility
+            .clone()
+            .late_bind(target.clone())
+            .map_err(|_| ManagementAdmissionError::TargetReplaced)?;
+        let removed = lock(&self.inner.unbound_create).remove(intent.table());
+        if removed.as_ref() != Some(&responsibility) {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        let weak = Arc::downgrade(&self.inner);
+        if let Err(error) = record_unsettled(&weak, exact) {
+            lock(&self.inner.unbound_create).insert(intent.table().clone(), responsibility);
+            return Err(error);
+        }
+        Ok(target)
     }
 }
 
@@ -500,7 +643,12 @@ pub struct ManagementEntranceLease {
     entrance: Weak<EntranceInner>,
     request: ManagementRequest,
     activity: Option<MvActivityLease>,
-    dispatched: Option<EffectResponsibility>,
+    dispatched: Option<DispatchedEffect>,
+}
+
+enum DispatchedEffect {
+    Exact(EffectResponsibility),
+    CreateIntent(CreateIntentResponsibility),
 }
 
 impl ManagementEntranceLease {
@@ -525,9 +673,14 @@ impl ManagementEntranceLease {
             .entrance
             .upgrade()
             .ok_or(ManagementAdmissionError::EntranceDropped)?;
-        if self.dispatched.is_some()
+        if self.request.create_intent.is_some()
+            || self.dispatched.is_some()
             || self.request.effect_scope != responsibility.scope()
             || responsibility.dispatching_incarnation() != &entrance.incarnation
+            || self
+                .request
+                .frozen_effect_identity
+                .is_some_and(|identity| identity != responsibility.identity())
         {
             return Err(ManagementAdmissionError::InvalidEffect);
         }
@@ -578,7 +731,76 @@ impl ManagementEntranceLease {
                 }
             }
         }
-        self.dispatched = Some(responsibility);
+        self.dispatched = Some(DispatchedEffect::Exact(responsibility));
+        Ok(())
+    }
+
+    /// Mark the single CREATE responsibility immediately before the first
+    /// staged provider call, when no physical object identity exists yet.
+    /// The lease remains responsible for the stage, final publish, abort, and
+    /// any Unknown outcome; [`Self::late_bind_create_target`] only narrows the
+    /// target after the provider supplies the exact object.
+    pub fn mark_create_intent_dispatched(
+        &mut self,
+        last_possible_dispatch_at: super::ManagementTimestamp,
+    ) -> Result<(), ManagementAdmissionError> {
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let intent = self
+            .request
+            .create_intent
+            .clone()
+            .ok_or(ManagementAdmissionError::InvalidEffect)?;
+        if self.dispatched.is_some()
+            || self.request.frozen_effect_identity != Some(intent.operation_id())
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        let responsibility = CreateIntentResponsibility::new(
+            intent.clone(),
+            entrance.incarnation.clone(),
+            self.request.effect_scope,
+            last_possible_dispatch_at,
+        );
+        let mut unbound = lock(&entrance.unbound_create);
+        if unbound.contains_key(intent.table())
+            || lock(&entrance.state).contains_key(intent.table())
+        {
+            return Err(ManagementAdmissionError::ReadmissionIncomplete);
+        }
+        unbound.insert(intent.table().clone(), responsibility.clone());
+        self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
+        Ok(())
+    }
+
+    /// Bind the provider-returned exact target without changing the already
+    /// frozen effect identity, scope, incarnation, or dispatch timestamp.
+    pub fn late_bind_create_target(
+        &mut self,
+        target: ManagedMvTarget,
+    ) -> Result<(), ManagementAdmissionError> {
+        let entrance = self
+            .entrance
+            .upgrade()
+            .ok_or(ManagementAdmissionError::EntranceDropped)?;
+        let Some(DispatchedEffect::CreateIntent(intent_responsibility)) = self.dispatched.take()
+        else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        let exact = intent_responsibility
+            .clone()
+            .late_bind(target)
+            .map_err(|_| ManagementAdmissionError::TargetReplaced)?;
+        let mut unbound = lock(&entrance.unbound_create);
+        match unbound.get(intent_responsibility.intent().table()) {
+            Some(current) if current == &intent_responsibility => {
+                unbound.remove(intent_responsibility.intent().table());
+            }
+            _ => return Err(ManagementAdmissionError::ReadmissionIncomplete),
+        }
+        self.dispatched = Some(DispatchedEffect::Exact(exact));
         Ok(())
     }
 
@@ -586,10 +808,33 @@ impl ManagementEntranceLease {
         mut self,
         disposition: EffectDisposition,
     ) -> Result<(), ManagementAdmissionError> {
-        let responsibility = self
+        let dispatched = self
             .dispatched
             .take()
             .ok_or(ManagementAdmissionError::EffectNotDispatched)?;
+        let responsibility = match dispatched {
+            DispatchedEffect::Exact(responsibility) => responsibility,
+            DispatchedEffect::CreateIntent(responsibility) => {
+                if disposition == EffectDisposition::KnownUncommitted {
+                    let entrance = self
+                        .entrance
+                        .upgrade()
+                        .ok_or(ManagementAdmissionError::EntranceDropped)?;
+                    let removed =
+                        lock(&entrance.unbound_create).remove(responsibility.intent().table());
+                    if removed.as_ref() != Some(&responsibility) {
+                        return Err(ManagementAdmissionError::ReadmissionIncomplete);
+                    }
+                    self.activity.take();
+                    return Ok(());
+                }
+                // The physical target is still unknown. Preserve the
+                // unbound responsibility on Drop and require an exact
+                // provider observation before any terminal other than abort.
+                self.dispatched = Some(DispatchedEffect::CreateIntent(responsibility));
+                return Err(ManagementAdmissionError::CreateTargetNotBound);
+            }
+        };
         match disposition {
             EffectDisposition::KnownCommitted => {
                 record_committed(&self.entrance, responsibility)?;
@@ -647,8 +892,17 @@ fn record_committed(
 
 impl Drop for ManagementEntranceLease {
     fn drop(&mut self) {
-        if let Some(responsibility) = self.dispatched.take() {
-            let _ = record_unsettled(&self.entrance, responsibility);
+        if let Some(dispatched) = self.dispatched.take() {
+            match dispatched {
+                DispatchedEffect::Exact(responsibility) => {
+                    let _ = record_unsettled(&self.entrance, responsibility);
+                }
+                DispatchedEffect::CreateIntent(_) => {
+                    // The unbound intent was registered before the provider
+                    // call. Leaving it in place is the conservative Unknown
+                    // barrier until an exact target can be observed and bound.
+                }
+            }
         }
     }
 }
@@ -665,6 +919,7 @@ pub enum ManagementAdmissionError {
     ReadmissionIncomplete,
     InvalidEffect,
     EffectNotDispatched,
+    CreateTargetNotBound,
     EntranceDropped,
 }
 
@@ -681,6 +936,7 @@ impl fmt::Display for ManagementAdmissionError {
             Self::ReadmissionIncomplete => "MV management readmission is incomplete",
             Self::InvalidEffect => "external effect does not match its management admission",
             Self::EffectNotDispatched => "external effect was not marked dispatched",
+            Self::CreateTargetNotBound => "staged create has no exact provider target to settle",
             Self::EntranceDropped => "MV management entrance no longer exists",
         };
         formatter.write_str(message)
@@ -710,6 +966,9 @@ fn validate_request_against_state(
     entrance: &EntranceInner,
     request: &ManagementRequest,
 ) -> Result<(), ManagementAdmissionError> {
+    if lock(&entrance.unbound_create).contains_key(&request.table) {
+        return Err(ManagementAdmissionError::EffectUnsettled);
+    }
     let mut state = lock(&entrance.state);
     match request.operation {
         ConnectorDocumentManagementOperation::Create => {

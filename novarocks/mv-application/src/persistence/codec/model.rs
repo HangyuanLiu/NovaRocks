@@ -31,6 +31,24 @@ use novarocks_query_application::persisted_query_definition::{
 
 pub const MV_PERSISTENCE_FORMAT_VERSION: u32 = 1;
 
+/// The versioned durable identity of the system aggregate that owns the
+/// automatically added retraction-count state. It is intentionally distinct
+/// from every user-authored `COUNT(*)` aggregate.
+const INTERNAL_RETRACTION_COUNT_AGGREGATE_IDENTITY_V1: &[u8] =
+    b"novarocks.mv.internal.aggregate.retraction-count.v1";
+
+/// The SQL aggregate vocabulary persisted for the internal retraction-count
+/// owner. An empty source-field list makes this a canonical internal
+/// `COUNT(*)`, never a user `COUNT(column)`.
+pub const INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY: &str = "count";
+
+/// Returns the one versioned identity permitted to own an automatic
+/// retraction-count state slot.
+pub fn internal_retraction_count_aggregate_identity() -> AggregateIdentity {
+    AggregateIdentity::try_new(INTERNAL_RETRACTION_COUNT_AGGREGATE_IDENTITY_V1.to_vec())
+        .expect("the fixed internal retraction-count aggregate identity is valid")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefinitionDocument {
     pub query: QuerySource,

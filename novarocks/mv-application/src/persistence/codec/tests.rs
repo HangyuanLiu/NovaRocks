@@ -225,6 +225,84 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
     }
 }
 
+fn retraction_count_interpretation(definition: &EncodedDocument) -> InterpretationDocument {
+    let mut interpretation = sample_interpretation(definition);
+    interpretation.state_slots = vec![
+        StateSlot {
+            slot_id: state_slot_id(41),
+            target_field_id: field_id(32),
+            type_signature: "binary".to_string(),
+            nullable: false,
+            role: StateRole::Single,
+            encoding: StateEncoding::NativeColumnV1,
+        },
+        StateSlot {
+            slot_id: state_slot_id(42),
+            target_field_id: field_id(33),
+            type_signature: "bigint".to_string(),
+            nullable: false,
+            role: StateRole::RetractionCount,
+            encoding: StateEncoding::NativeColumnV1,
+        },
+    ];
+    interpretation.aggregates = vec![
+        AggregateInterpretation {
+            aggregate_id: aggregate_id(51),
+            function_identity: "sum".to_string(),
+            source_fields: vec![SourceFieldReference {
+                occurrence_id: 7,
+                field_id: field_id(2),
+            }],
+            state_slot_ids: vec![state_slot_id(41)],
+        },
+        AggregateInterpretation {
+            aggregate_id: internal_retraction_count_aggregate_identity(),
+            function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
+            source_fields: Vec::new(),
+            state_slot_ids: vec![state_slot_id(42)],
+        },
+    ];
+    interpretation.target.fields = vec![
+        physical(
+            PhysicalFieldLogicalIdentity::Output(output_id(21)),
+            31,
+            "decimal(18,2)",
+            true,
+        ),
+        physical(
+            PhysicalFieldLogicalIdentity::State(state_slot_id(41)),
+            32,
+            "binary",
+            false,
+        ),
+        physical(
+            PhysicalFieldLogicalIdentity::State(state_slot_id(42)),
+            33,
+            "bigint",
+            false,
+        ),
+        physical(
+            PhysicalFieldLogicalIdentity::ApplyKey(apply_key_id(44)),
+            34,
+            "binary",
+            false,
+        ),
+        physical(
+            PhysicalFieldLogicalIdentity::Branch(branch_id(61)),
+            35,
+            "integer",
+            false,
+        ),
+        physical(
+            PhysicalFieldLogicalIdentity::Branch(branch_id(62)),
+            35,
+            "integer",
+            false,
+        ),
+    ];
+    interpretation
+}
+
 fn sample_publication(
     definition: &EncodedDocument,
     interpretation: &EncodedDocument,
@@ -620,6 +698,160 @@ fn aggregate_state_roles_are_exhaustive_for_avg_and_forbidden_elsewhere() {
             .to_string()
             .contains("distinct physical target fields")
     );
+}
+
+#[test]
+fn canonical_internal_count_owns_the_automatic_retraction_count_state() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let interpretation = retraction_count_interpretation(&definition);
+
+    assert_eq!(
+        internal_retraction_count_aggregate_identity().as_bytes(),
+        b"novarocks.mv.internal.aggregate.retraction-count.v1"
+    );
+
+    let encoded = encode_interpretation(&interpretation).expect("canonical internal owner");
+    let restored = decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default())
+        .expect("canonical internal owner round trip");
+    let internal = restored
+        .aggregates
+        .iter()
+        .find(|aggregate| aggregate.aggregate_id == internal_retraction_count_aggregate_identity())
+        .expect("canonical internal aggregate");
+    assert_eq!(
+        internal.function_identity,
+        INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY
+    );
+    assert!(internal.source_fields.is_empty());
+    assert_eq!(internal.state_slot_ids, vec![state_slot_id(42)]);
+}
+
+#[test]
+fn automatic_retraction_count_state_requires_its_canonical_internal_owner() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+
+    let mut missing_owner = retraction_count_interpretation(&definition);
+    missing_owner.aggregates.pop();
+    let error = encode_interpretation(&missing_owner)
+        .expect_err("automatic retraction state requires its canonical owner");
+    assert!(
+        error
+            .to_string()
+            .contains("requires the canonical internal count aggregate owner")
+    );
+
+    let mut shared_by_user = retraction_count_interpretation(&definition);
+    shared_by_user.aggregates[0]
+        .state_slot_ids
+        .push(state_slot_id(42));
+    let error = encode_interpretation(&shared_by_user)
+        .expect_err("a user aggregate cannot share the internal state");
+    assert!(
+        error
+            .to_string()
+            .contains("only the canonical internal retraction-count aggregate")
+    );
+
+    let mut internal_owns_normal_state = retraction_count_interpretation(&definition);
+    internal_owns_normal_state.aggregates[1]
+        .state_slot_ids
+        .push(state_slot_id(41));
+    let error = encode_interpretation(&internal_owns_normal_state)
+        .expect_err("the internal owner cannot own a normal state");
+    assert!(
+        error
+            .to_string()
+            .contains("must be COUNT(*) and own exactly its automatic retraction-count state slot")
+    );
+
+    let mut multiple_automatic_states = retraction_count_interpretation(&definition);
+    multiple_automatic_states.state_slots.push(StateSlot {
+        slot_id: state_slot_id(43),
+        target_field_id: field_id(36),
+        type_signature: "bigint".to_string(),
+        nullable: false,
+        role: StateRole::RetractionCount,
+        encoding: StateEncoding::NativeColumnV1,
+    });
+    multiple_automatic_states.target.fields.push(physical(
+        PhysicalFieldLogicalIdentity::State(state_slot_id(43)),
+        36,
+        "bigint",
+        false,
+    ));
+    let error = encode_interpretation(&multiple_automatic_states)
+        .expect_err("only one automatic retraction state is permitted");
+    assert!(
+        error
+            .to_string()
+            .contains("contains more than one automatic retraction-count state slot")
+    );
+}
+
+#[test]
+fn canonical_internal_owner_is_forbidden_without_an_automatic_state() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let mut interpretation = retraction_count_interpretation(&definition);
+    interpretation
+        .state_slots
+        .retain(|slot| slot.slot_id != state_slot_id(42));
+    interpretation.target.fields.retain(|field| {
+        !matches!(
+            field.logical_identity,
+            PhysicalFieldLogicalIdentity::State(ref slot_id) if slot_id == &state_slot_id(42)
+        )
+    });
+    interpretation.aggregates[1].state_slot_ids = vec![state_slot_id(41)];
+    let error = encode_interpretation(&interpretation)
+        .expect_err("internal aggregate without automatic state must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("requires an automatic retraction-count state slot")
+    );
+}
+
+#[test]
+fn user_count_without_automatic_retraction_state_remains_normal() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let mut interpretation = sample_interpretation(&definition);
+    interpretation.state_slots = vec![StateSlot {
+        slot_id: state_slot_id(41),
+        target_field_id: field_id(32),
+        type_signature: "binary".to_string(),
+        nullable: false,
+        role: StateRole::Single,
+        encoding: StateEncoding::NativeColumnV1,
+    }];
+    interpretation.aggregates = vec![AggregateInterpretation {
+        aggregate_id: aggregate_id(51),
+        function_identity: "count".to_string(),
+        source_fields: Vec::new(),
+        state_slot_ids: vec![state_slot_id(41)],
+    }];
+    interpretation.target.fields.retain(|field| {
+        !matches!(
+            field.logical_identity,
+            PhysicalFieldLogicalIdentity::State(ref slot_id) if slot_id == &state_slot_id(42)
+        )
+    });
+    let state = interpretation
+        .target
+        .fields
+        .iter_mut()
+        .find(|field| {
+            matches!(
+                field.logical_identity,
+                PhysicalFieldLogicalIdentity::State(ref slot_id) if slot_id == &state_slot_id(41)
+            )
+        })
+        .expect("normal count state binding");
+    state.target_field_id = field_id(32);
+    state.type_signature = "binary".to_string();
+    state.nullable = false;
+
+    encode_interpretation(&interpretation)
+        .expect("a user COUNT(*) remains a normal aggregate without the internal owner");
 }
 
 #[test]

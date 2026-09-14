@@ -1585,32 +1585,28 @@ fn committed_create_reserves_the_target_until_observation_converges() {
     let target = target("created_mv", b"created-object");
     let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
-    let create = || {
-        ManagementRequest::try_new(
-            target.catalog().clone(),
-            target.table().clone(),
-            None,
-            ConnectorDocumentManagementOperation::Create,
-            None,
+    let create = |identity| {
+        ManagementRequest::for_create_intent(
+            CreateIntent::try_new(target.catalog().clone(), target.table().clone(), identity)
+                .unwrap(),
             EffectScope::CATALOG_COMMIT,
         )
-        .unwrap()
     };
-    let mut lease = entrance.acquire(create(), || false).unwrap();
-    lease
-        .mark_dispatched(EffectResponsibility::new(
-            EffectIdentity::from_bytes([47; 16]),
-            target.clone(),
-            incarnation("inc-a"),
-            EffectScope::CATALOG_COMMIT,
-            ManagementTimestamp::from_unix_millis(1_000),
-        ))
+    let mut lease = entrance
+        .acquire(create(EffectIdentity::from_bytes([47; 16])), || false)
         .unwrap();
+    lease
+        .mark_create_intent_dispatched(ManagementTimestamp::from_unix_millis(1_000))
+        .unwrap();
+    lease.late_bind_create_target(target.clone()).unwrap();
     lease
         .record_terminal(EffectDisposition::KnownCommitted)
         .unwrap();
     assert_eq!(
-        entrance.acquire(create(), || false).err().unwrap(),
+        entrance
+            .acquire(create(EffectIdentity::from_bytes([48; 16])), || false)
+            .err()
+            .unwrap(),
         ManagementAdmissionError::TargetAlreadyExists
     );
 
@@ -1659,46 +1655,229 @@ fn committed_create_reserves_the_target_until_observation_converges() {
 fn create_known_uncommitted_can_retry_but_create_unknown_cannot() {
     let exact_target = target("new_mv", b"created-object");
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
-    let create = || {
-        ManagementRequest::try_new(
-            exact_target.catalog().clone(),
-            exact_target.table().clone(),
-            None,
-            ConnectorDocumentManagementOperation::Create,
-            None,
+    let create = |identity| {
+        ManagementRequest::for_create_intent(
+            CreateIntent::try_new(
+                exact_target.catalog().clone(),
+                exact_target.table().clone(),
+                identity,
+            )
+            .unwrap(),
             EffectScope::CATALOG_COMMIT,
         )
-        .unwrap()
     };
-    let mut first = entrance.acquire(create(), || false).unwrap();
+    let mut first = entrance
+        .acquire(create(EffectIdentity::from_bytes([23; 16])), || false)
+        .unwrap();
+    first
+        .mark_create_intent_dispatched(ManagementTimestamp::from_unix_millis(1_000))
+        .unwrap();
+    first.late_bind_create_target(exact_target.clone()).unwrap();
+    first
+        .record_terminal(EffectDisposition::KnownUncommitted)
+        .unwrap();
+    let mut second = entrance
+        .acquire(create(EffectIdentity::from_bytes([24; 16])), || false)
+        .unwrap();
+    second
+        .mark_create_intent_dispatched(ManagementTimestamp::from_unix_millis(2_000))
+        .unwrap();
+    second
+        .late_bind_create_target(exact_target.clone())
+        .unwrap();
+    second
+        .record_terminal(EffectDisposition::CommitUnknown)
+        .unwrap();
+    assert_eq!(
+        entrance
+            .acquire(create(EffectIdentity::from_bytes([25; 16])), || false)
+            .err()
+            .unwrap(),
+        ManagementAdmissionError::EffectUnsettled
+    );
+    assert_eq!(
+        entrance
+            .begin_readmission(
+                exact_target.table(),
+                ManagementContinuation::SameOwner {
+                    previous_incarnation: incarnation("inc-a"),
+                },
+            )
+            .unwrap()
+            .phase(),
+        ManagementObservationPhase::AwaitingEffectClosure
+    );
+}
+
+#[test]
+fn create_intent_marks_before_stage_binds_once_and_blocks_a_lost_response() {
+    let logical = table("created_mv");
+    let exact = target("created_mv", b"created-object");
+    let mismatch = target("other_mv", b"created-object");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let lost_intent = CreateIntent::try_new(
+        catalog(1),
+        logical.clone(),
+        EffectIdentity::from_bytes([71; 16]),
+    )
+    .unwrap();
+    let request = |identity| {
+        ManagementRequest::for_create_intent(
+            CreateIntent::try_new(catalog(1), logical.clone(), identity).unwrap(),
+            EffectScope::CATALOG_COMMIT,
+        )
+    };
+
+    let mut lease = entrance
+        .acquire(
+            ManagementRequest::for_create_intent(lost_intent.clone(), EffectScope::CATALOG_COMMIT),
+            || false,
+        )
+        .unwrap();
+    assert_eq!(
+        lease
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes([71; 16]),
+                exact.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap_err(),
+        ManagementAdmissionError::InvalidEffect
+    );
+    lease
+        .mark_create_intent_dispatched(ManagementTimestamp::from_unix_millis(1_000))
+        .unwrap();
+    assert_eq!(
+        lease.late_bind_create_target(mismatch).unwrap_err(),
+        ManagementAdmissionError::TargetReplaced
+    );
+    drop(lease);
+
+    // The staged response was lost before an exact target could be bound. The
+    // old intent remains an Unknown barrier rather than being treated as an
+    // absent table or retried with another caller-generated UUID.
+    assert_eq!(
+        entrance
+            .acquire(request(EffectIdentity::from_bytes([72; 16])), || false)
+            .err()
+            .unwrap(),
+        ManagementAdmissionError::EffectUnsettled
+    );
+
+    assert_eq!(
+        entrance
+            .begin_unbound_create_observation(&lost_intent)
+            .unwrap()
+            .complete(&connector_observation(&exact, "deployment-a", "inc-a", 1))
+            .err()
+            .unwrap(),
+        ManagementObservationError::UnsealedObservation
+    );
+    let fresh = FreshCreateIntentObservation::for_test(lost_intent.clone(), exact.clone());
+    assert_eq!(fresh.target(), &exact);
+    assert_eq!(
+        entrance.resolve_unbound_create_as_unknown(fresh).unwrap(),
+        exact
+    );
+    assert_eq!(entrance.unsettled_effects(exact.table()).len(), 1);
+    assert_eq!(
+        entrance
+            .begin_readmission(
+                exact.table(),
+                ManagementContinuation::SameOwner {
+                    previous_incarnation: incarnation("inc-a"),
+                },
+            )
+            .unwrap()
+            .phase(),
+        ManagementObservationPhase::AwaitingEffectClosure
+    );
+}
+
+#[test]
+fn automatic_actions_are_single_frozen_effects_and_require_convergence() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    let action = |identity| {
+        AutomaticMaintenanceEffect::new(
+            target.clone(),
+            dependencies.clone(),
+            identity,
+            EffectScope::CATALOG_COMMIT,
+        )
+    };
+
+    let mut first = entrance
+        .acquire_automatic_maintenance(action(EffectIdentity::from_bytes([81; 16])), || false)
+        .unwrap();
+    assert_eq!(
+        first
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes([82; 16]),
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                ManagementTimestamp::from_unix_millis(1_000),
+            ))
+            .unwrap_err(),
+        ManagementAdmissionError::InvalidEffect
+    );
     first
         .mark_dispatched(EffectResponsibility::new(
-            EffectIdentity::from_bytes([23; 16]),
-            exact_target.clone(),
+            EffectIdentity::from_bytes([81; 16]),
+            target.clone(),
             incarnation("inc-a"),
             EffectScope::CATALOG_COMMIT,
             ManagementTimestamp::from_unix_millis(1_000),
         ))
         .unwrap();
     first
-        .record_terminal(EffectDisposition::KnownUncommitted)
+        .record_terminal(EffectDisposition::KnownCommitted)
         .unwrap();
-    let mut second = entrance.acquire(create(), || false).unwrap();
-    second
-        .mark_dispatched(EffectResponsibility::new(
-            EffectIdentity::from_bytes([24; 16]),
-            exact_target.clone(),
-            incarnation("inc-a"),
-            EffectScope::CATALOG_COMMIT,
-            ManagementTimestamp::from_unix_millis(2_000),
+
+    // A next action needs a fresh installation; it cannot share the completed
+    // action's lease or stale management observation.
+    assert_eq!(
+        entrance
+            .acquire_automatic_maintenance(action(EffectIdentity::from_bytes([83; 16])), || false)
+            .err()
+            .unwrap(),
+        ManagementAdmissionError::ReadmissionIncomplete
+    );
+    let mut convergence = entrance
+        .begin_committed_convergence(
+            target.table(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation("inc-a"),
+            },
+        )
+        .unwrap();
+    convergence
+        .begin_current_observation(ManagementObservationRequestId::from_bytes([84; 16]))
+        .unwrap();
+    convergence
+        .accept_current_observation(fresh_observation(
+            [84; 16],
+            &target,
+            "deployment-a",
+            "inc-a",
+            2,
         ))
         .unwrap();
-    second
-        .record_terminal(EffectDisposition::CommitUnknown)
+    entrance
+        .install_observed_target(&convergence, dependencies.clone())
         .unwrap();
-    assert_eq!(
-        entrance.acquire(create(), || false).err().unwrap(),
-        ManagementAdmissionError::EffectUnsettled
+    assert!(
+        entrance
+            .acquire_automatic_maintenance(action(EffectIdentity::from_bytes([83; 16])), || false)
+            .is_ok()
     );
 }
 
