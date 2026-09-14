@@ -57,6 +57,16 @@ pub mod session_control;
 /// Statement-local external-effect boundary for safe topology retry.
 pub mod statement_effect;
 
+/// Read-only `information_schema` materialization contracts and providers.
+pub mod system_catalog;
+pub mod system_catalog_rewrite;
+pub mod view;
+mod view_iceberg;
+mod view_rewrite;
+mod view_service;
+#[cfg(test)]
+mod view_tests;
+
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.
 pub mod sql;

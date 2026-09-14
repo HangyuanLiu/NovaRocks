@@ -1114,7 +1114,7 @@ impl TestQueryCompiler {
                 }
                 let mut prepared = query;
                 self.view.view_service().rewrite_query(
-                    &self.view,
+                    &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
                     &mut prepared,
                     crate::view::ViewRequestContext {
                         current_catalog,
@@ -1122,9 +1122,8 @@ impl TestQueryCompiler {
                         connector_context: Some(&connector_context),
                     },
                 )?;
-                crate::catalog_application::virtual_table::rewrite_query(
-                    self.system_tables.catalog_service(),
-                    self.system_tables.connector_control().as_ref(),
+                novarocks_query_application::system_catalog_rewrite::rewrite_query(
+                    self.system_tables.facts_port().as_ref(),
                     self.system_tables.system_catalog().as_ref(),
                     &mut prepared,
                 )?;
@@ -1426,7 +1425,7 @@ fn prepare_explain_query_with_ports(
 ) -> Result<Query, String> {
     let mut prepared = query.clone();
     view_kernel.view_service().rewrite_query(
-        view_kernel,
+        &crate::view::engine::FrontendViewEngine::new(view_kernel.clone()),
         &mut prepared,
         crate::view::ViewRequestContext {
             current_catalog,

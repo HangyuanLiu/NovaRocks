@@ -29,7 +29,6 @@ use novarocks_spi::connector::ConnectorControlRegistry;
 use tokio::runtime::Handle;
 
 use crate::catalog_application::query_catalog::QueryCatalogService;
-use crate::catalog_application::system_catalog::SystemCatalog;
 use crate::catalog_application::{command as catalog_command, iceberg_ref_command};
 use crate::common::backend_topology::BackendTopologyService;
 use crate::connector::UnifiedStatisticsResolver;
@@ -47,6 +46,7 @@ use crate::query_execution::service::QueryExecutionService;
 use crate::view::ViewService;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_query_application::api::{BackendCommandExecutor, BackendTopologyCommandPort};
+use novarocks_query_application::system_catalog::SystemCatalog;
 use novarocks_spi::connector::MvStorageObservationPort;
 
 use crate::mv::{FrontendMvService, command as mv_command};
@@ -136,8 +136,12 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.view_service,
     );
     let system_tables = domain::SystemTableQueryKernel::new(
-        ports.catalog_service,
-        ports.connector_control,
+        Arc::new(
+            crate::catalog_application::system_catalog_facts::FrontendSystemCatalogFacts::new(
+                ports.catalog_service,
+                ports.connector_control,
+            ),
+        ),
         ports.system_catalog,
         Arc::clone(&ports.mv_readiness),
     );
