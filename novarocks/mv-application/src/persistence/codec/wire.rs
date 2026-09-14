@@ -283,7 +283,7 @@ const PUBLICATION: &[Field] = &[
     message(8, Schema::PublicationStatistics),
 ];
 const PUBLICATION_INPUT: &[Field] = &[scalar(1), bytes(2), bytes(3)];
-const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), bytes(2), boolean(3)];
+const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), boolean(2)];
 const PUBLICATION_STATISTICS: &[Field] = &[scalar(1), scalar(2)];
 const CONFIGURATION: &[Field] = &[scalar(1), scalar(2), boolean(3), scalar(4), scalar(5)];
 
@@ -316,11 +316,18 @@ impl Schema {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreflightUsage {
+    pub encoded_bytes: usize,
+    pub estimated_working_set_bytes: usize,
+    pub expanded_items: usize,
+}
+
 pub(super) fn preflight(
     bytes: &[u8],
     schema: Schema,
     budget: PersistenceDecodeBudget,
-) -> Result<(), PersistenceCodecError> {
+) -> Result<PreflightUsage, PersistenceCodecError> {
     if bytes.len() > budget.max_document_bytes {
         return Err(PersistenceCodecError::ResourceBudget {
             resource: "encoded document",
@@ -362,7 +369,12 @@ pub(super) fn preflight(
         expanded_items: 0,
         budget,
     };
-    scan_message(bytes, schema, 1, &mut state)
+    scan_message(bytes, schema, 1, &mut state)?;
+    Ok(PreflightUsage {
+        encoded_bytes: bytes.len(),
+        estimated_working_set_bytes: estimated_working_set,
+        expanded_items: measurement.expanded_items,
+    })
 }
 
 struct MeasureState {

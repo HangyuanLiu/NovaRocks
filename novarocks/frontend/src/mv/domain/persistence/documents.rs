@@ -29,7 +29,7 @@ use novarocks_mv_application::persistence::codec::{
     ConfigurationDocument, DefinitionDocument, EncodedDocument, InterpretationDocument,
     PersistenceCodecError, PublicationDocument, decode_configuration, decode_definition,
     decode_interpretation, decode_publication, encode_configuration, encode_definition,
-    encode_interpretation, encode_publication,
+    encode_interpretation, encode_publication, preflight_current_document_set,
 };
 use novarocks_mv_application::persistence::identity::DocumentRevision;
 use novarocks_mv_application::persistence::validation::{
@@ -37,11 +37,14 @@ use novarocks_mv_application::persistence::validation::{
 };
 use novarocks_spi::connector::document_storage::{
     ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentFormat, ConnectorDocumentId,
-    ConnectorDocumentName, ConnectorDocumentOwner, ConnectorDocumentReference,
-    ConnectorDocumentRevision, ConnectorDocumentSet, ConnectorStoredDocument,
-    ConnectorStoredDocumentAttachment,
+    ConnectorDocumentManagementObservation, ConnectorDocumentName, ConnectorDocumentOwner,
+    ConnectorDocumentReference, ConnectorDocumentRevision, ConnectorDocumentSet,
+    ConnectorStoredDocument, ConnectorStoredDocumentAttachment,
 };
-use novarocks_spi::connector::{ConnectorPreparedCreateDocumentTarget, ConnectorTableObjectId};
+use novarocks_spi::connector::{
+    ConnectorCommittedVersion, ConnectorPreparedCreateDocumentTarget, ConnectorTableIdentity,
+    ConnectorTableObjectId,
+};
 
 const OWNER: &str = "novarocks.mv";
 const DEFINITION: &str = "definition";
@@ -54,12 +57,18 @@ const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvDecodedDocuments {
+    pub target: ConnectorTableIdentity,
+    pub target_object_id: ConnectorTableObjectId,
+    pub metadata_version: ConnectorCommittedVersion,
     pub definition: DefinitionDocument,
     pub definition_revision: DocumentRevision,
     pub interpretation: InterpretationDocument,
     pub interpretation_revision: DocumentRevision,
     pub publication: Option<PublicationDocument>,
+    pub publication_revision: Option<DocumentRevision>,
+    pub publication_output_version: Option<ConnectorCommittedVersion>,
     pub configuration: ConfigurationDocument,
+    pub configuration_revision: DocumentRevision,
 }
 
 #[derive(Debug)]
@@ -182,12 +191,58 @@ pub(crate) fn publication_document_set(
     ConnectorDocumentSet::try_new(vec![publication]).map_err(Into::into)
 }
 
-/// Decodes one exact Current set. Deferred bodies must be loaded by the
-/// Connector lease before entering this application boundary.
-pub(crate) fn decode_current_documents(
-    documents: &[ConnectorStoredDocument],
+/// Decodes one exact, lease-sealed management observation. Deferred bodies
+/// must be loaded through the original observation request before entering
+/// this application boundary.
+pub(crate) fn decode_current_management_documents(
+    observation: &ConnectorDocumentManagementObservation,
+    loaded_documents: &[ConnectorDocument],
     budget: PersistenceDecodeBudget,
 ) -> Result<MvDecodedDocuments, MvDocumentError> {
+    observation.validate_sealed()?;
+    let decoded = decode_document_slice(observation.documents(), loaded_documents, budget)?;
+    if decoded.interpretation.target.object_id.as_bytes()
+        != observation.object_id().as_bytes().as_ref()
+    {
+        return Err(MvDocumentError::Contract(
+            "Current L target object does not match the exact observed table".to_string(),
+        ));
+    }
+    Ok(MvDecodedDocuments {
+        target: observation.target().clone(),
+        target_object_id: observation.object_id().clone(),
+        metadata_version: observation.metadata_version().clone(),
+        definition: decoded.definition,
+        definition_revision: decoded.definition_revision,
+        interpretation: decoded.interpretation,
+        interpretation_revision: decoded.interpretation_revision,
+        publication: decoded.publication,
+        publication_revision: decoded.publication_revision,
+        publication_output_version: decoded.publication_output_version,
+        configuration: decoded.configuration,
+        configuration_revision: decoded.configuration_revision,
+    })
+}
+
+#[derive(Debug)]
+struct DecodedDocumentSlice {
+    definition: DefinitionDocument,
+    definition_revision: DocumentRevision,
+    interpretation: InterpretationDocument,
+    interpretation_revision: DocumentRevision,
+    publication: Option<PublicationDocument>,
+    publication_revision: Option<DocumentRevision>,
+    publication_output_version: Option<ConnectorCommittedVersion>,
+    configuration: ConfigurationDocument,
+    configuration_revision: DocumentRevision,
+}
+
+fn decode_document_slice(
+    documents: &[ConnectorStoredDocument],
+    loaded_documents: &[ConnectorDocument],
+    budget: PersistenceDecodeBudget,
+) -> Result<DecodedDocumentSlice, MvDocumentError> {
+    let loaded_by_id = validate_loaded_documents(documents, loaded_documents)?;
     let mut by_name = BTreeMap::new();
     for document in documents {
         validate_envelope(document)?;
@@ -217,56 +272,90 @@ pub(crate) fn decode_current_documents(
     require_attachment(definition_stored, false)?;
     require_attachment(interpretation_stored, false)?;
     require_attachment(configuration_stored, false)?;
+    require_exact_references(definition_stored, &[])?;
+    require_exact_references(configuration_stored, &[])?;
 
-    let definition = decode_definition(available_content(definition_stored)?, budget)?;
-    let interpretation = decode_interpretation(available_content(interpretation_stored)?, budget)?;
-    let configuration = decode_configuration(available_content(configuration_stored)?, budget)?;
-    let definition_revision = revision(definition_stored);
-    let interpretation_revision = revision(interpretation_stored);
-    require_exact_reference(
-        interpretation_stored,
-        REFERENCES_DEFINITION,
-        definition_stored.id(),
+    let definition_content = resolved_content(definition_stored, &loaded_by_id)?;
+    let interpretation_content = resolved_content(interpretation_stored, &loaded_by_id)?;
+    let configuration_content = resolved_content(configuration_stored, &loaded_by_id)?;
+    let publication_content = by_name
+        .get(PUBLICATION)
+        .map(|stored| resolved_content(stored, &loaded_by_id))
+        .transpose()?;
+    preflight_current_document_set(
+        definition_content,
+        interpretation_content,
+        publication_content,
+        configuration_content,
+        budget,
     )?;
 
-    let publication = match by_name.get(PUBLICATION) {
-        Some(stored) => {
-            require_attachment(stored, true)?;
-            require_exact_reference(stored, REFERENCES_DEFINITION, definition_stored.id())?;
-            require_exact_reference(
-                stored,
-                REFERENCES_INTERPRETATION,
-                interpretation_stored.id(),
-            )?;
-            let publication = decode_publication(available_content(stored)?, budget)?;
-            validate_document_set(
-                &definition,
-                definition_revision,
-                &interpretation,
-                interpretation_revision,
-                &publication,
-            )?;
-            Some(publication)
-        }
-        None => {
-            if interpretation.definition_revision != definition_revision
-                || interpretation.computation_identity != definition.computation_identity
-            {
-                return Err(MvDocumentError::Contract(
-                    "Current L does not bind exact Current D".to_string(),
-                ));
-            }
-            None
-        }
-    };
+    let definition = decode_definition(definition_content, budget)?;
+    let interpretation = decode_interpretation(interpretation_content, budget)?;
+    let configuration = decode_configuration(configuration_content, budget)?;
+    let definition_revision = revision(definition_stored);
+    let interpretation_revision = revision(interpretation_stored);
+    let configuration_revision = revision(configuration_stored);
+    require_exact_references(
+        interpretation_stored,
+        &[(REFERENCES_DEFINITION, definition_stored.id())],
+    )?;
 
-    Ok(MvDecodedDocuments {
+    let (publication, publication_revision, publication_output_version) =
+        match by_name.get(PUBLICATION) {
+            Some(stored) => {
+                require_attachment(stored, true)?;
+                require_exact_references(
+                    stored,
+                    &[
+                        (REFERENCES_DEFINITION, definition_stored.id()),
+                        (REFERENCES_INTERPRETATION, interpretation_stored.id()),
+                    ],
+                )?;
+                let publication = decode_publication(
+                    publication_content.expect("publication content was resolved above"),
+                    budget,
+                )?;
+                validate_document_set(
+                    &definition,
+                    definition_revision,
+                    &interpretation,
+                    interpretation_revision,
+                    &publication,
+                )?;
+                let ConnectorStoredDocumentAttachment::ExactOutput(output_version) =
+                    stored.attachment()
+                else {
+                    unreachable!("publication attachment was validated above")
+                };
+                (
+                    Some(publication),
+                    Some(revision(stored)),
+                    Some(output_version.clone()),
+                )
+            }
+            None => {
+                if interpretation.definition_revision != definition_revision
+                    || interpretation.computation_identity != definition.computation_identity
+                {
+                    return Err(MvDocumentError::Contract(
+                        "Current L does not bind exact Current D".to_string(),
+                    ));
+                }
+                (None, None, None)
+            }
+        };
+
+    Ok(DecodedDocumentSlice {
         definition,
         definition_revision,
         interpretation,
         interpretation_revision,
         publication,
+        publication_revision,
+        publication_output_version,
         configuration,
+        configuration_revision,
     })
 }
 
@@ -283,20 +372,21 @@ fn validate_create_target(
             "interpretation target does not match the provider-prepared target".to_string(),
         ));
     }
-    let target_fields = interpretation
-        .target
-        .fields
-        .iter()
-        .map(|field| field.target_field_id.as_bytes())
-        .collect::<std::collections::BTreeSet<_>>();
-    let prepared_fields = target
-        .fields()
-        .iter()
-        .map(|field| field.provider_field_id().as_ref())
-        .collect::<std::collections::BTreeSet<_>>();
-    if target_fields != prepared_fields {
+    // A document-managed CREATE emits its physical columns in the same
+    // canonical logical-identity order used by L. Preserve the provider's
+    // request-ordinal mapping here instead of degrading it to set equality.
+    let mut target_fields = interpretation.target.fields.iter().collect::<Vec<_>>();
+    target_fields.sort_by(|left, right| left.logical_identity.cmp(&right.logical_identity));
+    if target_fields.len() != target.fields().len()
+        || target_fields.iter().zip(target.fields()).enumerate().any(
+            |(ordinal, (field, prepared))| {
+                prepared.request_ordinal() as usize != ordinal
+                    || field.target_field_id.as_bytes() != prepared.provider_field_id().as_ref()
+            },
+        )
+    {
         return Err(MvDocumentError::Contract(
-            "interpretation target fields do not match provider-prepared field bindings"
+            "interpretation target fields do not match the provider-prepared ordinal bindings"
                 .to_string(),
         ));
     }
@@ -390,16 +480,76 @@ fn required_document<'a>(
     })
 }
 
-fn available_content(document: &ConnectorStoredDocument) -> Result<&[u8], MvDocumentError> {
+fn validate_loaded_documents<'a>(
+    stored: &[ConnectorStoredDocument],
+    loaded: &'a [ConnectorDocument],
+) -> Result<BTreeMap<ConnectorDocumentId, &'a ConnectorDocument>, MvDocumentError> {
+    let stored_by_id = stored
+        .iter()
+        .map(|document| (document.id(), document))
+        .collect::<BTreeMap<_, _>>();
+    let mut loaded_by_id = BTreeMap::new();
+    for document in loaded {
+        let Some(envelope) = stored_by_id.get(document.id()).copied() else {
+            return Err(MvDocumentError::Contract(
+                "loaded MV document was not requested by the exact observation".to_string(),
+            ));
+        };
+        if loaded_by_id.insert(document.id().clone(), document).is_some()
+            || !matches!(
+                envelope.carrier(),
+                novarocks_spi::connector::document_storage::ConnectorDocumentCarrier::DeferredContent(_)
+            )
+            || envelope.format() != document.format()
+            || envelope.references() != document.references()
+            || envelope.encoded_len() != document.content().len()
+            || !loaded_attachment_matches(envelope.attachment(), document.attachment())
+        {
+            return Err(MvDocumentError::Contract(
+                "loaded MV document does not match its exact observed envelope".to_string(),
+            ));
+        }
+    }
+    Ok(loaded_by_id)
+}
+
+fn loaded_attachment_matches(
+    stored: &ConnectorStoredDocumentAttachment,
+    loaded: &ConnectorDocumentAttachment,
+) -> bool {
+    matches!(
+        (stored, loaded),
+        (
+            ConnectorStoredDocumentAttachment::TableMetadata,
+            ConnectorDocumentAttachment::TableMetadata
+        )
+    ) || matches!(
+        (stored, loaded),
+        (
+            ConnectorStoredDocumentAttachment::ExactOutput(expected),
+            ConnectorDocumentAttachment::ExactOutput(actual)
+        ) if expected == actual
+    )
+}
+
+fn resolved_content<'a>(
+    document: &'a ConnectorStoredDocument,
+    loaded: &BTreeMap<ConnectorDocumentId, &'a ConnectorDocument>,
+) -> Result<&'a [u8], MvDocumentError> {
     match document.carrier() {
         novarocks_spi::connector::document_storage::ConnectorDocumentCarrier::AvailableContent(
             content,
         ) => Ok(content),
         novarocks_spi::connector::document_storage::ConnectorDocumentCarrier::DeferredContent(
             _,
-        ) => Err(MvDocumentError::Contract(
-            "Current document content was not loaded before decode".to_string(),
-        )),
+        ) => loaded
+            .get(document.id())
+            .map(|loaded| loaded.content().as_ref())
+            .ok_or_else(|| {
+                MvDocumentError::Contract(
+                    "Current document content was not loaded before decode".to_string(),
+                )
+            }),
     }
 }
 
@@ -425,22 +575,24 @@ fn require_attachment(
     Ok(())
 }
 
-fn require_exact_reference(
+fn require_exact_references(
     document: &ConnectorStoredDocument,
-    relationship: &'static str,
-    target: &ConnectorDocumentId,
+    expected: &[(&'static str, &ConnectorDocumentId)],
 ) -> Result<(), MvDocumentError> {
-    if document
-        .references()
-        .iter()
-        .filter(|reference| {
-            reference.relationship() == relationship && reference.target() == target
+    if document.references().len() != expected.len()
+        || expected.iter().any(|(relationship, target)| {
+            document
+                .references()
+                .iter()
+                .filter(|reference| {
+                    reference.relationship() == *relationship && reference.target() == *target
+                })
+                .count()
+                != 1
         })
-        .count()
-        != 1
     {
         return Err(MvDocumentError::Contract(format!(
-            "{} does not reference exact Current {relationship}",
+            "{} does not contain exactly its required Current references",
             document.id().name().as_str()
         )));
     }
@@ -459,6 +611,7 @@ pub(crate) fn target_object_identity(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use novarocks_mv_application::persistence::codec::{
         ApplyKey, ApplyKeyComponent, ApplyKeyKind, ExpressionKind, ExpressionShape, OutputBinding,
@@ -472,12 +625,17 @@ mod tests {
         PartitionSpecVersion, PublicationIdentity, SchemaVersion,
     };
     use novarocks_spi::connector::document_storage::{
-        ConnectorDocumentCarrier, ConnectorStoredDocument,
+        ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier,
+        ConnectorDocumentManagementObservation, ConnectorDocumentObservationRequest,
+        ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits,
+        ConnectorManagedObjectMarker, ConnectorStoredDocument,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorInstanceId,
-        ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
-        ConnectorProviderBindingKey, ConnectorTableIdentity, ProviderBindingEpoch,
+        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
+        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
+        ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -645,6 +803,38 @@ mod tests {
         .unwrap()
     }
 
+    fn stored_deferred(document: &ConnectorDocument) -> ConnectorStoredDocument {
+        ConnectorStoredDocument::try_new(
+            document.id().clone(),
+            document.format().clone(),
+            document.content().len(),
+            document.references().to_vec(),
+            ConnectorStoredDocumentAttachment::TableMetadata,
+            ConnectorDocumentCarrier::DeferredContent(
+                ConnectorDeferredDocumentHandle::try_new(Bytes::from_static(b"deferred")).unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    struct NeverCancelled;
+
+    impl ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn request_context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn create_and_publication_sets_round_trip_as_one_exact_current() {
         let (definition, interpretation, configuration, target) = fixture();
@@ -672,7 +862,6 @@ mod tests {
             }],
             output: PublicationOutput {
                 object_id: ObjectIdentity::try_new(vec![4]).unwrap(),
-                native_data_version: NativeDataVersion::try_new(vec![13]).unwrap(),
                 empty_result: false,
             },
             kind: PublicationKind::FullRefresh,
@@ -687,20 +876,33 @@ mod tests {
             .collect::<Vec<_>>();
         current.push(stored(&publication_set.documents()[0], true));
 
-        let decoded = decode_current_documents(&current, PersistenceDecodeBudget::default())
+        let decoded = decode_document_slice(&current, &[], PersistenceDecodeBudget::default())
             .expect("exact Current");
         assert_eq!(decoded.definition, definition);
         assert_eq!(decoded.interpretation, interpretation);
         assert_eq!(decoded.configuration, configuration);
         assert_eq!(decoded.publication, Some(publication));
+        assert_eq!(
+            decoded
+                .publication_output_version
+                .as_ref()
+                .and_then(ConnectorCommittedVersion::snapshot_id),
+            Some(11)
+        );
     }
 
     #[test]
     fn create_rejects_provider_target_version_drift() {
         let (definition, interpretation, configuration, target) = fixture();
-        let mut drifted = interpretation;
-        drifted.target.schema_version = SchemaVersion::try_new(vec![99]).unwrap();
-        assert!(create_document_set(&definition, &drifted, &configuration, &target).is_err());
+        let mut schema_drifted = interpretation.clone();
+        schema_drifted.target.schema_version = SchemaVersion::try_new(vec![99]).unwrap();
+        assert!(
+            create_document_set(&definition, &schema_drifted, &configuration, &target).is_err()
+        );
+        let mut spec_drifted = interpretation;
+        spec_drifted.target.partition_spec_version =
+            PartitionSpecVersion::try_new(vec![99]).unwrap();
+        assert!(create_document_set(&definition, &spec_drifted, &configuration, &target).is_err());
     }
 
     #[test]
@@ -724,7 +926,6 @@ mod tests {
             }],
             output: PublicationOutput {
                 object_id: ObjectIdentity::try_new(vec![4]).unwrap(),
-                native_data_version: NativeDataVersion::try_new(vec![13]).unwrap(),
                 empty_result: false,
             },
             kind: PublicationKind::FullRefresh,
@@ -752,6 +953,115 @@ mod tests {
         )
         .unwrap();
         current.push(stored(&tampered, true));
-        assert!(decode_current_documents(&current, PersistenceDecodeBudget::default()).is_err());
+        assert!(decode_document_slice(&current, &[], PersistenceDecodeBudget::default()).is_err());
+    }
+
+    #[test]
+    fn create_rejects_swapped_provider_field_ordinals() {
+        let (definition, mut interpretation, configuration, target) = fixture();
+        let first = interpretation.target.fields[0].target_field_id.clone();
+        interpretation.target.fields[0].target_field_id =
+            interpretation.target.fields[1].target_field_id.clone();
+        interpretation.target.fields[1].target_field_id = first;
+
+        assert!(
+            create_document_set(&definition, &interpretation, &configuration, &target).is_err()
+        );
+    }
+
+    #[test]
+    fn current_rejects_extra_document_references() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let create = create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("create documents");
+        let original = &create.documents()[0];
+        let extra = ConnectorDocumentReference::try_new(
+            "stale",
+            ConnectorDocumentId::new(
+                owner().unwrap(),
+                document_name(DEFINITION).unwrap(),
+                ConnectorDocumentRevision::for_content(b"stale"),
+            ),
+        )
+        .unwrap();
+        let tampered = ConnectorDocument::try_new(
+            owner().unwrap(),
+            document_name(DEFINITION).unwrap(),
+            document_format(DEFINITION).unwrap(),
+            original.content().clone(),
+            vec![extra],
+            ConnectorDocumentAttachment::TableMetadata,
+        )
+        .unwrap();
+        let mut current = vec![stored(&tampered, false)];
+        current.extend(
+            create.documents()[1..]
+                .iter()
+                .map(|document| stored(document, false)),
+        );
+
+        assert!(decode_document_slice(&current, &[], PersistenceDecodeBudget::default()).is_err());
+    }
+
+    #[test]
+    fn current_requires_and_accepts_the_exact_loaded_deferred_document() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let create = create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("create documents");
+        let definition_document = create.documents()[0].clone();
+        let mut current = create
+            .documents()
+            .iter()
+            .map(|document| stored(document, false))
+            .collect::<Vec<_>>();
+        current[0] = stored_deferred(&definition_document);
+
+        assert!(decode_document_slice(&current, &[], PersistenceDecodeBudget::default()).is_err());
+        assert!(
+            decode_document_slice(
+                &current,
+                &[definition_document],
+                PersistenceDecodeBudget::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn current_management_decode_rejects_an_unsealed_observation() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let create = create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("create documents");
+        let request = ConnectorDocumentObservationRequest::try_new(
+            target.owner().clone(),
+            target.catalog_handle().clone(),
+            target.target().clone(),
+            target.object_id().clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            request_context(),
+        )
+        .unwrap();
+        let observation = ConnectorDocumentManagementObservation::try_new(
+            &request,
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata-11"), Some(11))
+                .unwrap(),
+            ConnectorManagedObjectMarker::try_new("materialized-view", "deployment", "incarnation")
+                .unwrap(),
+            create
+                .documents()
+                .iter()
+                .map(|document| stored(document, false))
+                .collect(),
+        )
+        .unwrap();
+
+        assert!(
+            decode_current_management_documents(
+                &observation,
+                &[],
+                PersistenceDecodeBudget::default()
+            )
+            .is_err()
+        );
     }
 }

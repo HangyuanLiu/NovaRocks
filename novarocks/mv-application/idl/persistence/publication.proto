@@ -40,8 +40,11 @@ message PublicationInput {
 
 message PublicationOutput {
   optional bytes object_id = 1;
-  optional bytes native_data_version = 2;
-  optional bool empty_result = 3;
+  // The provider binds the exact native output version in the structured
+  // CommitOutput attachment at the atomic commit point. It is deliberately
+  // absent from this application-owned payload because callers cannot predict
+  // that version and providers must not decode or rewrite the payload.
+  optional bool empty_result = 2;
 }
 
 enum PublicationKind {

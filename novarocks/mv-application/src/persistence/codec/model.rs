@@ -293,7 +293,6 @@ pub struct PublicationInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationOutput {
     pub object_id: ObjectIdentity,
-    pub native_data_version: NativeDataVersion,
     pub empty_result: bool,
 }
 

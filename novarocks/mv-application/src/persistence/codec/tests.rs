@@ -247,7 +247,6 @@ fn sample_publication(
         ],
         output: PublicationOutput {
             object_id: object_id(71),
-            native_data_version: native_data_version(102),
             empty_result: false,
         },
         kind: PublicationKind::FullRefresh,
@@ -265,6 +264,65 @@ fn sample_configuration() -> ConfigurationDocument {
         refresh_interval_ms: Some(60_000),
         max_staleness_ms: Some(120_000),
     }
+}
+
+#[test]
+fn current_document_set_charges_one_aggregate_item_budget() {
+    let definition = encode_definition(&sample_definition()).unwrap();
+    let interpretation = encode_interpretation(&sample_interpretation(&definition)).unwrap();
+    let publication =
+        encode_publication(&sample_publication(&definition, &interpretation)).unwrap();
+    let configuration = encode_configuration(&sample_configuration()).unwrap();
+    let default = PersistenceDecodeBudget::default();
+    let inputs = [
+        (definition.as_bytes(), wire::Schema::DefinitionDocument),
+        (
+            interpretation.as_bytes(),
+            wire::Schema::InterpretationDocument,
+        ),
+        (publication.as_bytes(), wire::Schema::PublicationDocument),
+        (
+            configuration.as_bytes(),
+            wire::Schema::ConfigurationDocument,
+        ),
+    ];
+    let usages = inputs
+        .iter()
+        .map(|(bytes, schema)| wire::preflight(bytes, *schema, default).unwrap())
+        .collect::<Vec<_>>();
+    let largest_document_items = usages
+        .iter()
+        .map(|usage| usage.expanded_items)
+        .max()
+        .unwrap();
+    assert!(
+        usages
+            .iter()
+            .map(|usage| usage.expanded_items)
+            .sum::<usize>()
+            > largest_document_items
+    );
+    let budget = PersistenceDecodeBudget {
+        max_items: largest_document_items,
+        ..default
+    };
+    for (bytes, schema) in inputs {
+        wire::preflight(bytes, schema, budget).expect("each document fits independently");
+    }
+
+    assert!(matches!(
+        preflight_current_document_set(
+            definition.as_bytes(),
+            interpretation.as_bytes(),
+            Some(publication.as_bytes()),
+            configuration.as_bytes(),
+            budget,
+        ),
+        Err(PersistenceCodecError::ResourceBudget {
+            resource: "Current expanded items",
+            ..
+        })
+    ));
 }
 
 #[test]

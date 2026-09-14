@@ -48,6 +48,8 @@ const HANDLE_DOMAIN: &[u8] = b"novarocks.connector-staged-table-handle.v1\0";
 const UNANCHORED_CTAS_PROVENANCE_DOMAIN: &[u8] =
     b"novarocks.connector-ctas-unanchored-provenance.v1\0";
 const MAX_PREPARED_CREATE_FIELD_ID_BYTES: usize = 1024;
+const MAX_PREPARED_CREATE_VERSION_ID_BYTES: usize = 1024;
+const MAX_PREPARED_CREATE_DOCUMENT_FIELDS: usize = 4096;
 
 fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
@@ -143,14 +145,39 @@ impl ConnectorPreparedCreateDocumentTarget {
             || catalog_handle.catalog_name() != &owner.instance_id
             || schema_version.is_empty()
             || partition_spec_version.is_empty()
-            || schema_version.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
-            || partition_spec_version.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
+            || schema_version.len() > MAX_PREPARED_CREATE_VERSION_ID_BYTES
+            || partition_spec_version.len() > MAX_PREPARED_CREATE_VERSION_ID_BYTES
             || fields.is_empty()
+            || fields.len() > MAX_PREPARED_CREATE_DOCUMENT_FIELDS
             || provider_token.is_empty()
             || provider_token.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
         {
             return Err(invalid(
                 "prepared create document target has an invalid owner, field set, or token",
+            ));
+        }
+        let aggregate_bytes = 64usize
+            .checked_add(owner.instance_id.as_str().len())
+            .and_then(|bytes| bytes.checked_add(catalog_handle.catalog_name().as_str().len()))
+            .and_then(|bytes| bytes.checked_add(target.instance_id.as_str().len()))
+            .and_then(|bytes| bytes.checked_add(target.namespace.len()))
+            .and_then(|bytes| bytes.checked_add(target.table.len()))
+            .and_then(|bytes| bytes.checked_add(object_id.as_bytes().len()))
+            .and_then(|bytes| bytes.checked_add(schema_version.len()))
+            .and_then(|bytes| bytes.checked_add(partition_spec_version.len()))
+            .and_then(|bytes| {
+                fields.iter().try_fold(bytes, |bytes, field| {
+                    bytes
+                        .checked_add(std::mem::size_of::<u32>())
+                        .and_then(|bytes| bytes.checked_add(field.provider_field_id().len()))
+                })
+            })
+            .and_then(|bytes| bytes.checked_add(provider_token.len()))
+            .ok_or_else(|| invalid("prepared create document target byte accounting overflowed"))?;
+        if aggregate_bytes > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "prepared create document target exceeds the aggregate handle byte limit",
             ));
         }
         fields.sort_by_key(ConnectorPreparedCreateFieldBinding::request_ordinal);
@@ -1900,6 +1927,122 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn prepared_document_target_bounds_version_identities_independently() {
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let error = ConnectorPreparedCreateDocumentTarget::try_new(
+            owner,
+            CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
+            ConnectorMutationOperationId::new(),
+            ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+            Bytes::from(vec![1; MAX_PREPARED_CREATE_VERSION_ID_BYTES + 1]),
+            Bytes::from_static(b"partition-spec-version"),
+            vec![
+                ConnectorPreparedCreateFieldBinding::try_new(0, Bytes::from_static(b"field-id"))
+                    .unwrap(),
+            ],
+            Bytes::from_static(b"provider-token"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn prepared_document_target_enforces_one_aggregate_carrier_limit() {
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let error = ConnectorPreparedCreateDocumentTarget::try_new(
+            owner,
+            CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
+            ConnectorMutationOperationId::new(),
+            ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+            Bytes::from_static(b"schema-version"),
+            Bytes::from_static(b"partition-spec-version"),
+            vec![
+                ConnectorPreparedCreateFieldBinding::try_new(0, Bytes::from_static(b"field-id"))
+                    .unwrap(),
+            ],
+            Bytes::from(vec![7; MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES]),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+    }
+
+    #[test]
+    fn staged_handle_digest_covers_exact_schema_and_partition_spec_versions() {
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let operation_id = ConnectorMutationOperationId::new();
+        let make_target = |schema: &'static [u8], spec: &'static [u8]| {
+            ConnectorPreparedCreateDocumentTarget::try_new(
+                owner.clone(),
+                CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
+                operation_id,
+                ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("orders"),
+                },
+                ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+                Bytes::from_static(schema),
+                Bytes::from_static(spec),
+                vec![
+                    ConnectorPreparedCreateFieldBinding::try_new(
+                        0,
+                        Bytes::from_static(b"field-id"),
+                    )
+                    .unwrap(),
+                ],
+                Bytes::from_static(b"provider-token"),
+            )
+            .unwrap()
+        };
+        let baseline = ConnectorStagedTableHandle::try_new_document_managed(
+            owner.clone(),
+            operation_id,
+            Bytes::from_static(b"handle"),
+            make_target(b"schema-a", b"spec-a"),
+        )
+        .unwrap();
+        let schema_changed = ConnectorStagedTableHandle::try_new_document_managed(
+            owner.clone(),
+            operation_id,
+            Bytes::from_static(b"handle"),
+            make_target(b"schema-b", b"spec-a"),
+        )
+        .unwrap();
+        let spec_changed = ConnectorStagedTableHandle::try_new_document_managed(
+            owner.clone(),
+            operation_id,
+            Bytes::from_static(b"handle"),
+            make_target(b"schema-a", b"spec-b"),
+        )
+        .unwrap();
+
+        assert_ne!(baseline.digest(), schema_changed.digest());
+        assert_ne!(baseline.digest(), spec_changed.digest());
     }
 
     struct FakeCapability {

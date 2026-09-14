@@ -254,6 +254,58 @@ pub fn decode_configuration(
     Ok(document)
 }
 
+/// Charges one simultaneously retained Current D/L/C/P set against a single
+/// decode budget before any document is materialized into its Rust model.
+/// Per-document preflight alone is insufficient because all decoded models
+/// remain live together in the application read model.
+pub fn preflight_current_document_set(
+    definition: &[u8],
+    interpretation: &[u8],
+    publication: Option<&[u8]>,
+    configuration: &[u8],
+    budget: PersistenceDecodeBudget,
+) -> Result<(), PersistenceCodecError> {
+    let required = [
+        (definition, wire::Schema::DefinitionDocument),
+        (interpretation, wire::Schema::InterpretationDocument),
+        (configuration, wire::Schema::ConfigurationDocument),
+    ];
+    let mut encoded_bytes = 0usize;
+    let mut working_set_bytes = 0usize;
+    let mut expanded_items = 0usize;
+    for (bytes, schema) in required
+        .into_iter()
+        .chain(publication.map(|bytes| (bytes, wire::Schema::PublicationDocument)))
+    {
+        let usage = wire::preflight(bytes, schema, budget)?;
+        encoded_bytes = encoded_bytes.saturating_add(usage.encoded_bytes);
+        working_set_bytes = working_set_bytes.saturating_add(usage.estimated_working_set_bytes);
+        expanded_items = expanded_items.saturating_add(usage.expanded_items);
+    }
+    if encoded_bytes > crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES {
+        return Err(PersistenceCodecError::ResourceBudget {
+            resource: "Current encoded document set",
+            maximum: crate::persistence::validation::DEFAULT_MAX_DOCUMENT_SET_BYTES,
+            actual: encoded_bytes,
+        });
+    }
+    if working_set_bytes > budget.max_working_set_bytes {
+        return Err(PersistenceCodecError::ResourceBudget {
+            resource: "Current decode working set",
+            maximum: budget.max_working_set_bytes,
+            actual: working_set_bytes,
+        });
+    }
+    if expanded_items > budget.max_items {
+        return Err(PersistenceCodecError::ResourceBudget {
+            resource: "Current expanded items",
+            maximum: budget.max_items,
+            actual: expanded_items,
+        });
+    }
+    Ok(())
+}
+
 fn encode_message(message: impl Message) -> Result<EncodedDocument, PersistenceCodecError> {
     let encoded_len = message.encoded_len();
     let maximum = PersistenceDecodeBudget::default().max_document_bytes;
@@ -451,9 +503,8 @@ fn preflight_interpretation_source(
 fn preflight_publication_source(
     document: &PublicationDocument,
 ) -> Result<(), PersistenceCodecError> {
-    let mut bytes = document.publication_id.as_bytes().len()
-        + document.output.object_id.as_bytes().len()
-        + document.output.native_data_version.as_bytes().len();
+    let mut bytes =
+        document.publication_id.as_bytes().len() + document.output.object_id.as_bytes().len();
     for input in &document.inputs {
         bytes = bytes
             .saturating_add(input.object_id.as_bytes().len())
@@ -1030,7 +1081,6 @@ fn publication_to_proto(document: &PublicationDocument) -> proto::PublicationDoc
             .collect(),
         output: Some(proto::PublicationOutput {
             object_id: Some(document.output.object_id.as_bytes().to_vec()),
-            native_data_version: Some(document.output.native_data_version.as_bytes().to_vec()),
             empty_result: Some(document.output.empty_result),
         }),
         kind: Some(match document.kind {
@@ -1088,10 +1138,6 @@ fn publication_from_proto(
             object_id: ObjectIdentity::try_new(required(
                 output.object_id,
                 "publication.output.object_id",
-            )?)?,
-            native_data_version: NativeDataVersion::try_new(required(
-                output.native_data_version,
-                "publication.output.native_data_version",
             )?)?,
             empty_result: required(output.empty_result, "publication.output.empty_result")?,
         },
