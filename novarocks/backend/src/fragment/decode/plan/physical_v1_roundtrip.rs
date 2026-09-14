@@ -55,7 +55,7 @@ use novarocks_types::SlotId;
 
 use super::context::NativePlanDecodeContext;
 use super::node::decode_node;
-use super::sink::decode_fragment_sink_program_with_context;
+use novarocks_native_adapter::fragment_sink::decode_fragment_sink_program;
 
 fn singleton_properties() -> PhysicalProperties {
     PhysicalProperties {
@@ -480,6 +480,7 @@ fn test_execution_runtime() -> Arc<ExecutionRuntime> {
                     sink_io_max_blocking_threads: 1,
                 },
                 Arc::new(functions.seal().unwrap()),
+                crate::application::test_memory_authority(),
             )
             .unwrap(),
         )
@@ -1249,12 +1250,7 @@ fn physical_plan_finish_encode_decode_preserves_duplicate_router_occurrences() {
         &NativePlanDecodeContext::default(),
     )
     .unwrap();
-    let program = decode_fragment_sink_program_with_context(
-        source,
-        &decoded_root.layout,
-        Some(&NativePlanDecodeContext::default()),
-    )
-    .unwrap();
+    let program = decode_fragment_sink_program(source, &decoded_root.layout).unwrap();
     let novarocks_execution::exec::fragment::sink::FragmentSinkProgram::SplitDataStream(split) =
         program
     else {
