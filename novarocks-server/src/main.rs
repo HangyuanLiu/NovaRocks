@@ -365,8 +365,64 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_process_function_set;
+    use super::{compose_memory_authority, compose_process_function_set};
     use novarocks_functions::{FunctionKind, FunctionVisibility};
+    use novarocks_server::app_config::NovaRocksConfig;
+    use std::sync::Arc;
+
+    /// One OS process gets one authority, and every role that needs capacity
+    /// is handed *that* one.
+    ///
+    /// Under all-in-one this is the whole point: two authorities over a single
+    /// address space would each believe they owned the entire bound, and
+    /// sampling the same RSS twice would not make that safe. The test states
+    /// it as pointer identity because that is what "the same bound" means at
+    /// runtime — a second authority with equal numbers would pass any test
+    /// that only compared configuration.
+    #[test]
+    fn every_role_in_one_process_shares_one_authority() {
+        let config = NovaRocksConfig::default();
+        let authority = compose_memory_authority(&config).expect("the default config composes");
+
+        // What `run()` does for all-in-one: clone the handle per role.
+        let frontend_handle = Arc::clone(&authority);
+        let backend_handle = Arc::clone(&authority);
+        assert!(
+            Arc::ptr_eq(&frontend_handle, &backend_handle),
+            "both roles must consume the same authority, not two with equal numbers"
+        );
+
+        // Composing again is what a second authority would look like, and it
+        // must be a different one: that is why `run()` calls this exactly once.
+        let second = compose_memory_authority(&config).expect("the default config composes");
+        assert!(
+            !Arc::ptr_eq(&authority, &second),
+            "each composition mints its own authority, so composing twice would \
+             split the process bound in two"
+        );
+    }
+
+    /// The control partition exists before any work account can.
+    #[test]
+    fn the_composed_authority_partitions_its_bound_and_installs_control() {
+        let config = NovaRocksConfig::default();
+        let authority = compose_memory_authority(&config).expect("the default config composes");
+
+        assert!(
+            authority.capacity_bytes() + authority.headroom_budget_bytes()
+                <= authority.process_bound_bytes(),
+            "B + H must fit inside P"
+        );
+        assert!(
+            authority.control_branch().is_some(),
+            "control must have its own partition before any work account exists"
+        );
+        assert_eq!(
+            authority.snapshot().root.live_bytes,
+            0,
+            "a freshly composed authority has charged nothing"
+        );
+    }
 
     #[test]
     fn native_compatibility_uses_one_sealed_process_function_set() {

@@ -27,6 +27,7 @@ use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
+use novarocks_memory::{AccountHandle, AccountKind, ExternalRef, MemoryAuthority};
 use novarocks_types::{QueryId, SlotId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -163,6 +164,14 @@ pub(crate) struct QueryContext {
     #[allow(dead_code)]
     pub(crate) query_deadline: Instant,
     pub(crate) mem_tracker: Arc<MemTracker>,
+    /// This query's memory account, created on first ask.
+    ///
+    /// The account lives exactly as long as the context does, which is what
+    /// makes the query's capacity return on its own when the query ends. It
+    /// stays `None` until an owner that was *handed* a memory authority asks
+    /// for it: this registry is a process-global singleton and must not be a
+    /// place capacity can be reached from.
+    mem_account: Option<AccountHandle>,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
 
@@ -213,6 +222,7 @@ impl QueryContext {
             query_expire,
             query_deadline: now + query_expire,
             mem_tracker,
+            mem_account: None,
             cleanup_leases: Vec::new(),
         }
     }
@@ -531,6 +541,38 @@ impl QueryContextManager {
             QueryContextGeneration::Native(legacy_native_attempt()),
             true,
         )
+    }
+
+    /// Returns this query's memory account, creating it on first ask.
+    ///
+    /// The authority arrives as an argument rather than as registry state.
+    /// This registry is a process-global singleton; letting it hold the
+    /// authority would make "one authority per process" true by accident of
+    /// that singleton rather than by composition, and would hand every caller
+    /// a way to reach capacity without being given it.
+    pub(crate) fn ensure_query_account(
+        &self,
+        query_id: QueryId,
+        authority: &Arc<MemoryAuthority>,
+    ) -> Result<AccountHandle, String> {
+        let mut inner = self.inner.lock().expect("query context manager lock");
+        let context = if inner.active.contains_key(&query_id) {
+            inner.active.get_mut(&query_id)
+        } else {
+            inner.second_chance.get_mut(&query_id)
+        }
+        .ok_or_else(|| "QueryContext missing for memory account".to_string())?;
+        if let Some(account) = context.mem_account.as_ref() {
+            return Ok(account.clone());
+        }
+        let account = authority
+            .create_account(
+                AccountKind::Work,
+                ExternalRef::new(query_id.high() as u64, query_id.low() as u64),
+            )
+            .map_err(|error| format!("create query memory account: {error}"))?;
+        context.mem_account = Some(account.clone());
+        Ok(account)
     }
 
     pub(crate) fn ensure_native_context_execution(

@@ -344,7 +344,7 @@ fn compose_backend_application_services(
         ExecutionRuntime::new(
             execution_runtime_config,
             Arc::clone(&function_set),
-            memory_authority,
+            Arc::clone(&memory_authority),
         )
         .map_err(|error| {
             BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
@@ -380,8 +380,10 @@ fn compose_backend_application_services(
             )
         },
     )?);
-    crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global()
-        .publish_resource_snapshot();
+    crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
+        &memory_authority,
+    ))
+    .publish_resource_snapshot();
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let context_host = Arc::new(crate::task_execution::NativeQueryContextHost::new(
@@ -408,7 +410,9 @@ fn compose_backend_application_services(
         task_execution_registry_config.max_active_tasks_per_backend,
     );
     let execution_host = Arc::new(crate::task_execution::NativeTaskExecutionHost::new(
-        crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(),
+        crate::runtime::native_fragment_query::NativeFragmentQueryRuntime::global(Arc::clone(
+            &memory_authority,
+        )),
         Arc::clone(&context_host) as Arc<dyn crate::task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         grpc_exchange_transmitter(data_runtime.clone()),

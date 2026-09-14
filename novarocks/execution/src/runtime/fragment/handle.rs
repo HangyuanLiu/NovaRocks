@@ -392,6 +392,60 @@ mod owner_tests {
         assert_eq!(last.load(Ordering::SeqCst), 1);
     }
 
+    /// The terminal profile carries the memory hierarchy the fragment charged
+    /// against.
+    ///
+    /// This is the seam that makes the later charge migration auditable: while
+    /// charges still live on trackers and accounts are nearly empty, the only
+    /// way to check that a byte moved from one tier to the other is to be able
+    /// to read both. The tree was reachable in wave-1 but had no caller.
+    #[test]
+    fn the_terminal_profile_carries_the_memory_hierarchy() {
+        let process = crate::runtime::mem_tracker::process_mem_tracker();
+        let query = crate::runtime::mem_tracker::MemTracker::new_child("query_test", &process);
+        let fragment = crate::runtime::mem_tracker::MemTracker::new_child("fragment_test", &query);
+        fragment.consume(4096);
+
+        let mut context = FragmentPrepareContext::default();
+        context.profiler = Some(crate::runtime::profile::fragment_root_profiler(0));
+        context.mem_tracker = Some(Arc::clone(&fragment));
+        // A real execution runtime, so the fragment runs through the driver
+        // executor production uses: the test executor never publishes the
+        // stopped fact the terminal path depends on.
+        let context = context
+            .with_execution_runtime(crate::runtime::execution_runtime::test_execution_runtime());
+        let terminal = prepare_fragment(noop_submission(UniqueId::new(99, 100)), context)
+            .expect("noop fragment prepares")
+            .start()
+            .join();
+
+        let profile = terminal.profile().expect("a profiled fragment reports one");
+        let memory = profile
+            .root
+            .children
+            .iter()
+            .find(|child| child.name == "MemTracker")
+            .expect("the terminal profile must carry the memory hierarchy");
+        assert_eq!(
+            memory.info_strings.get("Label").map(String::as_str),
+            Some("fragment_test"),
+            "the attached tree must be rooted at the fragment's own tracker"
+        );
+        assert!(
+            memory
+                .children
+                .iter()
+                .any(|child| child.name == "CommonMetrics"
+                    && child
+                        .counters
+                        .iter()
+                        .any(|counter| counter.name == "CurrentMemoryBytes")),
+            "the tree must report the bytes actually charged, got: {memory:?}"
+        );
+
+        fragment.release(4096);
+    }
+
     #[test]
     fn stopped_observer_panic_after_terminal_freeze_is_isolated() {
         let running = prepare_fragment(
@@ -764,6 +818,9 @@ pub struct DormantFragmentHandle {
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
+    /// This fragment's memory tracker, carried so the terminal profile can
+    /// report the hierarchy the fragment actually charged against.
+    mem_tracker: Option<Arc<MemTracker>>,
     start_failure: Option<StartFailurePoint>,
 }
 
@@ -796,6 +853,7 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
+            mem_tracker,
             ..
         } = self;
         let pipeline = match initial_failure {
@@ -812,6 +870,7 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
+            mem_tracker,
         });
         let lifecycle_on_stop = Arc::clone(&lifecycle);
         pipeline.subscribe_stopped(move |stopped| {
@@ -841,6 +900,7 @@ struct RunningFragmentLifecycle {
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
+    mem_tracker: Option<Arc<MemTracker>>,
 }
 
 struct RunningFragmentState {
@@ -948,6 +1008,16 @@ impl RunningFragmentLifecycle {
                         .resources
                         .finish_cancelled(reason.detail().to_string());
                 }
+            }
+            // Attach the memory hierarchy before the profile is frozen. The
+            // tracker tree and the account tree are two separate tiers of the
+            // same process and are read side by side, never summed: while
+            // charges still live on trackers, this is what makes the later
+            // migration auditable rather than a matter of trust.
+            if let (Some(profiler), Some(tracker)) =
+                (self.profiler.as_ref(), self.mem_tracker.as_ref())
+            {
+                crate::runtime::profile::attach_mem_tracker_tree(profiler, tracker);
             }
             let fact = FragmentTerminalFact::new(
                 self.query_id,
@@ -1133,6 +1203,7 @@ pub fn prepare_fragment(
             query_id,
             fragment_instance_id: finst_id,
             profiler: context.profiler.clone(),
+            mem_tracker: context.mem_tracker.clone(),
             start_failure: context.start_failure(),
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),
