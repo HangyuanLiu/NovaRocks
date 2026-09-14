@@ -574,6 +574,28 @@ fn render_plan(
     profile: Option<&SqlCompletedExplainProfile>,
     budget: ExplainRenderBudget,
 ) -> Result<Vec<String>, SqlCompileError> {
+    render_completed_plan(
+        plan,
+        completed.display_annotations(),
+        level,
+        profile,
+        budget,
+    )
+}
+
+/// Render a completed plan that is no longer held as one `SqlCompletedPlan`.
+///
+/// An owner that kept the plan and its display annotations separately - a
+/// published candidate, say - renders through here. The plan and the
+/// annotations are the whole input either way; nothing else about how they
+/// were carried reaches the text.
+pub fn render_completed_plan(
+    plan: &PhysicalPlan,
+    display_annotations: &[SqlDisplayAnnotation],
+    level: ExplainLevel,
+    profile: Option<&SqlCompletedExplainProfile>,
+    budget: ExplainRenderBudget,
+) -> Result<Vec<String>, SqlCompileError> {
     let context = RenderContext::new(plan, level, profile)?;
     let mut lines = ExplainRenderOutput::new(budget);
     lines.push(format_args!(
@@ -582,7 +604,7 @@ fn render_plan(
         plan.required().plan_contract_revision
     ))?;
     render_result_schema(plan, &mut lines)?;
-    render_display_annotations(completed.display_annotations(), &mut lines)?;
+    render_display_annotations(display_annotations, &mut lines)?;
     if is_detailed(level) {
         render_annotations(&context, AnnotationSubject::Plan, "", &mut lines)?;
         render_artifact_references(&context, &mut lines)?;

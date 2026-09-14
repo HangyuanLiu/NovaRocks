@@ -28,8 +28,8 @@ use std::{fmt, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use novarocks_physical_plan::{PhysicalPlan, validate_plan};
 use novarocks_sql::compiler::{
-    SqlCompileProgress, SqlCompiler, SqlDisplayAnnotation, SqlDisplayIntent, SqlFactBatch,
-    SqlFinalPlanCompileRequest, SqlNeedBatch,
+    ExplainRenderBudget, SqlCompileProgress, SqlCompiler, SqlDisplayAnnotation, SqlDisplayIntent,
+    SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, render_completed_plan,
 };
 use novarocks_workload_control::{CancellationView, Stage, StageRequest, WorkScope};
 
@@ -83,6 +83,32 @@ impl CompletedPhysicalPlanCandidate {
 
     pub fn display_annotations(&self) -> &[SqlDisplayAnnotation] {
         &self.display_annotations
+    }
+
+    /// Render this plan as ordinary EXPLAIN.
+    ///
+    /// The plan is already complete, so rendering asks nothing of anyone: no
+    /// catalog, no provider, and no task. A statement compiled to be executed
+    /// has no EXPLAIN text to give, and says so rather than inventing one.
+    pub fn render_explain_lines(
+        &self,
+        budget: ExplainRenderBudget,
+    ) -> Result<Vec<String>, FinalPlanCompletionError> {
+        let SqlDisplayIntent::Explain { level, analyze } = self.display_intent else {
+            return Err(FinalPlanCompletionError::Compiler {
+                message: Arc::from("completed plan does not carry EXPLAIN display intent"),
+            });
+        };
+        if analyze {
+            return Err(FinalPlanCompletionError::Compiler {
+                message: Arc::from("EXPLAIN ANALYZE requires a profile bound to this plan version"),
+            });
+        }
+        render_completed_plan(&self.plan, &self.display_annotations, level, None, budget).map_err(
+            |error| FinalPlanCompletionError::Compiler {
+                message: Arc::from(error.to_string()),
+            },
+        )
     }
 }
 
@@ -477,6 +503,63 @@ mod tests {
         assert_eq!(candidate.display_intent(), SqlDisplayIntent::Execute);
         assert!(candidate.display_annotations().is_empty());
         assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A completed plan renders its own EXPLAIN. Nothing is asked of a
+    /// catalog, a provider or a backend to produce the text - the plan is
+    /// already the answer.
+    #[tokio::test]
+    async fn a_completed_explain_renders_from_the_candidate_alone() {
+        let source = Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        });
+        let driver = FinalPlanCompletionDriver::new(source.clone());
+        let (_root, scope) = scope();
+        let completed = driver
+            .complete(
+                request(
+                    "SELECT 1",
+                    SqlCompileControl::unbounded(),
+                    SqlCompileIntent::Explain {
+                        level: ExplainLevel::Normal,
+                        analyze: false,
+                    },
+                ),
+                &scope,
+            )
+            .await
+            .expect("VALUES explain final plan completion");
+
+        let lines = completed
+            .candidate()
+            .render_explain_lines(ExplainRenderBudget::default())
+            .expect("a completed plan renders its own explain");
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("PHYSICAL PLAN version=")),
+            "{lines:?}"
+        );
+        assert_eq!(source.calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// A statement compiled to be executed has no EXPLAIN text to give.
+    #[tokio::test]
+    async fn an_executable_plan_has_no_explain_text() {
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        let completed = driver
+            .complete(values_request(), &scope)
+            .await
+            .expect("VALUES final plan completion");
+        assert!(
+            completed
+                .candidate()
+                .render_explain_lines(ExplainRenderBudget::default())
+                .is_err()
+        );
     }
 
     #[tokio::test]
