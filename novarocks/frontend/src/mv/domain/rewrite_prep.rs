@@ -21,15 +21,78 @@
 //! compiler receives the resulting immutable definition index and owns all
 //! candidate parse/analyze/statistics/selection work.
 
-use std::{fmt, sync::Arc};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::refresh::definition::parse_mv_select_query;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_sql::compiler::{
-    MvRewriteDefinitionIndex, SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts,
-    SqlMvRewritePublicationRelation, SqlMvRewriteSelectionFacts,
+    MaterializedViewFact, MaterializedViewNeed, MvRewriteDefinitionIndex,
+    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationRelation,
+    SqlMvRewriteSelectionFacts,
 };
+
+/// Freeze the optional rewrite facts for exactly one SQL completion need.
+///
+/// The repository can only enumerate a request-local inventory, so this
+/// function filters it before any connector or storage observation. A
+/// definition is relevant only when all of its base relations occur in the
+/// need: SQL rejects a fact containing an unrequested base relation, and a
+/// partial match would otherwise make that compiler contract ambiguous.
+///
+/// MV discovery and each candidate are optional accelerators. Their failures
+/// therefore produce a missing or empty observed fact, never a query failure.
+pub(crate) fn freeze_materialized_view_fact_with_ports(
+    need: &MaterializedViewNeed,
+    candidate_reader: &MvCandidateReader,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+) -> MaterializedViewFact {
+    let definitions = match candidate_reader.list_candidate_definitions() {
+        Ok(definitions) => definitions,
+        Err(error) => {
+            tracing::debug!(error = %error, "skip MV rewrite discovery because the inventory is unavailable");
+            return MaterializedViewFact::missing(
+                need,
+                "materialized-view rewrite inventory is unavailable",
+            )
+            .expect("a static MV inventory diagnostic is non-empty");
+        }
+    };
+    let requested_relations = need
+        .referenced_relations()
+        .iter()
+        .map(novarocks_types::naming::TableIdentity::fqn)
+        .collect::<HashSet<_>>();
+    let relevant = definitions.into_iter().filter(|definition| {
+        candidate_base_tables_are_requested(&definition.base_table_refs, &requested_relations)
+    });
+    let report = novarocks_mv_application::candidate::inspect_candidates(
+        relevant,
+        |definition| definition.mv_id.to_string(),
+        |definition| {
+            freeze_mv_rewrite_definition(connector_control, storage_observation, definition)
+        },
+    );
+    for diagnostic in report.diagnostics() {
+        tracing::debug!(
+            candidate = diagnostic.identity(),
+            error = diagnostic.message(),
+            "skip unavailable MV rewrite candidate"
+        );
+    }
+    MaterializedViewFact::observed(need, report.into_accepted())
+}
+
+fn candidate_base_tables_are_requested(
+    base_table_refs: &[String],
+    requested_relations: &HashSet<String>,
+) -> bool {
+    !base_table_refs.is_empty()
+        && base_table_refs
+            .iter()
+            .all(|base_table| requested_relations.contains(base_table))
+}
 
 /// Freeze rewrite candidates from the caller's leaf ports.  The frozen index
 /// remains request-local.
@@ -254,12 +317,38 @@ fn freeze_base_table_state(
 
 #[cfg(test)]
 mod tests {
-    use super::optional_candidate_inventory;
+    use std::collections::HashSet;
+
+    use super::{candidate_base_tables_are_requested, optional_candidate_inventory};
 
     #[test]
     fn unavailable_inventory_becomes_an_empty_optional_candidate_set() {
         let candidates = optional_candidate_inventory::<u8, _>(Err("StateStore unavailable"));
 
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn completion_need_filters_out_partial_mv_base_matches() {
+        let requested = HashSet::from([
+            "iceberg.sales.orders".to_string(),
+            "iceberg.sales.customers".to_string(),
+        ]);
+
+        assert!(candidate_base_tables_are_requested(
+            &[
+                "iceberg.sales.orders".to_string(),
+                "iceberg.sales.customers".to_string(),
+            ],
+            &requested,
+        ));
+        assert!(!candidate_base_tables_are_requested(
+            &[
+                "iceberg.sales.orders".to_string(),
+                "iceberg.sales.lineitem".to_string(),
+            ],
+            &requested,
+        ));
+        assert!(!candidate_base_tables_are_requested(&[], &requested));
     }
 }
