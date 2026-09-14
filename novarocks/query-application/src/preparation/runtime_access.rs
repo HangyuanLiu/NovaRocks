@@ -319,31 +319,17 @@ impl std::error::Error for FinalPlanAccessError {}
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use novarocks_sql::binding::SqlTableBindingAllocator;
 
-    use novarocks_physical_plan::{
-        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
-    };
-    use novarocks_sql::compiler::{
-        DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
-        SqlFinalPlanCompileRequest, SqlPlanningEnvironment, SqlSessionContext, SqlStatementInput,
-        builtin_sql_function_catalog, noop_constant_evaluator,
-    };
-    use novarocks_workload_control::{
-        ResourceConfig, RootWork, WorkClass, WorkRequest, WorkScope, WorkloadConfig,
-        WorkloadControl,
-    };
+    use crate::completed_plan_fixture::completed_values_plan;
 
-    use super::super::final_plan::{FinalPlanCompletionDriver, SqlCompletionFactSource};
     use super::*;
 
     fn a_binding() -> SqlTableBindingId {
-        novarocks_sql::binding::SqlTableBindingAllocator::try_new_for_test(
-            std::num::NonZeroU64::new(1).unwrap(),
-        )
-        .expect("allocator")
-        .allocate()
-        .expect("binding")
+        SqlTableBindingAllocator::try_new_for_test(std::num::NonZeroU64::new(1).unwrap())
+            .expect("allocator")
+            .allocate()
+            .expect("binding")
     }
 
     fn an_access() -> FrozenReadAccess<()> {
@@ -353,75 +339,9 @@ mod tests {
         }
     }
 
-    struct NoFacts;
-
-    #[async_trait::async_trait]
-    impl SqlCompletionFactSource for NoFacts {
-        type Access = ();
-
-        async fn resolve(
-            &self,
-            _: &novarocks_sql::compiler::SqlNeedBatch,
-            _: &ReadAccessSink<()>,
-        ) -> Result<novarocks_sql::compiler::SqlFactBatch, String> {
-            panic!("a VALUES plan asks for nothing")
-        }
-    }
-
     /// A plan over literal rows scans no provider, so it needs no capability.
     async fn values_candidate() -> CompletedPhysicalPlanCandidate {
-        let (_root, scope) = query_scope();
-        FinalPlanCompletionDriver::new(Arc::new(NoFacts))
-            .complete(values_request(), &scope)
-            .await
-            .expect("VALUES completes without facts")
-            .candidate()
-            .clone()
-    }
-
-    fn query_scope() -> (RootWork, WorkScope) {
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024,
-                control_bytes: 128,
-                per_scope_bytes: 896,
-            },
-        )
-        .expect("workload control");
-        control.mark_ready().expect("workload control ready");
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .expect("query root");
-        let scope = root.owner.scope();
-        (root, scope)
-    }
-
-    fn values_request() -> SqlFinalPlanCompileRequest {
-        SqlFinalPlanCompileRequest::new(
-            PlanVersionId::try_new([9; 16]).expect("plan version"),
-            SqlStatementInput::sql("SELECT 1"),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                current_catalog: Some("iceberg".to_string()),
-                current_database: "db".to_string(),
-                optimizer_settings: SessionOptimizerSettings::default(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            builtin_sql_function_catalog().snapshot(),
-            noop_constant_evaluator(),
-            SqlCompileControl::unbounded(),
-            PipelineDopDomain {
-                min: 1,
-                max: 8,
-                requires_power_of_two: true,
-            },
-            ScanReadBudget {
-                max_batch_rows: MAX_SCAN_BATCH_ROWS,
-                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
-            },
-            DEFAULT_COMPLETION_LIMITS,
-        )
+        completed_values_plan([9; 16]).await.candidate().clone()
     }
 
     #[tokio::test]
@@ -465,6 +385,18 @@ mod tests {
             .expect_err("one occurrence cannot be frozen twice");
         assert!(matches!(error, FinalPlanAccessError::FrozenTwice { .. }));
         assert_eq!(returned.len(), 2);
+    }
+
+    /// A capability deposited from another thread reaches the same account, so
+    /// a freeze that runs on the blocking lane cannot lose one.
+    #[test]
+    fn a_deposit_slip_reaches_the_same_account() {
+        let sink = ReadAccessSink::new();
+        let slip = sink.deposits();
+        std::thread::spawn(move || slip.deposit(ProviderReadOccurrenceId::new(5), an_access()))
+            .join()
+            .expect("deposit thread");
+        assert_eq!(sink.into_taken().len(), 1);
     }
 
     /// Distinct occurrences are the ordinary case, and the sidecar is keyed by
