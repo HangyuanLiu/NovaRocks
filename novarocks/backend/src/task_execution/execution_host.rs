@@ -1793,6 +1793,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 function_set,
+                crate::application::test_memory_authority(),
             )
             .expect("test execution runtime"),
         )
@@ -1802,7 +1803,7 @@ mod tests {
         let data_runtime = crate::rpc::runtime::test_backend_data_runtime();
         let completion_supervisor = TaskCompletionSupervisor::start(data_runtime.clone(), 64);
         NativeTaskExecutionHost::new(
-            NativeFragmentQueryRuntime::global(),
+            NativeFragmentQueryRuntime::global(crate::application::test_memory_authority()),
             facts,
             TaskInboundCapabilities::new(),
             crate::fragment::grpc_exchange_transmitter(data_runtime),

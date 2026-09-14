@@ -1233,6 +1233,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 test_execution_function_set(),
+                crate::application::test_memory_authority(),
             )
             .expect("writer execution runtime"),
         );

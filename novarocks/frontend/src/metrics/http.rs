@@ -81,6 +81,7 @@ impl MetricsHttpServer {
         serving_reader: Arc<dyn FrontendServingSnapshotReader>,
         island_reader: Arc<dyn BackendIslandSnapshotReader>,
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
+        memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     ) -> Result<Self, String> {
         let bind_addr = parse_metrics_bind_addr(host, port)
             .map_err(|error| format!("parse frontend metrics HTTP bind address failed: {error}"))?;
@@ -111,6 +112,7 @@ impl MetricsHttpServer {
                         serving_reader,
                         island_reader,
                         convergence_reader,
+                        memory_authority,
                         crate::native::report_server::lifecycle_convergence_debug_enabled(),
                     );
                     axum::serve(listener, app)

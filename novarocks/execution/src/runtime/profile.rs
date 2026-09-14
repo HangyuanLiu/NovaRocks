@@ -765,8 +765,15 @@ impl OperatorProfiles {
     }
 }
 
+/// The profile node the memory hierarchy hangs under.
+///
+/// Named once and shared, because a reader of a profile tree has to be able to
+/// tell this subtree apart: tracker labels intentionally mirror operator names,
+/// so anything that walks the tree looking for operators must stop here.
+pub const MEM_TRACKER_PROFILE_NODE: &str = "MemTracker";
+
 pub fn attach_mem_tracker_tree(profile: &RuntimeProfile, root: &Arc<MemTracker>) {
-    let mem_root = profile.child("MemTracker");
+    let mem_root = profile.child(MEM_TRACKER_PROFILE_NODE);
     fill_mem_tracker_profile(&mem_root, root);
 }
 

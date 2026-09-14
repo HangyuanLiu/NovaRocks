@@ -402,6 +402,7 @@ mod tests {
                     sink_io_max_blocking_threads: 1,
                 },
                 crate::runtime::execution_runtime::test_execution_function_set(),
+                crate::runtime::execution_runtime::test_memory_authority(),
             )
             .expect("test execution runtime"),
         );
