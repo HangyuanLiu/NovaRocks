@@ -48,7 +48,8 @@ mod plan;
 
 pub use physical_encode::{
     NoPhysicalV1PrivateFacts, PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact,
-    PhysicalV1WriteFact, encode_physical_plan_v1, physical_v1_scan_source_seal_digest,
+    PhysicalV1WriteFact, ScanRuntimeFilterBindings, encode_physical_plan_v1,
+    physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
 };
 pub use physical_v1::{
     NATIVE_V1_MAX_TREE_DEPTH, PhysicalV1PreflightError, WireLayout, WireLayoutError, WireSlotId,

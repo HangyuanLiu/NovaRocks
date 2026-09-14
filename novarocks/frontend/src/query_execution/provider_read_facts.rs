@@ -103,6 +103,16 @@ pub(crate) struct FrozenProviderRead {
 /// would and would not enforce. Nothing downstream can recover them from the
 /// plan, so they are kept from the moment the read stops being negotiable.
 pub(crate) struct FrozenReadEncoding {
+    /// The relation this read names, which the plan deliberately does not
+    /// carry: a physical plan addresses a provider relation by frozen
+    /// reference, not by the name a statement used to reach it.
+    pub(crate) identity: TableIdentity,
+    /// Each provider column this read projects, paired with how the request
+    /// named it. The plan addresses these columns by provider reference; what
+    /// a column is *called* is SQL-local and survives only here, so the pairing
+    /// is kept rather than the two halves separately - matching them again by
+    /// position later is how a rename becomes a mislabelled column.
+    pub(crate) columns: Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
     pub(crate) relation: novarocks_spi::connector::read_stack::ConnectorReadRelation,
     pub(crate) assignments: Vec<ConnectorReadAssignment>,
     /// What the provider guarantees. The engine may stop evaluating it.
@@ -247,22 +257,26 @@ fn freeze_one_read(
         .into_verified(&freeze_request)
         .map_err(|error| format!("provider read of {name} froze the wrong read: {error}"))?;
 
-    // 5. Take the capability, and account for it before anything else can
-    //    fail. Everything below is projection of facts already in hand, but
-    //    "before anything else" is the rule, not an estimate of what is risky.
-    let request_control = request_control_for(&read, context)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
-    let access = read
-        .seal_attempt_access(&request_control, &negotiated.handle)
-        .map_err(|error| {
-            format!("provider read of {name} cannot seal its per-attempt access: {error}")
-        })?;
+    // 5. Assemble everything the freeze leaves behind, so that taking the
+    //    capability and accounting for it are adjacent: nothing may happen
+    //    between sealing one and depositing it.
     let encoder = read.encoder();
     let provider_relation = metadata
         .relation(relation_kind, negotiated.handle.clone())
         .map_err(|error| format!("provider read of {name} has no frozen relation: {error}"))?;
     let (enforced_predicate, unenforced_predicate, remaining_expression) =
         filter_responsibility(&offer, &negotiated.outcomes);
+    let (schema, named_columns) =
+        column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
+    let request_control = request_control_for(&read, context)
+        .map_err(|error| format!("provider read of {name}: {error}"))?;
+
+    // 6. Take the capability and account for it in the same breath.
+    let access = read
+        .seal_attempt_access(&request_control, &negotiated.handle)
+        .map_err(|error| {
+            format!("provider read of {name} cannot seal its per-attempt access: {error}")
+        })?;
     deposits.deposit(
         need.occurrence(),
         FrozenReadAccess {
@@ -270,6 +284,8 @@ fn freeze_one_read(
             access: FrozenProviderRead {
                 access,
                 encoding: FrozenReadEncoding {
+                    identity: identity.clone(),
+                    columns: named_columns,
                     relation: provider_relation.clone(),
                     assignments: assignments.clone(),
                     enforced_predicate,
@@ -282,13 +298,12 @@ fn freeze_one_read(
         },
     );
 
-    // 6. Project the frozen read into the contract the plan is built against.
+    // 7. Project the frozen read into the contract the plan is built against.
     let relation_payload = encoder
         .encode_relation_payload(&provider_relation)
         .map_err(|error| format!("provider read of {name} cannot encode its relation: {error}"))?;
     let input_version = ExactInputVersion::try_new(frozen.input_version().as_bytes().to_vec())
         .map_err(|error| format!("provider read of {name} has no exact input version: {error}"))?;
-    let schema = column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
     let contract = ProviderReadStaticContract {
         sql_binding: need.binding(),
         request: ProviderReadRequestBinding::from_need(need),
@@ -685,34 +700,42 @@ fn filter_responsibility(
     }
 }
 
-/// The provider's column identity for each requested ordinal.
+/// The provider's column identity for each requested ordinal, and the name the
+/// request used for it.
 fn column_facts(
     columns: &[ProviderReadColumnNeed],
     assignments: &[ConnectorReadAssignment],
     encoder: &dyn ConnectorReadWireEncoder,
     name: &str,
-) -> Result<Box<[ProviderReadColumnFact]>, String> {
-    columns
-        .iter()
-        .zip(assignments.iter())
-        .map(|(column, assignment)| {
-            let payload = encoder
-                .encode_column_payload(assignment.column())
-                .map_err(|error| {
-                    format!(
-                        "provider read of {name} cannot encode column '{}': {error}",
-                        column.name()
-                    )
-                })?;
-            Ok(ProviderReadColumnFact::new(
-                column.ordinal(),
-                ProviderColumnReference {
-                    column_payload: payload,
-                },
-                column.engine_type().clone(),
-            ))
-        })
-        .collect()
+) -> Result<
+    (
+        Box<[ProviderReadColumnFact]>,
+        Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
+    ),
+    String,
+> {
+    let mut facts = Vec::with_capacity(columns.len());
+    let mut named = Vec::with_capacity(columns.len());
+    for (column, assignment) in columns.iter().zip(assignments.iter()) {
+        let payload = encoder
+            .encode_column_payload(assignment.column())
+            .map_err(|error| {
+                format!(
+                    "provider read of {name} cannot encode column '{}': {error}",
+                    column.name()
+                )
+            })?;
+        let reference = ProviderColumnReference {
+            column_payload: payload,
+        };
+        facts.push(ProviderReadColumnFact::new(
+            column.ordinal(),
+            reference.clone(),
+            column.engine_type().clone(),
+        ));
+        named.push((reference, column.clone()));
+    }
+    Ok((facts.into_boxed_slice(), named.into_boxed_slice()))
 }
 
 /// The physical facts the provider guarantees, in the request's own ordinals.

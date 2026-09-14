@@ -48,6 +48,11 @@ pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
 pub(crate) mod outcome;
+#[allow(
+    dead_code,
+    reason = "T07-Q encodes the completed plan through these facts; nothing calls them until then."
+)]
+pub(crate) mod physical_encoding;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
 pub mod post_compile;

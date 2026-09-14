@@ -223,7 +223,21 @@ struct EncodedRuntimeFilters {
     node_bindings: BTreeMap<(FragmentId, NodeId), Vec<u32>>,
 }
 
-type ScanRuntimeFilterBindings = BTreeMap<(FragmentId, NodeId), Vec<(u32, ValueId)>>;
+/// Which runtime filters each scan consumes, and under which wire binding id.
+pub type ScanRuntimeFilterBindings = BTreeMap<(FragmentId, NodeId), Vec<(u32, ValueId)>>;
+
+/// The runtime filters a scan must name in its provider-owned scan source.
+///
+/// The encoder derives these itself and checks what it is handed against them.
+/// Exposing the same derivation is what keeps a producer of scan sources from
+/// having to guess the binding identities: two derivations of one numbering
+/// disagree the moment either changes, and the disagreement would surface as a
+/// plan that cannot be encoded rather than as the numbering bug it is.
+pub fn physical_v1_scan_runtime_filters(
+    physical: &PhysicalPlan,
+) -> Result<ScanRuntimeFilterBindings, String> {
+    preflight_runtime_filters(physical)
+}
 
 fn encode_runtime_filters(
     physical: &PhysicalPlan,
