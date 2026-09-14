@@ -414,22 +414,33 @@ pub enum ProviderReadRelationNeed {
     },
 }
 
+/// Which admission-frozen input one provider read names.
+///
+/// A timestamp is deliberately not one of these. A timestamp names an instant,
+/// not an input, and only admission holds the snapshot log that turns one into
+/// the other. By the time a read is requested that resolution has already
+/// happened, so a timestamp arriving here would be a resolution that never ran
+/// rather than a version any provider could honour - and no provider may
+/// resolve one itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderReadVersionNeed {
     Current,
     Snapshot(i64),
-    TimestampMillis(i64),
 }
 
-fn provider_version_need(value: SqlTableVersionSelector) -> ProviderReadVersionNeed {
+fn provider_version_need(
+    id: CompileNeedId,
+    value: SqlTableVersionSelector,
+) -> Result<ProviderReadVersionNeed, CompletionProtocolError> {
     match value {
-        SqlTableVersionSelector::Current => ProviderReadVersionNeed::Current,
+        SqlTableVersionSelector::Current => Ok(ProviderReadVersionNeed::Current),
         SqlTableVersionSelector::Snapshot(snapshot_id) => {
-            ProviderReadVersionNeed::Snapshot(snapshot_id)
+            Ok(ProviderReadVersionNeed::Snapshot(snapshot_id))
         }
-        SqlTableVersionSelector::TimestampMillis(timestamp) => {
-            ProviderReadVersionNeed::TimestampMillis(timestamp)
-        }
+        SqlTableVersionSelector::TimestampMillis(_) => Err(CompletionProtocolError::InvalidNeed {
+            id,
+            reason: "provider read version was not resolved from a timestamp to a snapshot",
+        }),
     }
 }
 
@@ -756,16 +767,16 @@ pub(super) fn provider_relation_need_from_sql_scan(
     let need = match scan_kind {
         SqlScanKind::Data { version } => ProviderReadRelationNeed::Data {
             relation,
-            version: provider_version_need(*version),
+            version: provider_version_need(id, *version)?,
         },
         SqlScanKind::FrozenInputSet { version } => ProviderReadRelationNeed::FrozenInputSet {
             relation,
-            version: provider_version_need(*version),
+            version: provider_version_need(id, *version)?,
         },
         SqlScanKind::Metadata { kind, version } => ProviderReadRelationNeed::Metadata {
             relation,
             kind: *kind,
-            version: provider_version_need(*version),
+            version: provider_version_need(id, *version)?,
         },
         SqlScanKind::Delta {
             from_snapshot_id,
@@ -4385,6 +4396,22 @@ mod tests {
                 to_snapshot_id: 5,
                 ..
             }
+        ));
+        // A timestamp names an instant, not an admitted input, and nothing
+        // downstream of here holds the snapshot log that would turn one into
+        // the other. Asking is refused where the resolution was skipped.
+        assert!(matches!(
+            provider_relation_need_from_sql_scan(
+                CompileNeedId::new(1),
+                identity.clone(),
+                &SqlScanKind::Data {
+                    version: SqlTableVersionSelector::TimestampMillis(1_700_000_000_000),
+                },
+            ),
+            Err(CompletionProtocolError::InvalidNeed {
+                reason: "provider read version was not resolved from a timestamp to a snapshot",
+                ..
+            })
         ));
         let missing_reference = provider_relation_need_from_sql_scan(
             CompileNeedId::new(1),
