@@ -142,3 +142,198 @@ fn one_read_is_negotiated_frozen_and_accounted_for() {
     assert_eq!(kept.access.encoding.columns.len(), 1);
     assert_eq!(kept.access.encoding.columns[0].1.name(), "id");
 }
+
+/// The whole path on a statement that actually reads a provider: the compiler
+/// asks, this process answers, the plan completes, and it encodes.
+///
+/// The catalog, statistics and view answers are stated directly here because
+/// what is being proved is the provider half and the shape of the result. The
+/// provider half is the real adapter against the real fixture provider.
+mod scanning_statement {
+    use std::sync::Arc;
+
+    use novarocks_physical_plan::{
+        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
+    };
+    use novarocks_query_application::preparation::{
+        FinalPlanCompletionDriver, ProviderReadFactPort, ReadAccessSink, SqlCompletionFactSource,
+    };
+    use novarocks_sql::compiler::{
+        CatalogRelationFact, DEFAULT_COMPLETION_LIMITS, MaterializedViewFact,
+        SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent, SqlFactBatch,
+        SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment, SqlSessionContext,
+        SqlStatementInput, StatisticsFact, builtin_sql_function_catalog, noop_constant_evaluator,
+    };
+    use novarocks_sql::planning::dml::DmlStatisticsEvidence;
+    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use super::super::{
+        data_file, fixture_control_role_host, fixture_query_table_bindings, registry,
+    };
+    use crate::query_execution::physical_encoding::encode_completed_plan;
+    use crate::query_execution::provider_read_facts::{
+        FrontendProviderReadFacts, FrozenProviderRead,
+    };
+
+    /// Answers the three lookups from the fixture, and the provider read from
+    /// the real adapter.
+    struct FixtureFacts {
+        resolved: novarocks_sql::planning::catalog::ResolvedAnalyzerTable,
+        provider_reads: FrontendProviderReadFacts,
+    }
+
+    #[async_trait::async_trait]
+    impl SqlCompletionFactSource for FixtureFacts {
+        type Access = FrozenProviderRead;
+
+        async fn resolve(
+            &self,
+            needs: &SqlNeedBatch,
+            taken: &ReadAccessSink<FrozenProviderRead>,
+        ) -> Result<SqlFactBatch, String> {
+            match needs {
+                SqlNeedBatch::CatalogRelations(needs) => needs
+                    .iter()
+                    .map(|need| {
+                        CatalogRelationFact::resolved(need, self.resolved.clone())
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .map(|facts| SqlFactBatch::CatalogRelations(facts.into_boxed_slice())),
+                SqlNeedBatch::Statistics(needs) => needs
+                    .iter()
+                    .map(|need| {
+                        StatisticsFact::try_new(
+                            need,
+                            need.metrics().to_vec(),
+                            DmlStatisticsEvidence::Missing {
+                                binding: need.binding(),
+                                label: "fixture".to_string(),
+                                reason: "the fixture publishes no statistics".to_string(),
+                            },
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .map(|facts| SqlFactBatch::Statistics(facts.into_boxed_slice())),
+                SqlNeedBatch::MaterializedViews(needs) => needs
+                    .iter()
+                    .map(|need| {
+                        MaterializedViewFact::missing(need, "the fixture has no views")
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+                    .map(|facts| SqlFactBatch::MaterializedViews(facts.into_boxed_slice())),
+                SqlNeedBatch::ProviderReads(needs) => self
+                    .provider_reads
+                    .resolve_provider_reads(needs, taken)
+                    .await
+                    .map(|facts| SqlFactBatch::ProviderReads(facts.into_boxed_slice())),
+            }
+        }
+    }
+
+    #[test]
+    fn a_statement_that_reads_a_provider_completes_and_encodes() {
+        let connectors = registry(vec![data_file("s3://bucket/current.parquet")]);
+        let controls = crate::connector::FixtureControlResolver::new(connectors);
+        let fixture = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+            .expect("sealed ordinary fixture");
+        let store = Arc::new(fixture_query_table_bindings(&fixture, &controls));
+        // The store's own resolved table, so the catalog identity and the scan
+        // source name the same relation - which is what the completion
+        // contract checks and what production materialization guarantees.
+        let resolved = store
+            .captured_bindings()
+            .first()
+            .map(|(_, binding)| binding.resolved.clone())
+            .expect("the fixture admitted one binding");
+        let host = fixture_control_role_host(&fixture, &controls);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let facts = FixtureFacts {
+            resolved,
+            provider_reads: FrontendProviderReadFacts::new(
+                host,
+                store,
+                super::session(),
+                crate::connector::test_request_context(),
+                crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+                    runtime.handle().clone(),
+                    novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget::try_new(2, 1)
+                        .expect("blocking budget"),
+                ),
+            ),
+        };
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 4096,
+                control_bytes: 512,
+                per_scope_bytes: 3584,
+            },
+        )
+        .expect("workload control");
+        control.mark_ready().expect("workload control ready");
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root");
+        let scope = root.owner.scope();
+
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request(), &scope))
+            .unwrap_or_else(|error| panic!("a scanning statement completes: {error}"));
+        assert_eq!(completed.access().len(), 1, "one scan, one frozen read");
+
+        let encoded = encode_completed_plan(
+            completed,
+            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin engine function catalog"),
+        )
+        .expect("a completed plan that scans encodes");
+        assert_eq!(encoded.split_sources.len(), 1);
+        assert_eq!(encoded.access.iter().count(), 1);
+        assert!(
+            encoded
+                .scheduling
+                .fragments
+                .values()
+                .any(|fragment| fragment.has_scans()),
+            "the scan reaches scheduling"
+        );
+    }
+
+    fn request() -> SqlFinalPlanCompileRequest {
+        SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([11; 16]).expect("plan version"),
+            SqlStatementInput::sql("SELECT id FROM test_catalog.test_db.test_table"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: Some("test_catalog".to_string()),
+                current_database: "test_db".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+    }
+}
