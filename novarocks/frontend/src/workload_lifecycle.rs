@@ -115,9 +115,29 @@ pub struct FrontendWorkloadTotals {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct FrontendWorkloadServingSnapshot {
     pub active: FrontendActiveWorkloads,
+    /// Sanitized aggregate facts from the local workload authority. This
+    /// management projection contains no scope identity or mutation path.
+    pub governance: FrontendWorkloadGovernanceSnapshot,
     pub rejected_admissions: FrontendWorkloadTotals,
     pub completed_during_drain: FrontendWorkloadTotals,
     pub deadline_cancelled: FrontendWorkloadTotals,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct FrontendWorkloadGovernanceSnapshot {
+    pub root_responsibilities: usize,
+    pub preparation: usize,
+    pub execution: usize,
+    pub waiting_records: usize,
+    pub peak_waiting_records: usize,
+    pub waiting_bytes: u64,
+    pub peak_waiting_bytes: u64,
+    pub control_ready: usize,
+    pub control_inflight: usize,
+    pub resource_limit_bytes: u64,
+    pub held_bytes: u64,
+    pub peak_held_bytes: u64,
+    pub result_credit_held_bytes: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -242,6 +262,21 @@ fn frontend_workload_snapshot(
     rejected_admissions.session = rejected_sessions;
     FrontendWorkloadServingSnapshot {
         active,
+        governance: FrontendWorkloadGovernanceSnapshot {
+            root_responsibilities: workload.root_responsibilities,
+            preparation: workload.preparation,
+            execution: workload.execution,
+            waiting_records: workload.waiting_records,
+            peak_waiting_records: workload.peak_waiting_records,
+            waiting_bytes: workload.waiting_bytes,
+            peak_waiting_bytes: workload.peak_waiting_bytes,
+            control_ready: workload.control_ready,
+            control_inflight: workload.control_inflight,
+            resource_limit_bytes: workload.resource_limit_bytes,
+            held_bytes: workload.held_bytes,
+            peak_held_bytes: workload.peak_held_bytes,
+            result_credit_held_bytes: workload.result_credit_held_bytes,
+        },
         rejected_admissions,
         completed_during_drain: frontend_totals_from_root(
             &workload.root_lifecycle.completed_after_admission_closed,
@@ -376,6 +411,7 @@ impl FrontendServingSnapshotReader for FrontendServingLifecycle {
             catalog: inner.catalog.clone(),
             workload: FrontendWorkloadServingSnapshot {
                 active: FrontendActiveWorkloads::default(),
+                governance: FrontendWorkloadGovernanceSnapshot::default(),
                 rejected_admissions: FrontendWorkloadTotals {
                     session: admission.rejected_sessions,
                     ..FrontendWorkloadTotals::default()
@@ -440,6 +476,11 @@ mod tests {
             reader.frontend_serving_snapshot().workload.active.statement,
             1
         );
+        let initial_governance = &reader.frontend_serving_snapshot().workload.governance;
+        assert_eq!(initial_governance.resource_limit_bytes, 128);
+        assert_eq!(initial_governance.held_bytes, 0);
+        assert_eq!(initial_governance.peak_held_bytes, 0);
+        assert_eq!(initial_governance.result_credit_held_bytes, 0);
 
         assert_eq!(
             lifecycle.begin_drain(Duration::from_secs(1)),

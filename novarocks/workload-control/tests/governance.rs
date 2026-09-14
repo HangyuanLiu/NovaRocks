@@ -88,6 +88,24 @@ fn drain_control(control: &WorkloadControl) {
 }
 
 #[test]
+fn terminally_converged_root_retires_its_undispatched_cancellation_notification() {
+    let control = control();
+    let work = root(&control, WorkClass::Query);
+
+    work.owner.cancel(CancellationReason::DeadlineExceeded);
+    assert_eq!(control.snapshot().control_ready, 1);
+
+    work.business.release();
+    work.owner.complete_after_terminal_cancel_settled();
+
+    let snapshot = control.snapshot();
+    assert_eq!(snapshot.root_responsibilities, 0);
+    assert_eq!(snapshot.control_ready, 0);
+    assert_eq!(snapshot.control_inflight, 0);
+    assert!(control.next_control().is_none());
+}
+
+#[test]
 fn split_construction_keeps_process_progression_unique_and_service_handles_narrow() {
     let WorkloadControlParts {
         owner,
