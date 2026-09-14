@@ -61,7 +61,6 @@ use novarocks_physical_plan::{
     WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
     WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
     WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
-    derive_project_output_properties, expressions_are_replica_deterministic,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{RootWriteResultSchema, WriteTargetOrdinal};
@@ -2612,28 +2611,17 @@ impl ContractLoweringVisitor {
                 output.push(value);
             }
         }
-        let properties = derive_project_output_properties(
-            &source.properties,
-            &output,
-            expressions_are_replica_deterministic(
-                self.fragment_mut().expressions(),
-                expressions.iter().map(|(expression, _)| *expression),
-                true,
-            ),
-        );
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([source.node]),
-            required_inputs: Box::from([passthrough_requirement(&source.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Project {
-                expressions: expressions.into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_project(
+            node,
+            source.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the writer projection was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: source.fragment,
             node,
@@ -4829,29 +4817,17 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
-        let properties = derive_project_output_properties(
-            &child.properties,
-            &output,
-            expressions_are_replica_deterministic(
-                self.fragment_mut().expressions(),
-                expressions.iter().map(|(expression, _)| *expression),
-                true,
-            ),
-        );
-
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: output.clone().into_boxed_slice(),
-            },
-            kind: NodeKind::Project {
-                expressions: expressions.into_boxed_slice(),
-            },
-        })?;
+        self.fragment_mut().add_project(
+            node,
+            child.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5099,27 +5075,15 @@ impl ContractLoweringVisitor {
         let node = self.fragment_mut().reserve_node_id()?;
         let LoweredOrdering {
             expressions: order_by,
-            properties: ordering,
+            ..
         } = self.lower_ordering(node, &sort.items, &child.columns)?;
-        let properties = PhysicalProperties {
-            distribution: Distribution::Singleton,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering,
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([singleton_requirement()]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::Sort {
-                order_by,
-                mode: SortMode::Global,
-            },
-        })?;
+        self.fragment_mut()
+            .add_sort(node, child.node, order_by, SortMode::Global)?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the sort was just inserted")
+            .clone();
         let sorted = LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5225,38 +5189,22 @@ impl ContractLoweringVisitor {
         let node = self.fragment_mut().reserve_node_id()?;
         let LoweredOrdering {
             expressions: order_by,
-            properties: ordering,
+            ..
         } = self.lower_ordering(node, items, &child.columns)?;
-        let properties = PhysicalProperties {
-            distribution: child.properties.distribution.clone(),
-            row_multiplicity: child.properties.row_multiplicity,
-            ordering,
-        };
-        let required = if require_singleton {
-            singleton_requirement()
-        } else {
-            PhysicalProperties {
-                distribution: child.properties.distribution.clone(),
-                row_multiplicity: child.properties.row_multiplicity,
-                ordering: Box::default(),
-            }
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([required]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::TopN {
-                order_by,
-                limit,
-                offset,
-                phase,
-            },
-        })?;
+        self.fragment_mut().add_top_n(
+            node,
+            child.node,
+            order_by,
+            limit,
+            offset,
+            phase,
+            require_singleton,
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the top-n was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5953,34 +5901,18 @@ impl ContractLoweringVisitor {
         let order_by = self
             .lower_ordering(node, &window.order_by, &child.columns)?
             .expressions;
-        let ordering = window_ordering_keys(window, &child.columns)?.into_boxed_slice();
-        let properties = PhysicalProperties {
-            distribution: child.properties.distribution.clone(),
-            row_multiplicity: child.properties.row_multiplicity,
-            ordering,
+        let mode = if partition_by.is_empty() {
+            SortMode::Global
+        } else {
+            SortMode::Analytic { partition_by }
         };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([PhysicalProperties {
-                distribution: child.properties.distribution.clone(),
-                row_multiplicity: child.properties.row_multiplicity,
-                ordering: Box::default(),
-            }]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::Sort {
-                order_by,
-                mode: if partition_by.is_empty() {
-                    SortMode::Global
-                } else {
-                    SortMode::Analytic { partition_by }
-                },
-            },
-        })?;
+        self.fragment_mut()
+            .add_sort(node, child.node, order_by, mode)?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the sort was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,

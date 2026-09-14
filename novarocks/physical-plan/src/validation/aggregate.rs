@@ -144,12 +144,15 @@ pub(crate) fn aggregate_state_inputs(
 ) -> Option<Vec<ValueId>> {
     let mut values = group_by
         .iter()
-        .map(|(expression, _)| expression_value(fragment, *expression))
+        .map(|(expression, _)| crate::expression_value(fragment.expressions(), *expression))
         .collect::<Option<Vec<_>>>()?;
     if call.arguments.len() != 1 || !call.order_by.is_empty() {
         return None;
     }
-    values.push(expression_value(fragment, call.arguments[0])?);
+    values.push(crate::expression_value(
+        fragment.expressions(),
+        call.arguments[0],
+    )?);
     Some(values)
 }
 

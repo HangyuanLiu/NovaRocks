@@ -982,11 +982,11 @@ pub(crate) fn validate_node_semantics(
             if node.required_inputs.len() == 2 {
                 let left_keys = keys
                     .iter()
-                    .filter_map(|key| expression_value(fragment, key.left))
+                    .filter_map(|key| crate::expression_value(fragment.expressions(), key.left))
                     .collect::<Vec<_>>();
                 let right_keys = keys
                     .iter()
-                    .filter_map(|key| expression_value(fragment, key.right))
+                    .filter_map(|key| crate::expression_value(fragment.expressions(), key.right))
                     .collect::<Vec<_>>();
                 let compatible = match (
                     distribution,
@@ -1934,7 +1934,7 @@ pub(crate) fn validate_ordering_expressions(
 ) {
     let input_values = node.inputs.first().and_then(|input| indexes.output(*input));
     for key in ordering {
-        match expression_value(fragment, key.expr) {
+        match crate::expression_value(fragment.expressions(), key.expr) {
             Some(value) if input_values.is_some_and(|input| input.contains(&value)) => {}
             _ => errors.push(ValidationError::new(
                 path,

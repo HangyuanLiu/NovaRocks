@@ -1197,10 +1197,3 @@ pub(crate) fn validate_expression_values_on_port(
         expression.kind.expression_references(&mut pending);
     }
 }
-
-pub(crate) fn expression_value(fragment: &Fragment, expression: ExprId) -> Option<ValueId> {
-    match &fragment.expressions().get(expression)?.kind {
-        ExprKind::Value(value) => Some(*value),
-        _ => None,
-    }
-}

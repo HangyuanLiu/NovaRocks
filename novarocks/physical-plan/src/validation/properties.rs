@@ -877,7 +877,9 @@ pub(crate) fn validate_node_output_properties(
                 let required = node.required_inputs.first();
                 let grouping_values = group_by
                     .iter()
-                    .map(|(expression, _)| expression_value(fragment, *expression))
+                    .map(|(expression, _)| {
+                        crate::expression_value(fragment.expressions(), *expression)
+                    })
                     .collect::<Option<Vec<_>>>();
                 let colocated = input.is_some_and(|input| {
                     required.is_some_and(|required| {
@@ -1143,7 +1145,7 @@ pub(crate) fn direct_order_values(
 ) -> Option<Vec<ValueId>> {
     ordering
         .iter()
-        .map(|item| expression_value(fragment, item.expr))
+        .map(|item| crate::expression_value(fragment.expressions(), item.expr))
         .collect()
 }
 
@@ -1152,17 +1154,7 @@ pub(crate) fn derive_ordering(
     partition_by: &[crate::SortExpr],
     order_by: &[crate::SortExpr],
 ) -> Option<Vec<crate::OrderingKey>> {
-    partition_by
-        .iter()
-        .chain(order_by)
-        .map(|item| {
-            expression_value(fragment, item.expr).map(|value| crate::OrderingKey {
-                value,
-                direction: item.direction,
-                null_ordering: item.null_ordering,
-            })
-        })
-        .collect()
+    crate::ordering_keys(fragment.expressions(), partition_by, order_by)
 }
 
 pub(crate) fn distribution_colocates_by(distribution: &Distribution, keys: &[ValueId]) -> bool {

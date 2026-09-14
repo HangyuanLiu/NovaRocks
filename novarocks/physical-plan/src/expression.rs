@@ -425,3 +425,37 @@ pub fn expressions_are_replica_deterministic(
     }
     true
 }
+
+/// Value a sort key reads directly, when it reads one at all.
+///
+/// An ordering key names a value, not an arbitrary computation: a sort over a
+/// derived expression orders rows but establishes no ordering another operator
+/// can rely on.
+pub fn expression_value(arena: &ExprArena, expression: ExprId) -> Option<ValueId> {
+    match &arena.get(expression)?.kind {
+        ExprKind::Value(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// Ordering a sort establishes, partition keys first.
+///
+/// Returns `None` when any key is not a direct value reference, which is the
+/// case where no ordering can be claimed downstream.
+pub fn ordering_keys(
+    arena: &ExprArena,
+    partition_by: &[SortExpr],
+    order_by: &[SortExpr],
+) -> Option<Vec<crate::OrderingKey>> {
+    partition_by
+        .iter()
+        .chain(order_by)
+        .map(|item| {
+            expression_value(arena, item.expr).map(|value| crate::OrderingKey {
+                value,
+                direction: item.direction,
+                null_ordering: item.null_ordering,
+            })
+        })
+        .collect()
+}

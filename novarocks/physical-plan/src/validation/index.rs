@@ -456,7 +456,10 @@ impl SemanticTraceIndexes {
             }
             let mut index = ValueMappingIndex::default();
             for (expression, output) in expressions {
-                index.insert(expression_value(fragment, *expression), *output);
+                index.insert(
+                    crate::expression_value(fragment.expressions(), *expression),
+                    *output,
+                );
             }
             entry.insert(index);
         }

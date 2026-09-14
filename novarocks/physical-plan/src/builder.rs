@@ -285,6 +285,204 @@ impl FragmentBuilder {
         })
     }
 
+    /// Adds a sort over `input`.
+    ///
+    /// The ordering a sort establishes is not an independent fact to be stated
+    /// alongside the sort keys - it *is* the sort keys, read as values. Having
+    /// the caller supply both invited them to disagree, so the builder derives
+    /// the ordering and only the keys are supplied.
+    ///
+    /// A global sort needs one single-copy stream. An analytic sort leaves the
+    /// input layout alone, because it orders within partitions that the layout
+    /// already colocates.
+    pub fn add_sort(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        order_by: Box<[crate::SortExpr]>,
+        mode: crate::SortMode,
+    ) -> Result<(), BuildError> {
+        if order_by.is_empty() {
+            return Err(BuildError::OrderingWithoutKeys(node));
+        }
+        let partition_by: &[crate::SortExpr] = match &mode {
+            crate::SortMode::Global => &[],
+            crate::SortMode::Analytic { partition_by }
+            | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by,
+        };
+        let ordering = crate::ordering_keys(&self.expressions, partition_by, &order_by)
+            .ok_or(BuildError::OrderingKeyIsNotAValue(node))?
+            .into_boxed_slice();
+        let (output_properties, required) =
+            self.passthrough_ordering_properties(node, input, &mode, ordering)?;
+        let source = self.nodes.get(&input).expect("checked above");
+        let columns = source.output.columns.clone();
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([required]),
+            output_properties,
+            output: OutputPort { node, columns },
+            kind: NodeKind::Sort { order_by, mode },
+        })
+    }
+
+    /// Adds a top-N over `input`.
+    ///
+    /// A global phase needs one single-copy stream; a partial phase runs where
+    /// the rows already are and its result is reduced later.
+    pub fn add_top_n(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        order_by: Box<[crate::SortExpr]>,
+        limit: u64,
+        offset: u64,
+        phase: crate::TopNPhase,
+        require_singleton: bool,
+    ) -> Result<(), BuildError> {
+        if order_by.is_empty() {
+            return Err(BuildError::OrderingWithoutKeys(node));
+        }
+        let ordering = crate::ordering_keys(&self.expressions, &[], &order_by)
+            .ok_or(BuildError::OrderingKeyIsNotAValue(node))?
+            .into_boxed_slice();
+        let mode = if require_singleton {
+            crate::SortMode::Global
+        } else {
+            crate::SortMode::Analytic {
+                partition_by: Box::default(),
+            }
+        };
+        let (output_properties, required) =
+            self.passthrough_ordering_properties(node, input, &mode, ordering)?;
+        let source = self.nodes.get(&input).expect("checked above");
+        let columns = source.output.columns.clone();
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([required]),
+            output_properties,
+            output: OutputPort { node, columns },
+            kind: NodeKind::TopN {
+                order_by,
+                limit,
+                offset,
+                phase,
+            },
+        })
+    }
+
+    /// Adds a projection over `input`.
+    ///
+    /// `output` stays a caller decision because an output port is an ordered
+    /// list of occurrences that may repeat a value, which the expression list
+    /// cannot express: each expression defines its value exactly once. What
+    /// follows from those two is the input requirement and which of the input's
+    /// distribution and ordering survive, so the builder derives both.
+    pub fn add_project(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        expressions: Box<[(ExprId, ValueId)]>,
+        output: Box<[ValueId]>,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let input_properties = source.output_properties.clone();
+        for (expression, value) in &expressions {
+            let node_expression = self
+                .expressions
+                .get(*expression)
+                .ok_or(BuildError::UndefinedExpression(*expression))?;
+            if node_expression.owner != node {
+                return Err(BuildError::ExpressionOutsideOwner {
+                    expr: *expression,
+                    owner: node_expression.owner,
+                    node,
+                });
+            }
+            if !self.values.contains_key(value) {
+                return Err(BuildError::UndefinedValue(*value));
+            }
+        }
+        for value in &output {
+            if !self.values.contains_key(value) {
+                return Err(BuildError::UndefinedValue(*value));
+            }
+        }
+        let replica_deterministic = crate::expressions_are_replica_deterministic(
+            &self.expressions,
+            expressions.iter().map(|(expression, _)| *expression),
+            true,
+        );
+        let output_properties = crate::derive_project_output_properties(
+            &input_properties,
+            &output,
+            replica_deterministic,
+        );
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
+            output_properties,
+            output: OutputPort {
+                node,
+                columns: output,
+            },
+            kind: NodeKind::Project { expressions },
+        })
+    }
+
+    /// Output and input properties for an operator that orders rows it passes
+    /// through.
+    fn passthrough_ordering_properties(
+        &self,
+        node: NodeId,
+        input: NodeId,
+        mode: &crate::SortMode,
+        ordering: Box<[crate::OrderingKey]>,
+    ) -> Result<(crate::PhysicalProperties, crate::PhysicalProperties), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let input_properties = &source.output_properties;
+        if matches!(mode, crate::SortMode::Global) {
+            if input_properties.distribution != crate::Distribution::Singleton
+                || input_properties.row_multiplicity != crate::RowMultiplicity::SingleCopy
+            {
+                return Err(BuildError::GlobalOrderOverManyStreams(node));
+            }
+            return Ok((
+                crate::PhysicalProperties {
+                    distribution: crate::Distribution::Singleton,
+                    row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                    ordering,
+                },
+                crate::PhysicalProperties {
+                    distribution: crate::Distribution::Singleton,
+                    row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                    ordering: Box::default(),
+                },
+            ));
+        }
+        Ok((
+            crate::PhysicalProperties {
+                distribution: input_properties.distribution.clone(),
+                row_multiplicity: input_properties.row_multiplicity,
+                ordering,
+            },
+            crate::PhysicalProperties {
+                distribution: input_properties.distribution.clone(),
+                row_multiplicity: input_properties.row_multiplicity,
+                ordering: Box::default(),
+            },
+        ))
+    }
+
     /// Properties a node in this fragment produces.
     ///
     /// Callers that let the builder derive properties still need to read them
@@ -481,6 +679,7 @@ pub enum BuildError {
         input: NodeId,
     },
     UndefinedExpression(ExprId),
+    UndefinedValue(ValueId),
     /// Expressions belong to exactly one node's evaluation scope, so using one
     /// under a different node is a scope violation rather than a type error.
     ExpressionOutsideOwner {
@@ -496,6 +695,13 @@ pub enum BuildError {
     /// A cardinality assertion was built over replicated rows, where counting
     /// them counts execution copies rather than logical rows.
     AssertionOverReplicatedRows(NodeId),
+    OrderingWithoutKeys(NodeId),
+    /// A sort key reads a computation rather than a value, so no downstream
+    /// operator could rely on the ordering it claims.
+    OrderingKeyIsNotAValue(NodeId),
+    /// A global order was built over rows spread across more than one stream,
+    /// where "the first N in order" has no single meaning.
+    GlobalOrderOverManyStreams(NodeId),
 }
 
 impl fmt::Display for BuildError {
@@ -521,6 +727,7 @@ impl fmt::Display for BuildError {
             Self::UndefinedExpression(id) => {
                 write!(formatter, "expression {} is not defined", id.get())
             }
+            Self::UndefinedValue(id) => write!(formatter, "value {} is not defined", id.get()),
             Self::ExpressionOutsideOwner { expr, owner, node } => write!(
                 formatter,
                 "expression {} belongs to node {}, not node {}",
@@ -546,6 +753,19 @@ impl fmt::Display for BuildError {
             Self::AssertionOverReplicatedRows(id) => write!(
                 formatter,
                 "assertion node {} cannot count replicated rows",
+                id.get()
+            ),
+            Self::OrderingWithoutKeys(id) => {
+                write!(formatter, "ordering node {} has no sort key", id.get())
+            }
+            Self::OrderingKeyIsNotAValue(id) => write!(
+                formatter,
+                "ordering node {} has a sort key that is not a value reference",
+                id.get()
+            ),
+            Self::GlobalOrderOverManyStreams(id) => write!(
+                formatter,
+                "node {} requires one single-copy singleton input for a global order",
                 id.get()
             ),
             Self::DuplicateArtifactRef(id) => {

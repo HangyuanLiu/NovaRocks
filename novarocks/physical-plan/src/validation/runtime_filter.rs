@@ -1210,8 +1210,8 @@ pub(crate) fn equality_key_value(
         return None;
     };
     let key = keys.get(usize::try_from(witness.key_ordinal).ok()?)?;
-    expression_value(
-        fragment,
+    crate::expression_value(
+        fragment.expressions(),
         match side {
             crate::JoinSide::Left => key.left,
             crate::JoinSide::Right => key.right,
@@ -1388,12 +1388,15 @@ pub(crate) fn validate_runtime_filter_producer_target(
                     item.direction == direction
                         && item.null_ordering == null_ordering
                         && group_key.is_some_and(|(_, output)| {
-                            expression_value(fragment, item.expr) == Some(*output)
+                            crate::expression_value(fragment.expressions(), item.expr)
+                                == Some(*output)
                         })
                 })
                 && ordered_domain_matches
                 && group_key
-                    .and_then(|(expression, _)| expression_value(fragment, *expression))
+                    .and_then(|(expression, _)| {
+                        crate::expression_value(fragment.expressions(), *expression)
+                    })
                     .is_some_and(|value| producer.endpoint.values.as_ref() == [value])
         }
         _ => false,
@@ -1644,7 +1647,7 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                         mode: crate::SortMode::Global | crate::SortMode::Analytic { .. },
                     } if order_by
                         .iter()
-                        .all(|item| expression_value(fragment, item.expr).is_some())
+                        .all(|item| crate::expression_value(fragment.expressions(), item.expr).is_some())
                 );
                 let child = node
                     .inputs
@@ -1693,7 +1696,7 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                 if output != position.2 {
                     return None;
                 }
-                let source = expression_value(fragment, expression)?;
+                let source = crate::expression_value(fragment.expressions(), expression)?;
                 if !indexes.port_contains(fragment, child_node, source)
                     || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
                 {
@@ -1721,8 +1724,12 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                     return None;
                 }
                 let key_value = |side: crate::JoinSide| match side {
-                    crate::JoinSide::Left => expression_value(fragment, key.left),
-                    crate::JoinSide::Right => expression_value(fragment, key.right),
+                    crate::JoinSide::Left => {
+                        crate::expression_value(fragment.expressions(), key.left)
+                    }
+                    crate::JoinSide::Right => {
+                        crate::expression_value(fragment.expressions(), key.right)
+                    }
                 };
                 if key_value(source_side) != Some(position.2)
                     || !indexes.port_contains(fragment, node, position.2)
@@ -1756,7 +1763,7 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                 let (expression, output) = group_by
                     .get(usize::try_from(group_key_ordinal).ok()?)
                     .copied()?;
-                let source = expression_value(fragment, expression)?;
+                let source = crate::expression_value(fragment.expressions(), expression)?;
                 let child = *node.inputs.first()?;
                 let child_node = fragment.nodes().get(&child)?;
                 if node.inputs.len() != 1
