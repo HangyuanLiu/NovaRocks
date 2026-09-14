@@ -479,9 +479,21 @@ impl ScanNegotiationAdapter {
         })
     }
 
+    /// Record which predicates the engine must still evaluate.
+    ///
+    /// Only an `Exact` answer relieves the engine of the predicates it lowered.
+    /// A provider that prunes with a predicate has not promised that every row
+    /// it returns satisfies it, so treating pruning as a guarantee would drop
+    /// rows' worth of filtering and return rows the query excluded.
+    ///
+    /// A pruning answer therefore leaves every predicate with the engine, not
+    /// just the unlowerable ones. Keeping only the ones the provider did not
+    /// take on would need a per-occurrence answer: the aggregate remaining
+    /// constraint is over columns, and cannot say which predicate it came
+    /// from.
     fn record_filter_response(
         &mut self,
-        response: Option<&ConnectorReadFilterApplication>,
+        disposition: ReadPushdownDisposition,
     ) -> Result<(), String> {
         if self.residual_predicate_ordinals.is_some() {
             return Err(format!(
@@ -489,7 +501,7 @@ impl ScanNegotiationAdapter {
                 self.contract.node_id()
             ));
         }
-        self.residual_predicate_ordinals = Some(if response.is_some() {
+        self.residual_predicate_ordinals = Some(if disposition.relieves_engine() {
             self.unlowerable_predicate_ordinals.clone()
         } else {
             (0..self.contract.predicate_count()).collect()
@@ -696,13 +708,17 @@ impl<'a> ScanNegotiationSession<'a> {
                 constraint: constraint.clone(),
             },
         )?;
+        let disposition = response
+            .as_ref()
+            .map(|(_, outcome)| outcome.disposition)
+            .unwrap_or(ReadPushdownDisposition::Unsupported);
         let response = response.map(|(handle, outcome)| {
             let residual = outcome
                 .residual
                 .expect("an answered filter names its residual");
             ConnectorReadFilterApplication::new(handle, residual, None)
         });
-        self.outcome.record_filter_response(response.as_ref())?;
+        self.outcome.record_filter_response(disposition)?;
         self.offered_constraint = Some(constraint.clone());
         if let Some(application) = &response {
             self.accept_handle(application.handle().clone())?;
@@ -1452,13 +1468,49 @@ pub(crate) mod tests {
         let predicate_count = contract.predicate_count();
         let offered_limit = contract.offered_limit().then_some(1);
         let mut adapter = ScanNegotiationAdapter::begin(contract, Vec::new()).unwrap();
-        adapter.record_filter_response(None).unwrap();
+        adapter
+            .record_filter_response(ReadPushdownDisposition::Unsupported)
+            .unwrap();
         adapter.record_projection_response(None).unwrap();
         adapter.record_limit_response(offered_limit, None).unwrap();
         let outcome = adapter.finish().unwrap();
         assert_eq!(outcome.residual_predicate_ordinals.len(), predicate_count);
         assert!(!outcome.projection_applied);
         assert!(!outcome.limit_guaranteed);
+    }
+
+    /// Pruning is not a guarantee.
+    ///
+    /// A provider that only prunes with a predicate has not promised that every
+    /// row it returns satisfies it. Treating that as a guarantee would drop the
+    /// engine's own evaluation and return rows the query excluded, so a pruning
+    /// answer leaves every predicate with the engine.
+    #[test]
+    fn only_an_exact_filter_answer_relieves_the_engine() {
+        let plan = native_scan_plan(NativeScanFixture::UnsupportedPredicate).unwrap();
+        let contract = SealedPreparationPlan::seal(plan)
+            .scan_contracts()
+            .unwrap()
+            .remove(0);
+        let predicate_count = contract.predicate_count();
+        assert!(predicate_count > 0, "the fixture must carry a predicate");
+
+        for (disposition, expected) in [
+            (ReadPushdownDisposition::Exact, 0),
+            (ReadPushdownDisposition::PruningOnly, predicate_count),
+            (ReadPushdownDisposition::Unsupported, predicate_count),
+        ] {
+            let mut adapter = ScanNegotiationAdapter::begin(contract.clone(), Vec::new()).unwrap();
+            adapter.record_filter_response(disposition).unwrap();
+            adapter.record_projection_response(None).unwrap();
+            adapter.record_limit_response(None, None).unwrap();
+            let outcome = adapter.finish().unwrap();
+            assert_eq!(
+                outcome.residual_predicate_ordinals.len(),
+                expected,
+                "{disposition:?} left the wrong work with the engine"
+            );
+        }
     }
 
     #[test]
