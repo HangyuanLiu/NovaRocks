@@ -1296,6 +1296,56 @@ fn derive_document_managed_mv_create_leases(
     })
 }
 
+fn acquire_document_managed_mv_create_admission(
+    ports: &IcebergMvCorePorts,
+    leases: &DocumentManagedMvCreateLeases,
+    publication_id: novarocks_spi::connector::LakePublicationId,
+    target: novarocks_spi::connector::ConnectorTableIdentity,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    (
+        novarocks_mv_application::management::ManagementEntranceLease,
+        novarocks_spi::connector::ConnectorDocumentManagementAdmission,
+    ),
+    String,
+> {
+    let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+        publication_id.to_bytes(),
+    );
+    let intent = novarocks_mv_application::management::CreateIntent::try_new(
+        leases.documents.catalog_handle().clone(),
+        target.clone(),
+        novarocks_mv_application::management::EffectIdentity::from_bytes(publication_id.to_bytes()),
+    )
+    .map_err(|error| format!("build MV CREATE management intent: {error}"))?;
+    let management = ports
+        .management_entrance()?
+        .acquire(
+            novarocks_mv_application::management::ManagementRequest::for_create_intent(
+                intent,
+                novarocks_mv_application::management::EffectScope::CATALOG_COMMIT,
+            ),
+            || context.cancellation().is_cancelled(),
+        )
+        .map_err(|error| format!("acquire MV CREATE management entrance: {error}"))?;
+    let admission = leases
+        .documents
+        .admit_management(
+            novarocks_spi::connector::ConnectorDocumentManagementAdmissionRequest::try_new(
+                leases.documents.owner().clone(),
+                leases.documents.catalog_handle().clone(),
+                operation_id,
+                target,
+                None,
+                novarocks_spi::connector::ConnectorDocumentManagementOperation::Create,
+                context,
+            )
+            .map_err(|error| format!("build MV CREATE document admission: {error}"))?,
+        )
+        .map_err(|error| format!("admit MV CREATE documents: {error}"))?;
+    Ok((management, admission))
+}
+
 fn known_committed_create_finalize_error(phase: &str, error: impl std::fmt::Display) -> String {
     EngineError::commit_known_committed_finalize_failed(format!(
         "Iceberg MV repository create committed but {phase} failed: {error}"
