@@ -409,7 +409,9 @@ fn scan_lineage_filter(
                     node: filter,
                     columns: scan_values.clone().into_boxed_slice(),
                 },
-                kind: NodeKind::Filter { predicate },
+                kind: NodeKind::Filter {
+                    predicates: Box::from([predicate]),
+                },
             })
             .unwrap();
         (

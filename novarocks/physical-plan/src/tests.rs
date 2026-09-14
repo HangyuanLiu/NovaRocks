@@ -1173,6 +1173,89 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
     assert!(!errors.is_producer_defect());
 }
 
+/// Builds a fragment whose only expression is one n-ary connective over
+/// `count` boolean literals, and returns the validation outcome.
+fn wide_connective_fragment(
+    count: usize,
+    connective: fn(Box<[ExprId]>) -> ExprKind,
+) -> Result<Fragment, ValidationErrors> {
+    let mut builder = FragmentBuilder::new(FragmentId::new(9));
+    let node = builder.reserve_node_id().unwrap();
+    let boolean = ty(DataType::Boolean, false);
+    let args = (0..count)
+        .map(|_| {
+            builder
+                .add_expression(
+                    node,
+                    boolean.clone(),
+                    ExprKind::Literal(LiteralValue::Boolean(true)),
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let root = builder
+        .add_expression(node, boolean.clone(), connective(args.into_boxed_slice()))
+        .unwrap();
+    let value = builder
+        .add_value(
+            boolean,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([root])]),
+            },
+        })
+        .unwrap();
+    builder.finish_definition(node, FragmentSink::Noop, dop())
+}
+
+#[test]
+fn a_wide_predicate_is_width_and_not_depth() {
+    // Comfortably past MAX_EXPRESSION_SEMANTIC_DEPTH. A dashboard filter panel
+    // or a generated `(a=1 AND b=2) OR ...` reaches this size routinely, so it
+    // must validate: the depth bound exists to stop pathological nesting, not
+    // to cap how many conditions a query may state.
+    const CONJUNCTS: usize = MAX_EXPRESSION_SEMANTIC_DEPTH * 2;
+    const _: () = assert!(
+        CONJUNCTS > MAX_EXPRESSION_SEMANTIC_DEPTH,
+        "the fixture must exceed the depth bound or it proves nothing"
+    );
+    wide_connective_fragment(CONJUNCTS, |args| ExprKind::Conjunction { args })
+        .expect("a wide conjunction is an ordinary query");
+    wide_connective_fragment(CONJUNCTS, |args| ExprKind::Disjunction { args })
+        .expect("a wide disjunction is an ordinary query");
+}
+
+#[test]
+fn a_boolean_connective_needs_at_least_two_arguments() {
+    // One spelling per predicate: a single-argument connective would be a
+    // second way to write the argument itself.
+    for count in [0, 1] {
+        let errors = wide_connective_fragment(count, |args| ExprKind::Conjunction { args })
+            .expect_err("a connective below arity two has no meaning");
+        assert!(errors.is_producer_defect());
+        assert!(
+            errors
+                .to_string()
+                .contains("boolean connective requires at least two arguments")
+        );
+    }
+}
+
 #[test]
 fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
     let mut builder = FragmentBuilder::new(FragmentId::new(8));

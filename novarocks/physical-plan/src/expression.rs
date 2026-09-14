@@ -137,8 +137,6 @@ pub enum BinaryOperator {
     LtEq,
     Gt,
     GtEq,
-    And,
-    Or,
     BitAnd,
     BitOr,
     BitXor,
@@ -210,6 +208,27 @@ pub enum ExprKind {
         op: BinaryOperator,
         right: ExprId,
     },
+    /// SQL `AND` over an ordered argument list.
+    ///
+    /// Boolean connectives are n-ary rather than binary so that the number of
+    /// conjuncts a query writes does not become expression depth. A filter
+    /// panel that emits 300 predicates is an ordinary query, not a deep one,
+    /// and the depth bound exists to stop pathological nesting rather than to
+    /// cap how many conditions a user may write.
+    ///
+    /// `args` is evaluation order. Three-valued `AND` is associative and
+    /// commutative, but its arguments are not: they may fail or be volatile,
+    /// so a consumer must evaluate left to right and stop at the first `false`.
+    /// Any parenthesisation that preserves this order is observably equal,
+    /// which is what lets a codec shape the list into a balanced tree.
+    Conjunction {
+        args: Box<[ExprId]>,
+    },
+    /// SQL `OR` over an ordered argument list. Mirrors [`ExprKind::Conjunction`],
+    /// stopping at the first `true`.
+    Disjunction {
+        args: Box<[ExprId]>,
+    },
     FunctionCall {
         function: BoundFunction,
         args: Box<[ExprId]>,
@@ -272,6 +291,9 @@ impl ExprKind {
             | Self::IsNull { expr, .. }
             | Self::IsTruthValue { expr, .. } => output.push(*expr),
             Self::Binary { left, right, .. } => output.extend([*left, *right]),
+            Self::Conjunction { args } | Self::Disjunction { args } => {
+                output.extend(args.iter().copied());
+            }
             Self::FunctionCall { args, .. } => {
                 output.extend(args.iter().copied());
             }
@@ -385,6 +407,8 @@ pub fn expressions_are_replica_deterministic(
             | ExprKind::LambdaParameter { .. }
             | ExprKind::Unary { .. }
             | ExprKind::Binary { .. }
+            | ExprKind::Conjunction { .. }
+            | ExprKind::Disjunction { .. }
             | ExprKind::Lambda { .. }
             | ExprKind::Cast { .. }
             | ExprKind::IsNull { .. }

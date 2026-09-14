@@ -4740,12 +4740,16 @@ impl ContractLoweringVisitor {
         }
 
         let node = self.fragment_mut().reserve_node_id()?;
-        let predicate = self.lower_expression(node, predicate, &child.columns)?;
+        // Split the top-level conjunction here rather than lowering one nested
+        // expression: the filter owns the conjunct list, so consumers that
+        // reason per conjunct never have to re-split a tree.
+        let predicates =
+            self.lower_boolean_connective(node, predicate, BinOp::And, &child.columns)?;
         let properties = derive_filter_output_properties(
             &child.properties,
             expressions_are_replica_deterministic(
                 self.fragment_mut().expressions(),
-                std::iter::once(predicate),
+                predicates.iter().copied(),
                 true,
             ),
         );
@@ -4758,7 +4762,7 @@ impl ContractLoweringVisitor {
                 node,
                 columns: child.output.clone(),
             },
-            kind: NodeKind::Filter { predicate },
+            kind: NodeKind::Filter { predicates },
         })?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
@@ -6362,6 +6366,40 @@ impl ContractLoweringVisitor {
         })
     }
 
+    /// Flattens a same-operator `AND`/`OR` chain into one ordered argument list.
+    ///
+    /// The optimizer builds these connectives as binary trees, so a filter
+    /// panel emitting N conditions arrives as an N-deep chain. Collecting the
+    /// operands iteratively keeps both the lowering cost and the resulting
+    /// contract expression proportional to N in width rather than depth, which
+    /// is what stops an ordinary wide predicate from reading as a pathological
+    /// one. Traversal preserves left-to-right order, so short-circuit and any
+    /// argument failure stay exactly where SQL put them.
+    fn lower_boolean_connective(
+        &mut self,
+        owner: NodeId,
+        root: &TypedExpr,
+        connective: BinOp,
+        visible: &BTreeMap<ColumnId, ValueId>,
+    ) -> Result<Box<[ExprId]>, ContractLoweringError> {
+        let mut operands: Vec<&TypedExpr> = Vec::new();
+        let mut pending: Vec<&TypedExpr> = vec![root];
+        while let Some(current) = pending.pop() {
+            match &current.kind {
+                ExprKind::BinaryOp { left, op, right } if *op == connective => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                _ => operands.push(current),
+            }
+        }
+        let mut args = Vec::with_capacity(operands.len());
+        for operand in operands {
+            args.push(self.lower_expression(owner, operand, visible)?);
+        }
+        Ok(args.into_boxed_slice())
+    }
+
     fn lower_expression(
         &mut self,
         owner: NodeId,
@@ -6380,6 +6418,17 @@ impl ContractLoweringVisitor {
                     .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?,
             ),
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
+            ExprKind::BinaryOp {
+                op: op @ (BinOp::And | BinOp::Or),
+                ..
+            } => {
+                let args = self.lower_boolean_connective(owner, expression, *op, visible)?;
+                if matches!(op, BinOp::And) {
+                    ContractExprKind::Conjunction { args }
+                } else {
+                    ContractExprKind::Disjunction { args }
+                }
+            }
             ExprKind::BinaryOp { left, op, right } => ContractExprKind::Binary {
                 left: self.lower_expression(owner, left, visible)?,
                 op: lower_binary_operator(*op),
@@ -7848,8 +7897,13 @@ fn checked_ordinal(context: &'static str, ordinal: usize) -> Result<u32, Contrac
     u32::try_from(ordinal).map_err(|_| ContractLoweringError::OrdinalOverflow { context, ordinal })
 }
 
+/// Maps the non-connective binary operators. `AND`/`OR` never reach here:
+/// they lower to n-ary connectives through `lower_boolean_connective`.
 fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
     match operator {
+        BinOp::And | BinOp::Or => {
+            unreachable!("boolean connectives lower to n-ary Conjunction/Disjunction")
+        }
         BinOp::Add => BinaryOperator::Add,
         BinOp::Sub => BinaryOperator::Subtract,
         BinOp::Mul => BinaryOperator::Multiply,
@@ -7862,8 +7916,6 @@ fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
         BinOp::Gt => BinaryOperator::Gt,
         BinOp::Ge => BinaryOperator::GtEq,
         BinOp::EqForNull => BinaryOperator::EqForNull,
-        BinOp::And => BinaryOperator::And,
-        BinOp::Or => BinaryOperator::Or,
     }
 }
 
@@ -8499,6 +8551,7 @@ mod tests {
             "display_name_is_not_identity".to_string(),
             [7; 16],
             [9; 32],
+            std::sync::Arc::from(publication.publication_provenance()),
             Vec::new(),
             publication.publication_inputs().to_vec(),
             publication.publication_target().clone(),
@@ -8533,6 +8586,7 @@ mod tests {
             "display_name_is_not_identity".to_string(),
             [7; 16],
             [9; 32],
+            std::sync::Arc::from(other_publication.publication_provenance()),
             Vec::new(),
             other_publication.publication_inputs().to_vec(),
             other_publication.publication_target().clone(),

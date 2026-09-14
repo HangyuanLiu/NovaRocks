@@ -4793,6 +4793,9 @@ fn validate_expression(
                 validate_binary_types(left, *op, right, expression, &path, errors);
             }
         }
+        ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => {
+            validate_boolean_connective_types(fragment, args, expression, &path, errors);
+        }
         ExprKind::FunctionCall { function, args } => {
             if function.kind != FunctionKind::Scalar {
                 errors.push(ValidationError::new(
@@ -5061,6 +5064,46 @@ fn lambda_scope_contains(fragment: &Fragment, mut scope: Option<ExprId>, expecte
     false
 }
 
+/// Types an n-ary `AND`/`OR`.
+///
+/// Arity is checked here rather than left open: a connective over fewer than
+/// two arguments would give the same predicate two spellings, and the point of
+/// making the connective n-ary is to have exactly one.
+fn validate_boolean_connective_types(
+    fragment: &Fragment,
+    args: &[ExprId],
+    output: &crate::ExprNode,
+    path: &str,
+    errors: &mut ValidationErrorCollector,
+) {
+    if args.len() < 2 {
+        errors.push(ValidationError::new(
+            path,
+            "boolean connective requires at least two arguments",
+        ));
+        return;
+    }
+    let mut nullable = false;
+    for (ordinal, arg) in args.iter().enumerate() {
+        let Some(arg) = fragment.expressions().get(*arg) else {
+            continue;
+        };
+        if arg.ty.data_type != DataType::Boolean {
+            errors.push(ValidationError::new(
+                path,
+                format!("boolean connective argument {ordinal} is not boolean"),
+            ));
+        }
+        nullable |= arg.ty.nullable;
+    }
+    if output.ty.data_type != DataType::Boolean || output.ty.nullable != nullable {
+        errors.push(ValidationError::new(
+            path,
+            "boolean connective result type is inconsistent with its arguments",
+        ));
+    }
+}
+
 fn validate_binary_types(
     left: &crate::ExprNode,
     op: crate::BinaryOperator,
@@ -5114,12 +5157,6 @@ fn validate_binary_types(
         }
         crate::BinaryOperator::EqForNull => {
             same_inputs && output.ty.data_type == DataType::Boolean && !output.ty.nullable
-        }
-        crate::BinaryOperator::And | crate::BinaryOperator::Or => {
-            left.ty.data_type == DataType::Boolean
-                && right.ty.data_type == DataType::Boolean
-                && output.ty.data_type == DataType::Boolean
-                && output.ty.nullable == nullable
         }
         crate::BinaryOperator::BitAnd
         | crate::BinaryOperator::BitOr
@@ -6102,8 +6139,16 @@ fn validate_node_semantics(
             }
             validate_scan_predicate_contract(fragment, node.id, relation, residuals, path, errors);
         }
-        NodeKind::Filter { predicate } => {
-            require_boolean_expression(fragment, *predicate, path, errors);
+        NodeKind::Filter { predicates } => {
+            if predicates.is_empty() {
+                errors.push(ValidationError::new(
+                    path,
+                    "filter requires at least one predicate",
+                ));
+            }
+            for predicate in predicates {
+                require_boolean_expression(fragment, *predicate, path, errors);
+            }
             require_passthrough_output(fragment, node, path, errors);
         }
         NodeKind::Project { expressions } => {
@@ -7648,7 +7693,7 @@ fn validate_node_output_properties(
             }
             Some(relation.provided_properties())
         }
-        NodeKind::Filter { predicate } => {
+        NodeKind::Filter { predicates } => {
             let Some(input) = node
                 .inputs
                 .first()
@@ -7658,7 +7703,7 @@ fn validate_node_output_properties(
             };
             let expected = crate::derive_filter_output_properties(
                 &input.output_properties,
-                expressions_are_replica_deterministic(fragment, std::iter::once(*predicate), true),
+                expressions_are_replica_deterministic(fragment, predicates.iter().copied(), true),
             );
             if node.output_properties != expected {
                 errors.push(ValidationError::new(

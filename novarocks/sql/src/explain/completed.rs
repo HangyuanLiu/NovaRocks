@@ -1597,6 +1597,22 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 },
                 expr(*inner)
             ),
+            ExprKind::Conjunction { args } => write!(
+                formatter,
+                "({})",
+                args.iter()
+                    .map(|arg| format!("e{}", expr(*arg)))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ),
+            ExprKind::Disjunction { args } => write!(
+                formatter,
+                "({})",
+                args.iter()
+                    .map(|arg| format!("e{}", expr(*arg)))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
+            ),
             ExprKind::Binary { left, op, right } => write!(
                 formatter,
                 "(e{} {} e{})",
@@ -1792,8 +1808,6 @@ fn binary_operator(operator: novarocks_physical_plan::BinaryOperator) -> &'stati
         novarocks_physical_plan::BinaryOperator::LtEq => "<=",
         novarocks_physical_plan::BinaryOperator::Gt => ">",
         novarocks_physical_plan::BinaryOperator::GtEq => ">=",
-        novarocks_physical_plan::BinaryOperator::And => "AND",
-        novarocks_physical_plan::BinaryOperator::Or => "OR",
         novarocks_physical_plan::BinaryOperator::BitAnd => "&",
         novarocks_physical_plan::BinaryOperator::BitOr => "|",
         novarocks_physical_plan::BinaryOperator::BitXor => "^",
@@ -2810,11 +2824,13 @@ fn render_node_contract(
                 format_value_ids(derived_values)
             ));
         }
-        NodeKind::Filter { predicate } => {
-            lines.push(format_args!(
-                "{pad}  predicate: {}",
-                format_expr(plan, fragment_id, fragment, *predicate)
-            ));
+        NodeKind::Filter { predicates } => {
+            for (ordinal, predicate) in predicates.iter().enumerate() {
+                lines.push(format_args!(
+                    "{pad}  predicates[{ordinal}]: {}",
+                    format_expr(plan, fragment_id, fragment, *predicate)
+                ));
+            }
         }
         NodeKind::Project { expressions } => lines.push(format_args!(
             "{pad}  expressions=[{}]",
@@ -4035,7 +4051,7 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("EXPRESSION DEFINITIONS"), "{rendered}");
-        assert!(rendered.contains("predicate: e"), "{rendered}");
+        assert!(rendered.contains("predicates[0]: e"), "{rendered}");
         assert!(rendered.contains("HASH AGGREGATE"), "{rendered}");
         assert!(rendered.contains("builtin.aggregate/sum/v1"), "{rendered}");
         assert!(rendered.contains("order-by=[e"), "{rendered}");

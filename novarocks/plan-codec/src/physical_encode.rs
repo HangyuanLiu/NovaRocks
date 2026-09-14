@@ -771,7 +771,11 @@ fn charge_node_expressions(
                 charge(*expression)?;
             }
         }
-        NodeKind::Filter { predicate } => charge(*predicate)?,
+        NodeKind::Filter { predicates } => {
+            for predicate in predicates {
+                charge(*predicate)?;
+            }
+        }
         NodeKind::Project { expressions } => {
             for (expression, _) in expressions {
                 charge(*expression)?;
@@ -2295,12 +2299,12 @@ fn encode_node_payload(
             relation.schema(),
             scan_facts,
         )?),
-        NodeKind::Filter { predicate } => Kind::Filter(plan::FilterNode {
-            predicate: Some(encode_physical_expr(
+        NodeKind::Filter { predicates } => Kind::Filter(plan::FilterNode {
+            predicate: Some(crate::physical_expr::encode_predicate_conjunction(
                 fragment,
                 layout,
                 node.id,
-                *predicate,
+                predicates,
                 ValueResolution::NodeInput,
             )?),
         }),

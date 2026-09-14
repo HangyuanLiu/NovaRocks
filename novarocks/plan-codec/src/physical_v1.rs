@@ -1226,6 +1226,106 @@ mod tests {
         }
     }
 
+    /// Nesting depth of an encoded wire expression tree.
+    fn wire_expression_depth(expression: &novarocks_proto_models::expr::Expr) -> usize {
+        use novarocks_proto_models::expr::expr::Kind;
+        let children: Vec<&novarocks_proto_models::expr::Expr> = match expression.kind.as_ref() {
+            Some(Kind::BinaryOp(binary)) => binary
+                .left
+                .as_deref()
+                .into_iter()
+                .chain(binary.right.as_deref())
+                .collect(),
+            Some(Kind::UnaryOp(unary)) => unary.operand.as_deref().into_iter().collect(),
+            _ => Vec::new(),
+        };
+        1 + children
+            .into_iter()
+            .map(wire_expression_depth)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// A wide conjunction must not become a deep wire message.
+    ///
+    /// Native wire v1 only spells `AND` as a binary operator, so the encoder
+    /// has to turn the argument list into nesting. A left-deep chain would
+    /// make an ordinary 512-condition filter 512 messages deep and the
+    /// decoder's own recursion limit would reject it at the worker, after the
+    /// plan had already validated. Balancing keeps nesting logarithmic.
+    #[test]
+    fn a_wide_conjunction_encodes_to_a_shallow_wire_tree() {
+        const CONJUNCTS: usize = 512;
+        let mut builder = FragmentBuilder::new(FragmentId::new(11));
+        let values = builder.reserve_node_id().unwrap();
+        let boolean = ValueType::new(DataType::Boolean, false);
+        let mut predicates = Vec::with_capacity(CONJUNCTS);
+        let mut columns = Vec::with_capacity(CONJUNCTS);
+        for ordinal in 0..CONJUNCTS {
+            predicates.push(
+                builder
+                    .add_expression(
+                        values,
+                        boolean.clone(),
+                        ExprKind::Literal(LiteralValue::Boolean(true)),
+                    )
+                    .unwrap(),
+            );
+            columns.push(
+                builder
+                    .add_value(
+                        boolean.clone(),
+                        ValueOrigin::NodeOutput {
+                            node: values,
+                            output_ordinal: u32::try_from(ordinal).unwrap(),
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        builder
+            .insert_node(PhysicalNode {
+                id: values,
+                inputs: Box::default(),
+                required_inputs: Box::default(),
+                output_properties: properties(),
+                output: OutputPort {
+                    node: values,
+                    columns: columns.into_boxed_slice(),
+                },
+                kind: NodeKind::Values {
+                    rows: Box::from([predicates.clone().into_boxed_slice()]),
+                },
+            })
+            .unwrap();
+        let fragment = builder
+            .finish_definition(
+                values,
+                FragmentSink::Noop,
+                PipelineDopDomain {
+                    min: 1,
+                    max: 1,
+                    requires_power_of_two: false,
+                },
+            )
+            .expect("a wide conjunction is an ordinary fragment");
+        let layout = WireLayout::try_new(&fragment).expect("layout");
+
+        let encoded = crate::physical_expr::encode_predicate_conjunction(
+            &fragment,
+            &layout,
+            values,
+            &predicates,
+            crate::physical_expr::ValueResolution::NodeInput,
+        )
+        .expect("encode a wide conjunction");
+
+        let depth = wire_expression_depth(&encoded);
+        // ceil(log2(512)) + one level for the literal leaves.
+        assert!(depth <= 11, "wire nesting depth {depth} is not logarithmic");
+        assert!(depth >= 10, "unexpected shape: depth {depth}");
+    }
+
     fn repeated_projection_fragment() -> (
         novarocks_physical_plan::Fragment,
         novarocks_physical_plan::NodeId,

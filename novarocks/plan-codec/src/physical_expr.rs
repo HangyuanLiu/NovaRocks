@@ -231,6 +231,7 @@ fn expression_children(kind: &ExprKind) -> Vec<ExprId> {
         | ExprKind::IsNull { expr, .. }
         | ExprKind::IsTruthValue { expr, .. } => vec![*expr],
         ExprKind::Binary { left, right, .. } => vec![*left, *right],
+        ExprKind::Conjunction { args } | ExprKind::Disjunction { args } => args.to_vec(),
         ExprKind::FunctionCall { args, .. } => args.to_vec(),
         ExprKind::InList { expr, list, .. } => {
             std::iter::once(*expr).chain(list.iter().copied()).collect()
@@ -344,6 +345,160 @@ pub(crate) fn encode_physical_expr(
     })
 }
 
+/// Encodes an n-ary connective as a balanced binary tree.
+///
+/// Native wire v1 only spells `AND`/`OR` as a binary operator, so the argument
+/// list has to become nesting. Shaping it as a balanced tree rather than a
+/// chain keeps message nesting at log2(N), which matters because the decoder
+/// enforces a nesting limit an ordinary wide predicate would otherwise blow.
+///
+/// This is lossless. Balancing re-parenthesises but never reorders, and with
+/// left-to-right short-circuit evaluation every parenthesisation of a
+/// three-valued `AND`/`OR` chain evaluates the same arguments in the same
+/// order and yields the same result.
+fn encode_connective(
+    op: expr::BinaryOp,
+    args: &[ExprId],
+    fragment: &Fragment,
+    layout: &WireLayout,
+    owner: NodeId,
+    expression_type: &arrow::datatypes::DataType,
+    resolution: &ValueResolution<'_>,
+) -> Result<expr::expr::Kind, String> {
+    let nullable = args.iter().try_fold(false, |nullable, arg| {
+        fragment
+            .expressions()
+            .get(*arg)
+            .map(|node| nullable || node.ty.nullable)
+            .ok_or_else(|| {
+                format!(
+                    "fragment {} expression {} is not defined",
+                    fragment.id().get(),
+                    arg.get()
+                )
+            })
+    })?;
+    let build = |range: &[ExprId]| -> Result<expr::Expr, String> {
+        encode_connective_range(
+            op,
+            range,
+            fragment,
+            layout,
+            owner,
+            expression_type,
+            nullable,
+            resolution,
+        )
+    };
+    let (left, right) = split_connective(args)?;
+    Ok(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+        op: op as i32,
+        left: Some(Box::new(build(left)?)),
+        right: Some(Box::new(build(right)?)),
+    })))
+}
+
+/// Folds a filter's conjunct list into the single predicate expression native
+/// wire v1 spells, using the same balanced shape as an n-ary connective.
+pub(crate) fn encode_predicate_conjunction(
+    fragment: &Fragment,
+    layout: &WireLayout,
+    owner: NodeId,
+    predicates: &[ExprId],
+    resolution: ValueResolution<'_>,
+) -> Result<expr::Expr, String> {
+    let Some(first) = predicates.first() else {
+        return Err(format!(
+            "fragment {} node {} filter has no predicate",
+            fragment.id().get(),
+            owner.get()
+        ));
+    };
+    if predicates.len() == 1 {
+        return encode_physical_expr(fragment, layout, owner, *first, resolution);
+    }
+    let nullable = predicates.iter().try_fold(false, |nullable, predicate| {
+        fragment
+            .expressions()
+            .get(*predicate)
+            .map(|node| nullable || node.ty.nullable)
+            .ok_or_else(|| {
+                format!(
+                    "fragment {} expression {} is not defined",
+                    fragment.id().get(),
+                    predicate.get()
+                )
+            })
+    })?;
+    encode_connective_range(
+        expr::BinaryOp::And,
+        predicates,
+        fragment,
+        layout,
+        owner,
+        &arrow::datatypes::DataType::Boolean,
+        nullable,
+        &resolution,
+    )
+}
+
+/// Splits an argument list into two halves, preserving order.
+fn split_connective(args: &[ExprId]) -> Result<(&[ExprId], &[ExprId]), String> {
+    if args.len() < 2 {
+        return Err("boolean connective requires at least two arguments".into());
+    }
+    Ok(args.split_at(args.len() / 2))
+}
+
+fn encode_connective_range(
+    op: expr::BinaryOp,
+    args: &[ExprId],
+    fragment: &Fragment,
+    layout: &WireLayout,
+    owner: NodeId,
+    expression_type: &arrow::datatypes::DataType,
+    nullable: bool,
+    resolution: &ValueResolution<'_>,
+) -> Result<expr::Expr, String> {
+    if let [single] = args {
+        return encode_physical_expr(
+            fragment,
+            layout,
+            owner,
+            *single,
+            copy_resolution(resolution),
+        );
+    }
+    let (left, right) = split_connective(args)?;
+    Ok(expr::Expr {
+        r#type: Some(encode_physical_type(expression_type)?),
+        nullable,
+        kind: Some(expr::expr::Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
+            op: op as i32,
+            left: Some(Box::new(encode_connective_range(
+                op,
+                left,
+                fragment,
+                layout,
+                owner,
+                expression_type,
+                nullable,
+                resolution,
+            )?)),
+            right: Some(Box::new(encode_connective_range(
+                op,
+                right,
+                fragment,
+                layout,
+                owner,
+                expression_type,
+                nullable,
+                resolution,
+            )?)),
+        }))),
+    })
+}
+
 fn encode_kind(
     fragment: &Fragment,
     layout: &WireLayout,
@@ -376,6 +531,24 @@ fn encode_kind(
             left: Some(Box::new(child(*left)?)),
             right: Some(Box::new(child(*right)?)),
         })),
+        ExprKind::Conjunction { args } => encode_connective(
+            expr::BinaryOp::And,
+            args,
+            fragment,
+            layout,
+            owner,
+            expression_type,
+            resolution,
+        )?,
+        ExprKind::Disjunction { args } => encode_connective(
+            expr::BinaryOp::Or,
+            args,
+            fragment,
+            layout,
+            owner,
+            expression_type,
+            resolution,
+        )?,
         ExprKind::FunctionCall { function, args } => Kind::FunctionCall(expr::FunctionCall {
             function_name: builtin_function_name(&function.function_id)?.into(),
             args: encode_exprs(fragment, layout, owner, args, resolution)?,
@@ -615,8 +788,6 @@ fn encode_binary(operator: BinaryOperator) -> Result<expr::BinaryOp, String> {
         BinaryOperator::LtEq => expr::BinaryOp::Le,
         BinaryOperator::Gt => expr::BinaryOp::Gt,
         BinaryOperator::GtEq => expr::BinaryOp::Ge,
-        BinaryOperator::And => expr::BinaryOp::And,
-        BinaryOperator::Or => expr::BinaryOp::Or,
         BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor => {
             return Err("native wire v1 cannot encode bitwise binary operators".into());
         }

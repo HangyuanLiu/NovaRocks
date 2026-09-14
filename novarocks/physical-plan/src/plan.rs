@@ -596,8 +596,16 @@ pub enum NodeKind {
         residuals: Box<[ExprId]>,
         derived_values: Box<[ValueId]>,
     },
+    /// Retains rows for which every predicate holds.
+    ///
+    /// The conjunct list is held here rather than folded into one expression so
+    /// that predicate count never becomes expression depth, and so that
+    /// consumers that reason per conjunct - pushdown, residual responsibility,
+    /// runtime-filter placement - read the conjuncts directly instead of
+    /// re-splitting a tree. Order is evaluation order and short-circuits at the
+    /// first `false`, exactly as [`crate::ExprKind::Conjunction`] does.
     Filter {
-        predicate: ExprId,
+        predicates: Box<[ExprId]>,
     },
     Project {
         expressions: Box<[(ExprId, ValueId)]>,
@@ -704,7 +712,7 @@ impl NodeKind {
                 );
                 output.extend(residuals.iter().copied());
             }
-            Self::Filter { predicate } => output.push(*predicate),
+            Self::Filter { predicates } => output.extend(predicates.iter().copied()),
             Self::Project { expressions } => {
                 output.extend(expressions.iter().map(|(expr, _)| *expr));
             }
