@@ -131,6 +131,30 @@ pub struct NativeFragmentAttachment {
 }
 
 impl NativeFragmentAttachment {
+    /// Seal the fragments one completed plan encoded to.
+    ///
+    /// There is no second listing to cross-check against: the encoder produced
+    /// these from the plan itself, so the only thing that can be wrong is a
+    /// fragment appearing twice, and that is checked.
+    pub(crate) fn for_completed_plan(
+        fragments: impl IntoIterator<Item = NativePlanFragment>,
+        provenance: u64,
+    ) -> Result<Self, String> {
+        let mut by_fragment = BTreeMap::new();
+        for fragment in fragments {
+            let fragment_id = FragmentId::from(fragment.fragment_id);
+            if by_fragment.insert(fragment_id, fragment).is_some() {
+                return Err(format!(
+                    "completed plan encoded duplicate fragment id={fragment_id}"
+                ));
+            }
+        }
+        Ok(Self {
+            by_fragment,
+            provenance: Some(provenance),
+        })
+    }
+
     pub(crate) fn fragment_ids(&self) -> impl ExactSizeIterator<Item = FragmentId> + '_ {
         self.by_fragment.keys().copied()
     }

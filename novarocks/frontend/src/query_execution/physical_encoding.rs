@@ -47,6 +47,8 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::query_execution::native_fragment::NativeFragmentAttachment;
+use crate::query_execution::post_compile::mint_native_encoding_provenance;
 use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
 };
@@ -58,6 +60,10 @@ use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
 /// with, and what opening each of those reads takes.
 pub(crate) struct EncodedCompletedPlan {
     pub(crate) plan: plan::DistributedPlan,
+    /// The same fragments, keyed for submission and stamped so they cannot be
+    /// paired with another encoding's artifacts.
+    pub(crate) native: NativeFragmentAttachment,
+    pub(crate) topology: CompletedPlanTopology,
     pub(crate) access: ConnectorAttemptAccessPlan,
     /// One per scan, in plan order.
     pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
@@ -93,8 +99,14 @@ pub(crate) fn encode_completed_plan(
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     let split_sources = split_source_recipes(plan, &encodings, &access)?;
+    let native = NativeFragmentAttachment::for_completed_plan(
+        encoded.fragments.clone(),
+        mint_native_encoding_provenance(),
+    )?;
     Ok(EncodedCompletedPlan {
         plan: encoded,
+        native,
+        topology: completed_plan_topology(plan)?,
         access,
         split_sources,
     })
@@ -557,6 +569,11 @@ mod tests {
         );
         assert_eq!(encoded.access.iter().count(), 0);
         assert!(encoded.split_sources.is_empty());
+        // The submission bundle is the same fragment set, keyed.
+        assert_eq!(
+            encoded.native.fragment_ids().count(),
+            encoded.plan.fragments.len()
+        );
     }
 
     /// Rows are produced somewhere and gathered where the query reads them, so

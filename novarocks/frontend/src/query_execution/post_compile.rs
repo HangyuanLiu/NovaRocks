@@ -206,6 +206,12 @@ impl FinalizedDistributedExecution {
     }
 }
 
+/// One encoding's identity, so a bundle of fragments cannot be paired with
+/// another encoding's artifacts.
+pub(crate) fn mint_native_encoding_provenance() -> u64 {
+    next_native_encoding_provenance()
+}
+
 fn next_native_encoding_provenance() -> u64 {
     static NEXT_PROVENANCE: AtomicU64 = AtomicU64::new(1);
     loop {
