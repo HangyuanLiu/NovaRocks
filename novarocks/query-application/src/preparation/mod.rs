@@ -19,10 +19,12 @@
 
 mod description;
 mod driver;
+mod fact_source;
 mod final_plan;
 mod mv_proof;
 
 pub use description::*;
 pub use driver::*;
+pub use fact_source::*;
 pub use final_plan::*;
 pub use mv_proof::*;
