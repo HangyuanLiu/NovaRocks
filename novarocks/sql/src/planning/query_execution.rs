@@ -418,6 +418,38 @@ impl SealedScanIdentity {
     }
 }
 
+/// Stable SQL identity of one logical relation occurrence in a sealed scan.
+///
+/// The qualifier distinguishes repeated references to the same physical
+/// relation while the catalog, namespace, and relation retain the object name
+/// that was resolved at binding time. This is a read-only projection, not a
+/// planner node id or a persistable occurrence id.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlLogicalRelationOccurrence {
+    catalog: String,
+    namespace: String,
+    relation: String,
+    qualifier: String,
+}
+
+impl SqlLogicalRelationOccurrence {
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn relation(&self) -> &str {
+        &self.relation
+    }
+
+    pub fn qualifier(&self) -> &str {
+        &self.qualifier
+    }
+}
+
 /// Query-local seal around one immutable distributed plan.
 ///
 /// The opaque seal distinguishes two independently prepared queries even when
@@ -481,9 +513,7 @@ pub struct SealedScanContract {
     node_id: i32,
     binding: SqlTableBindingId,
     sql_occurrence: SqlScanOccurrence,
-    catalog: String,
-    namespace: String,
-    table: String,
+    logical_occurrence: SqlLogicalRelationOccurrence,
     predicates: usize,
     projected_columns: Vec<OutputColumn>,
     offered_limit: bool,
@@ -499,14 +529,21 @@ fn sealed_scan_contract(
     let facts = scan_preparation_facts(scan);
     let sql_occurrence = SqlScanOccurrence::from_scan(facts.binding(), &scan.columns)
         .expect("sealed SQL scan must retain at least one non-sentinel output column");
+    let logical_occurrence = SqlLogicalRelationOccurrence {
+        catalog: facts.identity().catalog().to_string(),
+        namespace: facts.identity().namespace().to_string(),
+        relation: facts.identity().table().to_string(),
+        qualifier: scan
+            .alias
+            .clone()
+            .unwrap_or_else(|| facts.identity().table().to_string()),
+    };
     SealedScanContract {
         identity: SealedScanIdentity { plan, node_id },
         node_id,
         binding: facts.binding(),
         sql_occurrence,
-        catalog: facts.identity().catalog().to_string(),
-        namespace: facts.identity().namespace().to_string(),
-        table: facts.identity().table().to_string(),
+        logical_occurrence,
         predicates: scan.predicates.len(),
         projected_columns: scan.columns.clone(),
         offered_limit,
@@ -535,16 +572,20 @@ impl SealedScanContract {
         self.sql_occurrence
     }
 
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        &self.logical_occurrence
+    }
+
     pub fn catalog(&self) -> &str {
-        &self.catalog
+        self.logical_occurrence.catalog()
     }
 
     pub fn namespace(&self) -> &str {
-        &self.namespace
+        self.logical_occurrence.namespace()
     }
 
     pub fn table(&self) -> &str {
-        &self.table
+        self.logical_occurrence.relation()
     }
 
     pub fn projected_columns(&self) -> &[OutputColumn] {
@@ -1552,6 +1593,42 @@ mod tests {
                 .iter()
                 .all(|identity| identity.plan() == sealed.id())
         );
+    }
+
+    #[test]
+    fn sealed_self_join_preserves_distinct_logical_relation_qualifiers() {
+        let sealed = SealedPreparationPlan::seal(
+            crate::test_support::native_self_join_scan_plan().expect("sealed self-join fixture"),
+        );
+        let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+        assert_eq!(contracts.len(), 2);
+
+        let left = contracts[0].logical_occurrence();
+        let right = contracts[1].logical_occurrence();
+        assert_eq!(left.catalog(), "test_catalog");
+        assert_eq!(left.namespace(), "test_db");
+        assert_eq!(left.relation(), "test_table");
+        assert_eq!(right.catalog(), left.catalog());
+        assert_eq!(right.namespace(), left.namespace());
+        assert_eq!(right.relation(), left.relation());
+        assert_eq!(left.qualifier(), "left_orders");
+        assert_eq!(right.qualifier(), "right_orders");
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn sealed_unaliased_scan_uses_relation_as_logical_qualifier() {
+        let sealed = SealedPreparationPlan::seal(
+            crate::test_support::native_scan_plan(
+                crate::test_support::NativeScanFixture::ConnectorRead,
+            )
+            .expect("sealed scan fixture"),
+        );
+        let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+        let occurrence = contracts[0].logical_occurrence();
+
+        assert_eq!(occurrence.relation(), "test_table");
+        assert_eq!(occurrence.qualifier(), occurrence.relation());
     }
 
     #[test]

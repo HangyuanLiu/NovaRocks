@@ -26,7 +26,8 @@ use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
         SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
-        SqlExecutionSchedulingFacts, project_execution_scheduling_facts,
+        SqlExecutionSchedulingFacts, SqlLogicalRelationOccurrence,
+        project_execution_scheduling_facts,
     },
 };
 
@@ -73,6 +74,7 @@ impl OutputContract {
 pub struct PlanScanBinding {
     scan: SealedScanIdentity,
     binding: novarocks_sql::binding::SqlTableBindingId,
+    logical_occurrence: SqlLogicalRelationOccurrence,
     occurrence: RelationOccurrence,
 }
 
@@ -81,6 +83,7 @@ impl PlanScanBinding {
         Self {
             scan: scan.identity(),
             binding: scan.binding(),
+            logical_occurrence: scan.logical_occurrence().clone(),
             occurrence: RelationOccurrence::resolved(
                 scan.identity(),
                 scan.sql_occurrence(),
@@ -96,6 +99,10 @@ impl PlanScanBinding {
 
     pub const fn scan_identity(&self) -> SealedScanIdentity {
         self.scan
+    }
+
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        &self.logical_occurrence
     }
 
     pub const fn occurrence(&self) -> &RelationOccurrence {
@@ -746,6 +753,10 @@ impl FrozenScanDescription {
         &self.lineage
     }
 
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        self.lineage.logical_occurrence()
+    }
+
     pub const fn final_handle(&self) -> &ConnectorReadTableHandle {
         &self.final_handle
     }
@@ -1333,6 +1344,14 @@ pub(crate) mod tests {
             description.scans()[0].scan_identity(),
             description.scans()[1].scan_identity()
         );
+        let left = description.scans()[0].logical_occurrence();
+        let right = description.scans()[1].logical_occurrence();
+        assert_eq!(left.catalog(), right.catalog());
+        assert_eq!(left.namespace(), right.namespace());
+        assert_eq!(left.relation(), right.relation());
+        assert_eq!(left.qualifier(), "left_orders");
+        assert_eq!(right.qualifier(), "right_orders");
+        assert_ne!(left, right);
         assert!(
             description
                 .scans()
