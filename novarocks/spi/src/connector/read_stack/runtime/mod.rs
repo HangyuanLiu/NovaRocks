@@ -526,14 +526,19 @@ pub trait ConnectorReadMetadata: Send + Sync {
         table: &ConnectorReadTableHandle,
     ) -> Result<Vec<ConnectorReadColumnBinding>, ConnectorError>;
 
-    /// Freeze the exact immutable provider facts of the final negotiated
-    /// handle. This call performs no split enumeration and returns no runtime
-    /// capability.
-    fn final_static_facts(
+    /// Commit the negotiated read and publish its immutable facts.
+    ///
+    /// This is the counterpart to `negotiate` and the point where a read stops
+    /// being negotiable. It happens once, enumerates no splits and returns no
+    /// runtime capability. The answer carries what it froze so the caller can
+    /// check it is the read it asked to commit; the facts are not reachable
+    /// until it has.
+    fn freeze(
         &self,
         _session: &ConnectorSession,
-        _table: &ConnectorReadTableHandle,
-    ) -> Result<super::ConnectorReadStaticFacts<ConnectorReadColumnHandle>, ConnectorError> {
+        _request: &super::negotiation::ReadFreezeRequest,
+    ) -> Result<super::negotiation::ConnectorReadFrozen<ConnectorReadColumnHandle>, ConnectorError>
+    {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "connector read generation does not publish final static facts",

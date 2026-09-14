@@ -164,3 +164,75 @@ impl ReadNegotiated {
         ))
     }
 }
+
+/// What a caller is committing to freeze.
+///
+/// The handle is the read as negotiation left it. The rest is what the caller
+/// believes it is committing, stated so the provider's answer can be checked
+/// against it rather than taken on trust.
+#[derive(Clone, Debug)]
+pub struct ReadFreezeRequest {
+    pub handle: ConnectorReadTableHandle,
+    pub relation_kind: novarocks_connector_contract::ConnectorReadRelationKind,
+    /// The input version the caller expects to have frozen, when it already
+    /// knows one. `None` accepts whichever version the provider reports, which
+    /// is the only option for a read whose version was never pinned.
+    pub expected_input_version: Option<super::static_facts::ConnectorReadInputVersion>,
+}
+
+/// A provider's answer to a freeze, before it has been checked.
+///
+/// The facts are unreachable until the caller proves they are the facts it
+/// asked for. Freezing is the one point where a read stops being negotiable,
+/// so a provider answering about a different relation kind, a different
+/// admitted generation or a different input version is not a difference to
+/// reconcile later - it is the wrong read, and the caller must not be able to
+/// walk past that by forgetting to look.
+#[derive(Clone, Debug)]
+pub struct ConnectorReadFrozen<C> {
+    facts: super::static_facts::ConnectorReadStaticFacts<C>,
+    relation_kind: novarocks_connector_contract::ConnectorReadRelationKind,
+    binding: super::runtime::ConnectorReadBinding,
+}
+
+impl<C: super::ColumnHandle> ConnectorReadFrozen<C> {
+    pub const fn new(
+        facts: super::static_facts::ConnectorReadStaticFacts<C>,
+        relation_kind: novarocks_connector_contract::ConnectorReadRelationKind,
+        binding: super::runtime::ConnectorReadBinding,
+    ) -> Self {
+        Self {
+            facts,
+            relation_kind,
+            binding,
+        }
+    }
+
+    /// Take the facts, having checked they answer this request.
+    pub fn into_verified(
+        self,
+        request: &ReadFreezeRequest,
+    ) -> Result<super::static_facts::ConnectorReadStaticFacts<C>, ConnectorError> {
+        if self.relation_kind != request.relation_kind {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "read freeze answered for a different relation kind",
+            ));
+        }
+        if &self.binding != request.handle.binding() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "read freeze answered from another admitted runtime generation",
+            ));
+        }
+        if let Some(expected) = &request.expected_input_version
+            && self.facts.input_version() != expected
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "read freeze answered for a different input version",
+            ));
+        }
+        Ok(self.facts)
+    }
+}

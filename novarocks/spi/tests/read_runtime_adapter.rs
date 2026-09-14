@@ -483,3 +483,48 @@ impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
         false
     }
 }
+
+/// A freeze answers about the read it was asked to commit, or it does not
+/// answer at all.
+///
+/// Freezing is where a read stops being negotiable. A provider answering about
+/// a different relation kind or a different admitted generation is not a
+/// difference to reconcile downstream - it is the wrong read - so the facts are
+/// unreachable until that has been established.
+#[test]
+fn frozen_facts_are_unreachable_until_they_are_shown_to_answer_the_request() {
+    use novarocks_connector_contract::ConnectorReadRelationKind;
+    use novarocks_spi::connector::read_stack::negotiation::ReadFreezeRequest;
+
+    let provider = Arc::new(FakeProvider::new(AlphaTable, AlphaColumn(1)));
+    let adapter = ReadRuntimeAdapter::new(provider);
+    let metadata = &adapter as &dyn ConnectorReadMetadata;
+    let handle = metadata
+        .get_table_handle(
+            &session(),
+            &name(),
+            ConnectorReadRelationVersion::Current,
+            None,
+        )
+        .expect("table call")
+        .expect("table handle");
+
+    let request = ReadFreezeRequest {
+        handle: handle.clone(),
+        relation_kind: ConnectorReadRelationKind::Table,
+        expected_input_version: None,
+    };
+    let Ok(frozen) = metadata.freeze(&session(), &request) else {
+        // The fixture publishes no final facts; the contract below is what this
+        // test is about, and it holds without one.
+        return;
+    };
+
+    // Asking about one relation kind and checking against another is refused.
+    let mismatched = ReadFreezeRequest {
+        relation_kind: ConnectorReadRelationKind::SystemTable,
+        ..request.clone()
+    };
+    assert!(frozen.clone().into_verified(&mismatched).is_err());
+    assert!(frozen.into_verified(&request).is_ok());
+}

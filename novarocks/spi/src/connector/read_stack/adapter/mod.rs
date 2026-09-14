@@ -714,12 +714,15 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             })
     }
 
-    fn final_static_facts(
+    fn freeze(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-    ) -> Result<ConnectorReadStaticFacts<ConnectorReadColumnHandle>, ConnectorError> {
-        let table = self.table(table)?;
+        request: &crate::connector::read_stack::negotiation::ReadFreezeRequest,
+    ) -> Result<
+        crate::connector::read_stack::negotiation::ConnectorReadFrozen<ConnectorReadColumnHandle>,
+        ConnectorError,
+    > {
+        let table = self.table(&request.handle)?;
         let facts = self.provider.final_static_facts(session, table)?;
         let distribution = match facts.properties().distribution() {
             ConnectorReadDistribution::Unconstrained => ConnectorReadDistribution::Unconstrained,
@@ -775,12 +778,21 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             })
             .collect::<Vec<_>>();
         let properties = ConnectorReadProperties::try_new(distribution, ordering)?;
-        ConnectorReadStaticFacts::try_new(
+        let facts = ConnectorReadStaticFacts::try_new(
             facts.input_version().clone(),
             facts.selection_digest(),
             properties,
             facts.artifact_coverage().clone(),
             Arc::<[u8]>::from(facts.coverage_evidence()),
+        )?;
+        // Carry back what was frozen, so the caller can establish it is the
+        // read it asked to commit before it can reach the facts at all.
+        Ok(
+            crate::connector::read_stack::negotiation::ConnectorReadFrozen::new(
+                facts,
+                request.relation_kind,
+                request.handle.binding().clone(),
+            ),
         )
     }
 
