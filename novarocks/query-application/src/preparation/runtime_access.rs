@@ -205,6 +205,16 @@ impl<A> FinalPlanRuntimeAccess<A> {
     pub fn into_taken(self) -> Vec<FrozenReadAccess<A>> {
         self.by_occurrence.into_values().collect()
     }
+
+    /// Give up every capability, still keyed by the scan it was frozen for.
+    ///
+    /// A capability cannot be copied, so an owner that needs to place each one
+    /// somewhere - a per-attempt access plan, say - has to take them rather
+    /// than read them. The occurrence comes along because that is how the plan
+    /// addresses the scan each one belongs to.
+    pub fn into_occurrences(self) -> BTreeMap<ProviderReadOccurrenceId, FrozenReadAccess<A>> {
+        self.by_occurrence
+    }
 }
 
 /// A completed plan and the capabilities its scans were frozen with.
@@ -257,6 +267,14 @@ impl<A> CompletedPlanWithAccess<A> {
     /// Give up the capabilities so their owner can release them.
     pub fn into_access(self) -> FinalPlanRuntimeAccess<A> {
         self.access
+    }
+
+    /// Split the pair, for an owner that consumes both halves.
+    ///
+    /// They separate only here, after having been proved to account for each
+    /// other; nothing can obtain one half without the other having existed.
+    pub fn into_parts(self) -> (CompletedPhysicalPlanCandidate, FinalPlanRuntimeAccess<A>) {
+        (self.candidate, self.access)
     }
 }
 

@@ -46,8 +46,9 @@ use novarocks_query_application::preparation::{
     FrozenReadAccess, ProviderReadFactPort, ReadAccessDeposit, ReadAccessSink,
 };
 use novarocks_spi::connector::{
-    ConnectorControlReadBinding, ConnectorPlanningContext, ConnectorReadAttemptAccess,
-    ConnectorReadWireEncoder, ConnectorRequestContext,
+    CatalogProperties, ConnectorControlPlanningLease, ConnectorControlReadBinding,
+    ConnectorPlanningContext, ConnectorReadAttemptAccess, ConnectorReadWireEncoder,
+    ConnectorRequestContext,
     read_stack::{
         ConnectorExpression, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
         ConnectorReadConstraint, ConnectorReadDistribution, ConnectorReadMetadata,
@@ -93,6 +94,11 @@ const READ_VARIABLE_PREFIX: &str = "r";
 /// with the plan version.
 pub(crate) struct FrozenProviderRead {
     pub(crate) access: ConnectorReadAttemptAccess,
+    /// The generation this read was frozen against, held open for as long as
+    /// the plan may run. Releasing it earlier would let the provider retire a
+    /// generation a frozen read still names.
+    pub(crate) generation: ConnectorControlPlanningLease,
+    pub(crate) catalog: CatalogProperties,
     pub(crate) encoding: FrozenReadEncoding,
 }
 
@@ -270,6 +276,12 @@ fn freeze_one_read(
         column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
     let request_control = request_control_for(&read, context)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let catalog_properties = materialization
+        .planning_lease
+        .binding()
+        .catalog_properties()
+        .map_err(|error| format!("provider read of {name} has no catalog properties: {error}"))?
+        .clone();
 
     // 6. Take the capability and account for it in the same breath.
     let access = read
@@ -283,6 +295,8 @@ fn freeze_one_read(
             binding: need.binding(),
             access: FrozenProviderRead {
                 access,
+                generation: materialization.planning_lease.clone(),
+                catalog: catalog_properties,
                 encoding: FrozenReadEncoding {
                     identity: identity.clone(),
                     columns: named_columns,

@@ -30,11 +30,12 @@
 
 use std::collections::BTreeMap;
 
+use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::{
     FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference, Relation,
 };
 use novarocks_plan_codec::{
-    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact,
+    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
     physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
 };
 use novarocks_proto_codec::FieldPath;
@@ -42,10 +43,41 @@ use novarocks_proto_codec::connector_read::{
     ConnectorReadEncoder, ConnectorTableScanSource, encode_connector_expression,
 };
 use novarocks_proto_models::{connector_read as dto, plan};
-use novarocks_query_application::preparation::FinalPlanRuntimeAccess;
+use novarocks_query_application::preparation::{CompletedPlanWithAccess, FinalPlanRuntimeAccess};
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::query_execution::preparation::attempt_access::{
+    ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
+};
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
+
+/// A completed plan on the wire, and the capabilities its reads will be
+/// performed with.
+pub(crate) struct EncodedCompletedPlan {
+    pub(crate) plan: plan::DistributedPlan,
+    pub(crate) access: ConnectorAttemptAccessPlan,
+}
+
+/// Put one completed plan on the wire, and place the capabilities its scans
+/// were frozen with.
+///
+/// The two halves of a frozen read separate exactly here, and in this order:
+/// the encoding half is read while the capabilities are still accounted for,
+/// and the capabilities are then moved - not copied, because a capability
+/// cannot be - into the plan for the attempt that will use them.
+pub(crate) fn encode_completed_plan(
+    paired: CompletedPlanWithAccess<FrozenProviderRead>,
+    functions: &EngineFunctionCatalog,
+) -> Result<EncodedCompletedPlan, String> {
+    let (candidate, reads) = paired.into_parts();
+    let plan = candidate.plan();
+    let facts = physical_v1_private_facts(plan, &reads)?;
+    let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
+    Ok(EncodedCompletedPlan {
+        plan: encoded,
+        access: attempt_access_for_completed_plan(plan, reads)?,
+    })
+}
 
 /// One plan's wire-private scan facts, addressed the way the encoder asks for
 /// them.
@@ -279,4 +311,118 @@ fn scan_columns(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use novarocks_physical_plan::{
+        MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
+    };
+    use novarocks_query_application::preparation::{
+        FinalPlanCompletionDriver, ReadAccessSink, SqlCompletionFactSource,
+    };
+    use novarocks_sql::compiler::{
+        DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl, SqlCompileIntent,
+        SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, SqlPlanningEnvironment,
+        SqlSessionContext, SqlStatementInput, builtin_sql_function_catalog,
+        noop_constant_evaluator,
+    };
+    use novarocks_workload_control::{
+        ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    };
+
+    use super::*;
+
+    struct NoFacts;
+
+    #[async_trait::async_trait]
+    impl SqlCompletionFactSource for NoFacts {
+        type Access = FrozenProviderRead;
+
+        async fn resolve(
+            &self,
+            _: &SqlNeedBatch,
+            _: &ReadAccessSink<FrozenProviderRead>,
+        ) -> Result<SqlFactBatch, String> {
+            panic!("a VALUES statement asks for nothing")
+        }
+    }
+
+    /// A statement over literal rows completes, encodes, and asks for no
+    /// capability - which is the whole chain from SQL text to wire form with
+    /// nothing in it that a provider had to answer.
+    #[test]
+    fn a_statement_over_literal_rows_reaches_the_wire_with_no_capability() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload control");
+        control.mark_ready().expect("workload control ready");
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root");
+        let scope = root.owner.scope();
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+
+        let encoded = encode_completed_plan(
+            completed,
+            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin engine function catalog"),
+        )
+        .expect("a completed plan encodes");
+        // The shape is the distributed one - rows are produced somewhere and
+        // gathered at the result - and nothing in it had to be frozen.
+        assert!(encoded.plan.fragments.len() >= 2);
+        assert!(
+            encoded
+                .plan
+                .fragments
+                .iter()
+                .map(|fragment| fragment.fragment_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == encoded.plan.fragments.len()
+        );
+        assert_eq!(encoded.access.iter().count(), 0);
+    }
+
+    fn request() -> SqlFinalPlanCompileRequest {
+        SqlFinalPlanCompileRequest::new(
+            PlanVersionId::try_new([9; 16]).expect("plan version"),
+            SqlStatementInput::sql("SELECT 1"),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: Some("iceberg".to_string()),
+                current_database: "db".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            builtin_sql_function_catalog().snapshot(),
+            noop_constant_evaluator(),
+            SqlCompileControl::unbounded(),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            ScanReadBudget {
+                max_batch_rows: MAX_SCAN_BATCH_ROWS,
+                max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+            },
+            DEFAULT_COMPLETION_LIMITS,
+        )
+    }
 }
