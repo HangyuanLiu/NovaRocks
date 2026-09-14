@@ -575,7 +575,9 @@ fn parse_dependency_storage_engine(value: &str) -> Result<MvDependencyStorageEng
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::persistence::definition::MvDesiredRefreshPolicy;
+    use crate::mv::domain::persistence::definition::{
+        MvDesiredRefreshPolicy, test_source_revision,
+    };
     use crate::mv::domain::persistence::descriptor::{DescriptorDependency, MvDescriptorV3};
     use crate::mv::domain::persistence::schema::{
         BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
@@ -585,7 +587,7 @@ mod tests {
     };
     use crate::mv::domain::persistence::semantic::MvRefreshDesiredConfiguration;
     use crate::mv::domain::readiness::MvReadinessPort;
-    use crate::mv::domain::repository::MvRepository;
+    use crate::mv::domain::repository::{MvProjectionRequest, MvRepository};
     use crate::mv::domain::storage_observation::{
         MvLakePackageObservation, MvLakePublication, MvLakeTargetSnapshot, MvPublishedBaseFact,
         MvPublishedLakeFacts, MvPublishedRefreshTechnique,
@@ -730,6 +732,54 @@ mod tests {
         package
     }
 
+    /// Seed the Accelerator directly with a complete v2 projection. These
+    /// readiness tests exercise quarantine behavior after an already-admitted
+    /// projection exists; they must not route their setup through the retired
+    /// legacy lake-descriptor projector.
+    async fn seed_ready_v2_projection(
+        repository: &InMemoryMvRepository,
+        runtime: &ProcessRuntime<
+            novarocks_mv_application::activity::CanonicalMvTarget,
+            novarocks_spi::connector::LakePublicationId,
+        >,
+        package: &MvLakePackageObservation,
+    ) {
+        let rebuilt = rebuild_mv_definition_from_lake(package).expect("rebuild test definition");
+        let source_revision = test_source_revision(
+            package.table.instance_id.as_str(),
+            &package.table.namespace,
+            &package.table.table,
+            package.target_object_id.clone(),
+            package
+                .current_target_snapshot
+                .map(|snapshot| snapshot.snapshot_id),
+        );
+        repository
+            .create_projection(
+                uuid::Uuid::now_v7(),
+                MvProjectionRequest {
+                    definition: rebuilt.create_request,
+                    refresh: rebuilt.refresh,
+                    publication: rebuilt.publication,
+                    source_revision,
+                    dependencies: dependency_requests_from_descriptor(
+                        &package.descriptor.base_dependencies,
+                        package.descriptor.created_at_ms,
+                    )
+                    .expect("rebuild test dependencies"),
+                },
+            )
+            .await
+            .expect("seed v2 projection");
+        runtime.set_ready(
+            novarocks_mv_application::activity::CanonicalMvTarget::from_parts(
+                Some(package.table.instance_id.as_str()),
+                &package.table.namespace,
+                &package.table.table,
+            ),
+        );
+    }
+
     fn sample_publication() -> MvLakePublication {
         MvLakePublication::Published(
             MvPublishedLakeFacts::try_new(
@@ -848,17 +898,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incomplete_catalog_quarantine_hides_retained_projection_from_readiness_consumers() {
         let repository = Arc::new(InMemoryMvRepository::default());
-        let repository_port: Arc<dyn MvRepository> = repository;
+        let repository_port: Arc<dyn MvRepository> = repository.clone();
+        let runtime = Arc::new(ProcessRuntime::default());
         let readiness = MvReadinessPort::new(
             Arc::clone(&repository_port),
-            Arc::new(ProcessRuntime::default()),
+            Arc::clone(&runtime),
             tokio::runtime::Handle::current(),
         );
         let package = sample_package(sample_publication());
 
-        readiness
-            .project_observed(uuid::Uuid::now_v7(), &package)
-            .expect("project observed package");
+        seed_ready_v2_projection(repository.as_ref(), runtime.as_ref(), &package).await;
         assert_eq!(
             readiness
                 .list_ready_projections()
@@ -891,21 +940,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn incomplete_catalog_quarantine_preserves_other_catalog_projections() {
         let repository = Arc::new(InMemoryMvRepository::default());
-        let repository_port: Arc<dyn MvRepository> = repository;
+        let repository_port: Arc<dyn MvRepository> = repository.clone();
+        let runtime = Arc::new(ProcessRuntime::default());
         let readiness = MvReadinessPort::new(
             Arc::clone(&repository_port),
-            Arc::new(ProcessRuntime::default()),
+            Arc::clone(&runtime),
             tokio::runtime::Handle::current(),
         );
         let affected = sample_package_for_catalog("ice_a", "analytics_a", "mv_orders_a");
         let unaffected = sample_package_for_catalog("ice_b", "analytics_b", "mv_orders_b");
 
-        readiness
-            .project_observed(uuid::Uuid::now_v7(), &affected)
-            .expect("project affected package");
-        readiness
-            .project_observed(uuid::Uuid::now_v7(), &unaffected)
-            .expect("project unaffected package");
+        seed_ready_v2_projection(repository.as_ref(), runtime.as_ref(), &affected).await;
+        seed_ready_v2_projection(repository.as_ref(), runtime.as_ref(), &unaffected).await;
 
         readiness
             .quarantine_catalog("ice_a", "namespace enumeration failed".to_string())
