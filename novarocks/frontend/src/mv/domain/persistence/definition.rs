@@ -22,7 +22,8 @@ use novarocks_mv_application::management::{
 };
 use novarocks_mv_application::persistence::identity::DocumentRevision;
 use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorCommittedVersion, ConnectorControlRuntimeId, ConnectorTableIdentity,
+    ConnectorTableObjectId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,14 +99,17 @@ impl MvAcceleratorSourceRevision {
     /// The exact immutable dependencies guarded by the single management
     /// entrance. C remains an independent target mutation, but is still part
     /// of this complete projection source revision.
-    pub(crate) fn management_dependencies(&self, runtime_epoch: u64) -> ManagementDependencySet {
+    pub(crate) fn management_dependencies(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> ManagementDependencySet {
         ManagementDependencySet::new(
             *self.definition_revision.as_bytes(),
             *self.interpretation_revision.as_bytes(),
             self.publication_revision
                 .as_ref()
                 .map(|revision| *revision.as_bytes()),
-            runtime_epoch,
+            control_runtime_id,
         )
     }
 }

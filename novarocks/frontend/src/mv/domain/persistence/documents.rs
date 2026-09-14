@@ -706,8 +706,8 @@ mod tests {
     };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-        ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
+        ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
         ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
@@ -1278,12 +1278,12 @@ mod tests {
         assert_eq!(revision.deployment_owner.as_str(), "deployment-a");
         assert_eq!(revision.process_incarnation.as_str(), "process-a");
         assert_eq!(
-            revision.management_dependencies(17),
+            revision.management_dependencies(ConnectorControlRuntimeId::from_bytes([17; 16])),
             ManagementDependencySet::new(
                 *decoded.definition_revision.as_bytes(),
                 *decoded.interpretation_revision.as_bytes(),
                 None,
-                17,
+                ConnectorControlRuntimeId::from_bytes([17; 16]),
             )
         );
     }

@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
-    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
-    ConnectorDocumentStorageLimits, ConnectorInstanceId, ConnectorManagedObjectMarker,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    ProviderBindingEpoch,
+    ConnectorControlRuntimeId, ConnectorDocumentManagementObservation,
+    ConnectorDocumentManagementOperation, ConnectorDocumentObservationRequest,
+    ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits, ConnectorInstanceId,
+    ConnectorManagedObjectMarker, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 use super::*;
@@ -45,6 +45,10 @@ fn owner(value: &str) -> DeploymentOwner {
 
 fn incarnation(value: &str) -> ProcessIncarnation {
     ProcessIncarnation::parse(value).unwrap()
+}
+
+fn runtime_id(value: u8) -> ConnectorControlRuntimeId {
+    ConnectorControlRuntimeId::from_bytes([value; 16])
 }
 
 fn table(name: &str) -> ConnectorTableIdentity {
@@ -879,7 +883,12 @@ fn process_rebuild_installs_a_barrier_instead_of_defaulting_to_ready() {
         target.table().clone(),
         Some(target.object_id().clone()),
         ConnectorDocumentManagementOperation::SingleTargetUpdate,
-        Some(ManagementDependencySet::new([1; 32], [2; 32], None, 1)),
+        Some(ManagementDependencySet::new(
+            [1; 32],
+            [2; 32],
+            None,
+            runtime_id(1),
+        )),
         EffectScope::CATALOG_COMMIT,
     )
     .unwrap();
@@ -1008,7 +1017,12 @@ fn abandoned_recovery_observation_can_be_reissued_without_opening_admission() {
         target.table().clone(),
         Some(target.object_id().clone()),
         ConnectorDocumentManagementOperation::SingleTargetUpdate,
-        Some(ManagementDependencySet::new([1; 32], [2; 32], None, 1)),
+        Some(ManagementDependencySet::new(
+            [1; 32],
+            [2; 32],
+            None,
+            runtime_id(1),
+        )),
         EffectScope::CATALOG_COMMIT,
     )
     .unwrap();
@@ -1021,7 +1035,7 @@ fn abandoned_recovery_observation_can_be_reissued_without_opening_admission() {
 #[test]
 fn fresh_incarnation_mismatch_closes_the_installed_entrance_target() {
     let target = target("mv", b"object-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 1);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(1));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("new"));
     let mut state = ready_observation_state(target.clone(), "deployment-a", "new");
     entrance
@@ -1119,7 +1133,7 @@ fn entrance_rechecks_long_computation_dependencies_and_isolates_targets() {
     let target_b = target("mv_b", b"object-b");
     let observation_a = ready_observation_state(target_a.clone(), "deployment-a", "inc-a");
     let observation_b = ready_observation_state(target_b.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation_a, dependencies.clone())
@@ -1137,13 +1151,34 @@ fn entrance_rechecks_long_computation_dependencies_and_isolates_targets() {
             [9; 32],
             [2; 32],
             Some([3; 32]),
-            4,
+            runtime_id(4),
         )),
         EffectScope::CATALOG_COMMIT,
     )
     .unwrap();
     assert_eq!(
         entrance.acquire(stale, || false).err().unwrap(),
+        ManagementAdmissionError::DependencyChanged
+    );
+
+    let mut different_runtime_bytes = runtime_id(4).to_bytes();
+    different_runtime_bytes[15] = 9;
+    let stale_runtime = ManagementRequest::try_new(
+        target_a.catalog().clone(),
+        target_a.table().clone(),
+        Some(target_a.object_id().clone()),
+        ConnectorDocumentManagementOperation::Publication,
+        Some(ManagementDependencySet::new(
+            [1; 32],
+            [2; 32],
+            Some([3; 32]),
+            ConnectorControlRuntimeId::from_bytes(different_runtime_bytes),
+        )),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    assert_eq!(
+        entrance.acquire(stale_runtime, || false).err().unwrap(),
         ManagementAdmissionError::DependencyChanged
     );
 
@@ -1182,7 +1217,7 @@ fn entrance_rechecks_long_computation_dependencies_and_isolates_targets() {
 fn unknown_or_dropped_after_dispatch_keeps_conflicting_management_closed() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())
@@ -1264,7 +1299,7 @@ fn unknown_or_dropped_after_dispatch_keeps_conflicting_management_closed() {
 fn fabricated_empty_readmission_cannot_clear_an_unknown_effect() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())
@@ -1303,7 +1338,7 @@ fn fabricated_empty_readmission_cannot_clear_an_unknown_effect() {
 fn dispatched_effect_requires_exact_scope_and_the_current_incarnation() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())
@@ -1360,8 +1395,8 @@ fn dispatched_effect_requires_exact_scope_and_the_current_incarnation() {
 fn committed_update_stays_closed_until_exact_observation_installs_new_dependencies() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let old_dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
-    let new_dependencies = ManagementDependencySet::new([5; 32], [6; 32], None, 7);
+    let old_dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let new_dependencies = ManagementDependencySet::new([5; 32], [6; 32], None, runtime_id(7));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, old_dependencies.clone())
@@ -1465,7 +1500,7 @@ fn committed_update_stays_closed_until_exact_observation_installs_new_dependenci
 #[test]
 fn abandoned_committed_convergence_preserves_exact_reissue_requirement() {
     let target = target("mv", b"object-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
@@ -1548,7 +1583,7 @@ fn abandoned_committed_convergence_preserves_exact_reissue_requirement() {
 #[test]
 fn committed_create_reserves_the_target_until_observation_converges() {
     let target = target("created_mv", b"created-object");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     let create = || {
         ManagementRequest::try_new(
@@ -1671,7 +1706,7 @@ fn create_known_uncommitted_can_retry_but_create_unknown_cannot() {
 fn same_target_wait_honors_work_scope_cancellation() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())
@@ -1699,7 +1734,7 @@ fn same_target_wait_honors_work_scope_cancellation() {
 fn management_ticket_preserves_worker_owner_and_nonblocking_fifo() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())
@@ -1745,7 +1780,7 @@ fn management_ticket_preserves_worker_owner_and_nonblocking_fifo() {
 fn stopping_cancels_worker_acquired_through_management_entrance() {
     let target = target("mv", b"object-a");
     let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
-    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, 4);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
     let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
     entrance
         .install_observed_target(&observation, dependencies.clone())

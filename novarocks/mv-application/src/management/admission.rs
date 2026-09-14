@@ -20,8 +20,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorDocumentManagementOperation, ConnectorTableIdentity,
-    ConnectorTableObjectId,
+    CatalogHandle, ConnectorControlRuntimeId, ConnectorDocumentManagementOperation,
+    ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
@@ -43,7 +43,7 @@ pub struct ManagementDependencySet {
     definition_revision: [u8; 32],
     interpretation_revision: [u8; 32],
     publication_base: Option<[u8; 32]>,
-    runtime_epoch: u64,
+    control_runtime_id: ConnectorControlRuntimeId,
 }
 
 impl ManagementDependencySet {
@@ -51,13 +51,13 @@ impl ManagementDependencySet {
         definition_revision: [u8; 32],
         interpretation_revision: [u8; 32],
         publication_base: Option<[u8; 32]>,
-        runtime_epoch: u64,
+        control_runtime_id: ConnectorControlRuntimeId,
     ) -> Self {
         Self {
             definition_revision,
             interpretation_revision,
             publication_base,
-            runtime_epoch,
+            control_runtime_id,
         }
     }
 }
@@ -322,7 +322,12 @@ impl ManagementEntrance {
             target.table().clone(),
             TargetAdmissionState {
                 target: target.clone(),
-                dependencies: ManagementDependencySet::new([0; 32], [0; 32], None, 0),
+                dependencies: ManagementDependencySet::new(
+                    [0; 32],
+                    [0; 32],
+                    None,
+                    ConnectorControlRuntimeId::from_bytes([0; 16]),
+                ),
                 unsettled: HashMap::from([(
                     recovery_barrier.responsibility().identity(),
                     recovery_barrier.clone(),
@@ -610,7 +615,12 @@ fn record_committed(
     let mut state = lock(&entrance.state);
     let target = state.entry(table).or_insert_with(|| TargetAdmissionState {
         target: responsibility.target().clone(),
-        dependencies: ManagementDependencySet::new([0; 32], [0; 32], None, 0),
+        dependencies: ManagementDependencySet::new(
+            [0; 32],
+            [0; 32],
+            None,
+            ConnectorControlRuntimeId::from_bytes([0; 16]),
+        ),
         unsettled: HashMap::new(),
         pending_committed_effect: None,
         pending_continuation: None,
@@ -773,7 +783,12 @@ fn record_unsettled(
     let mut state = lock(&entrance.state);
     let target = state.entry(table).or_insert_with(|| TargetAdmissionState {
         target: responsibility.target().clone(),
-        dependencies: ManagementDependencySet::new([0; 32], [0; 32], None, 0),
+        dependencies: ManagementDependencySet::new(
+            [0; 32],
+            [0; 32],
+            None,
+            ConnectorControlRuntimeId::from_bytes([0; 16]),
+        ),
         unsettled: HashMap::new(),
         pending_committed_effect: None,
         pending_continuation: None,
