@@ -2454,6 +2454,38 @@ pub(crate) mod tests {
         assert_eq!(fixture.session.finish_invocations(), 0);
     }
 
+    #[test]
+    fn an_implicit_empty_seal_reaches_an_invisible_staged_create() {
+        let (lease, _) = unopened_fixture(1, 16, known_committed());
+        let mut request = begin_request();
+        request.flavor =
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
+                novarocks_spi::connector::ConnectorTableHandle::try_new(
+                    catalog_handle().catalog_name().clone(),
+                    bytes::Bytes::from_static(b"invisible-staged-target"),
+                )
+                .expect("staged target handle"),
+            );
+        let session = Arc::new(
+            ConnectorWriteSession::begin(lease, catalog_properties(), request)
+                .expect("begin staged write"),
+        );
+
+        let sealed = finish_empty_staged_create_write_for_following_terminal_action(
+            session.as_ref(),
+            request_context(),
+        )
+        .expect("seal provider-managed empty staged write");
+        let (outcome, affected_rows, _) = sealed.into_parts();
+
+        assert!(matches!(
+            outcome,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(affected_rows, Some(0));
+        assert_eq!(session.finish_invocations(), 1);
+    }
+
     /// A commit whose external outcome is unknown is not finished with storage:
     /// reconciliation reads the same object store, and it is the only decision
     /// still reachable.
