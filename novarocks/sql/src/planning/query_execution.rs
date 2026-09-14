@@ -512,6 +512,7 @@ pub struct SealedScanContract {
     identity: SealedScanIdentity,
     node_id: i32,
     binding: SqlTableBindingId,
+    preparation_category: SqlScanPreparationCategory,
     sql_occurrence: SqlScanOccurrence,
     logical_occurrence: SqlLogicalRelationOccurrence,
     predicates: usize,
@@ -542,6 +543,7 @@ fn sealed_scan_contract(
         identity: SealedScanIdentity { plan, node_id },
         node_id,
         binding: facts.binding(),
+        preparation_category: facts.category(),
         sql_occurrence,
         logical_occurrence,
         predicates: scan.predicates.len(),
@@ -566,6 +568,10 @@ impl SealedScanContract {
 
     pub const fn binding(&self) -> SqlTableBindingId {
         self.binding
+    }
+
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.preparation_category
     }
 
     pub const fn sql_occurrence(&self) -> SqlScanOccurrence {
@@ -1629,6 +1635,38 @@ mod tests {
 
         assert_eq!(occurrence.relation(), "test_table");
         assert_eq!(occurrence.qualifier(), occurrence.relation());
+    }
+
+    #[test]
+    fn sealed_scan_contract_preserves_sql_preparation_category() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        for (fixture, expected) in [
+            (
+                NativeScanFixture::ConnectorRead,
+                SqlScanPreparationCategory::ConnectorRead,
+            ),
+            (
+                NativeScanFixture::DeltaForPreparedBinding,
+                SqlScanPreparationCategory::Delta,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetState,
+                SqlScanPreparationCategory::MvTargetState,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetLocator,
+                SqlScanPreparationCategory::MvTargetLocator,
+            ),
+        ] {
+            let sealed = SealedPreparationPlan::seal(
+                native_scan_plan(fixture).expect("sealed scan fixture"),
+            );
+            let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+
+            assert_eq!(contracts.len(), 1);
+            assert_eq!(contracts[0].preparation_category(), expected);
+        }
     }
 
     #[test]
