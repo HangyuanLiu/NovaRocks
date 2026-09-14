@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub(crate) mod aggregate_bindings;
 pub mod definition;
 pub mod dependency;
 pub mod descriptor;
