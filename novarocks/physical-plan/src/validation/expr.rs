@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
 
 use crate::{
-    AggregatePhase, ExprId, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, ValueId,
-    ValueOrigin, ValueType,
+    AggregatePhase, ExprId, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, ValueOrigin,
+    ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

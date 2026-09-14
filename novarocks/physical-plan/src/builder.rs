@@ -329,8 +329,10 @@ impl FragmentBuilder {
 
     /// Adds a top-N over `input`.
     ///
-    /// A global phase needs one single-copy stream; a partial phase runs where
-    /// the rows already are and its result is reduced later.
+    /// Whether one stream is required follows from the phase rather than being
+    /// stated beside it: a partial phase runs where the rows already are and
+    /// its result is reduced later, while every other phase produces the answer
+    /// and so needs one single-copy stream.
     pub fn add_top_n(
         &mut self,
         node: NodeId,
@@ -339,8 +341,8 @@ impl FragmentBuilder {
         limit: u64,
         offset: u64,
         phase: crate::TopNPhase,
-        require_singleton: bool,
     ) -> Result<(), BuildError> {
+        let require_singleton = !matches!(phase, crate::TopNPhase::Partial { .. });
         if order_by.is_empty() {
             return Err(BuildError::OrderingWithoutKeys(node));
         }

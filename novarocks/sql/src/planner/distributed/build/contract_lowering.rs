@@ -5151,7 +5151,6 @@ impl ContractLoweringVisitor {
                 partial_limit,
                 0,
                 ContractTopNPhase::Partial { sequence },
-                false,
             )?;
             let destination = self.allocate_fragment()?;
             self.current_fragment = destination;
@@ -5163,18 +5162,10 @@ impl ContractLoweringVisitor {
                 limit,
                 offset,
                 ContractTopNPhase::Final { sequence },
-                true,
             );
         }
         let child = self.ensure_singleton(child, &plan.output_columns)?;
-        self.append_topn(
-            child,
-            &topn.items,
-            limit,
-            offset,
-            ContractTopNPhase::Single,
-            true,
-        )
+        self.append_topn(child, &topn.items, limit, offset, ContractTopNPhase::Single)
     }
 
     fn append_topn(
@@ -5184,22 +5175,14 @@ impl ContractLoweringVisitor {
         limit: u64,
         offset: u64,
         phase: ContractTopNPhase,
-        require_singleton: bool,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let node = self.fragment_mut().reserve_node_id()?;
         let LoweredOrdering {
             expressions: order_by,
             ..
         } = self.lower_ordering(node, items, &child.columns)?;
-        self.fragment_mut().add_top_n(
-            node,
-            child.node,
-            order_by,
-            limit,
-            offset,
-            phase,
-            require_singleton,
-        )?;
+        self.fragment_mut()
+            .add_top_n(node, child.node, order_by, limit, offset, phase)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
