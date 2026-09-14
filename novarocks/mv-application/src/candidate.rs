@@ -35,7 +35,11 @@ impl CandidateDiagnostic {
         let identity = identity.into();
         let mut message = message.into();
         if message.len() > MAX_CANDIDATE_DIAGNOSTIC_BYTES {
-            message.truncate(MAX_CANDIDATE_DIAGNOSTIC_BYTES);
+            let mut boundary = MAX_CANDIDATE_DIAGNOSTIC_BYTES;
+            while !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
         }
         Self { identity, message }
     }
@@ -154,7 +158,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_candidates;
+    use super::{CandidateDiagnostic, MAX_CANDIDATE_DIAGNOSTIC_BYTES, inspect_candidates};
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundary() {
+        let diagnostic = CandidateDiagnostic::new("mv", "界".repeat(2_000));
+
+        assert!(diagnostic.message().len() <= MAX_CANDIDATE_DIAGNOSTIC_BYTES);
+        assert_eq!(diagnostic.message().len(), 4_095);
+        assert!(
+            diagnostic
+                .message()
+                .chars()
+                .all(|character| character == '界')
+        );
+    }
 
     #[test]
     fn one_bad_candidate_does_not_discard_verified_candidates() {
