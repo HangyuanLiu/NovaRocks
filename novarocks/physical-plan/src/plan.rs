@@ -227,6 +227,20 @@ pub struct PhysicalProperties {
 ///
 /// A broadcast input remains replica-equivalent only when every replica
 /// evaluates the predicate identically.
+/// What an operator requires of an input whose rows it passes through.
+///
+/// Passing rows through constrains neither layout nor order, but it cannot
+/// erase copies that already exist: a replicated input stays replicated on the
+/// other side. This is contract knowledge rather than planner knowledge, so it
+/// lives next to the properties it derives.
+pub fn passthrough_requirement(input: &PhysicalProperties) -> PhysicalProperties {
+    PhysicalProperties {
+        distribution: Distribution::Unconstrained,
+        row_multiplicity: input.row_multiplicity,
+        ordering: Box::default(),
+    }
+}
+
 pub fn derive_filter_output_properties(
     input: &PhysicalProperties,
     predicate_replica_deterministic: bool,

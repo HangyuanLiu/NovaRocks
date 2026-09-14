@@ -61,8 +61,7 @@ use novarocks_physical_plan::{
     WindowFrameExclusion, WindowFrameUnits, WindowSpec, WriterAggregateCall, WriterDerivedKind,
     WriterFinishSpec, WriterGroupedUnpivotMapping, WriterGroupedUnpivotSpec, WriterRelationField,
     WriterRelationFieldRole, WriterRelationSchema, WriterTarget, WriterTargetField,
-    derive_filter_output_properties, derive_project_output_properties,
-    expressions_are_replica_deterministic,
+    derive_project_output_properties, expressions_are_replica_deterministic,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadRelationKind;
 use novarocks_spi::connector::write_stack::{RootWriteResultSchema, WriteTargetOrdinal};
@@ -4745,25 +4744,13 @@ impl ContractLoweringVisitor {
         // reason per conjunct never have to re-split a tree.
         let predicates =
             self.lower_boolean_connective(node, predicate, BinOp::And, &child.columns)?;
-        let properties = derive_filter_output_properties(
-            &child.properties,
-            expressions_are_replica_deterministic(
-                self.fragment_mut().expressions(),
-                predicates.iter().copied(),
-                true,
-            ),
-        );
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([passthrough_requirement(&child.properties)]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::Filter { predicates },
-        })?;
+        self.fragment_mut()
+            .add_filter(node, child.node, predicates)?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the filter was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5062,22 +5049,13 @@ impl ContractLoweringVisitor {
         offset: u64,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let node = self.fragment_mut().reserve_node_id()?;
-        let properties = PhysicalProperties {
-            distribution: Distribution::Singleton,
-            row_multiplicity: RowMultiplicity::SingleCopy,
-            ordering: child.properties.ordering.clone(),
-        };
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([singleton_requirement()]),
-            output_properties: properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::Limit { limit, offset },
-        })?;
+        self.fragment_mut()
+            .add_limit(node, child.node, limit, offset)?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the limit was just inserted")
+            .clone();
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -5374,21 +5352,8 @@ impl ContractLoweringVisitor {
             }
         };
         let node = self.fragment_mut().reserve_node_id()?;
-        self.fragment_mut().insert_node(PhysicalNode {
-            id: node,
-            inputs: Box::from([child.node]),
-            required_inputs: Box::from([PhysicalProperties {
-                distribution: child.properties.distribution.clone(),
-                row_multiplicity: RowMultiplicity::SingleCopy,
-                ordering: Box::default(),
-            }]),
-            output_properties: child.properties.clone(),
-            output: OutputPort {
-                node,
-                columns: child.output.clone(),
-            },
-            kind: NodeKind::AssertOneRow(spec),
-        })?;
+        self.fragment_mut()
+            .add_assert_one_row(node, child.node, spec)?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -7762,12 +7727,10 @@ fn remap_properties_through_values(
     }
 }
 
+/// Delegates to the contract so the rule has one definition while the
+/// remaining node families move onto typed constructors.
 fn passthrough_requirement(input: &PhysicalProperties) -> PhysicalProperties {
-    PhysicalProperties {
-        distribution: Distribution::Unconstrained,
-        row_multiplicity: input.row_multiplicity,
-        ordering: Box::default(),
-    }
+    novarocks_physical_plan::passthrough_requirement(input)
 }
 
 fn singleton_requirement() -> PhysicalProperties {

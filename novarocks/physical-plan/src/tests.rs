@@ -1239,6 +1239,112 @@ fn wide_connective_fragment(
     builder.finish_definition(node, FragmentSink::Noop, dop())
 }
 
+/// Builds a single-copy singleton `Values` node returning one boolean column,
+/// and returns the builder plus that node.
+fn boolean_source() -> (FragmentBuilder, NodeId, ExprId) {
+    let mut builder = FragmentBuilder::new(FragmentId::new(12));
+    let values = builder.reserve_node_id().unwrap();
+    let boolean = ty(DataType::Boolean, false);
+    let literal = builder
+        .add_expression(
+            values,
+            boolean.clone(),
+            ExprKind::Literal(LiteralValue::Boolean(true)),
+        )
+        .unwrap();
+    let value = builder
+        .add_value(
+            boolean,
+            ValueOrigin::NodeOutput {
+                node: values,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: values,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node: values,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([literal])]),
+            },
+        })
+        .unwrap();
+    (builder, values, literal)
+}
+
+#[test]
+fn a_typed_constructor_refuses_before_a_node_exists() {
+    // These are the states the contract used to accept and then reject in a
+    // whole-fragment pass. Refusing them at the construction point means the
+    // caller finds out where the mistake was made, and the fragment never
+    // holds an illegal node at all.
+    let (mut builder, values, literal) = boolean_source();
+    let filter = builder.reserve_node_id().unwrap();
+
+    assert!(matches!(
+        builder.add_filter(filter, values, Box::default()),
+        Err(BuildError::FilterWithoutPredicate(_))
+    ));
+    assert!(matches!(
+        builder.add_filter(filter, NodeId::new(404), Box::from([literal])),
+        Err(BuildError::UndefinedInput { .. })
+    ));
+    // The literal belongs to the Values node, not to the filter.
+    assert!(matches!(
+        builder.add_filter(filter, values, Box::from([literal])),
+        Err(BuildError::ExpressionOutsideOwner { .. })
+    ));
+
+    // A fresh builder, because a rejected predicate would otherwise leave an
+    // expression no operator reaches - itself a contract violation.
+    {
+        let (mut other, other_values, _) = boolean_source();
+        let other_filter = other.reserve_node_id().unwrap();
+        let non_boolean = other
+            .add_expression(
+                other_filter,
+                ty(DataType::Int64, false),
+                ExprKind::Literal(LiteralValue::Int64(1)),
+            )
+            .unwrap();
+        assert!(matches!(
+            other.add_filter(other_filter, other_values, Box::from([non_boolean])),
+            Err(BuildError::PredicateIsNotBoolean(_))
+        ));
+    }
+
+    // Nothing above left a node behind.
+    assert!(builder.node_output_properties(filter).is_none());
+
+    let predicate = builder
+        .add_expression(
+            filter,
+            ty(DataType::Boolean, false),
+            ExprKind::Literal(LiteralValue::Boolean(true)),
+        )
+        .unwrap();
+    builder
+        .add_filter(filter, values, Box::from([predicate]))
+        .expect("a boolean predicate over an existing input is a filter");
+    // The caller never stated the output port or the properties, so it cannot
+    // have stated them wrongly.
+    let properties = builder.node_output_properties(filter).unwrap().clone();
+    assert_eq!(
+        properties,
+        derive_filter_output_properties(&singleton(), true)
+    );
+    builder
+        .finish_definition(filter, FragmentSink::Noop, dop())
+        .expect("a derived filter validates");
+}
+
 #[test]
 fn a_wide_predicate_is_width_and_not_depth() {
     // Comfortably past PlanLimits::FROZEN.expression_semantic_depth. A dashboard filter panel

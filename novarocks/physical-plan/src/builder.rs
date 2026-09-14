@@ -19,12 +19,14 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use arrow_schema::DataType;
+
 use crate::{
     ArtifactRefId, Edge, EdgeId, ExprArena, ExprId, ExprKind, ExprNode, Fragment, FragmentId,
-    FragmentParts, FragmentSink, NodeId, PhysicalNode, PhysicalPlan, PhysicalPlanParts,
-    PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts, ResultPort, RuntimeFilter,
-    RuntimeFilterId, SealedArtifactRef, ValidationErrors, ValueDef, ValueId, ValueOrigin,
-    ValueType, validate_fragment_definition, validate_plan,
+    FragmentParts, FragmentSink, NodeId, NodeKind, OutputPort, PhysicalNode, PhysicalPlan,
+    PhysicalPlanParts, PipelineDopDomain, PlanAnnotation, PlanVersionId, RequiredContracts,
+    ResultPort, RuntimeFilter, RuntimeFilterId, SealedArtifactRef, ValidationErrors, ValueDef,
+    ValueId, ValueOrigin, ValueType, validate_fragment_definition, validate_plan,
 };
 
 /// Mutable construction state. It cannot be encoded, scheduled or viewed as a
@@ -149,6 +151,146 @@ impl FragmentBuilder {
             }
         }
         Ok(())
+    }
+
+    /// Adds a filter over `input`, retaining rows for which every predicate
+    /// holds.
+    ///
+    /// The caller supplies only what it actually decides: which rows to keep.
+    /// The output port, the input requirement and the output properties all
+    /// follow from the input and the predicates, so building them by hand was
+    /// four separate chances to state something the contract then had to catch.
+    /// `node` is reserved first because the predicates are owned by it.
+    pub fn add_filter(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        predicates: Box<[ExprId]>,
+    ) -> Result<(), BuildError> {
+        if predicates.is_empty() {
+            return Err(BuildError::FilterWithoutPredicate(node));
+        }
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        let columns = source.output.columns.clone();
+        let input_properties = source.output_properties.clone();
+        for predicate in &predicates {
+            let expression = self
+                .expressions
+                .get(*predicate)
+                .ok_or(BuildError::UndefinedExpression(*predicate))?;
+            if expression.owner != node {
+                return Err(BuildError::ExpressionOutsideOwner {
+                    expr: *predicate,
+                    owner: expression.owner,
+                    node,
+                });
+            }
+            if expression.ty.data_type != DataType::Boolean {
+                return Err(BuildError::PredicateIsNotBoolean(*predicate));
+            }
+        }
+        let replica_deterministic = crate::expressions_are_replica_deterministic(
+            &self.expressions,
+            predicates.iter().copied(),
+            true,
+        );
+        let output_properties =
+            crate::derive_filter_output_properties(&input_properties, replica_deterministic);
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::passthrough_requirement(&input_properties)]),
+            output_properties,
+            output: OutputPort { node, columns },
+            kind: NodeKind::Filter { predicates },
+        })
+    }
+
+    /// Adds a global limit over `input`.
+    ///
+    /// A global limit is only meaningful over a single stream of single-copy
+    /// rows, so the requirement is checked here instead of being restated by
+    /// the caller and then re-derived by the contract. Row order survives;
+    /// nothing else about the input can.
+    pub fn add_limit(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        limit: Option<u64>,
+        offset: u64,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        if source.output_properties.distribution != crate::Distribution::Singleton
+            || source.output_properties.row_multiplicity != crate::RowMultiplicity::SingleCopy
+        {
+            return Err(BuildError::LimitInputIsNotGlobal(node));
+        }
+        let columns = source.output.columns.clone();
+        let output_properties = crate::PhysicalProperties {
+            distribution: crate::Distribution::Singleton,
+            row_multiplicity: crate::RowMultiplicity::SingleCopy,
+            ordering: source.output_properties.ordering.clone(),
+        };
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([crate::PhysicalProperties {
+                distribution: crate::Distribution::Singleton,
+                row_multiplicity: crate::RowMultiplicity::SingleCopy,
+                ordering: Box::default(),
+            }]),
+            output_properties,
+            output: OutputPort { node, columns },
+            kind: NodeKind::Limit { limit, offset },
+        })
+    }
+
+    /// Adds a cardinality assertion over `input`.
+    ///
+    /// The assertion counts rows, so it needs each logical row to exist once;
+    /// it constrains nothing else and changes nothing it passes on.
+    pub fn add_assert_one_row(
+        &mut self,
+        node: NodeId,
+        input: NodeId,
+        spec: crate::RowCountAssertionSpec,
+    ) -> Result<(), BuildError> {
+        let source = self
+            .nodes
+            .get(&input)
+            .ok_or(BuildError::UndefinedInput { node, input })?;
+        if source.output_properties.row_multiplicity != crate::RowMultiplicity::SingleCopy {
+            return Err(BuildError::AssertionOverReplicatedRows(node));
+        }
+        let columns = source.output.columns.clone();
+        let output_properties = source.output_properties.clone();
+        let required = crate::PhysicalProperties {
+            distribution: output_properties.distribution.clone(),
+            row_multiplicity: crate::RowMultiplicity::SingleCopy,
+            ordering: Box::default(),
+        };
+        self.insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::from([input]),
+            required_inputs: Box::from([required]),
+            output_properties,
+            output: OutputPort { node, columns },
+            kind: NodeKind::AssertOneRow(spec),
+        })
+    }
+
+    /// Properties a node in this fragment produces.
+    ///
+    /// Callers that let the builder derive properties still need to read them
+    /// back to describe the node to their own caller.
+    pub fn node_output_properties(&self, node: NodeId) -> Option<&crate::PhysicalProperties> {
+        self.nodes.get(&node).map(|node| &node.output_properties)
     }
 
     pub fn insert_node(&mut self, node: PhysicalNode) -> Result<(), BuildError> {
@@ -332,6 +474,28 @@ pub enum BuildError {
     DuplicateRuntimeFilter(RuntimeFilterId),
     DuplicateArtifactRef(ArtifactRefId),
     DuplicateResultPort,
+    /// A node names an input that has not been inserted yet. Fragments are
+    /// built bottom up, so this is always an ordering mistake.
+    UndefinedInput {
+        node: NodeId,
+        input: NodeId,
+    },
+    UndefinedExpression(ExprId),
+    /// Expressions belong to exactly one node's evaluation scope, so using one
+    /// under a different node is a scope violation rather than a type error.
+    ExpressionOutsideOwner {
+        expr: ExprId,
+        owner: NodeId,
+        node: NodeId,
+    },
+    PredicateIsNotBoolean(ExprId),
+    FilterWithoutPredicate(NodeId),
+    /// A global limit was built over rows that are not one single-copy stream,
+    /// where "the first N rows" has no single meaning.
+    LimitInputIsNotGlobal(NodeId),
+    /// A cardinality assertion was built over replicated rows, where counting
+    /// them counts execution copies rather than logical rows.
+    AssertionOverReplicatedRows(NodeId),
 }
 
 impl fmt::Display for BuildError {
@@ -348,6 +512,42 @@ impl fmt::Display for BuildError {
             Self::DuplicateRuntimeFilter(id) => {
                 write!(formatter, "duplicate runtime filter {}", id.get())
             }
+            Self::UndefinedInput { node, input } => write!(
+                formatter,
+                "node {} names undefined input {}",
+                node.get(),
+                input.get()
+            ),
+            Self::UndefinedExpression(id) => {
+                write!(formatter, "expression {} is not defined", id.get())
+            }
+            Self::ExpressionOutsideOwner { expr, owner, node } => write!(
+                formatter,
+                "expression {} belongs to node {}, not node {}",
+                expr.get(),
+                owner.get(),
+                node.get()
+            ),
+            Self::PredicateIsNotBoolean(id) => {
+                write!(
+                    formatter,
+                    "predicate expression {} is not boolean",
+                    id.get()
+                )
+            }
+            Self::FilterWithoutPredicate(id) => {
+                write!(formatter, "filter node {} has no predicate", id.get())
+            }
+            Self::LimitInputIsNotGlobal(id) => write!(
+                formatter,
+                "limit node {} requires one single-copy singleton input",
+                id.get()
+            ),
+            Self::AssertionOverReplicatedRows(id) => write!(
+                formatter,
+                "assertion node {} cannot count replicated rows",
+                id.get()
+            ),
             Self::DuplicateArtifactRef(id) => {
                 write!(formatter, "duplicate artifact reference {}", id.get())
             }
