@@ -179,7 +179,7 @@ fn contains_error(result: Result<Fragment, ValidationErrors>, expected: &str) ->
         .expect_err("fixture must be rejected")
         .errors()
         .iter()
-        .any(|error| error.message.contains(expected))
+        .any(|error| error.message().contains(expected))
 }
 
 fn finish_plan_with_partition_distributions(
@@ -256,7 +256,7 @@ fn contains_plan_error(result: Result<PhysicalPlan, ValidationErrors>, expected:
         .expect_err("plan fixture must be rejected")
         .errors()
         .iter()
-        .any(|error| error.message.contains(expected))
+        .any(|error| error.message().contains(expected))
 }
 
 #[test]

@@ -155,7 +155,7 @@ fn ordinary_unpivot_rejects_a_mapping_input_outside_its_child_port() {
         .expect_err("an Unpivot mapping must consume its exact child output");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("mapping input is absent from its exact child output")
     }));
 }
@@ -166,7 +166,7 @@ fn ordinary_unpivot_rejects_mapping_type_drift() {
         .expect_err("all mapping inputs must share the value output type");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("mapping input type differs from its value output")
     }));
 }
@@ -177,7 +177,7 @@ fn ordinary_unpivot_rejects_literal_constant_type_drift() {
         .expect_err("a constant must match its literal output type");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("constant type differs from its literal output")
     }));
 }

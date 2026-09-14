@@ -531,24 +531,112 @@ impl SemanticTraceIndexes {
     }
 }
 
+/// How a validation failure must be routed by whoever receives it.
+///
+/// The categories do not rank severity. They record *who is at fault*, which is
+/// the only thing that tells a consumer what to do next, and which a prose
+/// message cannot carry without being re-parsed at every call site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum ValidationErrorCategory {
+    /// The plan violates an invariant of the contract itself. A correct
+    /// producer cannot emit one, so a worker observing this category has proof
+    /// of a producer defect. It is never a statement about capability or
+    /// capacity, and retrying elsewhere cannot help.
+    StructuralInvariant,
+    /// The plan is well formed but names something this target cannot honour.
+    /// This is scheduling information: a different target may accept the very
+    /// same plan unchanged.
+    UnsupportedCapability,
+    /// The plan is well formed and supported but exceeds a declared structural
+    /// limit. This is admission information. It never implies the plan is
+    /// wrong, and it is the category an operator raises a limit to clear.
+    ResourceLimit,
+}
+
+impl ValidationErrorCategory {
+    /// Stable lowercase token for logs and typed assertions.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StructuralInvariant => "structural-invariant",
+            Self::UnsupportedCapability => "unsupported-capability",
+            Self::ResourceLimit => "resource-limit",
+        }
+    }
+}
+
+impl fmt::Display for ValidationErrorCategory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationError {
-    pub path: Box<str>,
-    pub message: Box<str>,
+    category: ValidationErrorCategory,
+    path: Box<str>,
+    message: Box<str>,
 }
 
 impl ValidationError {
-    fn new(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
+    /// A violated contract invariant. This is the default because the vast
+    /// majority of checks prove structure; capability and capacity failures are
+    /// the ones that must say so explicitly.
+    pub(crate) fn new(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
+        Self::categorized(ValidationErrorCategory::StructuralInvariant, path, message)
+    }
+
+    /// A declared structural limit was exceeded. Every limit check reports this
+    /// category so admission and backpressure can be driven without parsing the
+    /// message.
+    pub(crate) fn resource_limit(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
+        Self::categorized(ValidationErrorCategory::ResourceLimit, path, message)
+    }
+
+    /// The target cannot honour something the plan legitimately names.
+    #[expect(
+        dead_code,
+        reason = "consumed once T07-P lowers provider capability refusals"
+    )]
+    pub(crate) fn unsupported_capability(path: impl AsRef<str>, message: impl AsRef<str>) -> Self {
+        Self::categorized(
+            ValidationErrorCategory::UnsupportedCapability,
+            path,
+            message,
+        )
+    }
+
+    fn categorized(
+        category: ValidationErrorCategory,
+        path: impl AsRef<str>,
+        message: impl AsRef<str>,
+    ) -> Self {
         Self {
+            category,
             path: path.as_ref().into(),
             message: message.as_ref().into(),
         }
+    }
+
+    pub const fn category(&self) -> ValidationErrorCategory {
+        self.category
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}: {}", self.path, self.message)
+        write!(
+            formatter,
+            "[{}] {}: {}",
+            self.category, self.path, self.message
+        )
     }
 }
 
@@ -609,6 +697,23 @@ impl std::ops::Deref for ValidationErrorCollector {
 impl ValidationErrors {
     pub fn errors(&self) -> &[ValidationError] {
         &self.0
+    }
+
+    /// True when at least one error carries `category`.
+    pub fn has(&self, category: ValidationErrorCategory) -> bool {
+        self.0.iter().any(|error| error.category() == category)
+    }
+
+    /// True when every error is a violated contract invariant. A worker seeing
+    /// only this category has proof of a producer defect: no other target and
+    /// no raised limit can make the same plan succeed, so it must not be
+    /// reported as a capability or capacity refusal.
+    pub fn is_producer_defect(&self) -> bool {
+        !self.0.is_empty()
+            && self
+                .0
+                .iter()
+                .all(|error| error.category() == ValidationErrorCategory::StructuralInvariant)
     }
 
     fn from_collector(errors: ValidationErrorCollector) -> Self {
@@ -1872,7 +1977,7 @@ pub fn validate_plan(plan: &PhysicalPlan) -> Result<(), ValidationErrors> {
             if total_cut_items > MAX_PLAN_DERIVED_CUT_ITEMS
                 || total_cut_bytes > MAX_PLAN_DERIVED_CUT_BYTES
             {
-                errors.push(ValidationError::new(
+                errors.push(ValidationError::resource_limit(
                     "fragments.cuts.resources",
                     "aggregate derived fragment cuts exceed the plan publication budget",
                 ));
@@ -3888,7 +3993,7 @@ fn validate_runtime_filter_proof_graph(
 
 fn bounded_count(errors: &mut ValidationErrorCollector, path: &str, actual: usize, maximum: usize) {
     if actual > maximum {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             path,
             format!("contains {actual} items, exceeding {maximum}"),
         ));
@@ -5393,7 +5498,7 @@ fn validate_expression_acyclic(fragment: &Fragment, errors: &mut ValidationError
         ));
     }
     if depths.values().copied().max().unwrap_or(0) > MAX_EXPRESSION_SEMANTIC_DEPTH {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             &path,
             format!("expression semantic depth exceeds {MAX_EXPRESSION_SEMANTIC_DEPTH}"),
         ));
@@ -6643,7 +6748,7 @@ fn validate_node_semantics(
                 ));
             }
             if spec.expected_target_ordinals.len() > MAX_CONNECTOR_WRITE_TARGETS {
-                errors.push(ValidationError::new(
+                errors.push(ValidationError::resource_limit(
                     path,
                     "table finish target count exceeds the connector contract bound",
                 ));
@@ -9129,7 +9234,7 @@ fn validate_unpivot_resource_limits<'a>(
         return false;
     }
     if mapping_count > MAX_UNPIVOT_MAPPINGS {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             path,
             "unpivot mapping count exceeds the contract maximum",
         ));
@@ -9143,7 +9248,7 @@ fn validate_unpivot_resource_limits<'a>(
         constant_count = match constant_count.checked_add(constants.len()) {
             Some(count) if count <= MAX_UNPIVOT_CONSTANTS => count,
             _ => {
-                errors.push(ValidationError::new(
+                errors.push(ValidationError::resource_limit(
                     path,
                     "unpivot constant count exceeds the contract maximum",
                 ));
@@ -9171,7 +9276,7 @@ fn validate_unpivot_resource_limits<'a>(
             if collection_items > MAX_UNPIVOT_COLLECTION_ITEMS
                 || literal_bytes > MAX_UNPIVOT_LITERAL_BYTES
             {
-                errors.push(ValidationError::new(
+                errors.push(ValidationError::resource_limit(
                     path,
                     "unpivot literal collections exceed the contract budget",
                 ));
@@ -10785,7 +10890,7 @@ fn validate_runtime_filter_shape(
             .saturating_add(filter.consumers.len())
             > MAX_RUNTIME_FILTER_ENDPOINTS
     {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             path,
             "runtime filter endpoint count exceeds the contract maximum",
         ));
@@ -10801,7 +10906,7 @@ fn validate_runtime_filter_shape(
         })
     });
     if lineage_steps > MAX_RUNTIME_FILTER_LINEAGE_STEPS {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             path,
             "runtime filter lineage exceeds the contract maximum",
         ));
@@ -10928,7 +11033,7 @@ fn validate_runtime_filter_shape(
         || filter.policy.deadline_ms > MAX_RUNTIME_FILTER_DEADLINE_MS
         || filter.policy.max_retries > MAX_RUNTIME_FILTER_RETRIES
     {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             path,
             "runtime filter policy exceeds its resource bounds",
         ));
@@ -11256,7 +11361,7 @@ fn validate_runtime_filter_coverage(
                 child_references = child_references.saturating_add(children.len());
                 if child_references > MAX_RUNTIME_FILTER_COVERAGE_NODES {
                     safe = false;
-                    errors.push(ValidationError::new(
+                    errors.push(ValidationError::resource_limit(
                         path,
                         format!(
                             "runtime filter {label} coverage exceeds {} child references",
@@ -11295,7 +11400,7 @@ fn validate_runtime_filter_coverage(
                 let depth = child_depth.saturating_add(1);
                 if depth > MAX_RUNTIME_FILTER_COVERAGE_DEPTH {
                     safe = false;
-                    errors.push(ValidationError::new(
+                    errors.push(ValidationError::resource_limit(
                         path,
                         format!(
                             "runtime filter {label} coverage exceeds semantic depth {}",
@@ -12498,7 +12603,7 @@ fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationErrorCollect
                 .saturating_add(annotation.value.len())
         });
     if total_bytes > MAX_ANNOTATION_BYTES {
-        errors.push(ValidationError::new(
+        errors.push(ValidationError::resource_limit(
             "annotations",
             format!("contains {total_bytes} bytes, exceeding {MAX_ANNOTATION_BYTES}"),
         ));
@@ -12647,7 +12752,7 @@ mod validation_error_tests {
             errors
                 .errors()
                 .iter()
-                .filter(|error| error.message.contains("truncated"))
+                .filter(|error| error.message().contains("truncated"))
                 .count(),
             1
         );

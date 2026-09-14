@@ -503,24 +503,22 @@ fn validate_usage(
     errors: &mut ValidationErrorCollector,
 ) {
     if usage.items > max_items {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
+        errors.push(ValidationError::resource_limit(
+            path,
+            format!(
                 "contains {} dynamic items, exceeding {max_items}",
                 usage.items
-            )
-            .into(),
-        });
+            ),
+        ));
     }
     if usage.bytes > max_bytes {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
+        errors.push(ValidationError::resource_limit(
+            path,
+            format!(
                 "contains {} dynamic bytes, exceeding {max_bytes}",
                 usage.bytes
-            )
-            .into(),
-        });
+            ),
+        ));
     }
 }
 
@@ -1336,14 +1334,13 @@ fn add_runtime_filter_coverage_usage(
     }
     usage.add_items(coverage.nodes.len());
     if coverage.nodes.len() > crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
+        errors.push(ValidationError::resource_limit(
+            path,
+            format!(
                 "contains more than {} arena nodes",
                 crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES
-            )
-            .into(),
-        });
+            ),
+        ));
         return;
     }
     let mut child_references = 0_usize;
@@ -1356,14 +1353,13 @@ fn add_runtime_filter_coverage_usage(
         {
             child_references = child_references.saturating_add(children.len());
             if child_references > crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES {
-                errors.push(ValidationError {
-                    path: path.into(),
-                    message: format!(
+                errors.push(ValidationError::resource_limit(
+                    path,
+                    format!(
                         "contains more than {} child references",
                         crate::validation::MAX_RUNTIME_FILTER_COVERAGE_NODES
-                    )
-                    .into(),
-                });
+                    ),
+                ));
                 return;
             }
         }
@@ -1417,49 +1413,47 @@ fn validate_data_type(
         nodes = nodes.saturating_add(1);
         usage.add_items(1);
         if depth > MAX_DATA_TYPE_DEPTH {
-            errors.push(ValidationError {
-                path: path.into(),
-                message: format!("Arrow data type depth exceeds {MAX_DATA_TYPE_DEPTH}").into(),
-            });
+            errors.push(ValidationError::resource_limit(
+                path,
+                format!("Arrow data type depth exceeds {MAX_DATA_TYPE_DEPTH}"),
+            ));
             return;
         }
         if nodes > MAX_DATA_TYPE_NODES {
-            errors.push(ValidationError {
-                path: path.into(),
-                message: format!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes")
-                    .into(),
-            });
+            errors.push(ValidationError::resource_limit(
+                path,
+                format!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes"),
+            ));
             return;
         }
         match data_type {
             DataType::Timestamp(_, Some(timezone)) => {
                 usage.add_bytes(timezone.len());
                 if timezone.len() > MAX_TIMESTAMP_TIMEZONE_BYTES {
-                    errors.push(ValidationError {
-                        path: path.into(),
-                        message: format!(
+                    errors.push(ValidationError::resource_limit(
+                        path,
+                        format!(
                             "Arrow timestamp timezone exceeds {MAX_TIMESTAMP_TIMEZONE_BYTES} bytes"
-                        )
-                        .into(),
-                    });
+                        ),
+                    ));
                 }
             }
             DataType::FixedSizeBinary(size) if *size < 0 || *size > MAX_FIXED_SIZE_LENGTH => {
                 invalid_fixed_size(path, *size, errors);
             }
             DataType::Time32(unit) if !matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) => {
-                errors.push(ValidationError {
-                    path: path.into(),
-                    message: "Arrow Time32 must use second or millisecond units".into(),
-                });
+                errors.push(ValidationError::new(
+                    path,
+                    "Arrow Time32 must use second or millisecond units",
+                ));
             }
             DataType::Time64(unit)
                 if !matches!(unit, TimeUnit::Microsecond | TimeUnit::Nanosecond) =>
             {
-                errors.push(ValidationError {
-                    path: path.into(),
-                    message: "Arrow Time64 must use microsecond or nanosecond units".into(),
-                });
+                errors.push(ValidationError::new(
+                    path,
+                    "Arrow Time64 must use microsecond or nanosecond units",
+                ));
             }
             DataType::FixedSizeList(field, size) => {
                 if *size < 0 || *size > MAX_FIXED_SIZE_LENGTH {
@@ -1520,10 +1514,10 @@ fn validate_data_type(
                         | DataType::UInt32
                         | DataType::UInt64
                 ) {
-                    errors.push(ValidationError {
-                        path: path.into(),
-                        message: "Arrow dictionary key must be an integer type".into(),
-                    });
+                    errors.push(ValidationError::new(
+                        path,
+                        "Arrow dictionary key must be an integer type",
+                    ));
                 }
                 if data_type_children_exceed_budget(nodes, pending.len(), 2, path, errors) {
                     return;
@@ -1536,10 +1530,10 @@ fn validate_data_type(
                     run_ends.data_type(),
                     DataType::Int16 | DataType::Int32 | DataType::Int64
                 ) {
-                    errors.push(ValidationError {
-                        path: path.into(),
-                        message: "Arrow run-end type must be Int16, Int32 or Int64".into(),
-                    });
+                    errors.push(ValidationError::new(
+                        path,
+                        "Arrow run-end type must be Int16, Int32 or Int64",
+                    ));
                 }
                 if data_type_children_exceed_budget(nodes, pending.len(), 2, path, errors) {
                     return;
@@ -1596,10 +1590,10 @@ fn data_type_children_exceed_budget(
     if visited.saturating_add(pending).saturating_add(children) <= MAX_DATA_TYPE_NODES {
         return false;
     }
-    errors.push(ValidationError {
-        path: path.into(),
-        message: format!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes").into(),
-    });
+    errors.push(ValidationError::resource_limit(
+        path,
+        format!("Arrow data type contains more than {MAX_DATA_TYPE_NODES} nodes"),
+    ));
     true
 }
 
@@ -1611,20 +1605,13 @@ fn validate_field(
 ) {
     usage.add_bytes(field.name().len());
     if field.name().len() > MAX_DATA_TYPE_FIELD_NAME_BYTES {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!("Arrow field name exceeds {MAX_DATA_TYPE_FIELD_NAME_BYTES} bytes")
-                .into(),
-        });
+        errors.push(ValidationError::resource_limit(
+            path,
+            format!("Arrow field name exceeds {MAX_DATA_TYPE_FIELD_NAME_BYTES} bytes"),
+        ));
     }
     if field.metadata().len() > MAX_DATA_TYPE_FIELD_METADATA_ENTRIES {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
-                "Arrow field metadata contains more than {MAX_DATA_TYPE_FIELD_METADATA_ENTRIES} entries"
-            )
-            .into(),
-        });
+        errors.push(ValidationError::resource_limit(path, format!( "Arrow field metadata contains more than {MAX_DATA_TYPE_FIELD_METADATA_ENTRIES} entries" )));
     }
     usage.add_items(field.metadata().len());
     let mut metadata_bytes = 0_usize;
@@ -1639,21 +1626,18 @@ fn validate_field(
         if key.len() > MAX_DATA_TYPE_FIELD_METADATA_KEY_BYTES
             || value.len() > MAX_DATA_TYPE_FIELD_METADATA_VALUE_BYTES
         {
-            errors.push(ValidationError {
-                path: path.into(),
-                message: "Arrow field metadata key or value exceeds its byte limit".into(),
-            });
+            errors.push(ValidationError::resource_limit(
+                path,
+                "Arrow field metadata key or value exceeds its byte limit",
+            ));
         }
     }
     usage.add_bytes(metadata_bytes);
     if metadata_bytes > MAX_DATA_TYPE_FIELD_METADATA_BYTES {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
-                "Arrow field metadata exceeds {MAX_DATA_TYPE_FIELD_METADATA_BYTES} bytes"
-            )
-            .into(),
-        });
+        errors.push(ValidationError::resource_limit(
+            path,
+            format!("Arrow field metadata exceeds {MAX_DATA_TYPE_FIELD_METADATA_BYTES} bytes"),
+        ));
     }
 }
 
@@ -1666,22 +1650,24 @@ fn validate_decimal(
     errors: &mut ValidationErrorCollector,
 ) {
     if precision == 0 || precision > max_precision || scale < -max_scale || scale > max_scale {
-        errors.push(ValidationError {
-            path: path.into(),
-            message: format!(
-                "Arrow decimal precision/scale ({precision}, {scale}) is outside 1..={max_precision} and -{max_scale}..={max_scale}"
-            )
-            .into(),
-        });
+        errors.push(ValidationError::new(path, format!( "Arrow decimal precision/scale ({precision}, {scale}) is outside 1..={max_precision} and -{max_scale}..={max_scale}" )));
     }
 }
 
 fn invalid_fixed_size(path: &str, size: i32, errors: &mut ValidationErrorCollector) {
-    errors.push(ValidationError {
-        path: path.into(),
-        message: format!("Arrow fixed-size length {size} is outside 0..={MAX_FIXED_SIZE_LENGTH}")
-            .into(),
-    });
+    // A negative length is not a plan that is too large; it is a type that
+    // cannot exist. Only the upper bound is a limit an operator could raise.
+    if size < 0 {
+        errors.push(ValidationError::new(
+            path,
+            format!("Arrow fixed-size length {size} is negative"),
+        ));
+        return;
+    }
+    errors.push(ValidationError::resource_limit(
+        path,
+        format!("Arrow fixed-size length {size} exceeds {MAX_FIXED_SIZE_LENGTH}"),
+    ));
 }
 
 #[cfg(test)]
@@ -1743,7 +1729,7 @@ mod tests {
             &mut errors,
         );
         assert_eq!(errors.len(), 2);
-        assert!(errors[0].message.contains("dynamic items"));
-        assert!(errors[1].message.contains("dynamic bytes"));
+        assert!(errors[0].message().contains("dynamic items"));
+        assert!(errors[1].message().contains("dynamic bytes"));
     }
 }

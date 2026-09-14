@@ -64,7 +64,7 @@ fn exchange_source_rejects_reordered_output_occurrences() {
         .expect_err("exchange output positions must preserve the import sequence");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("exchange output occurrences differ from its exact import sequence")
     }));
 }

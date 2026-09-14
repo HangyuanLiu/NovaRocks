@@ -139,7 +139,7 @@ fn intersect_cannot_publish_two_hash_keys_for_one_input_comparison_value() {
         .expect_err("one input hash key cannot prove two output hash keys");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("set operation output properties differ")
     }));
 }

@@ -159,7 +159,7 @@ fn change_event_assignments_reject_the_generated_effect_output() {
         .expect_err("the generated effect output cannot be assigned by an event");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("assignment targets the generated effect output")
     }));
 }
@@ -172,7 +172,7 @@ fn change_event_assignments_reject_outputs_absent_from_the_node_port() {
         .expect_err("an event assignment must target the node output port");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("assignment output is absent from the node output port")
     }));
 }
@@ -185,7 +185,7 @@ fn change_event_assignments_reject_duplicate_outputs() {
         .expect_err("one event cannot assign one output twice");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("event contains a duplicate assignment output")
     }));
 }
@@ -928,7 +928,7 @@ fn writer_union_rejects_same_typed_auxiliary_field_swaps() {
     assert!(
         errors.errors().iter().any(|error| {
             error
-                .message
+                .message()
                 .contains("stream source fields do not map exactly to its table finish input roles")
         }),
         "{errors:?}"
@@ -946,7 +946,7 @@ fn independent_finish_rechecks_writer_union_field_occurrences() {
     let errors = validate_fragment(&swapped_finish, &cuts)
         .expect_err("independent validation must reject a same-typed field swap");
     assert!(errors.errors().iter().any(|error| {
-        error.message.contains(
+        error.message().contains(
             "upstream writer result fields do not map exactly to its table finish input roles",
         )
     }));
@@ -958,7 +958,7 @@ fn router_edge_rejects_a_destination_writer_ordinal_drift() {
         .expect_err("a route cannot select another writer target ordinal");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("write target ordinal differs from its destination table writer")
     }));
 }
@@ -969,7 +969,7 @@ fn router_edge_rejects_a_destination_writer_field_token_drift() {
         .expect_err("a route field token must reach the same destination writer field");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("field mapping differs from its destination table writer contract")
     }));
 }
@@ -980,7 +980,7 @@ fn router_edge_rejects_partition_authority_drift() {
         .expect_err("an empty route partition must freeze one singleton edge");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("partition values differ from its exact edge distribution")
     }));
 }
@@ -999,7 +999,7 @@ fn independent_router_source_rejects_a_drifted_destination_writer_proof() {
         .expect_err("the source fragment must recheck its peer writer proof");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("outbound cut lacks its exact destination writer proof")
     }));
 }
@@ -1019,7 +1019,7 @@ fn independent_router_writer_rejects_a_drifted_source_route_proof() {
         .expect_err("the writer fragment must recheck its source route proof");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("inbound cut proof differs from its exact table writer contract")
     }));
 }
@@ -1034,7 +1034,7 @@ fn independent_writer_rejects_a_drifted_writer_result_proof() {
         .expect_err("the writer fragment must recheck its writer result proof");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("outbound writer result proof differs from its exact table writer schema")
     }));
 }
@@ -1053,7 +1053,7 @@ fn independent_finish_rejects_a_drifted_writer_result_proof() {
         .expect_err("the finish fragment must recheck the exact upstream writer target");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("expected targets differ from its fragment cut writer proofs")
     }));
 }
@@ -1079,7 +1079,7 @@ fn router_data_inputs_exclude_the_generated_effect_value() {
         .expect_err("the effect discriminator cannot enter provider data fields");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("data input cannot contain its generated effect value")
     }));
 }
@@ -1124,7 +1124,7 @@ fn independent_fragment_rejects_duplicate_multicast_destinations() {
         .expect_err("one edge cannot occur twice in a multicast sink");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("sink contains a duplicate edge destination")
     }));
 }
@@ -1152,7 +1152,7 @@ fn independent_fragment_rejects_invalid_router_identity_and_layout() {
     let messages = errors
         .errors()
         .iter()
-        .map(|error| error.message.as_ref())
+        .map(|error| error.message())
         .collect::<Vec<_>>();
     assert!(
         messages
@@ -1209,7 +1209,7 @@ fn independent_fragment_rejects_duplicate_router_identity() {
         .expect_err("route identities must be unique");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("unique identities and dense target ordinals")
     }));
 }
@@ -1269,7 +1269,7 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
         .expect_err("the edge projection must match the route input sequence");
     assert!(errors.errors().iter().any(|error| {
         error
-            .message
+            .message()
             .contains("router edge projection differs from its exact route input sequence")
     }));
 }

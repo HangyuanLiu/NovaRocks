@@ -929,7 +929,7 @@ fn artifact_coverage_rejects_overlapping_ranges() {
     let mut errors = super::validation::ValidationErrorCollector::new();
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert_eq!(errors.len(), 1);
-    assert!(errors[0].message.contains("overlap"));
+    assert!(errors[0].message().contains("overlap"));
 }
 
 #[test]
@@ -953,7 +953,7 @@ fn complete_artifact_coverage_rejects_a_gap() {
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert!(errors.iter().any(|error| {
         error
-            .message
+            .message()
             .contains("complete coverage must form one gap-free unbounded domain")
     }));
 }
@@ -973,7 +973,7 @@ fn complete_artifact_coverage_rejects_bounded_ends() {
     super::validation::validate_coverage(&coverage, "coverage", &mut errors);
     assert!(errors.iter().any(|error| {
         error
-            .message
+            .message()
             .contains("complete coverage must form one gap-free unbounded domain")
     }));
 }
@@ -1158,11 +1158,67 @@ fn expression_semantic_depth_is_bounded_without_recursive_validation() {
         })
         .unwrap();
 
-    let error = builder
+    let errors = builder
         .finish_definition(node, FragmentSink::Noop, dop())
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("expression semantic depth exceeds 256"));
+        .unwrap_err();
+    assert!(
+        errors
+            .to_string()
+            .contains("expression semantic depth exceeds 256")
+    );
+    // Exceeding a declared bound is admission information, not proof that the
+    // producer emitted an illegal plan. A consumer must be able to tell those
+    // apart without reading the prose.
+    assert!(errors.has(ValidationErrorCategory::ResourceLimit));
+    assert!(!errors.is_producer_defect());
+}
+
+#[test]
+fn a_violated_contract_invariant_is_reported_as_a_producer_defect() {
+    let mut builder = FragmentBuilder::new(FragmentId::new(8));
+    let node = builder.reserve_node_id().unwrap();
+    let value_type = ty(DataType::Int64, false);
+    let expression = builder
+        .add_expression(
+            node,
+            value_type.clone(),
+            ExprKind::Literal(LiteralValue::Int64(1)),
+        )
+        .unwrap();
+    let value = builder
+        .add_value(
+            value_type,
+            ValueOrigin::NodeOutput {
+                node,
+                output_ordinal: 0,
+            },
+        )
+        .unwrap();
+    builder
+        .insert_node(PhysicalNode {
+            id: node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: singleton(),
+            output: OutputPort {
+                node,
+                columns: Box::from([value]),
+            },
+            kind: NodeKind::Values {
+                rows: Box::from([Box::from([expression])]),
+            },
+        })
+        .unwrap();
+
+    // A root that names an undefined node cannot be produced by a correct
+    // planner, cannot succeed on another backend, and cannot be cleared by
+    // raising a limit.
+    let errors = builder
+        .finish_definition(NodeId::new(999), FragmentSink::Noop, dop())
+        .unwrap_err();
+    assert!(errors.is_producer_defect());
+    assert!(!errors.has(ValidationErrorCategory::ResourceLimit));
+    assert!(!errors.has(ValidationErrorCategory::UnsupportedCapability));
 }
 
 #[test]
