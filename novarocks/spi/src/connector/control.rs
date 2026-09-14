@@ -22,15 +22,16 @@ use super::{
     ConnectorCatalogMutationResolver, ConnectorCleanupMaintenance,
     ConnectorCleanupMaintenanceResolver, ConnectorControlRuntimeId, ConnectorDataMutation,
     ConnectorDataMutationResolver, ConnectorDistributedRewrite,
-    ConnectorDistributedRewriteResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
-    ConnectorMetadataMaintenance, ConnectorMetadataMaintenanceResolver, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-    ConnectorScanHandle, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorStagedCreate, ConnectorStagedCreateLease, ConnectorStatistics,
-    ConnectorStatisticsLease, ConnectorStatisticsResolver, ConnectorTableHandle,
-    ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata,
-    ConnectorWriteControl, ConnectorWriteLease, ProviderBindingEpoch,
+    ConnectorDistributedRewriteResolver, ConnectorDocumentStorageBinding,
+    ConnectorDocumentStorageLease, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMetadata, ConnectorMetadataMaintenance,
+    ConnectorMetadataMaintenanceResolver, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
+    ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStagedCreate,
+    ConnectorStagedCreateLease, ConnectorStatistics, ConnectorStatisticsLease,
+    ConnectorStatisticsResolver, ConnectorTableHandle, ConnectorUnanchoredCtasCleanup,
+    ConnectorUnanchoredCtasCleanupLease, ConnectorViewMetadata, ConnectorWriteControl,
+    ConnectorWriteLease, ProviderBindingEpoch,
 };
 
 /// FE-only capability for planning a read after metadata has resolved a table.
@@ -273,6 +274,7 @@ pub struct ConnectorControlBinding {
     write: Option<Arc<dyn ConnectorWriteControl>>,
     statistics: Option<Arc<dyn ConnectorStatistics>>,
     view_metadata: Option<Arc<dyn ConnectorViewMetadata>>,
+    document_storage: Option<ConnectorDocumentStorageBinding>,
 }
 
 impl ConnectorControlBinding {
@@ -460,6 +462,7 @@ impl ConnectorControlBinding {
             write,
             statistics,
             view_metadata: None,
+            document_storage: None,
         })
     }
 
@@ -782,6 +785,30 @@ impl ConnectorControlBinding {
         self.view_metadata.as_ref()
     }
 
+    pub(crate) const fn document_storage(&self) -> Option<&ConnectorDocumentStorageBinding> {
+        self.document_storage.as_ref()
+    }
+
+    /// Attaches the optional application-document storage group to this exact
+    /// FE control generation. A provider without the group remains genuinely
+    /// unsupported; no empty implementation is installed on its behalf.
+    pub fn try_with_document_storage(
+        mut self,
+        document_storage: Option<ConnectorDocumentStorageBinding>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(capability) = &document_storage
+            && (capability.descriptor() != &self.descriptor
+                || capability.incarnation() != self.incarnation)
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "document storage binding does not match its control generation",
+            ));
+        }
+        self.document_storage = document_storage;
+        Ok(self)
+    }
+
     /// Attaches the optional view metadata capability to this exact control
     /// generation after the common mandatory capabilities have been validated.
     pub fn try_with_view_metadata(
@@ -967,6 +994,32 @@ impl ConnectorControlPlanningLease {
         ConnectorStatisticsLease::new(descriptor, incarnation, statistics, move || {
             drop(retained_planning_lease)
         })
+    }
+
+    /// Retain the exact document-storage generation observed during planning.
+    /// Callers cannot reacquire a newer catalog incarnation between document
+    /// observation and a later management decision.
+    pub fn derive_document_storage_lease(
+        &self,
+    ) -> Result<ConnectorDocumentStorageLease, ConnectorError> {
+        let document_storage = self.binding.document_storage().cloned().ok_or_else(|| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "connector control generation has no document storage capability",
+            )
+        })?;
+        let descriptor = self.binding.descriptor().clone();
+        let incarnation = self.binding.incarnation();
+        let catalog_handle = self.binding.catalog_handle()?.clone();
+        let retained_planning_lease = self.clone();
+        ConnectorDocumentStorageLease::new(
+            descriptor,
+            self.control_runtime_id(),
+            incarnation,
+            catalog_handle,
+            document_storage,
+            move || drop(retained_planning_lease),
+        )
     }
 
     /// Derive a catalog-mutation lease from this retained planning generation.

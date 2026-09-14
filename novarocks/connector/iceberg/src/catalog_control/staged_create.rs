@@ -31,7 +31,7 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
     ConnectorMutationFailureKind, ConnectorPartitionTransform, ConnectorProviderBindingKey,
     ConnectorRequestContext, ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome,
-    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
     ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
@@ -864,6 +864,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
             return Err(invalid(
                 "Iceberg staged-create operation ID must equal its publication ID",
             ));
+        }
+        if matches!(
+            &request.mode,
+            ConnectorStagedCreateMode::ApplicationDocumentManaged { .. }
+        ) {
+            return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
+                failure: ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unsupported,
+                    "Iceberg application-document staged create is not installed",
+                ),
+            });
         }
         if let Err(error) = Self::validate_context(&request.context) {
             return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
@@ -1769,6 +1780,7 @@ mod tests {
             partitioning: Vec::new(),
             properties: BTreeMap::new(),
             policy: CreatePolicy::FailIfExists,
+            mode: ConnectorStagedCreateMode::Ordinary,
             context: context(),
         };
         (adapter, request)

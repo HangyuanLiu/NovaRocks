@@ -434,6 +434,12 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
         request: ConnectorCleanupPlanningRequest,
     ) -> Result<ConnectorCleanupPlan, ConnectorError> {
         request.validate()?;
+        if request.operation().document_retention().is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg application-document retention is not installed",
+            ));
+        }
         validate_context(&request.context)?;
         self.ensure_owner(request.owner())?;
         if let Some(cached) = self

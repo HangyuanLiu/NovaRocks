@@ -42,13 +42,14 @@ use crate::connector::write_stack::runtime::{
 };
 use crate::connector::write_stack::target::{WriteTargetOrdinal, validate_dense_target_ordinals};
 use crate::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
-};
-use crate::connector::{
+    ConnectorDocumentPublicationDeclaration, ConnectorDocumentPublicationIntent,
     ConnectorManagedPublicationIntent, ConnectorRowMutationEffect, ConnectorTableHandle,
     ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose, ConnectorWriteBaseVersion,
     ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteIntent,
     ConnectorWriteReceipt, ConnectorWriteRouteId, ConnectorWriteTargetRef,
+};
+use crate::connector::{
+    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
 };
 use crate::connector::{ConnectorMutationRouteInput, ConnectorWriteFieldToken};
 use crate::connector::{
@@ -171,6 +172,17 @@ pub struct ConnectorWriteBeginRequest {
     pub context: ConnectorRequestContext,
 }
 
+impl ConnectorWriteBeginRequest {
+    pub fn validate_document_publication(&self) -> Result<(), ConnectorError> {
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
+            &self.flavor
+        {
+            declaration.validate_for_write(self.base.as_ref())?;
+        }
+        Ok(())
+    }
+}
+
 /// The write flavors a session admits.
 ///
 /// This selects how the provider plans its logical branches. It is deliberately
@@ -203,6 +215,12 @@ pub enum ConnectorWriteSessionFlavor {
     /// is a publication or DML.
     ManagedPublication {
         intent: ConnectorManagedPublicationIntent,
+        shape: ConnectorManagedPublicationShape,
+    },
+    /// A publication whose application-owned durable facts are attached by
+    /// the same existing write-session commit that publishes its data.
+    ApplicationDocumentPublication {
+        declaration: ConnectorDocumentPublicationDeclaration,
         shape: ConnectorManagedPublicationShape,
     },
     /// A merge-on-read row mutation. The provider decides how many branches
@@ -574,7 +592,14 @@ pub struct ConnectorWriteFinishRequest<'a> {
     pub commit: &'a ConnectorWriteCommitHandle,
     pub prepared: ConnectorPreparedWriteSet,
     pub statistics: Vec<WriteStatisticsArtifact>,
+    pub publication: ConnectorWriteFinishPublication,
     pub context: ConnectorRequestContext,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteFinishPublication {
+    None,
+    ApplicationDocuments(ConnectorDocumentPublicationIntent),
 }
 
 /// Release a begin session that never reached a complete prepared write set.

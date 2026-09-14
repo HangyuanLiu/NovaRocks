@@ -213,6 +213,24 @@ impl ConnectorControlWriteBinding {
     pub fn fragment_decoder(&self) -> Arc<dyn ConnectorWriteFragmentWireDecoder> {
         Arc::clone(&self.fragment_decoder)
     }
+
+    fn validate_for_role(
+        &self,
+        expected_key: &crate::connector::ConnectorProviderBindingKey,
+        expected_wire_owner: &str,
+    ) -> Result<(), ConnectorError> {
+        if self.write.binding_key() != expected_key
+            || self.session.binding_key() != expected_key
+            || self.handle_encoder.owner() != expected_wire_owner
+            || self.fragment_decoder.owner() != expected_wire_owner
+        {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "control write group does not match its exact role generation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One complete FE role binding for one exact desired catalog generation.
@@ -263,6 +281,13 @@ impl ConnectorControlRoleBinding {
                 "control role binding write group does not match generic control capability",
             ));
         }
+        if let Some(write) = &write {
+            let expected_key = crate::connector::ConnectorProviderBindingKey {
+                instance_id: control.descriptor().instance_id.clone(),
+                incarnation: control.incarnation(),
+            };
+            write.validate_for_role(&expected_key, control.descriptor().instance_id.as_str())?;
+        }
         Ok(Self {
             properties,
             control,
@@ -289,6 +314,28 @@ impl ConnectorControlRoleBinding {
 
     pub const fn write(&self) -> Option<&ConnectorControlWriteBinding> {
         self.write.as_ref()
+    }
+
+    /// Verify every broad authority needed before an application-document
+    /// management operation starts any provider preparation. The specific
+    /// operation must still pass `admit_management`; trait presence alone does
+    /// not claim support for create, update, or publication.
+    pub fn require_application_document_management_prerequisites(
+        &self,
+    ) -> Result<(), ConnectorError> {
+        let complete = self.control.document_storage().is_some_and(|documents| {
+            documents.supports_observation() && documents.supports_management()
+        }) && self.write.is_some()
+            && self.control.mutation().is_some()
+            && self.control.staged_create().is_some()
+            && self.control.cleanup_maintenance().is_some();
+        if !complete {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Unsupported,
+                "application-document management prerequisites are not installed",
+            ));
+        }
+        Ok(())
     }
 
     pub fn into_parts(

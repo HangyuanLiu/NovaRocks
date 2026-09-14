@@ -79,6 +79,15 @@ impl ConnectorCatalogMutation for IcebergMetadata {
         if let Err(error) = validate_request(self, &request) {
             return Ok(known_uncommitted(error));
         }
+        if matches!(
+            &request.operation,
+            ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. }
+        ) {
+            return Ok(known_uncommitted(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg application-document update is not installed",
+            )));
+        }
         // Every catalog creates through the create-table transaction. Which
         // receipt shape comes back is decided by what the publication proof
         // actually carries, not by asking which kind of catalog this is.
@@ -468,9 +477,10 @@ fn execute_operation(
             })
         }
         ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. }
-        | ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot { .. } => Err(internal(
-            "special snapshot operation bypassed its exact commit path",
-        )),
+        | ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot { .. }
+        | ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
+            Err(internal("special mutation bypassed its exact commit path"))
+        }
     }
 }
 
@@ -2575,6 +2585,11 @@ fn mutation_evidence(
         ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot { .. } => {
             return Err(internal(
                 "metadata-only MV stage evidence requires its operation marker",
+            ));
+        }
+        ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
+            return Err(internal(
+                "application-document update evidence requires its exact commit path",
             ));
         }
     };

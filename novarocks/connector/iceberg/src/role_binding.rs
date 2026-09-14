@@ -516,6 +516,7 @@ mod tests {
         // incarnation, not a second one materialized on the side.
         let write = binding.write().expect("one complete typed write group");
         let catalog_name = normalized.handle().catalog_name();
+        assert_eq!(write.write().binding_key(), write.session().binding_key());
         assert_eq!(write.handle_encoder().owner(), catalog_name.as_str());
         assert_eq!(write.fragment_decoder().owner(), catalog_name.as_str());
         assert_eq!(&write.session().binding_key().instance_id, catalog_name);

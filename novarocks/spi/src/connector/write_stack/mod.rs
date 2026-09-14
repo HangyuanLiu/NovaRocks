@@ -98,10 +98,10 @@ pub use runtime::{
 };
 pub use session::{
     ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteControl,
-    ConnectorWriteFinishRequest, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
-    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
-    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, WriteStatisticsArtifact,
-    WriteStatisticsContract,
+    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest, ConnectorWriteRewriteSource,
+    ConnectorWriteRouteFacts, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor,
+    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    WriteStatisticsArtifact, WriteStatisticsContract,
 };
 pub use target::{
     WriteTargetOrdinal, validate_dense_target_ordinals, validate_query_target_ordinals,

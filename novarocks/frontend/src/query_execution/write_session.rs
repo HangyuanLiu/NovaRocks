@@ -42,8 +42,8 @@ use novarocks_proto_codec::connector_write::{
 };
 use novarocks_proto_models::connector_write as write_dto;
 use novarocks_spi::connector::write_stack::{
-    ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishRequest,
-    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionPlan,
+    ConnectorPreparedWriteSet, ConnectorWriteBeginRequest, ConnectorWriteFinishPublication,
+    ConnectorWriteFinishRequest, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionPlan,
     ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, PreparedWriteSetLedger,
     UniqueWriterHandleLedger, WriteRowCountAccumulator, WriteTargetOrdinal,
 };
@@ -450,6 +450,7 @@ impl ConnectorWriteSession {
                 commit: self.plan.commit_handle(),
                 prepared,
                 statistics,
+                publication: ConnectorWriteFinishPublication::None,
                 context,
             })?;
         if matches!(outcome, ExternalMutationOutcome::CommitUnknown { .. }) {

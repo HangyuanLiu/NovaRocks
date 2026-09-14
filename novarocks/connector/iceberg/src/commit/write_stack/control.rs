@@ -2565,6 +2565,16 @@ impl IcebergWriteSessionControl {
         ),
         ConnectorError,
     > {
+        if matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
+        ) {
+            request.validate_document_publication()?;
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg application-document publication is not installed",
+            ));
+        }
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
         })?;
@@ -2752,6 +2762,12 @@ impl IcebergWriteSessionControl {
             }
             ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
                 plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
+            }
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "Iceberg application-document publication is not installed",
+                ));
             }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite(shape) => {
@@ -3222,6 +3238,7 @@ pub(crate) fn session_freezes_old_deletes(
                         | ConnectorWriteInputShape::EqualityDelete { .. }
                 )
         }
+        ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. } => false,
         // A staged target has no base snapshot and therefore no old delete
         // artifact to supersede: it is a table nobody has ever written to. A
         // copy-on-write mutation seals only data branches: it replaces whole
@@ -3455,6 +3472,15 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         &self,
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if !matches!(
+            &request.publication,
+            novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None
+        ) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "Iceberg application-document publication is not installed",
+            ));
+        }
         let handle = self.adapter.commit_handle(request.commit)?;
         let statistics = validate_statistics_artifacts(handle, request.statistics)?;
         let frozen = self.frozen_references_of(handle);

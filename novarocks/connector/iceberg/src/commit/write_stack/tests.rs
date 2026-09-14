@@ -2708,6 +2708,8 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             commit: plan.commit_handle(),
             prepared: set,
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect("a staged finish needs no catalog");
@@ -2731,6 +2733,8 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect_err("a sealed session is finished");
@@ -2778,6 +2782,8 @@ fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect("an empty staged write still seals");

@@ -872,6 +872,7 @@ impl CoreStandardCtasTargetSession {
             ),
             handle: self.handle.clone(),
             write,
+            payload: novarocks_spi::connector::ConnectorStagedCreatePublicationPayload::Ordinary,
             context: self
                 .context
                 .lock()

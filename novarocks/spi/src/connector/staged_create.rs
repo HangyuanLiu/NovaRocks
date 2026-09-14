@@ -30,12 +30,14 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorColumnDefinition, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationOperationId,
-    ConnectorPartitionTransform, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorWriteLease, ConnectorWriteReceipt,
-    CreatePolicy, ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, ProviderBindingEpoch,
+    CatalogHandle, ConnectorColumnDefinition, ConnectorControlRuntimeId,
+    ConnectorDocumentCreatePublicationIntent, ConnectorDocumentManagementAdmission, ConnectorError,
+    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
+    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorWriteLease, ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -45,12 +47,171 @@ pub type ConnectorStagedCreateOperationId = ConnectorMutationOperationId;
 const HANDLE_DOMAIN: &[u8] = b"novarocks.connector-staged-table-handle.v1\0";
 const UNANCHORED_CTAS_PROVENANCE_DOMAIN: &[u8] =
     b"novarocks.connector-ctas-unanchored-provenance.v1\0";
+const MAX_PREPARED_CREATE_FIELD_ID_BYTES: usize = 1024;
+
+fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConnectorPreparedCreateFieldBinding {
+    request_ordinal: u32,
+    provider_field_id: Bytes,
+}
+
+impl std::fmt::Debug for ConnectorPreparedCreateFieldBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorPreparedCreateFieldBinding")
+            .field("request_ordinal", &self.request_ordinal)
+            .field("provider_field_id_bytes", &self.provider_field_id.len())
+            .finish()
+    }
+}
+
+impl ConnectorPreparedCreateFieldBinding {
+    pub fn try_new(request_ordinal: u32, provider_field_id: Bytes) -> Result<Self, ConnectorError> {
+        if provider_field_id.is_empty()
+            || provider_field_id.len() > MAX_PREPARED_CREATE_FIELD_ID_BYTES
+        {
+            return Err(invalid(
+                "prepared create field identity is empty or exceeds its byte limit",
+            ));
+        }
+        Ok(Self {
+            request_ordinal,
+            provider_field_id,
+        })
+    }
+
+    pub const fn request_ordinal(&self) -> u32 {
+        self.request_ordinal
+    }
+
+    pub const fn provider_field_id(&self) -> &Bytes {
+        &self.provider_field_id
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ConnectorPreparedCreateDocumentTarget {
+    owner: ConnectorProviderBindingKey,
+    catalog_handle: CatalogHandle,
+    operation_id: ConnectorStagedCreateOperationId,
+    target: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    fields: Vec<ConnectorPreparedCreateFieldBinding>,
+    provider_token: Bytes,
+}
+
+impl std::fmt::Debug for ConnectorPreparedCreateDocumentTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorPreparedCreateDocumentTarget")
+            .field("owner", &self.owner)
+            .field("catalog_handle", &self.catalog_handle)
+            .field("operation_id", &self.operation_id)
+            .field("target", &self.target)
+            .field("object_id", &self.object_id)
+            .field("fields", &self.fields)
+            .field("provider_token_bytes", &self.provider_token.len())
+            .finish()
+    }
+}
+
+impl ConnectorPreparedCreateDocumentTarget {
+    pub fn try_new(
+        owner: ConnectorProviderBindingKey,
+        catalog_handle: CatalogHandle,
+        operation_id: ConnectorStagedCreateOperationId,
+        target: ConnectorTableIdentity,
+        object_id: ConnectorTableObjectId,
+        mut fields: Vec<ConnectorPreparedCreateFieldBinding>,
+        provider_token: Bytes,
+    ) -> Result<Self, ConnectorError> {
+        if target.instance_id != owner.instance_id
+            || catalog_handle.catalog_name() != &owner.instance_id
+            || fields.is_empty()
+            || provider_token.is_empty()
+            || provider_token.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
+        {
+            return Err(invalid(
+                "prepared create document target has an invalid owner, field set, or token",
+            ));
+        }
+        fields.sort_by_key(ConnectorPreparedCreateFieldBinding::request_ordinal);
+        let mut identities = std::collections::HashSet::with_capacity(fields.len());
+        if fields.iter().enumerate().any(|(expected_ordinal, field)| {
+            field.request_ordinal() as usize != expected_ordinal
+                || !identities.insert(field.provider_field_id().as_ref())
+        }) {
+            return Err(invalid(
+                "prepared create document target requires dense unique field bindings",
+            ));
+        }
+        Ok(Self {
+            owner,
+            catalog_handle,
+            operation_id,
+            target,
+            object_id,
+            fields,
+            provider_token,
+        })
+    }
+
+    pub const fn owner(&self) -> &ConnectorProviderBindingKey {
+        &self.owner
+    }
+
+    pub const fn operation_id(&self) -> ConnectorStagedCreateOperationId {
+        self.operation_id
+    }
+
+    pub const fn catalog_handle(&self) -> &CatalogHandle {
+        &self.catalog_handle
+    }
+
+    pub const fn target(&self) -> &ConnectorTableIdentity {
+        &self.target
+    }
+
+    pub const fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+
+    pub fn fields(&self) -> &[ConnectorPreparedCreateFieldBinding] {
+        &self.fields
+    }
+
+    pub const fn provider_token(&self) -> &Bytes {
+        &self.provider_token
+    }
+
+    fn digest_into(&self, hasher: &mut Sha256) {
+        digest_bytes(hasher, self.owner.instance_id.as_str().as_bytes());
+        hasher.update(self.owner.incarnation.to_bytes());
+        hasher.update(self.catalog_handle.version().as_bytes());
+        hasher.update(self.operation_id.to_bytes());
+        digest_bytes(hasher, self.target.namespace.as_bytes());
+        digest_bytes(hasher, self.target.table.as_bytes());
+        digest_bytes(hasher, self.object_id.as_bytes());
+        hasher.update((self.fields.len() as u64).to_be_bytes());
+        for field in &self.fields {
+            hasher.update(field.request_ordinal.to_be_bytes());
+            digest_bytes(hasher, &field.provider_field_id);
+        }
+        digest_bytes(hasher, &self.provider_token);
+    }
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ConnectorStagedTableHandle {
     owner: ConnectorProviderBindingKey,
     operation_id: ConnectorStagedCreateOperationId,
     provider_payload: Bytes,
+    document_target: Option<ConnectorPreparedCreateDocumentTarget>,
     digest: [u8; 32],
 }
 
@@ -59,6 +220,29 @@ impl ConnectorStagedTableHandle {
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorStagedCreateOperationId,
         provider_payload: Bytes,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_inner(owner, operation_id, provider_payload, None)
+    }
+
+    pub fn try_new_document_managed(
+        owner: ConnectorProviderBindingKey,
+        operation_id: ConnectorStagedCreateOperationId,
+        provider_payload: Bytes,
+        document_target: ConnectorPreparedCreateDocumentTarget,
+    ) -> Result<Self, ConnectorError> {
+        if document_target.owner() != &owner || document_target.operation_id() != operation_id {
+            return Err(invalid(
+                "prepared document target does not match its staged table handle",
+            ));
+        }
+        Self::try_new_inner(owner, operation_id, provider_payload, Some(document_target))
+    }
+
+    fn try_new_inner(
+        owner: ConnectorProviderBindingKey,
+        operation_id: ConnectorStagedCreateOperationId,
+        provider_payload: Bytes,
+        document_target: Option<ConnectorPreparedCreateDocumentTarget>,
     ) -> Result<Self, ConnectorError> {
         if provider_payload.is_empty()
             || provider_payload.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
@@ -74,12 +258,19 @@ impl ConnectorStagedTableHandle {
         hasher.update([0]);
         hasher.update(owner.incarnation.to_bytes());
         hasher.update(operation_id.to_bytes());
-        hasher.update(provider_payload.as_ref());
+        digest_bytes(&mut hasher, provider_payload.as_ref());
+        if let Some(document_target) = &document_target {
+            hasher.update([1]);
+            document_target.digest_into(&mut hasher);
+        } else {
+            hasher.update([0]);
+        }
         let digest = hasher.finalize().into();
         Ok(Self {
             owner,
             operation_id,
             provider_payload,
+            document_target,
             digest,
         })
     }
@@ -98,6 +289,10 @@ impl ConnectorStagedTableHandle {
 
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    pub const fn document_target(&self) -> Option<&ConnectorPreparedCreateDocumentTarget> {
+        self.document_target.as_ref()
     }
 }
 
@@ -224,6 +419,38 @@ impl std::fmt::Debug for ConnectorStagedTableHandle {
 }
 
 #[derive(Clone)]
+pub enum ConnectorStagedCreateMode {
+    Ordinary,
+    ApplicationDocumentManaged {
+        admission: ConnectorDocumentManagementAdmission,
+    },
+}
+
+impl ConnectorStagedCreateMode {
+    fn validate_for(
+        &self,
+        owner: &ConnectorProviderBindingKey,
+        operation_id: ConnectorStagedCreateOperationId,
+        table: &ConnectorTableIdentity,
+    ) -> Result<(), ConnectorError> {
+        if let Self::ApplicationDocumentManaged { admission } = self {
+            admission.validate()?;
+            if admission.owner() != owner
+                || admission.operation_id() != operation_id
+                || admission.target() != table
+                || admission.expected_object_id().is_some()
+                || admission.operation() != super::ConnectorDocumentManagementOperation::Create
+            {
+                return Err(invalid(
+                    "staged create document admission does not match its exact operation",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
 pub struct ConnectorStagedCreatePrepareRequest {
     pub owner: ConnectorProviderBindingKey,
     /// The statement-level identity shared by the staged root, Iceberg marker
@@ -236,6 +463,7 @@ pub struct ConnectorStagedCreatePrepareRequest {
     pub partitioning: Vec<ConnectorPartitionTransform>,
     pub properties: BTreeMap<Arc<str>, Arc<str>>,
     pub policy: CreatePolicy,
+    pub mode: ConnectorStagedCreateMode,
     pub context: ConnectorRequestContext,
 }
 
@@ -315,10 +543,17 @@ pub enum ConnectorStagedCreatePrepareOutcome {
 }
 
 #[derive(Clone)]
+pub enum ConnectorStagedCreatePublicationPayload {
+    Ordinary,
+    ApplicationDocuments(ConnectorDocumentCreatePublicationIntent),
+}
+
+#[derive(Clone)]
 pub struct ConnectorStagedCreatePublishRequest {
     pub operation_id: ConnectorMutationOperationId,
     pub handle: ConnectorStagedTableHandle,
     pub write: ConnectorStagedWriteProof,
+    pub payload: ConnectorStagedCreatePublicationPayload,
     pub context: ConnectorRequestContext,
 }
 
@@ -802,8 +1037,40 @@ impl ConnectorStagedCreateLease {
             partitioning,
             properties,
             policy,
+            mode: ConnectorStagedCreateMode::Ordinary,
             context,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_document_managed_request(
+        &self,
+        publication_id: LakePublicationId,
+        operation_id: ConnectorStagedCreateOperationId,
+        table: ConnectorTableIdentity,
+        columns: Vec<ConnectorColumnDefinition>,
+        partitioning: Vec<ConnectorPartitionTransform>,
+        properties: BTreeMap<Arc<str>, Arc<str>>,
+        policy: CreatePolicy,
+        admission: ConnectorDocumentManagementAdmission,
+        context: ConnectorRequestContext,
+    ) -> Result<ConnectorStagedCreatePrepareRequest, ConnectorError> {
+        let request = ConnectorStagedCreatePrepareRequest {
+            owner: self.provider_binding_key.clone(),
+            publication_id,
+            operation_id,
+            table,
+            columns,
+            partitioning,
+            properties,
+            policy,
+            mode: ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+            context,
+        };
+        request
+            .mode
+            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        Ok(request)
     }
 
     #[cfg(test)]
@@ -841,6 +1108,10 @@ impl ConnectorStagedCreateLease {
                 "staged-create operation ID must equal its statement publication ID",
             ));
         }
+        request
+            .mode
+            .validate_for(&request.owner, request.operation_id, &request.table)?;
+        let retained_request = request.clone();
         let operation_id = request.operation_id;
         {
             let mut operations = self
@@ -867,7 +1138,7 @@ impl ConnectorStagedCreateLease {
                 return Err(error);
             }
         };
-        if let Err(error) = self.validate_prepare_outcome(operation_id, &outcome) {
+        if let Err(error) = self.validate_prepare_outcome(&retained_request, &outcome) {
             self.record_after_dispatch(
                 operation_id,
                 Some(LeaseOperationState::Unknown {
@@ -977,6 +1248,18 @@ impl ConnectorStagedCreateLease {
         request: ConnectorStagedCreatePublishRequest,
     ) -> Result<ConnectorStagedCreatePublishOutcome, ConnectorError> {
         let bound_write = self.require_bound_write(&request.handle, &request.write)?;
+        match &request.payload {
+            ConnectorStagedCreatePublicationPayload::Ordinary
+                if request.handle.document_target().is_none() => {}
+            ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => {
+                intent.validate_for_handle(&request.handle)?;
+            }
+            _ => {
+                return Err(invalid(
+                    "staged create publication payload does not match its prepared target mode",
+                ));
+            }
+        }
         let operation_id = request.handle.operation_id();
         let handle_digest = request.handle.digest();
         let dispatch_operation_id = request.operation_id;
@@ -1347,14 +1630,31 @@ impl ConnectorStagedCreateLease {
 
     fn validate_prepare_outcome(
         &self,
-        operation_id: ConnectorStagedCreateOperationId,
+        request: &ConnectorStagedCreatePrepareRequest,
         outcome: &ConnectorStagedCreatePrepareOutcome,
     ) -> Result<(), ConnectorError> {
+        let operation_id = request.operation_id;
         match outcome {
             ConnectorStagedCreatePrepareOutcome::Prepared {
                 handle, receipt, ..
             } => {
                 self.validate_handle(handle, operation_id)?;
+                match (&request.mode, handle.document_target()) {
+                    (ConnectorStagedCreateMode::Ordinary, None) => {}
+                    (
+                        ConnectorStagedCreateMode::ApplicationDocumentManaged { admission },
+                        Some(target),
+                    ) if target.owner() == &request.owner
+                        && target.catalog_handle() == admission.catalog_handle()
+                        && target.operation_id() == request.operation_id
+                        && target.target() == &request.table
+                        && target.fields().len() == request.columns.len() => {}
+                    _ => {
+                        return Err(invalid(
+                            "staged create provider returned a target for a different request or management mode",
+                        ));
+                    }
+                }
                 self.validate_receipt(
                     receipt,
                     operation_id,
@@ -1501,7 +1801,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::connector::{ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId};
+    use crate::connector::{
+        CatalogVersion, ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId,
+    };
 
     struct NeverCancelled;
     impl ConnectorCancellation for NeverCancelled {
@@ -1544,6 +1846,33 @@ mod tests {
             table: Arc::from("different"),
         };
         assert!(tampered.validate().is_err());
+    }
+
+    #[test]
+    fn prepared_document_target_requires_dense_field_bindings() {
+        let instance_id = ConnectorInstanceId::parse("ice").unwrap();
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let error = ConnectorPreparedCreateDocumentTarget::try_new(
+            owner,
+            CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
+            ConnectorMutationOperationId::new(),
+            ConnectorTableIdentity {
+                instance_id,
+                namespace: Arc::from("db"),
+                table: Arc::from("orders"),
+            },
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+            vec![
+                ConnectorPreparedCreateFieldBinding::try_new(1, Bytes::from_static(b"field-id"))
+                    .unwrap(),
+            ],
+            Bytes::from_static(b"provider-token"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 
     struct FakeCapability {
@@ -1848,6 +2177,7 @@ mod tests {
             partitioning: Vec::new(),
             properties: BTreeMap::new(),
             policy: CreatePolicy::FailIfExists,
+            mode: ConnectorStagedCreateMode::Ordinary,
             context: context(),
         }
     }
@@ -2257,6 +2587,7 @@ mod tests {
                     operation_id: ConnectorMutationOperationId::new(),
                     handle: second,
                     write,
+                    payload: ConnectorStagedCreatePublicationPayload::Ordinary,
                     context: context(),
                 })
                 .is_err()
@@ -2307,6 +2638,7 @@ mod tests {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle: handle.clone(),
                 write: write.clone(),
+                payload: ConnectorStagedCreatePublicationPayload::Ordinary,
                 context: context(),
             })
             .unwrap();
@@ -2604,6 +2936,7 @@ mod tests {
                 operation_id: ConnectorMutationOperationId::new(),
                 handle: handle.clone(),
                 write: write.clone(),
+                payload: ConnectorStagedCreatePublicationPayload::Ordinary,
                 context: context(),
             })
             .unwrap();

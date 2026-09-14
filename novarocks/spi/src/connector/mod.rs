@@ -27,6 +27,7 @@ mod credential_lease;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
+pub mod document_storage;
 mod domain_facts;
 mod error;
 mod execution;
@@ -150,6 +151,7 @@ pub use distributed_rewrite::{
     REWRITE_POSITION_DELETES_KIND,
 };
 pub use distribution::ProviderBindingEpoch;
+pub use document_storage::*;
 pub use domain_facts::{
     ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
     ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
@@ -293,13 +295,14 @@ pub use staged_create::{
     CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
     ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance,
+    ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
     ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateLease, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreateLease, ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
-    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
+    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };
