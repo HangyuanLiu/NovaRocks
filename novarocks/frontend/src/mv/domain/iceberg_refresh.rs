@@ -304,6 +304,10 @@ struct IcebergMvCreatePreparation {
     >,
     expected_apply_key_field_id: i32,
     created_at_ms: i64,
+    /// Runtime state layout frozen during the same CREATE analysis as the
+    /// physical request. Stateless shapes use the validated empty layout so
+    /// D/L construction never invents an alternate aggregate carrier.
+    aggregate_runtime_layout: novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout,
     columns: Vec<TableColumnDef>,
     partition_fields: Vec<IcebergPartitionFieldExpr>,
     target_properties: Vec<(String, String)>,
@@ -1128,6 +1132,19 @@ fn prepare_iceberg_mv_create_with_ports(
         &canonical_select_query,
         &analysis,
     )?;
+    let aggregate_runtime_layout =
+        representative_aggregate_layout(&property, &canonical_select_query, &analysis)?
+            .map(|layout| layout.runtime_layout().clone())
+            .unwrap_or_else(|| {
+                novarocks_types::mv_aggregate_layout::MvAggregateRuntimeLayout::try_new(
+                    "__row_id__".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .expect("empty aggregate layout is a valid stateless CREATE carrier")
+            });
     let mut target_properties = vec![
         ("format-version".to_string(), "3".to_string()),
         ("write.row-lineage".to_string(), "true".to_string()),
@@ -1162,6 +1179,7 @@ fn prepare_iceberg_mv_create_with_ports(
         base_field_observations,
         expected_apply_key_field_id,
         columns,
+        aggregate_runtime_layout,
         partition_fields,
         target_properties,
         created_at_ms,
