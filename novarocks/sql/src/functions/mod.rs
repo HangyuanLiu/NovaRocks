@@ -1680,11 +1680,15 @@ pub fn contribute_builtin_functions(
             subject: "builtin aggregate binding declaration",
             value: error.to_string().into(),
         })?;
-        builder.register(FunctionDefinition::try_new_bound(
+        // One resolver in both roles: it answers binding questions and it is
+        // the typed signature contract an aggregate is resolved through.
+        let resolver = Arc::new(BuiltinAggregateResolver { declaration });
+        builder.register(FunctionDefinition::try_new_bound_aggregate(
             declaration.name,
             FunctionVisibility::Public,
             binding_declaration,
-            Arc::new(BuiltinAggregateResolver { declaration }),
+            Arc::clone(&resolver) as Arc<dyn novarocks_functions::FunctionBindingResolver>,
+            resolver as Arc<dyn novarocks_functions::AggregateSignatureResolver>,
         )?)?;
     }
     let unnest_declaration = FunctionBindingDeclaration::try_new(
@@ -1884,13 +1888,15 @@ pub(crate) fn test_exact_aggregate_catalog(
             }),
     )
     .expect("test aggregate binding declaration");
-    let definition = FunctionDefinition::try_new_bound(
+    let overloads = overloads.into_boxed_slice();
+    let definition = FunctionDefinition::try_new_bound_aggregate(
         name,
         visibility,
         declaration,
         Arc::new(TestExactAggregateBindingResolver {
-            overloads: overloads.into_boxed_slice(),
+            overloads: overloads.clone(),
         }),
+        novarocks_functions::exact_aggregate_signature_contract(overloads.into_vec()),
     )
     .expect("test aggregate definition");
     let mut builder = EngineFunctionCatalogBuilder::new();

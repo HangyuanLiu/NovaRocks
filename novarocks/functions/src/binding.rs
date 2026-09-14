@@ -279,11 +279,53 @@ impl fmt::Debug for FunctionBindingDefinition {
 impl FunctionDefinition {
     /// Register an explicit binding contract. Legacy resolution APIs reject
     /// this definition rather than discarding its selected identity.
+    /// Register a non-aggregate function from its binding declaration.
+    ///
+    /// An aggregate is refused here on purpose. Resolving one needs a typed
+    /// signature contract that this constructor has no way to obtain, and
+    /// building an aggregate without one produced a definition that named the
+    /// function everywhere but could not be resolved anywhere - which is not a
+    /// failure any caller can see until something tries to resolve it. Use
+    /// `try_new_bound_aggregate`, which cannot be called without one.
     pub fn try_new_bound(
         canonical_name: impl AsRef<str>,
         visibility: FunctionVisibility,
         declaration: FunctionBindingDeclaration,
         resolver: Arc<dyn FunctionBindingResolver>,
+    ) -> Result<Self, FunctionCatalogError> {
+        if declaration.kind == crate::FunctionKind::Aggregate {
+            return Err(FunctionCatalogError::InvalidStableIdentity {
+                subject: "aggregate function without a typed signature contract",
+                value: canonical_name.as_ref().into(),
+            });
+        }
+        Self::bound(canonical_name, visibility, declaration, resolver, None)
+    }
+
+    /// Register an aggregate from its binding declaration and the contract that
+    /// resolves its typed signature.
+    pub fn try_new_bound_aggregate(
+        canonical_name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        declaration: FunctionBindingDeclaration,
+        resolver: Arc<dyn FunctionBindingResolver>,
+        aggregate_resolver: Arc<dyn crate::AggregateSignatureResolver>,
+    ) -> Result<Self, FunctionCatalogError> {
+        Self::bound(
+            canonical_name,
+            visibility,
+            declaration,
+            resolver,
+            Some(aggregate_resolver),
+        )
+    }
+
+    fn bound(
+        canonical_name: impl AsRef<str>,
+        visibility: FunctionVisibility,
+        declaration: FunctionBindingDeclaration,
+        resolver: Arc<dyn FunctionBindingResolver>,
+        aggregate_resolver: Option<Arc<dyn crate::AggregateSignatureResolver>>,
     ) -> Result<Self, FunctionCatalogError> {
         let canonical_name = canonical_name.as_ref();
         super::validate_canonical_name(canonical_name)?;
@@ -315,7 +357,7 @@ impl FunctionDefinition {
             canonical_signatures,
             aggregate_overloads: aggregate_overloads.into_boxed_slice(),
             exact_aggregate_overloads: Box::default(),
-            aggregate_resolver: None,
+            aggregate_resolver,
             resolver: None,
             binding: Some(FunctionBindingDefinition {
                 declaration,

@@ -1049,6 +1049,7 @@ pub fn lower_nest_loop_join_node(
             | NestedLoopJoinType::LeftAnti
             | NestedLoopJoinType::NullAwareLeftAnti
     );
+    let declared_output_path = physical_output_path.clone();
     let output_schema = if is_semi_anti && !physical.output_columns.is_empty() {
         decode_output_layout(&physical.output_columns, physical_output_path.clone())
             .map_err(NativeFragmentDecodeError::from)?
@@ -1084,7 +1085,7 @@ pub fn lower_nest_loop_join_node(
         output_schema.clone()
     };
 
-    Ok(NativeLoweredPlanNode {
+    let joined = NativeLoweredPlanNode {
         node: ExecNode {
             kind: ExecNodeKind::NestedLoopJoin(NestedLoopJoinNode {
                 left: Box::new(left.node),
@@ -1099,6 +1100,86 @@ pub fn lower_nest_loop_join_node(
         },
         layout: output_layout,
         output_schema,
+    };
+    if is_semi_anti {
+        return Ok(joined);
+    }
+    project_join_scope_to_declared_output(
+        ("NestLoopJoinNode", node.node_id),
+        joined,
+        &physical.output_columns,
+        declared_output_path,
+        arena,
+    )
+}
+
+/// Publish a join's declared output when it is not the whole join scope.
+///
+/// A join executes over the concatenation of both sides; which of those columns
+/// it publishes is a separate statement, and one the wire makes on the node
+/// rather than inside the join message. Widening the result to the whole scope
+/// when the two differ is not a smaller answer - it is a different relation,
+/// with columns the query did not ask for and at positions it did not expect.
+fn project_join_scope_to_declared_output(
+    identity: (&str, i32),
+    joined: NativeLoweredPlanNode,
+    output_columns: &[proto_common::OutputColumn],
+    path: FieldPath,
+    arena: &mut ExprArena,
+) -> Result<NativeLoweredPlanNode, NativeFragmentDecodeError> {
+    let (node_kind, node_id) = identity;
+    if output_columns.is_empty() {
+        return Ok(joined);
+    }
+    let declared = decode_output_layout(output_columns, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    let declared_schema = declared.chunk_schema();
+    if declared_schema.slot_ids() == joined.output_schema.slot_ids() {
+        return Ok(joined);
+    }
+    let mut exprs = Vec::with_capacity(declared_schema.slot_ids().len());
+    for output in declared_schema.slots() {
+        let Some(source) = joined.output_schema.slot(output.slot_id()) else {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{node_kind} output slot {} is not present in the complete join scope",
+                    output.slot_id()
+                ),
+            ));
+        };
+        if output.data_type() != source.data_type() || output.nullable() != source.nullable() {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{node_kind} output slot {} type/nullability differs from the complete join scope",
+                    output.slot_id()
+                ),
+            ));
+        }
+        let expr = arena.push_typed(
+            ExprNode::SlotId(output.slot_id()),
+            source.data_type().clone(),
+        );
+        arena.set_field_schema(expr, source.field_schema().clone());
+        exprs.push(expr);
+    }
+    let layout = SlotLayout::for_slots(declared.slot_ids().iter().copied());
+    Ok(NativeLoweredPlanNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(joined.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(declared.slot_schemas().to_vec()),
+                output_indices: None,
+                output_chunk_schema: declared_schema.clone(),
+            }),
+        },
+        layout,
+        output_schema: declared_schema,
     })
 }
 

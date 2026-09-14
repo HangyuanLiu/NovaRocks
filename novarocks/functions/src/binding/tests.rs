@@ -146,6 +146,28 @@ fn catalog(
     builder.seal_bound().unwrap()
 }
 
+/// An aggregate needs the typed signature contract it is resolved through, so
+/// it cannot be registered through the non-aggregate constructor.
+fn aggregate_catalog(
+    resolver: Arc<AggregateResolver>,
+    declaration: FunctionBindingDeclaration,
+) -> EngineFunctionCatalog {
+    let mut builder = EngineFunctionCatalogBuilder::new();
+    builder
+        .register(
+            FunctionDefinition::try_new_bound_aggregate(
+                "echo",
+                FunctionVisibility::Public,
+                declaration,
+                Arc::clone(&resolver) as Arc<dyn FunctionBindingResolver>,
+                resolver as Arc<dyn crate::AggregateSignatureResolver>,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    builder.seal_bound().unwrap()
+}
+
 fn echo_catalog(resolver: Arc<EchoResolver>) -> EngineFunctionCatalog {
     catalog(
         resolver,
@@ -446,6 +468,21 @@ fn hidden_bound_functions_require_trusted_resolution_and_legacy_calls_do_not_dis
 
 struct AggregateResolver;
 
+impl crate::AggregateSignatureResolver for AggregateResolver {
+    fn resolve_aggregate(
+        &self,
+        argument_types: &[DataType],
+    ) -> Result<crate::ResolvedAggregateSignature, crate::FunctionResolutionError> {
+        Ok(crate::ResolvedAggregateSignature {
+            overload: crate::AggregateOverloadIdentity::try_new("test/aggregate/T/v1").unwrap(),
+            argument_types: argument_types.to_vec(),
+            intermediate_type: DataType::Binary,
+            output_type: DataType::Int64,
+            state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
+        })
+    }
+}
+
 impl FunctionBindingResolver for AggregateResolver {
     fn resolve(
         &self,
@@ -496,7 +533,7 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
         intermediate_pattern: "binary not null".into(),
         state_format: AggregateStateFormatIdentity::try_new("state/v1").unwrap(),
     });
-    let catalog = catalog(
+    let catalog = aggregate_catalog(
         Arc::new(AggregateResolver),
         declaration(FunctionKind::Aggregate, vec![overload]),
     );

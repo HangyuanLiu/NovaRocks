@@ -823,6 +823,19 @@ struct ExactAggregateResolver {
     overloads: Box<[AggregateOverloadMetadata]>,
 }
 
+/// The typed signature contract of an aggregate whose overloads are exact.
+///
+/// Resolution is a match against the declared overloads, so an aggregate that
+/// declares them has no reason to write its own contract - and writing one is
+/// where the two can disagree.
+pub fn exact_aggregate_signature_contract(
+    overloads: impl IntoIterator<Item = AggregateOverloadMetadata>,
+) -> Arc<dyn AggregateSignatureResolver> {
+    Arc::new(ExactAggregateResolver {
+        overloads: overloads.into_iter().collect(),
+    })
+}
+
 impl FunctionSignatureResolver for ExactAggregateResolver {
     fn resolve(
         &self,
