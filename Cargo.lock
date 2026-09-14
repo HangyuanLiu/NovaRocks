@@ -3974,9 +3974,15 @@ dependencies = [
 name = "novarocks-mv-application"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks-query-application",
+ "novarocks-spi",
  "novarocks-state-store-runtime",
  "novarocks-table-maintenance",
+ "prost 0.13.5",
+ "prost-build",
+ "protoc-bin-vendored",
+ "sha2",
  "tokio",
  "tracing",
 ]

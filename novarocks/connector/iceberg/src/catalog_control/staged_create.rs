@@ -29,14 +29,16 @@ use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorColumnDefinition, ConnectorCtasUnanchoredProvenance, ConnectorError,
     ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorPartitionTransform, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome,
-    ConnectorStagedCreateAbortRequest, ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
+    ConnectorMutationFailureKind, ConnectorPartitionTransform,
+    ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorStagedCreate,
+    ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
+    ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
-    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
+    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorVendedS3CredentialLeaseRefresher, CreatePolicy,
     ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
@@ -488,6 +490,7 @@ struct PreparedOperation {
     policy: CreatePolicy,
     planning: Option<ConnectorStagedWritePlanningBinding>,
     write: Option<StagedWrite>,
+    document_properties: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone)]
@@ -865,17 +868,12 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 "Iceberg staged-create operation ID must equal its publication ID",
             ));
         }
-        if matches!(
-            &request.mode,
-            ConnectorStagedCreateMode::ApplicationDocumentManaged { .. }
-        ) {
-            return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
-                failure: ConnectorMutationFailure::new(
-                    ConnectorMutationFailureKind::Unsupported,
-                    "Iceberg application-document staged create is not installed",
-                ),
-            });
-        }
+        let document_admission = match &request.mode {
+            ConnectorStagedCreateMode::Ordinary => None,
+            ConnectorStagedCreateMode::ApplicationDocumentManaged { admission } => {
+                Some(admission.clone())
+            }
+        };
         if let Err(error) = Self::validate_context(&request.context) {
             return Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted {
                 failure: failure_from_connector(error),
@@ -912,7 +910,21 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         }
 
         let mut properties = request.properties;
-        properties.retain(|key, _| !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER));
+        properties.retain(|key, _| {
+            !key.eq_ignore_ascii_case(CTAS_OPERATION_MARKER)
+                && !key.eq_ignore_ascii_case(
+                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY,
+                )
+                && !key.eq_ignore_ascii_case(
+                    crate::document_storage::observation::MANAGED_KIND_PROPERTY,
+                )
+                && !key.eq_ignore_ascii_case(
+                    crate::document_storage::observation::MANAGED_OWNER_PROPERTY,
+                )
+                && !key.eq_ignore_ascii_case(
+                    crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY,
+                )
+        });
         properties.insert(
             Arc::from(CTAS_OPERATION_MARKER),
             Arc::from(publication_marker(request.publication_id)),
@@ -968,11 +980,53 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     );
                 }
                 let payload = Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes());
-                let handle = ConnectorStagedTableHandle::try_new(
-                    self.owner(),
-                    request.operation_id,
-                    payload.clone(),
-                )?;
+                let handle = if let Some(admission) = document_admission {
+                    let managed_handle = (|| {
+                        let fields = prepared_document_field_bindings(staged.table.metadata())?;
+                        let target = ConnectorPreparedCreateDocumentTarget::try_new(
+                            self.owner(),
+                            admission.catalog_handle().clone(),
+                            request.operation_id,
+                            request.table.clone(),
+                            novarocks_spi::connector::ConnectorTableObjectId::try_new(
+                                Bytes::from(staged.table.metadata().uuid().to_string()),
+                            )?,
+                            fields,
+                            payload.clone(),
+                        )?;
+                        ConnectorStagedTableHandle::try_new_document_managed(
+                            self.owner(),
+                            request.operation_id,
+                            payload.clone(),
+                            target,
+                        )
+                    })();
+                    match managed_handle {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            return self.prepare_commit_unknown(
+                                request.operation_id,
+                                format!(
+                                    "freeze document-managed staged target after staged create: {error}"
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    match ConnectorStagedTableHandle::try_new(
+                        self.owner(),
+                        request.operation_id,
+                        payload.clone(),
+                    ) {
+                        Ok(handle) => handle,
+                        Err(error) => {
+                            return self.prepare_commit_unknown(
+                                request.operation_id,
+                                format!("freeze staged target after staged create: {error}"),
+                            );
+                        }
+                    }
+                };
                 self.record_terminal(
                     request.operation_id,
                     OperationState::Prepared(PreparedOperation {
@@ -982,6 +1036,7 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                         policy: request.policy,
                         planning: None,
                         write: None,
+                        document_properties: None,
                     }),
                 );
                 Ok(ConnectorStagedCreatePrepareOutcome::Prepared {
@@ -1172,6 +1227,15 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                 failure: failure_from_connector(error),
             });
         }
+        let document_properties =
+            match publication_document_properties(&request.handle, &request.payload) {
+                Ok(properties) => properties,
+                Err(error) => {
+                    self.record_terminal(operation_id, OperationState::Prepared(prepared));
+                    return Err(error);
+                }
+            };
+        prepared.document_properties = document_properties;
         if !write.action_built {
             match self.build_action(&prepared, &request.write, &request.context) {
                 Ok((updates, expected_snapshot_id, abort_handle)) => {
@@ -1198,6 +1262,11 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
         let write = prepared.write.as_ref().expect("built staged write");
         let mut updates = prepared.staged.initialization_updates.clone();
         updates.extend(write.updates.clone());
+        if let Some(properties) = &prepared.document_properties {
+            updates.push(TableUpdate::SetProperties {
+                updates: properties.clone(),
+            });
+        }
         let expected_snapshot_id = write.expected_snapshot_id;
         let commit = TableCommit::builder()
             .ident(prepared.staged.table.identifier().clone())
@@ -1543,6 +1612,86 @@ fn publication_matches(
             .is_some_and(|marker| marker == &publication_marker(prepared.publication_id))
         && expected_snapshot_id
             .is_none_or(|snapshot_id| metadata.snapshot_by_id(snapshot_id).is_some())
+        && prepared
+            .document_properties
+            .as_ref()
+            .is_none_or(|expected| {
+                expected.iter().all(|(key, value)| {
+                    metadata
+                        .properties()
+                        .get(key)
+                        .is_some_and(|actual| actual == value)
+                })
+            })
+}
+
+fn publication_document_properties(
+    handle: &ConnectorStagedTableHandle,
+    payload: &ConnectorStagedCreatePublicationPayload,
+) -> Result<Option<HashMap<String, String>>, ConnectorError> {
+    let intent = match payload {
+        ConnectorStagedCreatePublicationPayload::Ordinary => {
+            if handle.document_target().is_some() {
+                return Err(invalid(
+                    "document-managed staged target requires application documents at publication",
+                ));
+            }
+            return Ok(None);
+        }
+        ConnectorStagedCreatePublicationPayload::ApplicationDocuments(intent) => intent,
+    };
+    if handle.document_target() != Some(intent.prepared_target()) {
+        return Err(invalid(
+            "application documents do not match the exact staged target",
+        ));
+    }
+    let prepared = intent.prepared_documents();
+    let manifest =
+        crate::document_storage::codec::decode_document_manifest(prepared.provider_token())?;
+    if manifest.documents.len() != prepared.documents().len()
+        || manifest
+            .documents
+            .iter()
+            .zip(prepared.documents())
+            .any(|(envelope, document)| {
+                let Ok(stored) = crate::document_storage::codec::stored_document(envelope) else {
+                    return true;
+                };
+                stored.id() != document.id()
+                    || !matches!(
+                        document.attachment(),
+                        novarocks_spi::connector::ConnectorDocumentAttachment::TableMetadata
+                    )
+                    || !matches!(
+                        stored.attachment(),
+                        novarocks_spi::connector::ConnectorStoredDocumentAttachment::TableMetadata
+                    )
+            })
+    {
+        return Err(corrupt(
+            "prepared Iceberg document manifest does not match its exact create publication",
+        ));
+    }
+    let encoded = std::str::from_utf8(prepared.provider_token())
+        .map_err(|_| corrupt("prepared Iceberg document manifest is not valid UTF-8 metadata"))?;
+    Ok(Some(HashMap::from([
+        (
+            crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+            encoded.to_string(),
+        ),
+        (
+            crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+            intent.marker().kind().to_string(),
+        ),
+        (
+            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+            intent.marker().owner().to_string(),
+        ),
+        (
+            crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+            intent.marker().incarnation().to_string(),
+        ),
+    ])))
 }
 
 fn publication_receipt(
@@ -1651,6 +1800,26 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message.into())
 }
 
+fn prepared_document_field_bindings(
+    metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Vec<ConnectorPreparedCreateFieldBinding>, ConnectorError> {
+    metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let ordinal = u32::try_from(ordinal)
+                .map_err(|_| invalid("Iceberg staged-create field ordinal exceeds u32"))?;
+            ConnectorPreparedCreateFieldBinding::try_new(
+                ordinal,
+                Bytes::copy_from_slice(&field.id.to_be_bytes()),
+            )
+        })
+        .collect()
+}
+
 /// Project the owner's staged-commit result onto the shape this module's match
 /// arms already handle.
 ///
@@ -1691,8 +1860,9 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorMutationOperationId,
-        ConnectorProviderId, ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
+        ConnectorMutationOperationId, ConnectorProviderId, ConnectorTableIdentity,
+        ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
@@ -1828,7 +1998,147 @@ mod tests {
             policy: CreatePolicy::FailIfExists,
             planning: None,
             write: None,
+            document_properties: None,
         }
+    }
+
+    #[test]
+    fn document_managed_create_freezes_actual_iceberg_field_ids_in_request_order() {
+        let runtime = hadoop_runtime();
+        let prepared = prepared_operation(&runtime);
+        let fields = prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].request_ordinal(), 0);
+        assert_eq!(fields[0].provider_field_id().as_ref(), 1_i32.to_be_bytes());
+    }
+
+    fn publication_table_with_properties(
+        prepared: &PreparedOperation,
+        properties: HashMap<String, String>,
+    ) -> crate::iceberg::table::Table {
+        let metadata = prepared
+            .staged
+            .table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_properties(properties)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        crate::iceberg::table::Table::builder()
+            .identifier(prepared.staged.table.identifier().clone())
+            .file_io(prepared.staged.table.file_io().clone())
+            .metadata(metadata)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn applied_publication_requires_the_exact_document_manifest_and_managed_marker() {
+        let runtime = hadoop_runtime();
+        let mut prepared = prepared_operation(&runtime);
+        let document_properties = HashMap::from([
+            (
+                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                "exact-manifest".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+                "mv".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+                "deployment".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+                "incarnation".to_string(),
+            ),
+        ]);
+        prepared.document_properties = Some(document_properties.clone());
+        let mut published_properties = document_properties;
+        published_properties.insert(
+            CTAS_OPERATION_MARKER.to_string(),
+            publication_marker(prepared.publication_id),
+        );
+        let exact = publication_table_with_properties(&prepared, published_properties.clone());
+        assert!(publication_matches(
+            &exact,
+            prepared.operation_id(),
+            &prepared,
+            None
+        ));
+
+        published_properties
+            .remove(crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY);
+        let partial = publication_table_with_properties(&prepared, published_properties.clone());
+        assert!(!publication_matches(
+            &partial,
+            prepared.operation_id(),
+            &prepared,
+            None
+        ));
+
+        published_properties.insert(
+            crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+            "other".to_string(),
+        );
+        let mismatched = publication_table_with_properties(&prepared, published_properties);
+        assert!(!publication_matches(
+            &mismatched,
+            prepared.operation_id(),
+            &prepared,
+            None
+        ));
+    }
+
+    #[test]
+    fn document_managed_target_cannot_publish_without_application_documents() {
+        let runtime = hadoop_runtime();
+        let prepared = prepared_operation(&runtime);
+        let owner = ConnectorProviderBindingKey {
+            instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            incarnation: ProviderBindingEpoch::new(),
+        };
+        let operation_id = ConnectorMutationOperationId::new();
+        let target = ConnectorPreparedCreateDocumentTarget::try_new(
+            owner.clone(),
+            CatalogHandle::new(
+                owner.instance_id.clone(),
+                CatalogVersion::from_bytes([3; 32]),
+            ),
+            operation_id,
+            ConnectorTableIdentity {
+                instance_id: owner.instance_id.clone(),
+                namespace: Arc::from("db"),
+                table: Arc::from("t"),
+            },
+            ConnectorTableObjectId::try_new(Bytes::from(
+                prepared.staged.table.metadata().uuid().to_string(),
+            ))
+            .unwrap(),
+            prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap(),
+            Bytes::from_static(b"target"),
+        )
+        .unwrap();
+        let handle = ConnectorStagedTableHandle::try_new_document_managed(
+            owner,
+            operation_id,
+            Bytes::from_static(b"handle"),
+            target,
+        )
+        .unwrap();
+        assert_eq!(
+            publication_document_properties(
+                &handle,
+                &ConnectorStagedCreatePublicationPayload::Ordinary
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     fn hadoop_runtime() -> IcebergMetadataContext {

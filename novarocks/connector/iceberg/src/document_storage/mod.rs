@@ -15,19 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Connector-neutral materialized-view application mechanics.
+//! Iceberg storage for application-owned opaque documents.
 //!
-//! This crate owns only current-process product mechanics: candidate isolation
-//! and target/publication runtime state. Provider lake packages, SQL rewrite
-//! proofs, query bindings, and physical execution stay at their respective
-//! boundaries.
+//! The application owns every document body and version. This module owns the
+//! Iceberg envelope, immutable sidecar names, exact metadata projection,
+//! catalog pagination, and provider-level reachability used by cleanup.
 
-pub mod activity;
-pub mod candidate;
-pub mod maintenance;
-pub mod management;
-pub mod persistence;
-pub mod process_runtime;
-pub mod scheduler;
-pub mod scheduler_runtime;
-pub mod state_family;
+pub(crate) mod codec;
+mod create;
+mod discovery;
+pub(crate) mod envelope;
+pub(crate) mod io;
+pub(crate) mod observation;
+mod reference;
+mod retention;
+
+pub use create::IcebergDocumentStorage;
+pub(crate) use retention::retained_sidecars_for_roots;

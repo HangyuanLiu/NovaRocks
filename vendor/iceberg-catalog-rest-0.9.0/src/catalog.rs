@@ -719,6 +719,49 @@ impl RestCatalog {
             .await
     }
 
+    /// Fetch exactly one REST list-tables page without accumulating later
+    /// pages in memory. The token is opaque and must be replayed unchanged.
+    pub async fn list_tables_page(
+        &self,
+        namespace: &NamespaceIdent,
+        page_token: Option<&str>,
+        page_size: usize,
+    ) -> Result<ListTablesResponse> {
+        if page_size == 0 {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                "REST list-tables page size must be non-zero",
+            ));
+        }
+        let context = self.context().await?;
+        let endpoint = context.config.tables_endpoint(namespace);
+        let page_size = page_size.to_string();
+        let mut request = context
+            .client
+            .request(Method::GET, endpoint)
+            .query(&[("pageSize", page_size.as_str())]);
+        if let Some(token) = page_token {
+            request = request.query(&[("pageToken", token)]);
+        }
+        let http_response = context.client.query_catalog(request.build()?).await?;
+        match http_response.status() {
+            StatusCode::OK => {
+                deserialize_catalog_response::<ListTablesResponse>(http_response).await
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to list tables of a namespace that does not exist",
+            )),
+            _ => {
+                Err(deserialize_unexpected_catalog_error(
+                    http_response,
+                    context.client.disable_header_redaction(),
+                )
+                .await)
+            }
+        }
+    }
+
     /// Load the runtime config from the server by `user_config`.
     ///
     /// It's required for a REST catalog to update its config after creation.
@@ -2985,6 +3028,62 @@ mod tests {
 
         config_mock.assert_async().await;
         list_tables_mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn test_list_tables_page_preserves_the_opaque_continuation() {
+        let mut server = Server::new_async().await;
+
+        let config_mock = create_config_mock(&mut server).await;
+        let first_page_mock = server
+            .mock("GET", "/v1/namespaces/ns1/tables?pageSize=1")
+            .with_status(200)
+            .with_body(
+                r#"{
+                "identifiers": [{"namespace": ["ns1"], "name": "table1"}],
+                "next-page-token": "opaque-token"
+            }"#,
+            )
+            .create_async()
+            .await;
+        let second_page_mock = server
+            .mock(
+                "GET",
+                "/v1/namespaces/ns1/tables?pageSize=1&pageToken=opaque-token",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{
+                "identifiers": [{"namespace": ["ns1"], "name": "table2"}]
+            }"#,
+            )
+            .create_async()
+            .await;
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+        let namespace = NamespaceIdent::new("ns1".to_string());
+
+        let first = catalog
+            .list_tables_page(&namespace, None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first.identifiers.len(), 1);
+        assert_eq!(first.identifiers[0].name, "table1");
+        assert_eq!(first.next_page_token.as_deref(), Some("opaque-token"));
+
+        let second = catalog
+            .list_tables_page(&namespace, first.next_page_token.as_deref(), 1)
+            .await
+            .unwrap();
+        assert_eq!(second.identifiers.len(), 1);
+        assert_eq!(second.identifiers[0].name, "table2");
+        assert_eq!(second.next_page_token, None);
+
+        config_mock.assert_async().await;
+        first_page_mock.assert_async().await;
+        second_page_mock.assert_async().await;
     }
 
     #[tokio::test]
