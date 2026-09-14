@@ -49,12 +49,12 @@ use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorPlanningContext, ConnectorReadAttemptAccess,
     ConnectorReadWireEncoder, ConnectorRequestContext,
     read_stack::{
-        ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
-        ConnectorReadDistribution, ConnectorReadMetadata, ConnectorReadMetadataKind,
-        ConnectorReadMetadataRequest, ConnectorReadMetadataVersion, ConnectorReadNullOrdering,
-        ConnectorReadProperties, ConnectorReadRelationVersion, ConnectorReadRequestControl,
-        ConnectorReadSortDirection, ConnectorReadTableHandle, ConnectorReadWorkSource,
-        ConnectorSession, Constraint, SchemaTableName,
+        ConnectorExpression, ConnectorReadColumnBinding, ConnectorReadColumnHandle,
+        ConnectorReadConstraint, ConnectorReadDistribution, ConnectorReadMetadata,
+        ConnectorReadMetadataKind, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
+        ConnectorReadNullOrdering, ConnectorReadProperties, ConnectorReadRelationVersion,
+        ConnectorReadRequestControl, ConnectorReadSortDirection, ConnectorReadTableHandle,
+        ConnectorReadWorkSource, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
         negotiation::{
             ReadFreezeRequest, ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
             ReadPushdownOutcome,
@@ -79,6 +79,40 @@ use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 /// They are positional on purpose: the provider is being asked about the
 /// request's own dense ordinals, not about anything the query calls a column.
 const READ_VARIABLE_PREFIX: &str = "r";
+
+/// What this role keeps for one frozen read.
+///
+/// A freeze leaves two things behind that the plan itself must not carry, and
+/// they are kept together because they are accounted for together: each belongs
+/// to exactly one scan occurrence, each is useless without the plan, and the
+/// pairing that proves every scan has a capability proves every scan has its
+/// encoding too.
+///
+/// They are spent differently. The capability is released when the attempt
+/// ends. The encoding is read once, when the plan is put on the wire, and dies
+/// with the plan version.
+pub(crate) struct FrozenProviderRead {
+    pub(crate) access: ConnectorReadAttemptAccess,
+    pub(crate) encoding: FrozenReadEncoding,
+}
+
+/// The provider-side half of one scan's wire form.
+///
+/// These values exist only while a read is being negotiated: the assignments
+/// name provider columns, and the two domains are what the provider said it
+/// would and would not enforce. Nothing downstream can recover them from the
+/// plan, so they are kept from the moment the read stops being negotiable.
+pub(crate) struct FrozenReadEncoding {
+    pub(crate) relation: novarocks_spi::connector::read_stack::ConnectorReadRelation,
+    pub(crate) assignments: Vec<ConnectorReadAssignment>,
+    /// What the provider guarantees. The engine may stop evaluating it.
+    pub(crate) enforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
+    /// What the reader must still apply itself.
+    pub(crate) unenforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
+    pub(crate) remaining_expression: Option<ConnectorExpression>,
+    pub(crate) work_source: ConnectorReadWorkSource,
+    pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
+}
 
 /// Freezes each scan of one statement with its provider.
 pub(crate) struct FrontendProviderReadFacts {
@@ -109,10 +143,11 @@ impl FrontendProviderReadFacts {
 
 #[async_trait]
 impl ProviderReadFactPort for FrontendProviderReadFacts {
-    /// What performing a frozen read takes: the ability to reacquire exactly
-    /// the handle that was frozen, for one attempt. It holds no secret and
-    /// offers no way to choose a different read.
-    type Access = ConnectorReadAttemptAccess;
+    /// What a freeze leaves this role: the ability to reacquire exactly the
+    /// handle that was frozen, for one attempt, and the provider-side half of
+    /// that read's wire form. Neither holds a secret and neither offers a way
+    /// to choose a different read.
+    type Access = FrozenProviderRead;
 
     async fn resolve_provider_reads(
         &self,
@@ -148,7 +183,7 @@ fn freeze_one_read(
     bindings: &QueryTableBindingStore,
     session: &ConnectorSession,
     context: &ConnectorRequestContext,
-    deposits: &ReadAccessDeposit<ConnectorReadAttemptAccess>,
+    deposits: &ReadAccessDeposit<FrozenProviderRead>,
 ) -> Result<ProviderReadFact, String> {
     let relation = need.relation();
     let identity = relation_identity(relation);
@@ -222,19 +257,32 @@ fn freeze_one_read(
         .map_err(|error| {
             format!("provider read of {name} cannot seal its per-attempt access: {error}")
         })?;
-    deposits.deposit(
-        need.occurrence(),
-        FrozenReadAccess {
-            binding: need.binding(),
-            access,
-        },
-    );
-
-    // 6. Project the frozen read into the contract the plan is built against.
     let encoder = read.encoder();
     let provider_relation = metadata
         .relation(relation_kind, negotiated.handle.clone())
         .map_err(|error| format!("provider read of {name} has no frozen relation: {error}"))?;
+    let (enforced_predicate, unenforced_predicate, remaining_expression) =
+        filter_responsibility(&offer, &negotiated.outcomes);
+    deposits.deposit(
+        need.occurrence(),
+        FrozenReadAccess {
+            binding: need.binding(),
+            access: FrozenProviderRead {
+                access,
+                encoding: FrozenReadEncoding {
+                    relation: provider_relation.clone(),
+                    assignments: assignments.clone(),
+                    enforced_predicate,
+                    unenforced_predicate,
+                    remaining_expression,
+                    work_source: work_source_of(relation),
+                    encoder: Arc::clone(&encoder),
+                },
+            },
+        },
+    );
+
+    // 6. Project the frozen read into the contract the plan is built against.
     let relation_payload = encoder
         .encode_relation_payload(&provider_relation)
         .map_err(|error| format!("provider read of {name} cannot encode its relation: {error}"))?;
@@ -569,6 +617,74 @@ fn limit_fact(
     }
 }
 
+/// Who evaluates what, after the provider answered the filter.
+///
+/// Only `Exact` relieves the engine, and that is decided elsewhere - here it
+/// decides what the *reader* is told to do, which is a different question with
+/// the same answer at only one of the three dispositions.
+///
+/// - `Exact`: the provider guarantees the filter, so the engine stops
+///   evaluating it and the reader applies only what came back as residual.
+/// - `PruningOnly`: the provider will use the filter but guarantees nothing, so
+///   the engine keeps evaluating it. The reader is still handed the domain,
+///   because applying it removes only rows the engine would remove anyway -
+///   evaluating a predicate twice costs time, and skipping the pruning costs
+///   the entire point of a pruning answer.
+/// - `Unsupported`, or no filter offered: the reader is told nothing. An
+///   unenforced domain is the reader's own work by contract, and a relation the
+///   provider declined may have no reader that applies one - a metadata
+///   relation read whole by a single backend opens its page source with no
+///   constraint at all, so a predicate parked there would be applied by nobody.
+fn filter_responsibility(
+    offer: &OfferedOps,
+    outcomes: &[ReadPushdownOutcome],
+) -> (
+    TupleDomain<ConnectorReadColumnHandle>,
+    TupleDomain<ConnectorReadColumnHandle>,
+    Option<ConnectorExpression>,
+) {
+    let nothing_for_the_reader = (TupleDomain::all(), TupleDomain::all(), None);
+    let Some(index) = offer.filter else {
+        return nothing_for_the_reader;
+    };
+    let ReadPushdownOp::Filter {
+        constraint: offered,
+    } = &offer.ops[index]
+    else {
+        return nothing_for_the_reader;
+    };
+    let Some(answer) = outcomes.get(index) else {
+        return nothing_for_the_reader;
+    };
+    match answer.disposition {
+        ReadPushdownDisposition::Unsupported => nothing_for_the_reader,
+        ReadPushdownDisposition::PruningOnly => (
+            // No guarantee is claimed for any column: the engine evaluates the
+            // whole predicate regardless of what the provider skipped.
+            TupleDomain::all(),
+            offered.summary().clone(),
+            None,
+        ),
+        ReadPushdownDisposition::Exact => {
+            let Some(residual) = answer.residual.as_ref() else {
+                // A provider that guarantees a filter says what remains, even
+                // when nothing does. Without that we cannot tell what it kept,
+                // and guessing "nothing remains" would drop rows.
+                return nothing_for_the_reader;
+            };
+            let unenforced = residual.summary().clone();
+            // Enforcement is claimed only for a column the provider kept
+            // whole. A column handed back partially is covered by its own
+            // guarantee for the complement, and by the reader for the rest.
+            let enforced = offered
+                .summary()
+                .filter_columns(|column| unenforced.domain_for(column).is_none());
+            let remaining = Some(residual.expression().clone()).filter(|e| !e.is_constant_true());
+            (enforced, unenforced, remaining)
+        }
+    }
+}
+
 /// The provider's column identity for each requested ordinal.
 fn column_facts(
     columns: &[ProviderReadColumnNeed],
@@ -830,6 +946,28 @@ mod tests {
             let facts = predicate_facts(&need, &offer, &outcomes);
             assert_eq!(facts.len(), 1);
             assert_eq!(facts[0].guarantee(), expected, "{disposition:?}");
+        }
+    }
+
+    /// A filter the provider declined leaves the reader nothing to apply. The
+    /// engine evaluates the whole predicate, and a relation read whole by one
+    /// backend has no reader that would apply a parked domain anyway.
+    #[test]
+    fn a_declined_filter_leaves_the_reader_nothing() {
+        let need = a_need(None);
+        let offer = offer_of(&need);
+        for disposition in [
+            ReadPushdownDisposition::Unsupported,
+            // `Exact` without a residual is the same case: a provider that
+            // guarantees a filter says what remains, and without that we
+            // cannot tell what it kept.
+            ReadPushdownDisposition::Exact,
+        ] {
+            let outcomes = all_answered(&offer, disposition, ReadPushdownDisposition::Exact);
+            let (enforced, unenforced, remaining) = filter_responsibility(&offer, &outcomes);
+            assert_eq!(enforced, TupleDomain::all(), "{disposition:?}");
+            assert_eq!(unenforced, TupleDomain::all(), "{disposition:?}");
+            assert!(remaining.is_none(), "{disposition:?}");
         }
     }
 

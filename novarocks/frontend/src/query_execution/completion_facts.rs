@@ -39,8 +39,7 @@ use novarocks_query_application::preparation::{
     StatisticsFactPort,
 };
 use novarocks_spi::connector::{
-    ConnectorReadAttemptAccess, ConnectorRequestContext, MvStorageObservationPort,
-    read_stack::ConnectorSession,
+    ConnectorRequestContext, MvStorageObservationPort, read_stack::ConnectorSession,
 };
 use novarocks_sql::compiler::{
     CatalogLookupTarget, CatalogRelationFact, CatalogRelationNeed, MaterializedViewFact,
@@ -58,7 +57,7 @@ use crate::connector::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvCandidateReader;
 use crate::mv::domain::rewrite_prep::freeze_materialized_view_fact_with_ports;
 use crate::query_execution::planning::statistics::resolve_statistics_need;
-use crate::query_execution::provider_read_facts::FrontendProviderReadFacts;
+use crate::query_execution::provider_read_facts::{FrontendProviderReadFacts, FrozenProviderRead};
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 
 /// The owners in this process that can answer a compilation question, and the
@@ -311,7 +310,7 @@ pub(crate) fn frontend_fact_source(
     owners: CompletionFactOwners,
     scope: StatementFactScope,
     session: ConnectorSession,
-) -> QueryCompletionFactSource<ConnectorReadAttemptAccess> {
+) -> QueryCompletionFactSource<FrozenProviderRead> {
     let provider_reads = Arc::new(FrontendProviderReadFacts::new(
         Arc::clone(&owners.connector_control),
         Arc::clone(&scope.bindings),
