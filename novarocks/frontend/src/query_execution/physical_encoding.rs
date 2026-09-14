@@ -32,8 +32,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::{
-    FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference, ProviderReadOccurrenceId,
-    Relation,
+    Distribution, FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference,
+    ProviderReadOccurrenceId, Relation,
 };
 use novarocks_plan_codec::{
     PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
@@ -47,6 +47,10 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::query_execution::fragment_scheduling::{
+    FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
+    SchedulingStreamKind,
+};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::post_compile::mint_native_encoding_provenance;
 use crate::query_execution::preparation::attempt_access::{
@@ -64,6 +68,7 @@ pub(crate) struct EncodedCompletedPlan {
     /// paired with another encoding's artifacts.
     pub(crate) native: NativeFragmentAttachment,
     pub(crate) topology: CompletedPlanTopology,
+    pub(crate) scheduling: FragmentSchedulingFacts,
     pub(crate) access: ConnectorAttemptAccessPlan,
     /// One per scan, in plan order.
     pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
@@ -99,14 +104,16 @@ pub(crate) fn encode_completed_plan(
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     let split_sources = split_source_recipes(plan, &encodings, &access)?;
-    let native = NativeFragmentAttachment::for_completed_plan(
-        encoded.fragments.clone(),
-        mint_native_encoding_provenance(),
-    )?;
+    let provenance = mint_native_encoding_provenance();
+    let native =
+        NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
+    let topology = completed_plan_topology(plan)?;
+    let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
     Ok(EncodedCompletedPlan {
         plan: encoded,
         native,
-        topology: completed_plan_topology(plan)?,
+        topology,
+        scheduling,
         access,
         split_sources,
     })
@@ -196,6 +203,76 @@ pub(crate) fn completed_plan_topology(
             .result_port()
             .map(|result| SqlFragmentId::from(result.fragment.get())),
         anchor,
+    })
+}
+
+/// What scheduling reads about one completed plan.
+///
+/// A provider read's work reaches a backend one of two ways, and only the
+/// provider knows which, so that answer comes from the freeze. Nothing has
+/// enumerated any splits yet - that belongs to the attempt - so every scan
+/// starts with no ranges to spread.
+fn completed_plan_scheduling_facts(
+    plan: &PhysicalPlan,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    topology: &CompletedPlanTopology,
+    handoff_id: u64,
+) -> Result<FragmentSchedulingFacts, String> {
+    let mut fragments = BTreeMap::new();
+    for fragment in plan.fragments().values() {
+        let mut scans = Vec::new();
+        for node in fragment.nodes().values() {
+            let NodeKind::Scan { occurrence, .. } = &node.kind else {
+                continue;
+            };
+            let encoding = encodings.get(occurrence).ok_or_else(|| {
+                format!(
+                    "completed plan scans provider read occurrence {} with no frozen read",
+                    occurrence.get()
+                )
+            })?;
+            scans.push(SchedulingScanFacts {
+                node_id: wire_node_id(node.id)?,
+                ranges: Vec::new(),
+                work_source: Some(encoding.work_source),
+            });
+        }
+        fragments.insert(
+            SqlFragmentId::from(fragment.id().get()),
+            SchedulingFragmentFacts { scans },
+        );
+    }
+    let edges = plan
+        .edges()
+        .values()
+        .map(|edge| {
+            Ok(SchedulingEdgeFacts {
+                source: SqlFragmentId::from(edge.source.fragment.get()),
+                target: SqlFragmentId::from(edge.destination.fragment.get()),
+                target_exchange_node_id: wire_node_id(edge.destination.node)?,
+                native_hash_partitioned: matches!(
+                    edge.partitioning.destination,
+                    Distribution::Hash { .. }
+                ),
+                stream_kind: match edge.partitioning.destination {
+                    Distribution::Singleton => SchedulingStreamKind::Gather,
+                    Distribution::Broadcast => SchedulingStreamKind::Broadcast,
+                    Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
+                        SchedulingStreamKind::Partitioned
+                    }
+                    Distribution::Unconstrained | Distribution::RoundRobin => {
+                        SchedulingStreamKind::Other
+                    }
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(FragmentSchedulingFacts {
+        handoff_id,
+        order: topology.order.clone(),
+        anchor: topology.anchor,
+        fragments,
+        edges,
     })
 }
 
@@ -569,6 +646,20 @@ mod tests {
         );
         assert_eq!(encoded.access.iter().count(), 0);
         assert!(encoded.split_sources.is_empty());
+        // Scheduling sees the same fragments, in the same order, and reads no
+        // scan because there is none.
+        assert_eq!(
+            encoded.scheduling.fragments.len(),
+            encoded.plan.fragments.len()
+        );
+        assert_eq!(encoded.scheduling.order, encoded.topology.order);
+        assert!(
+            encoded
+                .scheduling
+                .fragments
+                .values()
+                .all(|fragment| !fragment.has_scans())
+        );
         // The submission bundle is the same fragment set, keyed.
         assert_eq!(
             encoded.native.fragment_ids().count(),
