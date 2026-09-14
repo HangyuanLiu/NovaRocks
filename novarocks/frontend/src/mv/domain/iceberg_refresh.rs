@@ -1253,6 +1253,49 @@ pub(crate) fn create_iceberg_mv_with_ports(
     Ok(StatementResult::Ok)
 }
 
+/// The three provider capabilities one document-managed MV CREATE consumes.
+/// They are derived together from one planning lease: re-acquiring any one at
+/// a later phase could split one staged target across provider generations.
+struct DocumentManagedMvCreateLeases {
+    planning: novarocks_spi::connector::ConnectorControlPlanningLease,
+    documents: novarocks_spi::connector::ConnectorDocumentStorageLease,
+    staged: novarocks_spi::connector::ConnectorStagedCreateLease,
+    write: novarocks_spi::connector::ConnectorWriteLease,
+}
+
+fn derive_document_managed_mv_create_leases(
+    ports: &IcebergMvCorePorts,
+    catalog: &str,
+) -> Result<DocumentManagedMvCreateLeases, String> {
+    let instance = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+        .map_err(|error| format!("MV CREATE catalog instance: {error}"))?;
+    let planning = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+        ports.connector_control.as_ref(),
+        &instance,
+    )
+    .map_err(|error| format!("acquire MV CREATE planning lease: {error}"))?;
+    let documents = planning
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive MV CREATE document lease: {error}"))?;
+    let staged = planning
+        .derive_staged_create_lease()
+        .map_err(|error| format!("derive MV CREATE staged lease: {error}"))?;
+    let write = planning
+        .derive_write_lease()
+        .map_err(|error| format!("derive MV CREATE write lease: {error}"))?;
+    if !staged.matches_write_lease(&write) {
+        return Err(
+            "MV CREATE staged and write leases came from different provider bindings".to_string(),
+        );
+    }
+    Ok(DocumentManagedMvCreateLeases {
+        planning,
+        documents,
+        staged,
+        write,
+    })
+}
+
 fn known_committed_create_finalize_error(phase: &str, error: impl std::fmt::Display) -> String {
     EngineError::commit_known_committed_finalize_failed(format!(
         "Iceberg MV repository create committed but {phase} failed: {error}"
