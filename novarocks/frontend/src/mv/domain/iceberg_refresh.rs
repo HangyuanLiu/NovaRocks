@@ -3132,6 +3132,12 @@ fn aggregate_state_role_contract(
         novarocks_types::mv_aggregate_layout::MvAggregateStateRole::Single => {
             mv_schema::AggregateStateRoleContract::Single
         }
+        novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgSum => {
+            mv_schema::AggregateStateRoleContract::AvgSum
+        }
+        novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgCount => {
+            mv_schema::AggregateStateRoleContract::AvgCount
+        }
         novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount => {
             mv_schema::AggregateStateRoleContract::RetractionCount
         }

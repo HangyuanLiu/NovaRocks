@@ -152,7 +152,11 @@ pub fn build_sql_mv_aggregate_physical_layout(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut state_columns = Vec::with_capacity(calls.len() + 1);
+    let avg_count = calls
+        .iter()
+        .filter(|call| call.function() == AggregateFunctionKind::Avg)
+        .count();
+    let mut state_columns = Vec::with_capacity(calls.len() + avg_count + 1);
     for (aggregate_index, call) in calls.iter().enumerate() {
         let visible_source_index = call.visible_source_index();
         let visible = output_columns.get(visible_source_index).ok_or_else(|| {
@@ -174,29 +178,56 @@ pub fn build_sql_mv_aggregate_physical_layout(
             sanitize_state_column_name(call.output_name())
         );
         let state_data_type = DataType::LargeBinary;
-        validate_state_column_type(
-            call.function(),
-            MvAggregateStateRole::Single,
-            &state_data_type,
-            &state_name,
-        )?;
-        physical_columns.push(physical_column(
-            state_name.clone(),
-            SqlType::Binary,
-            false,
-            false,
-            false,
-        ));
-        state_columns.push(MvAggregateStateColumn::new(
-            state_name,
-            state_data_type,
-            false,
-            visible_source_index,
-            aggregate_index,
-            runtime_kind(call.function()),
-            MvAggregateStateRole::Single,
-            call.count_star(),
-        ));
+        if call.function() == AggregateFunctionKind::Avg {
+            for (suffix, role) in [
+                ("avg_sum", MvAggregateStateRole::AvgSum),
+                ("avg_count", MvAggregateStateRole::AvgCount),
+            ] {
+                let state_name = format!("{state_name}_{suffix}");
+                validate_state_column_type(call.function(), role, &state_data_type, &state_name)?;
+                physical_columns.push(physical_column(
+                    state_name.clone(),
+                    SqlType::Binary,
+                    false,
+                    false,
+                    false,
+                ));
+                state_columns.push(MvAggregateStateColumn::new(
+                    state_name,
+                    state_data_type.clone(),
+                    false,
+                    visible_source_index,
+                    aggregate_index,
+                    runtime_kind(call.function()),
+                    role,
+                    false,
+                ));
+            }
+        } else {
+            validate_state_column_type(
+                call.function(),
+                MvAggregateStateRole::Single,
+                &state_data_type,
+                &state_name,
+            )?;
+            physical_columns.push(physical_column(
+                state_name.clone(),
+                SqlType::Binary,
+                false,
+                false,
+                false,
+            ));
+            state_columns.push(MvAggregateStateColumn::new(
+                state_name,
+                state_data_type,
+                false,
+                visible_source_index,
+                aggregate_index,
+                runtime_kind(call.function()),
+                MvAggregateStateRole::Single,
+                call.count_star(),
+            ));
+        }
     }
 
     if !calls
@@ -369,6 +400,12 @@ fn validate_state_column_type(
             DataType::Binary | DataType::LargeBinary => Ok(()),
             other => Err(format!(
                 "expected VARBINARY state column type for `{state_name}` ({function:?}), got: {other:?}"
+            )),
+        },
+        MvAggregateStateRole::AvgSum | MvAggregateStateRole::AvgCount => match data_type {
+            DataType::Binary | DataType::LargeBinary => Ok(()),
+            other => Err(format!(
+                "expected VARBINARY AVG state column type for `{state_name}` ({function:?}), got: {other:?}"
             )),
         },
     }

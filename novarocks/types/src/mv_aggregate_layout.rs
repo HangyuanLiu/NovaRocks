@@ -42,6 +42,10 @@ pub enum MvAggregateRuntimeKind {
 pub enum MvAggregateStateRole {
     /// The one opaque state column for an aggregate.
     Single,
+    /// The sum component of an AVG aggregate state.
+    AvgSum,
+    /// The non-null row-count component of an AVG aggregate state.
+    AvgCount,
     /// A hidden row-count used to decide whether a group was fully retracted.
     RetractionCount,
 }
@@ -209,7 +213,7 @@ impl MvAggregateRuntimeLayout {
         }
 
         let aggregate_count = aggregate_input_types.len();
-        let mut single_aggregate_indexes = vec![false; aggregate_count];
+        let mut aggregate_state_roles = vec![(false, false, false); aggregate_count];
         let mut retraction_count_columns = 0usize;
         for state_column in &state_columns {
             match state_column.state_role {
@@ -232,8 +236,14 @@ impl MvAggregateRuntimeLayout {
                             state_column.name
                         ));
                     }
+                    if state_column.aggregate_kind == MvAggregateRuntimeKind::Avg {
+                        return Err(format!(
+                            "aggregate MV AVG must use AvgSum and AvgCount roles: aggregate_index={}",
+                            state_column.aggregate_index
+                        ));
+                    }
                     if std::mem::replace(
-                        &mut single_aggregate_indexes[state_column.aggregate_index],
+                        &mut aggregate_state_roles[state_column.aggregate_index].0,
                         true,
                     ) {
                         return Err(format!(
@@ -249,11 +259,63 @@ impl MvAggregateRuntimeLayout {
                                 state_column.aggregate_index, state_column.visible_source_index
                             )
                         })?;
-                    if slot
-                        .replace(MvAggregateVisibleOutput::Aggregate(
+                    if slot.is_none() {
+                        *slot = Some(MvAggregateVisibleOutput::Aggregate(
+                            state_column.aggregate_index,
+                        ));
+                    } else if *slot
+                        != Some(MvAggregateVisibleOutput::Aggregate(
                             state_column.aggregate_index,
                         ))
-                        .is_some()
+                    {
+                        return Err(format!(
+                            "aggregate MV visible output is duplicated: aggregate_index={} source_index={}",
+                            state_column.aggregate_index, state_column.visible_source_index
+                        ));
+                    }
+                }
+                MvAggregateStateRole::AvgSum | MvAggregateStateRole::AvgCount => {
+                    if state_column.aggregate_index >= aggregate_count
+                        || state_column.aggregate_kind != MvAggregateRuntimeKind::Avg
+                        || !is_varbinary_data_type(&state_column.data_type)
+                        || state_column.nullable
+                    {
+                        return Err(format!(
+                            "aggregate MV AVG state has invalid runtime shape: column={}",
+                            state_column.name
+                        ));
+                    }
+                    let role_present = match state_column.state_role {
+                        MvAggregateStateRole::AvgSum => {
+                            &mut aggregate_state_roles[state_column.aggregate_index].1
+                        }
+                        MvAggregateStateRole::AvgCount => {
+                            &mut aggregate_state_roles[state_column.aggregate_index].2
+                        }
+                        _ => unreachable!("AVG state role was matched above"),
+                    };
+                    if std::mem::replace(role_present, true) {
+                        return Err(format!(
+                            "aggregate MV AVG state role is duplicated: aggregate_index={} role={:?}",
+                            state_column.aggregate_index, state_column.state_role
+                        ));
+                    }
+                    let slot = visible_output_order
+                        .get_mut(state_column.visible_source_index)
+                        .ok_or_else(|| {
+                            format!(
+                                "aggregate MV AVG visible source index out of range: aggregate_index={} source_index={}",
+                                state_column.aggregate_index, state_column.visible_source_index
+                            )
+                        })?;
+                    if slot.is_none() {
+                        *slot = Some(MvAggregateVisibleOutput::Aggregate(
+                            state_column.aggregate_index,
+                        ));
+                    } else if *slot
+                        != Some(MvAggregateVisibleOutput::Aggregate(
+                            state_column.aggregate_index,
+                        ))
                     {
                         return Err(format!(
                             "aggregate MV visible output is duplicated: aggregate_index={} source_index={}",
@@ -291,10 +353,28 @@ impl MvAggregateRuntimeLayout {
             }
         }
 
-        if let Some(missing_index) = single_aggregate_indexes.iter().position(|present| !present) {
-            return Err(format!(
-                "aggregate MV state column is missing: aggregate_index={missing_index}"
-            ));
+        for (aggregate_index, (single, avg_sum, avg_count)) in
+            aggregate_state_roles.into_iter().enumerate()
+        {
+            let kind = state_columns
+                .iter()
+                .find(|column| column.aggregate_index == aggregate_index)
+                .map(|column| column.aggregate_kind)
+                .ok_or_else(|| {
+                    format!(
+                        "aggregate MV state column is missing: aggregate_index={aggregate_index}"
+                    )
+                })?;
+            let valid = if kind == MvAggregateRuntimeKind::Avg {
+                !single && avg_sum && avg_count
+            } else {
+                single && !avg_sum && !avg_count
+            };
+            if !valid {
+                return Err(format!(
+                    "aggregate MV state roles are incomplete: aggregate_index={aggregate_index} kind={kind:?}"
+                ));
+            }
         }
 
         let visible_output_order = visible_output_order
@@ -434,5 +514,66 @@ mod tests {
             error,
             "aggregate MV retraction count state has invalid runtime shape: column=row_count"
         );
+    }
+
+    #[test]
+    fn layout_requires_avg_sum_and_count_roles() {
+        let error = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
+            vec![visible("avg_v", 0)],
+            vec![MvAggregateStateColumn::new(
+                "avg_state".to_string(),
+                DataType::LargeBinary,
+                false,
+                0,
+                0,
+                MvAggregateRuntimeKind::Avg,
+                MvAggregateStateRole::Single,
+                false,
+            )],
+            vec![Some(DataType::Int64)],
+            vec![],
+        )
+        .expect_err("AVG must not use one opaque state column");
+
+        assert_eq!(
+            error,
+            "aggregate MV AVG must use AvgSum and AvgCount roles: aggregate_index=0"
+        );
+    }
+
+    #[test]
+    fn layout_accepts_exact_avg_sum_and_count_roles() {
+        let layout = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
+            vec![visible("avg_v", 0)],
+            vec![
+                MvAggregateStateColumn::new(
+                    "avg_sum".to_string(),
+                    DataType::LargeBinary,
+                    false,
+                    0,
+                    0,
+                    MvAggregateRuntimeKind::Avg,
+                    MvAggregateStateRole::AvgSum,
+                    false,
+                ),
+                MvAggregateStateColumn::new(
+                    "avg_count".to_string(),
+                    DataType::LargeBinary,
+                    false,
+                    0,
+                    0,
+                    MvAggregateRuntimeKind::Avg,
+                    MvAggregateStateRole::AvgCount,
+                    false,
+                ),
+            ],
+            vec![Some(DataType::Int64)],
+            vec![],
+        )
+        .expect("exact AVG layout");
+
+        assert_eq!(layout.state_columns().len(), 2);
     }
 }

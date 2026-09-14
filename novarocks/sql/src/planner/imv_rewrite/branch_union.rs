@@ -253,7 +253,9 @@ fn branch_union_aggregate_change_stream_output_columns(
     }
     for column in &layout.state_columns {
         let data_type = match column.state_role {
-            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => DataType::Binary,
+            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
+            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => DataType::Binary,
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
                 column.data_type.clone()
             }

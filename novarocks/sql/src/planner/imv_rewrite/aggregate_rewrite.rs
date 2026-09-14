@@ -26,6 +26,7 @@ use crate::analysis::{
 };
 use crate::column_id::ColumnId;
 use crate::compiler::mv_rewrite::SqlImvAggregateStateRole;
+use crate::mv_refresh::AggregateFunctionKind;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
@@ -699,15 +700,32 @@ fn merged_state_expr(
         SqlImvAggregateStateRole::Single => Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: crate::functions::builtin_function_volatility(state_union_function(
-                    state_column.function,
+                    state_column,
                 )?),
-                name: state_union_function(state_column.function)?.to_string(),
+                name: state_union_function(state_column)?.to_string(),
                 args: vec![column_ref(old), column_ref(delta)],
                 distinct: false,
             },
             data_type: DataType::Binary,
             nullable: state_column.nullable,
         }),
+        SqlImvAggregateStateRole::AvgSum | SqlImvAggregateStateRole::AvgCount => {
+            let function = match state_column.state_role {
+                SqlImvAggregateStateRole::AvgSum => "sum_state_union",
+                SqlImvAggregateStateRole::AvgCount => "count_state_union",
+                _ => unreachable!("AVG state role was matched above"),
+            };
+            Ok(TypedExpr {
+                kind: ExprKind::FunctionCall {
+                    volatility: crate::functions::builtin_function_volatility(function),
+                    name: function.to_string(),
+                    args: vec![column_ref(old), column_ref(delta)],
+                    distinct: false,
+                },
+                data_type: DataType::Binary,
+                nullable: false,
+            })
+        }
         SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
             kind: ExprKind::Case {
                 operand: None,
@@ -870,9 +888,28 @@ fn aggregate_insert_expr_for_output(
             return source_expr_by_name(input_outputs, delta_outputs, &visible.name);
         }
         let state_column = single_state_column_for_visible(layout, visible_index)?;
-        let merged_state =
-            merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs)?;
-        let args = visible_state_args(state_column, merged_state, layout)?;
+        let args = if state_column.function == AggregateFunctionKind::Avg {
+            let sum_column = avg_state_column_for_visible(
+                layout,
+                visible_index,
+                SqlImvAggregateStateRole::AvgSum,
+            )?;
+            let count_column = avg_state_column_for_visible(
+                layout,
+                visible_index,
+                SqlImvAggregateStateRole::AvgCount,
+            )?;
+            visible_avg_state_args(
+                sum_column,
+                merged_state_expr(sum_column, input_outputs, delta_outputs, old_outputs)?,
+                merged_state_expr(count_column, input_outputs, delta_outputs, old_outputs)?,
+                layout,
+            )?
+        } else {
+            let merged_state =
+                merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs)?;
+            visible_state_args(state_column, merged_state)?
+        };
         return Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: crate::functions::builtin_function_volatility(visible_state_function(
@@ -1103,12 +1140,29 @@ fn single_state_column_for_visible(
         .state_columns
         .iter()
         .find(|column| {
-            column.state_role == SqlImvAggregateStateRole::Single
+            (column.state_role == SqlImvAggregateStateRole::Single
+                || column.state_role == SqlImvAggregateStateRole::AvgSum)
                 && column.visible_source_index == visible_index
         })
         .ok_or_else(|| {
             format!(
-                "Iceberg IMV aggregate rewrite missing single state column for visible output index {visible_index}"
+                "Iceberg IMV aggregate rewrite missing state column for visible output index {visible_index}"
+            )
+        })
+}
+
+fn avg_state_column_for_visible(
+    layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
+    visible_index: usize,
+    role: SqlImvAggregateStateRole,
+) -> Result<&crate::compiler::mv_rewrite::SqlImvAggregateStateColumn, String> {
+    layout
+        .state_columns
+        .iter()
+        .find(|column| column.state_role == role && column.visible_source_index == visible_index)
+        .ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite missing AVG {role:?} state column for visible output index {visible_index}"
             )
         })
 }
@@ -1136,14 +1190,28 @@ fn retraction_count_state_column(
 }
 
 fn state_union_function(
-    function: crate::mv_refresh::AggregateFunctionKind,
+    state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
 ) -> Result<&'static str, String> {
     use crate::mv_refresh::AggregateFunctionKind;
 
-    match function {
+    match state_column.state_role {
+        SqlImvAggregateStateRole::AvgSum => return Ok("sum_state_union"),
+        SqlImvAggregateStateRole::AvgCount => return Ok("count_state_union"),
+        SqlImvAggregateStateRole::RetractionCount => {
+            return Err(
+                "Iceberg IMV aggregate rewrite cannot union retraction count as binary state"
+                    .to_string(),
+            );
+        }
+        SqlImvAggregateStateRole::Single => {}
+    }
+    match state_column.function {
         AggregateFunctionKind::Count => Ok("count_state_union"),
         AggregateFunctionKind::Sum => Ok("sum_state_union"),
-        AggregateFunctionKind::Avg => Ok("avg_state_union"),
+        AggregateFunctionKind::Avg => Err(
+            "Iceberg IMV aggregate rewrite AVG must use explicit sum and count state columns"
+                .to_string(),
+        ),
         AggregateFunctionKind::Min => Ok("min_state_union"),
         AggregateFunctionKind::Max => Ok("max_state_union"),
         AggregateFunctionKind::BoolOr => Ok("bool_or_state_union"),
@@ -1176,10 +1244,24 @@ fn visible_state_function(
 fn visible_state_args(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     merged_state: TypedExpr,
-    layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<Vec<TypedExpr>, String> {
     use crate::mv_refresh::AggregateFunctionKind;
 
+    if state_column.function != AggregateFunctionKind::Avg {
+        return Ok(vec![merged_state]);
+    }
+    Err(
+        "Iceberg IMV aggregate rewrite AVG requires explicit sum and count state arguments"
+            .to_string(),
+    )
+}
+
+fn visible_avg_state_args(
+    state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
+    sum_state: TypedExpr,
+    count_state: TypedExpr,
+    layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
+) -> Result<Vec<TypedExpr>, String> {
     let visible = layout
         .visible_columns
         .get(state_column.visible_source_index)
@@ -1189,10 +1271,8 @@ fn visible_state_args(
                 state_column.visible_source_index
             )
         })?;
-    if state_column.function != AggregateFunctionKind::Avg
-        || !matches!(visible.data_type, DataType::Decimal128(_, _))
-    {
-        return Ok(vec![merged_state]);
+    if !matches!(visible.data_type, DataType::Decimal128(_, _)) {
+        return Ok(vec![sum_state, count_state]);
     }
     let Some(DataType::Decimal128(_, input_scale)) = layout
         .aggregate_input_types
@@ -1204,7 +1284,11 @@ fn visible_state_args(
             visible.name
         ));
     };
-    Ok(vec![merged_state, int64_literal(i64::from(*input_scale))])
+    Ok(vec![
+        sum_state,
+        count_state,
+        int64_literal(i64::from(*input_scale)),
+    ])
 }
 
 fn int64_literal(value: i64) -> TypedExpr {
@@ -1376,18 +1460,24 @@ fn aggregate_state_names(
             layout.state_columns.len()
         ));
     }
-    let single_state_count = layout
+    let state_call_count = layout
         .state_columns
         .iter()
         .filter(|column| {
-            column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+            column.state_role
+                != crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
         })
         .count();
-    if single_state_count != aggregate_node.aggregates.len() {
+    let expected_state_call_count = aggregate_node.aggregates.len()
+        + aggregate_node
+            .aggregates
+            .iter()
+            .filter(|call| call.name.eq_ignore_ascii_case("avg"))
+            .count();
+    if state_call_count != expected_state_call_count {
         return Err(format!(
-            "Iceberg IMV aggregate rewrite aggregate single state column count {} does not match aggregate call count {}",
-            single_state_count,
-            aggregate_node.aggregates.len()
+            "Iceberg IMV aggregate rewrite aggregate state column count {} does not match aggregate call count {}",
+            state_call_count, expected_state_call_count
         ));
     }
     for (index, (contract_column, layout_column)) in aggregate
@@ -1409,6 +1499,12 @@ fn aggregate_state_names(
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => {
                 crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::Single
             }
+            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum => {
+                crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::AvgSum
+            }
+            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
+                crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::AvgCount
+            }
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
                 crate::compiler::mv_rewrite::SqlImvAggregateStateRoleContract::RetractionCount
             }
@@ -1420,7 +1516,9 @@ fn aggregate_state_names(
             ));
         }
         match layout_column.state_role {
-            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => {
+            crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
+            | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
                 if !contract_column
                     .type_signature
                     .eq_ignore_ascii_case("binary")
@@ -1441,7 +1539,20 @@ fn aggregate_state_names(
                             aggregate_node.aggregates.len()
                         )
                     })?;
-                signed_state_function(&call.name)?;
+                if matches!(
+                    layout_column.state_role,
+                    crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
+                        | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount
+                ) {
+                    if !call.name.eq_ignore_ascii_case("avg") {
+                        return Err(format!(
+                            "Iceberg IMV aggregate rewrite AVG state column {} references non-AVG aggregate {}",
+                            contract_column.column_name, call.name
+                        ));
+                    }
+                } else {
+                    signed_state_function(&call.name)?;
+                }
             }
             crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
                 if !contract_column.type_signature.eq_ignore_ascii_case("long")
@@ -1496,12 +1607,19 @@ fn signed_aggregate(
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
 ) -> Result<LogicalPlanNode, String> {
     let input_columns = plan_output_columns(&aggregate_input)?;
-    let mut signed_calls = aggregate
-        .aggregates
+    let mut signed_calls = layout
+        .state_columns
         .iter()
-        .map(|call| {
+        .filter(|column| column.state_role != SqlImvAggregateStateRole::RetractionCount)
+        .map(|state_column| {
+            let call = aggregate.aggregates.get(state_column.aggregate_index).ok_or_else(|| {
+                format!(
+                    "Iceberg IMV aggregate rewrite state column {} references missing aggregate index {}",
+                    state_column.name, state_column.aggregate_index
+                )
+            })?;
             let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
-            signed_aggregate_call(&call, action_column, ctx.function_catalog())
+            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog())
         })
         .collect::<Result<Vec<_>, String>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
@@ -1892,45 +2010,52 @@ fn signed_aggregate_project_items(
                 });
             }
             VisibleAggregateOutput::Aggregate(aggregate_index) => {
-                let state_column = layout
+                let state_columns = layout
                     .state_columns
                     .iter()
-                    .find(|column| {
-                        column.state_role
-                            == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
-                            && column.aggregate_index == *aggregate_index
+                    .filter(|column| {
+                        column.aggregate_index == *aggregate_index
+                            && column.state_role != SqlImvAggregateStateRole::RetractionCount
                     })
-                    .ok_or_else(|| {
+                    .collect::<Vec<_>>();
+                if state_columns.is_empty() {
+                    return Err(format!(
+                        "Iceberg IMV aggregate rewrite missing state column for aggregate index {aggregate_index}"
+                    ));
+                }
+                for state_column in state_columns {
+                    let state_index = layout
+                        .state_columns
+                        .iter()
+                        .position(|column| column.name == state_column.name)
+                        .expect("state column was selected from this layout");
+                    let call = signed_calls.get(state_index).ok_or_else(|| {
                         format!(
-                            "Iceberg IMV aggregate rewrite missing state column for aggregate index {aggregate_index}"
+                            "Iceberg IMV aggregate rewrite missing signed state call for {}",
+                            state_column.name
                         )
                     })?;
-                let call = signed_calls.get(state_column.aggregate_index).ok_or_else(|| {
-                    format!(
-                        "Iceberg IMV aggregate rewrite missing signed state call for aggregate index {}",
-                        state_column.aggregate_index
-                    )
-                })?;
-                let child_output =
-                    signed_aggregate_child_output(aggregate_output_columns, state_column)?;
-                items.push(crate::analysis::ProjectItem {
-                    expr: TypedExpr {
-                        kind: ExprKind::ColumnRef {
-                            column_id: call.output_column_id,
-                            qualifier: None,
-                            column: child_output.name.clone(),
+                    let child_output =
+                        signed_aggregate_child_output(aggregate_output_columns, state_column)?;
+                    items.push(crate::analysis::ProjectItem {
+                        expr: TypedExpr {
+                            kind: ExprKind::ColumnRef {
+                                column_id: call.output_column_id,
+                                qualifier: None,
+                                column: child_output.name.clone(),
+                            },
+                            data_type: state_shaped_state_data_type(state_column),
+                            nullable: false,
                         },
-                        data_type: state_shaped_state_data_type(state_column),
-                        nullable: false,
-                    },
-                    output_name: state_column.name.clone(),
-                    output_column_id: allocate_imv_column(
-                        ctx,
-                        &state_column.name,
-                        state_shaped_state_data_type(state_column),
-                        false,
-                    )?,
-                });
+                        output_name: state_column.name.clone(),
+                        output_column_id: allocate_imv_column(
+                            ctx,
+                            &state_column.name,
+                            state_shaped_state_data_type(state_column),
+                            false,
+                        )?,
+                    });
+                }
             }
         }
     }
@@ -1985,7 +2110,9 @@ fn state_shaped_state_data_type(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
 ) -> DataType {
     match state_column.state_role {
-        crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single => DataType::Binary,
+        crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+        | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
+        | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => DataType::Binary,
         crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
             state_column.data_type.clone()
         }
@@ -2020,10 +2147,21 @@ fn retraction_count_aggregate_call(
 
 fn signed_aggregate_call(
     call: &AggregateCall,
+    state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<AggregateCall, String> {
-    let signed_name = signed_state_function(&call.name)?;
+    let signed_name = match state_column.state_role {
+        SqlImvAggregateStateRole::AvgSum => "sum_state_signed",
+        SqlImvAggregateStateRole::AvgCount => "count_state_signed",
+        SqlImvAggregateStateRole::Single => signed_state_function(&call.name)?,
+        SqlImvAggregateStateRole::RetractionCount => {
+            return Err(
+                "Iceberg IMV aggregate rewrite cannot build retraction count as a state call"
+                    .to_string(),
+            );
+        }
+    };
     let value = signed_value_arg(call)?;
     let input = signed_state_input(value, action_column);
     let resolved = function_catalog
@@ -2306,28 +2444,44 @@ mod tests {
                     nullable: true,
                 },
             ],
-            state_columns: vec![crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
-                name: "a__state".to_string(),
-                data_type: DataType::Binary,
-                nullable: false,
-                visible_source_index: 1,
-                aggregate_index: 0,
-                function: crate::mv_refresh::AggregateFunctionKind::Avg,
-                state_role: crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single,
-                count_star: false,
-            }],
+            state_columns: vec![
+                crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
+                    name: "a__state_avg_sum".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    visible_source_index: 1,
+                    aggregate_index: 0,
+                    function: crate::mv_refresh::AggregateFunctionKind::Avg,
+                    state_role: crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum,
+                    count_star: false,
+                },
+                crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
+                    name: "a__state_avg_count".to_string(),
+                    data_type: DataType::Binary,
+                    nullable: false,
+                    visible_source_index: 1,
+                    aggregate_index: 0,
+                    function: crate::mv_refresh::AggregateFunctionKind::Avg,
+                    state_role: crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount,
+                    count_star: false,
+                },
+            ],
             group_key_source_indexes: vec![0],
-            physical_column_names: vec!["k".to_string(), "a__state".to_string()],
+            physical_column_names: vec![
+                "k".to_string(),
+                "a__state_avg_sum".to_string(),
+                "a__state_avg_count".to_string(),
+            ],
             aggregate_input_types: vec![Some(DataType::Decimal128(20, 4))],
         };
         let state_column = layout
             .state_columns
             .iter()
             .find(|column| {
-                column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
+                column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
             })
-            .expect("single AVG state column");
-        let merged_state = TypedExpr {
+            .expect("AVG sum state column");
+        let sum_state = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: ColumnId::new_for_test(10),
                 qualifier: None,
@@ -2337,16 +2491,26 @@ mod tests {
             nullable: false,
         };
 
-        let args = visible_state_args(state_column, merged_state, &layout)
+        let count_state = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: ColumnId::new_for_test(11),
+                qualifier: None,
+                column: "a__state_avg_count".to_string(),
+            },
+            data_type: DataType::Binary,
+            nullable: false,
+        };
+
+        let args = visible_avg_state_args(state_column, sum_state, count_state, &layout)
             .expect("AVG decimal visible args");
 
-        assert_eq!(args.len(), 2);
+        assert_eq!(args.len(), 3);
         assert!(matches!(
-            &args[1].kind,
+            &args[2].kind,
             ExprKind::Literal(LiteralValue::Int(4))
         ));
-        assert_eq!(args[1].data_type, DataType::Int64);
-        assert!(!args[1].nullable);
+        assert_eq!(args[2].data_type, DataType::Int64);
+        assert!(!args[2].nullable);
     }
 
     fn col_expr(id: u32, name: &str) -> TypedExpr {
@@ -3562,7 +3726,7 @@ mod tests {
             .apply(expr, &mut ctx)
             .expect_err("state column count mismatch must fail");
         assert!(
-            err.contains("aggregate single state column count"),
+            err.contains("aggregate state column count"),
             "unexpected error: {err}"
         );
     }

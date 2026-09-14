@@ -484,6 +484,8 @@ pub(crate) struct SqlImvBaseSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SqlImvAggregateStateRole {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -597,6 +599,8 @@ pub(crate) struct SqlImvJoinContract {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SqlImvAggregateStateRoleContract {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -896,6 +900,8 @@ impl SqlImvJoinContractFacts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlImvAggregateStateRoleFacts {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -920,6 +926,12 @@ impl SqlImvAggregateStateColumnFacts {
                 role: match role {
                     SqlImvAggregateStateRoleFacts::Single => {
                         SqlImvAggregateStateRoleContract::Single
+                    }
+                    SqlImvAggregateStateRoleFacts::AvgSum => {
+                        SqlImvAggregateStateRoleContract::AvgSum
+                    }
+                    SqlImvAggregateStateRoleFacts::AvgCount => {
+                        SqlImvAggregateStateRoleContract::AvgCount
                     }
                     SqlImvAggregateStateRoleFacts::RetractionCount => {
                         SqlImvAggregateStateRoleContract::RetractionCount
@@ -1276,6 +1288,8 @@ impl SqlImvAggregateExecutionStateColumnFacts {
                 function,
                 state_role: match state_role {
                     SqlImvAggregateStateRoleFacts::Single => SqlImvAggregateStateRole::Single,
+                    SqlImvAggregateStateRoleFacts::AvgSum => SqlImvAggregateStateRole::AvgSum,
+                    SqlImvAggregateStateRoleFacts::AvgCount => SqlImvAggregateStateRole::AvgCount,
                     SqlImvAggregateStateRoleFacts::RetractionCount => {
                         SqlImvAggregateStateRole::RetractionCount
                     }
@@ -1721,6 +1735,12 @@ pub(crate) fn test_aggregate_snapshot(
                         SqlImvAggregateStateRoleContract::Single => {
                             SqlImvAggregateStateRole::Single
                         }
+                        SqlImvAggregateStateRoleContract::AvgSum => {
+                            SqlImvAggregateStateRole::AvgSum
+                        }
+                        SqlImvAggregateStateRoleContract::AvgCount => {
+                            SqlImvAggregateStateRole::AvgCount
+                        }
                         SqlImvAggregateStateRoleContract::RetractionCount => {
                             SqlImvAggregateStateRole::RetractionCount
                         }
@@ -1919,6 +1939,12 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     state_role: match column.role {
                         SqlImvAggregateStateRoleContract::Single => {
                             SqlImvAggregateStateRole::Single
+                        }
+                        SqlImvAggregateStateRoleContract::AvgSum => {
+                            SqlImvAggregateStateRole::AvgSum
+                        }
+                        SqlImvAggregateStateRoleContract::AvgCount => {
+                            SqlImvAggregateStateRole::AvgCount
                         }
                         SqlImvAggregateStateRoleContract::RetractionCount => {
                             SqlImvAggregateStateRole::RetractionCount

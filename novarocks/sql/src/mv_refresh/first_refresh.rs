@@ -28,7 +28,8 @@ use crate::column_id::ColumnRefFactory;
 use crate::compiler::RootDistributionRequirement;
 use crate::mv_refresh::aggregate_shape::{
     SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN, SQL_MV_ROW_ID_COLUMN, SqlAggregateCalls,
-    rewrite_select_sql_for_state, state_column_name,
+    avg_count_state_column_name, avg_sum_state_column_name, rewrite_select_sql_for_state,
+    state_column_name,
 };
 use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::planner::logical::LogicalPlanNode;
@@ -2395,7 +2396,14 @@ fn aggregate_physical_sql(
     aggregate_input_types: Option<&[Option<DataType>]>,
 ) -> Result<String, String> {
     let mut projection = Vec::with_capacity(
-        1 + calls.visible_outputs.len() + calls.aggregates.len() + usize::from(branch_id.is_some()),
+        1 + calls.visible_outputs.len()
+            + calls.aggregates.len()
+            + calls
+                .aggregates
+                .iter()
+                .filter(|aggregate| aggregate.function == AggregateFunctionKind::Avg)
+                .count()
+            + usize::from(branch_id.is_some()),
     );
     let group_key_refs = calls
         .group_keys
@@ -2444,6 +2452,13 @@ fn aggregate_physical_sql(
                     None
                 };
                 let args = if aggregate.function == AggregateFunctionKind::Avg {
+                    let sum_state_name = avg_sum_state_column_name(&aggregate.output_name);
+                    let count_state_name = avg_count_state_column_name(&aggregate.output_name);
+                    let state_args = format!(
+                        "{}, {}",
+                        qualified_column("state", &sum_state_name),
+                        qualified_column("state", &count_state_name),
+                    );
                     let input_type = aggregate_input_types
                         .and_then(|types| types.get(*aggregate_index))
                         .and_then(Option::as_ref);
@@ -2462,12 +2477,9 @@ fn aggregate_physical_sql(
                                 Some(DataType::Decimal128(_, scale)) => i64::from(*scale),
                                 _ => -1,
                             };
-                            format!(
-                                "{}, CAST({input_scale} AS BIGINT), {witness}",
-                                qualified_column("state", &state_name)
-                            )
+                            format!("{state_args}, CAST({input_scale} AS BIGINT), {witness}",)
                         }
-                        None => qualified_column("state", &state_name),
+                        None => state_args,
                     }
                 } else {
                     match witness {
@@ -2487,12 +2499,21 @@ fn aggregate_physical_sql(
     }
 
     for aggregate in &calls.aggregates {
-        let state_name = state_column_name(&aggregate.output_name);
-        projection.push(format!(
-            "{} AS {}",
-            qualified_column("state", &state_name),
-            quote_sql_identifier(&state_name),
-        ));
+        let state_names = if aggregate.function == AggregateFunctionKind::Avg {
+            vec![
+                avg_sum_state_column_name(&aggregate.output_name),
+                avg_count_state_column_name(&aggregate.output_name),
+            ]
+        } else {
+            vec![state_column_name(&aggregate.output_name)]
+        };
+        for state_name in state_names {
+            projection.push(format!(
+                "{} AS {}",
+                qualified_column("state", &state_name),
+                quote_sql_identifier(&state_name),
+            ));
+        }
     }
     if calls.needs_retraction_count_state() {
         projection.push(format!(
@@ -3264,7 +3285,7 @@ mod tests {
                 Some(&[Some(DataType::Decimal128(20, 4))]),
             )
             .unwrap();
-        assert!(prepared.sql().contains("avg_state_visible(`state`.`__agg_state_a_d`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))"), "{}", prepared.sql());
+        assert!(prepared.sql().contains("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))"), "{}", prepared.sql());
     }
 
     #[test]

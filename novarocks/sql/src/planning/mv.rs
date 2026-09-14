@@ -567,15 +567,24 @@ mod refresh_property_facade_tests {
                 "total",
                 "average",
                 "__agg_state_total",
-                "__agg_state_average",
+                "__agg_state_average_avg_sum",
+                "__agg_state_average_avg_count",
                 "__agg_state___ivm_row_count",
             ]
         );
         assert!(layout.row_id_column().is_key());
         assert_eq!(layout.runtime_layout().row_id_column_name(), "__row_id__");
-        assert_eq!(layout.runtime_layout().state_columns().len(), 3);
+        assert_eq!(layout.runtime_layout().state_columns().len(), 4);
+        assert_eq!(
+            layout.runtime_layout().state_columns()[1].state_role(),
+            novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgSum
+        );
         assert_eq!(
             layout.runtime_layout().state_columns()[2].state_role(),
+            novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgCount
+        );
+        assert_eq!(
+            layout.runtime_layout().state_columns()[3].state_role(),
             novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
         );
     }
@@ -3066,7 +3075,7 @@ pub fn rewrite_select_sql_for_state(
                         "rewrite_select_sql_for_state: aggregate index {aggregate_index} out of range"
                     )
                 })?;
-                new_projection.push(make_state_combinator_select_item(aggregate, false)?);
+                new_projection.extend(make_state_combinator_select_items(aggregate, false)?);
             }
         }
     }
@@ -3080,15 +3089,35 @@ pub fn rewrite_select_sql_for_state(
     Ok(printer::print_query(&query))
 }
 
-fn make_state_combinator_select_item(
+fn make_state_combinator_select_items(
     aggregate: &AggregateCallShape,
     signed: bool,
-) -> Result<ast::SelectItem, String> {
-    Ok(make_aggregate_select_item(
+) -> Result<Vec<ast::SelectItem>, String> {
+    let input = state_combinator_input_expr(aggregate)?;
+    if aggregate.function == AggregateFunctionKind::Avg {
+        let (sum_name, count_name) = if signed {
+            ("sum_state_signed", "count_state_signed")
+        } else {
+            ("sum_state", "count_state")
+        };
+        return Ok(vec![
+            make_aggregate_select_item(
+                sum_name,
+                input.clone(),
+                &aggregate_avg_sum_state_alias(&aggregate.output_name),
+            ),
+            make_aggregate_select_item(
+                count_name,
+                input,
+                &aggregate_avg_count_state_alias(&aggregate.output_name),
+            ),
+        ]);
+    }
+    Ok(vec![make_aggregate_select_item(
         state_combinator_name_for_kind(aggregate.function, signed),
-        state_combinator_input_expr(aggregate)?,
+        input,
         &aggregate_state_alias(&aggregate.output_name),
-    ))
+    )])
 }
 
 fn state_combinator_input_expr(aggregate: &AggregateCallShape) -> Result<ast::Expr, String> {
@@ -3110,6 +3139,14 @@ fn state_combinator_input_expr(aggregate: &AggregateCallShape) -> Result<ast::Ex
 fn aggregate_state_alias(output_name: &str) -> String {
     let sanitized = sanitize_state_column_name(output_name);
     format!("__agg_state_{sanitized}")
+}
+
+fn aggregate_avg_sum_state_alias(output_name: &str) -> String {
+    format!("{}_avg_sum", aggregate_state_alias(output_name))
+}
+
+fn aggregate_avg_count_state_alias(output_name: &str) -> String {
+    format!("{}_avg_count", aggregate_state_alias(output_name))
 }
 
 fn sanitize_state_column_name(name: &str) -> String {
@@ -3150,8 +3187,9 @@ fn state_combinator_name_for_kind(kind: AggregateFunctionKind, signed: bool) -> 
         (AggregateFunctionKind::Count, true) => "count_state_signed",
         (AggregateFunctionKind::Sum, false) => "sum_state",
         (AggregateFunctionKind::Sum, true) => "sum_state_signed",
-        (AggregateFunctionKind::Avg, false) => "avg_state",
-        (AggregateFunctionKind::Avg, true) => "avg_state_signed",
+        (AggregateFunctionKind::Avg, _) => {
+            unreachable!("AVG expands to explicit sum and count state columns")
+        }
         (AggregateFunctionKind::Min, false) => "min_state",
         (AggregateFunctionKind::Min, true) => "min_state_signed",
         (AggregateFunctionKind::Max, false) => "max_state",
@@ -4133,7 +4171,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_select_sql_avg_to_avg_state() {
+    fn rewrite_select_sql_avg_to_sum_and_count_state() {
         let original = "SELECT k1, COUNT(*) AS c, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten =
@@ -4145,11 +4183,17 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A_AVG_SUM"),
             "got: {rewritten}"
         );
         assert!(
-            !upper.contains("AVG(V2)") && !upper.contains("COUNT(*) AS C"),
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A_AVG_COUNT"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("AVG(V2)")
+                && !upper.contains("AVG_STATE(V2)")
+                && !upper.contains("COUNT(*) AS C"),
             "got: {rewritten}"
         );
     }
@@ -4200,7 +4244,11 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A_AVG_COUNT"),
             "got: {rewritten}"
         );
         assert!(
@@ -4219,11 +4267,19 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A1"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A1_AVG_SUM"),
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("AVG_STATE(V3) AS __AGG_STATE_A2"),
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A1_AVG_COUNT"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("SUM_STATE(V3) AS __AGG_STATE_A2_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V3) AS __AGG_STATE_A2_AVG_COUNT"),
             "got: {rewritten}"
         );
         assert!(!upper.contains("AVG(V2)") && !upper.contains("AVG(V3)"));
@@ -4239,8 +4295,12 @@ mod tests {
         let rewritten =
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
-        assert!(upper.contains("AVG_STATE(V2)"), "got: {rewritten}");
-        assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
+        assert!(upper.contains("SUM_STATE(V2)"), "got: {rewritten}");
+        assert!(upper.contains("COUNT_STATE(V2)"), "got: {rewritten}");
+        assert!(
+            !upper.contains("AVG(V2)") && !upper.contains("AVG_STATE(V2)"),
+            "got: {rewritten}"
+        );
         assert!(
             rewritten.contains("__agg_state_avg_v2_"),
             "state alias not found; got: {rewritten}"
@@ -4258,10 +4318,14 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2 + 1)") || upper.contains("AVG_STATE(V2+1)"),
+            (upper.contains("SUM_STATE(V2 + 1)") || upper.contains("SUM_STATE(V2+1)"))
+                && (upper.contains("COUNT_STATE(V2 + 1)") || upper.contains("COUNT_STATE(V2+1)")),
             "got: {rewritten}"
         );
-        assert!(!upper.contains("AVG(V2 + 1)"), "got: {rewritten}");
+        assert!(
+            !upper.contains("AVG(V2 + 1)") && !upper.contains("AVG_STATE(V2 + 1)"),
+            "got: {rewritten}"
+        );
     }
 
     #[test]
@@ -4421,7 +4485,11 @@ mod tests {
         );
         assert!(!upper.contains("AVG(V5)"), "got: {rewritten}");
         assert!(
-            upper.contains("AVG_STATE(V5) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V5) AS __AGG_STATE_A_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V5) AS __AGG_STATE_A_AVG_COUNT"),
             "got: {rewritten}"
         );
     }

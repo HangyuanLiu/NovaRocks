@@ -502,6 +502,12 @@ impl IcebergMvRewriteContext {
                                 novarocks_types::mv_aggregate_layout::MvAggregateStateRole::Single => {
                                     SqlImvAggregateStateRoleFacts::Single
                                 }
+                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgSum => {
+                                    SqlImvAggregateStateRoleFacts::AvgSum
+                                }
+                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgCount => {
+                                    SqlImvAggregateStateRoleFacts::AvgCount
+                                }
                                 novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount => {
                                     SqlImvAggregateStateRoleFacts::RetractionCount
                                 }
