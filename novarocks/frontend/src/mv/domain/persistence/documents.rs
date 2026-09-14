@@ -22,7 +22,7 @@
 //! that a Current document set must be internally complete. There is no
 //! descriptor-property or provider-token fallback in this adapter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
 use novarocks_mv_application::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
@@ -443,16 +443,25 @@ fn validate_create_target(
             "interpretation target does not match the provider-prepared target".to_string(),
         ));
     }
-    // A document-managed CREATE emits its physical columns in the same
-    // canonical logical-identity order used by L. Preserve the provider's
-    // request-ordinal mapping here instead of degrading it to set equality.
+    // A document-managed CREATE emits each distinct physical column at the
+    // ordinal of its first binding in L's canonical logical-identity order.
+    // Multiple typed logical identities may intentionally share that column.
+    // Preserve both the ordinal and provider field identity instead of
+    // degrading this comparison to unordered set equality.
     let mut target_fields = interpretation.target.fields.iter().collect::<Vec<_>>();
     target_fields.sort_by(|left, right| left.logical_identity.cmp(&right.logical_identity));
-    if target_fields.len() != target.fields().len()
-        || target_fields.iter().zip(target.fields()).enumerate().any(
-            |(ordinal, (field, prepared))| {
+    let mut physical_fields = Vec::with_capacity(target_fields.len());
+    let mut seen_physical_fields = BTreeSet::new();
+    for field in target_fields {
+        if seen_physical_fields.insert(field.target_field_id.as_bytes()) {
+            physical_fields.push(field.target_field_id.as_bytes());
+        }
+    }
+    if physical_fields.len() != target.fields().len()
+        || physical_fields.iter().zip(target.fields()).enumerate().any(
+            |(ordinal, (field_id, prepared))| {
                 prepared.request_ordinal() as usize != ordinal
-                    || field.target_field_id.as_bytes() != prepared.provider_field_id().as_ref()
+                    || *field_id != prepared.provider_field_id().as_ref()
             },
         )
     {
@@ -686,15 +695,16 @@ mod tests {
 
     use novarocks_mv_application::management::ManagementDependencySet;
     use novarocks_mv_application::persistence::codec::{
-        ApplyKey, ApplyKeyComponent, ApplyKeyKind, ExpressionKind, ExpressionShape, OutputBinding,
-        OutputDefinition, PhysicalFieldBinding, PhysicalFieldLogicalIdentity, PublicationInput,
-        PublicationKind, PublicationOutput, PublicationStatistics, QueryDialect, QuerySource,
-        RefreshPolicy, RelationOccurrence, ResolutionContext, SourceFieldBinding,
-        SourceFieldReference, TargetBinding, build_definition,
+        ApplyKey, ApplyKeyComponent, ApplyKeyKind, BranchInterpretation, ExpressionKind,
+        ExpressionShape, OutputBinding, OutputDefinition, PhysicalFieldBinding,
+        PhysicalFieldLogicalIdentity, PublicationInput, PublicationKind, PublicationOutput,
+        PublicationStatistics, QueryDialect, QuerySource, RefreshPolicy, RelationOccurrence,
+        ResolutionContext, SourceFieldBinding, SourceFieldReference, TargetBinding,
+        build_definition,
     };
     use novarocks_mv_application::persistence::identity::{
-        ApplyKeyIdentity, FieldIdentity, NativeDataVersion, ObjectIdentity, OutputIdentity,
-        PartitionSpecVersion, PublicationIdentity, SchemaVersion,
+        ApplyKeyIdentity, BranchIdentity, FieldIdentity, NativeDataVersion, ObjectIdentity,
+        OutputIdentity, PartitionSpecVersion, PublicationIdentity, SchemaVersion,
     };
     use novarocks_spi::connector::document_storage::{
         ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier, ConnectorDocumentDiscoveryPage,
@@ -854,6 +864,28 @@ mod tests {
         )
         .unwrap();
         (definition, interpretation, configuration, target)
+    }
+
+    fn prepared_target_with_fields(
+        target: &ConnectorPreparedCreateDocumentTarget,
+        fields: Vec<(u32, Bytes)>,
+    ) -> Result<ConnectorPreparedCreateDocumentTarget, ConnectorError> {
+        ConnectorPreparedCreateDocumentTarget::try_new(
+            target.owner().clone(),
+            target.catalog_handle().clone(),
+            target.operation_id(),
+            target.target().clone(),
+            target.object_id().clone(),
+            target.schema_version().clone(),
+            target.partition_spec_version().clone(),
+            fields
+                .into_iter()
+                .map(|(ordinal, field_id)| {
+                    ConnectorPreparedCreateFieldBinding::try_new(ordinal, field_id)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            target.provider_token().clone(),
+        )
     }
 
     fn stored(document: &ConnectorDocument, output: bool) -> ConnectorStoredDocument {
@@ -1156,6 +1188,133 @@ mod tests {
 
         assert!(
             create_document_set(&definition, &interpretation, &configuration, &target).is_err()
+        );
+    }
+
+    #[test]
+    fn create_accepts_multiple_branch_identities_sharing_one_prepared_physical_field() {
+        let (definition, mut interpretation, configuration, target) = fixture();
+        let output_id = interpretation.outputs[0].output_id.clone();
+        let shared_field_id = interpretation.outputs[0].target_field_id.clone();
+        let first_branch = opaque(20, BranchIdentity::try_new);
+        let second_branch = opaque(21, BranchIdentity::try_new);
+        interpretation.branches = vec![
+            BranchInterpretation {
+                branch_id: first_branch.clone(),
+                relation_occurrence_ids: vec![0],
+                output_ids: vec![output_id.clone()],
+            },
+            BranchInterpretation {
+                branch_id: second_branch.clone(),
+                relation_occurrence_ids: vec![0],
+                output_ids: vec![output_id],
+            },
+        ];
+        interpretation.target.fields.extend([
+            PhysicalFieldBinding {
+                logical_identity: PhysicalFieldLogicalIdentity::Branch(first_branch),
+                target_field_id: shared_field_id.clone(),
+                type_signature: "bigint".to_string(),
+                nullable: false,
+            },
+            PhysicalFieldBinding {
+                logical_identity: PhysicalFieldLogicalIdentity::Branch(second_branch),
+                target_field_id: shared_field_id,
+                type_signature: "bigint".to_string(),
+                nullable: false,
+            },
+        ]);
+
+        create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("shared physical target field");
+    }
+
+    #[test]
+    fn create_rejects_missing_or_extra_prepared_physical_fields() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let missing = prepared_target_with_fields(
+            &target,
+            vec![(0, target.fields()[0].provider_field_id().clone())],
+        )
+        .unwrap();
+        assert!(
+            create_document_set(&definition, &interpretation, &configuration, &missing).is_err()
+        );
+
+        let extra = prepared_target_with_fields(
+            &target,
+            vec![
+                (0, target.fields()[0].provider_field_id().clone()),
+                (1, target.fields()[1].provider_field_id().clone()),
+                (2, Bytes::from_static(b"extra-provider-field")),
+            ],
+        )
+        .unwrap();
+        assert!(create_document_set(&definition, &interpretation, &configuration, &extra).is_err());
+    }
+
+    #[test]
+    fn create_rejects_mismatched_prepared_ordinal_or_field_identity() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let swapped_ordinals = prepared_target_with_fields(
+            &target,
+            vec![
+                (0, target.fields()[1].provider_field_id().clone()),
+                (1, target.fields()[0].provider_field_id().clone()),
+            ],
+        )
+        .unwrap();
+        assert!(
+            create_document_set(
+                &definition,
+                &interpretation,
+                &configuration,
+                &swapped_ordinals,
+            )
+            .is_err()
+        );
+
+        let mismatched_field = prepared_target_with_fields(
+            &target,
+            vec![
+                (0, target.fields()[0].provider_field_id().clone()),
+                (1, Bytes::from_static(b"unknown-provider-field")),
+            ],
+        )
+        .unwrap();
+        assert!(
+            create_document_set(
+                &definition,
+                &interpretation,
+                &configuration,
+                &mismatched_field,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepared_target_rejects_duplicate_or_non_dense_ordinals() {
+        let (_, _, _, target) = fixture();
+        assert!(
+            prepared_target_with_fields(
+                &target,
+                vec![
+                    (0, target.fields()[0].provider_field_id().clone()),
+                    (0, target.fields()[1].provider_field_id().clone()),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            prepared_target_with_fields(
+                &target,
+                vec![
+                    (0, target.fields()[0].provider_field_id().clone()),
+                    (2, target.fields()[1].provider_field_id().clone()),
+                ],
+            )
+            .is_err()
         );
     }
 
