@@ -131,23 +131,27 @@ impl ConnectorAttemptAccessPlanBuilder {
 /// frozen read - the pairing the plan was published with says so - and the
 /// physical fragment and node identities are the ones the wire carries, so the
 /// key is a translation rather than a lookup that could miss.
+pub(crate) type FrozenReadCapability = (
+    novarocks_sql::binding::SqlTableBindingId,
+    ConnectorReadAttemptAccess,
+    ConnectorControlPlanningLease,
+    CatalogProperties,
+);
+
 pub(crate) fn attempt_access_for_completed_plan(
     plan: &novarocks_physical_plan::PhysicalPlan,
-    reads: novarocks_query_application::preparation::FinalPlanRuntimeAccess<
-        crate::query_execution::provider_read_facts::FrozenProviderRead,
-    >,
+    mut reads: BTreeMap<novarocks_physical_plan::ProviderReadOccurrenceId, FrozenReadCapability>,
 ) -> Result<ConnectorAttemptAccessPlan, String> {
     // A capability cannot be copied, so each is taken out as its scan claims
     // it. Two scans claiming one occurrence would leave the second with
     // nothing, which is what the absent entry below reports.
-    let mut reads = reads.into_occurrences();
     let mut entries = BTreeMap::new();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
             let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
                 continue;
             };
-            let frozen = reads.remove(occurrence).ok_or_else(|| {
+            let (_, access, generation, catalog) = reads.remove(occurrence).ok_or_else(|| {
                 format!(
                     "completed plan scans provider read occurrence {} with no frozen read",
                     occurrence.get()
@@ -161,9 +165,9 @@ pub(crate) fn attempt_access_for_completed_plan(
                 .insert(
                     (fragment_id, node_id),
                     Arc::new(ConnectorAttemptAccessEntry {
-                        catalog_properties: frozen.access.catalog,
-                        planning_lease: frozen.access.generation,
-                        access: frozen.access.access,
+                        catalog_properties: catalog,
+                        planning_lease: generation,
+                        access,
                     }),
                 )
                 .is_some()

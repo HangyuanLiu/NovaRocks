@@ -121,6 +121,13 @@ pub(crate) struct FrozenReadEncoding {
     pub(crate) columns: Box<[(ProviderColumnReference, ProviderReadColumnNeed)]>,
     pub(crate) relation: novarocks_spi::connector::read_stack::ConnectorReadRelation,
     pub(crate) assignments: Vec<ConnectorReadAssignment>,
+    /// The constraint the provider was offered.
+    ///
+    /// Splits are enumerated against what was offered, not against what the
+    /// provider took on: a provider that declined still prunes by whatever it
+    /// can, and handing it less than it was asked about would enumerate more
+    /// work than the query needs.
+    pub(crate) offered_constraint: ConnectorReadConstraint,
     /// What the provider guarantees. The engine may stop evaluating it.
     pub(crate) enforced_predicate: TupleDomain<ConnectorReadColumnHandle>,
     /// What the reader must still apply itself.
@@ -302,6 +309,7 @@ fn freeze_one_read(
                     columns: named_columns,
                     relation: provider_relation.clone(),
                     assignments: assignments.clone(),
+                    offered_constraint: offered_constraint(&offer),
                     enforced_predicate,
                     unenforced_predicate,
                     remaining_expression,
@@ -644,6 +652,17 @@ fn limit_fact(
     } else {
         ProviderReadLimitFact::Residual(rows)
     }
+}
+
+/// What the provider was offered as a filter, if anything.
+fn offered_constraint(offer: &OfferedOps) -> ConnectorReadConstraint {
+    offer
+        .filter
+        .and_then(|index| match &offer.ops[index] {
+            ReadPushdownOp::Filter { constraint } => Some(constraint.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| ConnectorReadConstraint::of_summary(TupleDomain::all()))
 }
 
 /// Who evaluates what, after the provider answered the filter.

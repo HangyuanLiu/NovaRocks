@@ -32,7 +32,8 @@ use std::collections::BTreeMap;
 
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::{
-    FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference, Relation,
+    FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference, ProviderReadOccurrenceId,
+    Relation,
 };
 use novarocks_plan_codec::{
     PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
@@ -43,40 +44,125 @@ use novarocks_proto_codec::connector_read::{
     ConnectorReadEncoder, ConnectorTableScanSource, encode_connector_expression,
 };
 use novarocks_proto_models::{connector_read as dto, plan};
-use novarocks_query_application::preparation::{CompletedPlanWithAccess, FinalPlanRuntimeAccess};
+use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
 use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
+use crate::query_execution::split_assignment_round::RoundSplitSourceRecipe;
+use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
 
-/// A completed plan on the wire, and the capabilities its reads will be
-/// performed with.
+/// A completed plan on the wire, the capabilities its reads will be performed
+/// with, and what opening each of those reads takes.
 pub(crate) struct EncodedCompletedPlan {
     pub(crate) plan: plan::DistributedPlan,
     pub(crate) access: ConnectorAttemptAccessPlan,
+    /// One per scan, in plan order.
+    pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
 }
 
-/// Put one completed plan on the wire, and place the capabilities its scans
-/// were frozen with.
+/// Put one completed plan on the wire, and place everything its scans were
+/// frozen with where the attempt that runs them will look.
 ///
-/// The two halves of a frozen read separate exactly here, and in this order:
-/// the encoding half is read while the capabilities are still accounted for,
-/// and the capabilities are then moved - not copied, because a capability
-/// cannot be - into the plan for the attempt that will use them.
+/// A freeze leaves three things and each has its own consumer: facts that put
+/// the plan on the wire, a capability that performs the read, and what opening
+/// that read's splits takes. They separate exactly here, after having been
+/// accounted for together, and the capability moves rather than copies because
+/// a capability cannot be copied.
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
 ) -> Result<EncodedCompletedPlan, String> {
     let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
-    let facts = physical_v1_private_facts(plan, &reads)?;
+    let mut encodings = BTreeMap::new();
+    let mut capabilities = BTreeMap::new();
+    for (occurrence, read) in reads.into_occurrences() {
+        let FrozenProviderRead {
+            access,
+            generation,
+            catalog,
+            encoding,
+        } = read.access;
+        encodings.insert(occurrence, encoding);
+        capabilities.insert(occurrence, (read.binding, access, generation, catalog));
+    }
+    let facts = physical_v1_private_facts(plan, &encodings)?;
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
+    let access = attempt_access_for_completed_plan(plan, capabilities)?;
+    let split_sources = split_source_recipes(plan, &encodings, &access)?;
     Ok(EncodedCompletedPlan {
         plan: encoded,
-        access: attempt_access_for_completed_plan(plan, reads)?,
+        access,
+        split_sources,
     })
+}
+
+/// What opening each scan's split source takes, for one attempt.
+fn split_source_recipes(
+    plan: &PhysicalPlan,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    access: &ConnectorAttemptAccessPlan,
+) -> Result<Vec<RoundSplitSourceRecipe>, String> {
+    let runtime_filters = physical_v1_scan_runtime_filters(plan)?;
+    let mut recipes = Vec::new();
+    for fragment in plan.fragments().values() {
+        for node in fragment.nodes().values() {
+            let NodeKind::Scan {
+                occurrence,
+                provider_outputs,
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            let encoding = encodings.get(occurrence).ok_or_else(|| {
+                format!(
+                    "completed plan scans provider read occurrence {} with no frozen read",
+                    occurrence.get()
+                )
+            })?;
+            let node_id = wire_node_id(node.id)?;
+            let fragment_id = SqlFragmentId::from(fragment.id().get());
+            let entry = access.share(fragment_id, node_id).ok_or_else(|| {
+                format!(
+                    "completed plan scan fragment_id={fragment_id} node_id={node_id} has no attempt access"
+                )
+            })?;
+            let dynamic_filters = runtime_filters
+                .get(&(fragment.id(), node.id))
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .map(|(filter_id, value)| {
+                    let ordinal = provider_outputs
+                        .iter()
+                        .position(|(_, output)| output == value)
+                        .ok_or_else(|| {
+                            format!(
+                                "runtime filter {filter_id} constrains a value scan node {node_id} does not produce"
+                            )
+                        })?;
+                    Ok((*filter_id, encoding.assignments[ordinal].column().clone()))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            recipes.push(RoundSplitSourceRecipe::for_frozen_read(
+                fragment_id,
+                node_id,
+                encoding.assignments.clone(),
+                dynamic_filters,
+                encoding.offered_constraint.clone(),
+                entry,
+            ));
+        }
+    }
+    Ok(recipes)
+}
+
+fn wire_node_id(node: NodeId) -> Result<i32, String> {
+    i32::try_from(node.get())
+        .map_err(|_| format!("scan node {} exceeds the wire node identity", node.get()))
 }
 
 /// One plan's wire-private scan facts, addressed the way the encoder asks for
@@ -92,9 +178,9 @@ impl PhysicalV1PrivateFacts for FrontendPhysicalV1Facts {
 }
 
 /// Build the private facts for every scan of one completed plan.
-pub(crate) fn physical_v1_private_facts(
+fn physical_v1_private_facts(
     plan: &PhysicalPlan,
-    reads: &FinalPlanRuntimeAccess<FrozenProviderRead>,
+    encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
 ) -> Result<FrontendPhysicalV1Facts, String> {
     // The encoder derives the runtime-filter binding identities itself and
     // checks what it is handed against them. Asking it rather than repeating
@@ -113,13 +199,12 @@ pub(crate) fn physical_v1_private_facts(
             else {
                 continue;
             };
-            let frozen = reads.get(*occurrence).ok_or_else(|| {
+            let encoding = encodings.get(occurrence).ok_or_else(|| {
                 format!(
                     "completed plan scans provider read occurrence {} with no frozen read",
                     occurrence.get()
                 )
             })?;
-            let encoding = &frozen.access.encoding;
             let dynamic_filters = runtime_filters
                 .get(&(fragment.id(), node.id))
                 .map_or(&[][..], Vec::as_slice);
