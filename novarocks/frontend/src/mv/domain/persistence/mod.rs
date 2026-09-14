@@ -19,5 +19,6 @@ pub mod definition;
 pub mod dependency;
 pub mod descriptor;
 pub(crate) mod documents;
+pub(crate) mod exact_revision;
 pub mod schema;
 pub mod semantic;

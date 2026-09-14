@@ -139,6 +139,36 @@ impl ConnectorExactSemanticRevision {
         })
     }
 
+    /// Restore the complete provider-issued facts carried by an
+    /// application-owned durable publication.
+    ///
+    /// This does not interpret either value. It reapplies the SPI bounds and
+    /// requires one provider identity for both halves so a persisted bare byte
+    /// string can never be promoted into an exact revision by itself.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_persisted_facts(
+        provider: ConnectorProviderId,
+        object_format: impl Into<Arc<str>>,
+        object_version: u16,
+        object_value: Bytes,
+        data_format: impl Into<Arc<str>>,
+        data_version: u16,
+        data_value: Bytes,
+    ) -> Result<Self, ConnectorError> {
+        let object_identity = ConnectorSemanticFact::try_new(
+            provider.clone(),
+            object_format,
+            object_version,
+            object_value,
+        )?;
+        let data_version =
+            ConnectorSemanticFact::try_new(provider, data_format, data_version, data_value)?;
+        Ok(Self {
+            object_identity,
+            data_version,
+        })
+    }
+
     pub const fn object_identity(&self) -> &ConnectorSemanticFact {
         &self.object_identity
     }
@@ -180,6 +210,43 @@ mod tests {
                 Some(101),
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn exact_revision_restores_only_complete_persisted_provider_facts() {
+        let provider = ConnectorProviderId::parse("iceberg").unwrap();
+        let object = ConnectorTableObjectId::try_new(Bytes::from_static(b"table-a")).unwrap();
+        let original = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            provider.clone(),
+            &object,
+            Some(101),
+        )
+        .unwrap();
+
+        let restored = ConnectorExactSemanticRevision::try_from_persisted_facts(
+            provider,
+            original.object_identity().format(),
+            original.object_identity().version(),
+            original.object_identity().value().clone(),
+            original.data_version().format(),
+            original.data_version().version(),
+            original.data_version().value().clone(),
+        )
+        .unwrap();
+
+        assert_eq!(restored, original);
+        assert!(
+            ConnectorExactSemanticRevision::try_from_persisted_facts(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                "",
+                1,
+                Bytes::from_static(b"object"),
+                "snapshot",
+                1,
+                Bytes::from_static(b"data"),
+            )
+            .is_err()
         );
     }
 }

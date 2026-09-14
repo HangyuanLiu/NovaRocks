@@ -46,10 +46,11 @@ pub(crate) const DOCUMENT_UPDATE_OPERATION_PROPERTY: &str =
 pub(crate) fn update_properties(
     intent: &ConnectorDocumentUpdateIntent,
     operation_id: ConnectorMutationOperationId,
+    current_metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<HashMap<String, String>, ConnectorError> {
     let prepared = intent.prepared_documents();
-    let manifest = validated_prepared_manifest(prepared)?;
-    if manifest.documents.iter().any(|document| {
+    let replacements = validated_prepared_manifest(prepared)?;
+    if replacements.documents.iter().any(|document| {
         !matches!(
             document.attachment,
             IcebergDocumentAttachmentV1::TableMetadata
@@ -59,6 +60,7 @@ pub(crate) fn update_properties(
             "Iceberg document update contains a non-metadata attachment",
         ));
     }
+    let manifest = merge_table_metadata_manifest(current_metadata, replacements)?;
     let encoded = super::codec::encode_document_manifest(&manifest)?;
     let encoded = std::str::from_utf8(&encoded)
         .map_err(|_| corrupt("prepared Iceberg document manifest is not UTF-8 metadata"))?;
@@ -84,6 +86,77 @@ pub(crate) fn update_properties(
         );
     }
     Ok(properties)
+}
+
+/// Merge a partial application-document update into the exact table-metadata
+/// manifest loaded and version-checked by the caller.
+///
+/// An update document replaces the document with the same `(owner, name)` and
+/// leaves every other envelope byte-for-byte unchanged. New names are appended
+/// in the provider-prepared order. Commit-output documents live on snapshots,
+/// so neither the current nor replacement table-metadata manifest may contain
+/// one.
+fn merge_table_metadata_manifest(
+    current_metadata: &crate::iceberg::spec::TableMetadata,
+    replacements: IcebergDocumentManifestV1,
+) -> Result<IcebergDocumentManifestV1, ConnectorError> {
+    let mut current = match current_metadata
+        .properties()
+        .get(DOCUMENT_MANIFEST_PROPERTY)
+    {
+        Some(encoded) => super::codec::decode_document_manifest(encoded.as_bytes())?,
+        None => IcebergDocumentManifestV1 {
+            version: super::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: Vec::new(),
+        },
+    };
+    if current.documents.iter().any(|document| {
+        !matches!(
+            document.attachment,
+            IcebergDocumentAttachmentV1::TableMetadata
+        )
+    }) {
+        return Err(corrupt(
+            "Iceberg table-metadata document manifest contains a non-metadata attachment",
+        ));
+    }
+
+    let mut replacement_indexes = HashMap::new();
+    let mut replacements = replacements
+        .documents
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    for (index, replacement) in replacements.iter().enumerate() {
+        let replacement = replacement
+            .as_ref()
+            .expect("replacement document is present while indexing");
+        if replacement_indexes
+            .insert((replacement.owner.clone(), replacement.name.clone()), index)
+            .is_some()
+        {
+            return Err(corrupt(
+                "Iceberg document update repeats an owner/name identity",
+            ));
+        }
+    }
+
+    let mut current_names = std::collections::HashSet::new();
+    for document in &mut current.documents {
+        let key = (document.owner.clone(), document.name.clone());
+        if !current_names.insert(key.clone()) {
+            return Err(corrupt(
+                "Iceberg table-metadata manifest repeats an owner/name identity",
+            ));
+        }
+        if let Some(index) = replacement_indexes.get(&key) {
+            *document = replacements[*index]
+                .take()
+                .expect("a replacement owner/name is consumed exactly once");
+        }
+    }
+    current.documents.extend(replacements.into_iter().flatten());
+    Ok(current)
 }
 
 pub(crate) fn operation_marker(operation_id: ConnectorMutationOperationId) -> String {

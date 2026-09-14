@@ -25,6 +25,9 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
+use novarocks_mv_application::management::{
+    DeploymentOwner, ManagedMvTarget, ManagementDependencySet, ProcessIncarnation,
+};
 use novarocks_mv_application::persistence::codec::{
     ConfigurationDocument, DefinitionDocument, EncodedDocument, InterpretationDocument,
     PersistenceCodecError, PublicationDocument, decode_configuration, decode_definition,
@@ -36,10 +39,11 @@ use novarocks_mv_application::persistence::validation::{
     PersistenceDecodeBudget, ValidationError, validate_document_set,
 };
 use novarocks_spi::connector::document_storage::{
-    ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentFormat, ConnectorDocumentId,
-    ConnectorDocumentManagementObservation, ConnectorDocumentName, ConnectorDocumentOwner,
+    ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentCarrier,
+    ConnectorDocumentFormat, ConnectorDocumentId, ConnectorDocumentManagementObservation,
+    ConnectorDocumentName, ConnectorDocumentObservationRequest, ConnectorDocumentOwner,
     ConnectorDocumentReference, ConnectorDocumentRevision, ConnectorDocumentSet,
-    ConnectorStoredDocument, ConnectorStoredDocumentAttachment,
+    ConnectorDocumentStorageLease, ConnectorStoredDocument, ConnectorStoredDocumentAttachment,
 };
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorPreparedCreateDocumentTarget, ConnectorTableIdentity,
@@ -54,9 +58,50 @@ const CONFIGURATION: &str = "configuration";
 const REFERENCES_DEFINITION: &str = "definition";
 const REFERENCES_INTERPRETATION: &str = "interpretation";
 const FORMAT_VERSION: u32 = 1;
+const MANAGED_MV_KIND: &str = "materialized-view";
+
+/// Exact lake inputs from which an Accelerator projection was derived.
+///
+/// The provider metadata version, each application document revision, and the
+/// output version attached to P remain separate facts. A caller must compare
+/// this whole value after long-running work; no timestamp or snapshot ID can
+/// stand in for the complete source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MvDocumentSourceRevision {
+    pub target: ConnectorTableIdentity,
+    pub target_object_id: ConnectorTableObjectId,
+    pub metadata_version: ConnectorCommittedVersion,
+    pub definition_revision: DocumentRevision,
+    pub interpretation_revision: DocumentRevision,
+    pub publication_revision: Option<DocumentRevision>,
+    pub publication_output_version: Option<ConnectorCommittedVersion>,
+    pub configuration_revision: DocumentRevision,
+    pub deployment_owner: DeploymentOwner,
+    pub process_incarnation: ProcessIncarnation,
+}
+
+impl MvDocumentSourceRevision {
+    /// The exact immutable dependencies guarded by the single management
+    /// entrance. C is deliberately absent because configuration changes are an
+    /// independent target mutation; it remains part of the Accelerator source
+    /// revision above and therefore still invalidates stale projections.
+    pub(crate) fn management_dependencies(&self, runtime_epoch: u64) -> ManagementDependencySet {
+        ManagementDependencySet::new(
+            *self.definition_revision.as_bytes(),
+            *self.interpretation_revision.as_bytes(),
+            self.publication_revision
+                .as_ref()
+                .map(|revision| *revision.as_bytes()),
+            runtime_epoch,
+        )
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvDecodedDocuments {
+    pub management_target: ManagedMvTarget,
+    pub deployment_owner: DeploymentOwner,
+    pub process_incarnation: ProcessIncarnation,
     pub target: ConnectorTableIdentity,
     pub target_object_id: ConnectorTableObjectId,
     pub metadata_version: ConnectorCommittedVersion,
@@ -69,6 +114,23 @@ pub(crate) struct MvDecodedDocuments {
     pub publication_output_version: Option<ConnectorCommittedVersion>,
     pub configuration: ConfigurationDocument,
     pub configuration_revision: DocumentRevision,
+}
+
+impl MvDecodedDocuments {
+    pub(crate) fn source_revision(&self) -> MvDocumentSourceRevision {
+        MvDocumentSourceRevision {
+            target: self.target.clone(),
+            target_object_id: self.target_object_id.clone(),
+            metadata_version: self.metadata_version.clone(),
+            definition_revision: self.definition_revision,
+            interpretation_revision: self.interpretation_revision,
+            publication_revision: self.publication_revision,
+            publication_output_version: self.publication_output_version.clone(),
+            configuration_revision: self.configuration_revision,
+            deployment_owner: self.deployment_owner.clone(),
+            process_incarnation: self.process_incarnation.clone(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -194,12 +256,23 @@ pub(crate) fn publication_document_set(
 /// Decodes one exact, lease-sealed management observation. Deferred bodies
 /// must be loaded through the original observation request before entering
 /// this application boundary.
-pub(crate) fn decode_current_management_documents(
+fn decode_current_management_documents(
     observation: &ConnectorDocumentManagementObservation,
     loaded_documents: &[ConnectorDocument],
     budget: PersistenceDecodeBudget,
 ) -> Result<MvDecodedDocuments, MvDocumentError> {
     observation.validate_sealed()?;
+    if observation.marker().kind() != MANAGED_MV_KIND {
+        return Err(MvDocumentError::Contract(
+            "Current management marker is not a materialized view".to_string(),
+        ));
+    }
+    let management_target = ManagedMvTarget::from_observation(observation)
+        .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
+    let deployment_owner = DeploymentOwner::parse(observation.marker().owner())
+        .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
+    let process_incarnation = ProcessIncarnation::parse(observation.marker().incarnation())
+        .map_err(|error| MvDocumentError::Contract(error.to_string()))?;
     let decoded = decode_document_slice(observation.documents(), loaded_documents, budget)?;
     if decoded.interpretation.target.object_id.as_bytes()
         != observation.object_id().as_bytes().as_ref()
@@ -209,6 +282,9 @@ pub(crate) fn decode_current_management_documents(
         ));
     }
     Ok(MvDecodedDocuments {
+        management_target,
+        deployment_owner,
+        process_incarnation,
         target: observation.target().clone(),
         target_object_id: observation.object_id().clone(),
         metadata_version: observation.metadata_version().clone(),
@@ -222,6 +298,33 @@ pub(crate) fn decode_current_management_documents(
         configuration: decoded.configuration,
         configuration_revision: decoded.configuration_revision,
     })
+}
+
+/// Observe one exact Current package, explicitly resolve only its deferred
+/// bodies through the retained request, then decode the sealed D/L/P/C set.
+///
+/// Cloning the request retains the same shared operation budget. Every body
+/// load is therefore charged together with the initial observation rather than
+/// receiving a fresh per-document allowance.
+pub(crate) fn observe_current_management_documents(
+    lease: &ConnectorDocumentStorageLease,
+    request: ConnectorDocumentObservationRequest,
+    decode_budget: PersistenceDecodeBudget,
+) -> Result<MvDecodedDocuments, MvDocumentError> {
+    let retained_request = request.clone();
+    let observation = lease.observe_current_management(request)?;
+    let mut loaded_documents = Vec::new();
+    for stored in observation.documents() {
+        if matches!(
+            stored.carrier(),
+            ConnectorDocumentCarrier::DeferredContent(_)
+        ) {
+            let load = retained_request
+                .try_load_request(stored.clone(), retained_request.context().clone())?;
+            loaded_documents.push(lease.load_document(load)?);
+        }
+    }
+    decode_current_management_documents(&observation, &loaded_documents, decode_budget)
 }
 
 #[derive(Debug)]
@@ -625,17 +728,20 @@ mod tests {
         PartitionSpecVersion, PublicationIdentity, SchemaVersion,
     };
     use novarocks_spi::connector::document_storage::{
-        ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier,
+        ConnectorDeferredDocumentHandle, ConnectorDocumentCarrier, ConnectorDocumentDiscoveryPage,
+        ConnectorDocumentDiscoveryRequest, ConnectorDocumentLoadRequest,
         ConnectorDocumentManagementObservation, ConnectorDocumentObservationRequest,
-        ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits,
-        ConnectorManagedObjectMarker, ConnectorStoredDocument,
+        ConnectorDocumentStorageBinding, ConnectorDocumentStorageBudget,
+        ConnectorDocumentStorageLimits, ConnectorDocumentStorageObservation,
+        ConnectorManagedObjectMarker, ConnectorStoredDocument, FrozenConnectorDocumentObservation,
     };
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
-        ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        ProviderBindingEpoch,
+        ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
     };
 
     use super::*;
@@ -748,7 +854,7 @@ mod tests {
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();
         let owner = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
-            incarnation: ProviderBindingEpoch::new(),
+            incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
         };
         let target = ConnectorPreparedCreateDocumentTarget::try_new(
             owner,
@@ -833,6 +939,121 @@ mod tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .unwrap()
+    }
+
+    struct DocumentObservation {
+        descriptor: ConnectorInstanceDescriptor,
+        incarnation: ProviderBindingEpoch,
+        stored: Vec<ConnectorStoredDocument>,
+        loaded: Vec<ConnectorDocument>,
+        metadata_version: ConnectorCommittedVersion,
+    }
+
+    impl ConnectorDocumentStorageObservation for DocumentObservation {
+        fn descriptor(&self) -> &ConnectorInstanceDescriptor {
+            &self.descriptor
+        }
+
+        fn incarnation(&self) -> ProviderBindingEpoch {
+            self.incarnation
+        }
+
+        fn observe_documents(
+            &self,
+            _request: ConnectorDocumentObservationRequest,
+        ) -> Result<FrozenConnectorDocumentObservation, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "not used by the Current MV document test",
+            ))
+        }
+
+        fn load_document(
+            &self,
+            request: ConnectorDocumentLoadRequest,
+        ) -> Result<ConnectorDocument, ConnectorError> {
+            self.loaded
+                .iter()
+                .find(|document| document.id() == request.document().id())
+                .cloned()
+                .ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::NotFound,
+                        "deferred MV document body is not present",
+                    )
+                })
+        }
+
+        fn observe_current_management(
+            &self,
+            request: ConnectorDocumentObservationRequest,
+        ) -> Result<ConnectorDocumentManagementObservation, ConnectorError> {
+            ConnectorDocumentManagementObservation::try_new(
+                &request,
+                self.metadata_version.clone(),
+                ConnectorManagedObjectMarker::try_new(
+                    MANAGED_MV_KIND,
+                    "deployment-a",
+                    "process-a",
+                )?,
+                self.stored.clone(),
+            )
+        }
+
+        fn discover_documents(
+            &self,
+            _request: ConnectorDocumentDiscoveryRequest,
+        ) -> Result<ConnectorDocumentDiscoveryPage, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::Unsupported,
+                "not used by the Current MV document test",
+            ))
+        }
+    }
+
+    fn document_lease(
+        target: &ConnectorPreparedCreateDocumentTarget,
+        stored: Vec<ConnectorStoredDocument>,
+        loaded: Vec<ConnectorDocument>,
+        metadata_version: ConnectorCommittedVersion,
+    ) -> ConnectorDocumentStorageLease {
+        let descriptor = ConnectorInstanceDescriptor {
+            provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+            instance_id: target.target().instance_id.clone(),
+        };
+        let observation = Arc::new(DocumentObservation {
+            descriptor: descriptor.clone(),
+            incarnation: target.owner().incarnation,
+            stored,
+            loaded,
+            metadata_version,
+        });
+        let documents = ConnectorDocumentStorageBinding::try_new(
+            descriptor,
+            target.owner().incarnation,
+            Some(observation),
+            None,
+        )
+        .unwrap();
+        let binding = novarocks_catalog_application::test_support::test_control_binding_for(
+            target.target().instance_id.clone(),
+            1,
+        )
+        .with_catalog_properties(
+            novarocks_spi::connector::CatalogProperties::new(
+                target.catalog_handle().clone(),
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                1,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap(),
+        )
+        .and_then(|binding| binding.try_with_document_storage(Some(documents)))
+        .unwrap();
+        novarocks_spi::connector::ConnectorControlPlanningLease::new(Arc::new(binding), || {})
+            .derive_document_storage_lease()
+            .unwrap()
     }
 
     #[test]
@@ -1024,6 +1245,74 @@ mod tests {
                 PersistenceDecodeBudget::default()
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn production_observation_loads_deferred_bodies_and_keeps_the_complete_source_revision() {
+        let (definition, interpretation, configuration, target) = fixture();
+        let create = create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("create documents");
+        let mut current = create
+            .documents()
+            .iter()
+            .map(|document| stored(document, false))
+            .collect::<Vec<_>>();
+        current[0] = stored_deferred(&create.documents()[0]);
+        let metadata_version =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata-23"), Some(23))
+                .unwrap();
+        let lease = document_lease(
+            &target,
+            current,
+            vec![create.documents()[0].clone()],
+            metadata_version.clone(),
+        );
+        let request = ConnectorDocumentObservationRequest::try_new(
+            target.owner().clone(),
+            target.catalog_handle().clone(),
+            target.target().clone(),
+            target.object_id().clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            request_context(),
+        )
+        .unwrap();
+
+        let decoded = observe_current_management_documents(
+            &lease,
+            request,
+            PersistenceDecodeBudget::default(),
+        )
+        .expect("sealed Current documents");
+        let revision = decoded.source_revision();
+
+        assert_eq!(decoded.definition, definition);
+        assert_eq!(decoded.interpretation, interpretation);
+        assert_eq!(decoded.configuration, configuration);
+        assert_eq!(revision.target, *target.target());
+        assert_eq!(revision.target_object_id, *target.object_id());
+        assert_eq!(revision.metadata_version, metadata_version);
+        assert_eq!(revision.definition_revision, decoded.definition_revision);
+        assert_eq!(
+            revision.interpretation_revision,
+            decoded.interpretation_revision
+        );
+        assert_eq!(revision.publication_revision, None);
+        assert_eq!(revision.publication_output_version, None);
+        assert_eq!(
+            revision.configuration_revision,
+            decoded.configuration_revision
+        );
+        assert_eq!(revision.deployment_owner.as_str(), "deployment-a");
+        assert_eq!(revision.process_incarnation.as_str(), "process-a");
+        assert_eq!(
+            revision.management_dependencies(17),
+            ManagementDependencySet::new(
+                *decoded.definition_revision.as_bytes(),
+                *decoded.interpretation_revision.as_bytes(),
+                None,
+                17,
+            )
         );
     }
 

@@ -2264,12 +2264,14 @@ fn execute_application_document_update(
             "Iceberg managed object owner changed before document update",
         ));
     }
-    let properties =
-        match crate::document_storage::publication::update_properties(intent, request.operation_id)
-        {
-            Ok(properties) => properties,
-            Err(error) => return Ok(known_uncommitted(error)),
-        };
+    let properties = match crate::document_storage::publication::update_properties(
+        intent,
+        request.operation_id,
+        loaded.table.metadata(),
+    ) {
+        Ok(properties) => properties,
+        Err(error) => return Ok(known_uncommitted(error)),
+    };
     let Some(manifest) =
         properties.get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
     else {
@@ -3730,6 +3732,58 @@ mod tests {
         ConnectorManagedObjectMarker::try_new("mv", "deployment", "writer").expect("managed marker")
     }
 
+    fn table_metadata_document(
+        name: &str,
+        content: &[u8],
+        references: Vec<crate::document_storage::envelope::IcebergDocumentReferenceV1>,
+    ) -> crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+        crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+            version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
+            owner: "novarocks.mv".to_string(),
+            name: name.to_string(),
+            format_owner: "novarocks.mv".to_string(),
+            format_name: name.to_string(),
+            format_version: 1,
+            revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(content)
+                .to_bytes(),
+            encoded_len: content.len() as u64,
+            references,
+            attachment:
+                crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata,
+            carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
+                content: content.to_vec(),
+            },
+        }
+    }
+
+    fn initial_mv_document_manifest() -> String {
+        let definition = table_metadata_document("definition", b"definition-v1", Vec::new());
+        let interpretation = table_metadata_document(
+            "interpretation",
+            b"interpretation-v1",
+            vec![
+                crate::document_storage::envelope::IcebergDocumentReferenceV1 {
+                    relationship: "definition".to_string(),
+                    owner: definition.owner.clone(),
+                    name: definition.name.clone(),
+                    revision: definition.revision,
+                },
+            ],
+        );
+        let configuration =
+            table_metadata_document("configuration", b"configuration-v1", Vec::new());
+        let manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
+            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: vec![definition, interpretation, configuration],
+        };
+        String::from_utf8(
+            crate::document_storage::codec::encode_document_manifest(&manifest)
+                .expect("encode initial MV document manifest")
+                .to_vec(),
+        )
+        .expect("MV document manifest is UTF-8")
+    }
+
     fn managed_table(provider: &IcebergMetadata) -> ConnectorTableIdentity {
         create_namespace(provider, "managed");
         let table = ConnectorTableIdentity {
@@ -3750,6 +3804,10 @@ mod tests {
             (
                 Arc::from(crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY),
                 Arc::from(marker.incarnation()),
+            ),
+            (
+                Arc::from(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY),
+                Arc::from(initial_mv_document_manifest()),
             ),
         ];
         create_table_fixture(
@@ -3799,6 +3857,7 @@ mod tests {
         table_uuid: String,
         operation_marker: String,
         manifest_digest: [u8; 32],
+        prepared_only_digest: [u8; 32],
         marker: ConnectorManagedObjectMarker,
     }
 
@@ -3853,10 +3912,10 @@ mod tests {
         let documents = ConnectorDocumentSet::try_new(vec![
             ConnectorDocument::try_new(
                 ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
-                ConnectorDocumentName::parse("definition").expect("document name"),
-                ConnectorDocumentFormat::try_new("novarocks.mv", "definition", 1)
+                ConnectorDocumentName::parse("configuration").expect("document name"),
+                ConnectorDocumentFormat::try_new("novarocks.mv", "configuration", 1)
                     .expect("document format"),
-                Bytes::from_static(b"definition-v1"),
+                Bytes::from_static(b"configuration-v2"),
                 Vec::new(),
                 ConnectorDocumentAttachment::TableMetadata,
             )
@@ -3876,9 +3935,15 @@ mod tests {
             ConnectorManagedObjectMarkerChange::Preserve,
         )
         .expect("document update intent");
-        let properties =
-            crate::document_storage::publication::update_properties(&intent, operation_id)
-                .expect("document update properties");
+        let prepared_only_digest = crate::document_storage::publication::prepared_manifest_digest(
+            intent.prepared_documents().provider_token(),
+        );
+        let properties = crate::document_storage::publication::update_properties(
+            &intent,
+            operation_id,
+            loaded.table.metadata(),
+        )
+        .expect("document update properties");
         let manifest = properties
             .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
             .expect("document manifest");
@@ -3893,6 +3958,7 @@ mod tests {
             table_uuid,
             operation_marker: crate::document_storage::publication::operation_marker(operation_id),
             manifest_digest: crate::document_storage::publication::manifest_digest(manifest),
+            prepared_only_digest,
             marker,
         }
     }
@@ -4148,6 +4214,20 @@ mod tests {
             .load_table(&table.namespace, &table.table)
             .expect("load before update");
         let before_snapshot = before.table.metadata().current_snapshot_id();
+        let before_snapshot_properties = before
+            .table
+            .metadata()
+            .current_snapshot()
+            .expect("managed table current snapshot")
+            .summary()
+            .additional_properties
+            .clone();
+        let before_manifest = crate::document_storage::codec::decode_document_manifest(
+            before.table.metadata().properties()
+                [crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY]
+                .as_bytes(),
+        )
+        .expect("decode initial document manifest");
         assert!(
             before_snapshot.is_some(),
             "fixture must have a real snapshot"
@@ -4184,17 +4264,65 @@ mod tests {
             after
                 .table
                 .metadata()
-                .properties()
-                .get(crate::document_storage::publication::DOCUMENT_UPDATE_OPERATION_PROPERTY),
-            Some(&update.operation_marker)
+                .current_snapshot()
+                .expect("managed table current snapshot after update")
+                .summary()
+                .additional_properties,
+            before_snapshot_properties,
+            "a table-metadata document update must not rewrite snapshot-attached P"
         );
-        assert!(
+        assert_eq!(
             after
                 .table
                 .metadata()
                 .properties()
-                .contains_key(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
+                .get(crate::document_storage::publication::DOCUMENT_UPDATE_OPERATION_PROPERTY),
+            Some(&update.operation_marker)
         );
+        let after_manifest_property = &after.table.metadata().properties()
+            [crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY];
+        assert_eq!(
+            crate::document_storage::publication::manifest_digest(after_manifest_property),
+            update.manifest_digest,
+            "reconciliation evidence must cover the final merged manifest"
+        );
+        assert_ne!(
+            update.manifest_digest, update.prepared_only_digest,
+            "reconciliation evidence must not cover only the C replacement"
+        );
+        let after_manifest = crate::document_storage::codec::decode_document_manifest(
+            after_manifest_property.as_bytes(),
+        )
+        .expect("decode updated document manifest");
+        assert_eq!(after_manifest.documents.len(), 3);
+        for unchanged_name in ["definition", "interpretation"] {
+            assert_eq!(
+                after_manifest
+                    .documents
+                    .iter()
+                    .find(|document| document.name == unchanged_name),
+                before_manifest
+                    .documents
+                    .iter()
+                    .find(|document| document.name == unchanged_name),
+                "C-only update changed the {unchanged_name} envelope"
+            );
+        }
+        let before_configuration = before_manifest
+            .documents
+            .iter()
+            .find(|document| document.name == "configuration")
+            .expect("initial configuration envelope");
+        let after_configuration = after_manifest
+            .documents
+            .iter()
+            .find(|document| document.name == "configuration")
+            .expect("updated configuration envelope");
+        assert_ne!(after_configuration.revision, before_configuration.revision);
+        assert!(matches!(
+            after_configuration.attachment,
+            crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata
+        ));
     }
 
     fn application_document_evidence(
