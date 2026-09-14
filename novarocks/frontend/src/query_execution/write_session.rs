@@ -85,6 +85,10 @@ enum WritePublicationState {
 pub(crate) struct ConnectorWriteSession {
     lease: ConnectorWriteStackLease,
     plan: ConnectorWriteSessionPlan,
+    /// Only an invisible staged target may be sealed without a distributed
+    /// data plane. The provider still decides what an empty prepared set
+    /// means; this flag prevents ordinary DML from manufacturing one.
+    implicit_empty_staged_create: bool,
     /// The application-owned publication attached to the provider's single
     /// external commit. Its declaration is frozen at begin, while its exact
     /// payload may be bound once after the data plane closes.
@@ -219,10 +223,15 @@ impl ConnectorWriteSession {
         request: ConnectorWriteBeginRequest,
         finish_publication: WritePublicationState,
     ) -> Result<Self, ConnectorError> {
+        let implicit_empty_staged_create = matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::StagedCreate(_)
+        );
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             lease,
             plan,
+            implicit_empty_staged_create,
             finish_publication: Mutex::new(finish_publication),
             catalog_properties,
             accumulated: Mutex::new(AccumulatedWriteSet::default()),
@@ -633,6 +642,34 @@ impl ConnectorWriteSession {
         outcome.map(|outcome| (outcome, terminal_context))
     }
 
+    /// Seal the provider's explicit empty prepared set for an invisible staged
+    /// CREATE that has no query data plane. This is intentionally unavailable
+    /// to ordinary writes: no caller may substitute an invented empty result
+    /// for a missing distributed completion.
+    fn finish_implicit_empty_staged_create_for_following_terminal_action(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<
+        (
+            ExternalMutationOutcome<ConnectorWriteReceipt>,
+            ConnectorRequestContext,
+        ),
+        ConnectorError,
+    > {
+        if !self.implicit_empty_staged_create {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "only an invisible staged-create write may seal an implicit empty prepared set",
+            ));
+        }
+        let publication = self.finish_publication_for_commit()?;
+        self.claim_terminal(TerminalDecision::Committed)?;
+        let terminal_context = self.terminal_context(context)?;
+        let outcome = self.commit_accumulated_with_context(terminal_context.clone(), publication);
+        self.release_terminal_storage_resolver();
+        outcome.map(|outcome| (outcome, terminal_context))
+    }
+
     /// Release a session that never reached a complete prepared write set.
     pub(crate) fn abort(
         &self,
@@ -960,6 +997,26 @@ pub(crate) fn finish_write_session_for_following_terminal_action(
     let (outcome, context) = session.finish_for_following_terminal_action(prepared, context)?;
     let affected_rows =
         matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(row_count);
+    Ok(FollowupTerminalWriteSession {
+        outcome,
+        affected_rows,
+        context,
+    })
+}
+
+/// Seal an invisible staged target with the provider's explicit empty prepared
+/// set, then transfer the terminal storage capability to staged publication.
+///
+/// MV CREATE uses this before its first target exists in the catalog. It is
+/// not a replacement for a missing distributed write completion.
+pub(crate) fn finish_empty_staged_create_write_for_following_terminal_action(
+    session: &ConnectorWriteSession,
+    context: ConnectorRequestContext,
+) -> Result<FollowupTerminalWriteSession, ConnectorError> {
+    let (outcome, context) =
+        session.finish_implicit_empty_staged_create_for_following_terminal_action(context)?;
+    let affected_rows =
+        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(0);
     Ok(FollowupTerminalWriteSession {
         outcome,
         affected_rows,
@@ -2379,6 +2436,22 @@ pub(crate) mod tests {
 
         assert_eq!(accounting.holds(), 0);
         assert!(accounting.leases_cleared());
+    }
+
+    #[test]
+    fn an_implicit_empty_seal_rejects_an_ordinary_write() {
+        let fixture = fixture_with_outcome(1, 16, known_committed());
+
+        let error = match finish_empty_staged_create_write_for_following_terminal_action(
+            fixture.session.as_ref(),
+            request_context(),
+        ) {
+            Ok(_) => panic!("ordinary write cannot manufacture an empty staged-create seal"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert_eq!(fixture.session.finish_invocations(), 0);
     }
 
     /// A commit whose external outcome is unknown is not finished with storage:
