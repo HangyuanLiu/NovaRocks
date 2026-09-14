@@ -20,5 +20,6 @@ pub mod dependency;
 pub mod descriptor;
 pub(crate) mod documents;
 pub(crate) mod exact_revision;
+pub(crate) mod publication_input;
 pub mod schema;
 pub mod semantic;
