@@ -28,7 +28,7 @@
 //! pairing the plan was published with, so a miss here is a defect rather than
 //! a case to handle.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::{
@@ -97,6 +97,93 @@ pub(crate) fn encode_completed_plan(
         plan: encoded,
         access,
         split_sources,
+    })
+}
+
+/// How one completed plan's fragments relate to each other.
+///
+/// Every field is derived from the fragments and edges alone, so two
+/// structurally identical plans produce identical topology - including the
+/// order, which decides the order fragments are established in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CompletedPlanTopology {
+    /// Fragments with producers before consumers. A plan whose fragments
+    /// cannot be ordered this way has a cycle, and no order would let it run.
+    pub(crate) order: Vec<SqlFragmentId>,
+    /// Fragments that feed at least one other fragment.
+    pub(crate) producers: Vec<SqlFragmentId>,
+    /// Where the query's rows are delivered, absent for a plan that only
+    /// writes.
+    pub(crate) result: Option<SqlFragmentId>,
+    /// The one fragment whose completion is the execution's completion.
+    pub(crate) anchor: SqlFragmentId,
+}
+
+/// Derive the topology of one completed plan.
+pub(crate) fn completed_plan_topology(
+    plan: &PhysicalPlan,
+) -> Result<CompletedPlanTopology, String> {
+    let mut in_degree = plan
+        .fragments()
+        .keys()
+        .map(|id| (SqlFragmentId::from(id.get()), 0_usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut consumers_of = BTreeMap::<SqlFragmentId, Vec<SqlFragmentId>>::new();
+    let mut producers = BTreeSet::new();
+    for edge in plan.edges().values() {
+        let source = SqlFragmentId::from(edge.source.fragment.get());
+        let destination = SqlFragmentId::from(edge.destination.fragment.get());
+        *in_degree.entry(destination).or_insert(0) += 1;
+        consumers_of.entry(source).or_default().push(destination);
+        producers.insert(source);
+    }
+
+    // Producers first, in ascending id order at every step, so the order is a
+    // property of the plan rather than of how it was walked.
+    let mut ready = in_degree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+        .collect::<VecDeque<_>>();
+    let mut order = Vec::with_capacity(in_degree.len());
+    while let Some(fragment) = ready.pop_front() {
+        order.push(fragment);
+        for consumer in consumers_of.get(&fragment).map_or(&[][..], Vec::as_slice) {
+            let degree = in_degree
+                .get_mut(consumer)
+                .ok_or_else(|| format!("plan edge names absent fragment {consumer}"))?;
+            *degree -= 1;
+            if *degree == 0 {
+                ready.push_back(*consumer);
+            }
+        }
+    }
+    if order.len() != in_degree.len() {
+        return Err("completed plan fragments cannot be ordered: a cycle feeds itself".to_string());
+    }
+
+    // The anchor is the one fragment nothing consumes. Two of those would mean
+    // two independent completions with no statement to bind them.
+    let mut terminals = in_degree
+        .keys()
+        .copied()
+        .filter(|id| !producers.contains(id))
+        .collect::<Vec<_>>();
+    let anchor = match terminals.len() {
+        1 => terminals.remove(0),
+        0 => return Err("completed plan has no fragment that ends it".to_string()),
+        _ => {
+            return Err(format!(
+                "completed plan ends in more than one fragment: {terminals:?}"
+            ));
+        }
+    };
+    Ok(CompletedPlanTopology {
+        order,
+        producers: producers.into_iter().collect(),
+        result: plan
+            .result_port()
+            .map(|result| SqlFragmentId::from(result.fragment.get())),
+        anchor,
     })
 }
 
@@ -444,20 +531,7 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 1024,
-                control_bytes: 128,
-                per_scope_bytes: 896,
-            },
-        )
-        .expect("workload control");
-        control.mark_ready().expect("workload control ready");
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .expect("query root");
-        let scope = root.owner.scope();
+        let (_root, scope) = query_scope();
         let completed = runtime
             .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
@@ -482,6 +556,57 @@ mod tests {
                 == encoded.plan.fragments.len()
         );
         assert_eq!(encoded.access.iter().count(), 0);
+        assert!(encoded.split_sources.is_empty());
+    }
+
+    /// Rows are produced somewhere and gathered where the query reads them, so
+    /// the producer comes first, one fragment ends the execution, and that
+    /// fragment is where the result is.
+    #[test]
+    fn a_distributed_statement_orders_its_producers_before_its_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+        let topology = completed_plan_topology(completed.candidate().plan())
+            .expect("a completed plan has a topology");
+
+        assert_eq!(
+            topology.order.len(),
+            completed.candidate().plan().fragments().len()
+        );
+        assert_eq!(topology.result, Some(topology.anchor));
+        assert!(!topology.producers.contains(&topology.anchor));
+        assert_eq!(
+            topology.order.last().copied(),
+            Some(topology.anchor),
+            "the fragment that ends the execution is ordered last"
+        );
+    }
+
+    fn query_scope() -> (
+        novarocks_workload_control::RootWork,
+        novarocks_workload_control::WorkScope,
+    ) {
+        let control = WorkloadControl::try_new(
+            WorkloadConfig::default(),
+            ResourceConfig {
+                total_bytes: 1024,
+                control_bytes: 128,
+                per_scope_bytes: 896,
+            },
+        )
+        .expect("workload control");
+        control.mark_ready().expect("workload control ready");
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .expect("query root");
+        let scope = root.owner.scope();
+        (root, scope)
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
