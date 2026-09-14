@@ -1825,6 +1825,9 @@ fn prepared_document_field_bindings(
             ConnectorPreparedCreateFieldBinding::try_new(
                 ordinal,
                 Bytes::copy_from_slice(&field.id.to_be_bytes()),
+                field.name.clone(),
+                field.field_type.to_string(),
+                !field.required,
             )
         })
         .collect()

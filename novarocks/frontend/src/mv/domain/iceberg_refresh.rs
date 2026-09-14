@@ -172,6 +172,10 @@ pub struct IcebergMvCorePorts {
     repository: Arc<dyn MvRepository>,
     readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    /// The one FE-process management authority used only by document-managed
+    /// CREATE and later maintenance paths. Refresh-only callers intentionally
+    /// construct this port without it until their own cutover is complete.
+    management_entrance: Option<Arc<novarocks_mv_application::management::ManagementEntrance>>,
 }
 
 impl IcebergMvCorePorts {
@@ -195,7 +199,39 @@ impl IcebergMvCorePorts {
             repository,
             readiness,
             storage_observation,
+            management_entrance: None,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_management_entrance(
+        functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+        catalog_service: Arc<QueryCatalogService>,
+        catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        repository: Arc<dyn MvRepository>,
+        readiness: Arc<MvReadinessPort>,
+        storage_observation: Arc<dyn MvStorageObservationPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    ) -> Self {
+        Self {
+            functions,
+            catalog_service,
+            catalog_application,
+            connector_control,
+            repository,
+            readiness,
+            storage_observation,
+            management_entrance: Some(management_entrance),
+        }
+    }
+
+    pub(crate) fn management_entrance(
+        &self,
+    ) -> Result<&Arc<novarocks_mv_application::management::ManagementEntrance>, String> {
+        self.management_entrance.as_ref().ok_or_else(|| {
+            "document-managed MV CREATE requires the composed FE management entrance".to_string()
+        })
     }
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {

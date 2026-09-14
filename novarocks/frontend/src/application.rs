@@ -1397,6 +1397,14 @@ impl FrontendApplicationHost {
         Arc::clone(&self.catalog_runtime_projection)
     }
 
+    /// The deployment identity is server-owned configuration, retained through
+    /// the authenticated native-trust capability. Frontend management uses it
+    /// only as its process-local owner identity; it never reads StateStore or
+    /// target metadata to infer an owner.
+    pub(crate) fn native_deployment_id(&self) -> &str {
+        self.data_runtime.native_trust().deployment_id().as_str()
+    }
+
     /// FE-local serving lifecycle shared by SQL and background admission
     /// owners. Server orchestration alone owns its Ready/Draining transitions.
     pub fn serving_lifecycle(&self) -> Arc<FrontendServingLifecycle> {

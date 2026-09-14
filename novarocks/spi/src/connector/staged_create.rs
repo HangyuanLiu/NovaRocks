@@ -60,6 +60,9 @@ fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
 pub struct ConnectorPreparedCreateFieldBinding {
     request_ordinal: u32,
     provider_field_id: Bytes,
+    name: String,
+    type_signature: String,
+    nullable: bool,
 }
 
 impl std::fmt::Debug for ConnectorPreparedCreateFieldBinding {
@@ -68,22 +71,36 @@ impl std::fmt::Debug for ConnectorPreparedCreateFieldBinding {
             .debug_struct("ConnectorPreparedCreateFieldBinding")
             .field("request_ordinal", &self.request_ordinal)
             .field("provider_field_id_bytes", &self.provider_field_id.len())
+            .field("name", &self.name)
+            .field("type_signature", &self.type_signature)
+            .field("nullable", &self.nullable)
             .finish()
     }
 }
 
 impl ConnectorPreparedCreateFieldBinding {
-    pub fn try_new(request_ordinal: u32, provider_field_id: Bytes) -> Result<Self, ConnectorError> {
+    pub fn try_new(
+        request_ordinal: u32,
+        provider_field_id: Bytes,
+        name: String,
+        type_signature: String,
+        nullable: bool,
+    ) -> Result<Self, ConnectorError> {
         if provider_field_id.is_empty()
             || provider_field_id.len() > MAX_PREPARED_CREATE_FIELD_ID_BYTES
+            || name.trim().is_empty()
+            || type_signature.trim().is_empty()
         {
             return Err(invalid(
-                "prepared create field identity is empty or exceeds its byte limit",
+                "prepared create field binding is empty or exceeds its byte limit",
             ));
         }
         Ok(Self {
             request_ordinal,
             provider_field_id,
+            name,
+            type_signature,
+            nullable,
         })
     }
 
@@ -93,6 +110,18 @@ impl ConnectorPreparedCreateFieldBinding {
 
     pub const fn provider_field_id(&self) -> &Bytes {
         &self.provider_field_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn type_signature(&self) -> &str {
+        &self.type_signature
+    }
+
+    pub const fn nullable(&self) -> bool {
+        self.nullable
     }
 }
 
@@ -170,6 +199,8 @@ impl ConnectorPreparedCreateDocumentTarget {
                     bytes
                         .checked_add(std::mem::size_of::<u32>())
                         .and_then(|bytes| bytes.checked_add(field.provider_field_id().len()))
+                        .and_then(|bytes| bytes.checked_add(field.name().len()))
+                        .and_then(|bytes| bytes.checked_add(field.type_signature().len()))
                 })
             })
             .and_then(|bytes| bytes.checked_add(provider_token.len()))
@@ -253,6 +284,9 @@ impl ConnectorPreparedCreateDocumentTarget {
         for field in &self.fields {
             hasher.update(field.request_ordinal.to_be_bytes());
             digest_bytes(hasher, &field.provider_field_id);
+            digest_bytes(hasher, field.name().as_bytes());
+            digest_bytes(hasher, field.type_signature().as_bytes());
+            hasher.update([u8::from(field.nullable())]);
         }
         digest_bytes(hasher, &self.provider_token);
     }
@@ -1920,8 +1954,14 @@ mod tests {
             Bytes::from_static(b"schema-version"),
             Bytes::from_static(b"partition-spec-version"),
             vec![
-                ConnectorPreparedCreateFieldBinding::try_new(1, Bytes::from_static(b"field-id"))
-                    .unwrap(),
+                ConnectorPreparedCreateFieldBinding::try_new(
+                    1,
+                    Bytes::from_static(b"field-id"),
+                    "field".to_string(),
+                    "int".to_string(),
+                    false,
+                )
+                .unwrap(),
             ],
             Bytes::from_static(b"provider-token"),
         )
@@ -1949,8 +1989,14 @@ mod tests {
             Bytes::from(vec![1; MAX_PREPARED_CREATE_VERSION_ID_BYTES + 1]),
             Bytes::from_static(b"partition-spec-version"),
             vec![
-                ConnectorPreparedCreateFieldBinding::try_new(0, Bytes::from_static(b"field-id"))
-                    .unwrap(),
+                ConnectorPreparedCreateFieldBinding::try_new(
+                    0,
+                    Bytes::from_static(b"field-id"),
+                    "field".to_string(),
+                    "int".to_string(),
+                    false,
+                )
+                .unwrap(),
             ],
             Bytes::from_static(b"provider-token"),
         )
@@ -1978,8 +2024,14 @@ mod tests {
             Bytes::from_static(b"schema-version"),
             Bytes::from_static(b"partition-spec-version"),
             vec![
-                ConnectorPreparedCreateFieldBinding::try_new(0, Bytes::from_static(b"field-id"))
-                    .unwrap(),
+                ConnectorPreparedCreateFieldBinding::try_new(
+                    0,
+                    Bytes::from_static(b"field-id"),
+                    "field".to_string(),
+                    "int".to_string(),
+                    false,
+                )
+                .unwrap(),
             ],
             Bytes::from(vec![7; MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES]),
         )
@@ -2012,6 +2064,9 @@ mod tests {
                     ConnectorPreparedCreateFieldBinding::try_new(
                         0,
                         Bytes::from_static(b"field-id"),
+                        "field".to_string(),
+                        "int".to_string(),
+                        false,
                     )
                     .unwrap(),
                 ],

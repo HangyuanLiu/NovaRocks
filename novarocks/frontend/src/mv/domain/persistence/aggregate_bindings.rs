@@ -57,6 +57,8 @@ pub(crate) struct MvCreateSourceFieldObservation {
     pub field_ordinal: u32,
     pub field_name: String,
     pub provider_field_id: Bytes,
+    pub type_signature: String,
+    pub nullable: bool,
 }
 
 /// Source fields for one syntactic relation occurrence. Repeated references to
@@ -64,6 +66,8 @@ pub(crate) struct MvCreateSourceFieldObservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvCreateRelationObservation {
     pub occurrence_id: u32,
+    pub provider_object_id: Bytes,
+    pub provider_schema_version: Bytes,
     pub fields: Vec<MvCreateSourceFieldObservation>,
 }
 
@@ -680,6 +684,9 @@ mod tests {
                     ConnectorPreparedCreateFieldBinding::try_new(
                         u32::try_from(ordinal).expect("small fixture ordinal"),
                         Bytes::from(vec![*field_id]),
+                        format!("field_{ordinal}"),
+                        "varbinary".to_string(),
+                        false,
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()

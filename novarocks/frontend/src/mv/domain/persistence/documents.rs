@@ -852,11 +852,17 @@ mod tests {
                 ConnectorPreparedCreateFieldBinding::try_new(
                     0,
                     Bytes::copy_from_slice(target_output.as_bytes()),
+                    "output".to_string(),
+                    "binary".to_string(),
+                    false,
                 )
                 .unwrap(),
                 ConnectorPreparedCreateFieldBinding::try_new(
                     1,
                     Bytes::copy_from_slice(target_apply.as_bytes()),
+                    "apply".to_string(),
+                    "binary".to_string(),
+                    false,
                 )
                 .unwrap(),
             ],
@@ -881,7 +887,13 @@ mod tests {
             fields
                 .into_iter()
                 .map(|(ordinal, field_id)| {
-                    ConnectorPreparedCreateFieldBinding::try_new(ordinal, field_id)
+                    ConnectorPreparedCreateFieldBinding::try_new(
+                        ordinal,
+                        field_id,
+                        format!("field_{ordinal}"),
+                        "binary".to_string(),
+                        false,
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
             target.provider_token().clone(),

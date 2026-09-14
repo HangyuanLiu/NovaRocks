@@ -148,6 +148,7 @@ struct FrontendRoleProducts {
     maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
+    mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     mv_service: Arc<crate::mv::FrontendMvService>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
@@ -317,6 +318,18 @@ async fn build_frontend_role_products(
         Arc::clone(&mv_repository),
         tokio::runtime::Handle::current(),
     );
+    let mv_management_entrance = Arc::new(
+        novarocks_mv_application::management::ManagementEntrance::new(
+            novarocks_mv_application::management::DeploymentOwner::parse(
+                host.native_deployment_id(),
+            )
+            .map_err(FrontendApplicationError::server)?,
+            novarocks_mv_application::management::ProcessIncarnation::parse(
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .expect("UUIDv7 process incarnation is a valid management identity"),
+        ),
+    );
     let mv_activation = core_capabilities::mv_refresh_provider_activation(
         core_capabilities::MvRefreshProviderActivationPorts::new(
             Arc::clone(&function_catalog),
@@ -437,6 +450,7 @@ async fn build_frontend_role_products(
         maintenance_engine,
         mv_readiness,
         mv_candidate_reader,
+        mv_management_entrance,
         mv_service,
         maintenance_ports,
         mv_storage_observation,
@@ -537,6 +551,7 @@ fn build_frontend_query_session_factory_from_role_products(
             mv_application,
             mv_service,
             Arc::clone(&mv_storage_observation),
+            Arc::clone(&products.mv_management_entrance),
             query_execution.clone(),
         ));
     let maintenance_command_executor =

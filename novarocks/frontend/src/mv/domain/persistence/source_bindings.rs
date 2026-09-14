@@ -114,11 +114,15 @@ fn bind_relation_fields(
                 field_ordinal: reference.field_ordinal(),
                 field_name: field.name().to_string(),
                 provider_field_id: field.provider_field_id().clone(),
+                type_signature: field.type_signature().to_string(),
+                nullable: field.nullable(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(MvCreateRelationObservation {
         occurrence_id: relation.occurrence_id(),
+        provider_object_id: observed.object_id().as_bytes().clone(),
+        provider_schema_version: observed.schema_version().clone(),
         fields,
     })
 }

@@ -429,6 +429,7 @@ pub struct MvCommandPorts {
     create_application: Arc<dyn MvApplicationService>,
     refresh_service: Arc<FrontendMvService>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     #[allow(
         dead_code,
         reason = "The frozen MV-command port keeps query execution available for the boundary."
@@ -447,6 +448,7 @@ impl MvCommandPorts {
         create_application: Arc<dyn MvApplicationService>,
         refresh_service: Arc<FrontendMvService>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
         query_execution: QueryExecutionService,
     ) -> Self {
         Self {
@@ -459,21 +461,24 @@ impl MvCommandPorts {
             create_application,
             refresh_service,
             storage_observation,
+            management_entrance,
             query_execution,
         }
     }
 }
 
 pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecutor {
-    let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(&ports.functions),
-        Arc::clone(&ports.catalog_service),
-        ports.catalog_application.clone(),
-        Arc::clone(&ports.connector_control),
-        Arc::clone(&ports.repository),
-        Arc::clone(&ports.readiness),
-        Arc::clone(&ports.storage_observation),
-    );
+    let iceberg_ports =
+        crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new_with_management_entrance(
+            Arc::clone(&ports.functions),
+            Arc::clone(&ports.catalog_service),
+            ports.catalog_application.clone(),
+            Arc::clone(&ports.connector_control),
+            Arc::clone(&ports.repository),
+            Arc::clone(&ports.readiness),
+            Arc::clone(&ports.storage_observation),
+            Arc::clone(&ports.management_entrance),
+        );
     let backend = Arc::new(
         crate::mv::domain::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
     );
