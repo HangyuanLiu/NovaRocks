@@ -28,7 +28,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::runtime::profile::{ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree};
+use crate::runtime::profile::{
+    MEM_TRACKER_PROFILE_NODE, ProfileCounter, ProfileNode, ProfileUnit, RuntimeProfileTree,
+};
 use crate::task_execution::status::{OperatorCounter, OperatorStatistics, SafeDetail};
 
 /// The child profile that carries every operator's shared counters.
@@ -245,6 +247,16 @@ fn visit(
     merged: &mut BTreeMap<OperatorKey, MergedOperator>,
     unattributed_operators: &mut usize,
 ) {
+    // The memory hierarchy is a different tier of the same fragment, and it
+    // names its accounts after the operators that charge them -- an operator's
+    // tracker is literally called `operator 0: ValuesSource (id=10)`. Every
+    // tracker node also carries a `CommonMetrics` child, so without this stop
+    // the projection would read each of them as a second, empty copy of an
+    // operator it already has. Memory facts are reported as memory, never
+    // merged into operator rows.
+    if node.name == MEM_TRACKER_PROFILE_NODE {
+        return;
+    }
     if let Some(common) = node
         .children
         .iter()
@@ -406,6 +418,52 @@ mod tests {
         assert_eq!(entries[0].input_rows(), Some(0));
         assert_eq!(entries[0].output_rows(), Some(500));
         assert_eq!(entries[0].wall_time(), Some(Duration::from_nanos(7_000)));
+    }
+
+    /// The memory hierarchy is not read as a second set of operators.
+    ///
+    /// An operator's memory tracker is named after the operator it belongs to,
+    /// and every tracker node carries a `CommonMetrics` child of its own. Both
+    /// facts are deliberate on the memory side, and together they make the
+    /// tracker subtree indistinguishable from operator profiles to anything
+    /// that only pattern-matches on shape. Without an explicit stop, attaching
+    /// the memory tree to a fragment profile silently doubles every operator
+    /// row and fills the copies with nothing.
+    #[test]
+    fn the_memory_hierarchy_is_never_read_as_operator_statistics() {
+        let fragment = RuntimeProfile::new("execute_fragment_native (plan_node_id=3)");
+        let driver = fragment
+            .child("Pipeline (id=0)")
+            .child("PipelineDriver (id=0)");
+        add_operator(&driver, "SCAN (plan_node_id=2)", 0, 500, 7_000);
+
+        let process = crate::runtime::mem_tracker::process_mem_tracker();
+        let fragment_tracker =
+            crate::runtime::mem_tracker::MemTracker::new_child("fragment_1_2", &process);
+        // Exactly how execution names an operator's account today.
+        let operator_tracker = crate::runtime::mem_tracker::MemTracker::new_child(
+            "operator 0: SCAN (plan_node_id=2)",
+            &fragment_tracker,
+        );
+        operator_tracker.consume(4096);
+        crate::runtime::profile::attach_mem_tracker_tree(&fragment, &fragment_tracker);
+
+        let projection = project_operator_statistics(&fragment.to_native_tree());
+
+        assert_eq!(
+            projection.unattributed_operators(),
+            0,
+            "tracker nodes are not operators, attributed or otherwise"
+        );
+        let entries = projection.statistics();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the memory tree must add no operator rows, got {entries:?}"
+        );
+        assert_eq!(entries[0].output_rows(), Some(500));
+
+        operator_tracker.release(4096);
     }
 
     /// An operator's own counters reach the projection, from both halves of
