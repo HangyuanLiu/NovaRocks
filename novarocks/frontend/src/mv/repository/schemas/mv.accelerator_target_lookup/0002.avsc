@@ -1,6 +1,6 @@
 {
   "type": "record",
-  "name": "MvAcceleratorTargetLookupV1",
+  "name": "MvAcceleratorTargetLookupV2",
   "namespace": "org.apache.novarocks.mv.accelerator",
   "fields": [
     { "name": "mv_id", "type": "long" }

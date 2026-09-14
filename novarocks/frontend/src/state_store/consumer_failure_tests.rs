@@ -42,7 +42,7 @@ use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::mv::domain::persistence::definition::{
-    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
+    CreateMvDefinitionRequest, MvDesiredRefreshPolicy, test_source_revision,
 };
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::repository::{
@@ -425,11 +425,13 @@ fn projection_request() -> MvProjectionRequest {
                 .into_iter()
                 .collect(),
         }),
-        source_revision: MvAcceleratorSourceRevision {
-            target_object_id: object_id(b"orders-mv-object"),
-            descriptor_content_hash: "descriptor-orders-mv".to_string(),
-            current_target_snapshot_id: Some(9),
-        },
+        source_revision: test_source_revision(
+            "ice",
+            "sales",
+            "orders_mv",
+            object_id(b"orders-mv-object"),
+            Some(9),
+        ),
         dependencies: vec![CreateMvDependencyRequest {
             upstream: MvDependencyObjectRef {
                 catalog: Some("ice".to_string()),

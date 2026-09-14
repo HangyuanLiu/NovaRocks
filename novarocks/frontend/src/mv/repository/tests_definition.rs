@@ -23,7 +23,7 @@ use crate::mv::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use crate::mv::domain::persistence::definition::{
-    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
+    CreateMvDefinitionRequest, MvDesiredRefreshPolicy, test_source_revision,
 };
 use crate::mv::domain::persistence::dependency::CreateMvDependencyRequest;
 use crate::mv::domain::repository::{
@@ -114,11 +114,13 @@ pub(crate) fn projection_request(
             .into_iter()
             .collect(),
         }),
-        source_revision: MvAcceleratorSourceRevision {
-            target_object_id: object_id(object),
-            descriptor_content_hash: format!("descriptor-{table}-{snapshot_id}"),
-            current_target_snapshot_id: Some(snapshot_id),
-        },
+        source_revision: test_source_revision(
+            "ice",
+            "sales",
+            table,
+            object_id(object),
+            Some(snapshot_id),
+        ),
         dependencies: vec![CreateMvDependencyRequest {
             upstream: MvDependencyObjectRef {
                 catalog: Some("ice".to_string()),
@@ -339,7 +341,7 @@ async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it
     let (host, repository) = repository().await;
     let store = host.state_store().expect("StateStore");
     let key = Key::try_from(Bytes::from_static(
-        b"novarocks/frontend/mv/accelerator/v1/unknown/future-record",
+        b"novarocks/frontend/mv/accelerator/v2/unknown/future-record",
     ))
     .unwrap();
     let value = Value::try_from(Bytes::from_static(b"opaque-corrupt-record")).unwrap();

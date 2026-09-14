@@ -25,9 +25,7 @@
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use novarocks_mv_application::management::{
-    DeploymentOwner, ManagedMvTarget, ManagementDependencySet, ProcessIncarnation,
-};
+use novarocks_mv_application::management::{DeploymentOwner, ManagedMvTarget, ProcessIncarnation};
 use novarocks_mv_application::persistence::codec::{
     ConfigurationDocument, DefinitionDocument, EncodedDocument, InterpretationDocument,
     PersistenceCodecError, PublicationDocument, decode_configuration, decode_definition,
@@ -50,6 +48,8 @@ use novarocks_spi::connector::{
     ConnectorTableObjectId,
 };
 
+use super::definition::{MvAcceleratorCommittedVersionRevision, MvAcceleratorSourceRevision};
+
 const OWNER: &str = "novarocks.mv";
 const DEFINITION: &str = "definition";
 const INTERPRETATION: &str = "interpretation";
@@ -59,43 +59,6 @@ const REFERENCES_DEFINITION: &str = "definition";
 const REFERENCES_INTERPRETATION: &str = "interpretation";
 const FORMAT_VERSION: u32 = 1;
 const MANAGED_MV_KIND: &str = "materialized-view";
-
-/// Exact lake inputs from which an Accelerator projection was derived.
-///
-/// The provider metadata version, each application document revision, and the
-/// output version attached to P remain separate facts. A caller must compare
-/// this whole value after long-running work; no timestamp or snapshot ID can
-/// stand in for the complete source.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvDocumentSourceRevision {
-    pub target: ConnectorTableIdentity,
-    pub target_object_id: ConnectorTableObjectId,
-    pub metadata_version: ConnectorCommittedVersion,
-    pub definition_revision: DocumentRevision,
-    pub interpretation_revision: DocumentRevision,
-    pub publication_revision: Option<DocumentRevision>,
-    pub publication_output_version: Option<ConnectorCommittedVersion>,
-    pub configuration_revision: DocumentRevision,
-    pub deployment_owner: DeploymentOwner,
-    pub process_incarnation: ProcessIncarnation,
-}
-
-impl MvDocumentSourceRevision {
-    /// The exact immutable dependencies guarded by the single management
-    /// entrance. C is deliberately absent because configuration changes are an
-    /// independent target mutation; it remains part of the Accelerator source
-    /// revision above and therefore still invalidates stale projections.
-    pub(crate) fn management_dependencies(&self, runtime_epoch: u64) -> ManagementDependencySet {
-        ManagementDependencySet::new(
-            *self.definition_revision.as_bytes(),
-            *self.interpretation_revision.as_bytes(),
-            self.publication_revision
-                .as_ref()
-                .map(|revision| *revision.as_bytes()),
-            runtime_epoch,
-        )
-    }
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MvDecodedDocuments {
@@ -117,15 +80,20 @@ pub(crate) struct MvDecodedDocuments {
 }
 
 impl MvDecodedDocuments {
-    pub(crate) fn source_revision(&self) -> MvDocumentSourceRevision {
-        MvDocumentSourceRevision {
+    pub(crate) fn source_revision(&self) -> MvAcceleratorSourceRevision {
+        MvAcceleratorSourceRevision {
             target: self.target.clone(),
             target_object_id: self.target_object_id.clone(),
-            metadata_version: self.metadata_version.clone(),
+            metadata_version: MvAcceleratorCommittedVersionRevision::from_committed(
+                &self.metadata_version,
+            ),
             definition_revision: self.definition_revision,
             interpretation_revision: self.interpretation_revision,
             publication_revision: self.publication_revision,
-            publication_output_version: self.publication_output_version.clone(),
+            publication_output_version: self
+                .publication_output_version
+                .as_ref()
+                .map(MvAcceleratorCommittedVersionRevision::from_committed),
             configuration_revision: self.configuration_revision,
             deployment_owner: self.deployment_owner.clone(),
             process_incarnation: self.process_incarnation.clone(),
@@ -716,6 +684,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use novarocks_mv_application::management::ManagementDependencySet;
     use novarocks_mv_application::persistence::codec::{
         ApplyKey, ApplyKeyComponent, ApplyKeyKind, ExpressionKind, ExpressionShape, OutputBinding,
         OutputDefinition, PhysicalFieldBinding, PhysicalFieldLogicalIdentity, PublicationInput,
@@ -1291,7 +1260,10 @@ mod tests {
         assert_eq!(decoded.configuration, configuration);
         assert_eq!(revision.target, *target.target());
         assert_eq!(revision.target_object_id, *target.object_id());
-        assert_eq!(revision.metadata_version, metadata_version);
+        assert_eq!(
+            revision.metadata_version,
+            MvAcceleratorCommittedVersionRevision::from_committed(&metadata_version)
+        );
         assert_eq!(revision.definition_revision, decoded.definition_revision);
         assert_eq!(
             revision.interpretation_revision,

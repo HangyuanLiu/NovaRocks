@@ -17,19 +17,24 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::sync::Arc;
 
 use apache_avro::{from_avro_datum, from_value, to_avro_datum, to_value};
 use bytes::Bytes;
+use novarocks_mv_application::management::{DeploymentOwner, ProcessIncarnation};
+use novarocks_mv_application::persistence::identity::DocumentRevision;
 use novarocks_mv_application::state_family::MV_ACCELERATOR_STATE_FAMILY;
-use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_spi::connector::{
+    ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableObjectId,
+};
 use novarocks_state_store_api::{Key, Value};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::mv::domain::persistence::definition::{
-    MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
-    StoredMvDefinition,
+    MV_ACCELERATOR_PROJECTION_SUBJECT, MvAcceleratorCommittedVersionRevision,
+    MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
 };
 use crate::mv::domain::persistence::dependency::MV_ACCELERATOR_DEPENDENCY_SUBJECT;
 use crate::mv::domain::persistence::schema::{MvPartitionContract, MvSchemaContract};
@@ -123,7 +128,113 @@ struct StoredMvDefinitionAvro {
     refresh_interval_ms: Option<i64>,
     max_staleness_ms: Option<i64>,
     created_at_ms: i64,
-    source_revision: MvAcceleratorSourceRevision,
+    source_revision: MvAcceleratorSourceRevisionAvro,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct MvAcceleratorCommittedVersionRevisionAvro {
+    digest: String,
+    snapshot_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct MvAcceleratorSourceRevisionAvro {
+    target_catalog: String,
+    target_namespace: String,
+    target_table: String,
+    target_object_id: ConnectorTableObjectId,
+    metadata_version: MvAcceleratorCommittedVersionRevisionAvro,
+    definition_revision: String,
+    interpretation_revision: String,
+    publication_revision: Option<String>,
+    publication_output_version: Option<MvAcceleratorCommittedVersionRevisionAvro>,
+    configuration_revision: String,
+    deployment_owner: String,
+    process_incarnation: String,
+}
+
+impl From<&MvAcceleratorCommittedVersionRevision> for MvAcceleratorCommittedVersionRevisionAvro {
+    fn from(value: &MvAcceleratorCommittedVersionRevision) -> Self {
+        Self {
+            digest: hex::encode(value.digest()),
+            snapshot_id: value.snapshot_id(),
+        }
+    }
+}
+
+impl TryFrom<MvAcceleratorCommittedVersionRevisionAvro> for MvAcceleratorCommittedVersionRevision {
+    type Error = String;
+
+    fn try_from(value: MvAcceleratorCommittedVersionRevisionAvro) -> Result<Self, Self::Error> {
+        Self::try_from_parts(
+            decode_sha256(&value.digest, "committed version digest")?,
+            value.snapshot_id,
+        )
+    }
+}
+
+impl From<&MvAcceleratorSourceRevision> for MvAcceleratorSourceRevisionAvro {
+    fn from(value: &MvAcceleratorSourceRevision) -> Self {
+        Self {
+            target_catalog: value.target.instance_id.as_str().to_string(),
+            target_namespace: value.target.namespace.to_string(),
+            target_table: value.target.table.to_string(),
+            target_object_id: value.target_object_id.clone(),
+            metadata_version: (&value.metadata_version).into(),
+            definition_revision: hex::encode(value.definition_revision.as_bytes()),
+            interpretation_revision: hex::encode(value.interpretation_revision.as_bytes()),
+            publication_revision: value
+                .publication_revision
+                .as_ref()
+                .map(|revision| hex::encode(revision.as_bytes())),
+            publication_output_version: value.publication_output_version.as_ref().map(Into::into),
+            configuration_revision: hex::encode(value.configuration_revision.as_bytes()),
+            deployment_owner: value.deployment_owner.as_str().to_string(),
+            process_incarnation: value.process_incarnation.as_str().to_string(),
+        }
+    }
+}
+
+impl TryFrom<MvAcceleratorSourceRevisionAvro> for MvAcceleratorSourceRevision {
+    type Error = String;
+
+    fn try_from(value: MvAcceleratorSourceRevisionAvro) -> Result<Self, Self::Error> {
+        Ok(Self {
+            target: ConnectorTableIdentity {
+                instance_id: ConnectorInstanceId::parse(&value.target_catalog)
+                    .map_err(|error| format!("decode MV Accelerator target catalog: {error}"))?,
+                namespace: Arc::from(value.target_namespace),
+                table: Arc::from(value.target_table),
+            },
+            target_object_id: value.target_object_id,
+            metadata_version: value.metadata_version.try_into()?,
+            definition_revision: decode_document_revision(
+                &value.definition_revision,
+                "definition revision",
+            )?,
+            interpretation_revision: decode_document_revision(
+                &value.interpretation_revision,
+                "interpretation revision",
+            )?,
+            publication_revision: value
+                .publication_revision
+                .as_deref()
+                .map(|revision| decode_document_revision(revision, "publication revision"))
+                .transpose()?,
+            publication_output_version: value
+                .publication_output_version
+                .map(TryInto::try_into)
+                .transpose()?,
+            configuration_revision: decode_document_revision(
+                &value.configuration_revision,
+                "configuration revision",
+            )?,
+            deployment_owner: DeploymentOwner::parse(&value.deployment_owner)
+                .map_err(|error| format!("decode MV Accelerator deployment owner: {error}"))?,
+            process_incarnation: ProcessIncarnation::parse(&value.process_incarnation)
+                .map_err(|error| format!("decode MV Accelerator process incarnation: {error}"))?,
+        })
+    }
 }
 
 impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
@@ -161,7 +272,7 @@ impl TryFrom<&StoredMvDefinition> for StoredMvDefinitionAvro {
             refresh_interval_ms: value.refresh_interval_ms,
             max_staleness_ms: value.max_staleness_ms,
             created_at_ms: value.created_at_ms,
-            source_revision: value.source_revision.clone(),
+            source_revision: (&value.source_revision).into(),
         })
     }
 }
@@ -201,9 +312,34 @@ impl TryFrom<StoredMvDefinitionAvro> for StoredMvDefinition {
             refresh_interval_ms: value.refresh_interval_ms,
             max_staleness_ms: value.max_staleness_ms,
             created_at_ms: value.created_at_ms,
-            source_revision: value.source_revision,
+            source_revision: value.source_revision.try_into()?,
         })
     }
+}
+
+fn decode_sha256(value: &str, subject: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "MV Accelerator {subject} must be canonical lowercase SHA-256 hex"
+        ));
+    }
+    let decoded =
+        hex::decode(value).map_err(|error| format!("decode MV Accelerator {subject}: {error}"))?;
+    decoded.try_into().map_err(|bytes: Vec<u8>| {
+        format!(
+            "MV Accelerator {subject} must be 32 bytes, got {}",
+            bytes.len()
+        )
+    })
+}
+
+fn decode_document_revision(value: &str, subject: &str) -> Result<DocumentRevision, String> {
+    DocumentRevision::try_from_bytes(&decode_sha256(value, subject)?)
+        .map_err(|error| format!("decode MV Accelerator {subject}: {error}"))
 }
 
 pub fn encode_projection(
@@ -214,6 +350,7 @@ pub fn encode_projection(
         .query_definition
         .validate()
         .map_err(|error| format!("invalid persisted MV query definition: {error}"))?;
+    validate_projection_source(definition)?;
     encode_record(
         MvRecordKind::Projection,
         operation_id,
@@ -231,10 +368,49 @@ pub fn decode_projection(
         .query_definition
         .validate()
         .map_err(|error| format!("invalid persisted MV query definition: {error}"))?;
+    validate_projection_source(&value)?;
     Ok(DecodedMvRecord {
         operation_id: decoded.operation_id,
         value,
     })
+}
+
+fn validate_projection_source(definition: &StoredMvDefinition) -> Result<(), String> {
+    let source = &definition.source_revision;
+    if source.target.namespace.is_empty() || source.target.table.is_empty() {
+        return Err("MV Accelerator source target identity is incomplete".to_string());
+    }
+    if definition.target_catalog.as_deref() != Some(source.target.instance_id.as_str())
+        || definition.target_namespace.as_deref() != Some(source.target.namespace.as_ref())
+        || definition.target_table.as_deref() != Some(source.target.table.as_ref())
+    {
+        return Err(
+            "MV Accelerator source target identity does not match the stored projection target"
+                .to_string(),
+        );
+    }
+    if source.publication_revision.is_some() != source.publication_output_version.is_some() {
+        return Err("MV Accelerator P revision and output-version presence must match".to_string());
+    }
+    match definition.last_refreshed_iceberg_snapshot_id {
+        Some(snapshot_id)
+            if source
+                .publication_output_version
+                .as_ref()
+                .and_then(MvAcceleratorCommittedVersionRevision::snapshot_id)
+                == Some(snapshot_id) =>
+        {
+            Ok(())
+        }
+        Some(_) => Err(
+            "MV Accelerator published waterline does not match the exact P output version"
+                .to_string(),
+        ),
+        None if source.publication_revision.is_none() => Ok(()),
+        None => {
+            Err("MV Accelerator never-published projection carries an exact P revision".to_string())
+        }
+    }
 }
 
 pub fn encode_record<T>(kind: MvRecordKind, operation_id: Uuid, value: &T) -> Result<Value, String>

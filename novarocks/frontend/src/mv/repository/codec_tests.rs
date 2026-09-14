@@ -21,7 +21,7 @@ use super::super::super::domain::dependency::model::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
 use super::super::super::domain::persistence::definition::{
-    MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
+    MvDesiredRefreshPolicy, StoredMvDefinition, test_source_revision,
 };
 use super::super::super::domain::repository::MvTargetLookup;
 use super::super::catalog::schema_catalog;
@@ -76,11 +76,13 @@ fn projection() -> StoredMvDefinition {
         refresh_interval_ms: None,
         max_staleness_ms: None,
         created_at_ms: 1,
-        source_revision: MvAcceleratorSourceRevision {
-            target_object_id: object_id(b"target-object"),
-            descriptor_content_hash: "descriptor-digest".to_string(),
-            current_target_snapshot_id: Some(11),
-        },
+        source_revision: test_source_revision(
+            "ice",
+            "sales",
+            "orders_mv",
+            object_id(b"target-object"),
+            Some(11),
+        ),
     }
 }
 
@@ -99,7 +101,7 @@ fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
     let projection = projection_by_id_key(9).expect("projection key");
     assert_eq!(
         std::str::from_utf8(projection.as_bytes()).unwrap(),
-        "novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000009"
+        "novarocks/frontend/mv/accelerator/v2/projection/by-id/0000000000000009"
     );
     assert_eq!(decode_key(&projection).unwrap().kind, MvKeyKind::Projection);
     assert_eq!(
@@ -113,8 +115,9 @@ fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
         "novarocks/frontend/mv/v1/definition/by-id/0000000000000001",
         "novarocks/frontend/mv/v1/refresh/by-id/0000000000000001",
         "novarocks/frontend/mv/v1/partition/by-mv/0000000000000001/61",
-        "novarocks/frontend/mv/accelerator/v1/refresh/by-id/0000000000000001",
-        "novarocks/frontend/mv/accelerator/v1/unknown/value",
+        "novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000001",
+        "novarocks/frontend/mv/accelerator/v2/refresh/by-id/0000000000000001",
+        "novarocks/frontend/mv/accelerator/v2/unknown/value",
     ] {
         let key = Key::try_from(Bytes::from(raw)).unwrap();
         assert!(decode_key(&key).is_err(), "{raw} must remain unreachable");
@@ -144,6 +147,29 @@ fn projection_codec_round_trips_complete_source_revision_and_waterline() {
     let decoded = decode_projection(&key, &value).unwrap();
     assert_eq!(decoded.operation_id, operation_id);
     assert_eq!(decoded.value, expected);
+    let source = decoded.value.source_revision;
+    assert_eq!(source.target.instance_id.as_str(), "ice");
+    assert_eq!(source.target.namespace.as_ref(), "sales");
+    assert_eq!(source.target.table.as_ref(), "orders_mv");
+    assert_eq!(source.deployment_owner.as_str(), "test-deployment");
+    assert_eq!(source.process_incarnation.as_str(), "test-process");
+    assert!(source.publication_revision.is_some());
+    assert_eq!(
+        source
+            .publication_output_version
+            .as_ref()
+            .and_then(|version| version.snapshot_id()),
+        Some(11)
+    );
+}
+
+#[test]
+fn projection_codec_rejects_an_incomplete_p_source_revision() {
+    let mut invalid = projection();
+    invalid.source_revision.publication_revision = None;
+    let error = encode_projection(Uuid::now_v7(), &invalid)
+        .expect_err("P revision and output version must remain indivisible");
+    assert!(error.contains("P revision and output-version presence must match"));
 }
 
 #[test]
@@ -159,6 +185,13 @@ fn envelope_rejects_wrong_kind_unknown_schema_and_corruption() {
     assert!(decode_record::<MvTargetLookup>(&wrong_key, &value).is_err());
 
     let target = target_lookup_key("ice", "sales", "orders").unwrap();
+    let mut v1_envelope = value.clone().into_bytes().to_vec();
+    v1_envelope[4] = 1;
+    let v1_envelope = Value::try_from(Bytes::from(v1_envelope)).unwrap();
+    let error = decode_record::<MvTargetLookup>(&target, &v1_envelope)
+        .expect_err("v1 envelope must not be readable");
+    assert!(error.contains("unsupported MV Accelerator envelope version 1"));
+
     let mut unknown_schema = value.clone().into_bytes().to_vec();
     unknown_schema[6..10].copy_from_slice(&999_i32.to_be_bytes());
     let unknown_schema = Value::try_from(Bytes::from(unknown_schema)).unwrap();
@@ -195,6 +228,10 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
             "mv.accelerator_target_lookup",
         ])
     );
+    for subject in catalog.subjects() {
+        assert!(catalog.entry(subject, 1).is_err());
+        assert_eq!(catalog.latest(subject).unwrap().id(), 2);
+    }
     assert!(catalog.entry("mv.definition", 4).is_err());
     assert!(catalog.entry("mv.refresh", 5).is_err());
     assert!(catalog.entry("mv.partition_state", 1).is_err());

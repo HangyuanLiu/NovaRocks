@@ -685,7 +685,7 @@ fn prepare_frontend_first_refresh_write(
             .source_revision()
             .map_err(|error| error.to_string())?
             .descriptor_content_hash
-            != definition.source_revision.descriptor_content_hash
+            != legacy_descriptor_content_hash(&definition.source_revision)?
         {
             return Err(
                 "MV repartition descriptor drifted from its ready accelerator projection"
@@ -1169,9 +1169,18 @@ fn managed_descriptor_properties(
 
     ConnectorManagedDescriptorProperties::try_new(vec![(
         Arc::from(MV_DESCRIPTOR_HASH_PROP),
-        Arc::from(definition.source_revision.descriptor_content_hash.as_str()),
+        Arc::from(legacy_descriptor_content_hash(&definition.source_revision)?),
     )])
     .map_err(|error| format!("build managed MV descriptor properties: {error}"))
+}
+
+fn legacy_descriptor_content_hash(
+    _source_revision: &crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision,
+) -> Result<&str, String> {
+    Err(
+        "legacy MV descriptor publication cannot consume an Accelerator v2 D/L/P/C source revision"
+            .to_string(),
+    )
 }
 
 fn managed_descriptor_properties_from_descriptor(

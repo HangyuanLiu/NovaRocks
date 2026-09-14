@@ -1163,12 +1163,13 @@ pub(crate) mod tests_support {
             refresh_interval_ms: None,
             max_staleness_ms: None,
             created_at_ms: 0,
-            source_revision:
-                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
-                    target_object_id: object_id("target-object"),
-                    descriptor_content_hash: "test-descriptor".to_string(),
-                    current_target_snapshot_id: Some(99),
-                },
+            source_revision: crate::mv::domain::persistence::definition::test_source_revision(
+                "tgt",
+                "db",
+                "mv",
+                object_id("target-object"),
+                Some(99),
+            ),
         }
     }
 

@@ -451,15 +451,16 @@ mod tests {
             refresh_interval_ms,
             max_staleness_ms: None,
             created_at_ms: 1,
-            source_revision:
-                crate::mv::domain::persistence::definition::MvAcceleratorSourceRevision {
-                    target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                        Bytes::from_static(b"scheduler-test-target"),
-                    )
-                    .expect("valid object ID"),
-                    descriptor_content_hash: "test-descriptor".to_string(),
-                    current_target_snapshot_id: None,
-                },
+            source_revision: crate::mv::domain::persistence::definition::test_source_revision(
+                "iceberg",
+                "db",
+                "mv",
+                novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from_static(
+                    b"scheduler-test-target",
+                ))
+                .expect("valid object ID"),
+                None,
+            ),
         }
     }
 

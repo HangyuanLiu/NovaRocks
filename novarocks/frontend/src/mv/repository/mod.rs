@@ -604,17 +604,36 @@ fn validate_projection_request(request: &MvProjectionRequest) -> Result<(), MvRe
             "MV Accelerator projection requires an exact target",
         ));
     }
-    if request.source_revision.descriptor_content_hash.is_empty() {
+    let source_target = &request.source_revision.target;
+    if source_target.instance_id.as_str()
+        != request
+            .definition
+            .target_catalog
+            .as_deref()
+            .unwrap_or_default()
+        || source_target.namespace.as_ref()
+            != request
+                .definition
+                .target_namespace
+                .as_deref()
+                .unwrap_or_default()
+        || source_target.table.as_ref()
+            != request
+                .definition
+                .target_table
+                .as_deref()
+                .unwrap_or_default()
+    {
         return Err(invalid(
-            "MV source revision descriptor hash must not be empty",
+            "MV source revision target identity does not match the projection target",
         ));
     }
-    if request
-        .source_revision
-        .current_target_snapshot_id
-        .is_some_and(|snapshot_id| snapshot_id < 0)
+    if request.source_revision.publication_revision.is_some()
+        != request.source_revision.publication_output_version.is_some()
     {
-        return Err(invalid("MV source revision snapshot must not be negative"));
+        return Err(invalid(
+            "MV source revision publication and output version presence differ",
+        ));
     }
     if request.definition.created_at_ms < 0 {
         return Err(invalid("MV projection creation time must not be negative"));
@@ -634,20 +653,25 @@ fn validate_projection_request(request: &MvProjectionRequest) -> Result<(), MvRe
     }
     match &request.publication {
         MvPublishedProjection::NeverPublished => {
-            if request.source_revision.current_target_snapshot_id.is_some() {
-                // A bootstrap target snapshot is allowed by the lake contract;
-                // it is a source revision and not an invented waterline.
+            if request.source_revision.publication_revision.is_some() {
+                return Err(invalid(
+                    "never-published MV projection carries a publication source revision",
+                ));
             }
         }
         MvPublishedProjection::Published(waterline) => {
+            let publication_snapshot_id = request
+                .source_revision
+                .publication_output_version
+                .as_ref()
+                .and_then(|version| version.snapshot_id());
             if waterline.last_refresh_ms < 0
                 || waterline.last_refresh_rows < 0
-                || waterline.last_refreshed_iceberg_snapshot_id < 0
-                || request.source_revision.current_target_snapshot_id
-                    != Some(waterline.last_refreshed_iceberg_snapshot_id)
+                || waterline.last_refreshed_iceberg_snapshot_id <= 0
+                || publication_snapshot_id != Some(waterline.last_refreshed_iceberg_snapshot_id)
             {
                 return Err(invalid(
-                    "published MV waterline does not match its source revision",
+                    "published MV waterline does not match its P output version",
                 ));
             }
             if waterline.base_snapshots.keys().collect::<BTreeSet<_>>()

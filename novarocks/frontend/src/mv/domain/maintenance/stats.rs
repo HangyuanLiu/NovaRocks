@@ -191,7 +191,7 @@ pub fn collect_table_stats_with_ports(
 mod tests {
     use super::*;
     use crate::mv::domain::persistence::definition::{
-        MvAcceleratorSourceRevision, MvDesiredRefreshPolicy, StoredMvDefinition,
+        MvDesiredRefreshPolicy, StoredMvDefinition, test_source_revision,
     };
     use novarocks_query_application::persisted_query_definition::{
         PersistedQueryDefinition, PersistedQueryDialect,
@@ -228,14 +228,16 @@ mod tests {
             refresh_interval_ms: None,
             max_staleness_ms: None,
             created_at_ms: 0,
-            source_revision: MvAcceleratorSourceRevision {
-                target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
+            source_revision: test_source_revision(
+                "ice",
+                "analytics",
+                "mv_x",
+                novarocks_spi::connector::ConnectorTableObjectId::try_new(
                     bytes::Bytes::from_static(b"maintenance-test-target"),
                 )
                 .expect("test object ID"),
-                descriptor_content_hash: "test-descriptor".to_string(),
-                current_target_snapshot_id: None,
-            },
+                None,
+            ),
         }
     }
 

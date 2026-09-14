@@ -311,10 +311,9 @@ fn decode_dependency_identity(value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// These bytes are already in deployed stores.  The literals are repeated
-    /// here rather than read from the manifest on purpose: an edit to the
-    /// registered prefix has to be made twice, deliberately, or this assertion
-    /// catches it before a live store is silently orphaned.
+    /// These bytes define the only UEA-7 Accelerator family. The literals are
+    /// repeated here rather than read from the manifest so a prefix edit has
+    /// to be deliberate in both the descriptor and its key contract.
     ///
     /// The family-wide scan prefix is the interesting case: the registered
     /// prefix carries no trailing separator, so the `/` this owner appends is
@@ -323,15 +322,15 @@ mod tests {
     fn key_bytes_are_stable_under_the_registered_prefix() {
         assert_eq!(
             accelerator_prefix().expect("family prefix").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/"
+            b"novarocks/frontend/mv/accelerator/v2/"
         );
         assert_eq!(
             projection_prefix().expect("projection prefix").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/projection/by-id/"
+            b"novarocks/frontend/mv/accelerator/v2/projection/by-id/"
         );
         assert_eq!(
             sequence_key().expect("sequence key").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
+            b"novarocks/frontend/mv/accelerator/v2/sequence/mv-id"
         );
     }
 }
