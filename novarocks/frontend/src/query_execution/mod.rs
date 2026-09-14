@@ -21,6 +21,11 @@ pub mod artifact;
 pub mod assembly;
 pub(crate) mod attempt_initialization;
 pub mod completion;
+#[allow(
+    dead_code,
+    reason = "T07-Q routes plain SELECT through this fact source; the owners it assembles answer nothing until then."
+)]
+pub(crate) mod completion_facts;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 #[allow(
     dead_code,
