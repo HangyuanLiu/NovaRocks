@@ -30,6 +30,7 @@ use crate::query_execution::kernels::{
 };
 use arrow::datatypes::DataType;
 use novarocks_spi::connector::{StatisticsMetric, StatisticsMetricRequest};
+use novarocks_sql::compiler::{StatisticsFact, StatisticsNeed};
 use novarocks_sql::planning::catalog::materialization_statistics_facts;
 use novarocks_sql::planning::dml::{
     DmlStatisticsEvidence, DmlStatisticsFailure, DmlStatisticsSnapshot,
@@ -140,6 +141,47 @@ fn project_statistics_evidence(
     Ok(evidence)
 }
 
+/// Resolve exactly one SQL completion statistics request from its already
+/// admitted binding. This boundary never looks up a current table, connector,
+/// or data version: the request-local binding is the only source of those
+/// facts.
+///
+/// The completion protocol owns the metric set. In particular, this must not
+/// reuse the wider optimizer snapshot request, because an `Available` fact is
+/// valid only when its evidence covers the exact metrics requested by the
+/// `StatisticsNeed`.
+pub(crate) fn resolve_statistics_need(
+    resolver: &UnifiedStatisticsResolver,
+    bindings: &QueryTableBindingStore,
+    need: &StatisticsNeed,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<StatisticsFact, String> {
+    let binding_id = need.binding();
+    let evidence = match bindings.binding(binding_id) {
+        Ok(binding) => {
+            let facts = materialization_statistics_facts(&binding.resolved);
+            project_binding_statistics_for_metrics(
+                resolver,
+                binding_id,
+                facts.label(),
+                facts.columns(),
+                &binding,
+                need.metrics(),
+                connector_context,
+            )?
+        }
+        // An unknown token is a contradiction with the exact catalog fact
+        // that introduced this SQL binding. It must not become a best-effort
+        // current lookup or a conservative Missing observation.
+        Err(_) => {
+            let label = format!("SQL binding {binding_id:?}");
+            fatal_statistics_evidence(binding_id, &label, DmlStatisticsFailure::BindingMissing)
+        }
+    };
+    StatisticsFact::try_new(need, need.metrics().to_vec(), evidence)
+        .map_err(|error| format!("build statistics completion fact: {error}"))
+}
+
 fn project_binding_statistics(
     resolver: &UnifiedStatisticsResolver,
     binding_id: novarocks_sql::binding::SqlTableBindingId,
@@ -148,6 +190,36 @@ fn project_binding_statistics(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<DmlStatisticsEvidence, String> {
     let label = facts.label();
+    let metrics = match metric_request(facts.columns()) {
+        Ok(metrics) => metrics,
+        Err(error) => {
+            return Ok(fatal_statistics_evidence(
+                binding_id,
+                label,
+                DmlStatisticsFailure::CorruptEvidence(format!("build metric request: {error}")),
+            ));
+        }
+    };
+    project_binding_statistics_for_metrics(
+        resolver,
+        binding_id,
+        label,
+        facts.columns(),
+        binding,
+        metrics.metrics(),
+        connector_context,
+    )
+}
+
+fn project_binding_statistics_for_metrics(
+    resolver: &UnifiedStatisticsResolver,
+    binding_id: novarocks_sql::binding::SqlTableBindingId,
+    label: &str,
+    columns: &[novarocks_types::schema::ColumnDef],
+    binding: &QueryTableBinding,
+    requested_metrics: &[StatisticsMetric],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<DmlStatisticsEvidence, String> {
     let Some(pin) = binding.statistics_pin.as_ref() else {
         return Ok(DmlStatisticsEvidence::Missing {
             binding: binding_id,
@@ -180,7 +252,7 @@ fn project_binding_statistics(
             reason: "resolved connector generation does not expose statistics".to_string(),
         });
     };
-    let metrics = match metric_request(facts.columns()) {
+    let metrics = match StatisticsMetricRequest::try_new(requested_metrics.to_vec()) {
         Ok(metrics) => metrics,
         Err(error) => {
             return Ok(fatal_statistics_evidence(
@@ -231,7 +303,7 @@ fn project_binding_statistics(
     Ok(DmlStatisticsEvidence::Available {
         binding: binding_id,
         label: label.to_string(),
-        columns: facts.columns().to_vec(),
+        columns: columns.to_vec(),
         evidence: (*evidence).clone(),
     })
 }
@@ -338,6 +410,7 @@ fn metric_request(
 #[cfg(test)]
 mod unified_tests {
     use std::num::NonZeroU64;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
@@ -406,6 +479,7 @@ mod unified_tests {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
         reads: AtomicUsize,
+        requested_metrics: Mutex<Vec<Vec<StatisticsMetric>>>,
     }
 
     impl ContextObservingProvider {
@@ -494,6 +568,10 @@ mod unified_tests {
             request: StatisticsReadRequest,
         ) -> Result<StatisticsEvidence, ConnectorError> {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            self.requested_metrics
+                .lock()
+                .expect("statistics fixture metrics lock")
+                .push(request.metrics.metrics().to_vec());
             if request.context.cancellation().is_cancelled() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Cancelled,
@@ -557,6 +635,7 @@ mod unified_tests {
             },
             incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
             reads: AtomicUsize::new(0),
+            requested_metrics: Mutex::new(Vec::new()),
         })
     }
 
@@ -671,6 +750,44 @@ mod unified_tests {
 
         assert!(error.contains("statistics fixture observed caller deadline"));
         assert_eq!(provider.reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn per_need_projection_preserves_the_exact_metric_request() {
+        let provider = observing_provider();
+        let binding = connector_binding_with_statistics(provider.clone());
+        let binding_id = novarocks_sql::planning::catalog::table_binding_id(&binding.resolved);
+        let requested = vec![
+            StatisticsMetric::RowCount,
+            StatisticsMetric::ThetaNdv {
+                column: Arc::from("k"),
+            },
+        ];
+        let context = request_context(
+            Instant::now() + Duration::from_secs(60),
+            Arc::new(AtomicBool::new(false)),
+        );
+
+        let evidence = project_binding_statistics_for_metrics(
+            &UnifiedStatisticsResolver::default(),
+            binding_id,
+            "ice.main.db.orders",
+            &[column("k")],
+            &binding,
+            &requested,
+            &context,
+        )
+        .expect("ordinary provider statistics failure remains Missing");
+
+        assert!(matches!(evidence, DmlStatisticsEvidence::Missing { .. }));
+        assert_eq!(
+            provider
+                .requested_metrics
+                .lock()
+                .expect("statistics fixture metrics lock")
+                .as_slice(),
+            [requested]
+        );
     }
 
     #[test]
