@@ -30,7 +30,7 @@ async-trait.workspace = true
 axum.workspace = true
 once_cell.workspace = true
 hex.workspace = true
-hyper = { version = "1", features = ["http2", "server"] }
+hyper.workspace = true
 hyper-util = { workspace = true, features = ["tokio"] }
 novarocks-types.workspace = true
 novarocks-version.workspace = true
