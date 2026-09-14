@@ -991,6 +991,16 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                             novarocks_spi::connector::ConnectorTableObjectId::try_new(
                                 Bytes::from(staged.table.metadata().uuid().to_string()),
                             )?,
+                            Bytes::copy_from_slice(
+                                &staged.table.metadata().current_schema_id().to_be_bytes(),
+                            ),
+                            Bytes::copy_from_slice(
+                                &staged
+                                    .table
+                                    .metadata()
+                                    .default_partition_spec_id()
+                                    .to_be_bytes(),
+                            ),
                             fields,
                             payload.clone(),
                         )?;
@@ -2119,6 +2129,22 @@ mod tests {
                 prepared.staged.table.metadata().uuid().to_string(),
             ))
             .unwrap(),
+            Bytes::copy_from_slice(
+                &prepared
+                    .staged
+                    .table
+                    .metadata()
+                    .current_schema_id()
+                    .to_be_bytes(),
+            ),
+            Bytes::copy_from_slice(
+                &prepared
+                    .staged
+                    .table
+                    .metadata()
+                    .default_partition_spec_id()
+                    .to_be_bytes(),
+            ),
             prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap(),
             Bytes::from_static(b"target"),
         )

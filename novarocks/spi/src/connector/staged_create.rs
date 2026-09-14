@@ -101,6 +101,8 @@ pub struct ConnectorPreparedCreateDocumentTarget {
     operation_id: ConnectorStagedCreateOperationId,
     target: ConnectorTableIdentity,
     object_id: ConnectorTableObjectId,
+    schema_version: Bytes,
+    partition_spec_version: Bytes,
     fields: Vec<ConnectorPreparedCreateFieldBinding>,
     provider_token: Bytes,
 }
@@ -114,6 +116,11 @@ impl std::fmt::Debug for ConnectorPreparedCreateDocumentTarget {
             .field("operation_id", &self.operation_id)
             .field("target", &self.target)
             .field("object_id", &self.object_id)
+            .field("schema_version_bytes", &self.schema_version.len())
+            .field(
+                "partition_spec_version_bytes",
+                &self.partition_spec_version.len(),
+            )
             .field("fields", &self.fields)
             .field("provider_token_bytes", &self.provider_token.len())
             .finish()
@@ -127,11 +134,17 @@ impl ConnectorPreparedCreateDocumentTarget {
         operation_id: ConnectorStagedCreateOperationId,
         target: ConnectorTableIdentity,
         object_id: ConnectorTableObjectId,
+        schema_version: Bytes,
+        partition_spec_version: Bytes,
         mut fields: Vec<ConnectorPreparedCreateFieldBinding>,
         provider_token: Bytes,
     ) -> Result<Self, ConnectorError> {
         if target.instance_id != owner.instance_id
             || catalog_handle.catalog_name() != &owner.instance_id
+            || schema_version.is_empty()
+            || partition_spec_version.is_empty()
+            || schema_version.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
+            || partition_spec_version.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
             || fields.is_empty()
             || provider_token.is_empty()
             || provider_token.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
@@ -156,6 +169,8 @@ impl ConnectorPreparedCreateDocumentTarget {
             operation_id,
             target,
             object_id,
+            schema_version,
+            partition_spec_version,
             fields,
             provider_token,
         })
@@ -181,6 +196,14 @@ impl ConnectorPreparedCreateDocumentTarget {
         &self.object_id
     }
 
+    pub const fn schema_version(&self) -> &Bytes {
+        &self.schema_version
+    }
+
+    pub const fn partition_spec_version(&self) -> &Bytes {
+        &self.partition_spec_version
+    }
+
     pub fn fields(&self) -> &[ConnectorPreparedCreateFieldBinding] {
         &self.fields
     }
@@ -197,6 +220,8 @@ impl ConnectorPreparedCreateDocumentTarget {
         digest_bytes(hasher, self.target.namespace.as_bytes());
         digest_bytes(hasher, self.target.table.as_bytes());
         digest_bytes(hasher, self.object_id.as_bytes());
+        digest_bytes(hasher, &self.schema_version);
+        digest_bytes(hasher, &self.partition_spec_version);
         hasher.update((self.fields.len() as u64).to_be_bytes());
         for field in &self.fields {
             hasher.update(field.request_ordinal.to_be_bytes());
@@ -1865,6 +1890,8 @@ mod tests {
                 table: Arc::from("orders"),
             },
             ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+            Bytes::from_static(b"schema-version"),
+            Bytes::from_static(b"partition-spec-version"),
             vec![
                 ConnectorPreparedCreateFieldBinding::try_new(1, Bytes::from_static(b"field-id"))
                     .unwrap(),
