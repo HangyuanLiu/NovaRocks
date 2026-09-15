@@ -22,7 +22,7 @@
 //! protocol conformance is covered by its dedicated scenarios.
 
 use crate::actors::mysql as mysql_actor;
-use crate::actors::mysql_stream::MysqlStream;
+use crate::actors::mysql_stream::AsyncMysqlStream;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
@@ -31,9 +31,12 @@ use novarocks_cluster_harness::process_resources::{
 };
 use novarocks_cluster_harness::{CrossProcessConfigOverlay, ServerHandle};
 use serde::Deserialize;
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
+use tokio::sync::Barrier;
+use tokio::task::{JoinHandle, JoinSet};
 
 const REQUIRED_BACKENDS: usize = 3;
 const TIERS: [usize; 3] = [16, 64, 256];
@@ -48,6 +51,10 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
 const FIXED_RUNTIME_THREAD_ALLOWANCE: u64 = 12;
 const IO_TIMEOUT_CAP: Duration = Duration::from_secs(10);
 const QUERY_TIMEOUT_SECONDS: u64 = 5;
+// This scenario must prove 256 logical MySQL roots, not allocate one OS
+// thread per root. Sixteen I/O workers keep the 256-socket fan-in making
+// progress while preserving a fixed, platform-safe harness bound.
+const CLIENT_RUNTIME_THREADS: usize = 16;
 // `sleep` evaluates in the BE after the one-row source is distributed. It is
 // deliberately a one-row source so each of the three admitted drivers uses
 // bounded memory while queued roots demonstrate the actual governance limit.
@@ -149,6 +156,7 @@ struct ActiveWorkloads {
 #[derive(Debug, Deserialize)]
 struct Governance {
     root_responsibilities: usize,
+    preparation: usize,
     execution: usize,
     waiting_records: usize,
     peak_waiting_records: usize,
@@ -158,17 +166,26 @@ struct Governance {
     held_bytes: u64,
     peak_held_bytes: u64,
     result_credit_held_bytes: u64,
+    control_ready: usize,
+    control_inflight: usize,
 }
 
-struct HeldQuery {
-    done: mpsc::Receiver<Result<String>>,
-    thread: thread::JoinHandle<Result<()>>,
-}
-
-struct PendingHeldQuery {
-    ready: mpsc::Receiver<()>,
-    done: mpsc::Receiver<Result<String>>,
-    thread: thread::JoinHandle<Result<()>>,
+impl FrontendState {
+    fn diagnostic(&self) -> String {
+        let workload = &self.workload;
+        let governance = &workload.governance;
+        format!(
+            "active_statement={} roots={} preparation={} execution={} waiting={} held_bytes={} control_ready={} control_inflight={}",
+            workload.active.statement,
+            governance.root_responsibilities,
+            governance.preparation,
+            governance.execution,
+            governance.waiting_records,
+            governance.held_bytes,
+            governance.control_ready,
+            governance.control_inflight,
+        )
+    }
 }
 
 struct TierWindow {
@@ -183,65 +200,52 @@ fn run_tier(
     tier: usize,
 ) -> Result<TierWindow> {
     let timeout = bounded_io_timeout(context, "connect held query clients")?;
-    let gate = Arc::new(Barrier::new(tier + 1));
-    let pending = (0..tier)
-        .map(|_| {
-            start_held_query(
-                context.mysql_user().to_owned(),
-                context.mysql_port(),
-                timeout,
-                Arc::clone(&gate),
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut queries = pending
-        .into_iter()
-        .map(|pending| {
-            pending
-                .ready
-                .recv_timeout(timeout)
-                .context("wait for concurrent query client readiness")?;
-            Ok(HeldQuery {
-                done: pending.done,
-                thread: pending.thread,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let runtime = bounded_client_runtime()?;
+    let readers = runtime.block_on(start_held_query_readers(
+        context.mysql_user().to_owned(),
+        context.mysql_port(),
+        timeout,
+        tier,
+    ))?;
     let start_millis = monitor.elapsed_millis();
-    gate.wait();
     let observed = await_governance(context, tier)?;
     assert_bounds(&observed, tier)?;
     context.action(format!(
         "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} peak_held_bytes={}",
         observed.execution, observed.waiting_records, observed.peak_waiting_records, observed.peak_held_bytes
     ));
-    // The governance contract owns cancellation convergence. Observe that
-    // first: a stalled client read must not conceal retained roots, queue
-    // records, or reserved bytes on the server side.
-    await_convergence(context)?;
-    for query in &queries {
-        let outcome = query
-            .done
-            .recv_timeout(bounded_io_timeout(
-                context,
-                "await held-query interruption",
-            )?)
-            .with_context(|| format!("await tier {tier} statement deadline result"))?;
+    let outcomes = runtime.block_on(read_timeout_outcomes(readers))?;
+    let mut terminal_failures = Vec::new();
+    for (index, (_connection, outcome)) in outcomes.iter().enumerate() {
         match outcome {
             Ok(error)
                 if error.contains("timed out")
                     || error.contains("timeout")
                     || error.contains("deadline") => {}
-            Ok(error) => bail!("tier {tier} returned a non-timeout terminal response: {error}"),
-            Err(error) => return Err(error).context(format!("read tier {tier} timeout response")),
+            Ok(error) => terminal_failures.push(format!(
+                "client {index} returned a non-timeout terminal response: {error}"
+            )),
+            Err(error) => terminal_failures.push(format!(
+                "client {index} failed to read its timeout response: {error}"
+            )),
         }
     }
-    for query in queries.drain(..) {
-        query
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("held-query actor panicked"))??;
+    if !terminal_failures.is_empty() {
+        // Retain every client socket until this diagnostic read. Dropping the
+        // sockets first would turn an absent deadline terminal into a client
+        // disconnect and conceal the FE owner state that must be investigated.
+        let state = frontend_state(context)
+            .map(|state| state.diagnostic())
+            .unwrap_or_else(|error| format!("unavailable: {error:#}"));
+        bail!(
+            "tier {tier} did not deliver deadline terminals: {}; FE workload state: {state}",
+            terminal_failures.join("; ")
+        );
     }
+    // The raw readers run continuously while these roots are live. Once all
+    // of them have observed the expected deadline terminal, governance still
+    // owns the separate responsibility/queue/byte convergence assertion.
+    await_convergence(context)?;
     Ok(TierWindow {
         tier,
         start_millis,
@@ -249,31 +253,78 @@ fn run_tier(
     })
 }
 
-fn start_held_query(
+fn bounded_client_runtime() -> Result<TokioRuntime> {
+    TokioRuntimeBuilder::new_multi_thread()
+        .worker_threads(CLIENT_RUNTIME_THREADS)
+        .enable_io()
+        .enable_time()
+        .build()
+        .context("build bounded async concurrency client runtime")
+}
+
+async fn start_held_query_readers(
     user: String,
     port: u16,
     timeout: Duration,
-    gate: Arc<Barrier>,
-) -> Result<PendingHeldQuery> {
-    let (ready_tx, ready) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let thread = thread::Builder::new()
-        .name("query-concurrency-held-client".to_string())
-        .spawn(move || -> Result<()> {
-            let mut connection = MysqlStream::connect(&user, port, timeout)?;
-            connection.send_query(&format!("SET query_timeout = {QUERY_TIMEOUT_SECONDS}"))?;
-            connection.expect_ok_packet("SET query_timeout")?;
-            ready_tx.send(())?;
-            gate.wait();
-            connection.send_query(HELD_QUERY)?;
-            done_tx.send(connection.read_timeout_query_error())?;
-            Ok(())
-        })?;
-    Ok(PendingHeldQuery {
-        ready,
-        done,
-        thread,
-    })
+    tier: usize,
+) -> Result<Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>> {
+    let mut connects = JoinSet::new();
+    for _ in 0..tier {
+        let user = user.clone();
+        connects.spawn(async move {
+            let mut connection = AsyncMysqlStream::connect(&user, port, timeout).await?;
+            connection
+                .send_query(&format!("SET query_timeout = {QUERY_TIMEOUT_SECONDS}"))
+                .await?;
+            connection.expect_ok_packet("SET query_timeout").await?;
+            Ok::<_, anyhow::Error>(connection)
+        });
+    }
+    let mut connections = Vec::with_capacity(tier);
+    while let Some(result) = connects.join_next().await {
+        connections.push(result.context("concurrent held-query client task panicked")??);
+    }
+    ensure!(
+        connections.len() == tier,
+        "expected {tier} held-query clients, connected {}",
+        connections.len()
+    );
+
+    let gate = Arc::new(Barrier::new(tier + 1));
+    let reads = connections
+        .into_iter()
+        .map(|mut connection| {
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                gate.wait().await;
+                let outcome = async {
+                    connection.send_query(HELD_QUERY).await?;
+                    connection.read_timeout_query_error().await
+                }
+                .await;
+                (connection, outcome)
+            })
+        })
+        .collect();
+    // Keep the original actor's causality: every client starts receiving its
+    // statement terminal immediately after it sends the query. Waiting for
+    // every write to finish before creating readers can strand roots behind
+    // the FE control queue even though their deadline has elapsed.
+    gate.wait().await;
+    Ok(reads)
+}
+
+async fn read_timeout_outcomes(
+    reads: Vec<JoinHandle<(AsyncMysqlStream, Result<String>)>>,
+) -> Result<Vec<(AsyncMysqlStream, Result<String>)>> {
+    let mut outcomes = Vec::with_capacity(reads.len());
+    for read in reads {
+        outcomes.push(
+            read.await
+                .context("concurrent held-query read task panicked")?,
+        );
+    }
+    Ok(outcomes)
 }
 
 fn frontend_state(context: &mut ScenarioContext) -> Result<FrontendState> {

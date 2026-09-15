@@ -16,12 +16,11 @@ from pathlib import Path
 TRUST = "novarocks-native-trust"
 ALLOWED_INTERNAL = {"novarocks-secret", "novarocks-types"}
 FORBIDDEN_INTERNAL = {
-    "novarocks-backend",
+    "novarocks-native-adapter",
     "novarocks-connector-iceberg",
     "novarocks-connector-starrocks",
     "novarocks-execution",
     "novarocks-failpoint",
-    "novarocks-frontend",
     "novarocks-fs",
     "novarocks-parser",
     "novarocks-proto-codec",

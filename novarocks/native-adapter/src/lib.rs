@@ -17,40 +17,80 @@
 
 //! Server-resolved Native transport capabilities and protocol adapters.
 
+extern crate self as novarocks_native_adapter;
+
 pub mod backend_announce;
+pub mod backend_application;
 pub mod backend_heartbeat;
+pub mod backend_metrics;
 pub mod backend_readiness;
+pub mod backend_rpc_service;
+pub mod backend_task_execution;
+#[cfg(any(test, feature = "test-support"))]
+pub mod backend_test_support;
 pub mod catalog_prune_rpc;
 pub mod connector_blocking_io;
+pub mod connector_write_data_plane;
+#[cfg(any(test, feature = "test-support"))]
+pub mod connector_write_test_support;
+pub mod debug_environment;
+pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
+pub mod exchange_transmitter;
+pub mod fragment_aggregate;
+pub mod fragment_decode_context;
 pub mod fragment_error;
+pub mod fragment_exchange_receiver;
 pub mod fragment_expression;
+pub mod fragment_hash_join;
+pub mod fragment_ingress_error;
 pub mod fragment_instance;
 pub mod fragment_layout;
+pub mod fragment_plan_decode;
+pub(crate) mod fragment_plan_decode_submission;
 pub mod fragment_plan_node;
+pub mod fragment_request;
+pub mod fragment_result_writer;
 pub mod fragment_runtime_filter;
+pub mod fragment_runtime_filter_binding;
+pub mod fragment_scan_decode;
 pub mod fragment_scan_output;
 pub mod fragment_sink;
 pub mod fragment_submission;
+pub mod fragment_typed_connector_scan;
 pub mod fragment_validation;
 pub mod fragment_variant_path;
+pub mod fragment_window;
 pub mod management_http;
 pub mod native_client;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
+pub mod native_fragment_query;
+#[cfg(test)]
+mod native_fragment_query_tests;
 pub mod native_server;
 pub use native_server::NativeRpcServerHandle;
 pub mod query_options;
+pub mod runtime_filter_feedback;
+pub mod runtime_filter_ingress;
 pub mod runtime_filter_install;
 pub mod runtime_filter_membership;
 pub mod runtime_filter_participant;
 pub mod runtime_filter_rpc;
 pub mod runtime_filter_terminal;
+#[cfg(any(test, feature = "test-support"))]
+pub mod runtime_filter_test_support;
 pub mod runtime_filter_transport;
 pub mod runtime_filter_typed_scan;
+pub mod task_execution_observation;
 pub mod task_protocol;
 pub mod task_protocol_fault;
+pub mod task_protocol_ingress;
+pub mod task_query_context_options;
+pub mod task_result_diagnostics;
 pub mod task_shared_facts;
+#[cfg(any(test, feature = "test-support"))]
+pub mod typed_connector_test_support;
 
 pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.rs"));

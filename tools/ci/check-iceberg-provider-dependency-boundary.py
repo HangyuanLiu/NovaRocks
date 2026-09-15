@@ -33,18 +33,17 @@ from pathlib import Path
 
 PROVIDER = "novarocks-connector-iceberg"
 SERVER = "novarocks-server"
-FRONTEND = "novarocks-frontend"
-BACKEND = "novarocks-backend"
+FRONTEND_APPLICATION = "novarocks-frontend-application"
 
 FORBIDDEN_PROVIDER_CLOSURE = {
     "novarocks",
     "novarocks-execution",
-    "novarocks-frontend",
-    "novarocks-backend",
+    "novarocks-frontend-application",
     "novarocks-state-store-sqlite",
     "novarocks-connector-starrocks",
 }
 ALLOWED_PROVIDER_INTERNAL = {
+    "novarocks-connector-iceberg-functions",
     "novarocks-fs",
     "novarocks-proto-codec",
     "novarocks-proto-models",
@@ -127,12 +126,10 @@ def verify_provider(manifest_path, metadata):
 
 def verify_roles(metadata):
     provider_direct = {PROVIDER}
-    frontend = package(metadata, FRONTEND)
-    backend = package(metadata, BACKEND)
-    for role_name, role in ((FRONTEND, frontend), (BACKEND, backend)):
-        direct = dependency_names(role, {None, "build", "dev"})
-        if direct & provider_direct:
-            fail(f"{role_name} must not directly depend on {PROVIDER}")
+    frontend_application = package(metadata, FRONTEND_APPLICATION)
+    direct = dependency_names(frontend_application, {None, "build", "dev"})
+    if direct & provider_direct:
+        fail(f"{FRONTEND_APPLICATION} must not directly depend on {PROVIDER}")
 
     server = package(metadata, SERVER)
     direct = dependency_names(server, {None})

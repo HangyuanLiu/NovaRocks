@@ -43,9 +43,9 @@ use crate::resources::IcebergMetadataResources;
 
 static NEXT_ATTEMPT_METADATA_CACHE_OWNER: AtomicU64 = AtomicU64::new(1);
 
-/// Provider-private, attempt-local table materialization cache.  It is stored
-/// inside `ConnectorRequestScope`, so neither a process-global cache nor a
-/// query plan can retain a request-bound FileIO or response-local secret.
+/// Provider-private, attempt-local successful table materialization cache. It
+/// is stored inside `ConnectorRequestScope`, so neither a process-global cache
+/// nor a query plan can retain a request-bound FileIO or response-local secret.
 #[derive(Default)]
 struct AttemptMetadataTableCache {
     entries: Mutex<HashMap<AttemptMetadataTableKey, Arc<AttemptMetadataTableEntry>>>,
@@ -84,13 +84,26 @@ impl AttemptMetadataTableCache {
                 Some(entry) => (Arc::clone(entry), false),
                 None => {
                     let entry = Arc::new(AttemptMetadataTableEntry::loading());
-                    entries.insert(key, Arc::clone(&entry));
+                    entries.insert(key.clone(), Arc::clone(&entry));
                     (entry, true)
                 }
             }
         };
         if loader {
             let result = load();
+            // A request can observe absence, create the object, then load it
+            // again for publication or bootstrap. Keep the single-flight
+            // result for existing waiters, but do not let a failed observation
+            // become a stale negative cache across that external effect.
+            if result.is_err() {
+                let mut entries = self.entries.lock().expect("attempt metadata cache lock");
+                if entries
+                    .get(&key)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    entries.remove(&key);
+                }
+            }
             let mut stored = entry.result.lock().expect("attempt metadata entry lock");
             debug_assert!(stored.is_none(), "attempt metadata entry completes once");
             *stored = Some(result.clone());
@@ -470,16 +483,21 @@ impl IcebergMetadataContext {
                 None,
             );
         };
-        // The cache is an admission-only freeze. A terminal write context has
-        // deliberately dropped the collector and carries a replacement
-        // terminal-only resolver; it must reload through that resolver rather
-        // than reuse a FileIO that was bound to the active attempt lease.
+        // The request cache freezes every read-only planning observation in
+        // one request scope, including the metadata/statistics/typed-scan
+        // paths before an attempt collector exists. A terminal write context
+        // deliberately drops that collector and retains a replacement storage
+        // resolver; it must reload through that resolver rather than reuse a
+        // FileIO bound to the completed attempt.
         //
-        // It must also reach the catalog rather than the control-state table
-        // cache: this is the observation a commit decides against, so a cached
-        // table would let it compute replacements from a snapshot the branch
-        // has already moved past.
-        if request_context.vended_credential_lease_sink().is_none() {
+        // Terminal reloads must also reach the catalog rather than the
+        // control-state table cache: a commit decides against that current
+        // observation, so a cached table could compute replacements from a
+        // snapshot the branch has already moved past.
+        if request_context.fresh_catalog_observation_required()
+            || (request_context.vended_credential_lease_sink().is_none()
+                && request_context.storage_resolver().is_some())
+        {
             return self.observe_table_classified(
                 &namespace,
                 &table,
@@ -508,7 +526,7 @@ impl IcebergMetadataContext {
 
     /// Perform the one physical catalog observation for a cache miss. The
     /// caller owns normalization and, when applicable, the attempt-local
-    /// single-flight entry that memoizes both its value and failure.
+    /// single-flight entry that memoizes a successful materialization.
     /// Load past the attempt-local cache, but still accept a control-state
     /// cached table when no vended credential collection forces a fresh
     /// observation.
@@ -734,11 +752,38 @@ impl std::fmt::Debug for IcebergMetadataContext {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     use super::*;
+
+    #[test]
+    fn failed_request_observation_is_not_retained_after_a_create_boundary() {
+        let cache = AttemptMetadataTableCache::default();
+        let key = AttemptMetadataTableKey {
+            owner: 1,
+            namespace: "analytics".to_string(),
+            table: "created_later".to_string(),
+        };
+        let calls = AtomicUsize::new(0);
+
+        let first = cache.get_or_load(key.clone(), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err((ConnectorErrorKind::NotFound, "target is absent".to_string()))
+        });
+        assert!(matches!(first, Err((ConnectorErrorKind::NotFound, _))));
+
+        let second = cache.get_or_load(key, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err((ConnectorErrorKind::NotFound, "target is absent".to_string()))
+        });
+        assert!(matches!(second, Err((ConnectorErrorKind::NotFound, _))));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn generation_runtime_keeps_one_explicit_catalog_client() {
