@@ -516,6 +516,17 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
+    // log(x) is also the one-argument form, over any numeric including
+    // DECIMAL -- the shared numeric reader decodes that to f64.
+    for t in NUMERIC_PRESERVING_TYPES {
+        add(m, "log", Signature::new(vec![t.clone()], TypeSpec::Float64));
+    }
+    add(
+        m,
+        "log",
+        Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Float64),
+    );
+
     // round / dround additionally take how many digits to keep.
     add(
         m,
@@ -1167,7 +1178,8 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::Any("T"),
             ],
             TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-        ),
+        )
+        .with_widening(),
     );
 
     // array_filter(List<T>, List<Boolean>) -> List<T>. The lambda form is
@@ -1178,7 +1190,7 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::List(Box::new(TypeSpec::Boolean)),
+                TypeSpec::List(Box::new(TypeSpec::Any("M"))),
             ],
             TypeSpec::List(Box::new(TypeSpec::Any("T"))),
         ),
@@ -1258,17 +1270,16 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // analyzer casts a subscript to `Int32` when it lowers one, and the
     // executor refuses any other width. A wider declaration named a call
     // neither of them makes.
-    add(
-        m,
-        "__array_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int32,
-            ],
-            TypeSpec::Any("T"),
-        ),
-    );
+    for index in [TypeSpec::Int32, TypeSpec::Int64] {
+        add(
+            m,
+            "__array_element_at",
+            Signature::new(
+                vec![TypeSpec::List(Box::new(TypeSpec::Any("T"))), index],
+                TypeSpec::Any("T"),
+            ),
+        );
+    }
 
     // array_join / array_to_string: List<*> + Utf8 -> Utf8
     for name in ["array_join", "array_to_string"] {
@@ -1377,10 +1388,23 @@ fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add_for_every(m, name, INTEGER_TYPES, |t| {
             Signature::new(vec![t.clone(), t.clone()], t.clone())
         });
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::LargeInt, TypeSpec::LargeInt],
+                TypeSpec::LargeInt,
+            ),
+        );
     }
     add_for_every(m, "bitnot", INTEGER_TYPES, |t| {
         Signature::new(vec![t.clone()], t.clone())
     });
+    add(
+        m,
+        "bitnot",
+        Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
+    );
     // Shifts take (T, BIGINT) -> T.
     for name in [
         "bit_shift_left",
@@ -1847,7 +1871,12 @@ fn register_iceberg_transform_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+        );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int32),
         );
     }
 }

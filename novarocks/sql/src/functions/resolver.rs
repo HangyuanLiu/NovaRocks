@@ -89,7 +89,23 @@ pub(crate) fn resolve_scalar_function_signature_with_overload(
         }
     }
 
-    // Pass 3: limited concrete casts for signatures that explicitly require
+    // Pass 3: lossless integer widening. A position that declares BIGINT
+    // describes what the executor reads, not what the caller must already
+    // have written; an INT reaching it loses nothing on the way up, and the
+    // caller coerces every argument to the selected types anyway. Without
+    // this, a narrower integer -- which is what an expression like `idx % 3`
+    // or a column of a smaller width produces -- had to be spelled out as its
+    // own overload for every function that takes a count, an offset or a
+    // position. Strictly widening only: a spec never accepts an actual it
+    // could not hold.
+    for (index, sig) in candidates.iter().enumerate() {
+        if integer_widening_matches(sig, arg_types) {
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
+        }
+    }
+
+    // Pass 4: limited concrete casts for signatures that explicitly require
     // the resulting parameter targets to be enforced by the caller.
     for (index, sig) in candidates.iter().enumerate() {
         if concrete_cast_matches(sig, arg_types) {
@@ -250,6 +266,47 @@ fn polymorphic_matches(
         }
     }
     true
+}
+
+/// True iff every argument either anchor-matches its spec or is an integer
+/// that the spec's own integer type can hold without loss.
+fn integer_widening_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
+    if !check_arity(sig, arg_types.len()) {
+        return false;
+    }
+    let mut widened_any = false;
+    let matched = arg_types.iter().enumerate().all(|(idx, actual)| {
+        let spec = signature_spec_at(sig, idx);
+        if anchor_matches(spec, actual) {
+            return true;
+        }
+        if integer_widens_losslessly(spec, actual) {
+            widened_any = true;
+            return true;
+        }
+        false
+    });
+    // A signature that matched without widening anything was already decided
+    // by an earlier pass; only reach here for one this pass actually rescued.
+    matched && widened_any
+}
+
+fn integer_widens_losslessly(spec: &TypeSpec, actual: &DataType) -> bool {
+    let width = |data_type: &DataType| match data_type {
+        DataType::Int8 => Some(1u8),
+        DataType::Int16 => Some(2),
+        DataType::Int32 => Some(4),
+        DataType::Int64 => Some(8),
+        _ => None,
+    };
+    let spec_width = match spec {
+        TypeSpec::Int8 => 1u8,
+        TypeSpec::Int16 => 2,
+        TypeSpec::Int32 => 4,
+        TypeSpec::Int64 => 8,
+        _ => return false,
+    };
+    width(actual).is_some_and(|actual_width| actual_width < spec_width)
 }
 
 fn concrete_cast_matches(sig: &Signature, arg_types: &[DataType]) -> bool {

@@ -285,6 +285,21 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
     }
 }
 
+/// Record every type variable reachable from `spec` as "seen but undecided",
+/// so a NULL at this position does not leave the variable unbound while still
+/// letting a later position decide it.
+fn bind_nothing_but_open(spec: &TypeSpec, bindings: &mut Bindings) {
+    match spec {
+        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => bindings.bind_null(name),
+        TypeSpec::List(inner) => bind_nothing_but_open(inner, bindings),
+        TypeSpec::Map(key, value) => {
+            bind_nothing_but_open(key, bindings);
+            bind_nothing_but_open(value, bindings);
+        }
+        _ => {}
+    }
+}
+
 /// Whether this spec names a concrete type rather than standing for one.
 fn names_a_type(spec: &TypeSpec) -> bool {
     match spec {
@@ -500,6 +515,20 @@ pub(crate) fn unify(
             }
             _ => false,
         },
+        // A NULL literal is a value of whatever list or map the position
+        // turns out to hold, exactly as it is for a bare type variable. It
+        // decides nothing, so any variable inside the spec is left open for a
+        // later position to decide -- `arrays_overlap(a, NULL)` takes its
+        // element type from `a`.
+        TypeSpec::List(inner_spec) if matches!(dt, DataType::Null) => {
+            bind_nothing_but_open(inner_spec, bindings);
+            true
+        }
+        TypeSpec::Map(key_spec, value_spec) if matches!(dt, DataType::Null) => {
+            bind_nothing_but_open(key_spec, bindings);
+            bind_nothing_but_open(value_spec, bindings);
+            true
+        }
         TypeSpec::List(inner_spec) => match dt {
             DataType::List(field) | DataType::LargeList(field) => {
                 unify(inner_spec, field.data_type(), bindings, mode)
