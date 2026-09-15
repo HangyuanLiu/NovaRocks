@@ -600,15 +600,20 @@ impl FunctionBindingResolver for BuiltinAggregateResolver {
     }
 }
 
+/// Aggregates that answer with a number even for a group that saw no value.
+///
+/// Only the ones that really do. `approx_count_distinct`, `ndv` and
+/// `bitmap_union_count` count the members of a union, and each of their
+/// executors deliberately answers NULL for an empty union rather than 0 --
+/// `bitmap_union_int_finalize_returns_null_for_empty_group` pins that. They
+/// were listed here anyway, so a query that filtered every row away published
+/// a non-nullable column and then delivered a NULL in it.
 fn builtin_aggregate_output_nullable(name: &str) -> bool {
     !matches!(
         name,
         "count"
             | "count_if"
             | "multi_distinct_count"
-            | "approx_count_distinct"
-            | "ndv"
-            | "bitmap_union_count"
             | "ds_hll_count_distinct"
             | "ds_hll_count_distinct_merge"
             | "approx_count_distinct_hll_sketch"
