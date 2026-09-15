@@ -209,6 +209,10 @@ impl TypeSpec {
 /// needs to manage type-variable bindings.
 pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
     match (spec, dt) {
+        // A NULL literal has no type of its own and is a value of whatever
+        // type it is used as. Refusing it here would refuse `f(NULL)` for
+        // every `f`, which is not a type error but a missing rule.
+        (_, DataType::Null) => true,
         (TypeSpec::Boolean, DataType::Boolean) => true,
         (TypeSpec::Int8, DataType::Int8) => true,
         (TypeSpec::Int16, DataType::Int16) => true,
@@ -381,6 +385,11 @@ pub(crate) fn unify(
     mode: BindMode,
 ) -> bool {
     match spec {
+        // A NULL literal is a value of whatever type the variable turns out to
+        // be, so it does not decide one. Binding `T` to NULL would make every
+        // other position disagree with it and refuse the call - which is how
+        // `f(NULL, x)` came to be a type error while `f(x, NULL)` was not.
+        TypeSpec::Any(_) if matches!(dt, DataType::Null) => true,
         TypeSpec::Any(name) => match mode {
             BindMode::Strict => bindings.bind(name, dt),
             BindMode::Widening => bindings.bind_widening(name, dt),
