@@ -240,8 +240,12 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // (Utf8, Utf8, Int64) -> Utf8 — three-arg string extraction, where the
+    // (Utf8, Utf8, Int32) -> Utf8 — three-arg string extraction, where the
     // third argument selects which piece and is a number rather than text.
+    //
+    // It is 32-bit and coercing for the same reason `substring`'s position is:
+    // a literal ordinal analyzes as `Int32`, and a wider declaration would
+    // match none of the calls anyone writes.
     for name in [
         "regexp_extract",
         "regexp_extract_all",
@@ -252,9 +256,10 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             m,
             name,
             Signature::new(
-                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int64],
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int32],
                 TypeSpec::Utf8,
-            ),
+            )
+            .with_argument_coercion(),
         );
     }
 
