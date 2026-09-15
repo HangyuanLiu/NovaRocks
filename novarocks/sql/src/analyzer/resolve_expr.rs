@@ -1396,7 +1396,15 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
-        let nullable = left_typed.nullable || right_typed.nullable;
+        // Arithmetic answers with NULL where it cannot answer with a number:
+        // a product or sum that overflows its declared decimal, a division or
+        // modulo by zero. Comparison and the boolean connectives have no such
+        // gap -- they are defined for every pair of values they accept -- so
+        // only they carry their operands' nullability through.
+        let nullable = match bin_op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            _ => left_typed.nullable || right_typed.nullable,
+        };
         Ok(TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left_typed),

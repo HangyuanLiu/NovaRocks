@@ -399,8 +399,18 @@ fn project_requested_output_columns(
             })
         else {
             return Err(format!(
-                "Bridge 2a {context} output occurrence {ordinal} for ColumnId({}) has no exact producer occurrence",
-                column.column_id.0
+                "Bridge 2a {context} output occurrence {ordinal} for ColumnId({}) has no exact producer occurrence; requested [{}] from producers [{}]",
+                column.column_id.0,
+                requested
+                    .iter()
+                    .map(|column| format!("{}:{}", column.column_id.0, column.name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                available
+                    .iter()
+                    .map(|column| format!("{}:{}", column.column_id.0, column.name))
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ));
         };
         if column.name != available_column.name
