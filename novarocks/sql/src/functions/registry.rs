@@ -225,20 +225,36 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // (Utf8, Utf8) -> Utf8 — two-arg string transforms.
+    // (Utf8, Utf8, Utf8) -> Utf8 — three-arg string rewrites. The executor
+    // takes exactly three arguments for each of these and the analyzer coerces
+    // all three to text; a two-argument declaration named a call none of them
+    // can evaluate.
+    for name in ["replace", "regexp_replace", "translate"] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+                TypeSpec::Utf8,
+            ),
+        );
+    }
+
+    // (Utf8, Utf8, Int64) -> Utf8 — three-arg string extraction, where the
+    // third argument selects which piece and is a number rather than text.
     for name in [
-        "replace",
         "regexp_extract",
         "regexp_extract_all",
-        "regexp_replace",
         "split_part",
         "substring_index",
-        "translate",
     ] {
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int64],
+                TypeSpec::Utf8,
+            ),
         );
     }
 
@@ -823,6 +839,21 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
+    // cardinality also counts a map's entries. The executor dispatches it
+    // through the map family as well, so declaring only the array form named
+    // half of what it does.
+    add(
+        m,
+        "cardinality",
+        Signature::new(
+            vec![TypeSpec::Map(
+                Box::new(TypeSpec::Any("K")),
+                Box::new(TypeSpec::Any("V")),
+            )],
+            TypeSpec::Int32,
+        ),
+    );
+
     // array_position(List<T>, T) -> Int32 — note Int32 not Int64, matching legacy.
     add(
         m,
@@ -936,14 +967,19 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // __array_element_at(List<T>, Int) -> T
+    // __array_element_at(List<T>, Int32) -> T
+    //
+    // The index is 32-bit because that is what both sides already use: the
+    // analyzer casts a subscript to `Int32` when it lowers one, and the
+    // executor refuses any other width. A wider declaration named a call
+    // neither of them makes.
     add(
         m,
         "__array_element_at",
         Signature::new(
             vec![
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int64,
+                TypeSpec::Int32,
             ],
             TypeSpec::Any("T"),
         ),
