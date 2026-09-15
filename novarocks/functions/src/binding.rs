@@ -267,6 +267,164 @@ pub(crate) struct FunctionBindingDefinition {
     resolver: Arc<dyn FunctionBindingResolver>,
 }
 
+impl FunctionBindingDefinition {
+    pub(crate) const fn new(
+        declaration: FunctionBindingDeclaration,
+        resolver: Arc<dyn FunctionBindingResolver>,
+    ) -> Self {
+        Self {
+            declaration,
+            resolver,
+        }
+    }
+}
+
+/// Derive an aggregate's binding contract from the overloads it already
+/// declares.
+///
+/// An aggregate overload states its identity, what it takes, what it returns
+/// and what its state looks like - which is everything a binding declaration
+/// holds. Deriving it means the two halves of one function cannot disagree,
+/// and that registering an aggregate cannot leave it resolvable through only
+/// one of them.
+pub(crate) fn parametric_aggregate_binding(
+    canonical_name: &str,
+    volatility: crate::FunctionVolatility,
+    overloads: &[crate::AggregateOverloadDeclaration],
+    aggregate_resolver: Arc<dyn crate::AggregateSignatureResolver>,
+) -> Result<FunctionBindingDefinition, FunctionCatalogError> {
+    let invalid_identity = |error: &dyn fmt::Display| FunctionCatalogError::InvalidStableIdentity {
+        subject: "parametric aggregate binding declaration",
+        value: error.to_string().into(),
+    };
+    let function_id = FunctionId::try_new(format!("parametric.aggregate/{canonical_name}/v1"))
+        .map_err(|error| invalid_identity(&error))?;
+    let declared = overloads
+        .iter()
+        .map(|overload| {
+            Ok(FunctionOverloadDeclaration {
+                identity: FunctionOverloadId::try_new(overload.identity.as_str())
+                    .map_err(|error| invalid_identity(&error))?,
+                argument_pattern: overload.argument_pattern.clone(),
+                result_pattern: overload.output_pattern.clone(),
+                aggregate: Some(AggregateBindingDeclaration {
+                    intermediate_pattern: overload.intermediate_pattern.clone(),
+                    state_format: overload.state_format.clone(),
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, FunctionCatalogError>>()?;
+    let declaration = FunctionBindingDeclaration::try_new(
+        function_id,
+        crate::FunctionKind::Aggregate,
+        FunctionSemantics {
+            volatility,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+        },
+        declared,
+    )
+    .map_err(|error| invalid_identity(&error))?;
+    Ok(FunctionBindingDefinition::new(
+        declaration,
+        Arc::new(ParametricAggregateBindingResolver { aggregate_resolver }),
+    ))
+}
+
+/// Answers binding questions for an aggregate through the same typed contract
+/// its signatures are resolved with, so the two can never disagree.
+struct ParametricAggregateBindingResolver {
+    aggregate_resolver: Arc<dyn crate::AggregateSignatureResolver>,
+}
+
+impl ParametricAggregateBindingResolver {
+    fn argument_types(
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<Vec<arrow_schema::DataType>, FunctionBindingError> {
+        request
+            .arguments
+            .iter()
+            .map(|argument| match argument {
+                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
+                FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
+            })
+            .collect()
+    }
+
+    fn selection(
+        &self,
+        request: FunctionBindingRequest<'_>,
+        resolved: &crate::ResolvedAggregateSignature,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let nullable = self.aggregate_resolver.produces_null();
+        Ok(FunctionBindingSelection {
+            overload: FunctionOverloadId::try_new(resolved.overload.as_str())
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
+            argument_types: request
+                .arguments
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect(),
+            result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                resolved.output_type.clone(),
+                nullable,
+            )),
+            aggregate: Some(crate::AggregateBindingSelection {
+                intermediate_type: FunctionValueType::new(
+                    resolved.intermediate_type.clone(),
+                    nullable,
+                ),
+                state_format: resolved.state_format.clone(),
+            }),
+        })
+    }
+}
+
+impl FunctionBindingResolver for ParametricAggregateBindingResolver {
+    fn resolve(
+        &self,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<FunctionBindingSelection, FunctionBindingError> {
+        let argument_types = Self::argument_types(request)?;
+        let logical = self
+            .aggregate_resolver
+            .resolve_aggregate(&argument_types[..request.logical_argument_count])
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        let resolved = if request.logical_argument_count == argument_types.len() {
+            logical
+        } else {
+            self.aggregate_resolver
+                .resolve_update_signature(&logical.overload, &argument_types)
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?
+        };
+        self.selection(request, &resolved)
+    }
+
+    /// Validate the overload that was selected, rather than resolving a fresh
+    /// one and accepting whatever comes back.
+    fn validate_selected(
+        &self,
+        selected: &FunctionBindingSelection,
+        request: FunctionBindingRequest<'_>,
+    ) -> Result<(), FunctionBindingError> {
+        let argument_types = Self::argument_types(request)?;
+        let selected_overload =
+            crate::AggregateOverloadIdentity::try_new(selected.overload.as_str())
+                .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        let resolved = self
+            .aggregate_resolver
+            .resolve_update_signature(&selected_overload, &argument_types)
+            .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?;
+        if &self.selection(request, &resolved)? == selected {
+            Ok(())
+        } else {
+            Err(FunctionBindingError::InvalidBinding(
+                "selected aggregate overload differs from its typed contract".into(),
+            ))
+        }
+    }
+}
+
 impl fmt::Debug for FunctionBindingDefinition {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

@@ -246,6 +246,16 @@ pub trait AggregateSignatureResolver: Send + Sync {
         false
     }
 
+    /// Whether this aggregate can produce NULL.
+    ///
+    /// Most can: an aggregate over no rows has nothing to return. One that
+    /// always has an answer - a count, or a sketch whose empty form is still a
+    /// sketch - says so, because a plan that declares a value nullable when it
+    /// never is carries a null check no row will ever take.
+    fn produces_null(&self) -> bool {
+        true
+    }
+
     /// Materialize the exact execution signature for an already-selected
     /// logical overload. The default admits no extra update channels; ordered
     /// aggregate families must opt in explicitly.
@@ -550,6 +560,12 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         false
     }
 
+    /// Whether this family can produce NULL. See
+    /// [`AggregateSignatureResolver::produces_null`].
+    fn produces_null(&self) -> bool {
+        true
+    }
+
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
@@ -638,6 +654,10 @@ impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatur
 
     fn supports_ordered_update_channels(&self) -> bool {
         self.family.supports_ordered_update_channels()
+    }
+
+    fn produces_null(&self) -> bool {
+        self.family.produces_null()
     }
 
     fn resolve_update_signature(
@@ -763,6 +783,14 @@ impl FunctionDefinition {
         })
     }
 
+    /// Register an aggregate whose overloads are resolved by a typed family.
+    ///
+    /// The binding declaration is derived here rather than asked for. An
+    /// aggregate overload already states everything a binding needs - its
+    /// identity, what it takes, what it returns, and what its state looks like
+    /// - so asking a caller to restate it invites the two halves to disagree,
+    /// and leaving it out produces a function that is named everywhere and
+    /// resolvable nowhere.
     pub fn try_new_parametric_aggregate(
         canonical_name: impl AsRef<str>,
         visibility: FunctionVisibility,
@@ -777,6 +805,12 @@ impl FunctionDefinition {
             Arc::new(LegacyAggregateSignatureResolver {
                 aggregate_resolver: Arc::clone(&aggregate_resolver),
             });
+        let binding = parametric_aggregate_binding(
+            canonical_name,
+            volatility,
+            &overloads,
+            Arc::clone(&aggregate_resolver),
+        )?;
         Ok(Self {
             canonical_name: canonical_name.into(),
             kind: FunctionKind::Aggregate,
@@ -790,7 +824,7 @@ impl FunctionDefinition {
             exact_aggregate_overloads: Box::default(),
             aggregate_resolver: Some(aggregate_resolver),
             resolver: Some(resolver),
-            binding: None,
+            binding: Some(binding),
         })
     }
 
