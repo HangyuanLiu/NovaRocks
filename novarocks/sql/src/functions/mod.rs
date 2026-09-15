@@ -851,25 +851,60 @@ fn scalar_result_nullable(name: &str, request: FunctionBindingRequest<'_>) -> bo
         None => false,
     };
     match name {
+        // These four decide their own result from the branches they choose
+        // between, so their nullability really is their arguments'.
         "coalesce" | "ifnull" | "nvl" => (0..request.logical_argument_count).all(value_nullable),
         "if" => (1..request.logical_argument_count).any(value_nullable),
         "case" => (1..request.logical_argument_count)
             .step_by(2)
             .any(value_nullable),
-        "nullif" => true,
-        "lag" | "lead" => true,
-        "__array_element_at"
-        | "element_at"
-        | "map_get"
-        | "array_min"
-        | "array_max"
-        | "json_query"
-        | "json_extract"
-        | "json_extract_scalar"
-        | "str_to_date" => true,
-        _ => (0..request.logical_argument_count).any(value_nullable),
+        // A function that is total -- one that answers for every value of
+        // its declared argument types -- passes its arguments' nullability
+        // through. Everything else is nullable.
+        name if TOTAL_SCALAR_FUNCTIONS.contains(&name) => {
+            (0..request.logical_argument_count).any(value_nullable)
+        }
+        _ => true,
     }
 }
+
+/// Scalar functions that answer for every value of their argument types, and
+/// so return NULL only where an argument was already NULL.
+///
+/// This used to be stated the other way round: results were non-null unless
+/// the function appeared on a list of exceptions. But a scalar function in
+/// this engine returns NULL for any input outside its domain -- an unparsable
+/// bitmap, a decimal that overflows, a string operation whose result is too
+/// long, `substring_index(s, d, 0)`, a time before zero -- and that describes
+/// most of the string, date and bitmap families rather than a handful of
+/// names. An exception list of that shape could never be finished, and every
+/// name missing from it was a column the planner promised could not be null
+/// and then filled with nulls.
+///
+/// Stated this way each entry is a claim someone made deliberately, and being
+/// wrong about a name that is *absent* costs only an optimization. The
+/// aggregate side already defaults the same way.
+const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
+    // Sign manipulation answers for every number it accepts; overflow is an
+    // error here, not a null.
+    "abs",
+    "negative",
+    "positive",
+    "sign",
+    // Measuring a string cannot fail.
+    "bit_length",
+    "char_length",
+    "character_length",
+    "length",
+    "octet_length",
+    // Case folding is defined for every string.
+    "lcase",
+    "lower",
+    "ucase",
+    "upper",
+    // A null test is the one thing that is never null.
+    "isnull",
+];
 
 fn binding_resolution_error(error: ResolveError) -> FunctionBindingError {
     match error {
