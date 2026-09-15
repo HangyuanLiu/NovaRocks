@@ -93,7 +93,24 @@ pub(super) fn prepare_repeat_input(
             continue;
         };
         let data_type = source_expr.data_type.clone();
-        let nullable = source_expr.nullable;
+        // Repeat's whole job is to null this key out on the levels whose
+        // grouping set leaves it out, which is why the substitution below
+        // points downstream reads at the materialized slot. A key that any
+        // level omits therefore holds NULL in that level's rows, however
+        // non-null its source was -- `GROUP BY CUBE(a, b)` over `1 AS a` rolls
+        // up to a row where `a` is NULL. A single grouping set omits nothing
+        // and keeps the source's own nullability.
+        let original_name = grouping_key_aliases
+            .get(idx)
+            .map(|(original_name, _)| original_name.to_ascii_lowercase());
+        let nulled_by_some_level = original_name.is_some_and(|name| {
+            repeat_info.repeat_column_ref_list.iter().any(|non_null| {
+                !non_null
+                    .iter()
+                    .any(|column| column.to_ascii_lowercase() == name)
+            })
+        });
+        let nullable = source_expr.nullable || nulled_by_some_level;
         let original_display = typed_expr_display_name(&source_expr);
         let materialized_column_id =
             factory.create(None, alias_name.clone(), data_type.clone(), nullable);

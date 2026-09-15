@@ -47,7 +47,7 @@ impl<'a> super::AnalyzerContext<'a> {
             self.analyze_table_factor_with_outer(&twj.relation, outer_scope)?;
 
         for join in &twj.joins {
-            let (right_rel, right_scope) =
+            let (right_rel, mut right_scope) =
                 self.analyze_table_factor_with_outer(&join.relation, Some(&current_scope))?;
 
             let (join_kind, constraint) = parse_join_operator(join.operator, &join.constraint)?;
@@ -230,6 +230,21 @@ impl<'a> super::AnalyzerContext<'a> {
                             None
                         };
 
+                    // An outer join pads the side that found no partner, so
+                    // every column that side exposes can arrive as NULL even
+                    // when the table declares it NOT NULL. Widen the padded
+                    // side's output scope before merging; the ON condition was
+                    // analyzed above against the unwidened scopes, which is
+                    // where the source's own nullability is still the truth.
+                    match join_kind {
+                        JoinKind::LeftOuter => right_scope.mark_all_nullable(),
+                        JoinKind::RightOuter => current_scope.mark_all_nullable(),
+                        JoinKind::FullOuter => {
+                            current_scope.mark_all_nullable();
+                            right_scope.mark_all_nullable();
+                        }
+                        _ => {}
+                    }
                     current_scope.merge(&right_scope);
                     // USING-clause column hiding: each USING column appears
                     // once in SELECT * and at the head of the column list.

@@ -457,6 +457,25 @@ impl AnalyzerScope {
     }
 
     /// Merge another scope into this one (for JOINs).
+    /// Mark every column this scope exposes as nullable.
+    ///
+    /// This is what an outer join does to the side it pads: a row that found
+    /// no partner still appears, with NULL in every one of that side's
+    /// columns, however non-null the source declared them. Only the output
+    /// scope is widened -- the ON condition sees the values before padding,
+    /// where the source's own nullability is still the truth.
+    pub(super) fn mark_all_nullable(&mut self) {
+        for (_, _, nullable) in self.qualified.values_mut() {
+            *nullable = true;
+        }
+        for (_, _, nullable) in self.unqualified.values_mut() {
+            *nullable = true;
+        }
+        for entry in &mut self.ordered {
+            entry.4 = true;
+        }
+    }
+
     pub(super) fn merge(&mut self, other: &AnalyzerScope) {
         for name in other.unqualified.keys() {
             if self.unqualified.contains_key(name)

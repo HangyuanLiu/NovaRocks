@@ -147,7 +147,6 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "url_decode",
         "char",
         "unhex",
-        "md5sum",
         "sm3",
     ] {
         add(
@@ -156,6 +155,14 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
+
+    // md5sum hashes the bytes of whatever it is given, over any number of
+    // arguments -- it is not one of the string transforms it was grouped with.
+    add(
+        m,
+        "md5sum",
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
+    );
 
     // These were grouped with the one-argument string transforms above, but
     // none of them is one: they differ in arity, in what they take, or in
@@ -1240,9 +1247,10 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
     // repeats of one variable -- which is what a variadic spec would force.
     // The registry vocabulary names type variables one at a time, so the
     // supported key counts are spelled out.
-    for keys in 1..=3usize {
+    const SORTBY_KEYS: [&str; 6] = ["K1", "K2", "K3", "K4", "K5", "K6"];
+    for keys in 1..=SORTBY_KEYS.len() {
         let mut args = vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))];
-        for name in ["K1", "K2", "K3"].iter().take(keys) {
+        for name in SORTBY_KEYS.iter().take(keys) {
             args.push(TypeSpec::List(Box::new(TypeSpec::Any(name))));
         }
         add(
