@@ -1127,10 +1127,12 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "ntile",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
     );
+    // session_number(value, timeout): the gap is measured on the value's own
+    // type, which is whatever the column is rather than always 64-bit.
     add(
         m,
         "session_number",
-        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Int64),
+        Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int64),
     );
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
@@ -1144,8 +1146,38 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
         );
     }
-    // lag/lead/first_value/last_value: preserve first arg type.
-    for name in ["lag", "lead", "first_value", "last_value"] {
+    // lag/lead: the value's type is what comes back. The offset is a count,
+    // not another value of that type, and the default is checked against the
+    // value by the analyzer's own LEAD/LAG rule - which is stricter than
+    // anything stated here and reports in the vocabulary the tests assert. A
+    // single variadic `T` said all three were the same type, which no call
+    // anyone writes satisfies.
+    for name in ["lag", "lead"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64],
+                TypeSpec::Any("T"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64, TypeSpec::Any("D")],
+                TypeSpec::Any("T"),
+            ),
+        );
+    }
+    // first_value/last_value: preserve the value's type. A second argument is
+    // the null-treatment marker rather than another value.
+    for name in ["first_value", "last_value"] {
         add(
             m,
             name,

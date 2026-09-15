@@ -2099,7 +2099,13 @@ impl<'a> super::AnalyzerContext<'a> {
                     .resolve_window_binding(&name, &arguments)
                     .map_err(|error| {
                         AnalyzeError::type_mismatch(
-                            format!("cannot bind window function `{name}`: {error}"),
+                            format!(
+                                "cannot bind window function `{name}` for argument types {:?}: {error}",
+                                args_typed
+                                    .iter()
+                                    .map(|argument| argument.data_type.clone())
+                                    .collect::<Vec<_>>()
+                            ),
                             func.span,
                         )
                     })?
