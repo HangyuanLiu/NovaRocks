@@ -533,6 +533,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+        );
+        add(
+            m,
+            name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
@@ -581,6 +586,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date),
         );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Datetime),
+        );
     }
     // sec_to_time formats an integer second count as a TIME string.
     add(
@@ -620,7 +630,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "dayofyear",
         "weekofyear",
         "quarter",
-        "hour_from_unixtime",
     ] {
         add(
             m,
@@ -632,7 +641,22 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date], TypeSpec::Int32),
         );
+        // A date written as a string is a date. The engine parses one
+        // wherever it takes a datetime, and refusing it here refused calls it
+        // has always answered.
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32),
+        );
     }
+
+    // hour_from_unixtime reads a unix second count, not a datetime.
+    add(
+        m,
+        "hour_from_unixtime",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int32),
+    );
 
     // Diff family -> Int64.
     for name in [
@@ -645,8 +669,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "hours_diff",
         "minutes_diff",
         "seconds_diff",
-        "to_days",
-        "time_to_sec",
     ] {
         add(
             m,
@@ -661,6 +683,18 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Date], TypeSpec::Int64),
         );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
+        );
+    }
+
+    // to_days / time_to_sec measure one instant, not the distance between two.
+    for name in ["to_days", "time_to_sec"] {
+        for argument in [TypeSpec::Datetime, TypeSpec::Date, TypeSpec::Utf8] {
+            add(m, name, Signature::new(vec![argument], TypeSpec::Int64));
+        }
     }
     // unix_timestamp / to_unix_timestamp - 0 or 1 arg
     for name in ["unix_timestamp", "to_unix_timestamp"] {
@@ -717,6 +751,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         m,
         "date",
         Signature::new(vec![TypeSpec::Date], TypeSpec::Date),
+    );
+    add(
+        m,
+        "date",
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
     );
 
     // time_slice / date_slice preserve the first argument type. The interval
