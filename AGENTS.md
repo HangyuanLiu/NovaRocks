@@ -682,16 +682,75 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite iceberg --mode verify
 ```
 
-Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, and
-native distributed suites. Cluster mode and backend count come from runner CLI;
-no suite owns an alternate server runtime.
+Suites are discovered from `tests/sql/correctness/`; ask the runner for the
+current list with `--list-suites`. `tests/sql/correctness/README.md` carries the
+suite map — which engine area each suite covers, its typical change entry, and
+whether it needs the REST Catalog fixture or a cross-process topology — and is
+the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are benchmark
+workloads under `tests/sql/benchmarks/` and belong to the benchmark runner, not
+to correctness CI. Cluster mode and backend count come from runner CLI; no suite
+owns an alternate server runtime.
 
 **Run specific cases:**
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --suite tpc-ds --only q10,q35,q69 --mode verify
+  --suite join --only join_cross_join_small,join_array_type --mode verify
 ```
+
+### 8.5 Test Scope Selection
+
+Run the tests a change can actually break. Targeted verification is the default;
+a full run is a deliberate step with a stated reason, not a safety reflex. Full
+runs belong at milestone convergence, at the final verification before claiming
+completion, and where the blast radius genuinely is the whole repository.
+
+**Rust: choose `-p` from the crate you edited.** Every first-party crate lives
+in the single root workspace, so `cargo test -p <crate>` always works; the
+packages under `vendor/` own separate workspaces and locks and are out of scope
+unless you edited them.
+
+| Change lands in | Run at least |
+|---|---|
+| `novarocks/sql/**` (parser, analyzer, optimizer, planner, function registry) | `-p novarocks-sql` |
+| `novarocks/execution/**` (operators, expressions, pipeline, exchange, runtime filter) | `-p novarocks-execution` |
+| `novarocks/frontend-application/**`, `novarocks/query-application/**`, `novarocks/catalog-application/**` | that crate, plus `-p novarocks-worker -p novarocks-native-adapter` when the change crosses the FE/BE boundary |
+| `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
+| `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
+| `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+
+**SQL: choose suites from the suite map** in
+`tests/sql/correctness/README.md`, and narrow further with `--only <case>` when
+a single case covers the change. A change to array function declarations needs
+`complex-type` and `function`, not the corpus; outer-join nullability needs
+`join`; CUBE needs `aggregate`.
+
+**What a full run costs** (measured 2026-09-15; re-check rather than quote if it
+matters): `cargo test --workspace` builds and runs about 119 test binaries
+across 50 packages and roughly ten thousand cases, minutes per round even when
+little changed. `--suite all` selects 33 suites / 776 cases; one runner
+invocation owns one server lifecycle, so running suites one at a time pays a
+server start per suite and a full pass costs tens of minutes.
+
+**A saturated machine produces false failures.** These are load-sensitive, not
+regressions:
+
+- `novarocks-fs`: `provider_pool_evicts_vended_provider_at_credential_expiration`
+  (`novarocks/fs/src/access.rs`) turns on a credential-expiration time constant.
+- `novarocks-test-support`: the `managed_process` family
+  (`tests/test-support/src/managed_process.rs`) turns on process readiness and
+  signal timing.
+
+The criterion is the combination — a time constant in the test, concurrent load
+while it ran, and a clean pass when run alone — not the crate name. Neither is
+in `tools/ci/baselines/known-failures.toml`, which covers accepted SQL failures
+only.
+
+For SQL suites, read the first failure rather than the failure count: one
+failing statement can leave the shared server in a state where later cases fail
+for reasons of their own, so the count overstates the problem. Re-run a
+suspected case against a clean server before attributing it to the change.
 
 ## 9. Suggested Starting Points for Typical Changes
 
@@ -838,6 +897,10 @@ dependencies, parallel waves, non-overlapping file ownership, sub-agent
 scheduling labels, independent validation, integration gates, and local commit
 checkpoints. Explicit user approval promotes the persisted plan from `draft` to
 `approved` before execution.
+
+Plan and execute both resolve test scope through section 8.5: a plan task names
+the tests its own change can break, and execution runs those, not the whole
+repository. A full run needs one of the reasons section 8.5 lists.
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by
