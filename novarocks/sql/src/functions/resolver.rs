@@ -212,7 +212,7 @@ fn realize_argument_type(
     actual: &DataType,
 ) -> Result<DataType, ResolveError> {
     match spec {
-        TypeSpec::AnyDecimal128 => Ok(actual.clone()),
+        TypeSpec::AnyDecimal128 | TypeSpec::AnyType => Ok(actual.clone()),
         _ => realize(spec, bindings).map_err(ResolveError::BadSignature),
     }
 }

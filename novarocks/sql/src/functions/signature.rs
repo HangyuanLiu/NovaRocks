@@ -63,6 +63,16 @@ pub(crate) enum TypeSpec {
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
     AnyDecimal128,
+    /// Decimal128 with unspecified precision/scale, bound to a name. Strict
+    /// match accepts any `DataType::Decimal128(_, _)` and records the exact
+    /// one, so a function that returns the decimal it was given -- `abs`,
+    /// `negative` -- can name it on both sides. `AnyDecimal128` cannot do
+    /// that: it carries no name, so nothing can refer back to it.
+    Decimal128Of(&'static str),
+    /// LARGEINT, whose physical carrier is `FixedSizeBinary(16)`. It is one
+    /// of this engine's integer types; the registry could not name it at all
+    /// before, so every numeric family silently refused it.
+    LargeInt,
     /// `List<inner>`. `inner` may itself be `Any(...)` for polymorphic
     /// signatures such as `array_append(List<T>, T) -> List<T>`.
     List(Box<TypeSpec>),
@@ -71,6 +81,14 @@ pub(crate) enum TypeSpec {
     /// Type variable, e.g. `Any("T")`. Binds to the corresponding concrete
     /// argument type during polymorphic resolution.
     Any(&'static str),
+    /// Any type at all, binding nothing. This is what a position accepts when
+    /// the function genuinely does not constrain it -- `json_object`'s
+    /// alternating keys and values, for instance. It differs from `Any(name)`
+    /// in exactly the way that matters for a variadic tail: a repeated type
+    /// *variable* asserts every argument shares one type, which for these
+    /// functions is false. Like `AnyDecimal128` it keeps the argument's own
+    /// type and cannot be a return type, having nothing to realize.
+    AnyType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +212,13 @@ impl TypeSpec {
                 value.write_canonical(output);
                 output.push('>');
             }
+            Self::AnyType => output.push_str("any"),
+            Self::LargeInt => output.push_str("largeint"),
+            Self::Decimal128Of(name) => {
+                output.push_str("decimal128<");
+                output.push_str(name);
+                output.push('>');
+            }
             Self::Any(name) => {
                 output.push_str("any<");
                 output.push_str(name);
@@ -231,6 +256,15 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Date, DataType::Date32) => true,
         (TypeSpec::Datetime, DataType::Timestamp(_, _)) => true,
         (TypeSpec::AnyDecimal128, DataType::Decimal128(_, _)) => true,
+        // `Decimal128Of` is deliberately absent: like `Any`, it must fall
+        // through to the polymorphic pass so the concrete decimal is bound
+        // before a return type tries to name it.
+        (TypeSpec::LargeInt, DataType::FixedSizeBinary(width))
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            true
+        }
+        (TypeSpec::AnyType, _) => true,
         (TypeSpec::List(inner_spec), DataType::List(field)) => {
             anchor_matches(inner_spec, field.data_type())
         }
@@ -255,6 +289,9 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
 fn names_a_type(spec: &TypeSpec) -> bool {
     match spec {
         TypeSpec::Any(_) => false,
+        // A wildcard stands for no type in particular, so a NULL literal at
+        // this position decides nothing either.
+        TypeSpec::AnyType => false,
         TypeSpec::List(inner) => names_a_type(inner),
         TypeSpec::Map(key, value) => names_a_type(key) && names_a_type(value),
         _ => true,
@@ -282,6 +319,17 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Binary => DataType::Binary,
         TypeSpec::Date => DataType::Date32,
         TypeSpec::Datetime => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        TypeSpec::LargeInt => {
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+        }
+        TypeSpec::Decimal128Of(name) => bindings
+            .lookup(name)
+            .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
+        TypeSpec::AnyType => {
+            return Err(
+                "AnyType cannot appear as a return type — it stands for no type at all".to_string(),
+            );
+        }
         TypeSpec::AnyDecimal128 => {
             return Err("AnyDecimal128 cannot appear as a return type — \
                        precision/scale propagation is not yet handled by \
@@ -438,6 +486,19 @@ pub(crate) fn unify(
         TypeSpec::Any(name) => match mode {
             BindMode::Strict => bindings.bind(name, dt),
             BindMode::Widening => bindings.bind_widening(name, dt),
+        },
+        // A named decimal binds like a type variable but only over decimals,
+        // so the exact precision and scale travel to the return type.
+        TypeSpec::Decimal128Of(name) => match dt {
+            DataType::Decimal128(_, _) => match mode {
+                BindMode::Strict => bindings.bind(name, dt),
+                BindMode::Widening => bindings.bind_widening(name, dt),
+            },
+            DataType::Null => {
+                bindings.bind_null(name);
+                true
+            }
+            _ => false,
         },
         TypeSpec::List(inner_spec) => match dt {
             DataType::List(field) | DataType::LargeList(field) => {

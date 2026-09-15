@@ -750,21 +750,34 @@ pub(crate) fn execute_drop_database_statement(
             .map(|identity| identity.table.to_string())
             .collect::<Vec<_>>();
         tables.sort();
-        let mut views = lease
-            .binding()
-            .view_metadata()
-            .map(|view_metadata| {
-                view_metadata.list_views(novarocks_spi::connector::ConnectorListViewsRequest {
-                    namespace: namespace_identity,
-                    context: connector_context.clone(),
-                })
-            })
-            .transpose()
-            .map_err(|error| error.to_string())?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|identity| identity.view.to_string())
-            .collect::<Vec<_>>();
+        // FORCE enumerates children to delete them, so this listing is a hint,
+        // not an authority: a catalog format that cannot hold views refuses
+        // rather than answering empty, and the namespace delete below still
+        // fails if anything was left behind. Surfacing the refusal here would
+        // make DROP DATABASE impossible on every view-less catalog.
+        let mut views = match lease.binding().view_metadata() {
+            None => Vec::new(),
+            Some(view_metadata) => {
+                match view_metadata.list_views(
+                    novarocks_spi::connector::ConnectorListViewsRequest {
+                        namespace: namespace_identity,
+                        context: connector_context.clone(),
+                    },
+                ) {
+                    Ok(views) => views
+                        .into_iter()
+                        .map(|identity| identity.view.to_string())
+                        .collect::<Vec<_>>(),
+                    Err(error)
+                        if error.kind()
+                            == novarocks_spi::connector::ConnectorErrorKind::Unsupported =>
+                    {
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        };
         views.sort();
         for table in tables {
             crate::connector::mutation::execute_catalog_mutation(
