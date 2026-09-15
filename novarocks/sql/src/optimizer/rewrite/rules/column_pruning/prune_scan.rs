@@ -231,6 +231,21 @@ impl LogicalRewriteRule for PruneScanColumns {
             })
             .map(|column| column.column_id)
             .collect::<Vec<_>>();
+        // Counting rows needs no column, but a read does: the scan source
+        // carries an ordered assignment per column and a provider has nothing
+        // to return rows from without one. So a read that needs no value still
+        // names one, chosen here rather than left to whoever notices the gap.
+        // Keeping the first is deliberate and not a fallback to everything -
+        // the old behaviour, which read the whole relation to count it.
+        let required_columns = if required_columns.is_empty() {
+            node.columns
+                .iter()
+                .find(|column| !all_synthetic.contains(&column.column_id))
+                .map(|column| vec![column.column_id])
+                .unwrap_or_default()
+        } else {
+            required_columns
+        };
 
         let column_count = node.columns.len();
         node.columns.retain(|column| {
@@ -613,13 +628,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![source_id]
         );
-        assert!(pruned.required_columns.as_ref().is_some_and(Vec::is_empty));
+        // The synthetic output and its descriptor are gone; the source column
+        // stays, and is what the read now names.
+        assert_eq!(
+            pruned.required_columns.as_deref(),
+            Some(&[source_id][..]),
+            "a read that needs no value still names one column"
+        );
         assert!(pruned.variant_columns.is_empty());
     }
 
     #[test]
-    fn prune_scan_preserves_an_explicit_zero_column_projection() {
-        // A zero-column page still carries row multiplicity for COUNT(*).
+    fn prune_scan_names_one_column_for_a_row_count_read() {
+        // Counting rows needs no value, but reading them needs a column.
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
@@ -642,6 +663,9 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        assert!(req.is_empty(), "zero-column scan must remain explicit");
+        // Counting rows needs no value, but reading them needs a column: the
+        // scan source has an assignment per column and none to read from
+        // otherwise. One column is named, not all of them.
+        assert_eq!(req.len(), 1, "a row-count read still names one column");
     }
 }

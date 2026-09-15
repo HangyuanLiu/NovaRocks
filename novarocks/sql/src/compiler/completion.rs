@@ -3451,7 +3451,8 @@ pub mod fixtures {
     use super::{
         CatalogLookupTarget, CatalogRelationNeed, CompileNeedId, CompletionProtocolError,
         MaterializedViewNeed, ProviderReadColumnNeed, ProviderReadNeed, ProviderReadPredicateNeed,
-        ProviderReadRelationNeed, SqlTableBindingId, StatisticsMetric, StatisticsNeed, TableIdentity,
+        ProviderReadRelationNeed, SqlTableBindingId, StatisticsMetric, StatisticsNeed,
+        TableIdentity,
     };
 
     pub fn catalog_relation_need(
