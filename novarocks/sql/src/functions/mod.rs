@@ -1444,7 +1444,17 @@ fn bind_dynamic_scalar_result(
             value_type.data_type.clone()
         }
         "__array_literal" => {
-            let item_type = argument_types.first().cloned().unwrap_or(DataType::Null);
+            // The element type is the one every element fits in, not the one
+            // the first element happens to have. Taking the first meant
+            // `[1, 300]` was an array of TINYINT and the 300 became NULL, and
+            // `[1, 2.5]` was an array of integers with the 2.5 truncated --
+            // silently, since nothing downstream can tell a narrowed literal
+            // from a NULL the query asked for.
+            let item_type = argument_types
+                .iter()
+                .cloned()
+                .reduce(|left, right| novarocks_types::wider_type(&left, &right))
+                .unwrap_or(DataType::Null);
             DataType::List(Arc::new(arrow::datatypes::Field::new(
                 "item", item_type, true,
             )))
