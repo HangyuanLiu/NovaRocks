@@ -395,14 +395,29 @@ impl RootResultDecodeInput {
         let decoded = DecodedResultBatch::try_new(batch).map_err(|error| {
             RootResultFetchFailure::new(AttemptFailureClass::ContractViolation, error)
         })?;
-        if !schema.accepts(decoded.batch())
-            || decoded.unique_backing_bytes() > bounds.retained_backing_upper_bound()
+        if let Some(mismatch) = schema.mismatch(decoded.batch()) {
+            drop(decoded);
+            return Err(contract_failure(contract_error(format!(
+                "decoded result does not match the schema its query declared: {mismatch}"
+            ))));
+        }
+        // Saying which bound and by how much: a decode that overruns its
+        // preflight is either a decoder that allocates more than the stream
+        // described or a preflight that described it wrongly, and the numbers
+        // are what tells those apart.
+        if decoded.unique_backing_bytes() > bounds.retained_backing_upper_bound()
             || decoded.governance_charge_bytes() > bounds.decode_operation_upper_bound()
         {
+            let detail = format!(
+                "decoded result exceeded its metadata-preflighted memory bound: \
+                 backing {} > {}, charge {} > {}",
+                decoded.unique_backing_bytes(),
+                bounds.retained_backing_upper_bound(),
+                decoded.governance_charge_bytes(),
+                bounds.decode_operation_upper_bound(),
+            );
             drop(decoded);
-            return Err(contract_failure(contract_error(
-                "decoded result exceeded its metadata-preflighted memory bound",
-            )));
+            return Err(contract_failure(contract_error(detail)));
         }
         let credit = self
             .credit

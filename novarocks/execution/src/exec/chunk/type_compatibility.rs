@@ -292,8 +292,16 @@ fn retag_data(
     }
 }
 
-fn runtime_field(target: &FieldRef, source: &FieldRef, child: &ArrayData) -> FieldRef {
-    let nullable = target.is_nullable() || source.is_nullable() || child.null_count() > 0;
+/// Retag one nested child against the expected field, widening its
+/// nullability only for nulls the array actually carries.
+///
+/// The carrier's own `nullable` flag is not evidence. A wire or file schema
+/// that describes a child permissively says nothing about whether this array
+/// holds a null, and adopting its pessimism would rewrite a precise expected
+/// type into one its own contract rejects -- a MAP key, which Arrow pins to
+/// non-nullable, is where that shows up first. The null count is the fact.
+fn runtime_field(target: &FieldRef, _source: &FieldRef, child: &ArrayData) -> FieldRef {
+    let nullable = target.is_nullable() || child.null_count() > 0;
     Arc::new(
         Field::new(target.name(), child.data_type().clone(), nullable)
             .with_metadata(target.metadata().clone()),
@@ -592,6 +600,72 @@ mod tests {
         let err = check_exact(&a, &bad_key).unwrap_err();
         assert_eq!(err.kind, ScalarMismatch);
         assert_eq!(err.nested_path, vec![NestedStep::MapKey]);
+    }
+
+    #[test]
+    fn retag_keeps_a_map_key_required_when_the_carrier_only_declares_it_nullable() {
+        // The exchange wire carries a generic Arrow map: `entries`, no field
+        // ids, both children declared nullable. The expected type is the
+        // provider's own, whose MAP key Arrow pins to non-nullable. No key is
+        // actually null, so the carrier's permissive declaration must not
+        // rewrite the expected type into one the result contract rejects.
+        let keys = Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef;
+        let values = Arc::new(Int32Array::from(vec![Some(10), None])) as ArrayRef;
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Int32, true),
+                Field::new("value", DataType::Int32, true),
+            ]),
+            vec![keys, values],
+            None,
+        );
+        let wire = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::from_lengths([2]),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let expected = DataType::Map(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(
+                    vec![
+                        Arc::new(Field::new("key", DataType::Int32, false)),
+                        Arc::new(Field::new("value", DataType::Int32, true)),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+
+        let out = retag_column(&wire, &expected).expect("retag generic map carrier");
+
+        assert_eq!(out.data_type(), &expected);
+    }
+
+    #[test]
+    fn retag_widens_a_nested_field_the_array_really_has_nulls_in() {
+        // The mirror case: nullability still widens, but only on the array's
+        // own evidence.
+        let items = Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef;
+        let wire = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, true)),
+            OffsetBuffer::from_lengths([2]),
+            items,
+            None,
+        )) as ArrayRef;
+        let expected = DataType::List(Arc::new(Field::new("element", DataType::Int32, false)));
+
+        let out = retag_column(&wire, &expected).expect("retag list carrier");
+
+        let DataType::List(element) = out.data_type() else {
+            panic!("expected list");
+        };
+        assert_eq!(element.name(), "element");
+        assert!(element.is_nullable());
     }
 
     #[test]

@@ -341,17 +341,48 @@ impl ResultSchema {
     }
 
     pub(crate) fn accepts(&self, batch: &RecordBatch) -> bool {
+        self.mismatch(batch).is_none()
+    }
+
+    /// Names the first field that disagrees with what the query declared, or
+    /// `None` when the batch is exactly the declared shape. A schema this side
+    /// rejects is otherwise indistinguishable from any other rejection, and
+    /// the difference is the whole diagnosis.
+    pub(crate) fn mismatch(&self, batch: &RecordBatch) -> Option<String> {
         let actual = batch.schema();
-        actual.fields().len() == self.fields.len()
-            && actual
-                .fields()
-                .iter()
-                .zip(self.fields.iter())
-                .all(|(actual, expected)| {
-                    actual.name() == expected.name()
-                        && actual.data_type() == expected.data_type()
-                        && actual.is_nullable() == expected.nullable()
-                })
+        if actual.fields().len() != self.fields.len() {
+            return Some(format!(
+                "column count {} != declared {}",
+                actual.fields().len(),
+                self.fields.len()
+            ));
+        }
+        for (actual, expected) in actual.fields().iter().zip(self.fields.iter()) {
+            if actual.name() != expected.name() {
+                return Some(format!(
+                    "column name {:?} != declared {:?}",
+                    actual.name(),
+                    expected.name()
+                ));
+            }
+            if actual.data_type() != expected.data_type() {
+                return Some(format!(
+                    "column {:?} type {:?} != declared {:?}",
+                    actual.name(),
+                    actual.data_type(),
+                    expected.data_type()
+                ));
+            }
+            if actual.is_nullable() != expected.nullable() {
+                return Some(format!(
+                    "column {:?} nullable {} != declared {}",
+                    actual.name(),
+                    actual.is_nullable(),
+                    expected.nullable()
+                ));
+            }
+        }
+        None
     }
 }
 
