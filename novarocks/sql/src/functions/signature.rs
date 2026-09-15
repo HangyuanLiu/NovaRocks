@@ -212,7 +212,11 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         // A NULL literal has no type of its own and is a value of whatever
         // type it is used as. Refusing it here would refuse `f(NULL)` for
         // every `f`, which is not a type error but a missing rule.
-        (_, DataType::Null) => true,
+        //
+        // Only a spec that names a type can absorb it this way. A spec with a
+        // type variable in it has to go through unification, or the variable
+        // would be left for the return type to realize with nothing bound.
+        (spec, DataType::Null) if names_a_type(spec) => true,
         (TypeSpec::Boolean, DataType::Boolean) => true,
         (TypeSpec::Int8, DataType::Int8) => true,
         (TypeSpec::Int16, DataType::Int16) => true,
@@ -244,6 +248,16 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
                 && anchor_matches(value_spec, fields[1].data_type())
         }
         _ => false,
+    }
+}
+
+/// Whether this spec names a concrete type rather than standing for one.
+fn names_a_type(spec: &TypeSpec) -> bool {
+    match spec {
+        TypeSpec::Any(_) => false,
+        TypeSpec::List(inner) => names_a_type(inner),
+        TypeSpec::Map(key, value) => names_a_type(key) && names_a_type(value),
+        _ => true,
     }
 }
 
