@@ -337,10 +337,34 @@ impl Bindings {
     /// occurrences). Returns `false` on a conflicting bind.
     pub(crate) fn bind(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
+            if existing == DataType::Null {
+                self.replace(name, dt);
+                return true;
+            }
             return &existing == dt;
         }
         self.entries.push((name, dt.clone()));
         true
+    }
+
+    /// Bind `name` to NULL only if nothing has said what it is.
+    ///
+    /// A NULL argument is a value of whatever the variable turns out to be, so
+    /// it never contradicts another position and never decides one. It is
+    /// recorded anyway, because a call whose every occurrence is NULL still
+    /// has to realize a return type, and NULL is the honest answer there.
+    pub(crate) fn bind_null(&mut self, name: &'static str) {
+        if self.lookup(name).is_none() {
+            self.entries.push((name, DataType::Null));
+        }
+    }
+
+    fn replace(&mut self, name: &str, dt: &DataType) {
+        for entry in self.entries.iter_mut() {
+            if entry.0 == name {
+                entry.1 = dt.clone();
+            }
+        }
     }
 
     /// Widening bind: if `name` is unbound, bind it to `dt`. If `name` is
@@ -352,6 +376,10 @@ impl Bindings {
     /// widened type is actually nonsensical.
     pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
+            if existing == DataType::Null {
+                self.replace(name, dt);
+                return true;
+            }
             let widened = novarocks_types::wider_type(&existing, dt);
             for entry in self.entries.iter_mut() {
                 if entry.0 == name {
@@ -389,7 +417,10 @@ pub(crate) fn unify(
         // be, so it does not decide one. Binding `T` to NULL would make every
         // other position disagree with it and refuse the call - which is how
         // `f(NULL, x)` came to be a type error while `f(x, NULL)` was not.
-        TypeSpec::Any(_) if matches!(dt, DataType::Null) => true,
+        TypeSpec::Any(name) if matches!(dt, DataType::Null) => {
+            bindings.bind_null(name);
+            true
+        }
         TypeSpec::Any(name) => match mode {
             BindMode::Strict => bindings.bind(name, dt),
             BindMode::Widening => bindings.bind_widening(name, dt),

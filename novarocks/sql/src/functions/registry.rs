@@ -146,15 +146,9 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "url_encode",
         "url_decode",
         "char",
-        "hex",
         "unhex",
-        "bar",
-        "money_format",
-        "append_trailing_char_if_absent",
         "md5sum",
         "sm3",
-        "parse_url",
-        "from_binary",
     ] {
         add(
             m,
@@ -162,6 +156,82 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
+
+    // These were grouped with the one-argument string transforms above, but
+    // none of them is one: they differ in arity, in what they take, or in
+    // both. The executor's own arity is what each declares here.
+    //
+    // hex renders bytes or a number as text.
+    for argument in [TypeSpec::Utf8, TypeSpec::Binary, TypeSpec::Int64] {
+        add(m, "hex", Signature::new(vec![argument], TypeSpec::Utf8));
+    }
+    // bar(value, lo, hi, width) draws a proportional bar.
+    add(
+        m,
+        "bar",
+        Signature::new(
+            vec![
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Utf8,
+        ),
+    );
+    // money_format renders a number, not a string.
+    for argument in [
+        TypeSpec::Int64,
+        TypeSpec::Float64,
+        TypeSpec::AnyDecimal128,
+        TypeSpec::Utf8,
+    ] {
+        add(
+            m,
+            "money_format",
+            Signature::new(vec![argument], TypeSpec::Utf8),
+        );
+    }
+    add(
+        m,
+        "append_trailing_char_if_absent",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "parse_url",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "parse_url",
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Utf8,
+        ),
+    );
+    // from_binary reads bytes and returns text; to_binary is its inverse. The
+    // optional second argument names the encoding.
+    add(
+        m,
+        "from_binary",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "from_binary",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "to_binary",
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "to_binary",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Binary),
+    );
 
     // (Utf8) -> Int32 — length / position / ascii family.
     for name in [
@@ -196,6 +266,24 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int32),
         );
     }
+    // locate and regexp_position also take the position to start from.
+    for name in ["locate", "regexp_position"] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int64],
+                TypeSpec::Int32,
+            ),
+        );
+    }
+    // field(value, ...candidates) reports which candidate the value equals,
+    // over any comparable type rather than text alone.
+    add(
+        m,
+        "field",
+        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+    );
     // `equiwidth_bucket` and `regexp_count` return Int64 instead of Int32.
     add(
         m,
