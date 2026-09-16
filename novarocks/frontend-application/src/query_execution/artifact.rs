@@ -2295,7 +2295,9 @@ fn native_submission_encoding_view<'a>(
         execution_id,
         keys,
         root,
-        prepared,
+        crate::query_execution::artifact::native_submission::SubmissionPlanFacts::from_prepared(
+            prepared,
+        ),
         native_bundle,
         schedule,
         options,

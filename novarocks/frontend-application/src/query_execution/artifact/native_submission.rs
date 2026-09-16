@@ -30,7 +30,9 @@ use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
+use novarocks_sql::plan_read::{
+    ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId as PlannerFragmentId,
+};
 use novarocks_types::UniqueId;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
@@ -80,7 +82,7 @@ pub struct NativeSubmissionEncodingView<'a> {
     execution_id: QueryExecutionId,
     keys: Vec<NativeSubmissionKey>,
     root: NativeSubmissionKey,
-    prepared: &'a PreparedFragmentSet,
+    plan: SubmissionPlanFacts,
     native_fragments: &'a NativeFragmentAttachment,
     schedule: &'a SchedulingPlan,
     options: &'a QueryOptions,
@@ -98,7 +100,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         execution_id: QueryExecutionId,
         keys: Vec<NativeSubmissionKey>,
         root: NativeSubmissionKey,
-        prepared: &'a PreparedFragmentSet,
+        plan: SubmissionPlanFacts,
         native_fragments: &'a NativeFragmentAttachment,
         schedule: &'a SchedulingPlan,
         options: &'a QueryOptions,
@@ -111,7 +113,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             execution_id,
             keys,
             root,
-            prepared,
+            plan,
             native_fragments,
             schedule,
             options,
@@ -158,27 +160,38 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         UniqueId::new(query_id.high(), query_id.low())
     }
 
-    pub fn topological_fragment_order(&self) -> &'a [PlannerFragmentId] {
-        self.prepared.scheduling_view().topological_order()
+    pub fn topological_fragment_order(&self) -> &[PlannerFragmentId] {
+        &self.plan.order
     }
 
-    pub fn edges(&self) -> &'a [FragmentEdge] {
-        self.prepared.scheduling_view().edges()
+    /// Whether this fragment feeds another through a plain stream edge.
+    /// Nothing downstream reads any other property of one.
+    pub fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
+        self.plan.has_stream_edge_from(fragment_id)
+    }
+
+    pub fn cte_edges(&self) -> &[FragmentEdge] {
+        self.plan.cte_edges()
+    }
+
+    pub fn router_edges(&self) -> &[FragmentEdge] {
+        self.plan.router_edges()
     }
 
     pub fn fragments(
         &self,
-    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'a>> + '_ {
-        self.prepared
-            .scheduling_view()
-            .fragments()
+    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'_>> + '_ {
+        self.plan
+            .fragments
+            .iter()
             .map(NativeSubmissionFragmentFacts::new)
     }
 
-    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'a>> {
-        self.prepared
-            .scheduling_view()
-            .fragment(fragment_id)
+    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'_>> {
+        self.plan
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == fragment_id)
             .map(NativeSubmissionFragmentFacts::new)
     }
 
@@ -255,35 +268,109 @@ fn validate_keys(
 /// way to reconstruct planning or scheduling state.
 #[derive(Clone, Copy)]
 pub struct NativeSubmissionFragmentFacts<'a> {
-    fragment: &'a crate::query_execution::preparation::PreparedFragment,
+    fragment: &'a SubmissionFragmentFacts,
 }
 
 impl<'a> NativeSubmissionFragmentFacts<'a> {
-    fn new(fragment: &'a crate::query_execution::preparation::PreparedFragment) -> Self {
+    const fn new(fragment: &'a SubmissionFragmentFacts) -> Self {
         Self { fragment }
     }
 
-    pub fn fragment_id(self) -> FragmentId {
-        self.fragment.fragment_id()
+    pub const fn fragment_id(self) -> FragmentId {
+        self.fragment.fragment_id
     }
 
-    pub fn role(self) -> NativeSubmissionFragmentRole {
-        match self.fragment.execution_role() {
-            crate::query_execution::preparation::PreparedFragmentRole::Result => {
-                NativeSubmissionFragmentRole::Result
-            }
-            crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
-                NativeSubmissionFragmentRole::NonTerminal
-            }
-        }
+    pub const fn role(self) -> NativeSubmissionFragmentRole {
+        self.fragment.role
     }
 
-    pub fn cte_id(self) -> Option<CteId> {
-        self.fragment.boundary_projection().cte_id()
+    pub const fn cte_id(self) -> Option<CteId> {
+        self.fragment.cte_id
     }
 
     pub fn cte_exchange_nodes(self) -> &'a [(CteId, i32, Vec<ColumnId>)] {
-        self.fragment.boundary_projection().cte_exchange_nodes()
+        &self.fragment.cte_exchange_nodes
+    }
+}
+
+/// One fragment, as submission encoding reads it.
+#[derive(Clone)]
+pub(crate) struct SubmissionFragmentFacts {
+    fragment_id: FragmentId,
+    role: NativeSubmissionFragmentRole,
+    cte_id: Option<CteId>,
+    cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+}
+
+/// What submission encoding reads about a plan, as values.
+///
+/// The planner's own edge is kept only for the two shapes that read its
+/// detail -- CTE multicast and change-stream routing. A plain stream edge is
+/// read for nothing but whether it exists, so only the set of fragments that
+/// have one is carried. That is what a completed plan can supply without
+/// inventing a partition expression or a slot list it does not have.
+#[derive(Clone)]
+pub(crate) struct SubmissionPlanFacts {
+    order: Vec<FragmentId>,
+    fragments: Vec<SubmissionFragmentFacts>,
+    stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+    cte_edges: Vec<FragmentEdge>,
+    router_edges: Vec<FragmentEdge>,
+}
+
+impl SubmissionPlanFacts {
+    pub(crate) fn from_prepared(prepared: &PreparedFragmentSet) -> Self {
+        let view = prepared.scheduling_view();
+        let mut cte_edges = Vec::new();
+        let mut router_edges = Vec::new();
+        let mut stream_edge_sources = std::collections::BTreeSet::new();
+        for edge in view.edges() {
+            match edge.edge_kind {
+                FragmentEdgeKind::Stream => {
+                    stream_edge_sources.insert(edge.source_fragment_id);
+                }
+                FragmentEdgeKind::CteMulticast { .. } => cte_edges.push(edge.clone()),
+                FragmentEdgeKind::ChangeStreamRouter { .. } => router_edges.push(edge.clone()),
+            }
+        }
+        Self {
+            order: view.topological_order().to_vec(),
+            fragments: prepared
+                .scheduling_view()
+                .fragments()
+                .map(|fragment| SubmissionFragmentFacts {
+                    fragment_id: fragment.fragment_id(),
+                    role: match fragment.execution_role() {
+                        crate::query_execution::preparation::PreparedFragmentRole::Result => {
+                            NativeSubmissionFragmentRole::Result
+                        }
+                        crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
+                            NativeSubmissionFragmentRole::NonTerminal
+                        }
+                    },
+                    cte_id: fragment.boundary_projection().cte_id(),
+                    cte_exchange_nodes: fragment
+                        .boundary_projection()
+                        .cte_exchange_nodes()
+                        .to_vec(),
+                })
+                .collect(),
+            stream_edge_sources,
+            cte_edges,
+            router_edges,
+        }
+    }
+
+    pub(crate) fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
+        self.stream_edge_sources.contains(&fragment_id)
+    }
+
+    pub(crate) fn cte_edges(&self) -> &[FragmentEdge] {
+        &self.cte_edges
+    }
+
+    pub(crate) fn router_edges(&self) -> &[FragmentEdge] {
+        &self.router_edges
     }
 }
 

@@ -44,10 +44,8 @@ pub(crate) fn encode_native_submission(
 ) -> Result<NativeSubmissionAttachment, String> {
     let schedule = view.schedule();
     let root_fragment_id = schedule.root_fragment_id;
-    let edges = view.edges();
-    let stream_edge_by_source = assembly::build_stream_edge_by_source(edges);
     let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<_>)> =
-        assembly::group_router_edges_by_source(edges)
+        assembly::group_router_edges_by_source(view.router_edges())
             .into_iter()
             .map(|((source_fragment_id, router_group_id), branch_edges)| {
                 (source_fragment_id, (router_group_id, branch_edges))
@@ -64,7 +62,7 @@ pub(crate) fn encode_native_submission(
             Vec<ColumnId>,
         )>,
     > = BTreeMap::new();
-    for edge in edges {
+    for edge in view.cte_edges() {
         if let FragmentEdgeKind::CteMulticast {
             cte_id,
             receive_producer_column_ids,
@@ -115,15 +113,14 @@ pub(crate) fn encode_native_submission(
             .remove(&fragment_id)
             .ok_or_else(|| format!("native fragment template {fragment_id} is missing"))?;
         let is_root = fragment_id == root_fragment_id;
-        let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
+        let has_stream_edge = view.has_stream_edge_from(fragment_id);
         let router_edges = router_edges_by_source.get(&fragment_id);
-        let is_producer =
-            stream_edge.is_some() || router_edges.is_some() || facts.cte_id().is_some();
+        let is_producer = has_stream_edge || router_edges.is_some() || facts.cte_id().is_some();
         validate_fragment_output_kind(fragment_id, is_root, is_producer, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(
             fragment_id,
             is_root,
-            stream_edge.is_some(),
+            has_stream_edge,
             router_edges.is_some(),
             facts.cte_id().is_some(),
         )?;
@@ -131,7 +128,7 @@ pub(crate) fn encode_native_submission(
             .iter()
             .map(|placement| {
                 let mut native_fragment = template.clone();
-                if !is_root && stream_edge.is_none() {
+                if !is_root && !has_stream_edge {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         assembly::patch_native_change_stream_router_sink(
                             &mut native_fragment,
