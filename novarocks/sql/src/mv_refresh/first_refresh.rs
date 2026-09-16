@@ -1160,35 +1160,37 @@ fn allocate_join_incremental_locator_column_ids(
     })
 }
 
-const JOIN_INCREMENTAL_EFFECT_COLUMN: &str = "__imv_change_stream_effect";
-const JOIN_INCREMENTAL_EFFECT_EXISTING: i32 = 1;
-const JOIN_INCREMENTAL_EFFECT_APPENDED: i32 = 2;
-
-#[derive(Clone, Copy)]
-enum JoinIncrementalEffectMode {
-    Constant(i32),
-    ByRowLineage,
-}
-
+/// Turn an optimized incremental producer into the change-event stream the
+/// write contract consumes.
+///
+/// The root has to be the native `ChangeEventExpand`: that node is how a plan
+/// says "each of my rows is a change with this effect", and the writer routes
+/// are bound to its effect column. A projection that merely computes an effect
+/// number looks the same from the side but tells the contract nothing, which
+/// is why sealing one is refused.
+///
+/// Each effect therefore becomes its own event with the predicate that selects
+/// it, and the predicates are made mutually exclusive rather than ordered: the
+/// expand emits one row per *matching* event, so overlapping predicates would
+/// duplicate a row instead of choosing between them.
 fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     write_mode: SqlMvIncrementalWriteMode,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
+    use crate::optimizer::operator::{ChangeEventOutputExpr, ChangeEventSpec};
+    use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
+
     let output_columns = &optimized_tree.output_columns;
     let has_delete_branch = matches!(write_mode, SqlMvIncrementalWriteMode::RowDelta);
     let action_output = has_delete_branch
         .then(|| join_incremental_change_op_output(change_stream, output_columns))
         .transpose()?;
-    let effect_mode = match write_mode {
-        SqlMvIncrementalWriteMode::FastAppend => {
-            JoinIncrementalEffectMode::Constant(JOIN_INCREMENTAL_EFFECT_APPENDED)
-        }
-        SqlMvIncrementalWriteMode::RowDelta => JoinIncrementalEffectMode::ByRowLineage,
-    };
-    let row_lineage_output = match effect_mode {
-        JoinIncrementalEffectMode::Constant(_) => None,
-        JoinIncrementalEffectMode::ByRowLineage => Some(
+    let row_lineage_output = match write_mode {
+        SqlMvIncrementalWriteMode::FastAppend => None,
+        SqlMvIncrementalWriteMode::RowDelta => Some(
             join_incremental_output_by_name(
                 output_columns,
                 "_file",
@@ -1197,7 +1199,7 @@ fn add_join_incremental_change_stream_effect(
             .clone(),
         ),
     };
-    let route_output = crate::analysis::OutputColumn {
+    let effect_output = crate::analysis::OutputColumn {
         column_id: crate::column_id::ColumnId(
             output_columns
                 .iter()
@@ -1206,7 +1208,7 @@ fn add_join_incremental_change_stream_effect(
                 .unwrap_or(0)
                 + 1,
         ),
-        name: JOIN_INCREMENTAL_EFFECT_COLUMN.to_string(),
+        name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
         data_type: arrow::datatypes::DataType::Int8,
         nullable: false,
         is_internal: true,
@@ -1215,62 +1217,146 @@ fn add_join_incremental_change_stream_effect(
         .execution_props
         .scalar_arena
         .as_ref()
-        .ok_or_else(|| "IMV change-stream route projection requires a scalar arena".to_string())?
+        .ok_or_else(|| "IMV change-stream expansion requires a scalar arena".to_string())?
         .as_ref()
         .clone();
-    let mut items = Vec::with_capacity(output_columns.len() + 1);
-    for column in output_columns {
-        arena.remember_source_column_display(column.column_id, None, column.name.clone());
-        let expr = arena.intern(
-            crate::optimizer::scalar::ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
+
+    // Every event carries the same row through unchanged; only its effect
+    // differs, which is exactly what the expand exists to express.
+    let assignments = output_columns
+        .iter()
+        .map(|column| {
+            arena.remember_source_column_display(column.column_id, None, column.name.clone());
+            ChangeEventOutputExpr {
+                output_column_id: column.column_id,
+                expr: Some(arena.intern(
+                    ScalarNode::ColumnRef(column.column_id),
+                    column.data_type.clone(),
+                    column.nullable,
+                )),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let not_deleted = action_output.as_ref().map(|action| {
+        let action_ref = arena.intern(
+            ScalarNode::ColumnRef(action.column_id),
+            action.data_type.clone(),
+            action.nullable,
         );
-        items.push(crate::optimizer::operator::ScalarProjectItem {
-            expr,
-            output_name: column.name.clone(),
-            output_column_id: column.column_id,
-            expr_display: None,
+        let delete = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
+            action.data_type.clone(),
+            false,
+        );
+        let is_delete = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: action_ref,
+                right: delete,
+            },
+            arrow::datatypes::DataType::Boolean,
+            action.nullable,
+        );
+        let is_not_delete = arena.intern(
+            ScalarNode::UnaryOp {
+                op: crate::common::UnOp::Not,
+                child: is_delete,
+            },
+            arrow::datatypes::DataType::Boolean,
+            action.nullable,
+        );
+        (is_delete, is_not_delete)
+    });
+
+    let mut events = Vec::with_capacity(3);
+    if let Some((is_delete, _)) = not_deleted {
+        events.push(ChangeEventSpec {
+            predicate: Some(is_delete),
+            effect: ConnectorRowMutationEffect::Delete,
+            assignments: assignments.clone(),
         });
     }
-    let effect_expr = join_incremental_effect_scalar(
-        &mut arena,
-        action_output.as_ref(),
-        row_lineage_output.as_ref(),
-        effect_mode,
-    )?;
-    arena.remember_project_output_display(route_output.column_id, None, route_output.name.clone());
-    items.push(crate::optimizer::operator::ScalarProjectItem {
-        expr: effect_expr,
-        output_name: route_output.name.clone(),
-        output_column_id: route_output.column_id,
-        expr_display: None,
-    });
-    let output_property = optimized_tree.execution_props.output_property.clone();
-    let stats = optimized_tree.stats.clone();
-    let mut output_columns = output_columns.clone();
-    output_columns.push(route_output);
-    let arena = Arc::new(arena);
-    let mut plan = crate::optimizer::OptimizedOperatorNode {
-        op: crate::optimizer::operator::Operator::PhysicalProject(
-            crate::optimizer::operator::ProjectOp {
-                items,
-                output_qualifier: None,
+    let surviving = not_deleted.map(|(_, is_not_delete)| is_not_delete);
+    match row_lineage_output {
+        // Every surviving row is new output appended beside what is already
+        // published.
+        None => events.push(ChangeEventSpec {
+            predicate: surviving,
+            effect: ConnectorRowMutationEffect::Insert,
+            assignments,
+        }),
+        // A surviving row either lands where no published row stands, or
+        // replaces the one its lineage names.
+        Some(lineage) => {
+            let lineage_ref = arena.intern(
+                ScalarNode::ColumnRef(lineage.column_id),
+                lineage.data_type.clone(),
+                lineage.nullable,
+            );
+            let is_fresh = arena.intern(
+                ScalarNode::IsNull {
+                    child: lineage_ref,
+                    negated: false,
+                },
+                arrow::datatypes::DataType::Boolean,
+                false,
+            );
+            let is_existing = arena.intern(
+                ScalarNode::IsNull {
+                    child: lineage_ref,
+                    negated: true,
+                },
+                arrow::datatypes::DataType::Boolean,
+                false,
+            );
+            events.push(ChangeEventSpec {
+                predicate: Some(conjoin(&mut arena, surviving, is_fresh)),
+                effect: ConnectorRowMutationEffect::Insert,
+                assignments: assignments.clone(),
+            });
+            events.push(ChangeEventSpec {
+                predicate: Some(conjoin(&mut arena, surviving, is_existing)),
+                effect: ConnectorRowMutationEffect::Replace,
+                assignments,
+            });
+        }
+    }
+
+    arena.remember_project_output_display(
+        effect_output.column_id,
+        None,
+        effect_output.name.clone(),
+    );
+    let mut expanded_columns = output_columns.clone();
+    expanded_columns.push(effect_output.clone());
+    crate::planning::dml::build_change_expand(
+        optimized_tree,
+        arena,
+        expanded_columns,
+        effect_output.column_id,
+        events,
+    )
+}
+
+/// `left AND right`, or `right` alone when there is no left side.
+fn conjoin(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    left: Option<crate::optimizer::scalar::ScalarId>,
+    right: crate::optimizer::scalar::ScalarId,
+) -> crate::optimizer::scalar::ScalarId {
+    match left {
+        None => right,
+        Some(left) => arena.intern(
+            crate::optimizer::scalar::ScalarNode::BinaryOp {
+                op: crate::common::BinOp::And,
+                left,
+                right,
             },
+            arrow::datatypes::DataType::Boolean,
+            false,
         ),
-        children: vec![optimized_tree],
-        stats,
-        explain_stats: crate::optimizer::optimized_tree::OptimizerExplainStats::default(),
-        output_columns,
-        execution_props: crate::optimizer::optimized_tree::PlanExecutionProps {
-            output_property: output_property.clone(),
-            child_output_properties: vec![output_property],
-            join_distribution: None,
-            scalar_arena: Some(Arc::clone(&arena)),
-        },
-    };
-    crate::optimizer::optimized_tree::attach_scalar_arena(&mut plan, arena);
-    Ok(plan)
+    }
 }
 
 fn join_incremental_change_op_output(
@@ -1340,107 +1426,6 @@ fn join_incremental_output_by_name<'a>(
         _ => Err(format!(
             "IMV change-stream {label} `{name}` is ambiguous in plan output"
         )),
-    }
-}
-
-fn join_incremental_effect_scalar(
-    arena: &mut crate::optimizer::scalar::ScalarArena,
-    action_output: Option<&crate::analysis::OutputColumn>,
-    row_lineage_output: Option<&crate::analysis::OutputColumn>,
-    mode: JoinIncrementalEffectMode,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
-    use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
-
-    let route_value = match mode {
-        JoinIncrementalEffectMode::Constant(value) => arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(
-                incremental_route_effect_code(value),
-            ))),
-            arrow::datatypes::DataType::Int8,
-            false,
-        ),
-        JoinIncrementalEffectMode::ByRowLineage => {
-            let lineage = row_lineage_output.ok_or_else(|| {
-                "IMV reuse/fresh route requires preserved row-lineage output".to_string()
-            })?;
-            let lineage_ref = arena.intern(
-                ScalarNode::ColumnRef(lineage.column_id),
-                lineage.data_type.clone(),
-                lineage.nullable,
-            );
-            let is_fresh = arena.intern(
-                ScalarNode::IsNull {
-                    child: lineage_ref,
-                    negated: false,
-                },
-                arrow::datatypes::DataType::Boolean,
-                false,
-            );
-            let fresh = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(3))),
-                arrow::datatypes::DataType::Int8,
-                false,
-            );
-            let existing = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(2))),
-                arrow::datatypes::DataType::Int8,
-                false,
-            );
-            arena.intern(
-                ScalarNode::Case {
-                    operand: None,
-                    when_then: vec![(is_fresh, fresh)],
-                    else_expr: Some(existing),
-                },
-                arrow::datatypes::DataType::Int8,
-                false,
-            )
-        }
-    };
-    let Some(action) = action_output else {
-        return Ok(route_value);
-    };
-    let action_ref = arena.intern(
-        ScalarNode::ColumnRef(action.column_id),
-        action.data_type.clone(),
-        action.nullable,
-    );
-    let delete = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-        action.data_type.clone(),
-        false,
-    );
-    let is_delete = arena.intern(
-        ScalarNode::BinaryOp {
-            op: BinOp::Eq,
-            left: action_ref,
-            right: delete,
-        },
-        arrow::datatypes::DataType::Boolean,
-        action.nullable,
-    );
-    let delete_effect = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-        arrow::datatypes::DataType::Int8,
-        false,
-    );
-    Ok(arena.intern(
-        ScalarNode::Case {
-            operand: None,
-            when_then: vec![(is_delete, delete_effect)],
-            else_expr: Some(route_value),
-        },
-        arrow::datatypes::DataType::Int8,
-        false,
-    ))
-}
-
-const fn incremental_route_effect_code(route: i32) -> i64 {
-    match route {
-        JOIN_INCREMENTAL_EFFECT_EXISTING => 2,
-        JOIN_INCREMENTAL_EFFECT_APPENDED => 3,
-        _ => 1,
     }
 }
 
@@ -3005,18 +2990,114 @@ mod tests {
         assert_eq!(alias.value, "k");
     }
 
+    fn incremental_column(id: u32, name: &str) -> crate::analysis::OutputColumn {
+        crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(id),
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn incremental_producer(
+        columns: Vec<crate::analysis::OutputColumn>,
+    ) -> crate::optimizer::OptimizedOperatorNode {
+        let mut node = crate::optimizer::OptimizedOperatorNode {
+            op: crate::optimizer::operator::Operator::PhysicalValues(
+                crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: columns.clone(),
+                },
+            ),
+            children: vec![],
+            output_columns: columns,
+            stats: Default::default(),
+            explain_stats: Default::default(),
+            execution_props: Default::default(),
+        };
+        crate::optimizer::optimized_tree::attach_scalar_arena(
+            &mut node,
+            std::sync::Arc::new(crate::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
+    fn incremental_events(
+        producer: &crate::optimizer::OptimizedOperatorNode,
+    ) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            panic!("the change-stream producer root must be the native ChangeEventExpand");
+        };
+        expand.events.iter().map(|event| event.effect).collect()
+    }
+
     #[test]
-    fn canonical_incremental_terminal_preserves_provider_effect_codes() {
-        assert_eq!(incremental_route_effect_code(0), 1, "delete");
+    fn an_append_only_incremental_refresh_expands_one_insert_event() {
+        let producer = add_join_incremental_change_stream_effect(
+            incremental_producer(vec![incremental_column(1, "k")]),
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::FastAppend,
+        )
+        .expect("an append-only producer expands");
+
         assert_eq!(
-            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_EXISTING),
-            2,
-            "reuse"
+            incremental_events(&producer),
+            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Insert]
+        );
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            unreachable!("asserted above");
+        };
+        assert_eq!(
+            expand.events[0].predicate, None,
+            "with nothing to distinguish, every row is the one event"
         );
         assert_eq!(
-            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_APPENDED),
-            3,
-            "fresh"
+            producer.output_columns.last().expect("effect output").name,
+            crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
+        );
+        assert_eq!(
+            expand.effect_column_id,
+            producer
+                .output_columns
+                .last()
+                .expect("effect output")
+                .column_id
+        );
+    }
+
+    #[test]
+    fn a_row_delta_refresh_separates_delete_fresh_and_replace() {
+        let producer = add_join_incremental_change_stream_effect(
+            incremental_producer(vec![
+                incremental_column(1, "k"),
+                incremental_column(2, crate::common::CHANGE_OP_COLUMN),
+                incremental_column(3, "_file"),
+            ]),
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::RowDelta,
+        )
+        .expect("a row-delta producer expands");
+
+        assert_eq!(
+            incremental_events(&producer),
+            vec![
+                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+            ],
+            "a deleted row, a row landing where none stands, and a row replacing one"
+        );
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            unreachable!("asserted above");
+        };
+        assert!(
+            expand.events.iter().all(|event| event.predicate.is_some()),
+            "every branch must select itself; the expand emits one row per matching event, so an \
+             unconditional branch would duplicate rows rather than lose a race"
         );
     }
 

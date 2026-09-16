@@ -74,6 +74,11 @@ impl FrontendMvStartupRestore {
 /// frontend graph alive after shutdown released it. Admission names its own
 /// catalog, so there is nothing to look up.
 pub(crate) struct FrontendMvCatalogAdmission {
+    admitted: std::sync::mpsc::Sender<novarocks_spi::connector::ConnectorInstanceId>,
+}
+
+/// The ports one rediscovery sweep needs, owned by the worker that runs them.
+struct MvRediscovery {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     catalog_application: Arc<dyn CatalogApplicationPort>,
     readiness: Arc<MvReadinessPort>,
@@ -81,20 +86,42 @@ pub(crate) struct FrontendMvCatalogAdmission {
 }
 
 impl FrontendMvCatalogAdmission {
+    /// Start the one worker that rediscovers admitted catalogs.
+    ///
+    /// It is a thread of its own, and both halves of that matter. Off the
+    /// runtime, because the sweep drives durable MV work through a synchronous
+    /// bridge that must not re-enter the runtime it is running on. One at a
+    /// time, because a deployment with many attached catalogs would otherwise
+    /// fan out a provider sweep per catalog at once; sequential sweeps take
+    /// longer to finish and cost the process nothing while they do.
+    ///
+    /// The worker ends when this value is dropped and the channel closes.
     pub(crate) fn new(
         connector_control: Arc<dyn ConnectorControlRegistry>,
         catalog_application: Arc<dyn CatalogApplicationPort>,
         readiness: Arc<MvReadinessPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
-        Self {
+        let (admitted, requests) = std::sync::mpsc::channel();
+        let rediscovery = MvRediscovery {
             connector_control,
             catalog_application,
             readiness,
             management_entrance,
-        }
+        };
+        std::thread::Builder::new()
+            .name("nr-mv-rediscovery".to_string())
+            .spawn(move || {
+                while let Ok(instance_id) = requests.recv() {
+                    rediscovery.rediscover(&instance_id);
+                }
+            })
+            .expect("spawn the MV rediscovery worker");
+        Self { admitted }
     }
+}
 
+impl MvRediscovery {
     fn rebuild_context(&self) -> crate::mv::domain::lake_rebuild::LakeRebuildContext<'_> {
         crate::mv::domain::lake_rebuild::LakeRebuildContext {
             catalog_runtime_projection: None,
@@ -113,20 +140,18 @@ impl FrontendMvCatalogAdmission {
             },
         )
     }
-}
 
-impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogAdmission {
-    fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
-        // Both restore steps belong here, in their one order: an MV is
-        // rediscovered from the lake and only then registered with the
-        // provider-local catalog state that makes it a resolvable table.
+    /// Rebuild one catalog's MV inventory from the lake, then register what it
+    /// found. The two steps have one order: an MV is rediscovered before it
+    /// can be registered.
+    fn rediscover(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
         if let Err(error) = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs(
             &self.rebuild_context(),
             std::slice::from_ref(instance_id),
         ) {
-            // Admission already happened; an observer cannot unadmit it. The
+            // Admission already happened; nothing here can unadmit it. The
             // affected targets quarantine themselves inside the sweep, so what
-            // is left to report here is the sweep failing as a whole.
+            // is left to report is the sweep failing as a whole.
             tracing::warn!(
                 catalog = instance_id.as_str(),
                 %error,
@@ -141,6 +166,21 @@ impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogA
                 "registering the MV targets of a newly admitted catalog failed"
             );
         }
+    }
+}
+
+impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogAdmission {
+    fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
+        // Rediscovery reads the provider, and this call is inside catalog
+        // convergence. Doing the reads here would make admitting one catalog
+        // wait on the lake behind another, and a deployment with many attached
+        // catalogs would then never finish starting -- which is exactly what a
+        // process holding seventy of them did. Admission completes now; the
+        // inventory catches up behind it.
+        //
+        // A closed channel means the role graph is gone, and there is nothing
+        // left to rediscover for.
+        let _ = self.admitted.send(instance_id.clone());
     }
 }
 

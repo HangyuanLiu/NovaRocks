@@ -70,6 +70,11 @@ impl MvReadinessPort {
     /// Construct the separate query inventory from the same product-owned
     /// repository. The reader intentionally does not inherit this port's
     /// process-local readiness or refresh authority.
+    /// The runtime this port defers blocking work to.
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.handle
+    }
+
     pub(crate) fn candidate_reader(&self) -> MvCandidateReader {
         MvCandidateReader::new(self.service.candidate_reader(), self.handle.clone())
     }

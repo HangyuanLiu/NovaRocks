@@ -1870,7 +1870,7 @@ fn merge_action_predicate(
     ))
 }
 
-fn build_change_expand(
+pub(crate) fn build_change_expand(
     child: crate::optimizer::OptimizedOperatorNode,
     arena: crate::optimizer::scalar::ScalarArena,
     output_columns: Vec<crate::analysis::OutputColumn>,
