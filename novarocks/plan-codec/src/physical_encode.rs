@@ -193,6 +193,8 @@ pub fn encode_physical_plan_v1(
         .result_port()
         .ok_or_else(|| "native wire v1 requires one result port".to_string())?;
     let runtime_filters = encode_runtime_filters(physical, &layouts)?;
+    // Derived once: every fragment's columns read the same names.
+    let names = result_value_names(physical);
     let fragments = physical
         .fragments()
         .values()
@@ -203,6 +205,7 @@ pub fn encode_physical_plan_v1(
                 &layouts[&fragment.id()],
                 private_facts,
                 &runtime_filters,
+                &names,
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -2292,6 +2295,7 @@ fn encode_fragment(
     layout: &WireLayout,
     scan_facts: &impl PhysicalV1PrivateFacts,
     runtime_filters: &EncodedRuntimeFilters,
+    names: &OutputValueNames,
 ) -> Result<plan::PlanFragment, String> {
     let root = encode_tree(
         physical,
@@ -2299,6 +2303,7 @@ fn encode_fragment(
         layout,
         fragment.root(),
         scan_facts,
+        names,
         runtime_filters,
     )?;
     let root_node = &fragment.nodes()[&fragment.root()];
@@ -2313,7 +2318,7 @@ fn encode_fragment(
         output_partition: Some(compatibility_fragment_partition()),
         sink: Some(encode_sink(physical, fragment, layout)?),
         output_exprs: Vec::new(),
-        output_columns: output_columns(physical.result_port(), fragment, layout, root_node)?,
+        output_columns: output_columns(names, fragment, layout, root_node)?,
         cte_id: matches!(fragment.sink(), FragmentSink::Multicast { .. })
             .then(|| fragment.id().get()),
         cte_exchange_nodes: physical
@@ -2353,6 +2358,7 @@ fn encode_tree(
     layout: &WireLayout,
     node_id: NodeId,
     scan_facts: &impl PhysicalV1PrivateFacts,
+    names: &OutputValueNames,
     runtime_filters: &EncodedRuntimeFilters,
 ) -> Result<plan::DistributedNode, String> {
     let node = fragment.nodes().get(&node_id).ok_or_else(|| {
@@ -2372,11 +2378,12 @@ fn encode_tree(
                 layout,
                 *child,
                 scan_facts,
+                names,
                 runtime_filters,
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let payload = encode_node_payload(physical, fragment, layout, node, scan_facts)?;
+    let payload = encode_node_payload(physical, fragment, layout, node, scan_facts, names)?;
     Ok(plan::DistributedNode {
         node_id: i32::try_from(node.id.get())
             .map_err(|_| "native wire v1 node identity exceeds i32".to_string())?,
@@ -2400,13 +2407,14 @@ fn encode_node_payload(
     layout: &WireLayout,
     node: &PhysicalNode,
     scan_facts: &impl PhysicalV1PrivateFacts,
+    names: &OutputValueNames,
 ) -> Result<plan::distributed_node::Payload, String> {
     use plan::distributed_node::Payload;
     use plan::plan_node::Kind;
 
     if let NodeKind::ExchangeSource { edge, .. } = &node.kind {
         return Ok(Payload::Exchange(encode_exchange_source(
-            physical, fragment, layout, node, *edge,
+            physical, fragment, layout, node, *edge, names,
         )?));
     }
     if let NodeKind::TableWriter { target } = &node.kind {
@@ -2419,7 +2427,7 @@ fn encode_node_payload(
             fragment, layout, node, spec,
         )?));
     }
-    let outputs = output_columns(physical.result_port(), fragment, layout, node)?;
+    let outputs = output_columns(names, fragment, layout, node)?;
     let kind = match &node.kind {
         NodeKind::Scan {
             relation,
@@ -2457,7 +2465,7 @@ fn encode_node_payload(
                             *expression,
                             ValueResolution::NodeInput,
                         )?),
-                        output_name: value_name(*value),
+                        output_name: names.output_name(fragment.id(), *value),
                         output_column_id: layout
                             .output_slot(node.id, ordinal_u32(ordinal)?)
                             .map_err(|error| error.to_string())?
@@ -3394,6 +3402,7 @@ fn encode_exchange_source(
     layout: &WireLayout,
     node: &PhysicalNode,
     edge_id: EdgeId,
+    names: &OutputValueNames,
 ) -> Result<plan::ExchangeReceiver, String> {
     let edge = &physical.edges()[&edge_id];
     let exact_scope = node
@@ -3415,7 +3424,7 @@ fn encode_exchange_source(
             .map(|value| value_expr(fragment, *value, exact_scope[value]))
             .collect::<Result<Vec<_>, String>>()?,
         source_fragment_id: edge.source.fragment.get(),
-        output_columns: output_columns(physical.result_port(), fragment, layout, node)?,
+        output_columns: output_columns(names, fragment, layout, node)?,
         output_qualifier: None,
         flavor: Some(plan::ExchangeFlavor {
             kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
@@ -3646,12 +3655,83 @@ fn output_scope_map(
         .collect()
 }
 
+/// The result port, and the user-facing name each fragment's output value
+/// carries.
+struct OutputValueNames<'a> {
+    result: Option<&'a ResultPort>,
+    by_value: BTreeMap<(FragmentId, ValueId), Box<str>>,
+}
+
+impl OutputValueNames<'_> {
+    /// What a produced value is called where a name reaches the client.
+    ///
+    /// A value the result port never names is called after the value itself:
+    /// nothing downstream reads that name, and inventing a semantic one would
+    /// put a name in the plan that the statement never gave.
+    fn output_name(&self, fragment: FragmentId, value: ValueId) -> String {
+        self.by_value
+            .get(&(fragment, value))
+            .map_or_else(|| value_name(value), |name| name.as_ref().to_string())
+    }
+}
+
+/// The user-facing name each fragment's output value carries.
+///
+/// Only the result port names anything. Every other fragment's output is
+/// some projection of what eventually reaches it, and the client sees the
+/// rows a producer sent, so a name travels backwards along the edges that
+/// carry its value. A value no name reaches stays unnamed, which is what
+/// `value_name_ref` says about it.
+fn result_value_names(physical: &PhysicalPlan) -> OutputValueNames<'_> {
+    let mut names = BTreeMap::new();
+    let Some(result) = physical.result_port() else {
+        return OutputValueNames {
+            result: None,
+            by_value: names,
+        };
+    };
+    for field in &result.fields {
+        names
+            .entry((result.fragment, field.value))
+            .or_insert_with(|| Box::from(field.alias.as_deref().unwrap_or(&field.name)));
+    }
+    // Carry each name one hop at a time until nothing changes. Edges form a
+    // DAG and a pass can only add, so this needs no order and terminates.
+    loop {
+        let mut carried = false;
+        for edge in physical.edges().values() {
+            for (source_value, destination_value) in &edge.destination.receive_mapping {
+                let Some(name) = names
+                    .get(&(edge.destination.fragment, *destination_value))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    names.entry((edge.source.fragment, *source_value))
+                {
+                    slot.insert(name);
+                    carried = true;
+                }
+            }
+        }
+        if !carried {
+            break;
+        }
+    }
+    OutputValueNames {
+        result: Some(result),
+        by_value: names,
+    }
+}
+
 fn output_columns(
-    result: Option<&ResultPort>,
+    names: &OutputValueNames<'_>,
     fragment: &Fragment,
     layout: &WireLayout,
     node: &PhysicalNode,
 ) -> Result<Vec<common::OutputColumn>, String> {
+    let result = names.result;
     node.output
         .columns
         .iter()
@@ -3666,6 +3746,12 @@ fn output_columns(
                 .filter(|field| field.value == *value);
             let name = result_field
                 .map(|field| field.alias.as_deref().unwrap_or(&field.name))
+                .or_else(|| {
+                    names
+                        .by_value
+                        .get(&(fragment.id(), *value))
+                        .map(std::convert::AsRef::as_ref)
+                })
                 .unwrap_or_else(|| value_name_ref(*value));
             let ty = &fragment.values()[value].ty;
             let internal = matches!(
