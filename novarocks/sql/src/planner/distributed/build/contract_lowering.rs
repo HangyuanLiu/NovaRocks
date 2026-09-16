@@ -5924,19 +5924,26 @@ impl ContractLoweringVisitor {
             });
         }
         require_output_shape("Window", &plan.output_columns, &window.output_columns)?;
+        // A window node produces what reached it plus what its functions
+        // answered, and publishes some of that -- a statement that filters on
+        // a rank and then selects two columns publishes neither everything it
+        // read nor everything it ranked. Each function's own output column is
+        // found among the published ones, which is where its identity, type
+        // and nullability are stated.
+        let window_columns = window
+            .window_exprs
+            .iter()
+            .map(|expression| {
+                plan.output_columns
+                    .iter()
+                    .find(|column| column.column_id == expression.output_column_id)
+                    .cloned()
+                    .ok_or(ContractLoweringError::UnknownColumnReference(
+                        expression.output_column_id,
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut current = self.lower_node(&plan.children[0])?;
-        if plan.output_columns.len() != current.output.len() + window.window_exprs.len() {
-            return Err(ContractLoweringError::ArityMismatch {
-                context: "Window output",
-                expected: current.output.len() + window.window_exprs.len(),
-                actual: plan.output_columns.len(),
-            });
-        }
-        require_output_shape(
-            "Window",
-            &plan.output_columns[..current.output.len()],
-            &plan.children[0].output_columns,
-        )?;
 
         let mut current_output_columns = plan.children[0].output_columns.clone();
         let mut start = 0;
@@ -5952,16 +5959,23 @@ impl ContractLoweringVisitor {
                 current,
                 &current_output_columns,
                 &window.window_exprs[start..end],
-                &plan.output_columns[plan.children[0].output_columns.len() + start
-                    ..plan.children[0].output_columns.len() + end],
+                &window_columns[start..end],
             )?;
-            current_output_columns.extend_from_slice(
-                &plan.output_columns[plan.children[0].output_columns.len() + start
-                    ..plan.children[0].output_columns.len() + end],
-            );
+            current_output_columns.extend_from_slice(&window_columns[start..end]);
             start = end;
         }
-        require_lowered_output_shape("Window", &current, &plan.output_columns)?;
+        // What stands above reads the columns the statement published, in the
+        // order it published them.
+        let visible = plan
+            .output_columns
+            .iter()
+            .map(|column| {
+                current.columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        current.output = visible.into_boxed_slice();
         current.display_names = plan
             .output_columns
             .iter()
