@@ -6776,7 +6776,8 @@ impl ContractLoweringVisitor {
                         detail: "scalar expression carries a relation result".to_string(),
                     });
                 };
-                if result_type != &ty {
+                let result_type = undecorated(result_type);
+                if result_type != ty {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
                         detail: format!(
                             "binding result {result_type:?} differs from expression result {ty:?}"
@@ -6788,8 +6789,13 @@ impl ContractLoweringVisitor {
                         function_id: binding.function_id.clone(),
                         overload: binding.selected.overload.clone(),
                         kind: binding.kind,
-                        argument_types: binding.selected.argument_types.clone(),
-                        result_type: result_type.clone(),
+                        argument_types: binding
+                            .selected
+                            .argument_types
+                            .iter()
+                            .map(undecorated_argument)
+                            .collect(),
+                        result_type,
                         volatility: binding.semantics.volatility,
                         argument_evaluation: binding.semantics.argument_evaluation,
                         failure_behavior: binding.semantics.failure_behavior,

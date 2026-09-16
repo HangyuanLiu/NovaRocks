@@ -654,6 +654,27 @@ fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataT
 /// rather than to any other function of that name. The backend spells this
 /// same identity for itself when it registers implementations, so that sealing
 /// compares two independently written sets rather than one copied twice.
+/// Whether two argument types are the same but for what their nested fields
+/// admit. See the caller for why that is not part of a type's identity here.
+fn same_argument_up_to_nested_nullability(
+    types: (
+        &novarocks_functions::FunctionArgumentType,
+        &novarocks_functions::FunctionArgumentType,
+    ),
+) -> bool {
+    use novarocks_functions::FunctionArgumentType;
+    match types {
+        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
+            left.nullable == right.nullable
+                && crate::literal::arrow_type_equals_ignoring_metadata(
+                    &left.data_type,
+                    &right.data_type,
+                )
+        }
+        (left, right) => left == right,
+    }
+}
+
 fn builtin_aggregate_overload(name: &str) -> String {
     format!("builtin.aggregate/{name}/derived-v1")
 }
@@ -999,12 +1020,59 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
             aggregate: None,
         };
         if &expected == selected {
-            Ok(())
-        } else {
-            Err(FunctionBindingError::InvalidBinding(
-                "selected scalar overload differs from exact registry resolution".into(),
-            ))
+            return Ok(());
         }
+        // What a nested field admits is not part of a type's identity across
+        // this boundary -- a map read from Iceberg has non-null keys while the
+        // same type declared from SQL says they may be null, which is what
+        // `literal::arrow_type_equals_ignoring_metadata` exists to say. So a
+        // binding whose arguments differ only there is the same binding.
+        if expected.overload == selected.overload
+            && expected.result_type == selected.result_type
+            && expected.aggregate == selected.aggregate
+            && expected.argument_types.len() == selected.argument_types.len()
+            && expected
+                .argument_types
+                .iter()
+                .zip(selected.argument_types.iter())
+                .all(same_argument_up_to_nested_nullability)
+        {
+            return Ok(());
+        }
+        // Name the part that differs: the whole selection does not fit in one
+        // error line, and every field of it can drift for its own reason.
+        let differing = if expected.argument_types != selected.argument_types {
+            let ordinal = expected
+                .argument_types
+                .iter()
+                .zip(selected.argument_types.iter())
+                .position(|(registry, plan)| registry != plan);
+            match ordinal {
+                Some(ordinal) => format!(
+                    "argument {ordinal}: plan {:?}, registry {:?}",
+                    selected.argument_types[ordinal], expected.argument_types[ordinal]
+                ),
+                None => format!(
+                    "argument count: plan {}, registry {}",
+                    selected.argument_types.len(),
+                    expected.argument_types.len()
+                ),
+            }
+        } else if expected.result_type != selected.result_type {
+            format!(
+                "result type: registry {:?}, plan {:?}",
+                expected.result_type, selected.result_type
+            )
+        } else {
+            format!(
+                "aggregate state: registry {:?}, plan {:?}",
+                expected.aggregate, selected.aggregate
+            )
+        };
+        Err(FunctionBindingError::InvalidBinding(
+            format!("selected scalar overload differs from exact registry resolution: {differing}")
+                .into(),
+        ))
     }
 }
 
