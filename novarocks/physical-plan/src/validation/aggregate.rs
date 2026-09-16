@@ -295,6 +295,20 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                 };
                 pending.push(((fragment.id(), input), values));
             }
+            // A partial top-N between two phases of an aggregate drops whole
+            // groups the final would not have published anyway -- that is what
+            // it is placed for, and its own sequence proves the order it prunes
+            // by is the grouping. The states that survive it carry on
+            // unchanged.
+            NodeKind::TopN {
+                phase: crate::TopNPhase::Partial { .. },
+                ..
+            } => {
+                let Some(input) = node.inputs.first().copied() else {
+                    return false;
+                };
+                pending.push(((fragment.id(), input), expected_values));
+            }
             NodeKind::SetOp {
                 kind: crate::SetOperationKind::UnionAll,
                 input_mappings,
