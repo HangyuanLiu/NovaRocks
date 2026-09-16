@@ -4095,6 +4095,38 @@ fn reader_catalog_version(line: &str) -> Option<&str> {
         .find_map(|field| field.strip_prefix("catalog_version="))
 }
 
+/// Whether every Backend opened a reader for `catalog` after its baseline.
+///
+/// This is deliberately a monotonic fact rather than the instantaneous
+/// `opens > closes`. One unit reader belongs to one scheduled split and is
+/// closed before the next split's is opened (`novarocks/worker/src/
+/// typed_connector_runtime.rs`), so "a reader is open right now" is a
+/// per-split window that a poll can miss entirely, on any one of the
+/// Backends. "Opened one since this phase began" is true forever once it
+/// happens, so no poll can miss it -- and unlike a bare "has ever opened"
+/// latch it still tells two phases of the same scenario apart, which is what
+/// the repeated barriers in the vended scenarios depend on.
+fn every_backend_opened_reader_since(
+    logs: &[String],
+    baselines: &[String],
+    catalog: &str,
+) -> Result<bool> {
+    ensure!(
+        logs.len() == baselines.len(),
+        "phase baseline covers {} Backends but {} are running",
+        baselines.len(),
+        logs.len()
+    );
+    let appended = appended_since(
+        logs,
+        baselines,
+        "for a reader opened since this phase began",
+    )?;
+    Ok(appended
+        .iter()
+        .all(|log| reader_open_lines(log, catalog).next().is_some()))
+}
+
 fn reader_counts(log: &str) -> (usize, usize) {
     (
         log.match_indices(CONNECTOR_READER_OPEN).count(),
@@ -4123,4 +4155,106 @@ fn reader_counts_for_catalog_version(log: &str, catalog: &str, version: &str) ->
             .count()
     };
     (count(CONNECTOR_READER_OPEN), count(CONNECTOR_READER_CLOSE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_line(catalog: &str, version: &str, sequence: u32) -> String {
+        format!(
+            "{CONNECTOR_READER_OPEN} provider=iceberg instance={catalog} \
+             catalog_version={version} scheduled_split_sequence_id={sequence}\n"
+        )
+    }
+
+    fn close_line(catalog: &str, version: &str, sequence: u32) -> String {
+        format!(
+            "{CONNECTOR_READER_CLOSE} provider=iceberg instance={catalog} \
+             catalog_version={version} scheduled_split_sequence_id={sequence}\n"
+        )
+    }
+
+    #[test]
+    fn a_reader_opened_after_the_baseline_counts_on_every_backend() {
+        let baselines = vec!["prologue\n".to_string(); 3];
+        let logs = baselines
+            .iter()
+            .map(|baseline| format!("{baseline}{}", open_line("cat", "v1", 1)))
+            .collect::<Vec<_>>();
+        assert!(every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn a_backend_that_has_not_opened_since_the_baseline_holds_the_barrier() {
+        let baselines = vec!["prologue\n".to_string(); 3];
+        let mut logs = baselines
+            .iter()
+            .map(|baseline| format!("{baseline}{}", open_line("cat", "v1", 1)))
+            .collect::<Vec<_>>();
+        logs[1].clone_from(&baselines[1]);
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn a_reader_opened_before_the_baseline_does_not_satisfy_a_later_phase() {
+        // The defect a bare "has ever opened" latch would reintroduce: the
+        // vended scenarios run this barrier once per phase, and every phase
+        // after the first would pass without observing anything.
+        let baselines = vec![open_line("cat", "v1", 1); 3];
+        let logs = baselines.clone();
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn the_judgement_is_scoped_to_one_catalog() {
+        let baselines = vec![String::new(); 3];
+        let logs = vec![open_line("other_catalog", "v1", 1); 3];
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn closing_a_reader_does_not_retract_the_fact_that_it_opened() {
+        // The whole point of the monotonic judgement: one unit reader belongs
+        // to one split and is closed before the next opens, so an
+        // `opens > closes` judgement would flip back to false here.
+        let baselines = vec![String::new(); 3];
+        let logs = vec![
+            format!(
+                "{}{}",
+                open_line("cat", "v1", 1),
+                close_line("cat", "v1", 1)
+            );
+            3
+        ];
+        assert!(every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+        // Guards the contrast rather than the old helper: the instantaneous
+        // form really does go false at exactly this point.
+        let (opens, closes) = reader_counts(&logs[0]);
+        assert_eq!(opens, closes);
+    }
+
+    #[test]
+    fn a_log_that_shrank_below_its_baseline_is_an_error_not_a_panic() {
+        let baselines = vec!["a much longer prologue\n".to_string(); 3];
+        let logs = vec!["short\n".to_string(); 3];
+        let error = every_backend_opened_reader_since(&logs, &baselines, "cat")
+            .expect_err("a truncated log cannot be judged");
+        assert!(
+            format!("{error:#}").contains("log was truncated while checking"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_that_does_not_cover_every_backend_is_an_error() {
+        let baselines = vec![String::new(); 2];
+        let logs = vec![open_line("cat", "v1", 1); 3];
+        let error = every_backend_opened_reader_since(&logs, &baselines, "cat")
+            .expect_err("a baseline must cover every running Backend");
+        assert!(
+            format!("{error:#}").contains("covers 2 Backends but 3 are running"),
+            "unexpected error: {error:#}"
+        );
+    }
 }
