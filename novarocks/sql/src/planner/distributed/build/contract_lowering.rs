@@ -4241,15 +4241,19 @@ impl ContractLoweringVisitor {
                 )
             }
             AggMode::Global => {
-                if aggregate.is_merge.iter().any(|merge| !*merge) {
-                    return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "global aggregate has a logical-argument call",
-                    });
-                }
-                let sequences = (0..aggregate.aggregates.len())
+                // A node that finishes its groups need not be merging every
+                // call: `count(distinct x), sum(y)` splits into one that merges
+                // the sum's state while it still reads x's values. Only the
+                // merging calls pair with a phase below, so only they take a
+                // sequence.
+                let sequences = aggregate
+                    .is_merge
+                    .iter()
+                    .filter(|merge| **merge)
                     .map(|_| self.allocate_aggregate_sequence())
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice();
+                let merges = !sequences.is_empty();
                 let previous_sequences =
                     self.pending_aggregate_sequences.replace(sequences.clone());
                 let previous_used =
@@ -4259,7 +4263,7 @@ impl ContractLoweringVisitor {
                 self.pending_aggregate_sequences = previous_sequences;
                 self.pending_aggregate_sequence_used = previous_used;
                 let child = child_result?;
-                if !used {
+                if merges && !used {
                     return Err(ContractLoweringError::MissingPlannerFact {
                         node: "HashAggregate",
                         fact: "a structurally connected Local producer for every Global call",
@@ -4270,14 +4274,24 @@ impl ContractLoweringVisitor {
                 } else {
                     child
                 };
-                (
-                    sequences
-                        .iter()
-                        .copied()
-                        .map(|sequence| AggregatePhase::Final { sequence })
-                        .collect(),
-                    child,
-                )
+                let mut taken = sequences.iter().copied();
+                let phases = aggregate
+                    .is_merge
+                    .iter()
+                    .map(|merge| {
+                        if *merge {
+                            taken
+                                .next()
+                                .map(|sequence| AggregatePhase::Final { sequence })
+                                .ok_or(ContractLoweringError::InvalidAggregate {
+                                    detail: "global aggregate has more merging calls than sequences",
+                                })
+                        } else {
+                            Ok(AggregatePhase::Single)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (phases, child)
             }
             AggMode::Local => {
                 if aggregate.is_merge.iter().any(|merge| *merge) {
