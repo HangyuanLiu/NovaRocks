@@ -217,7 +217,14 @@ fn freeze_one_read(
     let read = control
         .typed_read_for_planning_lease(&materialization.planning_lease)
         .map_err(|error| format!("provider read of {name} has no typed read binding: {error}"))?;
-    let metadata = read.metadata();
+    // The control this read is negotiated and frozen through is the same one
+    // its attempt access is sealed against. A provider may pin what it
+    // resolved while answering -- the sealed access is then a view of that pin
+    // -- and asking through a second control would seal against a request that
+    // was never asked anything.
+    let request_control = request_control_for(&read, context)
+        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let metadata = request_control.metadata();
     let table = SchemaTableName::try_new(&identity.namespace, &identity.table)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
 
@@ -281,8 +288,6 @@ fn freeze_one_read(
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
         column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
-    let request_control = request_control_for(&read, context)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
     let catalog_properties = materialization
         .planning_lease
         .binding()
