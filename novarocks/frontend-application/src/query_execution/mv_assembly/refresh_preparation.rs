@@ -1510,6 +1510,16 @@ fn prepare_frontend_incremental_write(
             )
         })?;
     let runtime_bindings = validate_projection_target(&projection, &target_schema_validation)?;
+    // An incremental refresh of an aggregate view needs the same analyzed
+    // aggregate facts a first refresh does: L says the view aggregates, and a
+    // rewrite that cannot say which SQL call each aggregate identity belongs
+    // to has nothing to maintain the state columns with.
+    let aggregate = frozen_refresh_aggregate_analysis(
+        source,
+        &projection,
+        &canonical_query,
+        &connector_context,
+    )?;
     let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
         projection: Arc::new(projection),
         pin: &pin,
@@ -1518,7 +1528,7 @@ fn prepare_frontend_incremental_write(
         target_observation: &target_schema_validation,
         runtime_bindings: &runtime_bindings,
         has_join: is_join,
-        aggregate: None,
+        aggregate,
     })?;
 
     if let Some((left_ref, right_ref)) = join_bases {

@@ -705,15 +705,36 @@ fn validate_physical_column(
     data_type: &DataType,
     nullable: bool,
 ) -> Result<(), String> {
+    let bound = arrow_type_from_contract_signature(&field.type_signature)?;
     if field.name != name
-        || arrow_type_from_contract_signature(&field.type_signature)? != *data_type
+        || !denote_one_provider_type(&bound, data_type)
         || field.nullable != nullable
     {
-        return Err(
-            "MV rewrite analyzed physical column differs from its L/provider binding".into(),
-        );
+        return Err(format!(
+            "MV rewrite analyzed physical column differs from its L/provider binding: L has \
+             name={} type={} nullable={}; the analysis wants name={} type={:?} nullable={}",
+            field.name, field.type_signature, field.nullable, name, data_type, nullable
+        ));
     }
     Ok(())
+}
+
+/// Whether two Arrow types are the same provider type.
+///
+/// A contract type signature names the provider's type, and several Arrow
+/// layouts can carry one of them: Iceberg has a single `binary`, which the
+/// connector reads into either binary array width, and the aggregate state
+/// column is written as the large one. Comparing the Arrow variants exactly
+/// demands a coincidence of layouts the signature never promised, and the
+/// aggregate layout's own validators already accept either.
+fn denote_one_provider_type(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Binary | DataType::LargeBinary, DataType::Binary | DataType::LargeBinary) => {
+            true
+        }
+        (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8 | DataType::LargeUtf8) => true,
+        (left, right) => left == right,
+    }
 }
 
 fn state_role(role: StateRole) -> SqlImvAggregateStateRoleFacts {
