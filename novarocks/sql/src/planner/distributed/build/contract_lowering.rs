@@ -6391,21 +6391,17 @@ impl ContractLoweringVisitor {
             source.clone(),
             ContractExprKind::Literal(literal),
         )?;
-        if source == target {
+        if source.data_type == target.data_type {
             return Ok(literal_id);
         }
-        if source.nullable != target.nullable {
-            return Err(ContractLoweringError::InvalidLiteral {
-                kind: "typed",
-                detail: format!(
-                    "literal source nullability {} differs from analyzed nullability {}",
-                    source.nullable, target.nullable
-                ),
-            });
-        }
+        // Only the type is converted. A literal is an exact value and never
+        // admits null, whatever the analyzed type says about the position it
+        // stands in; carrying that through is more precise than the analyzed
+        // type and is the only thing a cast can carry, because a cast states
+        // its input's nullability rather than changing it.
         Ok(self.fragment_mut().add_expression(
             owner,
-            target.clone(),
+            ValueType::new(target.data_type.clone(), source.nullable),
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
@@ -7714,18 +7710,19 @@ fn lower_literal(
             ValueType::new(DataType::Int64, false),
         )),
         LiteralValue::LargeInt(value)
-            if novarocks_type_contract::is_largeint_data_type(&target.data_type)
-                && !target.nullable =>
+            if novarocks_type_contract::is_largeint_data_type(&target.data_type) =>
         {
-            Ok((ContractLiteralValue::LargeInt(*value), target.clone()))
+            Ok((
+                ContractLiteralValue::LargeInt(*value),
+                ValueType::new(target.data_type.clone(), false),
+            ))
         }
         LiteralValue::LargeInt(_) => Err(ContractLoweringError::InvalidLiteral {
             kind: "LargeInt",
             detail: format!(
-                "requires non-nullable FixedSizeBinary({}), got {:?} nullable={}",
+                "requires FixedSizeBinary({}), got {:?}",
                 novarocks_type_contract::LARGEINT_BYTE_WIDTH,
                 target.data_type,
-                target.nullable
             ),
         }),
         LiteralValue::Float(value) => Ok((
@@ -7741,10 +7738,13 @@ fn lower_literal(
             ValueType::new(DataType::Binary, false),
         )),
         LiteralValue::Decimal(value) => match &target.data_type {
-            DataType::Decimal128(precision, scale) if !target.nullable => {
+            DataType::Decimal128(precision, scale) => {
                 let unscaled = parse_decimal128(value, *scale)?;
                 require_decimal_precision(unscaled, *precision, "Decimal")?;
-                Ok((ContractLiteralValue::Decimal128(unscaled), target.clone()))
+                Ok((
+                    ContractLiteralValue::Decimal128(unscaled),
+                    ValueType::new(target.data_type.clone(), false),
+                ))
             }
             other => Err(ContractLoweringError::InvalidLiteral {
                 kind: "Decimal",
