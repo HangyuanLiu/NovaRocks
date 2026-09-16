@@ -1019,7 +1019,8 @@ impl ScheduleBoundDistributedQuery {
             frozen_live_backends,
             has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
-                &self.prepared,
+                self.prepared.runtime_filter_facts(),
+                self.prepared.scheduling_view().edges(),
                 self.schedule.planning_schedule(),
             ),
             _private: std::marker::PhantomData,
