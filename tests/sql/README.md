@@ -51,13 +51,37 @@ mkdir -p ~/minio-data
 minio server ~/minio-data --console-address :9001 &
 ```
 
+## Who Owns the Server
+
+The runner's default `--cluster-mode all-in-one` does **not** start a server: it
+connects to the host and port its config names, so a server must already be
+running there. `--cluster-mode cross-process` is the opposite — the runner
+launches and owns the FE/BE cluster itself, locating the binary through
+`NOVAROCKS_BIN` or a build under `target/`.
+
 ## Default Standalone Flow
 
-Start the standalone server on `9030`:
+Start a server first. It takes one FE config and one BE config — copy
+`novarocks-fe.toml.example` and `novarocks-be.toml.example` from the repo root,
+or use the generated pair below. There is no `--port` flag:
 
 ```bash
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --port 9030
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone \
+  --role all-in-one --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
 ```
+
+Inside a worktree, do not assume a port — source the generated environment and
+use its configs, so this worktree cannot collide with another:
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone \
+  --role all-in-one --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
+```
+
+When backgrounding the server, gate the first query on the `NOVAROCKS_READY`
+marker it prints after binding — probing the port alone cannot tell a fresh
+server from a leftover process that already owned it.
 
 Then run a suite:
 
@@ -66,9 +90,15 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -
   --suite filter --mode verify
 ```
 
-The runner defaults to `tests/sql/runner/conf/default.toml` when no explicit
-`--config` is provided. Suites that need an Iceberg fixture should
-pass the generated environment config or an explicit fixture config.
+The runner defaults to `tests/sql/runner/conf/default.toml` (host `127.0.0.1`,
+port `9030`) when no explicit `--config` is provided; pass
+`--config "$NOVAROCKS_SQL_TEST_CONFIG"` to target the generated worktree
+environment instead. Suites that need an Iceberg fixture should pass the
+generated environment config or an explicit fixture config.
+
+`tests/sql/correctness/README.md` carries the suite map — which engine area each
+suite covers and what fixture or topology it needs. Choose suites from it rather
+than running the whole corpus.
 
 ## Benchmark Flow
 
