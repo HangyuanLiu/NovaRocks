@@ -1337,11 +1337,13 @@ fn preflight_encoder(
                     }
                 }
                 NodeKind::Aggregate { calls, .. } => {
-                    let phase = calls.first().map(|call| call.binding.phase);
-                    if calls.iter().any(|call| Some(call.binding.phase) != phase) {
-                        return unsupported(fragment, node, "mixed-phase Aggregate");
-                    }
-                    if phase.is_some_and(|phase| !v1_aggregate_phase_is_lossless(phase)) {
+                    // Each call says for itself whether it reads values or a
+                    // state, and the wire carries that per call, so calls of
+                    // different phases in one node travel intact.
+                    if calls
+                        .iter()
+                        .any(|call| !v1_aggregate_phase_is_lossless(call.binding.phase))
+                    {
                         return unsupported(fragment, node, "intermediate Aggregate");
                     }
                     for call in calls {
@@ -2631,23 +2633,27 @@ fn encode_node_payload(
             calls,
             grouping,
         } => {
-            let phase = calls.first().map(|call| call.binding.phase);
-            if calls.iter().any(|call| Some(call.binding.phase) != phase) {
-                return unsupported(fragment, node, "mixed-phase Aggregate");
+            if calls
+                .iter()
+                .any(|call| matches!(call.binding.phase, AggregatePhase::Intermediate { .. }))
+            {
+                return unsupported(fragment, node, "intermediate Aggregate");
             }
-            // An aggregate with no call -- a DISTINCT -- reads its mode from
-            // the node's own statement, which is the only place it is written.
-            let mode = match phase {
-                Some(AggregatePhase::Single) => plan::AggMode::Single,
-                Some(AggregatePhase::Partial { .. }) => plan::AggMode::Local,
-                Some(AggregatePhase::Final { .. }) => plan::AggMode::Global,
-                Some(AggregatePhase::Intermediate { .. }) => {
-                    return unsupported(fragment, node, "intermediate Aggregate");
+            // The wire's mode says only whether this node finishes its groups,
+            // which the node itself states. Whether a call reads values or a
+            // state is said per call, so a node that merges some calls while
+            // computing others -- a DISTINCT beside a plain aggregate -- needs
+            // no single phase across them.
+            let mode = match grouping {
+                novarocks_physical_plan::AggregateGrouping::Partial => plan::AggMode::Local,
+                novarocks_physical_plan::AggregateGrouping::Complete
+                    if calls
+                        .iter()
+                        .any(|call| matches!(call.binding.phase, AggregatePhase::Final { .. })) =>
+                {
+                    plan::AggMode::Global
                 }
-                None => match grouping {
-                    novarocks_physical_plan::AggregateGrouping::Complete => plan::AggMode::Single,
-                    novarocks_physical_plan::AggregateGrouping::Partial => plan::AggMode::Local,
-                },
+                novarocks_physical_plan::AggregateGrouping::Complete => plan::AggMode::Single,
             };
             let group_key_columns = group_by
                 .iter()
