@@ -40,6 +40,7 @@ pub(crate) struct FrontendMvStartupRestore {
     catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
     catalog_application: Arc<dyn CatalogApplicationPort>,
     readiness: Arc<MvReadinessPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl FrontendMvStartupRestore {
@@ -48,12 +49,14 @@ impl FrontendMvStartupRestore {
         catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
         catalog_application: Arc<dyn CatalogApplicationPort>,
         readiness: Arc<MvReadinessPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             connector_control,
             catalog_runtime_projection,
             catalog_application,
             readiness,
+            management_entrance,
         }
     }
 }
@@ -65,7 +68,54 @@ impl FrontendMvStartupRestore {
 /// invisible until the next restart -- which would find the same empty set.
 /// Reacting to admission makes the lake the single source the inventory is
 /// rebuilt from, whenever its catalog appears.
-impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvStartupRestore {
+///
+/// It deliberately holds no catalog runtime projection. The projection holds
+/// this observer, and an observer that held it back would keep the whole
+/// frontend graph alive after shutdown released it. Admission names its own
+/// catalog, so there is nothing to look up.
+pub(crate) struct FrontendMvCatalogAdmission {
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    catalog_application: Arc<dyn CatalogApplicationPort>,
+    readiness: Arc<MvReadinessPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+}
+
+impl FrontendMvCatalogAdmission {
+    pub(crate) fn new(
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        catalog_application: Arc<dyn CatalogApplicationPort>,
+        readiness: Arc<MvReadinessPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    ) -> Self {
+        Self {
+            connector_control,
+            catalog_application,
+            readiness,
+            management_entrance,
+        }
+    }
+
+    fn rebuild_context(&self) -> crate::mv::domain::lake_rebuild::LakeRebuildContext<'_> {
+        crate::mv::domain::lake_rebuild::LakeRebuildContext {
+            catalog_runtime_projection: None,
+            catalog_application: Some(self.catalog_application.as_ref()),
+            connector_control: self.connector_control.as_ref(),
+            readiness: self.readiness.as_ref(),
+            management_entrance: Some(self.management_entrance.as_ref()),
+        }
+    }
+
+    fn restore_targets(&self) -> Result<(), String> {
+        crate::mv::domain::iceberg_refresh::restore_iceberg_mv_targets(
+            &crate::mv::domain::iceberg_refresh::MvTargetRestoreContext {
+                connector_control: self.connector_control.as_ref(),
+                readiness: self.readiness.as_ref(),
+            },
+        )
+    }
+}
+
+impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogAdmission {
     fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
         // Both restore steps belong here, in their one order: an MV is
         // rediscovered from the lake and only then registered with the
@@ -101,6 +151,7 @@ impl FrontendMvStartupRestore {
             catalog_application: Some(self.catalog_application.as_ref()),
             connector_control: self.connector_control.as_ref(),
             readiness: self.readiness.as_ref(),
+            management_entrance: Some(self.management_entrance.as_ref()),
         }
     }
 }

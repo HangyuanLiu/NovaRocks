@@ -59,6 +59,9 @@ pub struct MvCommandExecutor {
     /// a composition with no management authority at all, where the management
     /// procedures have nothing to report and say so.
     continuation: Option<Arc<novarocks_mv_application::management::ManagementContinuationService>>,
+    /// Where an operator's declaration is recorded. Absent means the
+    /// declaration commands refuse: an unrecorded declaration must not act.
+    management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
 }
 
 impl MvCommandExecutor {
@@ -70,6 +73,9 @@ impl MvCommandExecutor {
         continuation: Option<
             Arc<novarocks_mv_application::management::ManagementContinuationService>,
         >,
+        management_audit: Option<
+            Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
+        >,
     ) -> Self {
         Self {
             ports,
@@ -77,6 +83,7 @@ impl MvCommandExecutor {
             storage_observation,
             mv_backend,
             continuation,
+            management_audit,
         }
     }
 
@@ -206,6 +213,7 @@ impl MvCommandExecutor {
     ) -> Result<Option<StatementResult>, String> {
         if let Some(result) = crate::mv::domain::management_call::try_execute_management_call(
             self.continuation.as_ref(),
+            self.management_audit.as_ref(),
             statement,
         )? {
             return Ok(Some(result));

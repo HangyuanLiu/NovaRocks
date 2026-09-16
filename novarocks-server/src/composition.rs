@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use anyhow::anyhow;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -634,6 +635,8 @@ pub fn compose_frontend_role_config(
         query_blocking_queue,
     ))
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
+    let (remote_effect_policy, management_audit) = mv_management_continuation(config)?;
+    execution = execution.with_mv_management(remote_effect_policy, management_audit);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution = execution.with_mv_scheduler_config(MvSchedulerConfig::new(
@@ -1324,4 +1327,82 @@ mod tests {
                 .contains("frontend workload resources")
         );
     }
+}
+
+/// Turn this deployment's MV management claims into the domain values the
+/// frontend takes.
+///
+/// Both halves refuse rather than degrade. A guarantee whose basis does not
+/// establish a remote lifetime is a configuration error, not a weaker
+/// guarantee, and an audit path that cannot be written is a configuration
+/// error, not a reason to act unrecorded.
+fn mv_management_continuation(
+    config: &NovaRocksConfig,
+) -> anyhow::Result<(
+    novarocks_mv_application::management::RemoteEffectPolicy,
+    Option<std::sync::Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+)> {
+    let policy = novarocks_mv_application::management::RemoteEffectPolicy::try_new(
+        remote_effect_guarantee(
+            config.mv_management.catalog_commit_guarantee.as_ref(),
+            novarocks_mv_application::management::EffectScope::CATALOG_COMMIT,
+            "catalog_commit_guarantee",
+        )?,
+        remote_effect_guarantee(
+            config.mv_management.object_deletion_guarantee.as_ref(),
+            novarocks_mv_application::management::EffectScope::OBJECT_DELETION,
+            "object_deletion_guarantee",
+        )?,
+    )
+    .map_err(|error| anyhow!("InvalidMvManagementConfig: {error}"))?;
+    let audit = match config.mv_management.audit_log.as_deref() {
+        None => None,
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::path::Path::new(&config.sys_log_dir).join(path)
+            };
+            let sink = novarocks_frontend_application::FileManagementAuditSink::open(path)
+                .map_err(|error| anyhow!("InvalidMvManagementConfig: {error}"))?;
+            Some(std::sync::Arc::new(sink)
+                as std::sync::Arc<
+                    dyn novarocks_mv_application::management::ManagementAuditSink,
+                >)
+        }
+    };
+    Ok((policy, audit))
+}
+
+fn remote_effect_guarantee(
+    config: Option<&crate::app_config::RemoteEffectGuaranteeConfig>,
+    scope: novarocks_mv_application::management::EffectScope,
+    field: &str,
+) -> anyhow::Result<Option<novarocks_mv_application::management::RemoteEffectLifetimeGuarantee>> {
+    use novarocks_mv_application::management::RemoteEffectGuaranteeBasis;
+
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let basis = match config.basis.as_str() {
+        "provider-service-contract" => RemoteEffectGuaranteeBasis::ProviderServiceContract,
+        "deployment-enforced-bound" => RemoteEffectGuaranteeBasis::DeploymentEnforcedBound,
+        other => {
+            return Err(anyhow!(
+                "InvalidMvManagementConfig: [mv_management].{field}.basis `{other}` does not \
+                 establish a remote effect lifetime; only `provider-service-contract` and \
+                 `deployment-enforced-bound` do"
+            ));
+        }
+    };
+    novarocks_mv_application::management::RemoteEffectLifetimeGuarantee::try_new(
+        scope,
+        Duration::from_millis(config.lifetime_ms),
+        Duration::from_millis(config.safety_margin_ms),
+        basis,
+        &config.source,
+    )
+    .map(Some)
+    .map_err(|error| anyhow!("InvalidMvManagementConfig: [mv_management].{field}: {error}"))
 }

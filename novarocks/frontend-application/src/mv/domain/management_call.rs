@@ -29,7 +29,8 @@
 use std::sync::Arc;
 
 use novarocks_mv_application::management::{
-    ManagementContinuationService, MvManagementStatus, ReadmissionChallenge, ReadmissionMode,
+    ManagementAuditSink, ManagementContinuationService, MvManagementStatus, ReadmissionChallenge,
+    ReadmissionMode,
 };
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
@@ -130,6 +131,7 @@ impl ManagementCall {
 /// Execute one MV management procedure, or leave the CALL to its own consumer.
 pub(crate) fn try_execute_management_call(
     continuation: Option<&Arc<ManagementContinuationService>>,
+    audit: Option<&Arc<dyn ManagementAuditSink>>,
     statement: &CallStatement,
 ) -> Result<Option<StatementResult>, String> {
     let Some(call) = ManagementCall::try_decode(statement)? else {
@@ -142,16 +144,24 @@ pub(crate) fn try_execute_management_call(
         ManagementCall::Status { target } => execute_status(continuation, &target)
             .map(StatementResult::Query)
             .map(Some),
-        // A declaration is an external effect on this process's admission
-        // state, and it may not take effect before it is recorded. The audit
-        // sink and the owner handover that record it are not wired yet, so
-        // these refuse rather than acting unrecorded.
-        ManagementCall::Resume { .. } => Err(format!(
-            "{RESUME_PROCEDURE} requires the management audit sink, which is not configured"
-        )),
-        ManagementCall::SetOwner { .. } => Err(format!(
-            "{SET_OWNER_PROCEDURE} requires the management audit sink, which is not configured"
-        )),
+        // A declaration is a statement nobody can check afterwards unless it
+        // was written down, so it is refused outright where there is nowhere
+        // to write it. Where there is, the readmission it performs is still
+        // being built, and saying so names the actual gap.
+        ManagementCall::Resume { .. } => Err(declaration_unavailable(RESUME_PROCEDURE, audit)),
+        ManagementCall::SetOwner { .. } => Err(declaration_unavailable(SET_OWNER_PROCEDURE, audit)),
+    }
+}
+
+fn declaration_unavailable(
+    procedure: &str,
+    audit: Option<&Arc<dyn ManagementAuditSink>>,
+) -> String {
+    match audit {
+        None => format!(
+            "{procedure} requires a management audit sink; set [mv_management].audit_log so the              declaration can be recorded before it takes effect"
+        ),
+        Some(_) => format!("{procedure} is not implemented yet"),
     }
 }
 
@@ -386,6 +396,7 @@ mod tests {
     #[test]
     fn a_management_call_without_the_serving_authority_says_so() {
         let error = try_execute_management_call(
+            None,
             None,
             &call("CALL novarocks_mv_management_status('ice', 'db', 'mv')"),
         )

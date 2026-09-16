@@ -22,6 +22,7 @@
 //! admission decisions for the application owner.
 
 mod admission;
+mod audit;
 mod continuation;
 mod effects;
 mod observation;
@@ -32,6 +33,10 @@ pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
     ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
     MvCurrentManagementAdmission, MvManagementPhase,
+};
+pub use audit::{
+    MAX_MANAGEMENT_AUDIT_FIELD_BYTES, ManagementAuditAction, ManagementAuditOutcome,
+    ManagementAuditRecord, ManagementAuditSink,
 };
 pub use continuation::{
     ManagementContinuationService, MvManagementStatus, MvUnsettledEffectStatus, RemoteEffectPolicy,

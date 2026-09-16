@@ -425,6 +425,7 @@ pub struct MvCommandPorts {
     management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     management_continuation:
         Option<Arc<novarocks_mv_application::management::ManagementContinuationService>>,
+    management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
 }
 
 impl MvCommandPorts {
@@ -440,6 +441,9 @@ impl MvCommandPorts {
         management_continuation: Option<
             Arc<novarocks_mv_application::management::ManagementContinuationService>,
         >,
+        management_audit: Option<
+            Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
+        >,
     ) -> Self {
         Self {
             functions,
@@ -452,6 +456,7 @@ impl MvCommandPorts {
             storage_observation,
             management_entrance,
             management_continuation,
+            management_audit,
         }
     }
 }
@@ -477,6 +482,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         Arc::clone(&ports.storage_observation),
         backend,
         ports.management_continuation,
+        ports.management_audit,
     )
 }
 

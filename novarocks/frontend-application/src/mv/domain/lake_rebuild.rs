@@ -62,6 +62,10 @@ pub struct LakeRebuildContext<'a> {
     pub catalog_application: Option<&'a dyn novarocks_catalog_application::CatalogApplicationPort>,
     pub connector_control: &'a dyn ConnectorControlResolver,
     pub readiness: &'a MvReadinessPort,
+    /// Closes management on every target rediscovered from a writer this
+    /// process is not. Absent only where there is no management authority at
+    /// all, in which case nothing could reopen the target anyway.
+    pub management_entrance: Option<&'a novarocks_mv_application::management::ManagementEntrance>,
 }
 
 /// Rebuild the read-only Accelerator inventory from sealed Current D/L/P/C.
@@ -135,6 +139,7 @@ pub fn rebuild_imv_cache_from_catalogs(
 
         for discovered in targets {
             let target = canonical_target(&discovered.target);
+            let discovered_catalog = discovered.catalog.clone();
             let request = MvCurrentProjectionRequest::try_new(
                 discovered.catalog,
                 target.clone(),
@@ -148,6 +153,21 @@ pub fn rebuild_imv_cache_from_catalogs(
                 &source,
             ) {
                 Ok(_) => {
+                    if let Some(entrance) = ctx.management_entrance
+                        && let Err(error) =
+                            crate::mv::domain::management_recovery::close_recovered_target_management(
+                                entrance,
+                                discovered_catalog.clone(),
+                                &installed_projection(ctx, &target)?,
+                            )
+                    {
+                        tracing::warn!(
+                            catalog = instance_id.as_str(),
+                            mv_target = target.name(),
+                            %error,
+                            "leaving a rediscovered MV open to management because its recovery barrier could not be installed"
+                        );
+                    }
                     if let Err(error) = validate_installed_candidate(ctx, &target, &context) {
                         ctx.readiness
                             .quarantine(target.clone(), error.clone())
@@ -436,6 +456,23 @@ fn canonical_target(table: &ConnectorTableIdentity) -> MvTarget {
         &table.namespace,
         &table.table,
     )
+}
+
+/// The projection this sweep just installed, read back from the inventory it
+/// was installed into.
+fn installed_projection(
+    ctx: &LakeRebuildContext<'_>,
+    target: &MvTarget,
+) -> Result<StoredMvProjection, String> {
+    ctx.readiness
+        .candidate_reader()
+        .list_candidate_definitions()
+        .map_err(|error| format!("list MV candidates after lake rebuild failed: {error}"))?
+        .into_iter()
+        .find(|projection| projection.facts.target() == target)
+        .ok_or_else(|| {
+            "read-only MV installation did not publish its candidate inventory".to_string()
+        })
 }
 
 fn validate_installed_candidate(

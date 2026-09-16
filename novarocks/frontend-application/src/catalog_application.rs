@@ -114,7 +114,7 @@ pub trait CatalogAdmissionObserver: Send + Sync {
 pub struct CatalogRuntimeProjection {
     published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
     query_catalog: Mutex<Option<QueryCatalogBinding>>,
-    admission_observers: Mutex<Vec<Arc<dyn CatalogAdmissionObserver>>>,
+    admission_observers: Mutex<Vec<std::sync::Weak<dyn CatalogAdmissionObserver>>>,
 }
 
 impl CatalogRuntimeProjection {
@@ -133,9 +133,15 @@ impl CatalogRuntimeProjection {
     /// after the process opened. A consumer that swept once at startup would
     /// therefore sweep an empty set and never look again, so admission is
     /// delivered as it happens instead.
+    ///
+    /// The registration is weak, and that is a lifetime statement rather than
+    /// an optimisation: this publication set belongs to the host and outlives
+    /// the role graph, so an observer it owned would keep that graph -- and
+    /// every provider handle inside it -- alive past shutdown. The registrant
+    /// keeps its own reference for exactly as long as it wants to be called.
     pub fn bind_admission_observer(
         &self,
-        observer: Arc<dyn CatalogAdmissionObserver>,
+        observer: &Arc<dyn CatalogAdmissionObserver>,
     ) -> Result<(), CatalogApplicationError> {
         self.admission_observers
             .lock()
@@ -145,7 +151,7 @@ impl CatalogRuntimeProjection {
                     "catalog runtime admission observer lock is poisoned",
                 )
             })?
-            .push(observer);
+            .push(Arc::downgrade(observer));
         Ok(())
     }
 
@@ -154,10 +160,13 @@ impl CatalogRuntimeProjection {
     /// stall every other catalog in the process.
     fn notify_admitted(&self, instance_id: &ConnectorInstanceId) {
         let observers = match self.admission_observers.lock() {
-            Ok(observers) => observers.clone(),
+            Ok(mut observers) => {
+                observers.retain(|observer| observer.strong_count() > 0);
+                observers.clone()
+            }
             Err(_) => return,
         };
-        for observer in observers {
+        for observer in observers.iter().filter_map(std::sync::Weak::upgrade) {
             observer.catalog_admitted(instance_id);
         }
     }
