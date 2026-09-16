@@ -76,6 +76,10 @@ Known limits:
 
 ## Architecture
 
+Application ownership, dependency direction, logical-execution lifecycle and
+the separation between responsibility, output, and resource release are
+described in the [application domains guide](docs/guides/architecture/application-domains.md).
+
 ### Native FE/BE Roles
 
 ```text
@@ -369,7 +373,7 @@ Use targeted package tests while iterating on a native crate:
 
 ```bash
 cargo test -p novarocks
-cargo test -p novarocks-backend
+cargo test -p novarocks-native-adapter
 cargo test -p novarocks-server
 ```
 

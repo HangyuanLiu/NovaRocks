@@ -19,6 +19,7 @@ use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
+use mysql::{Row, Value};
 use novarocks_cluster_harness::{
     NativeTrustFixture, QueryExecutionResourceSnapshot, QueryLifecycleStructuredSnapshot,
     RuntimeFilterParticipantTerminalDetails, RuntimeFilterParticipantTerminalTelemetry,
@@ -33,6 +34,7 @@ use std::time::Duration;
 
 const REQUIRED_BACKENDS: usize = 3;
 const ACK_DROP_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop";
+const ACK_DROP_RENDEZVOUS_FAULT_KIND: &str = "runtime-filter-contribution-ack-drop-rendezvous";
 const RESOURCE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const NATIVE_QUERY_ACTIVE_FRAGMENTS_RESOURCE: &str = "native_query_active_fragments";
 
@@ -217,7 +219,7 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
     let before_execution_id = candidate_snapshot.execution_id.clone();
     let baseline = resource_snapshot(context)?;
     let created_baseline = be_marker_counts(context, TASK_CREATE_APPLIED_MARKER)?;
-    arm_all_backends(context, ACK_DROP_FAULT_KIND)?;
+    arm_all_backends(context, ACK_DROP_RENDEZVOUS_FAULT_KIND)?;
     context.action(
         "armed one Accepted-after-ACK-drop Runtime Filter fault for every native participant",
     );
@@ -235,7 +237,13 @@ fn run_accepted_after_ack_drop(context: &mut ScenarioContext) -> Result<()> {
             "held Runtime Filter retry query terminated before publishing its connection id",
         )?;
     context.action("started a held Runtime Filter retry query through public MySQL");
-    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
+    await_ack_drop_while_query_active(
+        context,
+        ACK_DROP_RENDEZVOUS_FAULT_KIND,
+        &baseline,
+        &created_baseline,
+        &target.done,
+    )?;
     context.action(
         "observed the Accepted ACK-drop token consumed while the Runtime Filter query remained active",
     );
@@ -324,7 +332,13 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .recv_timeout(context.remaining("receive Runtime Filter query connection id")?)
         .context("Runtime Filter query terminated before publishing its connection id")?;
     context.action("started an in-flight native Runtime Filter query through public MySQL");
-    await_ack_drop_while_query_active(context, &baseline, &created_baseline, &target.done)?;
+    await_ack_drop_while_query_active(
+        context,
+        ACK_DROP_FAULT_KIND,
+        &baseline,
+        &created_baseline,
+        &target.done,
+    )?;
     context.action(
         "observed a receiver-Accepted Runtime Filter contribution while the EES task query remained active",
     );
@@ -357,18 +371,18 @@ fn run_cancel_with_terminal_ack_replay(context: &mut ScenarioContext) -> Result<
         .map_err(|_| anyhow::anyhow!("Runtime Filter query actor panicked"))??;
     context.action("cancelled the active Runtime Filter query through public MySQL");
 
-    // Participants, not the cluster size: a query context exists only where a
-    // task was placed, and which backends receive a table's splits is the
-    // scheduler's business. What this case is about survives that -- the abort
-    // was delivered to more than one backend rather than only observed by the
-    // client.
+    // A query context exists only where the scheduler placed work. This query
+    // has completed its distributed join before its root sleep, so its active
+    // participant set is not the three-node cluster. One abort marker is the
+    // exact proof that public KILL reached the remaining live backend; asking
+    // for two would assert a placement the task graph no longer has.
     await_backends_advanced(
         context,
         TASK_CONTEXT_ABORT_APPLIED_MARKER,
         &abort_baseline,
-        2,
+        1,
     )?;
-    context.action("observed the cancellation applied as an abort on more than one backend");
+    context.action("observed the cancellation applied as an abort on a live backend");
     context
         .handle()
         .clear_query_lifecycle_faults()
@@ -563,7 +577,7 @@ fn run_ncp5_feedback_unavailable(context: &mut ScenarioContext) -> Result<()> {
 /// The publisher-authorization half of the old assertion is not lost, only
 /// moved to where it can still be provoked:
 /// `the_task_carrier_is_authorized_by_the_process_that_ran_the_producing_task`
-/// in `novarocks/frontend/src/runtime_filter/feedback.rs` drives an undeclared
+/// in `novarocks/frontend-application/src/runtime_filter/feedback.rs` drives an undeclared
 /// process straight into `admit_task_feedback` and asserts both the
 /// "publisher is not authorized" refusal and an untouched winner.
 fn run_nid2_foreign_attempt_rejection(context: &mut ScenarioContext) -> Result<()> {
@@ -770,14 +784,110 @@ fn create_ncp5_pruning_tables(
             tables.catalog, tables.database, tables.probe
         ))
         .context("analyze NCP-5 probe table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.probe,
+    )?;
     control
         .query_drop(format!(
             "ANALYZE TABLE {}.{}.{}",
             tables.catalog, tables.database, tables.build
         ))
         .context("analyze NCP-5 build table")?;
+    wait_for_statistics_job_success(
+        context,
+        control,
+        &tables.catalog,
+        &tables.database,
+        &tables.build,
+    )?;
     context.action("created three disjoint Iceberg probe ranges for NCP-5 whole-file pruning");
     Ok(tables)
+}
+
+/// `ANALYZE` acknowledges job submission, not its native collection attempt.
+///
+/// NCP-5 arms a one-shot lifecycle fault after fixture construction.  Waiting
+/// for the exact table's business conclusion keeps a background statistics
+/// attempt from consuming that arm after setup has returned.
+fn wait_for_statistics_job_success(
+    context: &mut ScenarioContext,
+    control: &mut mysql::Conn,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    loop {
+        let rows: Vec<Row> = control
+            .query("SHOW ANALYZE JOBS")
+            .context("observe submitted NCP-5 ANALYZE job")?;
+        let mut matches = Vec::new();
+        for row in rows {
+            if analyze_job_field(&row, "catalog")?.as_deref() == Some(catalog)
+                && analyze_job_field(&row, "namespace")?.as_deref() == Some(namespace)
+                && analyze_job_field(&row, "table")?.as_deref() == Some(table)
+            {
+                matches.push(row);
+            }
+        }
+        let Some(job) = matches.pop() else {
+            context.remaining("wait for submitted NCP-5 ANALYZE job to become observable")?;
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        };
+        if !matches.is_empty() {
+            bail!(
+                "multiple ANALYZE jobs matched {catalog}.{namespace}.{table}; exact job identity is ambiguous"
+            );
+        }
+        let job_id = analyze_job_field(&job, "job_id")?
+            .filter(|value| !value.is_empty())
+            .context("NCP-5 ANALYZE job observation has no job_id")?;
+        let state = analyze_job_field(&job, "state")?
+            .filter(|value| !value.is_empty())
+            .context("NCP-5 ANALYZE job observation has no state")?;
+        match state.as_str() {
+            "SUCCEEDED" => return Ok(()),
+            "SUBMITTED" | "PREPARING" | "COLLECTING" | "PUBLISHING" => {
+                context.remaining(&format!(
+                    "wait for NCP-5 ANALYZE job {job_id} to reach its business conclusion"
+                ))?;
+                thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let detail = analyze_job_field(&job, "error_message")?.unwrap_or_default();
+                bail!(
+                    "NCP-5 ANALYZE job {job_id} for {catalog}.{namespace}.{table} reached {state}: {detail}"
+                );
+            }
+        }
+    }
+}
+
+fn analyze_job_field(row: &Row, name: &str) -> Result<Option<String>> {
+    let index = row
+        .columns_ref()
+        .iter()
+        .position(|column| column.name_str().eq_ignore_ascii_case(name))
+        .with_context(|| format!("NCP-5 ANALYZE job observation omitted column {name}"))?;
+    match row
+        .as_ref(index)
+        .context("NCP-5 ANALYZE job observation value is missing")?
+    {
+        Value::NULL => Ok(None),
+        Value::Bytes(bytes) => Ok(Some(
+            String::from_utf8(bytes.clone())
+                .context("NCP-5 ANALYZE job observation is not UTF-8")?,
+        )),
+        Value::Int(value) => Ok(Some(value.to_string())),
+        Value::UInt(value) => Ok(Some(value.to_string())),
+        Value::Float(value) => Ok(Some(value.to_string())),
+        Value::Double(value) => Ok(Some(value.to_string())),
+        _ => bail!("NCP-5 ANALYZE job observation column {name} has an unsupported value type"),
+    }
 }
 
 fn create_hadoop_catalog(control: &mut mysql::Conn, catalog: &str, warehouse: &Path) -> Result<()> {
@@ -1011,6 +1121,7 @@ fn await_backends_advanced(
 
 fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     context: &mut ScenarioContext,
+    fault_kind: &str,
     baseline: &QueryExecutionResourceSnapshot,
     created_baseline: &[usize],
     done: &mpsc::Receiver<std::result::Result<Vec<T>, mysql::Error>>,
@@ -1018,10 +1129,10 @@ fn await_ack_drop_while_query_active<T: std::fmt::Debug>(
     let fault_root = context.runtime_dir().join("query-lifecycle-faults");
     let backend_count = context.handle().be_count();
     let arms = (0..backend_count)
-        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.arm")))
+        .map(|backend| fault_root.join(format!("be-{backend}.{fault_kind}.arm")))
         .collect::<Vec<_>>();
     let triggers = (0..backend_count)
-        .map(|backend| fault_root.join(format!("be-{backend}.{ACK_DROP_FAULT_KIND}.trigger")))
+        .map(|backend| fault_root.join(format!("be-{backend}.{fault_kind}.trigger")))
         .collect::<Vec<_>>();
     let mut latest = None;
     loop {

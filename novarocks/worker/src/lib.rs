@@ -29,6 +29,9 @@ mod admission_epoch;
 mod catalog_manager;
 mod catalog_manager_config;
 mod clock;
+pub mod connector_batch_transform;
+pub mod connector_variant_transform;
+pub mod connector_write_runtime;
 mod convergence;
 mod credential_slot;
 mod deadline;
@@ -41,10 +44,16 @@ mod lease;
 mod lifecycle;
 mod observation;
 mod operation;
+pub mod query_context;
+pub mod read_attempt;
 mod receipt;
 mod reliable_transport;
+pub mod result_batch;
+pub mod result_buffer;
 mod runtime_filter_error;
+pub mod sink_commit;
 mod status;
+mod task_completion;
 mod task_creation_gate;
 mod task_domain_execution;
 mod task_execution_ports;
@@ -54,6 +63,10 @@ mod task_registry_config;
 mod task_registry_entry;
 #[cfg(test)]
 mod task_registry_tests;
+pub mod typed_connector_runtime;
+pub mod typed_page_source;
+pub mod typed_scan_filter;
+mod typed_scan_runtime;
 
 /// Worker-owned runtime-filter artifacts and local resource contracts.
 pub mod runtime_filter {
@@ -128,6 +141,7 @@ pub use status::{
     METRIC_PUBLISH_MIN_INTERVAL, RootResultBinding, RootResultRoute, StatusAdvance,
     TaskMetricsSink, TaskStatusOwner, TaskStatusReporter,
 };
+pub use task_completion::{TaskCompletionAction, TaskCompletionSignal, TaskCompletionSupervisor};
 pub use task_creation_gate::{NoopTaskCreationGate, TaskCreationGate};
 pub use task_domain_execution::{
     DomainExecutionRejection, apply_planned_task_domain_updates, apply_task_domain_updates,
@@ -140,6 +154,10 @@ pub use task_execution_ports::{
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
 pub use task_registry::{DeadlineSweep, RegistryCounters, TaskExecutionRegistry};
 pub use task_registry_config::TaskExecutionRegistryConfig;
+pub use typed_scan_runtime::{
+    CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
+    TypedConnectorReadDescriptor, TypedScanRuntime,
+};
 
 /// Positive, ordered joint retained-result limits owned by one worker process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

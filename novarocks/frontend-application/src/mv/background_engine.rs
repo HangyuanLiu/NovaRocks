@@ -1,0 +1,318 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Frontend adapter bound to the MV background runtime.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
+use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
+use crate::mv::domain::lifecycle::{RefreshError, RefreshErrorKind};
+use crate::mv::domain::refresh::{
+    definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
+};
+use crate::query_execution::mv_assembly::refresh_handoff::{
+    MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
+};
+use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
+use novarocks_mv_application::product::MvRefreshAttemptIdentity;
+use novarocks_spi::connector::{
+    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+};
+use novarocks_sql::planning::mv::MvRefreshStatement;
+use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
+use novarocks_table_maintenance::MaintenanceTarget;
+
+use super::background::{MvBackgroundEngine, MvRefreshStep};
+use novarocks_mv_application::maintenance::{
+    MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
+};
+
+struct BackgroundConnectorCancellation {
+    signal: Arc<AtomicBool>,
+}
+
+impl ConnectorCancellation for BackgroundConnectorCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.signal.load(Ordering::SeqCst)
+    }
+}
+
+fn background_connector_request_context() -> Result<ConnectorRequestContext, String> {
+    ConnectorRequestContext::try_new(
+        Instant::now() + Duration::from_secs(300),
+        Arc::new(BackgroundConnectorCancellation {
+            signal: Arc::new(AtomicBool::new(false)),
+        }),
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone)]
+/// FE-role adapter that binds MV background product callbacks to the native
+/// query and connector capabilities of this process.
+pub(crate) struct FrontendMvBackgroundEngine {
+    ports: IcebergMvCorePorts,
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+    storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
+}
+
+impl FrontendMvBackgroundEngine {
+    pub(crate) fn new_with_ports(
+        ports: IcebergMvCorePorts,
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
+        storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
+    ) -> Self {
+        Self {
+            ports,
+            connector_control,
+            readiness,
+            storage_observation,
+        }
+    }
+
+    fn definition_for_target(
+        &self,
+        target: &MvTarget,
+    ) -> Result<
+        novarocks_mv_application::persistence::definition::StoredMvDefinition,
+        MvBackgroundEngineError,
+    > {
+        let projection = self
+            .readiness
+            .load_ready(target)
+            .map_err(repository_error)?
+            .ok_or_else(|| {
+                MvBackgroundEngineError::new(
+                    MvBackgroundEngineErrorKind::TargetGone,
+                    format!("MV target {} no longer exists", target.display_name()),
+                )
+            })?;
+        let definition = projection.definition;
+        if definition.storage_engine != "iceberg" {
+            return Err(MvBackgroundEngineError::new(
+                MvBackgroundEngineErrorKind::InvalidDefinition,
+                format!("MV {} is not Iceberg-backed", definition.mv_id),
+            ));
+        }
+        Ok(definition)
+    }
+}
+
+impl MvBackgroundEngine for FrontendMvBackgroundEngine {
+    fn resolve_refresh_steps(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Vec<MvRefreshStep>, MvBackgroundEngineError> {
+        let requested = iceberg_mv_dependency_ref(
+            target.catalog.as_deref().unwrap_or("default_catalog"),
+            &target.database,
+            &target.name,
+        );
+        let steps =
+            build_upstream_refresh_steps_with_readiness(self.readiness.as_ref(), &requested)
+                .map_err(|error| {
+                    MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::InvalidDefinition,
+                        error,
+                    )
+                })?;
+        steps
+            .into_iter()
+            .map(|step| {
+                if !step.is_iceberg() {
+                    return Err(MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::InvalidDefinition,
+                        format!(
+                            "MV refresh step {} is not Iceberg-backed",
+                            step.display_name()
+                        ),
+                    ));
+                }
+                let mv_id = self.definition_for_target(step.target())?.mv_id;
+                Ok(MvRefreshStep {
+                    mv_id,
+                    target: step.into_target(),
+                })
+            })
+            .collect()
+    }
+
+    fn prepare_refresh_step(
+        &self,
+        step: &MvRefreshStep,
+        attempt: MvRefreshAttemptIdentity,
+        connector_context: &ConnectorRequestContext,
+    ) -> Result<PreparedMvRefresh, MvBackgroundEngineError> {
+        let statement = MvRefreshStatement {
+            name_parts: vec![step.target.name.clone()],
+            full: false,
+        };
+        let request = crate::mv::domain::application::MvRefreshRequest {
+            name_parts: vec![step.target.name.clone()],
+            full: false,
+        };
+        let service = crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(
+            &self.ports,
+            step.target.catalog.as_deref(),
+            &step.target.database,
+            &request,
+            connector_context,
+        );
+        service
+            .prepare_step(MvRefreshPreparationRequest {
+                statement,
+                target: step.target.clone(),
+                attempt,
+            })
+            .map_err(preparation_error)
+    }
+
+    fn current_base_snapshots(
+        &self,
+        target: &MvTarget,
+    ) -> Result<BTreeMap<String, Option<i64>>, MvBackgroundEngineError> {
+        let definition = self.definition_for_target(target)?;
+        let refs = parse_iceberg_table_refs(&definition.base_table_refs).map_err(|error| {
+            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
+        })?;
+        let connector_context = background_connector_request_context().map_err(|error| {
+            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
+        })?;
+        refs.into_iter()
+            .map(|table_ref| {
+                let snapshot = observe_current_refresh_base(
+                    self.connector_control.as_ref(),
+                    self.storage_observation.as_ref(),
+                    &table_ref,
+                    &connector_context,
+                )
+                .map_err(|error| {
+                    MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::TransientUnavailable,
+                        error,
+                    )
+                })?
+                .current_snapshot_id();
+                Ok((table_ref.fqn(), snapshot))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+    }
+
+    fn maintenance_facts(
+        &self,
+        target: &MaintenanceTarget,
+    ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError> {
+        let definitions = self
+            .readiness
+            .list_ready_projections()
+            .map_err(repository_error)?
+            .into_iter()
+            .map(|projection| projection.definition)
+            .collect::<Vec<_>>();
+        let stats = crate::mv::domain::maintenance::stats::collect_table_stats_with_ports(
+            self.connector_control.as_ref(),
+            self.storage_observation.as_ref(),
+            &target.catalog,
+            &target.namespace,
+            &target.table,
+            &definitions,
+        )
+        .map_err(|error| {
+            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
+        })?;
+        Ok(MvMaintenanceFacts {
+            current_snapshot_id: stats.current_snapshot_id,
+            total_data_files: stats.total_data_files.map(|value| value as i64),
+            max_compactable_data_files: stats.max_compactable_data_files.map(|value| value as i64),
+            total_delete_files: stats.total_delete_files.map(|value| value as i64),
+            total_files_size_bytes: stats.total_files_size_bytes.map(|value| value as i64),
+            oldest_snapshot_timestamp_ms: stats
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.timestamp_ms)
+                .min(),
+            snapshot_count: stats.snapshots.len(),
+            non_default_reference_count: stats.non_default_reference_count,
+            downstream_floor_ts_ms: stats.downstream_floor_ts_ms,
+            downstream_floor_unknown: stats.downstream_floor_unknown,
+            maintenance_enabled: stats.maintenance_enabled,
+            expire_max_snapshot_age_ms: stats.expire_max_snapshot_age_ms,
+            expire_min_snapshots_to_keep: stats.expire_min_snapshots_to_keep,
+            target_file_size_bytes: stats.target_file_size_bytes,
+        })
+    }
+}
+
+fn preparation_error(error: RefreshError) -> MvBackgroundEngineError {
+    let kind = match error.kind {
+        RefreshErrorKind::PreCommitFailed => MvBackgroundEngineErrorKind::TransientUnavailable,
+        RefreshErrorKind::UserError => MvBackgroundEngineErrorKind::InvalidDefinition,
+        RefreshErrorKind::CommitFailedKnownUncommitted
+        | RefreshErrorKind::CommitFailedKnownCommitted
+        | RefreshErrorKind::CommitUnknown
+        | RefreshErrorKind::MetadataFinalizeFailed => MvBackgroundEngineErrorKind::TerminalFailure,
+    };
+    MvBackgroundEngineError::new(kind, error.message)
+}
+
+fn repository_error(
+    error: novarocks_mv_application::repository::MvRepositoryError,
+) -> MvBackgroundEngineError {
+    use novarocks_mv_application::repository::MvRepositoryErrorKind;
+
+    let kind = match error.kind() {
+        MvRepositoryErrorKind::NotFound => MvBackgroundEngineErrorKind::TargetGone,
+        MvRepositoryErrorKind::Unavailable => MvBackgroundEngineErrorKind::TransientUnavailable,
+        MvRepositoryErrorKind::Corruption => MvBackgroundEngineErrorKind::Corruption,
+        MvRepositoryErrorKind::CommitUnknown => MvBackgroundEngineErrorKind::TerminalFailure,
+        MvRepositoryErrorKind::InvalidRequest | MvRepositoryErrorKind::Conflict => {
+            MvBackgroundEngineErrorKind::InvariantViolation
+        }
+    };
+    MvBackgroundEngineError::new(kind, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preparation_error;
+    use crate::mv::domain::lifecycle::RefreshError;
+    use novarocks_mv_application::maintenance::MvBackgroundEngineErrorKind;
+
+    #[test]
+    fn retryable_preparation_error_preserves_its_typed_disposition() {
+        let error = preparation_error(RefreshError::pre_commit("connector is starting"));
+        assert_eq!(
+            error.kind(),
+            MvBackgroundEngineErrorKind::TransientUnavailable
+        );
+    }
+
+    #[test]
+    fn definition_preparation_error_remains_blocked() {
+        let error = preparation_error(RefreshError::user("stored MV contract is incompatible"));
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::InvalidDefinition);
+    }
+}

@@ -23,7 +23,6 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
-use novarocks_backend::application::BackendServerConfig;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
@@ -34,13 +33,10 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
-use novarocks_frontend::{
-    application::{
-        FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
-        FrontendQueryControlTimeouts,
-    },
-    server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
-    topology::ClusterBackendOpenConfig,
+use novarocks_frontend_application::{
+    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
+    FrontendServingConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -49,6 +45,7 @@ use novarocks_fs::{
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_native_adapter::backend_application::BackendServerConfig;
 use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
@@ -524,8 +521,6 @@ pub fn compose_frontend_role_config(
         abort_capacity,
     );
     let mut execution = FrontendExecutionConfig::new(
-        native_trust.advertised_endpoint().host().to_string(),
-        native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,

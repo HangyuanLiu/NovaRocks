@@ -41,8 +41,8 @@ write_fixture() {
   write_package "$root" "novarocks/functions" "novarocks-functions"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
-  write_package "$root" "novarocks/frontend" "novarocks-frontend"
-  write_package "$root" "novarocks/backend" "novarocks-backend"
+  write_package "$root" "novarocks/frontend-application" "novarocks-frontend-application"
+  write_package "$root" "novarocks/native-adapter" "novarocks-native-adapter"
   write_package "$root" "novarocks/proto-models" "novarocks-proto-models"
   write_package "$root" "novarocks-server" "novarocks-server"
   write_package "$root" "datasketches" "datasketches"
@@ -56,8 +56,8 @@ members = [
   "novarocks/functions",
   "novarocks/connector/iceberg-functions",
   "novarocks/connector/iceberg",
-  "novarocks/frontend",
-  "novarocks/backend",
+  "novarocks/frontend-application",
+  "novarocks/native-adapter",
   "novarocks/proto-models",
   "novarocks-server",
   "datasketches",
@@ -85,12 +85,12 @@ EOF
 [dependencies]
 novarocks-connector-iceberg-functions = { path = "../iceberg-functions" }
 EOF
-  cat >>"$root/novarocks/frontend/Cargo.toml" <<'EOF'
+  cat >>"$root/novarocks/frontend-application/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-execution = { path = "../execution" }
 EOF
-  cat >>"$root/novarocks/backend/Cargo.toml" <<'EOF'
+  cat >>"$root/novarocks/native-adapter/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-execution = { path = "../execution" }
@@ -164,8 +164,8 @@ assert_rejected "$sink_name" "DataSink must reserve field name statistics"
 role="$fixture_root/role"
 cp -R "$valid" "$role"
 printf 'datasketches = { workspace = true, features = ["hll"] }\n' \
-  >>"$role/novarocks/frontend/Cargo.toml"
-assert_rejected "$role" "novarocks-frontend must not directly depend on datasketches"
+  >>"$role/novarocks/frontend-application/Cargo.toml"
+assert_rejected "$role" "novarocks-frontend-application must not directly depend on datasketches"
 
 provider_sketch="$fixture_root/provider-sketch"
 cp -R "$valid" "$provider_sketch"
