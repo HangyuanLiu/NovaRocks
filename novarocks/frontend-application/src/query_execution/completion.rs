@@ -300,7 +300,7 @@ pub struct PreparedLogicalRead {
 }
 
 impl PreparedLogicalRead {
-    pub(super) fn new(
+    pub(crate) fn new(
         description: novarocks_query_application::preparation::FrozenExecutionDescription,
         attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
         options: Arc<crate::query_execution::contract::ResolvedQueryOptions>,
