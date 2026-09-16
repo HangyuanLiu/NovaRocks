@@ -196,16 +196,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 lambda.span,
             )),
 
-            // Unary NOT
+            // Unary NOT. `NOT NULL` is NULL, so the result admits null
+            // exactly when its operand does.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
+                let nullable = inner_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Not,
                         expr: Box::new(inner_typed),
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -368,6 +370,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         ));
                     }
                 }
+                // A comparison against NULL is NULL, so the result admits
+                // null whenever any operand does. A filter treating null as
+                // not-matching is the filter's own semantics, not this type's.
+                let nullable = expr_typed.nullable || low_typed.nullable || high_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -376,7 +382,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: between.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -384,6 +390,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Like(like) => {
                 let expr_typed = self.analyze_expr(&like.expr, scope)?;
                 let pattern_typed = self.analyze_expr(&like.pattern, scope)?;
+                let nullable = expr_typed.nullable || pattern_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Like {
                         expr: Box::new(expr_typed),
@@ -391,7 +398,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: like.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
