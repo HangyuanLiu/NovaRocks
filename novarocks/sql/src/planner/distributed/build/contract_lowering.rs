@@ -4398,14 +4398,19 @@ impl ContractLoweringVisitor {
             } else {
                 binding.intermediate_type.clone()
             };
-            if value_type(column) != expected_output_type {
+            // The column may admit null this phase's output never produces
+            // -- a count standing where the statement types a nullable
+            // integer is sound. It may not claim the reverse, and the type
+            // itself must be the one this phase produces.
+            let layout = value_type(column);
+            if layout.data_type != expected_output_type.data_type
+                || (expected_output_type.nullable && !layout.nullable)
+            {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "HashAggregate",
                     ordinal: call_ordinal + aggregate.group_by.len(),
                     detail: format!(
-                        "phase output type {:?} differs from layout {:?}",
-                        expected_output_type,
-                        value_type(column)
+                        "phase output type {expected_output_type:?} differs from layout {layout:?}"
                     ),
                 });
             }
