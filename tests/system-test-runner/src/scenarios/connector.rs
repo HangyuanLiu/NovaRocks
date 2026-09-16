@@ -3602,12 +3602,63 @@ fn wait_for_backend_logs(
     operation: &str,
     predicate: impl Fn(&[String]) -> bool,
 ) -> Result<Vec<String>> {
+    wait_for_backend_logs_while(context, operation, None, |logs| Ok(predicate(logs)))
+}
+
+/// The read a barrier is waiting on, so the wait cannot outlive it.
+///
+/// A barrier reads Backend logs; it cannot see that the query producing those
+/// entries has already died. Without this, a wait whose read failed keeps
+/// polling until the scenario budget is gone and then reports its own
+/// timeout, naming the observation that never arrived instead of the failure
+/// that prevented it -- and the real error, which only the client connection
+/// saw, is lost.
+struct AwaitedRead<'a> {
+    read: &'a ConnectorRead,
+    subject: &'a str,
+}
+
+impl AwaitedRead<'_> {
+    fn new<'a>(read: &'a ConnectorRead, subject: &'a str) -> AwaitedRead<'a> {
+        AwaitedRead { read, subject }
+    }
+
+    /// `Ok(())` while the read is still running.
+    ///
+    /// Taking the result is safe precisely because it ends the wait: nothing
+    /// downstream of a failed barrier gets to consume it again.
+    fn still_running(&self) -> Result<()> {
+        match self.read.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("{} ended without reporting a result", self.subject)
+            }
+            Ok(result) => bail!("{} ended first: {result:?}", self.subject),
+        }
+    }
+}
+
+/// Waits for a Backend-log observation, bounded by the scenario deadline and
+/// by the liveness of the read that is supposed to produce it.
+fn wait_for_backend_logs_while(
+    context: &mut ScenarioContext,
+    operation: &str,
+    awaited: Option<AwaitedRead<'_>>,
+    predicate: impl Fn(&[String]) -> Result<bool>,
+) -> Result<Vec<String>> {
     loop {
+        // Before the logs: a read that is already over will never add the
+        // entry this is waiting for, so its own failure is the answer.
+        if let Some(awaited) = awaited.as_ref() {
+            awaited
+                .still_running()
+                .with_context(|| format!("waiting to {operation}"))?;
+        }
         let logs = (0..context.handle().be_count())
             .map(|index| context.handle().be_current_log_contents(index))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("read BE logs while waiting to {operation}"))?;
-        if predicate(&logs) {
+        if predicate(&logs)? {
             return Ok(logs);
         }
         let remaining = context.remaining(operation)?;
@@ -4173,6 +4224,80 @@ mod tests {
             "{CONNECTOR_READER_CLOSE} provider=iceberg instance={catalog} \
              catalog_version={version} scheduled_split_sequence_id={sequence}\n"
         )
+    }
+
+    /// Every channel a `ConnectorRead` owns, so a test can hold the sending
+    /// ends and decide when the read is over.
+    struct ReadHarness {
+        read: ConnectorRead,
+        done_tx: mpsc::SyncSender<std::result::Result<Vec<i64>, mysql::Error>>,
+        _ready_tx: mpsc::SyncSender<u32>,
+        _probe_rx: mpsc::Receiver<()>,
+        _probe_result_tx: mpsc::SyncSender<std::result::Result<Option<i64>, mysql::Error>>,
+        _release_rx: mpsc::Receiver<()>,
+    }
+
+    fn read_harness() -> ReadHarness {
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let (probe, probe_rx) = mpsc::sync_channel(1);
+        let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::channel();
+        ReadHarness {
+            read: ConnectorRead {
+                ready,
+                done,
+                probe,
+                probe_result,
+                release,
+                thread: thread::spawn(|| Ok(())),
+            },
+            done_tx,
+            _ready_tx: ready_tx,
+            _probe_rx: probe_rx,
+            _probe_result_tx: probe_result_tx,
+            _release_rx: release_rx,
+        }
+    }
+
+    #[test]
+    fn a_running_read_lets_the_barrier_keep_waiting() {
+        let harness = read_harness();
+        AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect("a read that has not finished does not end the wait");
+    }
+
+    #[test]
+    fn a_read_that_already_ended_stops_the_wait_and_names_its_result() {
+        let harness = read_harness();
+        harness.done_tx.send(Ok(vec![7])).expect("publish result");
+        let error = AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect_err("a finished read must end the wait");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("the probe read ended first"),
+            "{rendered}"
+        );
+        assert!(rendered.contains('7'), "{rendered}");
+    }
+
+    #[test]
+    fn a_read_whose_thread_vanished_stops_the_wait_too() {
+        let mut harness = read_harness();
+        // Dropping the last sender is how a reader thread that died without
+        // publishing anything becomes observable.
+        let (dead_tx, dead_rx) = mpsc::sync_channel(1);
+        drop(dead_tx);
+        harness.read.done = dead_rx;
+        let error = AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect_err("a vanished read must end the wait");
+        assert!(
+            format!("{error:#}").contains("ended without reporting a result"),
+            "{error:#}"
+        );
     }
 
     #[test]
