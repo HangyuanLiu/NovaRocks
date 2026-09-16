@@ -31,9 +31,9 @@ use arrow::datatypes::DataType;
 #[cfg(test)]
 use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_physical_plan::{
-    AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregatePhase,
-    AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction, BoundTableFunction,
-    BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
+    AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregateGrouping,
+    AggregatePhase, AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction,
+    BoundTableFunction, BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
     ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
     EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
     ExprKind as ContractExprKind, Fragment, FragmentBuilder, FragmentId, FragmentSink,
@@ -4493,7 +4493,7 @@ impl ContractLoweringVisitor {
             });
         }
 
-        let completes_groups = phases_complete_groups(&calls);
+        let completes_groups = phases_complete_groups(aggregate.mode, &calls);
         let required_distribution = if completes_groups {
             if group_by.is_empty() {
                 if child.properties.distribution != Distribution::Singleton {
@@ -4539,6 +4539,11 @@ impl ContractLoweringVisitor {
             NodeKind::Aggregate {
                 group_by: group_by.into_boxed_slice(),
                 calls: calls.into_boxed_slice(),
+                grouping: if completes_groups {
+                    AggregateGrouping::Complete
+                } else {
+                    AggregateGrouping::Partial
+                },
             },
         )?;
         let properties = self
@@ -7723,14 +7728,21 @@ fn lower_aggregate_binding(
     })
 }
 
-fn phases_complete_groups(calls: &[ContractAggregateCall]) -> bool {
-    calls.is_empty()
-        || calls.iter().any(|call| {
-            matches!(
-                call.binding.phase,
-                AggregatePhase::Single | AggregatePhase::Final { .. }
-            )
-        })
+/// Whether this aggregate's groups are complete when it is done with them.
+///
+/// A phase says so, and a `SELECT DISTINCT`-shaped aggregate has no call to
+/// read a phase from -- so an aggregate that carries none answers from the
+/// mode it was planned in, where a partial phase completes nothing.
+fn phases_complete_groups(mode: AggMode, calls: &[ContractAggregateCall]) -> bool {
+    if calls.is_empty() {
+        return matches!(mode, AggMode::Single | AggMode::Global);
+    }
+    calls.iter().any(|call| {
+        matches!(
+            call.binding.phase,
+            AggregatePhase::Single | AggregatePhase::Final { .. }
+        )
+    })
 }
 
 fn distribution_colocates(distribution: &Distribution, keys: &[ValueId]) -> bool {

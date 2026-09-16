@@ -388,7 +388,9 @@ pub(crate) fn validate_node_output_closure(
         NodeKind::Project { expressions } => {
             Some(expressions.iter().map(|(_, value)| *value).collect())
         }
-        NodeKind::Aggregate { group_by, calls } => Some(
+        NodeKind::Aggregate {
+            group_by, calls, ..
+        } => Some(
             group_by
                 .iter()
                 .map(|(_, value)| *value)
@@ -809,7 +811,30 @@ pub(crate) fn validate_node_semantics(
                 }
             }
         }
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by,
+            calls,
+            grouping,
+        } => {
+            // The node's statement and its calls' phases are the same fact
+            // written twice, so they must agree; only an aggregate with no
+            // call at all is stating something the calls cannot.
+            let stated_by_calls = calls
+                .iter()
+                .any(|call| {
+                    matches!(
+                        call.binding.phase,
+                        crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
+                    )
+                })
+                .then_some(crate::AggregateGrouping::Complete)
+                .unwrap_or(crate::AggregateGrouping::Partial);
+            if !calls.is_empty() && *grouping != stated_by_calls {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate grouping differs from the phase its calls carry",
+                ));
+            }
             for (expression_id, output) in group_by {
                 match (
                     fragment.expressions().get(*expression_id),

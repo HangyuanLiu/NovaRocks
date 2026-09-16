@@ -589,6 +589,15 @@ pub enum SortMode {
     },
 }
 
+/// Whether an aggregate's groups are complete when it emits them.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateGrouping {
+    /// Some later pass still combines these groups.
+    Partial,
+    /// Each group is emitted once, finished.
+    Complete,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopNPhase {
     Single,
@@ -679,6 +688,16 @@ pub enum NodeKind {
     Aggregate {
         group_by: Box<[(ExprId, ValueId)]>,
         calls: Box<[AggregateCall]>,
+        /// Whether the groups this node emits are finished with.
+        ///
+        /// Every call already states its own phase and they agree, so this
+        /// repeats what they say -- except for an aggregate that has no call
+        /// at all. A `DISTINCT` is exactly that, and a local pass that only
+        /// drops duplicates ahead of a shuffle is as legitimate as the pass
+        /// that finishes the groups; without this the two are
+        /// indistinguishable and the local pass is asked to prove a
+        /// co-location it does not need.
+        grouping: AggregateGrouping,
     },
     HashJoin {
         kind: JoinKind,
@@ -782,7 +801,9 @@ impl NodeKind {
             Self::Project { expressions } => {
                 output.extend(expressions.iter().map(|(expr, _)| *expr));
             }
-            Self::Aggregate { group_by, calls } => {
+            Self::Aggregate {
+                group_by, calls, ..
+            } => {
                 output.extend(group_by.iter().map(|(expression, _)| *expression));
                 for call in calls {
                     output.extend(call.arguments.iter().copied());

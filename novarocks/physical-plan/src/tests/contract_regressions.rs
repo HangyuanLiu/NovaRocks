@@ -764,6 +764,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
             kind: NodeKind::Aggregate {
                 group_by: Box::from([(group_key, scan_value)]),
                 calls: Box::default(),
+                grouping: crate::AggregateGrouping::Complete,
             },
         })
         .unwrap();
@@ -1250,6 +1251,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
             kind: NodeKind::Aggregate {
                 group_by: Box::from([(group_key, aggregate_value)]),
                 calls: Box::default(),
+                grouping: crate::AggregateGrouping::Complete,
             },
         })
         .unwrap();

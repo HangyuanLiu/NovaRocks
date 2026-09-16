@@ -781,7 +781,9 @@ fn add_node_usage(
             add_relation_usage(relation, &format!("{path}.relation"), usage, errors);
         }
         NodeKind::Project { expressions } => usage.add_items(expressions.len()),
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by, calls, ..
+        } => {
             usage.add_item_counts([group_by.len(), calls.len()]);
             for (index, call) in calls.iter().enumerate() {
                 if usage.exhausted() {

@@ -20,8 +20,8 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
-    AggregatePhase, Distribution, ExprId, Fragment, FragmentCuts, NodeKind, PhysicalNode,
-    PhysicalPlan, RowMultiplicity, ValueId,
+    Distribution, ExprId, Fragment, FragmentCuts, NodeKind, PhysicalNode, PhysicalPlan,
+    RowMultiplicity, ValueId,
 };
 
 pub(crate) fn validate_fragment_partition_identities(
@@ -799,7 +799,9 @@ pub(crate) fn validate_node_output_properties(
             }
             return;
         }
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by, grouping, ..
+        } => {
             let input = node
                 .inputs
                 .first()
@@ -820,14 +822,7 @@ pub(crate) fn validate_node_output_properties(
                     | Distribution::BucketShuffle { .. } => Distribution::Unconstrained,
                 })
                 .unwrap_or(Distribution::Unconstrained);
-            let consumes_complete_groups = calls.is_empty()
-                || calls.iter().any(|call| {
-                    matches!(
-                        call.binding.phase,
-                        AggregatePhase::Single | AggregatePhase::Final { .. }
-                    )
-                });
-            if consumes_complete_groups {
+            if *grouping == crate::AggregateGrouping::Complete {
                 let required = node.required_inputs.first();
                 let grouping_values = group_by
                     .iter()

@@ -941,7 +941,9 @@ fn charge_node_expressions(
                 charge(*expression)?;
             }
         }
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by, calls, ..
+        } => {
             for (expression, _) in group_by {
                 charge(*expression)?;
             }
@@ -2624,26 +2626,36 @@ fn encode_node_payload(
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         }),
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by,
+            calls,
+            grouping,
+        } => {
             let phase = calls.first().map(|call| call.binding.phase);
             if calls.iter().any(|call| Some(call.binding.phase) != phase) {
                 return unsupported(fragment, node, "mixed-phase Aggregate");
             }
-            let mode = match phase.unwrap_or(AggregatePhase::Single) {
-                AggregatePhase::Single => plan::AggMode::Single,
-                AggregatePhase::Partial { .. } => plan::AggMode::Local,
-                AggregatePhase::Final { .. } => plan::AggMode::Global,
-                AggregatePhase::Intermediate { .. } => {
+            // An aggregate with no call -- a DISTINCT -- reads its mode from
+            // the node's own statement, which is the only place it is written.
+            let mode = match phase {
+                Some(AggregatePhase::Single) => plan::AggMode::Single,
+                Some(AggregatePhase::Partial { .. }) => plan::AggMode::Local,
+                Some(AggregatePhase::Final { .. }) => plan::AggMode::Global,
+                Some(AggregatePhase::Intermediate { .. }) => {
                     return unsupported(fragment, node, "intermediate Aggregate");
                 }
+                None => match grouping {
+                    novarocks_physical_plan::AggregateGrouping::Complete => plan::AggMode::Single,
+                    novarocks_physical_plan::AggregateGrouping::Partial => plan::AggMode::Local,
+                },
             };
             let group_key_columns = group_by
                 .iter()
-                .map(|(_, value)| output_column_for_value(fragment, layout, node, *value))
+                .map(|(_, value)| output_column_for_value(fragment, layout, node, *value, names))
                 .collect::<Result<Vec<_>, String>>()?;
             let aggregate_columns = calls
                 .iter()
-                .map(|call| output_column_for_value(fragment, layout, node, call.output))
+                .map(|call| output_column_for_value(fragment, layout, node, call.output, names))
                 .collect::<Result<Vec<_>, String>>()?;
             Kind::HashAggregate(plan::HashAggregateNode {
                 mode: mode as i32,
@@ -3830,10 +3842,13 @@ fn output_column_for_value(
     layout: &WireLayout,
     node: &PhysicalNode,
     value: ValueId,
+    names: &OutputValueNames<'_>,
 ) -> Result<common::OutputColumn, String> {
+    // An aggregate can be the last thing a statement does, in which case its
+    // own layout is where the client's column names come from.
     output_column(
         output_slot_for_value(layout, node, value)?,
-        value_name_ref(value),
+        &names.output_name(fragment.id(), value),
         &fragment.values()[&value].ty,
         false,
     )
@@ -5990,6 +6005,7 @@ mod tests {
                 kind: NodeKind::Aggregate {
                     group_by: Box::from([(group_key, right_value)]),
                     calls: Box::default(),
+                    grouping: novarocks_physical_plan::AggregateGrouping::Complete,
                 },
             })
             .unwrap();

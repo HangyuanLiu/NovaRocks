@@ -206,7 +206,9 @@ pub(crate) fn trace_aggregate_sequence_inputs(
             return false;
         };
         match &node.kind {
-            NodeKind::Aggregate { group_by, calls } => {
+            NodeKind::Aggregate {
+                group_by, calls, ..
+            } => {
                 let Some(call) = trace_indexes.aggregate_sequence_call(
                     fragment.id(),
                     node.id,

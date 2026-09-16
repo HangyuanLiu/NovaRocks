@@ -2863,7 +2863,7 @@ fn render_node_contract(
                     context.value_name(fragment_id, *output)
                 ))
         )),
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate { group_by, calls, .. } => {
             lines.push(format_args!(
                 "{pad}  group-by=[{}]",
                 joined(group_by, ", ", |(expression, output): &(ExprId, ValueId), formatter: &mut fmt::Formatter<'_>| write!(

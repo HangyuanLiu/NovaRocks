@@ -266,6 +266,14 @@ fn add_aggregate(
                     order_by: Box::default(),
                     output,
                 }]),
+                grouping: match phase {
+                    AggregatePhase::Single | AggregatePhase::Final { .. } => {
+                        AggregateGrouping::Complete
+                    }
+                    AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
+                        AggregateGrouping::Partial
+                    }
+                },
             },
         })
         .unwrap();
@@ -526,6 +534,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
             kind: NodeKind::Aggregate {
                 group_by: Box::default(),
                 calls: calls.into_boxed_slice(),
+                grouping: AggregateGrouping::Complete,
             },
         })
         .unwrap();
