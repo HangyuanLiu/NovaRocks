@@ -688,30 +688,30 @@ fn validate_create_target(
             "interpretation target does not match the provider-prepared target".to_string(),
         ));
     }
-    // A document-managed CREATE emits each distinct physical column at the
-    // ordinal of its first binding in L's canonical logical-identity order.
-    // Multiple typed logical identities may intentionally share that column.
-    // Preserve both the ordinal and provider field identity instead of
-    // degrading this comparison to unordered set equality.
-    let mut target_fields = interpretation.target.fields.iter().collect::<Vec<_>>();
-    target_fields.sort_by(|left, right| left.logical_identity.cmp(&right.logical_identity));
-    let mut physical_fields = Vec::with_capacity(target_fields.len());
-    let mut seen_physical_fields = BTreeSet::new();
-    for field in target_fields {
-        if seen_physical_fields.insert(field.target_field_id.as_bytes()) {
-            physical_fields.push(field.target_field_id.as_bytes());
-        }
-    }
-    if physical_fields.len() != target.fields().len()
-        || physical_fields.iter().zip(target.fields()).enumerate().any(
-            |(ordinal, (field_id, prepared))| {
-                prepared.request_ordinal() as usize != ordinal
-                    || *field_id != prepared.provider_field_id().as_ref()
-            },
-        )
-    {
+    // Every prepared column must be bound, and every binding must name a
+    // prepared column.
+    //
+    // This compares what is bound, not where it sits. The target's column
+    // order is the one the statement asked for, while L orders its bindings by
+    // logical identity and lets several typed identities share one physical
+    // column; the two orders have no reason to coincide, and requiring it made
+    // any view of more than a couple of columns unconstructible. The prepared
+    // list's own shape -- dense ordinals, distinct field identities -- is
+    // guaranteed by the type that carries it.
+    let prepared_fields = target
+        .fields()
+        .iter()
+        .map(|prepared| prepared.provider_field_id().as_ref())
+        .collect::<BTreeSet<_>>();
+    let bound_fields = interpretation
+        .target
+        .fields
+        .iter()
+        .map(|field| field.target_field_id.as_bytes())
+        .collect::<BTreeSet<_>>();
+    if prepared_fields != bound_fields {
         return Err(MvDocumentError::Contract(
-            "interpretation target fields do not match the provider-prepared ordinal bindings"
+            "interpretation target bindings and the provider-prepared columns are not the same set"
                 .to_string(),
         ));
     }
@@ -1539,8 +1539,12 @@ mod tests {
     }
 
     #[test]
-    fn create_rejects_mismatched_prepared_ordinal_or_field_identity() {
+    fn create_accepts_the_providers_own_column_order() {
         let (definition, interpretation, configuration, target) = fixture();
+        // Which physical column sits at which ordinal is the provider's fact
+        // about the table it staged, and L binds by field identity rather than
+        // position. Demanding that the two orders coincide is what used to
+        // make any view of more than a couple of columns unconstructible.
         let swapped_ordinals = prepared_target_with_fields(
             &target,
             vec![
@@ -1549,15 +1553,19 @@ mod tests {
             ],
         )
         .unwrap();
-        assert!(
-            create_document_set(
-                &definition,
-                &interpretation,
-                &configuration,
-                &swapped_ordinals,
-            )
-            .is_err()
-        );
+
+        create_document_set(
+            &definition,
+            &interpretation,
+            &configuration,
+            &swapped_ordinals,
+        )
+        .expect("the same columns in the provider's own order still describe this target");
+    }
+
+    #[test]
+    fn create_rejects_a_binding_the_provider_never_prepared() {
+        let (definition, interpretation, configuration, target) = fixture();
 
         let mismatched_field = prepared_target_with_fields(
             &target,
