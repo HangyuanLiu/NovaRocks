@@ -43,6 +43,7 @@ unimplemented = "deny"
 
 [workspace.dependencies]
 anyhow = "1"
+apache-avro = "0.21"
 # The `pool` feature is a process-level semantic switch, not one consumer's
 # option: it adds a reservation to every `Bytes` and `MutableBuffer` in the
 # build, so enabling it anywhere but here would leave a single-crate test or a
