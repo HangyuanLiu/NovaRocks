@@ -485,11 +485,46 @@ impl NativeTaskResultTransport {
     }
 }
 
+/// What a `tonic::Status` is hiding, which its own `Display` never prints.
+///
+/// The classification below already reads `source()` to tell an HTTP/2
+/// failure from a service-readiness one, and then the message threw it away.
+/// So a broken connection reached every log and every client as the fixed
+/// text `transport error`, and the io or h2 error that actually broke it --
+/// a reset, a refused connection, a TLS alert -- was not recoverable from
+/// outside the process. Whoever hits this next should not have to guess.
+///
+/// Transport-layer sources carry addresses and syscall errors, never
+/// credential material; the status message itself is unchanged, so nothing
+/// that was already redacted becomes visible here.
+fn transport_error_chain(error: &tonic::Status) -> String {
+    /// Enough to reach the io error under tonic and h2, bounded so a cyclic
+    /// or pathological chain cannot turn one diagnostic into a flood.
+    const MAX_DEPTH: usize = 8;
+
+    let mut chain = String::new();
+    let mut source = std::error::Error::source(error);
+    for _ in 0..MAX_DEPTH {
+        let Some(current) = source else {
+            break;
+        };
+        chain.push_str(&format!("; caused by: {current}"));
+        source = current.source();
+    }
+    if source.is_some() {
+        chain.push_str("; caused by: ...");
+    }
+    chain
+}
+
 fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResultFetchError {
     let unknown_is_transport = error.code() == tonic::Code::Unknown
         && (std::error::Error::source(&error).is_some()
             || error.message().starts_with("Service was not ready: "));
-    let detail = format!("fetch_task_result rpc failed: {error}");
+    let detail = format!(
+        "fetch_task_result rpc failed: {error}{}",
+        transport_error_chain(&error)
+    );
     match error.code() {
         // These statuses state that the exact backend endpoint or its HTTP/2
         // transport could not complete the request in this attempt's bounded
@@ -1195,6 +1230,33 @@ mod tests {
                     .into_pump_failure();
             assert_eq!(failure.class(), AttemptFailureClass::ContractViolation);
         }
+    }
+
+    #[test]
+    fn a_transport_failure_reports_what_actually_broke_the_connection() {
+        // `tonic::Status` prints only its own code and message, so every
+        // broken connection reached logs and clients as the fixed text
+        // "transport error" while the io error underneath went nowhere. The
+        // classification already reads that source to decide the failure
+        // class; reporting it costs nothing and is the difference between a
+        // diagnosable incident and a guess.
+        let status = tonic::Status::from_error(Box::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        )));
+        let detail = classify_fetch_task_result_rpc_status(status).detail;
+        assert!(
+            detail.contains("connection reset by peer"),
+            "the cause must survive into the reported detail: {detail}"
+        );
+        assert!(detail.contains("caused by"), "{detail}");
+    }
+
+    #[test]
+    fn a_status_with_no_cause_reports_no_chain() {
+        let status = tonic::Status::new(tonic::Code::ResourceExhausted, "full");
+        let detail = classify_fetch_task_result_rpc_status(status).detail;
+        assert!(!detail.contains("caused by"), "{detail}");
     }
 
     #[test]
