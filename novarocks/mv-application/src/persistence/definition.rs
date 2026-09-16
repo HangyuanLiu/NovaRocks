@@ -15,8 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
 use crate::management::{DeploymentOwner, ManagementDependencySet, ProcessIncarnation};
 use crate::persistence::identity::DocumentRevision;
 use novarocks_spi::connector::{
@@ -151,36 +149,6 @@ pub fn test_source_revision(
         deployment_owner: DeploymentOwner::parse("test-deployment").expect("test owner"),
         process_incarnation: ProcessIncarnation::parse("test-process").expect("test incarnation"),
     }
-}
-
-/// Lake-derived materialized-view accelerator root.
-///
-/// This record contains canonical desired facts and aggregate published facts
-/// only. Active attempts, scheduler state, partition freshness and recovery
-/// state are process runtime and must never be added to this payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredMvDefinition {
-    pub mv_id: i64,
-    pub query_definition: PersistedQueryDefinition,
-    pub base_table_refs: Vec<String>,
-    pub primary_key_columns: Vec<String>,
-    pub storage_engine: String,
-    pub target_catalog: Option<String>,
-    pub target_namespace: Option<String>,
-    pub target_table: Option<String>,
-    pub schema_contract: Option<MvSchemaContract>,
-    pub partition_spec: Option<MvPartitionContract>,
-    pub last_refresh_ms: Option<i64>,
-    pub last_refresh_rows: Option<i64>,
-    pub last_refresh_snapshots: BTreeMap<String, i64>,
-    pub last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    pub last_refreshed_iceberg_snapshot_id: Option<i64>,
-    pub refresh_policy: MvDesiredRefreshPolicy,
-    pub refresh_paused: bool,
-    pub refresh_interval_ms: Option<i64>,
-    pub max_staleness_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub source_revision: MvAcceleratorSourceRevision,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

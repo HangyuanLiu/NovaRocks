@@ -2177,6 +2177,8 @@ mod tests {
                 database: "db".to_string(),
                 name: "mv_join".to_string(),
             },
+            left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
+            right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(42),
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(

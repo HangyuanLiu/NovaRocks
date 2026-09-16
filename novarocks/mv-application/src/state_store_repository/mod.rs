@@ -30,7 +30,7 @@ mod tests_dependency;
 #[path = "tests_port.rs"]
 mod tests_port;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_state_store_api::{
@@ -40,12 +40,14 @@ use novarocks_state_store_api::{
 use uuid::Uuid;
 
 use crate::dependency::MvDependencyObjectRef;
-use crate::persistence::definition::StoredMvDefinition;
-use crate::persistence::dependency::{CreateMvDependencyRequest, StoredMvDependency};
+use crate::persistence::dependency::{
+    StoredMvDependency, classify_dependencies, projection_dependencies,
+};
+use crate::persistence::projection::StoredMvProjection;
 use crate::product::MvTarget;
 use crate::repository::{
     DeleteMvProjectionRequest, LoadedMvProjection, MvProjectionRequest, MvProjectionVersion,
-    MvPublishedProjection, MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
+    MvRepository, MvRepositoryError, MvRepositoryErrorKind, MvTargetLookup,
     ReplaceMvProjectionRequest,
 };
 use crate::repository_metrics::MvRepositoryMetrics;
@@ -98,6 +100,80 @@ impl StateStoreMvRepository {
         .map_err(operation::state_store_error)
     }
 
+    async fn classified_dependencies(
+        &self,
+        prefix: Key,
+    ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
+        let mut transaction = self
+            .store
+            .begin_read()
+            .await
+            .map_err(operation::state_store_error)?;
+        let page_size = self.store.limits().max_page_size;
+        let rows = scan_transaction_range(
+            transaction.as_mut(),
+            KeyRange::for_prefix(prefix.clone()).map_err(operation::state_store_error)?,
+            page_size,
+        )
+        .await
+        .map_err(operation::state_store_error)?;
+        let roots = scan_transaction_range(
+            transaction.as_mut(),
+            KeyRange::for_prefix(projection_prefix().map_err(corruption)?)
+                .map_err(operation::state_store_error)?,
+            page_size,
+        )
+        .await
+        .map_err(operation::state_store_error)?;
+        // A failed or partial inventory is not evidence that an occurrence is external.
+        let inventory = roots
+            .into_iter()
+            .map(|record| {
+                decode_projection(&record.key, &record.value)
+                    .map(|decoded| decoded.value)
+                    .map_err(corruption)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut dependencies = decode_dependencies(rows)?;
+        let mut expected = Vec::new();
+        for root in &inventory {
+            for dependency in projection_dependencies(root.mv_id, &root.facts) {
+                let downstream_key = dependency_by_downstream_key(
+                    root.mv_id,
+                    &dependency.upstream,
+                    dependency.occurrence_id,
+                )
+                .map_err(corruption)?;
+                let upstream_key = dependency_by_upstream_key(
+                    &dependency.upstream,
+                    root.mv_id,
+                    dependency.occurrence_id,
+                )
+                .map_err(corruption)?;
+                if downstream_key.as_bytes().starts_with(prefix.as_bytes())
+                    || upstream_key.as_bytes().starts_with(prefix.as_bytes())
+                {
+                    expected.push(dependency);
+                }
+            }
+        }
+        if dependencies.len() != expected.len()
+            || dependencies
+                .iter()
+                .any(|dependency| !expected.contains(dependency))
+        {
+            return Err(corruption(
+                "MV dependency index is incomplete or differs from its canonical occurrences",
+            ));
+        }
+        classify_dependencies(&mut dependencies, &inventory);
+        transaction
+            .abort()
+            .await
+            .map_err(operation::state_store_error)?;
+        Ok(dependencies)
+    }
+
     async fn read_record(&self, key: &Key) -> Result<Option<StateRecord>, MvRepositoryError> {
         let mut transaction = self
             .store
@@ -123,8 +199,7 @@ impl MvRepository for StateStoreMvRepository {
         operation_id: Uuid,
         projection: MvProjectionRequest,
     ) -> Result<LoadedMvProjection, MvRepositoryError> {
-        validate_projection_request(&projection)?;
-        let dependencies = deduplicate_dependencies(0, &projection.dependencies)?;
+        let dependencies = projection_dependencies(0, &projection.facts);
         let store = Arc::clone(&self.store);
         let mv_id = operation::run(
             store.as_ref(),
@@ -200,10 +275,10 @@ impl MvRepository for StateStoreMvRepository {
         if request.mv_id <= 0 {
             return Err(invalid("MV projection ID must be positive"));
         }
-        validate_projection_request(&request.projection)?;
+
         let mv_id = request.mv_id;
         let desired_dependencies =
-            deduplicate_dependencies(request.mv_id, &request.projection.dependencies)?;
+            projection_dependencies(request.mv_id, &request.projection.facts);
         let expected_version = request.expected_version.store_version().clone();
         let page_size = self.store.limits().max_page_size;
         let store = Arc::clone(&self.store);
@@ -283,7 +358,7 @@ impl MvRepository for StateStoreMvRepository {
         let loaded = self.load_by_id(lookup.value.mv_id).await?.ok_or_else(|| {
             corruption("MV Accelerator target lookup references a missing projection")
         })?;
-        if definition_target(&loaded.definition).map_err(corruption)? != *target {
+        if definition_target(&loaded.projection).map_err(corruption)? != *target {
             return Err(corruption(
                 "MV Accelerator target lookup does not match its projection",
             ));
@@ -337,7 +412,7 @@ impl MvRepository for StateStoreMvRepository {
                     let definition = decode_projection(&root_key, &root_record.value)
                         .map_err(invalid_state_store)?
                         .value;
-                    if definition.source_revision != request.expected_source_revision {
+                    if definition.facts.source_revision() != &request.expected_source_revision {
                         return Err(conflict_state_store(
                             "MV source revision changed before delete",
                         ));
@@ -397,20 +472,16 @@ impl MvRepository for StateStoreMvRepository {
         &self,
         mv_id: i64,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        let records = self
-            .scan_prefix(dependency_by_downstream_prefix(mv_id).map_err(corruption)?)
-            .await?;
-        decode_dependencies(records)
+        self.classified_dependencies(dependency_by_downstream_prefix(mv_id).map_err(corruption)?)
+            .await
     }
 
     async fn list_downstream_dependencies(
         &self,
         upstream: &MvDependencyObjectRef,
     ) -> Result<Vec<StoredMvDependency>, MvRepositoryError> {
-        let records = self
-            .scan_prefix(dependency_by_upstream_prefix(upstream).map_err(corruption)?)
-            .await?;
-        decode_dependencies(records)
+        self.classified_dependencies(dependency_by_upstream_prefix(upstream).map_err(corruption)?)
+            .await
     }
 
     async fn wipe_projection_by_target(
@@ -424,9 +495,9 @@ impl MvRepository for StateStoreMvRepository {
         self.delete_projection(
             operation_id,
             DeleteMvProjectionRequest {
-                mv_id: loaded.definition.mv_id,
+                mv_id: loaded.projection.mv_id,
                 expected_version: loaded.version,
-                expected_source_revision: loaded.definition.source_revision,
+                expected_source_revision: loaded.projection.facts.source_revision().clone(),
             },
         )
         .await
@@ -565,200 +636,20 @@ fn loaded_projection(
         .map_err(corruption)?
         .value;
     Ok(LoadedMvProjection {
-        definition,
+        projection: definition,
         version: MvProjectionVersion::from_store(record.version),
     })
 }
 
-fn validate_projection_request(request: &MvProjectionRequest) -> Result<(), MvRepositoryError> {
-    request
-        .definition
-        .query_definition
-        .validate()
-        .map_err(|error| invalid(format!("invalid persisted MV query definition: {error}")))?;
-    if !request
-        .definition
-        .storage_engine
-        .eq_ignore_ascii_case("iceberg")
-    {
-        return Err(invalid(
-            "MV Accelerator accepts only lake-backed Iceberg projections",
-        ));
-    }
-    if request
-        .definition
-        .target_catalog
-        .as_deref()
-        .is_none_or(str::is_empty)
-        || request
-            .definition
-            .target_namespace
-            .as_deref()
-            .is_none_or(str::is_empty)
-        || request
-            .definition
-            .target_table
-            .as_deref()
-            .is_none_or(str::is_empty)
-    {
-        return Err(invalid(
-            "MV Accelerator projection requires an exact target",
-        ));
-    }
-    let source_target = &request.source_revision.target;
-    if source_target.instance_id.as_str()
-        != request
-            .definition
-            .target_catalog
-            .as_deref()
-            .unwrap_or_default()
-        || source_target.namespace.as_ref()
-            != request
-                .definition
-                .target_namespace
-                .as_deref()
-                .unwrap_or_default()
-        || source_target.table.as_ref()
-            != request
-                .definition
-                .target_table
-                .as_deref()
-                .unwrap_or_default()
-    {
-        return Err(invalid(
-            "MV source revision target identity does not match the projection target",
-        ));
-    }
-    if request.source_revision.publication_revision.is_some()
-        != request.source_revision.publication_output_version.is_some()
-    {
-        return Err(invalid(
-            "MV source revision publication and output version presence differ",
-        ));
-    }
-    if request.definition.created_at_ms < 0 {
-        return Err(invalid("MV projection creation time must not be negative"));
-    }
-    if request.refresh.interval_ms.is_some_and(|value| value <= 0)
-        || request
-            .refresh
-            .max_staleness_ms
-            .is_some_and(|value| value < 0)
-    {
-        return Err(invalid("MV refresh configuration has an invalid duration"));
-    }
-    if request.refresh.interval_ms.is_some() && !request.refresh.policy.accepts_interval() {
-        return Err(invalid(
-            "MV refresh interval is only valid for ASYNC_INTERVAL",
-        ));
-    }
-    match &request.publication {
-        MvPublishedProjection::NeverPublished => {
-            if request.source_revision.publication_revision.is_some() {
-                return Err(invalid(
-                    "never-published MV projection carries a publication source revision",
-                ));
-            }
-        }
-        MvPublishedProjection::Published(waterline) => {
-            let publication_snapshot_id = request
-                .source_revision
-                .publication_output_version
-                .as_ref()
-                .and_then(|version| version.snapshot_id());
-            if waterline.last_refresh_ms < 0
-                || waterline.last_refresh_rows < 0
-                || waterline.last_refreshed_iceberg_snapshot_id <= 0
-                || publication_snapshot_id != Some(waterline.last_refreshed_iceberg_snapshot_id)
-            {
-                return Err(invalid(
-                    "published MV waterline does not match its P output version",
-                ));
-            }
-            if waterline.base_snapshots.keys().collect::<BTreeSet<_>>()
-                != waterline
-                    .base_table_object_ids
-                    .keys()
-                    .collect::<BTreeSet<_>>()
-            {
-                return Err(invalid(
-                    "published MV base snapshots and object identities differ",
-                ));
-            }
-            if waterline
-                .base_snapshots
-                .values()
-                .any(|snapshot_id| *snapshot_id < 0)
-            {
-                return Err(invalid("published MV base snapshot must not be negative"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn definition_from_request(mv_id: i64, request: &MvProjectionRequest) -> StoredMvDefinition {
-    let (
-        last_refresh_ms,
-        last_refresh_rows,
-        last_refresh_snapshots,
-        last_refresh_table_object_ids,
-        last_refreshed_iceberg_snapshot_id,
-    ) = match &request.publication {
-        MvPublishedProjection::NeverPublished => {
-            (None, None, BTreeMap::new(), BTreeMap::new(), None)
-        }
-        MvPublishedProjection::Published(waterline) => (
-            Some(waterline.last_refresh_ms),
-            Some(waterline.last_refresh_rows),
-            waterline.base_snapshots.clone(),
-            waterline.base_table_object_ids.clone(),
-            Some(waterline.last_refreshed_iceberg_snapshot_id),
-        ),
-    };
-    StoredMvDefinition {
+fn definition_from_request(mv_id: i64, request: &MvProjectionRequest) -> StoredMvProjection {
+    StoredMvProjection {
         mv_id,
-        query_definition: request.definition.query_definition.clone(),
-        base_table_refs: request.definition.base_table_refs.clone(),
-        primary_key_columns: request.definition.primary_key_columns.clone(),
-        storage_engine: request.definition.storage_engine.clone(),
-        target_catalog: request.definition.target_catalog.clone(),
-        target_namespace: request.definition.target_namespace.clone(),
-        target_table: request.definition.target_table.clone(),
-        schema_contract: request.definition.schema_contract.clone(),
-        partition_spec: request.definition.partition_spec.clone(),
-        last_refresh_ms,
-        last_refresh_rows,
-        last_refresh_snapshots,
-        last_refresh_table_object_ids,
-        last_refreshed_iceberg_snapshot_id,
-        refresh_policy: request.refresh.policy.clone(),
-        refresh_paused: request.refresh.paused,
-        refresh_interval_ms: request.refresh.interval_ms,
-        max_staleness_ms: request.refresh.max_staleness_ms,
-        created_at_ms: request.definition.created_at_ms,
-        source_revision: request.source_revision.clone(),
+        facts: request.facts.clone(),
     }
 }
 
-fn definition_target(definition: &StoredMvDefinition) -> Result<MvTarget, String> {
-    MvTarget::try_new(
-        Some(
-            definition
-                .target_catalog
-                .clone()
-                .ok_or_else(|| "MV projection target catalog is missing".to_string())?,
-        ),
-        definition
-            .target_namespace
-            .clone()
-            .ok_or_else(|| "MV projection target namespace is missing".to_string())?,
-        definition
-            .target_table
-            .clone()
-            .ok_or_else(|| "MV projection target table is missing".to_string())?,
-    )
-    .map_err(|error| error.to_string())
+fn definition_target(projection: &StoredMvProjection) -> Result<MvTarget, String> {
+    Ok(projection.facts.target().clone())
 }
 
 fn target_key(target: &MvTarget) -> Result<Key, String> {
@@ -769,35 +660,13 @@ fn target_key(target: &MvTarget) -> Result<Key, String> {
     )
 }
 
-fn deduplicate_dependencies(
-    mv_id: i64,
-    requests: &[CreateMvDependencyRequest],
-) -> Result<Vec<CreateMvDependencyRequest>, MvRepositoryError> {
-    let mut unique = BTreeMap::new();
-    for request in requests {
-        if request.created_at_ms < 0 {
-            return Err(invalid("MV dependency creation time must not be negative"));
-        }
-        let key = dependency_by_downstream_key(mv_id.max(1), &request.upstream).map_err(invalid)?;
-        if let Some(existing) = unique.insert(key, request.clone())
-            && existing != *request
-        {
-            return Err(invalid("duplicate MV dependency has conflicting facts"));
-        }
-    }
-    Ok(unique.into_values().collect())
-}
-
-fn dependencies_for_mv(
-    mv_id: i64,
-    requests: &[CreateMvDependencyRequest],
-) -> Vec<StoredMvDependency> {
+fn dependencies_for_mv(mv_id: i64, requests: &[StoredMvDependency]) -> Vec<StoredMvDependency> {
     requests
         .iter()
-        .map(|request| StoredMvDependency {
-            downstream_mv_id: mv_id,
-            upstream: request.upstream.clone(),
-            created_at_ms: request.created_at_ms,
+        .cloned()
+        .map(|mut dependency| {
+            dependency.downstream_mv_id = mv_id;
+            dependency
         })
         .collect()
 }
@@ -817,7 +686,7 @@ async fn put_sequence(
 async fn put_projection(
     transaction: &mut dyn WriteTransaction,
     operation_id: Uuid,
-    definition: &StoredMvDefinition,
+    definition: &StoredMvProjection,
     precondition: Precondition,
 ) -> Result<(), StateStoreError> {
     let key = projection_by_id_key(definition.mv_id).map_err(invalid_state_store)?;
@@ -846,11 +715,18 @@ async fn put_dependency_pair(
     operation_id: Uuid,
     dependency: &StoredMvDependency,
 ) -> Result<(), StateStoreError> {
-    let downstream =
-        dependency_by_downstream_key(dependency.downstream_mv_id, &dependency.upstream)
-            .map_err(invalid_state_store)?;
-    let upstream = dependency_by_upstream_key(&dependency.upstream, dependency.downstream_mv_id)
-        .map_err(invalid_state_store)?;
+    let downstream = dependency_by_downstream_key(
+        dependency.downstream_mv_id,
+        &dependency.upstream,
+        dependency.occurrence_id,
+    )
+    .map_err(invalid_state_store)?;
+    let upstream = dependency_by_upstream_key(
+        &dependency.upstream,
+        dependency.downstream_mv_id,
+        dependency.occurrence_id,
+    )
+    .map_err(invalid_state_store)?;
     if transaction.get(&downstream).await?.is_some() || transaction.get(&upstream).await?.is_some()
     {
         return Err(conflict_state_store("MV dependency index already exists"));
@@ -866,8 +742,8 @@ async fn put_dependency_pair(
 async fn replace_target_index(
     transaction: &mut dyn WriteTransaction,
     operation_id: Uuid,
-    current: &StoredMvDefinition,
-    next: &StoredMvDefinition,
+    current: &StoredMvProjection,
+    next: &StoredMvProjection,
 ) -> Result<(), StateStoreError> {
     let current_key = target_key(&definition_target(current).map_err(invalid_state_store)?)
         .map_err(invalid_state_store)?;
@@ -915,7 +791,7 @@ async fn replace_dependency_indexes(
     transaction: &mut dyn WriteTransaction,
     operation_id: Uuid,
     mv_id: i64,
-    desired: &[CreateMvDependencyRequest],
+    desired: &[StoredMvDependency],
     page_size: usize,
 ) -> Result<(), StateStoreError> {
     let records = scan_write_prefix(
@@ -928,8 +804,12 @@ async fn replace_dependency_indexes(
     for downstream in records {
         let dependency: DecodedMvRecord<StoredMvDependency> =
             decode_record(&downstream.key, &downstream.value).map_err(invalid_state_store)?;
-        let upstream_key = dependency_by_upstream_key(&dependency.value.upstream, mv_id)
-            .map_err(invalid_state_store)?;
+        let upstream_key = dependency_by_upstream_key(
+            &dependency.value.upstream,
+            mv_id,
+            dependency.value.occurrence_id,
+        )
+        .map_err(invalid_state_store)?;
         let upstream = transaction
             .get(&upstream_key)
             .await?
@@ -939,7 +819,11 @@ async fn replace_dependency_indexes(
     let desired = dependencies_for_mv(mv_id, desired)
         .into_iter()
         .map(|dependency| {
-            let key = dependency_by_downstream_key(mv_id, &dependency.upstream)?;
+            let key = dependency_by_downstream_key(
+                mv_id,
+                &dependency.upstream,
+                dependency.occurrence_id,
+            )?;
             Ok((key, dependency))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()
@@ -977,7 +861,7 @@ async fn replace_dependency_indexes(
 
 async fn delete_indexes_for_projection(
     transaction: &mut dyn WriteTransaction,
-    definition: &StoredMvDefinition,
+    definition: &StoredMvProjection,
     mv_id: i64,
     page_size: usize,
 ) -> Result<(), StateStoreError> {
@@ -1006,8 +890,12 @@ async fn delete_indexes_for_projection(
     for record in downstream {
         let dependency: DecodedMvRecord<StoredMvDependency> =
             decode_record(&record.key, &record.value).map_err(invalid_state_store)?;
-        let upstream_key = dependency_by_upstream_key(&dependency.value.upstream, mv_id)
-            .map_err(invalid_state_store)?;
+        let upstream_key = dependency_by_upstream_key(
+            &dependency.value.upstream,
+            mv_id,
+            dependency.value.occurrence_id,
+        )
+        .map_err(invalid_state_store)?;
         let upstream = transaction
             .get(&upstream_key)
             .await?
@@ -1028,15 +916,34 @@ fn decode_dependencies(
     let mut dependencies = records
         .into_iter()
         .map(|record| {
-            decode_record::<StoredMvDependency>(&record.key, &record.value)
-                .map(|decoded| decoded.value)
-                .map_err(corruption)
+            let dependency = decode_record::<StoredMvDependency>(&record.key, &record.value)
+                .map_err(corruption)?
+                .value;
+            let downstream_key = dependency_by_downstream_key(
+                dependency.downstream_mv_id,
+                &dependency.upstream,
+                dependency.occurrence_id,
+            )
+            .map_err(corruption)?;
+            let upstream_key = dependency_by_upstream_key(
+                &dependency.upstream,
+                dependency.downstream_mv_id,
+                dependency.occurrence_id,
+            )
+            .map_err(corruption)?;
+            if record.key != downstream_key && record.key != upstream_key {
+                return Err(corruption(
+                    "MV dependency key differs from its canonical occurrence",
+                ));
+            }
+            Ok(dependency)
         })
         .collect::<Result<Vec<_>, _>>()?;
     dependencies.sort_by(|left, right| {
         left.upstream
             .display_name()
             .cmp(&right.upstream.display_name())
+            .then(left.occurrence_id.cmp(&right.occurrence_id))
     });
     Ok(dependencies)
 }

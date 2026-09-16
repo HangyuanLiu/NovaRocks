@@ -6570,7 +6570,7 @@ fn mv_rewrite_provenance_annotation(
             })?;
     let publication_state_digest = mv_rewrite_publication_state_digest(selection)?;
     Ok(format!(
-        "v1;publication_id={};definition_fingerprint={};publication_state_digest={}",
+        "v2;publication_id={};definition_fingerprint={};publication_state_digest={}",
         hex_bytes(&publication_id),
         hex_bytes(&definition_fingerprint),
         hex_bytes(&publication_state_digest)
@@ -6598,14 +6598,40 @@ fn mv_rewrite_publication_state_digest(
     let mut digest = Sha256::new();
     update_digest_part(
         &mut digest,
-        b"novarocks.mv-rewrite-publication-provenance.v1",
+        b"novarocks.mv-rewrite-publication-provenance.v2",
+    );
+    for (fact, revision) in [
+        (
+            "MV rewrite definition revision",
+            selection.definition_revision(),
+        ),
+        (
+            "MV rewrite interpretation revision",
+            selection.interpretation_revision(),
+        ),
+    ] {
+        update_digest_part(
+            &mut digest,
+            &revision.ok_or(ContractLoweringError::MissingPlannerFact { node: "Scan", fact })?,
+        );
+    }
+    update_digest_part(
+        &mut digest,
+        selection
+            .publication_provenance()
+            .ok_or(ContractLoweringError::MissingPlannerFact {
+                node: "Scan",
+                fact: "MV rewrite publication provenance",
+            })?
+            .as_bytes(),
     );
     update_digest_part(
         &mut digest,
         &(selection.publication_inputs().len() as u64).to_be_bytes(),
     );
     for input in selection.publication_inputs() {
-        update_mv_publication_relation_digest(&mut digest, b"input", input);
+        update_digest_part(&mut digest, &input.occurrence_id().get().to_be_bytes());
+        update_mv_publication_relation_digest(&mut digest, b"input", input.relation());
     }
     update_mv_publication_relation_digest(&mut digest, b"target", target);
     Ok(digest.finalize().into())
@@ -8293,6 +8319,8 @@ mod tests {
             "display_name_is_not_identity".to_string(),
             [7; 16],
             [9; 32],
+            publication.definition_revision(),
+            publication.interpretation_revision(),
             std::sync::Arc::from(publication.publication_provenance()),
             Vec::new(),
             publication.publication_inputs().to_vec(),
@@ -8301,14 +8329,14 @@ mod tests {
 
         let annotation = mv_rewrite_provenance_annotation(&selection).unwrap();
         assert!(annotation.starts_with(concat!(
-            "v1;publication_id=07070707070707070707070707070707;",
+            "v2;publication_id=07070707070707070707070707070707;",
             "definition_fingerprint=",
             "0909090909090909090909090909090909090909090909090909090909090909;",
             "publication_state_digest="
         )));
         let state_digest = annotation
             .strip_prefix(concat!(
-                "v1;publication_id=07070707070707070707070707070707;",
+                "v2;publication_id=07070707070707070707070707070707;",
                 "definition_fingerprint=",
                 "0909090909090909090909090909090909090909090909090909090909090909;",
                 "publication_state_digest="
@@ -8328,6 +8356,8 @@ mod tests {
             "display_name_is_not_identity".to_string(),
             [7; 16],
             [9; 32],
+            other_publication.definition_revision(),
+            other_publication.interpretation_revision(),
             std::sync::Arc::from(other_publication.publication_provenance()),
             Vec::new(),
             other_publication.publication_inputs().to_vec(),
@@ -8336,6 +8366,54 @@ mod tests {
         assert_ne!(
             annotation,
             mv_rewrite_provenance_annotation(&other_selection).unwrap()
+        );
+    }
+
+    #[test]
+    fn mv_rewrite_provenance_binds_document_revisions_occurrence_ids_and_order() {
+        let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new(
+            [7; 16],
+            [9; 32],
+            vec!["ice.db.orders".to_string()],
+        )
+        .unwrap();
+        let input = |id| {
+            crate::compiler::SqlMvRewritePublicationInput::try_new(
+                crate::compiler::SqlMvRelationOccurrenceId::new(id),
+                publication.publication_inputs()[0].relation().clone(),
+            )
+            .unwrap()
+        };
+        let digest = |definition, interpretation, inputs| {
+            let selection = crate::planner::payload::MvRewriteSelection::selected(
+                "display".to_string(),
+                [7; 16],
+                [9; 32],
+                definition,
+                interpretation,
+                std::sync::Arc::from(publication.publication_provenance()),
+                Vec::new(),
+                inputs,
+                publication.publication_target().clone(),
+            );
+            mv_rewrite_publication_state_digest(&selection).unwrap()
+        };
+        let expected = digest([11; 32], [12; 32], vec![input(7), input(42)]);
+        assert_ne!(
+            expected,
+            digest([13; 32], [12; 32], vec![input(7), input(42)])
+        );
+        assert_ne!(
+            expected,
+            digest([11; 32], [13; 32], vec![input(7), input(42)])
+        );
+        assert_ne!(
+            expected,
+            digest([11; 32], [12; 32], vec![input(42), input(7)])
+        );
+        assert_ne!(
+            expected,
+            digest([11; 32], [12; 32], vec![input(0), input(1)])
         );
     }
 

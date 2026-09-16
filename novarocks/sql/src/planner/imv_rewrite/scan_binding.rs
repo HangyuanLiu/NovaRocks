@@ -33,9 +33,7 @@ use crate::planner::imv_rewrite::annotation::ImvExtension;
 use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanScanNode;
-use crate::planner::table::{
-    ScanSource, SqlScanKind, SqlScanSource, SqlTableIdentity, SqlTableVersionSelector,
-};
+use crate::planner::table::{ScanSource, SqlScanKind, SqlScanSource, SqlTableVersionSelector};
 use novarocks_spi::connector::ConnectorTableObjectId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,16 +130,13 @@ fn bind_delta_scan(
     mut scan: PlanScanNode,
     snapshot: &SqlImvRewriteSnapshot,
 ) -> Result<PlanScanNode, String> {
-    let source = sql_base_scan_source(&scan.table.source)?;
-    let window = resolve_snapshot_window(snapshot, &source.table)?;
-    scan.table.source = ScanSource::Sql(SqlScanSource::new(
-        source.binding,
-        source.table,
-        SqlScanKind::Delta {
-            from_snapshot_id: window.from_snapshot_id,
-            to_snapshot_id: window.to_snapshot_id,
-        },
-    ));
+    let mut source = sql_base_scan_source(&scan.table.source)?;
+    let window = resolve_snapshot_window(snapshot, &source)?;
+    source.kind = SqlScanKind::Delta {
+        from_snapshot_id: window.from_snapshot_id,
+        to_snapshot_id: window.to_snapshot_id,
+    };
+    scan.table.source = ScanSource::Sql(source);
     Ok(scan)
 }
 
@@ -150,19 +145,16 @@ fn bind_version_scan(
     snapshot: &SqlImvRewriteSnapshot,
     role: ImvVersionRole,
 ) -> Result<PlanScanNode, String> {
-    let source = sql_base_scan_source(&scan.table.source)?;
-    let window = resolve_snapshot_window(snapshot, &source.table)?;
+    let mut source = sql_base_scan_source(&scan.table.source)?;
+    let window = resolve_snapshot_window(snapshot, &source)?;
     let snapshot_id = match role {
         ImvVersionRole::From => window.from_snapshot_id,
         ImvVersionRole::To => window.to_snapshot_id,
     };
-    scan.table.source = ScanSource::Sql(SqlScanSource::new(
-        source.binding,
-        source.table,
-        SqlScanKind::FrozenInputSet {
-            version: SqlTableVersionSelector::Snapshot(snapshot_id),
-        },
-    ));
+    source.kind = SqlScanKind::FrozenInputSet {
+        version: SqlTableVersionSelector::Snapshot(snapshot_id),
+    };
+    scan.table.source = ScanSource::Sql(source);
     scan.columns
         .retain(|column| !is_action_column_name(&column.name));
     scan.table
@@ -193,13 +185,13 @@ fn sql_base_scan_source(source: &ScanSource) -> Result<SqlScanSource, String> {
 
 fn resolve_snapshot_window(
     snapshot: &SqlImvRewriteSnapshot,
-    table: &SqlTableIdentity,
+    source: &SqlScanSource,
 ) -> Result<ImvSnapshotWindow, String> {
-    let base = find_base_ref(snapshot, table)?;
+    let base = find_base_ref(snapshot, source)?;
     let base_fqn = base.table.fqn();
     let from_snapshot_id = snapshot
         .previous_snapshot_ids
-        .get(&base_fqn)
+        .get(&base.occurrence_id)
         .copied()
         .ok_or_else(|| {
             format!(
@@ -218,14 +210,22 @@ fn resolve_snapshot_window(
 
 fn find_base_ref<'a>(
     snapshot: &'a SqlImvRewriteSnapshot,
-    table: &SqlTableIdentity,
+    source: &SqlScanSource,
 ) -> Result<&'a crate::compiler::mv_rewrite::SqlImvBaseSnapshot, String> {
+    let occurrence = source
+        .mv_occurrence
+        .ok_or_else(|| "IMV scan has no definition occurrence binding".to_string())?;
     snapshot
-        .base_snapshot_for_parts(&table.catalog, &table.namespace, &table.table)
+        .base_snapshot_for_occurrence(occurrence)
+        .filter(|base| {
+            base.table.catalog == source.table.catalog
+                && base.table.namespace == source.table.namespace
+                && base.table.table == source.table.table
+        })
         .ok_or_else(|| {
             format!(
                 "IMV scan binding base {}.{}.{} is not part of MV refresh context",
-                table.catalog, table.namespace, table.table
+                source.table.catalog, source.table.namespace, source.table.table
             )
         })
 }
@@ -257,28 +257,28 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
 
     fn sql_source(table: &str) -> ScanSource {
-        ScanSource::Sql(SqlScanSource::new(
-            SqlTableBindingId::new(
-                SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
-                NonZeroU32::new(1).expect("ordinal"),
-            ),
-            SqlTableIdentity {
-                catalog: "ice".to_string(),
-                namespace: "db".to_string(),
-                table: table.to_string(),
-            },
-            SqlScanKind::Data {
-                version: SqlTableVersionSelector::Current,
-            },
-        ))
+        ScanSource::Sql(
+            SqlScanSource::new(
+                SqlTableBindingId::new(
+                    SqlTableBindingScopeId::new(NonZeroU64::new(1).expect("scope")),
+                    NonZeroU32::new(1).expect("ordinal"),
+                ),
+                SqlTableIdentity {
+                    catalog: "ice".to_string(),
+                    namespace: "db".to_string(),
+                    table: table.to_string(),
+                },
+                SqlScanKind::Data {
+                    version: SqlTableVersionSelector::Current,
+                },
+            )
+            .with_mv_occurrence(crate::compiler::SqlMvRelationOccurrenceId::new(7)),
+        )
     }
 
-    fn base_identity(table: &str) -> SqlTableIdentity {
-        SqlTableIdentity {
-            catalog: "ice".to_string(),
-            namespace: "db".to_string(),
-            table: table.to_string(),
-        }
+    fn base_identity(table: &str) -> SqlScanSource {
+        let ScanSource::Sql(source) = sql_source(table);
+        source
     }
 
     fn iceberg_scan() -> PlanScanNode {

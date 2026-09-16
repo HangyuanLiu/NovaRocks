@@ -241,6 +241,7 @@ mod tests {
             relation_occurrences: occurrences,
             outputs: Vec::new(),
             computation_identity: ComputationIdentity::from_canonical_bytes(b"definition"),
+            created_at_ms: 1_700_000_000_000,
         }
     }
 

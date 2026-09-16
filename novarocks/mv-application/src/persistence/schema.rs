@@ -15,11 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Persisted MV schema / field-id contract.
+//! Transient schema contract used by the SQL/runtime adaptation boundary.
 //!
-//! Persisted inside `StoredMvDefinition.schema_contract`. Captures base
-//! referenced fields + output lineage + target schema mapping at CREATE
-//! MV time. Validated on every REFRESH.
+//! This is not an Accelerator root or a durable fallback. Canonical D/L/P/C
+//! own persistent MV facts; adapters reconstruct runtime bindings from their
+//! opaque identities and exact provider schema facts.
 
 use serde::{Deserialize, Serialize};
 

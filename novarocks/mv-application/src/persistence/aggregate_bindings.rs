@@ -234,7 +234,7 @@ fn source_field_map(
     let expected_occurrences = facts
         .relation_occurrences()
         .iter()
-        .map(|relation| relation.occurrence_id())
+        .map(|relation| relation.occurrence_id().get())
         .collect::<BTreeSet<_>>();
     if observations_by_occurrence
         .keys()
@@ -250,7 +250,7 @@ fn source_field_map(
     let mut result = BTreeMap::new();
     for relation in facts.relation_occurrences() {
         let observation = observations_by_occurrence
-            .get(&relation.occurrence_id())
+            .get(&relation.occurrence_id().get())
             .expect("validated exact occurrence coverage");
         let mut fields = BTreeMap::new();
         for field in &observation.fields {
@@ -268,7 +268,7 @@ fn source_field_map(
                 );
             }
             result.insert(
-                (relation.occurrence_id(), field.field_ordinal()),
+                (relation.occurrence_id().get(), field.field_ordinal()),
                 FieldIdentity::try_new(observed.provider_field_id.to_vec())
                     .map_err(|error| error.to_string())?,
             );
@@ -313,7 +313,13 @@ fn branch_identities(
     let mut branches = BTreeMap::new();
     for branch in facts.union_branches() {
         let mut canonical = CanonicalBytes::new(BRANCH_IDENTITY_DOMAIN);
-        canonical.u32s(branch.relation_occurrence_ids());
+        canonical.u32s(
+            &branch
+                .relation_occurrence_ids()
+                .iter()
+                .map(|id| id.get())
+                .collect::<Vec<_>>(),
+        );
         let output_ids = branch
             .output_ordinals()
             .iter()
@@ -346,7 +352,7 @@ fn aggregate_source_fields(
         .iter()
         .map(|reference| {
             let field_id = source_fields
-                .get(&(reference.occurrence_id(), reference.field_ordinal()))
+                .get(&(reference.occurrence_id().get(), reference.field_ordinal()))
                 .ok_or_else(|| {
                     "SQL source reference has no exact provider field observation".to_string()
                 })?;
@@ -354,7 +360,7 @@ fn aggregate_source_fields(
                 return Err("SQL source reference has an empty field name".to_string());
             }
             Ok(RuntimeSourceFieldReference {
-                occurrence_id: reference.occurrence_id(),
+                occurrence_id: reference.occurrence_id().get(),
                 field_id: field_id.clone(),
             })
         })

@@ -76,6 +76,7 @@ fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> RelationOc
 
 fn sample_definition() -> DefinitionDocument {
     build_definition(
+        1_700_000_000_000,
         QuerySource {
             effective_sql: "SELECT AVG(o.amount) AS average_amount FROM ice.sales.orders o UNION ALL SELECT AVG(o2.amount) AS average_amount FROM ice.sales.orders o2".to_string(),
             dialect: QueryDialect::StarRocks,
@@ -308,6 +309,7 @@ fn sample_publication(
     interpretation: &EncodedDocument,
 ) -> PublicationDocument {
     PublicationDocument {
+        publication_prepared_at_ms: 1_700_000_001_000,
         publication_id: PublicationIdentity::try_new(vec![91]).expect("publication id"),
         definition_revision: definition.revision(),
         interpretation_revision: interpretation.revision(),
@@ -535,6 +537,7 @@ fn set_order_is_canonical_but_occurrence_and_branch_order_remain_semantic() {
     let mut reordered_occurrences = definition.relation_occurrences.clone();
     reordered_occurrences.reverse();
     let occurrence_reordered = build_definition(
+        1_700_000_000_000,
         definition.query.clone(),
         reordered_occurrences,
         definition.outputs.clone(),
@@ -1025,6 +1028,7 @@ fn packed_repeated_values_consume_the_decode_item_budget() {
 fn tiny_nested_headers_consume_the_pre_prost_working_set_budget() {
     let dto = super::proto::DefinitionDocument {
         format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
+        created_at_ms: Some(1_700_000_000_000),
         query: None,
         relation_occurrences: Vec::new(),
         outputs: vec![super::proto::OutputDefinition::default(); 32],
@@ -1065,4 +1069,36 @@ fn stale_definition_or_interpretation_revision_is_rejected() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn created_time_changes_document_revision_but_not_computation_identity() {
+    let original = sample_definition();
+    let mut later = original.clone();
+    later.created_at_ms += 1;
+    let first = encode_definition(&original).unwrap();
+    let second = encode_definition(&later).unwrap();
+    assert_ne!(first.revision(), second.revision());
+    let decoded = decode_definition(second.as_bytes(), PersistenceDecodeBudget::default()).unwrap();
+    assert_eq!(decoded.computation_identity, original.computation_identity);
+    assert_eq!(decoded.created_at_ms, later.created_at_ms);
+}
+
+#[test]
+fn definition_and_publication_times_are_required_wire_facts() {
+    let encoded = encode_definition(&sample_definition()).unwrap();
+    let mut dto = super::proto::DefinitionDocument::decode(encoded.as_bytes()).unwrap();
+    dto.created_at_ms = None;
+    assert!(matches!(
+        decode_definition(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
+        Err(PersistenceCodecError::MissingField(_))
+    ));
+    let l = encode_interpretation(&sample_interpretation(&encoded)).unwrap();
+    let p = encode_publication(&sample_publication(&encoded, &l)).unwrap();
+    let mut dto = super::proto::PublicationDocument::decode(p.as_bytes()).unwrap();
+    dto.publication_prepared_at_ms = None;
+    assert!(matches!(
+        decode_publication(&dto.encode_to_vec(), PersistenceDecodeBudget::default()),
+        Err(PersistenceCodecError::MissingField(_))
+    ));
 }

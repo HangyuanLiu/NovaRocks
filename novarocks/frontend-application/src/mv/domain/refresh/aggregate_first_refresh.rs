@@ -27,7 +27,10 @@ use std::sync::Arc;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 
-use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, inject_pin_as_for_version_as_of};
+use crate::mv::domain::refresh::pin::{
+    RefreshSnapshotPin, inject_pin_as_for_version_as_of, inject_pin_prefix_as_for_version_as_of,
+    require_pin_fully_consumed,
+};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_execution::exec::mv::aggregate_state::materialize_aggregate_result_chunks;
 use novarocks_parser::{ast, printer};
@@ -63,14 +66,16 @@ pub(crate) fn prepare_aggregate_first_refresh_chunks<F>(
 where
     F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
-    let read = read_aggregate_state(
+    let (read, consumed) = read_aggregate_state(
         select_sql,
         calls,
         pin,
         current_catalog,
         current_database,
+        0,
         read,
     )?;
+    require_pin_fully_consumed(pin, consumed)?;
     let target_layout = read.source_layout.clone();
     normalize_and_materialize_aggregate_read(read, calls, &target_layout, calls)
 }
@@ -85,8 +90,9 @@ fn read_aggregate_state<F>(
     pin: &RefreshSnapshotPin,
     current_catalog: Option<&str>,
     current_database: &str,
+    start_occurrence: usize,
     read: &mut F,
-) -> Result<AggregateStateRead, String>
+) -> Result<(AggregateStateRead, usize), String>
 where
     F: FnMut(&str, &AggregateSqlCalls, ast::Query) -> Result<AggregateStateRead, String>,
 {
@@ -94,14 +100,15 @@ where
     let state_sql =
         novarocks_sql::planning::mv::rewrite_select_sql_for_state(&original_query, calls)?;
     let mut state_query = parse_stored_select_query(&state_sql)?;
-    inject_pin_as_for_version_as_of(
+    let (_, consumed) = inject_pin_prefix_as_for_version_as_of(
         &mut state_query,
         pin,
         &HashSet::new(),
         current_catalog,
         current_database,
+        start_occurrence,
     )?;
-    read(select_sql, calls, state_query)
+    Ok((read(select_sql, calls, state_query)?, consumed))
 }
 
 /// Build the pinned, state-shaped query used by an aggregate first refresh.
@@ -149,27 +156,60 @@ pub(crate) fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     current_database: &str,
 ) -> Result<Vec<(AggregateSqlCalls, String)>, String> {
     let branches = branch_union_first_refresh_branch_queries(select_sql, branch_count)?;
-    branches
-        .into_iter()
-        .enumerate()
-        .map(|(branch_index, (branch_query, branch_sql))| {
-            let branch_calls = extract_aggregate_sql_calls(&branch_query)?;
-            if branch_index == 0 && &branch_calls != first_branch_calls {
-                return Err(
-                    "branch UNION ALL aggregate first branch calls drifted from the validated contract"
-                        .to_string(),
-                );
-            }
-            let state_sql = prepare_aggregate_first_refresh_state_sql(
-                &branch_sql,
-                &branch_calls,
-                pin,
-                current_catalog,
-                current_database,
-            )?;
-            Ok((branch_calls, state_sql))
-        })
-        .collect()
+    // Each branch names only the D occurrences it owns; together, and in this
+    // left-to-right order, the branches must name every one of them exactly once.
+    let mut consumed = 0_usize;
+    let mut prepared = Vec::with_capacity(branches.len());
+    for (branch_index, (branch_query, branch_sql)) in branches.into_iter().enumerate() {
+        let branch_calls = extract_aggregate_sql_calls(&branch_query)?;
+        if branch_index == 0 && &branch_calls != first_branch_calls {
+            return Err(
+                "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                    .to_string(),
+            );
+        }
+        let (state_sql, next) = prepare_aggregate_first_refresh_branch_state_sql(
+            &branch_sql,
+            &branch_calls,
+            pin,
+            current_catalog,
+            current_database,
+            consumed,
+        )?;
+        consumed = next;
+        prepared.push((branch_calls, state_sql));
+    }
+    require_pin_fully_consumed(pin, consumed)?;
+    Ok(prepared)
+}
+
+/// One branch of a branch-UNION aggregate first refresh, pinned from
+/// `start_occurrence`. Returns the SQL and the next unconsumed occurrence.
+#[allow(
+    dead_code,
+    reason = "Retained for staged materialized-view integration and recovery wiring."
+)]
+fn prepare_aggregate_first_refresh_branch_state_sql(
+    select_sql: &str,
+    calls: &AggregateSqlCalls,
+    pin: &RefreshSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    start_occurrence: usize,
+) -> Result<(String, usize), String> {
+    let original_query = parse_stored_select_query(select_sql)?;
+    let state_sql =
+        novarocks_sql::planning::mv::rewrite_select_sql_for_state(&original_query, calls)?;
+    let mut state_query = parse_stored_select_query(&state_sql)?;
+    let (_, consumed) = inject_pin_prefix_as_for_version_as_of(
+        &mut state_query,
+        pin,
+        &HashSet::new(),
+        current_catalog,
+        current_database,
+        start_occurrence,
+    )?;
+    Ok((printer::print_query(&state_query), consumed))
 }
 
 #[allow(
@@ -191,6 +231,7 @@ where
     let branches = branch_union_first_refresh_branch_queries(select_sql, branch_count)?;
     let mut target_layout = None;
     let mut prepared = Vec::new();
+    let mut consumed = 0_usize;
     for (branch_index, (branch_query, branch_sql)) in branches.into_iter().enumerate() {
         let branch_id = i32::try_from(branch_index).map_err(|_| {
             format!(
@@ -204,14 +245,16 @@ where
                     .to_string(),
             );
         }
-        let branch_read = read_aggregate_state(
+        let (branch_read, next_occurrence) = read_aggregate_state(
             &branch_sql,
             &branch_calls,
             pin,
             current_catalog,
             current_database,
+            consumed,
             read,
         )?;
+        consumed = next_occurrence;
         let canonical_layout = target_layout
             .get_or_insert_with(|| branch_read.source_layout.clone())
             .clone();
@@ -230,6 +273,7 @@ where
         )?;
         prepared.extend(append_branch_id_to_chunks(branch_chunks, branch_id)?);
     }
+    require_pin_fully_consumed(pin, consumed)?;
     Ok(prepared)
 }
 

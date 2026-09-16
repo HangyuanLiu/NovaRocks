@@ -189,32 +189,39 @@ pub(crate) fn reject_drop_column_mv_dependencies_with_readiness(
         .last()
         .ok_or_else(|| "DROP COLUMN has an empty column path".to_string())?;
     let leaf = normalize_identifier(leaf)?;
-    let target_key = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
-    let target_key_lower = target_key.to_ascii_lowercase();
     let target = MvDependencyTarget::from_backend(target)?;
     for projection in readiness
         .list_ready_projections()
         .map_err(|error| format!("load materialized view metadata failed: {error}"))?
     {
-        let definition = projection.definition;
-        let references_target = definition
-            .base_table_refs
+        let definition = projection.projection.facts.definition();
+        let matching_occurrences = definition
+            .relation_occurrences
             .iter()
-            .any(|base| base.eq_ignore_ascii_case(&target_key))
-            || definition
-                .query_definition
-                .raw_query_source
-                .to_ascii_lowercase()
-                .contains(&target_key_lower);
-        if references_target
-            && (sql_mentions_identifier(&definition.query_definition.raw_query_source, &leaf)
-                || sql_projects_target_wildcard(
-                    &definition.query_definition.raw_query_source,
-                    &target,
-                ))
+            .filter(|occurrence| {
+                occurrence
+                    .catalog_at_binding
+                    .eq_ignore_ascii_case(&target.catalog)
+                    && occurrence
+                        .namespace_at_binding
+                        .eq_ignore_ascii_case(&target.namespace)
+                    && occurrence
+                        .relation_at_binding
+                        .eq_ignore_ascii_case(&target.table)
+            })
+            .collect::<Vec<_>>();
+        let references_column = matching_occurrences.iter().any(|occurrence| {
+            occurrence
+                .fields
+                .iter()
+                .any(|field| field.name_at_binding.eq_ignore_ascii_case(&leaf))
+        });
+        if !matching_occurrences.is_empty()
+            && (references_column
+                || sql_projects_target_wildcard(&definition.query.effective_sql, &target))
         {
             return Err(format!(
-                "DROP COLUMN `{}` is blocked because a StarRocks materialized view references it",
+                "DROP COLUMN `{}` is blocked because a materialized view references it",
                 column_path.dotted()
             ));
         }
@@ -237,12 +244,6 @@ impl MvDependencyTarget {
             table: normalize_identifier(&target.table)?,
         })
     }
-}
-
-fn sql_mentions_identifier(sql: &str, normalized_identifier: &str) -> bool {
-    sql.split(|ch: char| !(ch == '_' || ch.is_ascii_alphanumeric()))
-        .filter(|token| !token.is_empty())
-        .any(|token| token.eq_ignore_ascii_case(normalized_identifier))
 }
 
 fn sql_projects_target_wildcard(sql: &str, target: &MvDependencyTarget) -> bool {

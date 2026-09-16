@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::super::catalog::schema_catalog;
 use super::super::key::{
@@ -27,58 +27,19 @@ use super::{
     encode_record,
 };
 use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
-use crate::persistence::definition::{
-    MvDesiredRefreshPolicy, StoredMvDefinition, test_source_revision,
-};
+use crate::persistence::projection::StoredMvProjection;
+use crate::persistence::test_support::sample_projection;
+use crate::product::MvTarget;
 use crate::repository::MvTargetLookup;
 use bytes::Bytes;
-use novarocks_query_application::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
-use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{Key, Value};
 use uuid::Uuid;
 
-fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
-    ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes)).expect("bounded object ID")
-}
-
-fn projection() -> StoredMvDefinition {
-    StoredMvDefinition {
+fn projection() -> StoredMvProjection {
+    StoredMvProjection {
         mv_id: 7,
-        query_definition: PersistedQueryDefinition::new(
-            "SELECT * FROM ice.sales.orders",
-            PersistedQueryDialect::StarRocks,
-            "ice",
-            "sales",
-        )
-        .unwrap(),
-        base_table_refs: vec!["ice.sales.orders".to_string()],
-        primary_key_columns: vec![],
-        storage_engine: "iceberg".to_string(),
-        target_catalog: Some("ice".to_string()),
-        target_namespace: Some("sales".to_string()),
-        target_table: Some("orders_mv".to_string()),
-        schema_contract: None,
-        partition_spec: None,
-        last_refresh_ms: Some(10),
-        last_refresh_rows: Some(20),
-        last_refresh_snapshots: BTreeMap::from([("ice.sales.orders".to_string(), 9)]),
-        last_refresh_table_object_ids: BTreeMap::from([(
-            "ice.sales.orders".to_string(),
-            object_id(b"base-object"),
-        )]),
-        last_refreshed_iceberg_snapshot_id: Some(11),
-        refresh_policy: MvDesiredRefreshPolicy::Manual,
-        refresh_paused: false,
-        refresh_interval_ms: None,
-        max_staleness_ms: None,
-        created_at_ms: 1,
-        source_revision: test_source_revision(
-            "ice",
-            "sales",
-            "orders_mv",
-            object_id(b"target-object"),
+        facts: sample_projection(
+            MvTarget::from_parts(Some("ice"), "sales", "orders_mv"),
             Some(11),
         ),
     }
@@ -99,7 +60,7 @@ fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
     let projection = projection_by_id_key(9).expect("projection key");
     assert_eq!(
         std::str::from_utf8(projection.as_bytes()).unwrap(),
-        "novarocks/frontend/mv/accelerator/v2/projection/by-id/0000000000000009"
+        "novarocks/frontend/mv/accelerator/v3/projection/by-id/0000000000000009"
     );
     assert_eq!(decode_key(&projection).unwrap().kind, MvKeyKind::Projection);
     assert_eq!(
@@ -114,6 +75,7 @@ fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
         "novarocks/frontend/mv/v1/refresh/by-id/0000000000000001",
         "novarocks/frontend/mv/v1/partition/by-mv/0000000000000001/61",
         "novarocks/frontend/mv/accelerator/v1/projection/by-id/0000000000000001",
+        "novarocks/frontend/mv/accelerator/v2/projection/by-id/0000000000000001",
         "novarocks/frontend/mv/accelerator/v2/refresh/by-id/0000000000000001",
         "novarocks/frontend/mv/accelerator/v2/unknown/value",
     ] {
@@ -124,8 +86,8 @@ fn current_key_classifier_is_closed_and_rejects_legacy_runtime_families() {
 
 #[test]
 fn dependency_indexes_share_one_canonical_identity() {
-    let downstream = dependency_by_downstream_key(7, &upstream()).unwrap();
-    let upstream = dependency_by_upstream_key(&upstream(), 7).unwrap();
+    let downstream = dependency_by_downstream_key(7, &upstream(), 7).unwrap();
+    let upstream = dependency_by_upstream_key(&upstream(), 7, 7).unwrap();
     assert_eq!(
         decode_key(&downstream).unwrap().kind,
         MvKeyKind::DependencyDownstream
@@ -145,7 +107,7 @@ fn projection_codec_round_trips_complete_source_revision_and_waterline() {
     let decoded = decode_projection(&key, &value).unwrap();
     assert_eq!(decoded.operation_id, operation_id);
     assert_eq!(decoded.value, expected);
-    let source = decoded.value.source_revision;
+    let source = decoded.value.facts.source_revision();
     assert_eq!(source.target.instance_id.as_str(), "ice");
     assert_eq!(source.target.namespace.as_ref(), "sales");
     assert_eq!(source.target.table.as_ref(), "orders_mv");
@@ -159,15 +121,6 @@ fn projection_codec_round_trips_complete_source_revision_and_waterline() {
             .and_then(|version| version.snapshot_id()),
         Some(11)
     );
-}
-
-#[test]
-fn projection_codec_rejects_an_incomplete_p_source_revision() {
-    let mut invalid = projection();
-    invalid.source_revision.publication_revision = None;
-    let error = encode_projection(Uuid::now_v7(), &invalid)
-        .expect_err("P revision and output version must remain indivisible");
-    assert!(error.contains("P revision and output-version presence must match"));
 }
 
 #[test]
@@ -228,9 +181,29 @@ fn schema_catalog_contains_exactly_four_current_accelerator_subjects() {
     );
     for subject in catalog.subjects() {
         assert!(catalog.entry(subject, 1).is_err());
-        assert_eq!(catalog.latest(subject).unwrap().id(), 2);
+        assert!(catalog.entry(subject, 2).is_err());
+        assert_eq!(catalog.latest(subject).unwrap().id(), 3);
     }
     assert!(catalog.entry("mv.definition", 4).is_err());
     assert!(catalog.entry("mv.refresh", 5).is_err());
     assert!(catalog.entry("mv.partition_state", 1).is_err());
+}
+
+#[test]
+fn canonical_root_rejects_tampered_output_payload_and_missing_document() {
+    let expected = projection();
+    let key = projection_by_id_key(expected.mv_id).unwrap();
+    let mut dto = super::StoredMvProjectionAvro::try_from(&expected).unwrap();
+    dto.output_version.as_mut().unwrap().payload =
+        serde_bytes::ByteBuf::from(b"different-output".to_vec());
+    let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &dto).unwrap();
+    assert!(
+        decode_projection(&key, &value)
+            .unwrap_err()
+            .contains("exact output")
+    );
+    let mut dto = super::StoredMvProjectionAvro::try_from(&expected).unwrap();
+    dto.configuration.clear();
+    let value = encode_record(MvRecordKind::Projection, Uuid::now_v7(), &dto).unwrap();
+    assert!(decode_projection(&key, &value).is_err());
 }

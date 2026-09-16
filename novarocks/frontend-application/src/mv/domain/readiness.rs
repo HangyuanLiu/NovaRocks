@@ -11,16 +11,17 @@
 
 use novarocks_mv_application::activity::CanonicalMvTarget;
 use novarocks_mv_application::readiness::{
-    MvCandidateReader as ProductCandidateReader, MvDropReadiness, MvReadinessService,
+    MvCandidateReader as ProductCandidateReader, MvCurrentProjectionRequest,
+    MvCurrentProjectionSource, MvDropReadiness, MvProjectionDeleteGuard, MvProjectionError,
+    MvProjectionInstallOutcome, MvReadOnlyCurrentProjectionSource, MvReadinessService,
 };
 use uuid::Uuid;
 
 use crate::mv::activity::canonical_mv_target;
-use crate::mv::domain::accelerator::projection_from_lake;
 use crate::mv::domain::storage_observation::MvLakePackageObservation;
-use novarocks_mv_application::dependency::MvDependencyObjectRef;
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::dependency::MvDependencyObjectIdentity;
 use novarocks_mv_application::persistence::dependency::StoredMvDependency;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::repository::{LoadedMvProjection, MvRepositoryError};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
@@ -84,21 +85,48 @@ impl MvReadinessPort {
 
     pub(crate) fn project_observed(
         &self,
-        operation_id: Uuid,
-        package: &MvLakePackageObservation,
+        _operation_id: Uuid,
+        _package: &MvLakePackageObservation,
     ) -> Result<(), MvRepositoryError> {
-        let target = canonical_target(package);
-        let projection = projection_from_lake(package).map_err(|error| {
+        Err(
             novarocks_mv_application::repository::MvRepositoryError::new(
                 novarocks_mv_application::repository::MvRepositoryErrorKind::Corruption,
-                error,
-            )
-        })?;
-        self.block_on(self.service.project(operation_id, target, projection))
+                "legacy MV lake package cannot install a canonical D/L/P/C projection",
+            ),
+        )
     }
 
-    pub(crate) fn quarantine(&self, target: CanonicalMvTarget, reason: String) {
-        self.service.quarantine(target, reason);
+    pub(crate) fn observe_current_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvCurrentProjectionSource,
+    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
+        self.block_on(
+            self.service
+                .observe_current_and_install(operation_id, request, source),
+        )
+    }
+
+    pub(crate) fn observe_current_read_only_and_install(
+        &self,
+        operation_id: Uuid,
+        request: MvCurrentProjectionRequest,
+        source: &dyn MvReadOnlyCurrentProjectionSource,
+    ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
+        self.block_on(self.service.observe_current_read_only_and_install(
+            operation_id,
+            request,
+            source,
+        ))
+    }
+
+    pub(crate) fn quarantine(
+        &self,
+        target: CanonicalMvTarget,
+        reason: String,
+    ) -> Result<(), MvProjectionError> {
+        self.block_on(self.service.invalidate_current(target, reason))
     }
 
     /// Isolate every retained projection in one catalog after an incomplete
@@ -108,8 +136,18 @@ impl MvReadinessPort {
         &self,
         catalog: &str,
         reason: String,
-    ) -> Result<(), MvRepositoryError> {
-        self.block_on(self.service.quarantine_catalog(catalog, reason))
+    ) -> Result<(), MvProjectionError> {
+        let projections =
+            self.block_on(self.service.candidate_reader().list_candidate_definitions())?;
+        for projection in projections {
+            if projection.facts.target().catalog() == Some(catalog) {
+                self.block_on(
+                    self.service
+                        .invalidate_current(projection.facts.target().clone(), reason.clone()),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn load_ready(
@@ -147,7 +185,7 @@ impl MvReadinessPort {
     /// accelerator data, not active semantic dependencies.
     pub(crate) fn ensure_no_ready_downstream_dependencies(
         &self,
-        upstream: &MvDependencyObjectRef,
+        upstream: &MvDependencyObjectIdentity,
     ) -> Result<(), MvRepositoryError> {
         self.block_on(
             self.service
@@ -155,17 +193,14 @@ impl MvReadinessPort {
         )
     }
 
-    /// Delete the current ready projection using its opaque loaded version.
-    /// DDL never fabricates a repository version or reads the Accelerator
-    /// behind the readiness boundary.
-    pub(crate) fn delete_ready_projection(
+    /// Reserve the exact repository expectation before any provider delete.
+    pub(crate) fn reserve_projection_delete(
         &self,
-        operation_id: Uuid,
         target: &MvTarget,
-    ) -> Result<bool, MvRepositoryError> {
+    ) -> Result<MvProjectionDeleteGuard, MvProjectionError> {
         self.block_on(
             self.service
-                .delete_ready_projection(operation_id, &canonical_mv_target(target)),
+                .reserve_projection_delete(canonical_mv_target(target)),
         )
     }
 
@@ -173,12 +208,11 @@ impl MvReadinessPort {
     pub(crate) fn prepare_drop(
         &self,
         target: &MvTarget,
-        upstream: &MvDependencyObjectRef,
         if_exists: bool,
-    ) -> Result<MvDropReadiness, MvRepositoryError> {
+    ) -> Result<MvDropReadiness, MvProjectionError> {
         self.block_on(
             self.service
-                .prepare_drop(&canonical_mv_target(target), upstream, if_exists),
+                .prepare_drop(&canonical_mv_target(target), if_exists),
         )
     }
 
@@ -186,12 +220,10 @@ impl MvReadinessPort {
     pub(crate) fn delete_after_provider_drop(
         &self,
         operation_id: Uuid,
-        target: &MvTarget,
-    ) -> Result<(), MvRepositoryError> {
-        self.block_on(
-            self.service
-                .delete_after_provider_drop(operation_id, &canonical_mv_target(target)),
-        )
+        guard: MvProjectionDeleteGuard,
+    ) -> Result<MvProjectionInstallOutcome, String> {
+        self.block_on(self.service.delete_after_provider_drop(operation_id, guard))
+            .map_err(|error| error.to_string())
     }
 
     /// Reject the test/harness-only whole-family Accelerator wipe while this
@@ -206,7 +238,7 @@ impl MvReadinessPort {
     /// Process readiness is deliberately left untouched: the wipe procedure's
     /// contract is that the runner restarts this FE immediately afterwards, and
     /// startup observation is the only permitted rebuild path.
-    pub(crate) fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError> {
+    pub(crate) fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvProjectionError> {
         self.block_on(self.service.wipe_accelerator(operation_id))
     }
 
@@ -216,7 +248,7 @@ impl MvReadinessPort {
         &self,
         operation_id: Uuid,
         target: &MvTarget,
-    ) -> Result<bool, MvRepositoryError> {
+    ) -> Result<bool, MvProjectionError> {
         self.block_on(
             self.service
                 .wipe_projection(operation_id, &canonical_mv_target(target)),
@@ -238,7 +270,7 @@ impl MvCandidateReader {
     /// revision are verified.
     pub(crate) fn list_candidate_definitions(
         &self,
-    ) -> Result<Vec<StoredMvDefinition>, MvRepositoryError> {
+    ) -> Result<Vec<StoredMvProjection>, MvRepositoryError> {
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| {
                 self.handle

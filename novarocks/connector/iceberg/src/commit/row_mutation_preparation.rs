@@ -606,6 +606,7 @@ mod tests {
             let payload = IcebergTablePayload {
                 namespace: "db".to_string(),
                 table: "t".to_string(),
+                metadata_location: None,
                 table_info,
                 metadata_columns: self.metadata_columns,
                 metadata_table_type: self.metadata_table_type,

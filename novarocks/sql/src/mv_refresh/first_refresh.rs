@@ -42,7 +42,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use self::sql_shape::SqlMvSnapshotPin;
+pub use self::sql_shape::{SqlMvSnapshotPin, SqlMvSnapshotPinOccurrence};
 use self::sql_shape::{
     branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
     prepare_union_projection_full_read_sql,
@@ -1481,7 +1481,7 @@ fn plain_join_first_refresh_logical_request<'a>(
 }
 
 fn build_join_first_refresh_append_logical_plan(
-    plan: crate::planner::logical::LogicalPlanNode,
+    mut plan: crate::planner::logical::LogicalPlanNode,
     mut factory: crate::column_id::ColumnRefFactory,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
@@ -1492,6 +1492,7 @@ fn build_join_first_refresh_append_logical_plan(
     ),
     String,
 > {
+    crate::planner::imv_rewrite::entrypoint::bind_definition_occurrences(&mut plan, snapshot)?;
     let (left, right) = join_base_snapshots(snapshot)?;
     let crate::planner::logical::LogicalPlanNode {
         kind, mut children, ..
@@ -1518,11 +1519,17 @@ fn build_join_first_refresh_append_logical_plan(
         })
         .collect::<Vec<_>>();
     validate_join_payload(snapshot, &payload_columns)?;
-    let left_scan = find_unique_base_scan(&input, &left.table, "left")?;
-    let right_scan = find_unique_base_scan(&input, &right.table, "right")?;
+    let left_scan = find_unique_base_scan(&input, left, "left")?;
+    let right_scan = find_unique_base_scan(&input, right, "right")?;
     let left_row_id = find_row_id_column(&left_scan, "left")?;
     let right_row_id = find_row_id_column(&right_scan, "right")?;
-    let key_pairs = join_key_pairs(snapshot, &left.table, &right.table, &left_scan, &right_scan)?;
+    let key_pairs = join_key_pairs(
+        snapshot,
+        left.occurrence_id,
+        right.occurrence_id,
+        &left_scan,
+        &right_scan,
+    )?;
     project.items.push(project_item(&left_row_id));
     project.items.push(project_item(&right_row_id));
     let input = crate::planner::logical::LogicalPlanNode::new(
@@ -1603,26 +1610,18 @@ fn join_base_snapshots(
     let left = snapshot
         .base_snapshots
         .iter()
-        .find(|base| {
-            base.table
-                .fqn()
-                .eq_ignore_ascii_case(&predicate.left.table_fqn)
-        })
+        .find(|base| base.occurrence_id == predicate.left.occurrence_id)
         .ok_or_else(|| {
             "join first-refresh left base is absent from the sealed snapshot".to_string()
         })?;
     let right = snapshot
         .base_snapshots
         .iter()
-        .find(|base| {
-            base.table
-                .fqn()
-                .eq_ignore_ascii_case(&predicate.right.table_fqn)
-        })
+        .find(|base| base.occurrence_id == predicate.right.occurrence_id)
         .ok_or_else(|| {
             "join first-refresh right base is absent from the sealed snapshot".to_string()
         })?;
-    if left.table.fqn().eq_ignore_ascii_case(&right.table.fqn()) {
+    if left.occurrence_id == right.occurrence_id {
         return Err("join first-refresh requires distinct left and right bases".to_string());
     }
     Ok((left, right))
@@ -1657,7 +1656,7 @@ struct JoinBaseScan {
 
 fn find_unique_base_scan(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_types::naming::TableIdentity,
+    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
     role: &str,
 ) -> Result<JoinBaseScan, String> {
     let mut scans = Vec::new();
@@ -1666,25 +1665,23 @@ fn find_unique_base_scan(
         [scan] => Ok(scan.clone()),
         [] => Err(format!(
             "join first-refresh cannot find {role} base scan {}",
-            base.fqn()
+            base.table.fqn()
         )),
         _ => Err(format!(
             "join first-refresh found multiple {role} base scans {}",
-            base.fqn()
+            base.table.fqn()
         )),
     }
 }
 
 fn collect_base_scans(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_types::naming::TableIdentity,
+    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
     scans: &mut Vec<JoinBaseScan>,
 ) {
     if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
         && let crate::planner::table::ScanSource::Sql(source) = &scan.table.source
-        && source.table.catalog.eq_ignore_ascii_case(&base.catalog)
-        && source.table.namespace.eq_ignore_ascii_case(&base.namespace)
-        && source.table.table.eq_ignore_ascii_case(&base.table)
+        && source.mv_occurrence == Some(base.occurrence_id)
     {
         scans.push(JoinBaseScan {
             columns: scan.columns.clone(),
@@ -1720,8 +1717,8 @@ fn find_row_id_column(
 
 fn join_key_pairs(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: &novarocks_types::naming::TableIdentity,
-    right: &novarocks_types::naming::TableIdentity,
+    left: crate::compiler::SqlMvRelationOccurrenceId,
+    right: crate::compiler::SqlMvRelationOccurrenceId,
     left_scan: &JoinBaseScan,
     right_scan: &JoinBaseScan,
 ) -> Result<Vec<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>, String>
@@ -1734,22 +1731,20 @@ fn join_key_pairs(
     join.predicates
         .iter()
         .map(|predicate| {
-            let (left_lineage, right_lineage) =
-                if predicate.left.table_fqn.eq_ignore_ascii_case(&left.fqn())
-                    && predicate.right.table_fqn.eq_ignore_ascii_case(&right.fqn())
-                {
-                    (&predicate.left, &predicate.right)
-                } else if predicate.left.table_fqn.eq_ignore_ascii_case(&right.fqn())
-                    && predicate.right.table_fqn.eq_ignore_ascii_case(&left.fqn())
-                {
-                    (&predicate.right, &predicate.left)
-                } else {
-                    return Err(
-                        "join first-refresh predicate does not align with sealed bases".to_string(),
-                    );
-                };
-            let left_name = base_field_name(snapshot, &left.fqn(), left_lineage.field_id)?;
-            let right_name = base_field_name(snapshot, &right.fqn(), right_lineage.field_id)?;
+            let (left_lineage, right_lineage) = if predicate.left.occurrence_id == left
+                && predicate.right.occurrence_id == right
+            {
+                (&predicate.left, &predicate.right)
+            } else if predicate.left.occurrence_id == right && predicate.right.occurrence_id == left
+            {
+                (&predicate.right, &predicate.left)
+            } else {
+                return Err(
+                    "join first-refresh predicate does not align with sealed bases".to_string(),
+                );
+            };
+            let left_name = base_field_name(snapshot, left, &left_lineage.field_id)?;
+            let right_name = base_field_name(snapshot, right, &right_lineage.field_id)?;
             Ok(
                 crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
                     left_column: find_unique_column(
@@ -1770,19 +1765,20 @@ fn join_key_pairs(
 
 fn base_field_name(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    table_fqn: &str,
-    field_id: i32,
+    occurrence: crate::compiler::SqlMvRelationOccurrenceId,
+    field_id: &bytes::Bytes,
 ) -> Result<String, String> {
     snapshot
         .schema_contract
         .bases
         .iter()
-        .find(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
-        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
+        .find(|base| base.occurrence_id == occurrence)
+        .and_then(|base| base.fields.iter().find(|field| &field.field_id == field_id))
         .map(|field| field.name_at_create.clone())
         .ok_or_else(|| {
             format!(
-                "join first-refresh lineage references unknown base field {table_fqn}#{field_id}"
+                "join first-refresh lineage references unknown occurrence {} field {field_id:?}",
+                occurrence.get()
             )
         })
 }
@@ -1821,6 +1817,8 @@ fn build_join_descriptor(
         source: descriptor::JoinRefreshOutputSource::Action(action_column.column_id),
     });
     Ok(descriptor::JoinRefreshDescriptor {
+        left_occurrence_id: join_base_snapshots(snapshot)?.0.occurrence_id,
+        right_occurrence_id: join_base_snapshots(snapshot)?.1.occurrence_id,
         mode: descriptor::JoinRefreshMode::Full,
         mv_identity: descriptor::JoinRefreshMvIdentity {
             catalog: snapshot.target.catalog.clone(),
@@ -2507,27 +2505,28 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<Vec<(SqlAggregateCalls, String)>, String> {
-    branch_union_queries(select_query, branch_count)?
-        .into_iter()
-        .enumerate()
-        .map(|(branch_index, (branch_query, _branch_sql))| {
-            let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
-            if branch_index == 0 && &branch_calls != first_branch_calls {
-                return Err(
-                    "branch UNION ALL aggregate first branch calls drifted from the validated contract"
-                        .to_string(),
-                );
-            }
-            let state_sql = prepare_aggregate_first_refresh_state_sql(
-                &branch_query,
-                &branch_calls,
-                pin,
-                current_catalog,
-                current_database,
-            )?;
-            Ok((branch_calls, state_sql))
-        })
-        .collect()
+    branch_union_queries(
+        select_query,
+        branch_count,
+        pin,
+        current_catalog,
+        current_database,
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(branch_index, (branch_query, _branch_sql))| {
+        let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
+        if branch_index == 0 && &branch_calls != first_branch_calls {
+            return Err(
+                "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                    .to_string(),
+            );
+        }
+        let state_query = rewrite_select_sql_for_state(&branch_query, &branch_calls)?;
+        let state_sql = novarocks_parser::printer::print_query(&state_query);
+        Ok((branch_calls, state_sql))
+    })
+    .collect()
 }
 
 fn aggregate_physical_sql(
@@ -3188,7 +3187,7 @@ mod tests {
     }
 
     fn pin() -> SqlMvSnapshotPin {
-        SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
+        SqlMvSnapshotPin::from_entries_for_tests(&[(7, "ice.db.fact", 42, "fact-uuid")])
     }
 
     fn aggregate_calls(sql: &str) -> crate::planning::mv::SqlMvAggregateCalls {
@@ -3236,8 +3235,8 @@ mod tests {
         let aggregate_shape = aggregate_calls(aggregate_sql);
         let union_sql = "SELECT v FROM ice.db.a UNION ALL SELECT v FROM ice.db.b";
         let union_pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let branch_sql = "SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k UNION ALL SELECT k, sum(v) AS total FROM ice.db.b GROUP BY k";
         let branch_calls = aggregate_calls("SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k");
@@ -3428,8 +3427,8 @@ mod tests {
         let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let prepared = prepare_fan_in_aggregate_first_refresh_write_sql(
             &query,
@@ -3459,8 +3458,8 @@ mod tests {
                 &query,
                 &calls,
                 &SqlMvSnapshotPin::from_entries_for_tests(&[
-                    ("ice.db.a", 11, "a"),
-                    ("ice.db.b", 22, "b"),
+                    (7, "ice.db.a", 11, "a"),
+                    (42, "ice.db.b", 22, "b"),
                 ]),
                 Some("ice"),
                 "db",
@@ -3477,8 +3476,8 @@ mod tests {
         let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let prepared = prepare_composed_aggregate_first_refresh_write_sql(
             &query,

@@ -44,7 +44,7 @@ async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_del
         .replace_projection(
             uuid::Uuid::now_v7(),
             ReplaceMvProjectionRequest {
-                mv_id: created.definition.mv_id,
+                mv_id: created.projection.mv_id,
                 expected_version: created.version.clone(),
                 projection: tests_definition::projection_request(
                     "orders_mv",
@@ -60,9 +60,9 @@ async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_del
         .delete_projection(
             uuid::Uuid::now_v7(),
             DeleteMvProjectionRequest {
-                mv_id: created.definition.mv_id,
+                mv_id: created.projection.mv_id,
                 expected_version: created.version,
-                expected_source_revision: created.definition.source_revision,
+                expected_source_revision: created.projection.facts.source_revision().clone(),
             },
         )
         .await
@@ -73,9 +73,9 @@ async fn provider_neutral_port_exposes_only_whole_projection_cas_and_guarded_del
         .delete_projection(
             uuid::Uuid::now_v7(),
             DeleteMvProjectionRequest {
-                mv_id: replaced.definition.mv_id,
+                mv_id: replaced.projection.mv_id,
                 expected_version: replaced.version,
-                expected_source_revision: replaced.definition.source_revision,
+                expected_source_revision: replaced.projection.facts.source_revision().clone(),
             },
         )
         .await

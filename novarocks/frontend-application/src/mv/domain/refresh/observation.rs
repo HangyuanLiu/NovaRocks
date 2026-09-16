@@ -15,97 +15,55 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Refresh-time schema and base-state observations over explicit Core ports.
+//! Refresh schema observations from retained provider metadata and canonical D/L.
 
-use crate::mv::domain::analysis::{
-    canonicalize_iceberg_mv_select_query, rebind::rewrite_select_sql_for_rebind,
+use crate::mv::domain::refresh::schema_contract::{
+    MvOccurrenceFieldRebind, validate_projection_target, validate_relation_occurrence_schema,
 };
-use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
-use crate::mv::domain::refresh::definition::parse_mv_select_query;
-use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use crate::mv::domain::schema_validation::{
-    ContractDecision, JoinContractDecision, validate_join_schema_contract, validate_schema_contract,
-};
 use crate::mv::domain::storage_observation::{
     MvRefreshBaseObservation, MvSchemaValidationObservation,
 };
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
-use novarocks_spi::connector::MvStorageObservationPort;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
+use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_spi::connector::{
-    ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+    ConnectorControlResolver, ConnectorRequestContext, ConnectorTableResolution,
+    MvStorageObservationPort,
 };
 use novarocks_types::naming::TableIdentity;
-use std::sync::Arc;
 
-fn derive_rebind_query_source(
-    query_definition: &novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
-) -> Result<String, String> {
-    let query = parse_mv_select_query(&query_definition.raw_query_source)?;
-    Ok(novarocks_parser::printer::print_query(
-        &canonicalize_iceberg_mv_select_query(
-            &query,
-            Some(query_definition.resolution.default_catalog.as_str()),
-            &query_definition.resolution.default_database,
-        ),
-    ))
-}
-
-/// Loads the current schema facts used to validate a persisted MV contract.
+/// No second Current capture is allowed: object, metadata version, schema and
+/// fields all come from the provider's same retained handle.
 pub(crate) fn observe_schema_validation_for_table(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
     connector_context: &ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, String> {
-    let exact_lease =
+    let lease =
         crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;
     let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
+        &lease,
         connector_context.clone(),
         &table.namespace,
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let observation = crate::mv::domain::storage_observation::observe_schema_validation(
+    let observed = crate::mv::domain::storage_observation::observe_schema_validation(
         storage_observation,
-        &exact_lease,
+        &lease,
         &metadata,
         connector_context.clone(),
     )
-    .map_err(|error| {
-        format!(
-            "observe MV schema validation facts for {}: {error}",
-            table.fqn()
-        )
-    })?;
-    let instance_id = ConnectorInstanceId::parse(&table.catalog)
-        .map_err(|error| format!("parse connector instance for {}: {error}", table.fqn()))?;
-    let captured = exact_lease
-        .binding()
-        .metadata()
-        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
-            table: ConnectorTableIdentity {
-                instance_id,
-                namespace: Arc::from(table.namespace.as_str()),
-                table: Arc::from(table.table.as_str()),
-            },
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            selector: ConnectorTableObjectSelector::Current,
-            context: connector_context.clone(),
-        })
-        .map_err(|error| {
-            format!(
-                "capture MV table object binding for {}: {error}",
-                table.fqn()
-            )
-        })?;
-    Ok(observation.with_table_object_id(captured.object_id))
+    .map_err(|error| format!("observe exact MV schema for {}: {error}", table.fqn()))?;
+    if observed.table() != &metadata.identity {
+        return Err(
+            "MV schema observation does not match the retained metadata locator".to_string(),
+        );
+    }
+    Ok(observed)
 }
 
-/// Loads the current base-table refresh facts without admitting query assembly
-/// dependencies into refresh-domain planning.
 pub(crate) fn observe_current_refresh_base(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
@@ -120,170 +78,114 @@ pub(crate) fn observe_current_refresh_base(
     )
 }
 
-/// Revalidates a persisted definition against the exact leaf observations
-/// needed by refresh planning. This is MV-domain schema work; it deliberately
-/// receives the individual observation ports rather than a query-assembly
-/// source object.
-pub(crate) fn rebind_mv_definition_before_refresh_derivation(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+/// Collects exact target runtime bindings and every occurrence-local rename.
+/// The caller owns SQL rewriting; duplicate physical inputs are never coalesced.
+pub(crate) fn observe_refresh_schema(
+    connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    mv_definition: &StoredMvDefinition,
+    projection: &StoredMvProjection,
     base_refs: &[TableIdentity],
     target: &IcebergMvTarget,
     retained_target_observation: Option<&MvSchemaValidationObservation>,
     connector_context: &ConnectorRequestContext,
-) -> Result<(StoredMvDefinition, String), String> {
-    let Some(contract) = mv_definition.schema_contract.as_ref() else {
-        return Ok((
-            mv_definition.clone(),
-            mv_definition.query_definition.raw_query_source.clone(),
-        ));
-    };
-    let caps = RefreshCapabilities::from_schema_contract(contract)?;
-    let target_ref = TableIdentity {
-        catalog: target.catalog.clone(),
-        namespace: target.namespace.clone(),
-        table: target.table.clone(),
-    };
-    match caps.snapshot_policy {
-        BaseSnapshotPolicy::SingleBase => {
-            let [base_ref] = base_refs else {
-                return Err("single-base MV refresh has an invalid base reference set".to_string());
-            };
-            let base_observation = observe_schema_validation_for_table(
+) -> Result<(MvRuntimeBindings, Vec<MvOccurrenceFieldRebind>), String> {
+    let loaded_target;
+    let target_observation = match retained_target_observation {
+        Some(observation) => observation,
+        None => {
+            loaded_target = observe_schema_validation_for_table(
                 connector_control,
                 storage_observation,
-                base_ref,
+                &TableIdentity {
+                    catalog: target.catalog.clone(),
+                    namespace: target.namespace.clone(),
+                    table: target.table.clone(),
+                },
                 connector_context,
             )?;
-            let loaded_target_observation;
-            let target_observation = match retained_target_observation {
-                Some(observation) => observation,
-                None => {
-                    loaded_target_observation = observe_schema_validation_for_table(
-                        connector_control,
-                        storage_observation,
-                        &target_ref,
-                        connector_context,
-                    )?;
-                    &loaded_target_observation
-                }
-            };
-            match validate_schema_contract(contract, &base_observation, target_observation) {
-                ContractDecision::Incompatible(error) => Err(error.to_string()),
-                ContractDecision::CompatibleSafe => Ok((
-                    mv_definition.clone(),
-                    mv_definition.query_definition.raw_query_source.clone(),
-                )),
-                ContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
-                    mv_definition.clone(),
-                    rewrite_select_sql_for_rebind(
-                        &derive_rebind_query_source(&mv_definition.query_definition)?,
-                        &rebound_columns,
-                    )?,
-                )),
-            }
+            &loaded_target
         }
-        BaseSnapshotPolicy::JoinPairPartialInitialSkip => {
-            let [left_ref, right_ref] = base_refs else {
-                return Err("join MV refresh has an invalid base reference set".to_string());
-            };
-            let left_observation = observe_schema_validation_for_table(
-                connector_control,
-                storage_observation,
-                left_ref,
-                connector_context,
-            )?;
-            let right_observation = observe_schema_validation_for_table(
-                connector_control,
-                storage_observation,
-                right_ref,
-                connector_context,
-            )?;
-            let loaded_target_observation;
-            let target_observation = match retained_target_observation {
-                Some(observation) => observation,
-                None => {
-                    loaded_target_observation = observe_schema_validation_for_table(
-                        connector_control,
-                        storage_observation,
-                        &target_ref,
-                        connector_context,
-                    )?;
-                    &loaded_target_observation
-                }
-            };
-            let left_fqn = left_ref.fqn();
-            let right_fqn = right_ref.fqn();
-            match validate_join_schema_contract(
-                contract,
-                &[
-                    (left_fqn.as_str(), left_observation),
-                    (right_fqn.as_str(), right_observation),
-                ],
-                target_observation,
-            )
-            .map_err(|error| error.to_string())?
-            {
-                JoinContractDecision::CompatibleSafe => Ok((
-                    mv_definition.clone(),
-                    mv_definition.query_definition.raw_query_source.clone(),
-                )),
-                JoinContractDecision::CompatibleSafeWithRebind { rebound_columns } => Ok((
-                    mv_definition.clone(),
-                    rewrite_select_sql_for_rebind(
-                        &derive_rebind_query_source(&mv_definition.query_definition)?,
-                        &rebound_columns,
-                    )?,
-                )),
-            }
+    };
+    let bindings = validate_projection_target(projection, target_observation)?;
+    let occurrences = &projection.facts.definition().relation_occurrences;
+    if occurrences.len() != base_refs.len() {
+        return Err("MV refresh source references do not retain every D occurrence".to_string());
+    }
+    let mut renames = Vec::new();
+    for (occurrence, table) in occurrences.iter().zip(base_refs) {
+        if occurrence.catalog_at_binding != table.catalog
+            || occurrence.namespace_at_binding != table.namespace
+            || occurrence.relation_at_binding != table.table
+        {
+            return Err(format!(
+                "MV refresh source locator does not match occurrence {}",
+                occurrence.occurrence_id
+            ));
         }
-        BaseSnapshotPolicy::AllBasesRequired => Ok((
-            mv_definition.clone(),
-            mv_definition.query_definition.raw_query_source.clone(),
-        )),
+        let observed = observe_schema_validation_for_table(
+            connector_control,
+            storage_observation,
+            table,
+            connector_context,
+        )?;
+        renames.extend(validate_relation_occurrence_schema(occurrence, &observed)?);
+    }
+    Ok((bindings, renames))
+}
+
+/// Until the SQL occurrence-aware rewriter is connected, renamed fields fail
+/// closed. The canonical document is never changed to pretend a rebind occurred.
+pub(crate) fn rebind_mv_definition_before_refresh_derivation(
+    connector_control: &dyn ConnectorControlResolver,
+    storage_observation: &dyn MvStorageObservationPort,
+    projection: &StoredMvProjection,
+    base_refs: &[TableIdentity],
+    target: &IcebergMvTarget,
+    retained_target_observation: Option<&MvSchemaValidationObservation>,
+    connector_context: &ConnectorRequestContext,
+) -> Result<(StoredMvProjection, String), String> {
+    let (_, renames) = observe_refresh_schema(
+        connector_control,
+        storage_observation,
+        projection,
+        base_refs,
+        target,
+        retained_target_observation,
+        connector_context,
+    )?;
+    require_occurrence_rewriter(&renames)?;
+    Ok((
+        projection.clone(),
+        projection.facts.definition().query.effective_sql.clone(),
+    ))
+}
+
+fn require_occurrence_rewriter(renames: &[MvOccurrenceFieldRebind]) -> Result<(), String> {
+    if renames.is_empty() {
+        Ok(())
+    } else {
+        Err("MV refresh requires occurrence-aware SQL field rebinding".to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::analysis::rebind::RebindColumn;
-    use novarocks_query_application::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
+    use novarocks_mv_application::persistence::identity::FieldIdentity;
 
     #[test]
-    fn rebind_source_uses_frozen_context_without_rewriting_raw_definition() {
-        let raw = "SELECT d.region, SUM(f.amount) AS total FROM fact AS f JOIN dim AS d ON f.dim_id = d.id GROUP BY d.region";
-        let definition =
-            PersistedQueryDefinition::new(raw, PersistedQueryDialect::StarRocks, "ice", "sales")
-                .expect("definition should be valid");
-
-        let derived = derive_rebind_query_source(&definition).expect("derive rebind source");
-        assert!(derived.contains("ice.sales.fact AS f"), "{derived}");
-        assert!(derived.contains("ice.sales.dim AS d"), "{derived}");
-        assert_eq!(definition.raw_query_source, raw);
-
-        let rewritten = rewrite_select_sql_for_rebind(
-            &derived,
-            &[
-                RebindColumn {
-                    base_table_fqn: "ice.sales.fact".to_string(),
-                    field_id: 2,
-                    name_at_create: "dim_id".to_string(),
-                    current_name: "new_dim_id".to_string(),
-                },
-                RebindColumn {
-                    base_table_fqn: "ice.sales.dim".to_string(),
-                    field_id: 3,
-                    name_at_create: "region".to_string(),
-                    current_name: "area".to_string(),
-                },
-            ],
-        )
-        .expect("qualified derived source should rebind");
-        assert!(rewritten.contains("f.new_dim_id"), "{rewritten}");
-        assert!(rewritten.contains("d.area AS region"), "{rewritten}");
+    fn renamed_fields_cannot_fall_back_to_the_stored_sql() {
+        let rename = MvOccurrenceFieldRebind {
+            occurrence_id: 7,
+            field_id: FieldIdentity::try_new(vec![0xff, 1]).unwrap(),
+            qualifier_at_binding: "left_input".to_string(),
+            name_at_binding: "old_name".to_string(),
+            current_name: "new_name".to_string(),
+        };
+        assert!(require_occurrence_rewriter(&[]).is_ok());
+        assert_eq!(
+            require_occurrence_rewriter(&[rename]).unwrap_err(),
+            "MV refresh requires occurrence-aware SQL field rebinding"
+        );
     }
 }

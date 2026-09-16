@@ -50,7 +50,27 @@ pub fn persist_exact_query_revision(
     Ok((object, data))
 }
 
-pub(crate) fn restore_exact_query_revision(
+/// Persist one provider-issued exact semantic revision without translating it
+/// through a query-local binding receipt. Scheduler and maintenance paths
+/// already hold the connector's sealed revision, so this preserves the same
+/// complete provider/format/version/value tuple without inventing a second
+/// identity conversion.
+pub fn persist_exact_connector_revision(
+    revision: &ConnectorExactSemanticRevision,
+) -> Result<(MvObjectIdentity, NativeDataVersion), ConnectorError> {
+    let object = revision.object_identity();
+    let data = revision.data_version();
+    if object.provider() != data.provider() {
+        return invalid("exact connector revision facts belong to different providers");
+    }
+    let object = MvObjectIdentity::try_new(encode_connector_fact(object)?)
+        .map_err(|error| invalid_error(error.to_string()))?;
+    let data = NativeDataVersion::try_new(encode_connector_fact(data)?)
+        .map_err(|error| invalid_error(error.to_string()))?;
+    Ok((object, data))
+}
+
+pub fn restore_exact_query_revision(
     object: &MvObjectIdentity,
     data: &NativeDataVersion,
 ) -> Result<ConnectorExactSemanticRevision, ConnectorError> {
@@ -92,6 +112,49 @@ fn encode_fact(format: &ProviderFactFormat, value: &[u8]) -> Result<Vec<u8>, Con
     push_len(&mut encoded, format_name.len())?;
     encoded.extend_from_slice(format_name);
     encoded.extend_from_slice(&format.version().to_be_bytes());
+    push_len(&mut encoded, value.len())?;
+    encoded.extend_from_slice(value);
+    Ok(encoded)
+}
+
+fn encode_connector_fact(
+    fact: &novarocks_spi::connector::ConnectorSemanticFact,
+) -> Result<Vec<u8>, ConnectorError> {
+    encode_fact_parts(
+        fact.provider().as_str(),
+        fact.format(),
+        fact.version(),
+        fact.value().as_ref(),
+    )
+}
+
+fn encode_fact_parts(
+    provider: &str,
+    format_name: &str,
+    version: u16,
+    value: &[u8],
+) -> Result<Vec<u8>, ConnectorError> {
+    let provider = provider.as_bytes();
+    let format_name = format_name.as_bytes();
+    if provider.is_empty()
+        || provider.len() > u16::MAX as usize
+        || format_name.is_empty()
+        || format_name.len() > MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES
+        || value.is_empty()
+        || value.len() > MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES
+        || version == 0
+    {
+        return invalid("exact revision fact is outside the persistence bounds");
+    }
+    let mut encoded = Vec::with_capacity(
+        FACT_ENVELOPE_MAGIC.len() + 8 + provider.len() + format_name.len() + value.len(),
+    );
+    encoded.extend_from_slice(FACT_ENVELOPE_MAGIC);
+    push_len(&mut encoded, provider.len())?;
+    encoded.extend_from_slice(provider);
+    push_len(&mut encoded, format_name.len())?;
+    encoded.extend_from_slice(format_name);
+    encoded.extend_from_slice(&version.to_be_bytes());
     push_len(&mut encoded, value.len())?;
     encoded.extend_from_slice(value);
     Ok(encoded)

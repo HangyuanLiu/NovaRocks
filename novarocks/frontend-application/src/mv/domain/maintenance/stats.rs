@@ -27,10 +27,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableResolution,
+    ConnectorExactSemanticRevision, ConnectorInstanceId, ConnectorReadSelector,
+    ConnectorTableIdentity, ConnectorTableResolution,
 };
 
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::exact_revision::{
+    persist_exact_connector_revision, restore_exact_query_revision,
+};
+use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SnapshotInfo {
@@ -65,23 +69,57 @@ pub(crate) struct DownstreamFloor {
     pub(crate) unknown: bool,
 }
 
-/// Minimum published consumed-snapshot timestamp across all MV definitions
-/// that read `table_fqn` incrementally. A consumer pointing at a snapshot we
-/// cannot resolve marks the floor unknown, which blocks expire for safety.
+/// Minimum published consumed-version timestamp across every durable relation
+/// occurrence that reads this exact table object. A name match never revives a
+/// dependency on a replaced object, while an unresolved version of the current
+/// object blocks expiration for safety.
 pub(crate) fn downstream_floor(
-    definitions: &[StoredMvDefinition],
-    table_fqn: &str,
-    snapshot_ts_by_id: &BTreeMap<i64, i64>,
+    projections: &[StoredMvProjection],
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+    current_revision: &ConnectorExactSemanticRevision,
+    timestamp_by_revision: &BTreeMap<ConnectorExactSemanticRevision, i64>,
 ) -> DownstreamFloor {
     let mut floor_ts: Option<i64> = None;
     let mut unknown = false;
-    let mut consider = |snapshot_id: i64| match snapshot_ts_by_id.get(&snapshot_id) {
-        Some(ts) => floor_ts = Some(floor_ts.map_or(*ts, |f| f.min(*ts))),
-        None => unknown = true,
-    };
-    for definition in definitions {
-        if let Some(id) = definition.last_refresh_snapshots.get(table_fqn) {
-            consider(*id);
+    for projection in projections {
+        let MvPublicationState::Published(publication) = projection.facts.publication() else {
+            continue;
+        };
+        let inputs = publication
+            .document()
+            .inputs
+            .iter()
+            .map(|input| (input.relation_occurrence_id, input))
+            .collect::<BTreeMap<_, _>>();
+        for occurrence in projection
+            .facts
+            .definition()
+            .relation_occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.catalog_at_binding == catalog
+                    && occurrence.namespace_at_binding == namespace
+                    && occurrence.relation_at_binding == table
+            })
+        {
+            let Some(input) = inputs.get(&occurrence.occurrence_id) else {
+                unknown = true;
+                continue;
+            };
+            let Ok(revision) =
+                restore_exact_query_revision(&input.object_id, &input.native_data_version)
+            else {
+                unknown = true;
+                continue;
+            };
+            if revision.object_identity() == current_revision.object_identity() {
+                match timestamp_by_revision.get(&revision) {
+                    Some(ts) => floor_ts = Some(floor_ts.map_or(*ts, |floor| floor.min(*ts))),
+                    None => unknown = true,
+                }
+            }
         }
     }
     DownstreamFloor {
@@ -91,7 +129,8 @@ pub(crate) fn downstream_floor(
 }
 
 /// Read one MV storage table's maintenance facts through the neutral surface.
-/// `definitions` is the full MV list from the same pass, used for the floor.
+/// `projections` is the full ready MV list from the same pass, used for the
+/// downstream floor.
 ///
 /// The compaction observation runs first on purpose. Answering it forces the
 /// provider to discard its cached table and re-read the catalog, and the
@@ -108,7 +147,7 @@ pub fn collect_table_stats_with_ports(
     catalog: &str,
     namespace: &str,
     table: &str,
-    definitions: &[StoredMvDefinition],
+    projections: &[StoredMvProjection],
 ) -> Result<TableMaintenanceStats, String> {
     let context = crate::connector::connector_request_context(
         None,
@@ -161,13 +200,41 @@ pub fn collect_table_stats_with_ports(
             timestamp_ms: snapshot.timestamp_ms,
         })
         .collect();
-    let snapshot_ts_by_id: BTreeMap<i64, i64> = snapshots
+    let current_revision = exact_lease
+        .binding()
+        .metadata()
+        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+        .map_err(|error| {
+            format!("observe exact {catalog}.{namespace}.{table} maintenance identity: {error}")
+        })?;
+    let timestamp_by_revision = snapshots
         .iter()
-        .map(|snapshot| (snapshot.snapshot_id, snapshot.timestamp_ms))
-        .collect();
+        .map(|snapshot| {
+            exact_lease
+                .binding()
+                .metadata()
+                .exact_semantic_revision(
+                    &metadata.table,
+                    ConnectorReadSelector::SnapshotId(snapshot.snapshot_id),
+                )
+                .map(|revision| (revision, snapshot.timestamp_ms))
+                .map_err(|error| {
+                    format!(
+                        "observe exact {catalog}.{namespace}.{table} snapshot {}: {error}",
+                        snapshot.snapshot_id
+                    )
+                })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-    let fqn = format!("{catalog}.{namespace}.{table}");
-    let floor = downstream_floor(definitions, &fqn, &snapshot_ts_by_id);
+    let floor = downstream_floor(
+        projections,
+        catalog,
+        namespace,
+        table,
+        &current_revision,
+        &timestamp_by_revision,
+    );
     let policy = *observed.policy();
 
     Ok(TableMaintenanceStats {
@@ -190,67 +257,74 @@ pub fn collect_table_stats_with_ports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_mv_application::persistence::definition::{
-        MvDesiredRefreshPolicy, StoredMvDefinition, test_source_revision,
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::{
+        projection::StoredMvProjection, test_support::ProjectionFixture,
     };
-    use novarocks_query_application::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
-    use std::collections::BTreeMap;
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_spi::connector::{ConnectorProviderId, ConnectorTableObjectId};
 
-    fn definition_with_consumed(fqn: &str, snapshot_id: i64) -> StoredMvDefinition {
-        let mut last_refresh_snapshots = BTreeMap::new();
-        last_refresh_snapshots.insert(fqn.to_string(), snapshot_id);
-        StoredMvDefinition {
-            mv_id: 1,
-            query_definition: PersistedQueryDefinition::new(
-                "SELECT 1",
-                PersistedQueryDialect::StarRocks,
-                "ice",
-                "analytics",
-            )
-            .unwrap(),
-            base_table_refs: vec![fqn.to_string()],
-            primary_key_columns: vec![],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("ice".to_string()),
-            target_namespace: Some("analytics".to_string()),
-            target_table: Some("mv_x".to_string()),
-            schema_contract: None,
-            partition_spec: None,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots,
-            last_refresh_table_object_ids: BTreeMap::new(),
-            last_refreshed_iceberg_snapshot_id: None,
-            refresh_policy: MvDesiredRefreshPolicy::Manual,
-            refresh_paused: false,
-            refresh_interval_ms: None,
-            max_staleness_ms: None,
-            created_at_ms: 0,
-            source_revision: test_source_revision(
-                "ice",
-                "analytics",
-                "mv_x",
-                novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                    bytes::Bytes::from_static(b"maintenance-test-target"),
-                )
-                .expect("test object ID"),
-                None,
-            ),
+    fn exact(object: &'static [u8], snapshot_id: i64) -> ConnectorExactSemanticRevision {
+        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            ConnectorProviderId::parse("iceberg").unwrap(),
+            &ConnectorTableObjectId::try_new(Bytes::from_static(object)).unwrap(),
+            Some(snapshot_id),
+        )
+        .unwrap()
+    }
+
+    fn projection(
+        mv_id: i64,
+        relation: &str,
+        object: &'static [u8],
+        snapshots: [i64; 2],
+    ) -> StoredMvProjection {
+        let target_name = format!("mv_{mv_id}");
+        let mut fixture = ProjectionFixture::new(
+            MvTarget::from_parts(Some("ice"), "analytics", &target_name),
+            Some(11),
+        );
+        for (index, occurrence) in fixture
+            .definition
+            .relation_occurrences
+            .iter_mut()
+            .enumerate()
+        {
+            occurrence.relation_at_binding = relation.to_string();
+            let revision = exact(object, snapshots[index]);
+            let (object_id, data_version) = persist_exact_connector_revision(&revision).unwrap();
+            occurrence.object_id = object_id.clone();
+            let input = fixture
+                .publication
+                .as_mut()
+                .unwrap()
+                .inputs
+                .iter_mut()
+                .find(|input| input.relation_occurrence_id == occurrence.occurrence_id)
+                .unwrap();
+            input.object_id = object_id;
+            input.native_data_version = data_version;
+        }
+        StoredMvProjection {
+            mv_id,
+            facts: fixture.build().unwrap(),
         }
     }
 
     #[test]
-    fn floor_is_min_consumed_snapshot_timestamp() {
-        let mut ts_by_id = BTreeMap::new();
-        ts_by_id.insert(10, 1_000);
-        ts_by_id.insert(20, 2_000);
-        let defs = vec![
-            definition_with_consumed("ice.sales.t", 20),
-            definition_with_consumed("ice.sales.t", 10),
-        ];
-        let floor = downstream_floor(&defs, "ice.sales.t", &ts_by_id);
+    fn floor_is_min_consumed_version_timestamp_across_occurrences() {
+        let current = exact(b"source", 30);
+        let timestamp_by_revision =
+            BTreeMap::from([(exact(b"source", 10), 1_000), (exact(b"source", 20), 2_000)]);
+        let projections = vec![projection(1, "orders", b"source", [20, 10])];
+        let floor = downstream_floor(
+            &projections,
+            "ice",
+            "sales",
+            "orders",
+            &current,
+            &timestamp_by_revision,
+        );
         assert_eq!(
             floor,
             DownstreamFloor {
@@ -262,8 +336,16 @@ mod tests {
 
     #[test]
     fn floor_is_none_without_consumers() {
-        let defs = vec![definition_with_consumed("ice.sales.other", 10)];
-        let floor = downstream_floor(&defs, "ice.sales.t", &BTreeMap::new());
+        let current = exact(b"source", 30);
+        let projections = vec![projection(1, "other", b"source", [10, 10])];
+        let floor = downstream_floor(
+            &projections,
+            "ice",
+            "sales",
+            "orders",
+            &current,
+            &BTreeMap::new(),
+        );
         assert_eq!(
             floor,
             DownstreamFloor {
@@ -274,9 +356,38 @@ mod tests {
     }
 
     #[test]
-    fn floor_unknown_when_consumed_snapshot_missing_from_metadata() {
-        let defs = vec![definition_with_consumed("ice.sales.t", 99)];
-        let floor = downstream_floor(&defs, "ice.sales.t", &BTreeMap::new());
+    fn floor_unknown_when_current_object_consumed_version_is_not_retained() {
+        let current = exact(b"source", 30);
+        let projections = vec![projection(1, "orders", b"source", [99, 99])];
+        let floor = downstream_floor(
+            &projections,
+            "ice",
+            "sales",
+            "orders",
+            &current,
+            &BTreeMap::new(),
+        );
         assert!(floor.unknown);
+    }
+
+    #[test]
+    fn replaced_object_does_not_hold_the_new_objects_snapshots() {
+        let current = exact(b"new-source", 30);
+        let projections = vec![projection(1, "orders", b"old-source", [10, 10])];
+        let floor = downstream_floor(
+            &projections,
+            "ice",
+            "sales",
+            "orders",
+            &current,
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            floor,
+            DownstreamFloor {
+                floor_ts_ms: None,
+                unknown: false,
+            }
+        );
     }
 }

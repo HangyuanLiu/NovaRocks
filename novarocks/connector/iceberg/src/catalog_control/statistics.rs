@@ -1682,6 +1682,7 @@ mod tests {
         IcebergTablePayload {
             namespace: "db".to_string(),
             table: "t".to_string(),
+            metadata_location: None,
             table_info: None,
             metadata_columns: Vec::new(),
             metadata_table_type: None,

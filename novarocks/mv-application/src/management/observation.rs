@@ -49,11 +49,11 @@ impl ManagementObservationAuthorization {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(super) struct ManagementObservationLiveness(Arc<AtomicBool>);
 
 impl ManagementObservationLiveness {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(Arc::new(AtomicBool::new(true)))
     }
 

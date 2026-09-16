@@ -1272,12 +1272,13 @@ pub(crate) mod tests {
         .unwrap();
         let receipts = ExactBindingReceiptStore::new(&allocator);
         for selected in action.input_mapping() {
-            receipts.register_for_test(
-                selected.binding(),
-                publication_binding(
-                    &action.publication_inputs()[selected.publication_input_ordinal()],
-                ),
-            );
+            let expected = action
+                .publication_inputs()
+                .iter()
+                .find(|input| input.occurrence_id() == selected.definition_occurrence_id())
+                .expect("test selection names a publication occurrence");
+            receipts
+                .register_for_test(selected.binding(), publication_binding(expected.relation()));
         }
         let selected = crate::preparation::prove_selected_mv_query_inputs(
             crate::api::QueryConsistency::Strict,

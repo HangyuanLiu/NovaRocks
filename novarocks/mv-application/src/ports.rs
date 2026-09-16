@@ -24,7 +24,7 @@ use crate::product::{
     MvProductErrorKind, MvRefreshAttemptIdentity, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
-use crate::readiness::MvDropReadiness;
+use crate::readiness::{MvDropReadiness, MvProjectionDeleteGuard};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MvProviderFailureKind {
@@ -172,7 +172,7 @@ pub trait MvDropProjectionPort: Send + Sync {
     fn delete_after_provider_drop(
         &self,
         operation: MvOperationContext,
-        target: &MvTarget,
+        guard: MvProjectionDeleteGuard,
     ) -> Result<(), MvProviderFailure>;
 }
 

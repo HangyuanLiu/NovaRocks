@@ -21,13 +21,12 @@ use novarocks_state_store_runtime::PersistentStateFamily;
 
 /// Frozen StateStore identity owned by the MV application.
 ///
-/// UEA-7 deliberately starts a new physical family because the v2 source
-/// revision is not compatible with the retired descriptor/snapshot record.
-/// No v1 prefix is registered or read by the application.
+/// Canonical domain documents replace the retired descriptor-shaped roots.
+/// No older physical family is registered or read by the application.
 pub const MV_ACCELERATOR_STATE_FAMILY: PersistentStateFamily = PersistentStateFamily::new(
     "mv-application/accelerator",
-    "novarocks/frontend/mv/accelerator/v2",
-    2,
+    "novarocks/frontend/mv/accelerator/v3",
+    3,
 );
 
 #[cfg(test)]
@@ -35,11 +34,11 @@ mod tests {
     use super::MV_ACCELERATOR_STATE_FAMILY;
 
     #[test]
-    fn accelerator_family_exposes_only_the_v2_identity() {
+    fn accelerator_family_exposes_only_the_current_identity() {
         assert_eq!(
             MV_ACCELERATOR_STATE_FAMILY.prefix(),
-            "novarocks/frontend/mv/accelerator/v2"
+            "novarocks/frontend/mv/accelerator/v3"
         );
-        assert_eq!(MV_ACCELERATOR_STATE_FAMILY.record_version(), 2);
+        assert_eq!(MV_ACCELERATOR_STATE_FAMILY.record_version(), 3);
     }
 }

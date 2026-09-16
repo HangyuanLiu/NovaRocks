@@ -377,7 +377,6 @@ async fn build_frontend_role_products(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
-        Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)

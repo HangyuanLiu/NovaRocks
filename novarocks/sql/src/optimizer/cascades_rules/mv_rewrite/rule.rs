@@ -546,7 +546,7 @@ fn selected_candidate_marker(
         source.table.catalog, source.table.namespace, source.table.table
     );
     if selection.publication_inputs().len() != 1
-        || selection.publication_inputs()[0].table_fqn() != query_fqn
+        || selection.publication_inputs()[0].relation().table_fqn() != query_fqn
     {
         return None;
     }
@@ -556,8 +556,13 @@ fn selected_candidate_marker(
         mv_name.to_string(),
         selection.publication_id(),
         selection.definition_fingerprint(),
+        selection.definition_revision(),
+        selection.interpretation_revision(),
         Arc::from(selection.publication_provenance()),
-        vec![(occurrence, 0)],
+        vec![(
+            occurrence,
+            selection.publication_inputs()[0].occurrence_id(),
+        )],
         selection.publication_inputs().to_vec(),
         selection.publication_target().clone(),
     ))
@@ -1524,7 +1529,12 @@ mod tests {
         assert_eq!(selection.definition_fingerprint(), Some([9; 32]));
         assert_eq!(selection.input_mapping().len(), 1);
         assert_eq!(selection.input_mapping()[0].binding(), test_binding());
-        assert_eq!(selection.input_mapping()[0].publication_input_ordinal(), 0);
+        assert_eq!(
+            selection.input_mapping()[0]
+                .definition_occurrence_id()
+                .get(),
+            0
+        );
     }
 
     #[test]

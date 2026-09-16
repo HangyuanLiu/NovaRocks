@@ -54,7 +54,7 @@ pub(crate) struct ImvRewriteOutcome {
 
 pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcome, String> {
     let ImvRewriteInput {
-        plan,
+        mut plan,
         snapshot,
         disabled_rules,
         deadline,
@@ -63,6 +63,7 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         function_catalog,
     } = input;
 
+    bind_definition_occurrences(&mut plan, &snapshot)?;
     reserve_existing_plan_column_ids(&column_ref_factory, &plan);
     let mut ctx_rw = RewriteContext::for_mv_refresh_with_settings(
         crate::optimizer::options::SessionOptimizerSettings {
@@ -108,6 +109,71 @@ pub(crate) fn run_imv_rewrite(input: ImvRewriteInput) -> Result<ImvRewriteOutcom
         trace: ctx_rw.trace().clone(),
         annotation: ext.annotation,
     })
+}
+
+/// Bind the original, ordered definition leaves once, before any rewrite can
+/// clone or reorder them. Durable IDs are lookup keys, never vector offsets.
+pub(crate) fn bind_definition_occurrences(
+    plan: &mut LogicalPlanNode,
+    snapshot: &SqlImvRewriteSnapshot,
+) -> Result<(), String> {
+    fn bind<'a>(
+        plan: &mut LogicalPlanNode,
+        inputs: &mut impl Iterator<Item = &'a crate::compiler::mv_rewrite::SqlImvBaseSnapshot>,
+        snapshot: &SqlImvRewriteSnapshot,
+    ) -> Result<(), String> {
+        if let LogicalPlanKind::Scan(scan) = &mut plan.kind {
+            let base = inputs
+                .next()
+                .ok_or_else(|| "IMV definition has an unrecorded scan occurrence".to_string())?;
+            let crate::planner::table::ScanSource::Sql(source) = &mut scan.table.source;
+            let qualifier = scan.alias.as_deref().unwrap_or(&source.table.table);
+            if source.table.catalog != base.table.catalog
+                || source.table.namespace != base.table.namespace
+                || source.table.table != base.table.table
+                || qualifier != base.qualifier_at_binding
+            {
+                return Err(format!(
+                    "IMV definition occurrence {} does not match its admitted scan",
+                    base.occurrence_id.get()
+                ));
+            }
+            source.mv_occurrence = Some(base.occurrence_id);
+            if let Some(contract) = snapshot
+                .schema_contract
+                .bases
+                .iter()
+                .find(|contract| contract.occurrence_id == base.occurrence_id)
+            {
+                for field in &contract.fields {
+                    let matches = scan
+                        .table
+                        .columns
+                        .iter()
+                        .filter(|column| column.name == field.name_at_create)
+                        .collect::<Vec<_>>();
+                    if !matches!(matches.as_slice(), [column] if column.data_type == field.data_type && column.nullable == field.nullable)
+                    {
+                        return Err(format!(
+                            "IMV occurrence {} field {:?} differs from its admitted SQL schema",
+                            base.occurrence_id.get(),
+                            field.field_id
+                        ));
+                    }
+                }
+            }
+        }
+        for child in &mut plan.children {
+            bind(child, inputs, snapshot)?;
+        }
+        Ok(())
+    }
+    let mut inputs = snapshot.base_snapshots.iter();
+    bind(plan, &mut inputs, snapshot)?;
+    if inputs.next().is_some() {
+        return Err("IMV definition omitted an admitted relation occurrence".to_string());
+    }
+    Ok(())
 }
 
 /// Normalize a transparent root projection before IMV rewrite.  This is SQL
@@ -1012,6 +1078,148 @@ pub(crate) mod tests {
         crate::compiler::mv_rewrite::test_incremental_snapshot()
     }
 
+    fn empty_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        let mut snapshot = (*dummy_mv_ctx()).clone();
+        snapshot.base_snapshots = Arc::from([]);
+        snapshot.previous_snapshot_ids.clear();
+        snapshot.previous_table_object_ids.clear();
+        Arc::new(snapshot)
+    }
+
+    fn repeated_source_mv_ctx() -> Arc<crate::compiler::mv_rewrite::SqlImvRewriteSnapshot> {
+        let mut snapshot = (*dummy_mv_ctx()).clone();
+        let first = snapshot.base_snapshots[0].clone();
+        let mut second = first.clone();
+        second.occurrence_id = crate::compiler::SqlMvRelationOccurrenceId::new(42);
+        snapshot
+            .previous_snapshot_ids
+            .insert(second.occurrence_id, 12);
+        snapshot
+            .previous_table_object_ids
+            .insert(second.occurrence_id, second.table_object_id.clone());
+        snapshot.base_snapshots = Arc::from([first, second]);
+        Arc::new(snapshot)
+    }
+
+    #[test]
+    fn definition_occurrence_binding_rejects_missing_extra_and_swapped_sources() {
+        assert!(
+            bind_definition_occurrences(
+                &mut top_level_project_filter_union_plan(),
+                &dummy_mv_ctx()
+            )
+            .is_err()
+        );
+        assert!(
+            bind_definition_occurrences(&mut iceberg_scan_plan(), &repeated_source_mv_ctx())
+                .is_err()
+        );
+        let mut snapshot = (*join_aggregate_mv_ctx()).clone();
+        let mut sources = snapshot.base_snapshots.to_vec();
+        sources.swap(0, 1);
+        snapshot.base_snapshots = Arc::from(sources);
+        assert!(bind_definition_occurrences(&mut join_projection_plan(), &snapshot).is_err());
+    }
+
+    #[test]
+    fn definition_occurrence_binding_rejects_changed_schema_facts() {
+        let mut snapshot = (*aggregate_mv_ctx()).clone();
+        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].data_type = DataType::Int32;
+        assert!(
+            bind_definition_occurrences(&mut aggregate_plan(), &snapshot)
+                .unwrap_err()
+                .contains("admitted SQL schema")
+        );
+        let mut snapshot = (*aggregate_mv_ctx()).clone();
+        Arc::make_mut(&mut snapshot.schema_contract).bases[0].fields[0].nullable = true;
+        assert!(
+            bind_definition_occurrences(&mut aggregate_plan(), &snapshot)
+                .unwrap_err()
+                .contains("admitted SQL schema")
+        );
+    }
+
+    #[test]
+    fn repeated_source_union_keeps_non_dense_occurrences_and_separate_windows() {
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan: top_level_project_filter_union_plan(),
+            snapshot: repeated_source_mv_ctx(),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        fn windows(plan: &LogicalPlanNode, found: &mut Vec<(u32, i64)>) {
+            if let LogicalPlanKind::Scan(scan) = &plan.kind {
+                let ScanSource::Sql(source) = &scan.table.source;
+                if let SqlScanKind::Delta {
+                    from_snapshot_id, ..
+                } = source.kind
+                {
+                    found.push((source.mv_occurrence.unwrap().get(), from_snapshot_id));
+                }
+            }
+            for child in &plan.children {
+                windows(child, found);
+            }
+        }
+        let mut found = Vec::new();
+        windows(&outcome.plan, &mut found);
+        assert_eq!(found, vec![(7, 11), (42, 12)]);
+    }
+
+    #[test]
+    fn self_join_preserves_occurrences_through_delta_branch_cloning() {
+        fn same_table(plan: &mut LogicalPlanNode) {
+            if let LogicalPlanKind::Scan(scan) = &mut plan.kind {
+                let ScanSource::Sql(source) = &mut scan.table.source;
+                source.table.table = "base".to_string();
+                scan.table.name = "base".to_string();
+            }
+            for child in &mut plan.children {
+                same_table(child);
+            }
+        }
+        let mut plan = join_projection_plan();
+        same_table(&mut plan);
+        let mut snapshot = (*join_projection_mv_ctx()).clone();
+        let mut bases = snapshot.base_snapshots.to_vec();
+        let object_id = bases[0].table_object_id.clone();
+        for base in &mut bases {
+            base.table.table = "base".to_string();
+            base.table_object_id = object_id.clone();
+            snapshot
+                .previous_table_object_ids
+                .insert(base.occurrence_id, object_id.clone());
+        }
+        snapshot.base_snapshots = Arc::from(bases);
+        let contract = Arc::make_mut(&mut snapshot.schema_contract);
+        for base in &mut contract.bases {
+            base.table_fqn = "ice.db.base".to_string();
+        }
+        for output in &mut contract.output_columns {
+            for field in &mut output.expression.referenced_base_fields {
+                field.table_fqn = "ice.db.base".to_string();
+            }
+        }
+        for predicate in &mut contract.join.as_mut().unwrap().predicates {
+            predicate.left.table_fqn = "ice.db.base".to_string();
+            predicate.right.table_fqn = "ice.db.base".to_string();
+        }
+        let outcome = run_imv_rewrite(ImvRewriteInput {
+            plan,
+            snapshot: Arc::new(snapshot),
+            disabled_rules: Vec::new(),
+            deadline: None,
+            column_ref_factory: test_column_ref_factory(),
+        })
+        .unwrap();
+        let descriptor = outcome.annotation.change_stream.join_refresh.unwrap();
+        assert_eq!(descriptor.left_base_fqn, descriptor.right_base_fqn);
+        assert_eq!(descriptor.left_occurrence_id.get(), 7);
+        assert_eq!(descriptor.right_occurrence_id.get(), 42);
+    }
+
     #[allow(
         dead_code,
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
@@ -1041,15 +1249,13 @@ pub(crate) mod tests {
             crate::compiler::mv_rewrite::SqlImvOutputColumnLineage {
                 expression: crate::compiler::mv_rewrite::SqlImvExpressionLineage {
                     kind: crate::compiler::mv_rewrite::SqlImvExpressionKind::Column,
-                    referenced_base_field_ids: vec![1],
-                    referenced_base_fields: Vec::new(),
+                    referenced_base_fields: vec![test_aggregate_field(1)],
                 },
             },
             crate::compiler::mv_rewrite::SqlImvOutputColumnLineage {
                 expression: crate::compiler::mv_rewrite::SqlImvExpressionLineage {
                     kind: crate::compiler::mv_rewrite::SqlImvExpressionKind::Column,
-                    referenced_base_field_ids: vec![2],
-                    referenced_base_fields: Vec::new(),
+                    referenced_base_fields: vec![test_aggregate_field(2)],
                 },
             },
         ];
@@ -1065,6 +1271,17 @@ pub(crate) mod tests {
         aggregate_mv_ctx_customized(|_| {})
     }
 
+    fn test_aggregate_field(
+        field: u32,
+    ) -> crate::compiler::mv_rewrite::SqlImvQualifiedFieldLineage {
+        crate::compiler::mv_rewrite::SqlImvQualifiedFieldLineage {
+            occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
+            table_fqn: "ice.db.b".to_string(),
+            qualifier_at_create: "b".to_string(),
+            field_id: bytes::Bytes::from(format!("field-{field}")),
+        }
+    }
+
     #[allow(
         dead_code,
         reason = "Retained as an IMV rewrite fixture or assertion for feature-specific test targets."
@@ -1077,7 +1294,7 @@ pub(crate) mod tests {
                 target_spec_id: 7,
                 fields: vec![crate::compiler::mv_rewrite::SqlImvPartitionField {
                     partition_field_name: "k".to_string(),
-                    source_target_field_id: 100,
+                    source_target_field_id: bytes::Bytes::from_static(b"field-100"),
                     transform: crate::compiler::mv_rewrite::SqlImvPartitionTransform::Identity,
                 }],
             });
@@ -1577,7 +1794,7 @@ pub(crate) mod tests {
         // of whether wrapping occurs.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1722,7 +1939,7 @@ pub(crate) mod tests {
         // the pipeline can succeed and we can inspect the trace count.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: vec!["NoSuchRule".to_string(), "WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1827,7 +2044,7 @@ pub(crate) mod tests {
         // the marker-rejection contract rather than identity.
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1846,7 +2063,7 @@ pub(crate) mod tests {
         // try_run_imv_rewrite_pipeline swallows the Err.
         let err = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1865,7 +2082,7 @@ pub(crate) mod tests {
         // wire-up reaches the new rule.
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -1880,7 +2097,7 @@ pub(crate) mod tests {
     fn imv_pipeline_traces_stage_names() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: empty_values_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: empty_mv_ctx(),
             disabled_rules: vec!["WrapRootInImvDelta".to_string()],
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2228,7 +2445,7 @@ pub(crate) mod tests {
     fn imv_pipeline_rewrites_top_level_union_all_delta_end_to_end() {
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: top_level_project_filter_union_plan(),
-            snapshot: dummy_mv_ctx(),
+            snapshot: repeated_source_mv_ctx(),
             disabled_rules: Vec::new(),
             deadline: None,
             column_ref_factory: test_column_ref_factory(),
@@ -2322,7 +2539,10 @@ pub(crate) mod tests {
         assert_eq!(specs[0].target_spec_id, 7);
         assert_eq!(specs[0].fields.len(), 1);
         assert_eq!(specs[0].fields[0].partition_field_name, "k");
-        assert_eq!(specs[0].fields[0].source_target_field_id, 100);
+        assert_eq!(
+            specs[0].fields[0].source_target_field_id,
+            bytes::Bytes::from_static(b"field-100")
+        );
         assert_eq!(specs[0].fields[0].output_index, 0);
         assert_eq!(
             specs[0].fields[0].transform,
@@ -2355,15 +2575,14 @@ pub(crate) mod tests {
                     target_spec_id: 7,
                     fields: vec![crate::compiler::mv_rewrite::SqlImvPartitionField {
                         partition_field_name: "k".to_string(),
-                        source_target_field_id: 100,
+                        source_target_field_id: bytes::Bytes::from_static(b"field-100"),
                         transform: crate::compiler::mv_rewrite::SqlImvPartitionTransform::Identity,
                     }],
                 });
             contract.output_columns[0].expression.kind =
                 crate::compiler::mv_rewrite::SqlImvExpressionKind::Func;
-            contract.output_columns[0]
-                .expression
-                .referenced_base_field_ids = vec![1, 2];
+            contract.output_columns[0].expression.referenced_base_fields =
+                vec![test_aggregate_field(1), test_aggregate_field(2)];
         });
         let outcome = run_imv_rewrite(ImvRewriteInput {
             plan: aggregate_plan(),

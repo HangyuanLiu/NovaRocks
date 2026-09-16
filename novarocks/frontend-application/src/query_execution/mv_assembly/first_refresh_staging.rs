@@ -35,10 +35,11 @@ use crate::query_execution::planning::write_sink::{
 };
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::first_refresh::{
-    SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext,
-    analyze_join_first_refresh_connector_write, analyze_mv_first_refresh_connector_write,
-    compile_join_first_refresh_connector_write_dataflow,
+    SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext, SqlMvSnapshotPin,
+    SqlMvSnapshotPinOccurrence, analyze_join_first_refresh_connector_write,
+    analyze_mv_first_refresh_connector_write, compile_join_first_refresh_connector_write_dataflow,
     compile_mv_first_refresh_connector_write_dataflow,
 };
 
@@ -49,20 +50,117 @@ pub(crate) fn frozen_logical_context_from_rewrite(
         Vec<crate::catalog_application::query_materializer::QueryLocalTableOverlay>,
     >,
 ) -> Result<MvFirstRefreshLogicalContext, String> {
+    let pin = ordered_current_sources(rewrite)?;
+    // Validate the exact application facts against the SQL-owned occurrence
+    // contract before the logical artifact can outlive this preparation step.
+    // The richer source revisions remain in the application artifact because
+    // activation must reconstruct the canonical context without decoding IDs.
+    let _sql_pin = sql_snapshot_pin(&rewrite.mv_definition, &pin)?;
     Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*rewrite.mv_definition).clone(),
         canonical_select_query: (*rewrite.canonical_select_query).clone(),
         base_refs: rewrite.base_refs.to_vec(),
-        pin: novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
-            rewrite.pin.to_snapshot_map(),
-            rewrite.pin.to_table_object_id_map(),
-        )?,
-        previous_snapshot_ids: rewrite.previous_snapshot_ids.clone(),
-        previous_table_object_ids: rewrite.previous_table_object_ids.clone(),
+        pin,
+        previous: ordered_previous_sources(rewrite)?,
+        analysis: rewrite.analysis_facts().clone(),
         target_table_uuid: rewrite.target_table_uuid.clone(),
         affected_partitions,
         frozen_base_overlays,
     })
+}
+
+fn ordered_current_sources(
+    rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
+) -> Result<Vec<crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot>, String> {
+    let occurrences = &rewrite
+        .mv_definition
+        .facts
+        .definition()
+        .relation_occurrences;
+    if occurrences.len() != rewrite.pin.len() {
+        return Err("MV first-refresh source pins do not cover every D occurrence".to_string());
+    }
+    occurrences
+        .iter()
+        .map(|occurrence| {
+            rewrite
+                .pin
+                .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "MV first-refresh source pin is missing D occurrence {}",
+                        occurrence.occurrence_id
+                    )
+                })
+        })
+        .collect()
+}
+
+fn ordered_previous_sources(
+    rewrite: &crate::mv::domain::rewrite::context::IcebergMvRewriteContext,
+) -> Result<Vec<crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot>, String> {
+    use novarocks_mv_application::persistence::projection::MvPublicationState;
+
+    match rewrite.mv_definition.facts.publication() {
+        MvPublicationState::NeverPublished if rewrite.previous.is_empty() => Ok(Vec::new()),
+        MvPublicationState::NeverPublished => {
+            Err("never-published MV first-refresh artifact has source history".to_string())
+        }
+        MvPublicationState::Published(published) => published
+            .document()
+            .inputs
+            .iter()
+            .map(|input| {
+                rewrite
+                    .previous
+                    .iter()
+                    .find(|source| source.occurrence_id.get() == input.relation_occurrence_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "MV first-refresh history is missing D occurrence {}",
+                            input.relation_occurrence_id
+                        )
+                    })
+            })
+            .collect(),
+    }
+}
+
+fn sql_snapshot_pin(
+    projection: &novarocks_mv_application::persistence::projection::StoredMvProjection,
+    sources: &[crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot],
+) -> Result<SqlMvSnapshotPin, String> {
+    let occurrences = &projection.facts.definition().relation_occurrences;
+    if occurrences.len() != sources.len() {
+        return Err("MV first-refresh SQL pin does not cover every D occurrence".to_string());
+    }
+    SqlMvSnapshotPin::try_from_occurrences(
+        occurrences
+            .iter()
+            .zip(sources)
+            .map(|(occurrence, source)| {
+                let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+                if source.occurrence_id != occurrence_id {
+                    return Err(format!(
+                        "MV first-refresh SQL pin order differs at D occurrence {}",
+                        occurrence.occurrence_id
+                    ));
+                }
+                SqlMvSnapshotPinOccurrence::try_new(
+                    occurrence_id,
+                    novarocks_types::naming::TableIdentity {
+                        catalog: occurrence.catalog_at_binding.clone(),
+                        namespace: occurrence.namespace_at_binding.clone(),
+                        table: occurrence.relation_at_binding.clone(),
+                    },
+                    source.snapshot_id,
+                    source.table_object_id.clone(),
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    )
 }
 
 /// Reserve the one primary first-refresh write cohort from facts frozen in an
@@ -241,8 +339,6 @@ fn bind_first_refresh_write_dataflow(
             })?;
             let refresh_rewrite = rebuild_frozen_mv_rewrite_context(
                 ports,
-                current_catalog.as_deref(),
-                &current_database,
                 expected_target_snapshot_id,
                 &target_catalog,
                 &target_namespace,
@@ -342,8 +438,6 @@ fn bind_first_refresh_write_dataflow(
 )]
 pub(crate) fn rebuild_frozen_mv_rewrite_context(
     ports: &IcebergMvCorePorts,
-    current_catalog: Option<&str>,
-    current_database: &str,
     expected_target_snapshot_id: Option<i64>,
     target_catalog: &str,
     target_namespace: &str,
@@ -352,22 +446,17 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
     planning_lease: &ConnectorControlPlanningLease,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>, String> {
-    let target_identity =
-        novarocks_types::naming::TableIdentity {
-            catalog: facts.mv_definition.target_catalog.clone().ok_or_else(|| {
+    let persisted_target = facts.mv_definition.facts.target();
+    let target_identity = novarocks_types::naming::TableIdentity {
+        catalog: persisted_target
+            .catalog()
+            .ok_or_else(|| {
                 "MV first-refresh logical artifact target has no connector catalog".to_string()
-            })?,
-            namespace: facts
-                .mv_definition
-                .target_namespace
-                .clone()
-                .ok_or_else(|| {
-                    "MV first-refresh logical artifact target has no namespace".to_string()
-                })?,
-            table: facts.mv_definition.target_table.clone().ok_or_else(|| {
-                "MV first-refresh logical artifact target has no table".to_string()
-            })?,
-        };
+            })?
+            .to_string(),
+        namespace: persisted_target.namespace().to_string(),
+        table: persisted_target.name().to_string(),
+    };
     if target_identity.catalog != target_catalog
         || target_identity.namespace != target_namespace
         || target_identity.table != target_name
@@ -395,53 +484,46 @@ pub(crate) fn rebuild_frozen_mv_rewrite_context(
             "MV refresh logical artifact target snapshot drifted after preparation".to_string(),
         );
     }
-    let application_pin =
-        crate::mv::domain::refresh::pin::RefreshSnapshotPin::from_captured_entries(
-            facts
-                .base_refs
-                .iter()
-                .map(|base| {
-                    let snapshot_id = facts.pin.get(base).ok_or_else(|| {
-                        format!(
-                            "MV first-refresh logical artifact has no snapshot pin for {}",
-                            base.fqn()
-                        )
-                    })?;
-                    let table_object_id = facts.pin.object_id(base).ok_or_else(|| {
-                        format!(
-                            "MV first-refresh logical artifact has no object-ID pin for {}",
-                            base.fqn()
-                        )
-                    })?;
-                    Ok((base.clone(), snapshot_id, table_object_id.clone()))
-                })
-                .collect::<Result<Vec<_>, String>>()?,
+    let target_schema = crate::mv::domain::storage_observation::observe_schema_validation(
+        ports.storage_observation(),
+        target_binding.lease(),
+        target_binding.metadata(),
+        connector_context.clone(),
+    )
+    .map_err(|error| format!("observe exact MV target schema for activation: {error}"))?;
+    if target_schema.table() != target_binding.identity() {
+        return Err(
+            "MV first-refresh target schema and retained target binding differ".to_string(),
         );
-    let schema_contract = facts.mv_definition.schema_contract.clone().map(Arc::new);
-    crate::mv::domain::rewrite::context::IcebergMvRewriteContext::from_parts(
-        target_identity,
-        facts.mv_definition.mv_id,
-        current_catalog.map(str::to_string),
-        current_database.to_string(),
+    }
+    crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context(
         Arc::new(facts.mv_definition.clone()),
-        Arc::new(facts.canonical_select_query.clone()),
-        Arc::from(facts.base_refs.clone()),
-        Arc::new(application_pin),
-        facts.previous_snapshot_ids.clone(),
-        facts.previous_table_object_ids.clone(),
-        expected_target_snapshot_id,
+        facts.pin.clone(),
+        facts.previous.clone(),
         facts.target_table_uuid.clone(),
         target_binding.physical_write_schema()?,
-        Arc::from(target_binding.observation().field_ids().to_vec()),
-        schema_contract,
+        target_schema.exact_schema().clone(),
+        facts.analysis.clone(),
     )
-    .map(Arc::new)
 }
 
 fn validate_frozen_join_base_facts(facts: &MvFirstRefreshLogicalContext) -> Result<(), String> {
     if facts.base_refs.is_empty() || facts.pin.len() != facts.base_refs.len() {
         return Err(
             "MV first-refresh logical artifact has incomplete base snapshot pins".to_string(),
+        );
+    }
+    let occurrences = &facts.mv_definition.facts.definition().relation_occurrences;
+    if occurrences.len() != facts.pin.len()
+        || occurrences
+            .iter()
+            .zip(&facts.pin)
+            .any(|(occurrence, source)| {
+                source.occurrence_id != SqlMvRelationOccurrenceId::new(occurrence.occurrence_id)
+            })
+    {
+        return Err(
+            "MV first-refresh logical artifact does not preserve D occurrence order".to_string(),
         );
     }
     // Production logical first-refresh artifacts retain the materializations
@@ -468,4 +550,51 @@ fn parse_query_from_sql(sql: &str) -> Result<novarocks_parser::ast::Query, Strin
         return Err("MV first-refresh physical artifact is not a SELECT query".to_string());
     };
     Ok(query.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use novarocks_mv_application::persistence::{
+        projection::StoredMvProjection, test_support::ProjectionFixture,
+    };
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_spi::connector::{
+        ConnectorExactSemanticRevision, ConnectorProviderId, ConnectorTableObjectId,
+    };
+
+    fn projection() -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 17,
+            facts: ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None)
+                .build()
+                .unwrap(),
+        }
+    }
+
+    fn source(occurrence_id: u32) -> crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot {
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"source-object")).unwrap();
+        crate::mv::domain::rewrite::context::MvRewriteSourceSnapshot {
+            occurrence_id: SqlMvRelationOccurrenceId::new(occurrence_id),
+            snapshot_id: 12,
+            table_object_id: object_id.clone(),
+            semantic_revision: ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                &object_id,
+                Some(12),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn sql_pin_preserves_sparse_definition_occurrence_order() {
+        let projection = projection();
+        let pin = sql_snapshot_pin(&projection, &[source(7), source(8)]).unwrap();
+        assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
+        assert_eq!(pin.occurrences()[1].occurrence_id().get(), 8);
+        assert!(sql_snapshot_pin(&projection, &[source(8), source(7)]).is_err());
+    }
 }

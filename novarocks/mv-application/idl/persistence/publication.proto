@@ -30,6 +30,8 @@ message PublicationDocument {
   optional PublicationOutput output = 6;
   optional PublicationKind kind = 7;
   optional PublicationStatistics statistics = 8;
+  // Frozen before publication dispatch, not the catalog commit completion time.
+  optional uint64 publication_prepared_at_ms = 9;
 }
 
 message PublicationInput {

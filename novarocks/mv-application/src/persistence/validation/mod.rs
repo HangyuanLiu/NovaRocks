@@ -83,7 +83,18 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+fn validate_timestamp(value: u64, path: &str) -> Result<(), ValidationError> {
+    if value > i64::MAX as u64 {
+        return Err(ValidationError::new(
+            path,
+            "timestamp exceeds the supported millisecond range",
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_definition(document: &DefinitionDocument) -> Result<(), ValidationError> {
+    validate_timestamp(document.created_at_ms, "definition.created_at_ms")?;
     nonempty_text(
         "definition.query.effective_sql",
         &document.query.effective_sql,
@@ -588,6 +599,10 @@ fn validate_retraction_count_owner(
 }
 
 pub fn validate_publication(document: &PublicationDocument) -> Result<(), ValidationError> {
+    validate_timestamp(
+        document.publication_prepared_at_ms,
+        "publication.publication_prepared_at_ms",
+    )?;
     if document.inputs.is_empty() {
         return Err(ValidationError::new(
             "publication.inputs",
@@ -638,18 +653,14 @@ pub fn validate_configuration(document: &ConfigurationDocument) -> Result<(), Va
     Ok(())
 }
 
-/// Validates the immutable reference graph without reading Current catalog
-/// state. Live-object rebinding is a separate caller-owned pure projection.
-pub fn validate_document_set(
+/// Validates D/L even before the first publication exists.
+pub fn validate_definition_interpretation(
     definition: &DefinitionDocument,
     definition_revision: DocumentRevision,
     interpretation: &InterpretationDocument,
-    interpretation_revision: DocumentRevision,
-    publication: &PublicationDocument,
 ) -> Result<(), ValidationError> {
     validate_definition(definition)?;
     validate_interpretation(interpretation)?;
-    validate_publication(publication)?;
     if interpretation.definition_revision != definition_revision {
         return Err(ValidationError::new(
             "interpretation.definition_revision",
@@ -662,19 +673,6 @@ pub fn validate_document_set(
             "does not match the supplied definition semantics",
         ));
     }
-    if publication.definition_revision != definition_revision {
-        return Err(ValidationError::new(
-            "publication.definition_revision",
-            "does not reference the supplied definition document",
-        ));
-    }
-    if publication.interpretation_revision != interpretation_revision {
-        return Err(ValidationError::new(
-            "publication.interpretation_revision",
-            "does not reference the supplied interpretation document",
-        ));
-    }
-
     let definition_occurrences = definition
         .relation_occurrences
         .iter()
@@ -720,6 +718,38 @@ pub fn validate_document_set(
             }
         }
     }
+    Ok(())
+}
+
+/// Validates the immutable reference graph without reading Current catalog
+/// state. Live-object rebinding is a separate caller-owned pure projection.
+pub fn validate_document_set(
+    definition: &DefinitionDocument,
+    definition_revision: DocumentRevision,
+    interpretation: &InterpretationDocument,
+    interpretation_revision: DocumentRevision,
+    publication: &PublicationDocument,
+) -> Result<(), ValidationError> {
+    validate_definition_interpretation(definition, definition_revision, interpretation)?;
+    validate_publication(publication)?;
+    if publication.definition_revision != definition_revision {
+        return Err(ValidationError::new(
+            "publication.definition_revision",
+            "does not reference the supplied definition document",
+        ));
+    }
+    if publication.interpretation_revision != interpretation_revision {
+        return Err(ValidationError::new(
+            "publication.interpretation_revision",
+            "does not reference the supplied interpretation document",
+        ));
+    }
+
+    let definition_occurrences = definition
+        .relation_occurrences
+        .iter()
+        .map(|value| (value.occurrence_id, value))
+        .collect::<BTreeMap<_, _>>();
     let published_occurrences = publication
         .inputs
         .iter()

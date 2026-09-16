@@ -33,14 +33,12 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::startup_restore::MvStartupRestore;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
-use novarocks_spi::connector::MvStorageObservationPort;
 
 /// The frontend's implementation of the ordered startup restore steps.
 pub(crate) struct FrontendMvStartupRestore {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
     catalog_application: Arc<dyn CatalogApplicationPort>,
-    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     readiness: Arc<MvReadinessPort>,
 }
 
@@ -49,14 +47,12 @@ impl FrontendMvStartupRestore {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
         catalog_application: Arc<dyn CatalogApplicationPort>,
-        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         readiness: Arc<MvReadinessPort>,
     ) -> Self {
         Self {
             connector_control,
             catalog_runtime_projection,
             catalog_application,
-            mv_storage_observation,
             readiness,
         }
     }
@@ -72,7 +68,6 @@ impl MvStartupRestore for FrontendMvStartupRestore {
                 catalog_runtime_projection: Some(&self.catalog_runtime_projection),
                 catalog_application: Some(self.catalog_application.as_ref()),
                 connector_control: self.connector_control.as_ref(),
-                mv_storage_observation: self.mv_storage_observation.as_ref(),
                 readiness: self.readiness.as_ref(),
             },
         )

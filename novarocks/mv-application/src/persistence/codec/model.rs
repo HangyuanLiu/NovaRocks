@@ -51,6 +51,7 @@ pub fn internal_retraction_count_aggregate_identity() -> AggregateIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DefinitionDocument {
+    pub created_at_ms: u64,
     pub query: QuerySource,
     /// Ordered syntactic occurrences. Duplicates are meaningful.
     pub relation_occurrences: Vec<RelationOccurrence>,
@@ -291,6 +292,8 @@ impl PhysicalFieldLogicalIdentity {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicationDocument {
+    /// Time the publication facts were frozen, not provider commit completion.
+    pub publication_prepared_at_ms: u64,
     pub publication_id: PublicationIdentity,
     pub definition_revision: DocumentRevision,
     pub interpretation_revision: DocumentRevision,

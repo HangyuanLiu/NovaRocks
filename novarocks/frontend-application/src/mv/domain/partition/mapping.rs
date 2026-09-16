@@ -15,400 +15,165 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#[cfg(test)]
-use novarocks_sql::planning::mv::ApplyKeySource;
+use crate::mv::domain::model::MvPartitionKey;
+use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 
-use crate::mv::domain::model::{MvPartitionKey, MvPartitionKeyField, MvPartitionValue};
-use novarocks_mv_application::persistence::schema::{
-    ExpressionKind, MvPartitionTransformContract, MvSchemaContract,
-};
-
+/// Validates the exact source object carried by a connector partition impact.
+///
+/// Canonical D/L currently retain the target partition-spec version but not the
+/// typed transform/source-field binding needed to turn provider partition facts
+/// into an MV partition key. Decoding opaque identities or falling back to the
+/// retired numeric schema contract would create a second authority, so exact
+/// partition impacts fail closed until that binding is part of canonical L and
+/// the provider observation.
 pub(crate) fn map_connector_partition_to_mv_key(
-    contract: &MvSchemaContract,
-    observation: &crate::mv::domain::storage_observation::MvSchemaValidationObservation,
+    projection: &StoredMvProjection,
+    observation: &MvSchemaValidationObservation,
     connector_partition: &novarocks_spi::connector::ConnectorChangePartition,
 ) -> Result<Option<MvPartitionKey>, String> {
-    let Some(partition) = &contract.target.partition else {
-        return Ok(None);
-    };
-    let base_contract = std::iter::once(&contract.base)
-        .chain(contract.bases.iter())
-        .find(|base| observation.table_object_id() == Some(&base.table_object_id))
-        .ok_or_else(|| {
-            "MV partition mapping has no stable base contract for the observed table object ID"
-                .to_string()
-        })?;
+    let schema = observation.exact_schema();
+    let source_matches = projection
+        .facts
+        .definition()
+        .relation_occurrences
+        .iter()
+        .any(|occurrence| {
+            occurrence.catalog_at_binding == observation.table().instance_id.as_str()
+                && occurrence.object_id.as_bytes() == schema.object_id.as_bytes().as_ref()
+        });
+    if !source_matches {
+        return Err(
+            "connector partition impact does not belong to an exact D source occurrence"
+                .to_string(),
+        );
+    }
 
-    let mut mapped_fields = Vec::with_capacity(partition.fields.len());
-    for partition_field in &partition.fields {
-        let output_index = contract
-            .target
-            .visible_columns
-            .iter()
-            .position(|column| column.target_field_id == partition_field.source_target_field_id)
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} references missing target field {}",
-                    partition_field.partition_field_name, partition_field.source_target_field_id
-                )
-            })?;
-        let output_lineage = contract.output.columns.get(output_index).ok_or_else(|| {
-            format!(
-                "MV partition field {} requires row-evaluation fallback",
-                partition_field.partition_field_name
-            )
-        })?;
-        if output_lineage.expression.kind != ExpressionKind::Column
-            || output_lineage.expression.referenced_base_field_ids.len() != 1
-        {
-            return Err(format!(
-                "MV partition field {} requires row-evaluation fallback",
-                partition_field.partition_field_name
-            ));
-        }
-        let stable_field_id = output_lineage.expression.referenced_base_field_ids[0];
-        if !base_contract
-            .schema_at_create
+    for field in connector_partition.fields() {
+        if !schema
             .fields
             .iter()
-            .any(|field| field.field_id == stable_field_id)
+            .any(|observed| observed.name.eq_ignore_ascii_case(field.source_column()))
         {
             return Err(format!(
-                "MV partition field {} references unknown stable base field {}",
-                partition_field.partition_field_name, stable_field_id
+                "connector partition impact references source column {} outside the exact schema observation",
+                field.source_column()
             ));
         }
-        let observed_field = observation
-            .fields()
-            .iter()
-            .find(|field| field.field_id() == stable_field_id)
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} cannot resolve stable base field {} in the exact schema observation",
-                    partition_field.partition_field_name, stable_field_id
-                )
-            })?;
-        let connector_field = connector_partition
-            .fields()
-            .iter()
-            .find(|field| field.source_column().eq_ignore_ascii_case(observed_field.name()))
-            .ok_or_else(|| {
-                format!(
-                    "MV partition field {} has no connector partition fact for exact source column {}",
-                    partition_field.partition_field_name,
-                    observed_field.name()
-                )
-            })?;
-        if !connector_transform_matches_contract(
-            connector_field.transform(),
-            &partition_field.transform,
-        ) {
-            return Err(format!(
-                "MV partition field {} connector transform does not match its persisted contract",
-                partition_field.partition_field_name
-            ));
-        }
-        let value = match connector_field.value() {
-            novarocks_spi::connector::ConnectorChangePartitionValue::Null => MvPartitionValue::Null,
-            novarocks_spi::connector::ConnectorChangePartitionValue::String(value) => {
-                MvPartitionValue::String(value.to_string())
-            }
-        };
-        mapped_fields.push(MvPartitionKeyField::new(
-            partition_field.partition_field_name.clone(),
-            value,
-        ));
     }
 
-    Ok(Some(MvPartitionKey::new(
-        partition.target_spec_id,
-        mapped_fields,
-    )))
-}
-
-fn connector_transform_matches_contract(
-    connector: novarocks_spi::connector::ConnectorChangePartitionTransform,
-    contract: &MvPartitionTransformContract,
-) -> bool {
-    use novarocks_spi::connector::ConnectorChangePartitionTransform as Connector;
-
-    match (connector, contract) {
-        (Connector::Identity, MvPartitionTransformContract::Identity)
-        | (Connector::Year, MvPartitionTransformContract::Year)
-        | (Connector::Month, MvPartitionTransformContract::Month)
-        | (Connector::Day, MvPartitionTransformContract::Day)
-        | (Connector::Hour, MvPartitionTransformContract::Hour) => true,
-        (Connector::Bucket { buckets }, MvPartitionTransformContract::Bucket { num_buckets }) => {
-            buckets.get() == *num_buckets
-        }
-        (
-            Connector::Truncate { width },
-            MvPartitionTransformContract::Truncate { width: expected },
-        ) => width.get() == *expected,
-        _ => false,
-    }
+    Err(
+        "affected partition mapping requires a canonical typed partition transform/source-field binding"
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use novarocks_mv_application::persistence::schema::{
-        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
-        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
-        MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
-        TargetContract, TargetVisibleColumn,
-    };
-
-    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
-            .expect("valid opaque table object ID")
-    }
-
-    fn contract_with_partition(transform: MvPartitionTransformContract) -> MvSchemaContract {
-        let mut contract = contract_with_identity_partition();
-        let partition = contract
-            .target
-            .partition
-            .as_mut()
-            .expect("identity helper always builds a partition");
-        partition.fields[0].transform = transform;
-        contract
-    }
-
-    /// Neutral observation fixture: the mapper matches the contract's base by
-    /// opaque physical object ID and reads source column names from its fields.
-    fn observation() -> crate::mv::domain::storage_observation::MvSchemaValidationObservation {
-        crate::mv::domain::storage_observation::MvSchemaValidationObservation::try_new_with_maximum_payload(
-            "base-uuid".to_string(),
-            0,
-            true,
-            true,
-            vec![crate::mv::domain::storage_observation::MvObservedTargetField {
-                field_id: 1,
-                name: "id".to_string(),
-                type_signature: "int".to_string(),
-                nullable: false,
-            }],
-            crate::mv::domain::storage_observation::MvSchemaValidationPartitionContract::new(7, Vec::new()),
-        )
-        .expect("observation fixture")
-        .with_table_object_id(object_id(&[0, 0xff, b'b', b'a', b's', b'e']))
-    }
-
-    fn connector_partition(
-        transform: novarocks_spi::connector::ConnectorChangePartitionTransform,
-        value: novarocks_spi::connector::ConnectorChangePartitionValue,
-    ) -> novarocks_spi::connector::ConnectorChangePartition {
-        novarocks_spi::connector::ConnectorChangePartition::try_new(vec![
-            novarocks_spi::connector::ConnectorChangePartitionField::try_new(
-                "id", transform, value,
-            )
-            .expect("partition field fixture"),
-        ])
-        .expect("partition fixture")
-    }
-
-    fn map(
-        contract: &MvSchemaContract,
-        partition: &novarocks_spi::connector::ConnectorChangePartition,
-    ) -> Result<Option<MvPartitionKey>, String> {
-        map_connector_partition_to_mv_key(contract, &observation(), partition)
-    }
-
-    fn contract_with_identity_partition() -> MvSchemaContract {
-        MvSchemaContract {
-            contract_version: 1,
-            base: BaseContract {
-                table_fqn: "ice.sales.orders".to_string(),
-                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
-                alias_at_create: None,
-                schema_id_at_create: 0,
-                schema_at_create: BaseSchemaSnapshot {
-                    fields: vec![BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "id".to_string(),
-                        type_signature: "int".to_string(),
-                        required: true,
-                    }],
-                },
-            },
-            bases: Vec::new(),
-            output: OutputContract {
-                columns: vec![OutputColumnLineage {
-                    expression: ExpressionLineage {
-                        kind: ExpressionKind::Column,
-                        referenced_base_field_ids: vec![1],
-                        referenced_base_fields: Vec::new(),
-                    },
-                }],
-                filter: None,
-            },
-            join: None,
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "ice.analytics.mv_orders".to_string(),
-                table_uuid: "target-uuid".to_string(),
-                schema_id_at_create: 0,
-                visible_columns: vec![TargetVisibleColumn {
-                    output_name: "id".to_string(),
-                    target_field_id: 10,
-                    type_signature: "int".to_string(),
-                    nullable: false,
-                }],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "__nova_base_row_id".to_string(),
-                    target_field_id: 11,
-                    source: ApplyKeySource::BaseRowId,
-                },
-                partition: Some(MvPartitionContract {
-                    target_spec_id: 7,
-                    fields: vec![MvPartitionFieldContract {
-                        partition_field_id: 100,
-                        partition_field_name: "id".to_string(),
-                        source_target_field_id: 10,
-                        source_column_name: "id".to_string(),
-                        transform: MvPartitionTransformContract::Identity,
-                    }],
-                }),
-            },
-        }
-    }
-
+    use novarocks_mv_application::persistence::projection::StoredMvProjection;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
-        ConnectorChangePartitionTransform as CT, ConnectorChangePartitionValue as CV,
+        ConnectorCancellation, ConnectorChangePartition, ConnectorChangePartitionField,
+        ConnectorChangePartitionTransform, ConnectorChangePartitionValue,
+        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
+        MvSchemaValidationObservation as SpiObservation,
     };
-    use std::num::NonZeroU32;
+    use std::sync::Arc;
 
-    fn key(value: &str) -> Option<MvPartitionKey> {
-        Some(MvPartitionKey::new(
-            7,
-            vec![MvPartitionKeyField::new(
-                "id".to_string(),
-                MvPartitionValue::String(value.to_string()),
-            )],
-        ))
-    }
+    struct Active;
 
-    #[test]
-    fn maps_identity_partition_value_to_mv_key() {
-        let contract = contract_with_identity_partition();
-        let partition = connector_partition(CT::Identity, CV::String("42".into()));
-
-        assert_eq!(map(&contract, &partition).unwrap(), key("42"));
-    }
-
-    #[test]
-    fn maps_year_transform_to_mv_key() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Year);
-        let partition = connector_partition(CT::Year, CV::String("2026".into()));
-
-        assert_eq!(map(&contract, &partition).unwrap(), key("2026"));
-    }
-
-    #[test]
-    fn maps_month_day_hour_transforms() {
-        for (contracted, connector, value) in [
-            (MvPartitionTransformContract::Month, CT::Month, "2026-08"),
-            (MvPartitionTransformContract::Day, CT::Day, "2026-08-12"),
-            (
-                MvPartitionTransformContract::Hour,
-                CT::Hour,
-                "2026-08-12-07",
-            ),
-        ] {
-            let contract = contract_with_partition(contracted);
-            let partition = connector_partition(connector, CV::String(value.into()));
-
-            assert_eq!(map(&contract, &partition).unwrap(), key(value));
+    impl ConnectorCancellation for Active {
+        fn is_cancelled(&self) -> bool {
+            false
         }
     }
 
-    #[test]
-    fn maps_bucket_transform_with_matching_arity() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
-        let partition = connector_partition(
-            CT::Bucket {
-                buckets: NonZeroU32::new(8).expect("nonzero"),
-            },
-            CV::String("3".into()),
-        );
-
-        assert_eq!(map(&contract, &partition).unwrap(), key("3"));
+    fn context() -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            Arc::new(Active),
+            1024,
+            16 * 1024,
+        )
+        .unwrap()
     }
 
-    #[test]
-    fn rejects_bucket_transform_arity_mismatch() {
-        let contract =
-            contract_with_partition(MvPartitionTransformContract::Bucket { num_buckets: 8 });
-        let partition = connector_partition(
-            CT::Bucket {
-                buckets: NonZeroU32::new(16).expect("nonzero"),
-            },
-            CV::String("3".into()),
-        );
-
-        let err = map(&contract, &partition).unwrap_err();
-        assert!(err.contains("transform"), "err={err}");
+    fn projection() -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(
+                MvTarget::from_parts(Some("ice"), "sales", "mv"),
+                Some(11),
+            )
+            .build()
+            .unwrap(),
+        }
     }
 
-    #[test]
-    fn maps_truncate_transform_with_matching_width() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Truncate { width: 4 });
-        let partition = connector_partition(
-            CT::Truncate {
-                width: NonZeroU32::new(4).expect("nonzero"),
-            },
-            CV::String("abcd".into()),
-        );
-
-        assert_eq!(map(&contract, &partition).unwrap(), key("abcd"));
-    }
-
-    #[test]
-    fn rejects_truncate_transform_width_mismatch() {
-        let contract = contract_with_partition(MvPartitionTransformContract::Truncate { width: 4 });
-        let partition = connector_partition(
-            CT::Truncate {
-                width: NonZeroU32::new(16).expect("nonzero"),
-            },
-            CV::String("abcd".into()),
-        );
-
-        let err = map(&contract, &partition).unwrap_err();
-        assert!(err.contains("transform"), "err={err}");
-    }
-
-    #[test]
-    fn null_partition_value_renders_as_mv_null() {
-        let contract = contract_with_identity_partition();
-        let partition = connector_partition(CT::Identity, CV::Null);
-
-        assert_eq!(
-            map(&contract, &partition).unwrap(),
-            Some(MvPartitionKey::new(
-                7,
-                vec![MvPartitionKeyField::new(
-                    "id".to_string(),
-                    MvPartitionValue::Null,
+    fn observation(object: &'static [u8]) -> MvSchemaValidationObservation {
+        let context = context();
+        crate::mv::domain::storage_observation::schema_validation_from_spi(
+            SpiObservation::try_new(
+                ConnectorTableIdentity {
+                    instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+                    namespace: Arc::from("sales"),
+                    table: Arc::from("orders"),
+                },
+                ConnectorTableObjectId::try_new(Bytes::from_static(object)).unwrap(),
+                ConnectorCommittedVersion::try_new(
+                    Bytes::from_static(b"source-metadata"),
+                    Some(11),
+                )
+                .unwrap(),
+                Bytes::from_static(&[1]),
+                Bytes::from_static(&[4]),
+                true,
+                true,
+                vec![(
+                    0,
+                    MvObservedSourceField::try_new(
+                        Bytes::from_static(&[1]),
+                        "order_id".to_string(),
+                        "bigint".to_string(),
+                        false,
+                    )
+                    .unwrap(),
                 )],
-            ))
-        );
+                &context,
+            )
+            .unwrap(),
+            &context,
+        )
+        .unwrap()
+    }
+
+    fn partition() -> ConnectorChangePartition {
+        ConnectorChangePartition::try_new(vec![
+            ConnectorChangePartitionField::try_new(
+                "order_id",
+                ConnectorChangePartitionTransform::Identity,
+                ConnectorChangePartitionValue::String("42".into()),
+            )
+            .unwrap(),
+        ])
+        .unwrap()
     }
 
     #[test]
-    fn returns_none_for_unpartitioned_contract() {
-        let mut contract = contract_with_identity_partition();
-        contract.target.partition = None;
-        let partition = connector_partition(CT::Identity, CV::String("42".into()));
+    fn exact_partition_impact_never_reconstructs_a_retired_numeric_mapping() {
+        let projection = projection();
+        let error =
+            map_connector_partition_to_mv_key(&projection, &observation(&[11]), &partition())
+                .unwrap_err();
+        assert!(error.contains("canonical typed partition"), "{error}");
 
-        assert_eq!(map(&contract, &partition).unwrap(), None);
+        let error =
+            map_connector_partition_to_mv_key(&projection, &observation(&[12]), &partition())
+                .unwrap_err();
+        assert!(error.contains("exact D source occurrence"), "{error}");
     }
-
-    // `rejects_void_transform` and `unsupported_partition_value_requires_unknown_mapping`
-    // are not ported: ConnectorChangePartitionTransform has no Void variant and
-    // ConnectorChangePartitionValue has no Unsupported variant, so both states
-    // are unrepresentable rather than rejected at runtime.
 }

@@ -64,6 +64,7 @@ impl StrictMvCandidateMatch {
 /// the sealed receipt authority that minted those binding tokens.
 pub struct SelectedMvQueryInputs {
     inputs: Arc<[ExactObjectBinding]>,
+    definition_occurrences: Arc<[novarocks_sql::compiler::SqlMvRelationOccurrenceId]>,
     rewrite_action: SealedMvRewriteAction,
 }
 
@@ -99,16 +100,29 @@ pub fn prove_selected_mv_query_inputs(
         return Err("MV selection repeats a pre-rewrite query occurrence".to_string());
     }
 
+    // Definition occurrence IDs are scoped by D and may be sparse. Their
+    // order is the publication's order, never an array address chosen by the
+    // optimizer or a query-runtime scan identity.
+    let mut publication_positions = std::collections::BTreeMap::new();
+    for (position, expected) in publication_inputs.iter().enumerate() {
+        if publication_positions
+            .insert(expected.occurrence_id(), position)
+            .is_some()
+        {
+            return Err("MV publication repeats a definition occurrence".to_string());
+        }
+    }
     let mut inputs = vec![None; publication_inputs.len()];
     for selected in mapping {
         if selected.occurrence().binding() != selected.binding() {
             return Err("MV selection occurrence and binding token disagree".to_string());
         }
-        let ordinal = selected.publication_input_ordinal();
-        let expected = publication_inputs
-            .get(ordinal)
+        let position = publication_positions
+            .get(&selected.definition_occurrence_id())
+            .copied()
             .ok_or_else(|| "MV selection names an unknown publication input".to_string())?;
-        if inputs[ordinal].is_some() {
+        let expected = publication_inputs[position].relation();
+        if inputs[position].is_some() {
             return Err("MV selection repeats a publication input".to_string());
         }
         let actual = receipts.resolve(selected.binding())?;
@@ -118,14 +132,19 @@ pub fn prove_selected_mv_query_inputs(
                     .to_string(),
             );
         }
-        inputs[ordinal] = Some(actual);
+        inputs[position] = Some(actual);
     }
     let inputs = inputs
         .into_iter()
         .map(|input| input.ok_or_else(|| "MV selection omits a publication input".to_string()))
         .collect::<Result<Vec<_>, _>>()?;
+    let definition_occurrences = publication_inputs
+        .iter()
+        .map(novarocks_sql::compiler::SqlMvRewritePublicationInput::occurrence_id)
+        .collect::<Vec<_>>();
     Ok(SelectedMvQueryInputs {
         inputs: inputs.into(),
+        definition_occurrences: definition_occurrences.into(),
         rewrite_action,
     })
 }
@@ -153,7 +172,10 @@ pub fn prove_selected_mv_target(
     let candidate = MvCandidateFactInput::try_new(
         publication_id,
         selected.rewrite_action.definition_fingerprint(),
+        selected.rewrite_action.definition_revision(),
+        selected.rewrite_action.interpretation_revision(),
         selected.rewrite_action.publication_provenance(),
+        &selected.definition_occurrences,
         &selected.inputs,
         target.binding(),
     )
@@ -248,7 +270,7 @@ mod tests {
     #[test]
     fn selected_proof_joins_publication_to_actual_input_and_target_receipts() {
         let action = rewrite_action();
-        let input = publication_binding(&action.publication_inputs()[0]);
+        let input = publication_binding(action.publication_inputs()[0].relation());
         let selected = selected_inputs(action.clone(), input).unwrap();
         let target = target_occurrence(&action);
         let strict = prove_selected_mv_target(selected, &target).unwrap();
@@ -260,7 +282,7 @@ mod tests {
     #[test]
     fn selected_proof_rejects_s101_s102_and_object_replacement() {
         let action = rewrite_action();
-        let expected = &action.publication_inputs()[0];
+        let expected = action.publication_inputs()[0].relation();
         let same_object = expected.revision().object_identity().value();
         for mismatched in [
             changed_publication_binding(expected, same_object, 102),
@@ -275,7 +297,7 @@ mod tests {
         let action = rewrite_action();
         let selected = selected_inputs(
             action.clone(),
-            publication_binding(&action.publication_inputs()[0]),
+            publication_binding(action.publication_inputs()[0].relation()),
         )
         .unwrap();
         let plan = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
@@ -300,7 +322,7 @@ mod tests {
 
         let selected = selected_inputs(
             action.clone(),
-            publication_binding(&action.publication_inputs()[0]),
+            publication_binding(action.publication_inputs()[0].relation()),
         )
         .unwrap();
         let unreadable = ExactObjectBinding::new_without_semantic_revision_for_test(
@@ -334,9 +356,11 @@ mod tests {
         );
 
         let occurrence = action.input_mapping()[0].occurrence();
+        let present = action.publication_inputs()[0].occurrence_id();
+        let missing = novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(999);
         for mapping in [
-            vec![(occurrence, 0), (occurrence, 0)],
-            vec![(occurrence, 1)],
+            vec![(occurrence, present), (occurrence, present)],
+            vec![(occurrence, missing)],
         ] {
             let malformed = novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(
                 novarocks_sql::test_support::native_mv_rewritten_scan_plan_with_inputs(mapping)
@@ -347,7 +371,7 @@ mod tests {
             .remove(0)
             .mv_rewrite_action()
             .unwrap();
-            let actual = publication_binding(&malformed.publication_inputs()[0]);
+            let actual = publication_binding(malformed.publication_inputs()[0].relation());
             assert!(selected_inputs(malformed, actual).is_err());
         }
     }

@@ -54,10 +54,11 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::storage_observation::{
-    MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
+use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
+use novarocks_mv_application::persistence::codec::{
+    ConfigurationDocument, DefinitionDocument, InterpretationDocument,
 };
-use novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration;
+use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
@@ -133,41 +134,21 @@ pub(crate) struct ImvStatelessRebuildRequest {
 /// versions and next-run bookkeeping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MvRebuildEquivalenceSnapshot {
-    query_definition:
-        novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
-    base_table_refs: Vec<String>,
-    primary_key_columns: Vec<String>,
-    schema_contract: novarocks_mv_application::persistence::schema::MvSchemaContract,
-    partition_spec: Option<novarocks_mv_application::persistence::schema::MvPartitionContract>,
-    refresh: MvRefreshDesiredConfiguration,
-    created_at_ms: i64,
-    publication: MvLakePublishedProjection,
+    target: novarocks_mv_application::product::MvTarget,
+    definition: DefinitionDocument,
+    interpretation: InterpretationDocument,
+    configuration: ConfigurationDocument,
+    publication: MvPublicationState,
 }
 
-fn equivalence_snapshot(
-    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
-    package: &MvLakePackageObservation,
-) -> Result<MvRebuildEquivalenceSnapshot, String> {
-    let schema_contract = definition.schema_contract.clone().ok_or_else(|| {
-        "stateless rebuild equivalence requires a rebuilt MV schema contract".to_string()
-    })?;
-    Ok(MvRebuildEquivalenceSnapshot {
-        query_definition: definition.query_definition.clone(),
-        base_table_refs: definition.base_table_refs.clone(),
-        primary_key_columns: definition.primary_key_columns.clone(),
-        partition_spec: definition.partition_spec.clone(),
-        schema_contract,
-        refresh: MvRefreshDesiredConfiguration::new(
-            definition.refresh_policy.clone(),
-            definition.refresh_paused,
-            definition.refresh_interval_ms,
-            definition.max_staleness_ms,
-        )?,
-        created_at_ms: definition.created_at_ms,
-        publication: package
-            .published_projection()
-            .map_err(|error| format!("project lake publication for equivalence: {error}"))?,
-    })
+fn equivalence_snapshot(projection: &StoredMvProjection) -> MvRebuildEquivalenceSnapshot {
+    MvRebuildEquivalenceSnapshot {
+        target: projection.facts.target().clone(),
+        definition: projection.facts.definition().clone(),
+        interpretation: projection.facts.interpretation().clone(),
+        configuration: projection.facts.configuration().clone(),
+        publication: projection.facts.publication().clone(),
+    }
 }
 
 impl ImvStatelessRebuildRequest {
@@ -361,7 +342,18 @@ fn execute_request_with_context(
         let source_revision = package
             .source_revision()
             .map_err(|error| format!("derive stateless rebuild source revision: {error}"))?;
-        clear_sqlite_and_rebuild_from_lake(readiness, &package)?;
+        let catalog = exact_lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| format!("resolve stateless rebuild catalog handle: {error}"))?
+            .clone();
+        clear_accelerator_and_rebuild_from_lake(
+            readiness,
+            connector_control,
+            catalog,
+            &package,
+            connector_context.clone(),
+        )?;
         let reloaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
             &exact_lease,
             connector_context.clone(),
@@ -423,9 +415,12 @@ fn execute_request_with_context(
 /// (`rebuild_one_lake_package_if_missing_verified`) rather than sweeping every
 /// registered catalog via `rebuild_imv_cache_from_lake`, so the probe touches
 /// only its own target.
-fn clear_sqlite_and_rebuild_from_lake(
+fn clear_accelerator_and_rebuild_from_lake(
     readiness: &MvReadinessPort,
+    connector_control: &dyn ConnectorControlResolver,
+    catalog: novarocks_spi::connector::CatalogHandle,
     package: &MvLakePackageObservation,
+    connector_context: ConnectorRequestContext,
 ) -> Result<(), String> {
     // 1. Confirm the SQLite definition currently exists; the round-trip is only
     //    meaningful if there is a cached record to clear.
@@ -447,7 +442,7 @@ fn clear_sqlite_and_rebuild_from_lake(
             package.table.table
         ));
     };
-    let before = equivalence_snapshot(&existing.definition, package)?;
+    let before = equivalence_snapshot(&existing.projection);
 
     // 2. Clear only rebuildable accelerator records. Historical refresh
     // records remain intact, and the repository rejects an active refresh.
@@ -466,24 +461,37 @@ fn clear_sqlite_and_rebuild_from_lake(
     }
 
     // 3. Rebuild the single target MV purely from the lake package.
+    let canonical_target = novarocks_mv_application::product::MvTarget::from_parts(
+        Some(package.table.instance_id.as_str()),
+        &package.table.namespace,
+        &package.table.table,
+    );
     crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_verified(
-        readiness, package,
+        readiness,
+        connector_control,
+        catalog,
+        canonical_target.clone(),
+        connector_context,
     )?;
 
-    // 4. Confirm the definition reappeared. If it did not, statelessness failed:
-    //    the lake package did not carry enough to reconstruct the SQLite record.
+    // 4. Confirm the canonical candidate reappeared. Read-only lake rebuild is
+    //    intentionally not management readiness, so `load_ready` must remain
+    //    unavailable until a separate management observation succeeds.
     let rebuilt = readiness
-        .load_ready(&target)
-        .map_err(|e| format!("verify MV definition after full rebuild failed: {e}"))?;
+        .candidate_reader()
+        .list_candidate_definitions()
+        .map_err(|e| format!("verify MV candidate after full rebuild failed: {e}"))?
+        .into_iter()
+        .find(|projection| projection.facts.target() == &canonical_target);
     let Some(rebuilt) = rebuilt else {
         return Err(format!(
-            "{PROCEDURE_NAME} full level: MV repository definition for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
+            "{PROCEDURE_NAME} full level: MV candidate for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
             package.table.instance_id.as_str(),
             package.table.namespace,
             package.table.table
         ));
     };
-    let after = equivalence_snapshot(&rebuilt.definition, package)?;
+    let after = equivalence_snapshot(&rebuilt);
     if before != after {
         return Err(format!(
             "{PROCEDURE_NAME} full level: rebuilt accelerator semantics differ from the pre-wipe projection"
@@ -555,10 +563,59 @@ mod tests {
         MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
     use bytes::Bytes;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
     use novarocks_parser::{
         ast::{MaintenanceStatement, Statement},
         parse,
     };
+
+    #[test]
+    fn equivalence_compares_complete_documents_not_accelerator_identity() {
+        let fixture =
+            || ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        let before = StoredMvProjection {
+            mv_id: 1,
+            facts: fixture().build().unwrap(),
+        };
+        let rebuilt = StoredMvProjection {
+            mv_id: 99,
+            facts: fixture().build().unwrap(),
+        };
+        assert_eq!(
+            equivalence_snapshot(&before),
+            equivalence_snapshot(&rebuilt)
+        );
+        assert_eq!(
+            equivalence_snapshot(&before)
+                .definition
+                .relation_occurrences
+                .len(),
+            2
+        );
+
+        let mut changed = fixture();
+        changed.configuration.paused = true;
+        let changed = StoredMvProjection {
+            mv_id: 1,
+            facts: changed.build().unwrap(),
+        };
+        assert_ne!(
+            equivalence_snapshot(&before),
+            equivalence_snapshot(&changed)
+        );
+
+        let unpublished = StoredMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None)
+                .build()
+                .unwrap(),
+        };
+        assert_ne!(
+            equivalence_snapshot(&before),
+            equivalence_snapshot(&unpublished)
+        );
+    }
 
     fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
         novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))

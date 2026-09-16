@@ -20,14 +20,52 @@ use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
-    CatalogHandle, ConnectorControlRuntimeId, ConnectorDocumentManagementOperation,
-    ConnectorTableIdentity, ConnectorTableObjectId,
+    CatalogHandle, ConnectorCommittedVersion, ConnectorControlRuntimeId,
+    ConnectorDocumentManagementOperation, ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
     CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
     MvActivityLease, MvActivityOwner, MvActivityTicket,
 };
+use crate::persistence::documents::MvObservedCurrentDocuments;
+
+/// Single-use proof that the management owner admitted the exact same Current
+/// observation after effect closure and owner/incarnation validation.
+/// Historical reads and foreign-owner observations cannot construct it.
+#[derive(Debug)]
+pub struct MvCurrentManagementAdmission {
+    target: ManagedMvTarget,
+    owner: DeploymentOwner,
+    incarnation: ProcessIncarnation,
+    metadata_version: ConnectorCommittedVersion,
+    liveness: ManagementObservationLiveness,
+}
+
+impl MvCurrentManagementAdmission {
+    pub(crate) fn matches(&self, documents: &MvObservedCurrentDocuments) -> bool {
+        self.liveness.is_open()
+            && self.target == documents.management_target
+            && self.owner == documents.deployment_owner
+            && self.incarnation == documents.process_incarnation
+            && self.metadata_version == documents.metadata_version
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.liveness.is_open()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(documents: &MvObservedCurrentDocuments) -> Self {
+        Self {
+            target: documents.management_target.clone(),
+            owner: documents.deployment_owner.clone(),
+            incarnation: documents.process_incarnation.clone(),
+            metadata_version: documents.metadata_version.clone(),
+            liveness: ManagementObservationLiveness::new(),
+        }
+    }
+}
 
 use super::observation::{
     FreshCreateIntentObservation, ManagementObservationAuthorization,
@@ -237,7 +275,7 @@ impl ManagementEntrance {
         &self,
         observation: &ManagementObservationState,
         dependencies: ManagementDependencySet,
-    ) -> Result<(), ManagementAdmissionError> {
+    ) -> Result<MvCurrentManagementAdmission, ManagementAdmissionError> {
         if observation.phase() != ManagementObservationPhase::Ready {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
         }
@@ -270,6 +308,16 @@ impl ManagementEntrance {
         {
             return Err(ManagementAdmissionError::ReadmissionIncomplete);
         }
+        let admission = MvCurrentManagementAdmission {
+            target: observation.target().clone(),
+            owner: observation.local_owner().clone(),
+            incarnation: observation.local_incarnation().clone(),
+            metadata_version: observation
+                .latest_metadata_version()
+                .cloned()
+                .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?,
+            liveness: observation.liveness().clone(),
+        };
         state.insert(
             observation.target().table().clone(),
             TargetAdmissionState {
@@ -283,7 +331,7 @@ impl ManagementEntrance {
                 ready: true,
             },
         );
-        Ok(())
+        Ok(admission)
     }
 
     /// Close normal writes before acquiring new current evidence. The returned

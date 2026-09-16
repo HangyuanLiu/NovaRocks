@@ -219,6 +219,10 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 }
 
 #[cfg(test)]
+#[path = "tests/admission_support.rs"]
+mod admission_support;
+
+#[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
@@ -231,8 +235,10 @@ mod tests {
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
+    use super::admission_support::{AdmissionCatalogSpy, AdmissionFileIoSpy};
     use super::*;
     use crate::access_binding::IcebergReadBinding;
+    use crate::catalog::CatalogCreateIntent;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
 
@@ -245,29 +251,72 @@ mod tests {
 
     #[test]
     fn native_hadoop_rejects_every_document_management_operation_before_catalog_io() {
+        assert_native_management_refused_before_io("hadoop");
+    }
+
+    #[test]
+    fn native_hive_rejects_every_document_management_operation_before_catalog_io() {
+        assert_native_management_refused_before_io("hive");
+    }
+
+    fn assert_native_management_refused_before_io(catalog_kind: &str) {
         let tokio = tokio::runtime::Runtime::new().unwrap();
         let handle = tokio.handle().clone();
         let warehouse = tempfile::tempdir().unwrap();
-        let configuration = crate::catalog_config::parse_catalog_configuration(
-            "ice",
-            &[(
+        // No metastore is needed: the native catalog must refuse document
+        // management without contacting this reserved loopback endpoint.
+        let metastore = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        metastore.set_nonblocking(true).unwrap();
+        let mut properties = vec![
+            ("iceberg.catalog.type".to_string(), catalog_kind.to_string()),
+            (
                 "iceberg.catalog.warehouse".to_string(),
                 warehouse.path().display().to_string(),
-            )],
-        )
-        .unwrap();
+            ),
+        ];
+        if catalog_kind == "hive" {
+            properties.push((
+                "hive.metastore.uris".to_string(),
+                format!("thrift://{}", metastore.local_addr().unwrap()),
+            ));
+        }
+        let configuration =
+            crate::catalog_config::parse_catalog_configuration("ice", &properties).unwrap();
+        let file_io = Arc::new(AdmissionFileIoSpy::default());
         let binding = IcebergReadBinding::new(
             None,
             novarocks_fs::FsAccessResolver::new(),
-            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
-            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+            file_io.clone(),
+            file_io.clone(),
         );
+        let state = IcebergCatalogControlState::new(configuration);
+        let resources = IcebergMetadataResources::new(binding, handle);
+        let native_runtime = crate::metadata_context::IcebergMetadataContext::try_new(
+            state.clone(),
+            resources.clone(),
+        )
+        .unwrap();
+        // These catalogs still support ordinary empty-table creation. This
+        // test narrows document management, not all catalog write semantics.
+        native_runtime
+            .novarocks_catalog()
+            .admit_create(CatalogCreateIntent::EmptyTable)
+            .expect("native catalog still admits an empty table");
+        assert!(
+            native_runtime
+                .novarocks_catalog()
+                .admit_create(CatalogCreateIntent::CreateTableAsSelect)
+                .is_err(),
+        );
+        let catalog = Arc::new(AdmissionCatalogSpy::new(Arc::clone(
+            native_runtime.novarocks_catalog(),
+        )));
         let runtime = Arc::new(
-            crate::metadata_context::IcebergMetadataContext::try_new(
-                IcebergCatalogControlState::new(configuration),
-                IcebergMetadataResources::new(binding, handle),
-            )
-            .unwrap(),
+            crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
+                state,
+                resources,
+                catalog.clone(),
+            ),
         );
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
@@ -320,7 +369,14 @@ mod tests {
             .unwrap();
             let error = storage.admit_management(request).unwrap_err();
             assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+            catalog.assert_no_io();
+            file_io.assert_no_dispatch();
+            assert!(warehouse.path().read_dir().unwrap().next().is_none());
+            assert_eq!(
+                metastore.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "document admission must not contact the native metastore",
+            );
         }
-        assert!(warehouse.path().read_dir().unwrap().next().is_none());
     }
 }

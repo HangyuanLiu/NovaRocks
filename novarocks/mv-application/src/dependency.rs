@@ -17,11 +17,32 @@
 
 use serde::{Deserialize, Serialize};
 
+use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
+
+/// Exact upstream identity used by destructive dependency guards. Names are
+/// lookup coordinates only; safety is keyed by catalog instance and the
+/// provider-issued opaque object fact frozen in D.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvDependencyObjectIdentity {
+    pub catalog_instance: String,
+    pub object_id: ConnectorTableObjectId,
+}
+
+impl MvDependencyObjectIdentity {
+    pub fn new(catalog_instance: impl Into<String>, object_id: ConnectorTableObjectId) -> Self {
+        Self {
+            catalog_instance: catalog_instance.into(),
+            object_id,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MvDependencyObjectType {
+    /// Persisted occurrence facts are classified only against a complete root inventory.
+    Unclassified,
     Table,
     MaterializedView,
 }
@@ -29,6 +50,7 @@ pub enum MvDependencyObjectType {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MvDependencyStorageEngine {
+    Unclassified,
     /// Legacy serialized value retained for explicit rejection/migration.
     /// It is not a native internal-table capability.
     StarRocks,
@@ -46,13 +68,24 @@ pub struct MvDependencyObjectRef {
 }
 
 impl MvDependencyObjectRef {
+    /// Name is a lookup coordinate, not an exact source identity. Index rows
+    /// retain D's occurrence and object identity for subsequent validation.
+    pub fn same_locator(&self, other: &Self) -> bool {
+        self.catalog.as_deref().map(str::to_ascii_lowercase)
+            == other.catalog.as_deref().map(str::to_ascii_lowercase)
+            && self
+                .database_or_namespace
+                .eq_ignore_ascii_case(&other.database_or_namespace)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
     pub fn display_name(&self) -> String {
         let object = match self.catalog.as_deref() {
             Some(catalog) => format!("{catalog}.{}.{}", self.database_or_namespace, self.name),
             None => format!("{}.{}", self.database_or_namespace, self.name),
         };
         match self.object_type {
-            MvDependencyObjectType::Table => object,
+            MvDependencyObjectType::Table | MvDependencyObjectType::Unclassified => object,
             MvDependencyObjectType::MaterializedView => format!("mv:{object}"),
         }
     }

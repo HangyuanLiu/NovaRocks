@@ -18,17 +18,20 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dependency::{
-    MvDependencyObjectRef, iceberg_mv_dependency_ref, starrocks_mv_dependency_ref,
+    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
+    iceberg_mv_dependency_ref,
 };
-use crate::persistence::definition::StoredMvDefinition;
+use crate::persistence::projection::StoredMvProjection;
 
 pub(crate) const MV_ACCELERATOR_DEPENDENCY_SUBJECT: &str = "mv.accelerator_dependency";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMvDependency {
     pub downstream_mv_id: i64,
+    pub occurrence_id: u32,
+    pub upstream_object_id: serde_bytes::ByteBuf,
     pub upstream: MvDependencyObjectRef,
-    pub created_at_ms: i64,
+    pub created_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,27 +40,63 @@ pub struct CreateMvDependencyRequest {
     pub created_at_ms: i64,
 }
 
-pub fn stored_definition_dependency_ref(
-    definition: &StoredMvDefinition,
-    starrocks_name: Option<(&str, &str)>,
-) -> Result<MvDependencyObjectRef, String> {
-    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        let catalog = definition
-            .target_catalog
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target catalog".to_string())?;
-        let namespace = definition
-            .target_namespace
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target namespace".to_string())?;
-        let table = definition
-            .target_table
-            .as_deref()
-            .ok_or_else(|| "iceberg MV definition missing target table".to_string())?;
-        return Ok(iceberg_mv_dependency_ref(catalog, namespace, table));
+pub fn stored_definition_dependency_ref(projection: &StoredMvProjection) -> MvDependencyObjectRef {
+    let target = projection.facts.source_revision();
+    iceberg_mv_dependency_ref(
+        target.target.instance_id.as_str(),
+        target.target.namespace.as_ref(),
+        target.target.table.as_ref(),
+    )
+}
+
+/// Index rows derive from D, never caller-supplied FQN watermarks.
+pub(crate) fn projection_dependencies(
+    downstream_mv_id: i64,
+    facts: &crate::persistence::projection::MvDocumentProjection,
+) -> Vec<StoredMvDependency> {
+    facts
+        .dependencies()
+        .into_iter()
+        .map(|dependency| StoredMvDependency {
+            downstream_mv_id,
+            occurrence_id: dependency.occurrence_id,
+            upstream_object_id: serde_bytes::ByteBuf::from(
+                dependency.object_id.as_bytes().to_vec(),
+            ),
+            upstream: MvDependencyObjectRef {
+                catalog: Some(dependency.catalog),
+                database_or_namespace: dependency.namespace,
+                name: dependency.relation,
+                object_type: MvDependencyObjectType::Unclassified,
+                storage_engine: MvDependencyStorageEngine::Unclassified,
+            },
+            created_at_ms: facts.definition().created_at_ms,
+        })
+        .collect()
+}
+
+/// Classification is a derived view of one complete inventory, never a fact
+/// guessed from the locator or persisted independently of its source root.
+pub(crate) fn classify_dependencies(
+    dependencies: &mut [StoredMvDependency],
+    inventory: &[StoredMvProjection],
+) {
+    for dependency in dependencies {
+        let is_mv = inventory.iter().any(|projection| {
+            let source = projection.facts.source_revision();
+            dependency.upstream.catalog.as_deref() == Some(source.target.instance_id.as_str())
+                && dependency.upstream_object_id.as_slice()
+                    == source.target_object_id.as_bytes().as_ref()
+        });
+        dependency.upstream.object_type = if is_mv {
+            MvDependencyObjectType::MaterializedView
+        } else {
+            MvDependencyObjectType::Table
+        };
+        dependency.upstream.storage_engine = if is_mv {
+            MvDependencyStorageEngine::Iceberg
+        } else {
+            MvDependencyStorageEngine::ExternalTable
+        };
     }
-    let (database, table) = starrocks_name.ok_or_else(|| {
-        "StarRocks table MV definition requires database/table name for dependency ref".to_string()
-    })?;
-    Ok(starrocks_mv_dependency_ref(database, table))
 }

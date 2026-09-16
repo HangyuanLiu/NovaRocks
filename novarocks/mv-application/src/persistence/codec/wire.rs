@@ -196,6 +196,7 @@ const DEFINITION: &[Field] = &[
     repeated_message(3, Schema::RelationOccurrence),
     repeated_message(4, Schema::OutputDefinition),
     bytes(5),
+    scalar(6),
 ];
 const QUERY: &[Field] = &[bytes(1), scalar(2), message(3, Schema::ResolutionContext)];
 const RESOLUTION: &[Field] = &[bytes(1), bytes(2)];
@@ -281,6 +282,7 @@ const PUBLICATION: &[Field] = &[
     message(6, Schema::PublicationOutput),
     scalar(7),
     message(8, Schema::PublicationStatistics),
+    scalar(9),
 ];
 const PUBLICATION_INPUT: &[Field] = &[scalar(1), bytes(2), bytes(3)];
 const PUBLICATION_OUTPUT: &[Field] = &[bytes(1), boolean(2)];

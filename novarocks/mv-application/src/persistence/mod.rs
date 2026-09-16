@@ -26,9 +26,15 @@ pub mod descriptor;
 pub mod documents;
 pub mod exact_revision;
 pub mod identity;
+pub mod projection;
+pub mod runtime_bindings;
 pub mod schema;
 pub mod semantic;
 pub mod validation;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
 
 pub(crate) mod generated {
     include!(concat!(env!("OUT_DIR"), "/novarocks.mv.persistence.v1.rs"));

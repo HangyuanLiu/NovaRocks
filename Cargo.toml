@@ -90,6 +90,7 @@ roaring = "0.10"
 rustls = { version = "0.23", default-features = false }
 ryu = "1"
 serde = "1"
+serde_bytes = "0.11"
 serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"

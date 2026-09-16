@@ -29,8 +29,9 @@ use std::collections::{BTreeMap, HashSet};
 use bytes::Bytes;
 
 use super::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
+    ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableObjectId,
 };
 
 pub const MAX_MV_OBSERVATION_FIELDS: usize = 4_096;
@@ -352,48 +353,104 @@ impl MvCreatedTargetObservation {
     }
 }
 
-/// Exact schema facts used to validate an existing MV target.
+/// Exact physical schema facts from one retained metadata handle. Opaque
+/// identities must use the same provider encoding as CREATE source bindings.
+/// Each field carries its provider physical ordinal; consumers must not infer
+/// identity or ordinal from a name, numeric field ID, or enumeration order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvSchemaValidationObservation {
-    table_uuid: String,
-    schema_id: i32,
+    table: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    metadata_version: ConnectorCommittedVersion,
+    schema_version: Bytes,
+    partition_spec_version: Bytes,
     format_v3: bool,
     stored_row_lineage_enabled: bool,
-    fields: Vec<MvObservedField>,
-    partition: MvObservedPartitionSpec,
+    fields: Vec<(u32, MvObservedSourceField)>,
 }
 
 impl MvSchemaValidationObservation {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        table_uuid: String,
-        schema_id: i32,
+        table: ConnectorTableIdentity,
+        object_id: ConnectorTableObjectId,
+        metadata_version: ConnectorCommittedVersion,
+        schema_version: Bytes,
+        partition_spec_version: Bytes,
         format_v3: bool,
         stored_row_lineage_enabled: bool,
-        fields: Vec<MvObservedField>,
-        partition: MvObservedPartitionSpec,
+        fields: Vec<(u32, MvObservedSourceField)>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
-        require_non_empty(&table_uuid, "MV schema validation table UUID")?;
-        if schema_id < 0 {
-            return corrupt("MV schema validation observation has a negative schema ID");
+        validate_table(&table, "MV exact schema")?;
+        metadata_version.validate()?;
+        if schema_version.is_empty() || partition_spec_version.is_empty() || fields.is_empty() {
+            return corrupt(
+                "MV exact schema observation has missing schema, partition, or field facts",
+            );
         }
-        validate_fields_and_partition(&fields, &partition, context, "MV schema validation")?;
+        if fields.len() > MAX_MV_OBSERVATION_FIELDS {
+            return exhausted("MV exact schema observation exceeds the field limit");
+        }
+        let mut used = 0;
+        for size in [
+            object_id.as_bytes().len(),
+            metadata_version.payload().len(),
+            schema_version.len(),
+            partition_spec_version.len(),
+        ] {
+            reserve(&mut used, size, context, "MV exact schema")?;
+        }
+        let mut ids = HashSet::new();
+        let mut ordinals = HashSet::new();
+        let mut names = HashSet::new();
+        for (ordinal, field) in &fields {
+            if !ids.insert(field.provider_field_id())
+                || !ordinals.insert(*ordinal)
+                || !names.insert(field.name().to_ascii_lowercase())
+            {
+                return corrupt(
+                    "MV exact schema observation has duplicate field identity, ordinal, or name",
+                );
+            }
+            reserve(
+                &mut used,
+                FIELD_FIXED_BYTES
+                    .saturating_add(field.provider_field_id().len())
+                    .saturating_add(field.name().len())
+                    .saturating_add(field.type_signature().len()),
+                context,
+                "MV exact schema",
+            )?;
+        }
+        validate_context(context)?;
         Ok(Self {
-            table_uuid,
-            schema_id,
+            table,
+            object_id,
+            metadata_version,
+            schema_version,
+            partition_spec_version,
             format_v3,
             stored_row_lineage_enabled,
             fields,
-            partition,
         })
     }
 
-    pub fn table_uuid(&self) -> &str {
-        &self.table_uuid
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
     }
-    pub const fn schema_id(&self) -> i32 {
-        self.schema_id
+    pub fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+    pub fn metadata_version(&self) -> &ConnectorCommittedVersion {
+        &self.metadata_version
+    }
+    pub fn schema_version(&self) -> &Bytes {
+        &self.schema_version
+    }
+    pub fn partition_spec_version(&self) -> &Bytes {
+        &self.partition_spec_version
     }
     pub const fn is_format_v3(&self) -> bool {
         self.format_v3
@@ -401,11 +458,8 @@ impl MvSchemaValidationObservation {
     pub const fn stored_row_lineage_enabled(&self) -> bool {
         self.stored_row_lineage_enabled
     }
-    pub fn fields(&self) -> &[MvObservedField] {
+    pub fn fields(&self) -> &[(u32, MvObservedSourceField)] {
         &self.fields
-    }
-    pub const fn partition(&self) -> &MvObservedPartitionSpec {
-        &self.partition
     }
 }
 
@@ -1337,6 +1391,44 @@ mod tests {
         )
         .expect_err("duplicate provider identity must reject");
         assert_eq!(err.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn exact_schema_requires_unique_physical_identity_ordinal_and_name() {
+        let field = |id, name: &str| {
+            MvObservedSourceField::try_new(
+                Bytes::from(vec![id]),
+                name.to_owned(),
+                "long".into(),
+                false,
+            )
+            .unwrap()
+        };
+        let observe = |fields| {
+            MvSchemaValidationObservation::try_new(
+                table(),
+                target_object_id(),
+                ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata"), Some(11))
+                    .unwrap(),
+                Bytes::from_static(b"schema"),
+                Bytes::from_static(b"spec"),
+                true,
+                true,
+                fields,
+                &context(),
+            )
+        };
+        assert!(observe(vec![(0, field(1, "a")), (1, field(2, "b"))]).is_ok());
+        for fields in [
+            vec![(0, field(1, "a")), (1, field(1, "b"))],
+            vec![(0, field(1, "a")), (0, field(2, "b"))],
+            vec![(0, field(1, "a")), (1, field(2, "A"))],
+        ] {
+            assert_eq!(
+                observe(fields).unwrap_err().kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
     }
 
     #[test]

@@ -50,7 +50,8 @@ use super::aggregate_bindings::{
 
 const APPLY_KEY_IDENTITY_DOMAIN: &[u8] = b"novarocks.mv.apply-key.v1";
 
-pub(crate) struct MvCreateDocumentFacts<'a> {
+pub struct MvCreateDocumentFacts<'a> {
+    pub created_at_ms: u64,
     pub query_definition:
         novarocks_query_application::persisted_query_definition::PersistedQueryDefinition,
     pub sql_facts: &'a SqlMvCreatePersistenceFacts,
@@ -63,13 +64,13 @@ pub(crate) struct MvCreateDocumentFacts<'a> {
     pub configuration: ConfigurationDocument,
 }
 
-pub(crate) struct MvCreateDocuments {
+pub struct MvCreateDocuments {
     pub definition: DefinitionDocument,
     pub interpretation: InterpretationDocument,
     pub configuration: ConfigurationDocument,
 }
 
-pub(crate) fn build_mv_create_documents(
+pub fn build_mv_create_documents(
     input: MvCreateDocumentFacts<'_>,
 ) -> Result<MvCreateDocuments, String> {
     let target_observations = target_observations(input.prepared_target)?;
@@ -82,6 +83,7 @@ pub(crate) fn build_mv_create_documents(
     })?;
     let targets = target_by_name(&target_observations)?;
     let definition = DefinitionDocument::try_from(RuntimeDefinitionFacts {
+        created_at_ms: input.created_at_ms,
         query_definition: input.query_definition,
         relation_occurrences: definition_relations(
             input.sql_facts,
@@ -224,16 +226,18 @@ fn definition_relations(
         .relation_occurrences()
         .iter()
         .map(|relation| {
-            let item = observed.get(&relation.occurrence_id()).ok_or_else(|| {
-                "definition relation is missing exact source observation".to_string()
-            })?;
+            let item = observed
+                .get(&relation.occurrence_id().get())
+                .ok_or_else(|| {
+                    "definition relation is missing exact source observation".to_string()
+                })?;
             let fields = item
                 .fields
                 .iter()
                 .map(|field| {
                     Ok(RuntimeSourceFieldFacts {
                         field_id: source_fields
-                            .get(&(relation.occurrence_id(), field.field_ordinal))
+                            .get(&(relation.occurrence_id().get(), field.field_ordinal))
                             .cloned()
                             .ok_or_else(|| "definition field is not SQL referenced".to_string())?,
                         name_at_binding: field.field_name.clone(),
@@ -243,7 +247,7 @@ fn definition_relations(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             Ok(RuntimeRelationOccurrenceFacts {
-                occurrence_id: relation.occurrence_id(),
+                occurrence_id: relation.occurrence_id().get(),
                 catalog_at_binding: relation.catalog().to_string(),
                 namespace_at_binding: relation.namespace().to_string(),
                 relation_at_binding: relation.relation().to_string(),
@@ -276,9 +280,9 @@ fn references(
         .iter()
         .map(|item| {
             Ok(RuntimeSourceFieldReference {
-                occurrence_id: item.occurrence_id(),
+                occurrence_id: item.occurrence_id().get(),
                 field_id: source
-                    .get(&(item.occurrence_id(), item.field_ordinal()))
+                    .get(&(item.occurrence_id().get(), item.field_ordinal()))
                     .cloned()
                     .ok_or_else(|| "SQL output source has no frozen provider field".to_string())?,
             })
@@ -350,7 +354,11 @@ fn branch_bindings(
                     .get(&branch.branch_ordinal())
                     .cloned()
                     .ok_or_else(|| "SQL branch has no semantic identity".to_string())?,
-                relation_occurrence_ids: branch.relation_occurrence_ids().to_vec(),
+                relation_occurrence_ids: branch
+                    .relation_occurrence_ids()
+                    .iter()
+                    .map(|id| id.get())
+                    .collect(),
                 output_ids: branch
                     .output_ordinals()
                     .iter()

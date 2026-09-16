@@ -193,11 +193,18 @@ pub(crate) fn table_object_id(
 pub(crate) fn committed_version(
     table: &crate::iceberg::table::Table,
 ) -> Result<ConnectorCommittedVersion, ConnectorError> {
-    let metadata = table.metadata();
+    committed_version_from_metadata(table.metadata(), table.metadata_location())
+}
+
+/// The metadata and catalog pointer must come from one frozen provider read.
+pub(crate) fn committed_version_from_metadata(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    metadata_location: Option<&str>,
+) -> Result<ConnectorCommittedVersion, ConnectorError> {
     let payload = serde_json::to_vec(&serde_json::json!({
         "version": 1,
         "table_uuid": metadata.uuid().to_string(),
-        "metadata_location": table.metadata_location(),
+        "metadata_location": metadata_location,
         "last_updated_ms": metadata.last_updated_ms(),
         "current_snapshot_id": metadata.current_snapshot_id(),
     }))

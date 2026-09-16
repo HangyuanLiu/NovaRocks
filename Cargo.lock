@@ -3965,6 +3965,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2",
  "tokio",

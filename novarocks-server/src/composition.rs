@@ -219,27 +219,31 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
     ) -> Result<MvSchemaValidationObservation, ConnectorError> {
         let observed =
             self.inspector
-                .observe_created_target(exact_lease, metadata, context.clone())?;
+                .observe_schema_validation(exact_lease, metadata, context.clone())?;
         let fields = observed
             .fields
             .into_iter()
-            .map(|field| {
-                MvObservedField::new(
-                    field.field_id,
-                    field.name,
-                    field.type_signature,
-                    field.nullable,
-                )
+            .map(|(ordinal, field)| {
+                Ok((
+                    ordinal,
+                    MvObservedSourceField::try_new(
+                        field.provider_field_id,
+                        field.name,
+                        field.type_signature,
+                        field.nullable,
+                    )?,
+                ))
             })
-            .collect();
-        let partition = mv_partition_observation(observed.partition);
+            .collect::<Result<Vec<_>, ConnectorError>>()?;
         MvSchemaValidationObservation::try_new(
-            observed.table_uuid,
-            observed.schema_id,
+            metadata.identity.clone(),
+            observed.object_id,
+            observed.metadata_version,
+            observed.schema_version,
+            observed.partition_spec_version,
             observed.format_v3,
             observed.explicit_row_lineage_enabled,
             fields,
-            partition,
             &context,
         )
     }

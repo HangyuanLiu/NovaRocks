@@ -16,12 +16,12 @@
 // under the License.
 
 use crate::mv::domain::dependency::graph::topological_upstream_order_for_edges;
+use crate::mv::domain::dependency_resolver::classify_ready_dependency_occurrences;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::dependency::{
     MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
 };
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
 use novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
@@ -68,6 +68,12 @@ pub(crate) fn refresh_step_for_dependency_object(
                 object.display_name()
             ));
         }
+        MvDependencyStorageEngine::Unclassified => {
+            return Err(format!(
+                "unclassified dependency cannot be refreshed as materialized view: {}",
+                object.display_name()
+            ));
+        }
     };
     Ok(MvRefreshDependencyStep {
         object: object.clone(),
@@ -91,12 +97,16 @@ pub(crate) fn build_upstream_refresh_steps_with_readiness(
         .map_err(|e| format!("load MV projections for refresh graph failed: {e}"))?;
 
     let mut edges = Vec::new();
-    for projection in projections {
-        let definition = projection.definition.clone();
-        let target = stored_definition_dependency_ref_for_iceberg(&definition)?;
-        let upstream_mvs = readiness
-            .list_ready_dependencies_by_downstream(&projection)
-            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?
+    let inventory = projections
+        .iter()
+        .map(|loaded| &loaded.projection)
+        .collect::<Vec<_>>();
+    for loaded in &projections {
+        let target = stored_definition_dependency_ref(&loaded.projection);
+        let dependencies = readiness
+            .list_ready_dependencies_by_downstream(loaded)
+            .map_err(|e| format!("load MV dependencies for refresh graph failed: {e}"))?;
+        let upstream_mvs = classify_ready_dependency_occurrences(dependencies, &inventory)?
             .into_iter()
             .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
             .map(|dep| dep.upstream)
@@ -108,18 +118,6 @@ pub(crate) fn build_upstream_refresh_steps_with_readiness(
         .iter()
         .map(refresh_step_for_dependency_object)
         .collect()
-}
-
-fn stored_definition_dependency_ref_for_iceberg(
-    definition: &StoredMvDefinition,
-) -> Result<MvDependencyObjectRef, String> {
-    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        return stored_definition_dependency_ref(definition, None);
-    }
-    Err(format!(
-        "legacy materialized view definition {} uses an unsupported storage engine",
-        definition.mv_id
-    ))
 }
 
 #[cfg(test)]
@@ -185,6 +183,18 @@ mod tests {
             refresh_step_for_dependency_object(&external_mv)
                 .expect_err("external table must not be refreshed as an MV"),
             "external table cannot be refreshed as materialized view: mv:external.analytics.orders_mv"
+        );
+    }
+
+    #[test]
+    fn refresh_step_rejects_unclassified_storage_even_for_an_mv_label() {
+        let mut dependency = iceberg_mv_dependency_ref("ice", "analytics", "orders_mv");
+        dependency.storage_engine = MvDependencyStorageEngine::Unclassified;
+
+        assert_eq!(
+            refresh_step_for_dependency_object(&dependency)
+                .expect_err("an MV label cannot provide missing storage admission"),
+            "unclassified dependency cannot be refreshed as materialized view: mv:ice.analytics.orders_mv",
         );
     }
 }

@@ -15,14 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_mv_application::dependency::{MvDependencyObjectRef, MvDependencyStorageEngine};
+use novarocks_mv_application::dependency::{MvDependencyObjectRef, MvDependencyObjectType};
 
-fn object_in_iceberg_scope(
+/// The command entrance has already admitted the catalog's Iceberg provider.
+/// A dependency's storage enum does not describe that current catalog scope.
+fn object_in_admitted_scope(
     object: &MvDependencyObjectRef,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> bool {
-    if object.storage_engine != MvDependencyStorageEngine::Iceberg {
+    if !matches!(
+        object.object_type,
+        MvDependencyObjectType::Table | MvDependencyObjectType::MaterializedView
+    ) {
         return false;
     }
     let Some(obj_catalog) = object.catalog.as_deref() else {
@@ -44,7 +49,9 @@ fn iceberg_mv_target_in_scope(
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Option<String> {
-    if !object_in_iceberg_scope(target, scope_catalog, scope_namespace) {
+    if target.object_type != MvDependencyObjectType::MaterializedView
+        || !object_in_admitted_scope(target, scope_catalog, scope_namespace)
+    {
         return None;
     }
     let catalog = target.catalog.as_deref()?;
@@ -85,12 +92,12 @@ pub(crate) fn validate_no_external_dependents_for_scope(
 ) -> Result<(), String> {
     let mut external_dependents: Vec<String> = Vec::new();
     for (target, upstreams) in definitions_with_deps {
-        let target_in_scope = object_in_iceberg_scope(target, scope_catalog, scope_namespace);
+        let target_in_scope = object_in_admitted_scope(target, scope_catalog, scope_namespace);
         if target_in_scope {
             continue;
         }
         for upstream in upstreams {
-            if object_in_iceberg_scope(upstream, scope_catalog, scope_namespace) {
+            if object_in_admitted_scope(upstream, scope_catalog, scope_namespace) {
                 external_dependents.push(format!(
                     "{} depends on {}",
                     target.display_name(),
@@ -119,8 +126,8 @@ pub(crate) fn validate_no_external_dependents_for_scope(
 mod tests {
     use super::*;
     use novarocks_mv_application::dependency::{
-        iceberg_mv_dependency_ref, iceberg_table_object_ref, starrocks_mv_dependency_ref,
-        starrocks_table_object_ref,
+        external_table_object_ref, iceberg_mv_dependency_ref, iceberg_table_object_ref,
+        starrocks_mv_dependency_ref, starrocks_table_object_ref,
     };
 
     #[test]
@@ -145,7 +152,7 @@ mod tests {
     }
 
     #[test]
-    fn iceberg_mv_targets_scope_ignores_non_iceberg_and_outside_scope() {
+    fn iceberg_mv_targets_scope_ignores_absent_catalog_and_outside_scope() {
         let targets = vec![
             starrocks_mv_dependency_ref("analytics", "mv_starrocks"),
             iceberg_mv_dependency_ref("ice", "other", "mv_other"),
@@ -153,7 +160,7 @@ mod tests {
         ];
 
         validate_no_iceberg_mv_targets_in_scope("ice", Some("analytics"), &targets)
-            .expect("only in-scope iceberg MV targets should block the drop");
+            .expect("only MV targets in the admitted catalog scope should block the drop");
     }
 
     #[test]
@@ -194,6 +201,40 @@ mod tests {
     }
 
     #[test]
+    fn external_table_source_in_the_admitted_catalog_scope_blocks_drop() {
+        let target = iceberg_mv_dependency_ref("ice", "analytics", "mv_orders");
+        let upstream = external_table_object_ref("ice", "sales", "orders");
+        let edges = [(target, vec![upstream])];
+
+        let error = validate_no_external_dependents_for_scope("ICE", Some("SALES"), &edges)
+            .expect_err("external source facts still belong to the admitted drop scope");
+        assert!(error.contains("mv:ice.analytics.mv_orders depends on ice.sales.orders"));
+    }
+
+    #[test]
+    fn external_table_source_in_another_catalog_or_namespace_does_not_block_drop() {
+        let target = iceberg_mv_dependency_ref("ice", "analytics", "mv_orders");
+        let edges = [(
+            target,
+            vec![
+                external_table_object_ref("other", "sales", "orders"),
+                external_table_object_ref("ice", "other_namespace", "orders"),
+            ],
+        )];
+
+        validate_no_external_dependents_for_scope("ice", Some("sales"), &edges)
+            .expect("different locator scopes do not intersect the admitted drop");
+    }
+
+    #[test]
+    fn ordinary_table_kind_is_not_reported_as_an_mv_target() {
+        let targets = [external_table_object_ref("ice", "sales", "orders")];
+
+        validate_no_iceberg_mv_targets_in_scope("ice", Some("sales"), &targets)
+            .expect("a source table locator does not prove an MV target");
+    }
+
+    #[test]
     fn external_dependents_scope_at_catalog_granularity() {
         let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
         let upstream_a = iceberg_table_object_ref("cat1", "ns1", "events");
@@ -209,13 +250,13 @@ mod tests {
     }
 
     #[test]
-    fn external_dependents_scope_ignores_non_iceberg_upstreams() {
+    fn external_dependents_scope_ignores_upstreams_without_a_catalog_locator() {
         let mv_target = iceberg_mv_dependency_ref("cat2", "db2", "mv_outside");
         let upstream = starrocks_table_object_ref("cat1", "orders");
         let edges = vec![(mv_target, vec![upstream])];
 
         validate_no_external_dependents_for_scope("cat1", Some("orders"), &edges)
-            .expect("non-iceberg upstreams must not block iceberg-scope drops");
+            .expect("an absent catalog locator cannot match the admitted catalog scope");
     }
 
     #[test]

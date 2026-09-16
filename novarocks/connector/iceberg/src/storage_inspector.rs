@@ -29,8 +29,8 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
+    ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorRequestContext, ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
 };
 
 use crate::commit::{MV_PUBLICATION_ID_PROP, MvPublicationProvenanceV2, RefreshTechnique};
@@ -102,6 +102,17 @@ pub struct IcebergStorageSourceField {
     pub name: String,
     pub type_signature: String,
     pub nullable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IcebergStorageExactSchemaObservation {
+    pub object_id: ConnectorTableObjectId,
+    pub metadata_version: ConnectorCommittedVersion,
+    pub schema_version: Bytes,
+    pub partition_spec_version: Bytes,
+    pub format_v3: bool,
+    pub explicit_row_lineage_enabled: bool,
+    pub fields: Vec<(u32, IcebergStorageSourceField)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +291,22 @@ pub struct IcebergStorageMaintenancePolicy {
 pub struct IcebergStorageInspector;
 
 impl IcebergStorageInspector {
+    pub fn observe_schema_validation(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<IcebergStorageExactSchemaObservation, ConnectorError> {
+        let (table, metadata_location) = decoded_table_generation(exact_lease, metadata, &context)?;
+        let observed = exact_schema_observation(&table, metadata_location.as_deref(), &context)?;
+        if metadata.version.as_ref() != Some(&observed.schema_version) {
+            return Err(corrupt(
+                "exact MV schema observation differs from the admitted metadata schema version",
+            ));
+        }
+        Ok(observed)
+    }
+
     pub fn observe_create_source(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -650,6 +677,65 @@ fn create_source_observation(
     })
 }
 
+fn exact_schema_observation(
+    table: &TableMetadata,
+    metadata_location: Option<&str>,
+    context: &ConnectorRequestContext,
+) -> Result<IcebergStorageExactSchemaObservation, ConnectorError> {
+    let metadata_location = metadata_location
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            corrupt("exact MV schema observation requires a committed metadata location")
+        })?;
+    let target = target_observation(table, context)?;
+    let object_id = iceberg_object_id_from_uuid(target.table_uuid)?;
+    let metadata_version = crate::document_storage::observation::committed_version_from_metadata(
+        table,
+        Some(metadata_location),
+    )?;
+    let mut budget = object_id.as_bytes().len();
+    reserve_bytes(context, &mut budget, metadata_version.payload().len())?;
+    // Match the existing admitted metadata/CREATE identity encodings. These
+    // bytes remain provider-owned; consumers only compare them for equality.
+    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
+    let partition_spec_version =
+        Bytes::copy_from_slice(&target.partition.target_spec_id.to_le_bytes());
+    reserve_bytes(context, &mut budget, schema_version.len())?;
+    reserve_bytes(context, &mut budget, partition_spec_version.len())?;
+    let fields = target
+        .fields
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let provider_field_id = Bytes::copy_from_slice(&field.field_id.to_be_bytes());
+            reserve_bytes(context, &mut budget, 32)?;
+            reserve_bytes(context, &mut budget, provider_field_id.len())?;
+            reserve(context, &mut budget, &field.name)?;
+            reserve(context, &mut budget, &field.type_signature)?;
+            Ok((
+                u32::try_from(ordinal)
+                    .map_err(|_| exhausted("MV physical field ordinal exceeds u32"))?,
+                IcebergStorageSourceField {
+                    provider_field_id,
+                    name: field.name,
+                    type_signature: field.type_signature,
+                    nullable: field.nullable,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    validate_context(context)?;
+    Ok(IcebergStorageExactSchemaObservation {
+        object_id,
+        metadata_version,
+        schema_version,
+        partition_spec_version,
+        format_v3: target.format_v3,
+        explicit_row_lineage_enabled: target.explicit_row_lineage_enabled,
+        fields,
+    })
+}
+
 fn lake_package_observation(
     table: &TableMetadata,
     context: &ConnectorRequestContext,
@@ -709,6 +795,7 @@ fn lake_package_observation(
 struct TableHandlePayload {
     namespace: String,
     table: String,
+    metadata_location: Option<String>,
     table_info: Option<IcebergTableInfo>,
 }
 
@@ -717,6 +804,14 @@ fn decoded_table(
     metadata: &ConnectorTableMetadata,
     context: &ConnectorRequestContext,
 ) -> Result<TableMetadata, ConnectorError> {
+    decoded_table_generation(exact_lease, metadata, context).map(|(table, _)| table)
+}
+
+fn decoded_table_generation(
+    exact_lease: &ConnectorControlPlanningLease,
+    metadata: &ConnectorTableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<(TableMetadata, Option<String>), ConnectorError> {
     validate_context(context)?;
     if exact_lease.binding().descriptor().instance_id != metadata.identity.instance_id
         || metadata.table.owner() != &metadata.identity.instance_id
@@ -754,11 +849,12 @@ fn decoded_table(
             "Iceberg storage inspection metadata exceeds the request payload budget",
         ));
     }
-    serde_json::from_str(&serialized).map_err(|error| {
+    let table = serde_json::from_str(&serialized).map_err(|error| {
         corrupt(format!(
             "decode Iceberg storage inspection metadata: {error}"
         ))
-    })
+    })?;
+    Ok((table, payload.metadata_location))
 }
 
 fn published_facts(
@@ -980,6 +1076,66 @@ mod tests {
             Bytes::copy_from_slice(&2_i32.to_be_bytes())
         );
         assert!(!observed.schema_version.is_empty());
+    }
+
+    #[test]
+    fn exact_schema_uses_the_same_metadata_version_as_document_observation() {
+        let table = metadata(HashMap::new());
+        let location = "file:///warehouse/db/t/metadata/v7.metadata.json";
+        let observed = exact_schema_observation(&table, Some(location), &context(4096)).unwrap();
+        let source = create_source_observation(&table, &context(4096)).unwrap();
+        assert_eq!(
+            observed.metadata_version,
+            crate::document_storage::observation::committed_version_from_metadata(
+                &table,
+                Some(location)
+            )
+            .unwrap()
+        );
+        assert_eq!(observed.object_id, source.object_id);
+        assert_eq!(observed.schema_version, source.schema_version);
+        assert_eq!(
+            observed.partition_spec_version,
+            Bytes::copy_from_slice(&table.default_partition_spec().spec_id().to_le_bytes())
+        );
+        for ((ordinal, actual), expected) in observed.fields.iter().zip(&source.fields) {
+            assert_eq!(actual, expected);
+            assert_eq!(
+                *ordinal as usize,
+                observed
+                    .fields
+                    .iter()
+                    .position(|(_, field)| field == actual)
+                    .unwrap()
+            );
+        }
+        let later = exact_schema_observation(
+            &table,
+            Some("file:///warehouse/db/t/metadata/v8.metadata.json"),
+            &context(4096),
+        )
+        .unwrap();
+        assert_ne!(observed.metadata_version, later.metadata_version);
+        assert_eq!(observed.schema_version, later.schema_version);
+    }
+
+    #[test]
+    fn exact_schema_rejects_uncommitted_handles_and_budget_exhaustion() {
+        let table = metadata(HashMap::new());
+        for location in [None, Some("")] {
+            assert_eq!(
+                exact_schema_observation(&table, location, &context(4096))
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
+        assert_eq!(
+            exact_schema_observation(&table, Some("file:///v1.metadata.json"), &context(1))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
     }
 
     #[test]

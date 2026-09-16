@@ -29,9 +29,9 @@ use crate::mv::domain::lifecycle::ListMvsRequest;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, resolve_refresh_target};
-use novarocks_mv_application::persistence::definition::{
-    MvDesiredRefreshPolicy, StoredMvDefinition,
-};
+use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_parser::ast::Visit;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
@@ -67,7 +67,7 @@ fn existing_mv_storage_engine_by_target(
     readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
 ) -> Result<Option<MvStorageEngine>, String> {
-    let Some(definition) = readiness
+    let Some(_projection) = readiness
         .load_ready(&MvTarget {
             catalog: Some(target.catalog.clone()),
             database: target.namespace.clone(),
@@ -77,7 +77,8 @@ fn existing_mv_storage_engine_by_target(
     else {
         return Ok(None);
     };
-    MvStorageEngine::from_sql_str(&definition.definition.storage_engine).map(Some)
+    // The product currently admits only Iceberg MV document projections.
+    Ok(Some(MvStorageEngine::Iceberg))
 }
 
 fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPolicy, Option<i64>) {
@@ -88,6 +89,30 @@ fn stored_refresh_policy(policy: &MvCreateRefreshPolicy) -> (MvDesiredRefreshPol
             (MvDesiredRefreshPolicy::AsyncInterval, Some(*interval_ms))
         }
     }
+}
+
+fn desired_refresh_configuration(
+    configuration: &ConfigurationDocument,
+) -> Result<novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration, String>
+{
+    novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration::new(
+        match configuration.refresh_policy {
+            RefreshPolicy::Manual => MvDesiredRefreshPolicy::Manual,
+            RefreshPolicy::AsyncOnChange => MvDesiredRefreshPolicy::AsyncOnChange,
+            RefreshPolicy::AsyncInterval => MvDesiredRefreshPolicy::AsyncInterval,
+        },
+        configuration.paused,
+        configuration
+            .refresh_interval_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| "MV refresh interval exceeds the SQL duration range".to_string())?,
+        configuration
+            .max_staleness_ms
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| "MV maximum staleness exceeds the SQL duration range".to_string())?,
+    )
 }
 
 #[allow(
@@ -111,7 +136,7 @@ fn load_definition_for_alter(
     current_catalog: Option<&str>,
     db: &str,
     name_parts: &[String],
-) -> Result<StoredMvDefinition, String> {
+) -> Result<StoredMvProjection, String> {
     let target = resolve_refresh_target(current_catalog, db, name_parts)?;
     let Some(definition) = readiness
         .load_ready(&MvTarget {
@@ -126,14 +151,7 @@ fn load_definition_for_alter(
             target.catalog, target.namespace, target.table
         ));
     };
-    let definition = definition.definition;
-    if MvStorageEngine::from_sql_str(&definition.storage_engine)? != MvStorageEngine::Iceberg {
-        return Err(
-            "ALTER MATERIALIZED VIEW is only supported for Iceberg-backed materialized views"
-                .to_string(),
-        );
-    }
-    Ok(definition)
+    Ok(definition.projection)
 }
 
 /// Create an MV from the explicit MV ports composed by the frontend.
@@ -268,13 +286,7 @@ pub fn alter_mv_with_ports(
         db,
         &stmt.name_parts,
     )?;
-    let current_refresh =
-        novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration::new(
-            definition.refresh_policy.clone(),
-            definition.refresh_paused,
-            definition.refresh_interval_ms,
-            definition.max_staleness_ms,
-        )
+    let current_refresh = desired_refresh_configuration(definition.facts.configuration())
         .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
     let refresh = match &stmt.action {
         MvAlterAction::SetRefresh(policy) => {
@@ -478,6 +490,35 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+
+    #[test]
+    fn alter_refresh_reads_every_desired_field_from_configuration() {
+        let configuration = super::ConfigurationDocument {
+            refresh_policy: super::RefreshPolicy::AsyncInterval,
+            paused: true,
+            refresh_interval_ms: Some(123),
+            max_staleness_ms: Some(456),
+        };
+        let desired = super::desired_refresh_configuration(&configuration).unwrap();
+        assert_eq!(desired.policy, super::MvDesiredRefreshPolicy::AsyncInterval);
+        assert!(desired.paused);
+        assert_eq!(desired.interval_ms, Some(123));
+        assert_eq!(desired.max_staleness_ms, Some(456));
+    }
+
+    #[test]
+    fn alter_refresh_rejects_duration_overflow_instead_of_truncating() {
+        let mut configuration = super::ConfigurationDocument {
+            refresh_policy: super::RefreshPolicy::AsyncInterval,
+            paused: false,
+            refresh_interval_ms: Some(u64::MAX),
+            max_staleness_ms: None,
+        };
+        assert!(super::desired_refresh_configuration(&configuration).is_err());
+        configuration.refresh_interval_ms = Some(123);
+        configuration.max_staleness_ms = Some(u64::MAX);
+        assert!(super::desired_refresh_configuration(&configuration).is_err());
+    }
 
     fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");

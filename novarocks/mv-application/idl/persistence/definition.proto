@@ -28,6 +28,8 @@ message DefinitionDocument {
   repeated RelationOccurrence relation_occurrences = 3;
   repeated OutputDefinition outputs = 4;
   optional bytes computation_identity = 5;
+  // Frozen CREATE fact; not part of computation identity.
+  optional uint64 created_at_ms = 6;
 }
 
 message QuerySource {

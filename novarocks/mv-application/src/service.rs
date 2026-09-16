@@ -249,12 +249,12 @@ impl MvProductService {
             .map_err(MvProviderFailure::into_product_error)?
         {
             MvDropReadiness::AlreadyAbsent => Ok(MvProductResult::Acknowledged),
-            MvDropReadiness::ReadyToDrop => {
+            MvDropReadiness::ReadyToDrop(guard) => {
                 provider
                     .drop_target(operation, &target)
                     .map_err(MvProviderFailure::into_product_error)?;
                 projection
-                    .delete_after_provider_drop(operation, &target)
+                    .delete_after_provider_drop(operation, guard)
                     .map_err(known_committed_finalize_failure)?;
                 catalog_registration
                     .unregister_target(operation, &target)
@@ -629,21 +629,23 @@ mod tests {
         fn prepare_drop(
             &self,
             _operation: MvOperationContext,
-            _target: &MvTarget,
+            target: &MvTarget,
             _if_exists: bool,
         ) -> Result<MvDropReadiness, MvProviderFailure> {
             self.record("prepare_drop");
             Ok(if self.drop_absent {
                 MvDropReadiness::AlreadyAbsent
             } else {
-                MvDropReadiness::ReadyToDrop
+                MvDropReadiness::ReadyToDrop(crate::readiness::MvProjectionDeleteGuard::for_test(
+                    target.clone(),
+                ))
             })
         }
 
         fn delete_after_provider_drop(
             &self,
             _operation: MvOperationContext,
-            _target: &MvTarget,
+            _guard: crate::readiness::MvProjectionDeleteGuard,
         ) -> Result<(), MvProviderFailure> {
             self.record("delete_projection");
             Ok(())

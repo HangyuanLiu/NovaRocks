@@ -22,7 +22,7 @@
 //! transform SQL ASTs; they have no catalog, execution, or connector
 //! dependency.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 use novarocks_parser::Span;
 use novarocks_parser::ast;
@@ -30,99 +30,135 @@ use novarocks_parser::printer;
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_types::naming::TableIdentity;
 
+use crate::compiler::SqlMvRelationOccurrenceId;
 use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
 
-/// Opaque, copied snapshot identity facts consumed by first-refresh SQL
-/// shaping. It owns values only; it carries no catalog, table, or planning
-/// graph handle.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SqlMvSnapshotPin {
-    snapshots: BTreeMap<String, i64>,
-    table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+/// One definition occurrence and its exact first-refresh read facts.
+///
+/// The locator validates the matching SQL occurrence; identity is never
+/// inferred from the locator and repeated locators remain distinct entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlMvSnapshotPinOccurrence {
+    occurrence_id: SqlMvRelationOccurrenceId,
+    table: TableIdentity,
+    snapshot_id: i64,
+    table_object_id: ConnectorTableObjectId,
 }
 
-impl SqlMvSnapshotPin {
-    pub fn try_from_maps(
-        snapshots: BTreeMap<String, i64>,
-        table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+impl SqlMvSnapshotPinOccurrence {
+    pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
+        table: TableIdentity,
+        snapshot_id: i64,
+        table_object_id: ConnectorTableObjectId,
     ) -> Result<Self, String> {
-        if snapshots.is_empty() || snapshots.len() != table_object_ids.len() {
-            return Err("MV first-refresh snapshot pin has incomplete identity facts".to_string());
-        }
-        for (fqn, snapshot_id) in &snapshots {
-            if fqn.trim().is_empty() || *snapshot_id < 0 {
-                return Err("MV first-refresh snapshot pin has invalid snapshot facts".to_string());
-            }
-            if table_object_ids
-                .get(fqn)
-                .is_none_or(|object_id| object_id.as_bytes().is_empty())
-            {
-                return Err(
-                    "MV first-refresh snapshot pin is missing a table incarnation".to_string(),
-                );
-            }
+        if table.catalog.trim().is_empty()
+            || table.namespace.trim().is_empty()
+            || table.table.trim().is_empty()
+            || snapshot_id < 0
+            || table_object_id.as_bytes().is_empty()
+        {
+            return Err("MV first-refresh snapshot occurrence has invalid facts".to_string());
         }
         Ok(Self {
-            snapshots,
-            table_object_ids,
+            occurrence_id,
+            table,
+            snapshot_id,
+            table_object_id,
         })
     }
 
+    pub const fn occurrence_id(&self) -> SqlMvRelationOccurrenceId {
+        self.occurrence_id
+    }
+
+    pub const fn table(&self) -> &TableIdentity {
+        &self.table
+    }
+
+    pub const fn snapshot_id(&self) -> i64 {
+        self.snapshot_id
+    }
+
+    pub const fn table_object_id(&self) -> &ConnectorTableObjectId {
+        &self.table_object_id
+    }
+}
+
+/// Ordered, copied occurrence facts consumed by first-refresh SQL shaping.
+/// It owns values only; it carries no catalog, table, or planning graph handle.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SqlMvSnapshotPin {
+    occurrences: Vec<SqlMvSnapshotPinOccurrence>,
+}
+
+impl SqlMvSnapshotPin {
+    pub fn try_from_occurrences(
+        occurrences: Vec<SqlMvSnapshotPinOccurrence>,
+    ) -> Result<Self, String> {
+        if occurrences.is_empty() {
+            return Err("MV first-refresh snapshot pin has incomplete identity facts".to_string());
+        }
+        let mut occurrence_ids = HashSet::with_capacity(occurrences.len());
+        if occurrences
+            .iter()
+            .any(|occurrence| !occurrence_ids.insert(occurrence.occurrence_id))
+        {
+            return Err("MV first-refresh snapshot pin repeats an occurrence".to_string());
+        }
+        Ok(Self { occurrences })
+    }
+
     #[cfg(test)]
-    pub(super) fn from_entries_for_tests(entries: &[(&str, i64, &str)]) -> Self {
-        Self::try_from_maps(
+    pub(super) fn from_entries_for_tests(entries: &[(u32, &str, i64, &str)]) -> Self {
+        Self::try_from_occurrences(
             entries
                 .iter()
-                .map(|(fqn, snapshot, _)| ((*fqn).to_string(), *snapshot))
-                .collect(),
-            entries
-                .iter()
-                .map(|(fqn, _, object_id)| {
-                    (
-                        (*fqn).to_string(),
+                .map(|(occurrence_id, fqn, snapshot_id, object_id)| {
+                    let parts = fqn.split('.').collect::<Vec<_>>();
+                    let [catalog, namespace, table] = parts.as_slice() else {
+                        panic!("test table identity must have three parts")
+                    };
+                    SqlMvSnapshotPinOccurrence::try_new(
+                        SqlMvRelationOccurrenceId::new(*occurrence_id),
+                        TableIdentity {
+                            catalog: catalog.to_string(),
+                            namespace: namespace.to_string(),
+                            table: table.to_string(),
+                        },
+                        *snapshot_id,
                         ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
                             object_id.as_bytes(),
                         ))
                         .expect("test object ID"),
                     )
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, _>>()
+                .expect("test MV snapshot occurrences must be valid"),
         )
         .expect("test MV snapshot pin must be valid")
     }
 
-    /// Return the captured snapshot for a frozen identity.
-    pub fn get(&self, table: &TableIdentity) -> Option<i64> {
-        self.snapshots.get(&table.fqn()).copied()
-    }
-
-    /// Return the captured table incarnation for a frozen identity.
-    pub fn object_id(&self, table: &TableIdentity) -> Option<&ConnectorTableObjectId> {
-        self.table_object_ids.get(&table.fqn())
+    /// Return exact facts for one frozen definition occurrence.
+    pub fn get(
+        &self,
+        occurrence_id: SqlMvRelationOccurrenceId,
+    ) -> Option<&SqlMvSnapshotPinOccurrence> {
+        self.occurrences
+            .iter()
+            .find(|occurrence| occurrence.occurrence_id == occurrence_id)
     }
 
     pub fn len(&self) -> usize {
-        self.snapshots.len()
+        self.occurrences.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.snapshots.is_empty()
+        self.occurrences.is_empty()
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for staged SQL planner migration consumers and test helpers."
-    )]
-    pub(super) fn snapshot_map(&self) -> &BTreeMap<String, i64> {
-        &self.snapshots
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged SQL planner migration consumers and test helpers."
-    )]
-    pub(super) fn table_object_id_map(&self) -> &BTreeMap<String, ConnectorTableObjectId> {
-        &self.table_object_ids
+    pub fn occurrences(&self) -> &[SqlMvSnapshotPinOccurrence] {
+        &self.occurrences
     }
 }
 
@@ -133,13 +169,7 @@ pub(super) fn prepare_projection_full_read_sql(
     current_database: &str,
 ) -> Result<String, String> {
     let mut query = select_query.clone();
-    inject_pin_as_version_as_of(
-        &mut query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
+    inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
     append_physical_apply_key(query)
 }
 
@@ -157,13 +187,7 @@ pub(super) fn prepare_union_projection_full_read_sql(
         format!("iceberg UNION ALL MV full refresh branch count {branch_count} does not fit in i32")
     })?;
     let mut query = select_query.clone();
-    inject_pin_as_version_as_of(
-        &mut query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
+    inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
 
     let mut validated_branch_count = 0;
     let mut saw_union_all = false;
@@ -195,21 +219,19 @@ pub(super) fn pin_state_sql(
     current_database: &str,
 ) -> Result<String, String> {
     let mut query = state_query.clone();
-    inject_pin_as_version_as_of(
-        &mut query,
-        pin,
-        &HashSet::new(),
-        current_catalog,
-        current_database,
-    )?;
+    inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
     Ok(printer::print_query(&query))
 }
 
 pub(super) fn branch_union_queries(
     select_query: &ast::Query,
     branch_count: usize,
+    pin: &SqlMvSnapshotPin,
+    current_catalog: Option<&str>,
+    current_database: &str,
 ) -> Result<Vec<(ast::Query, String)>, String> {
-    let query = select_query.clone();
+    let mut query = select_query.clone();
+    inject_pin_as_version_as_of(&mut query, pin, current_catalog, current_database)?;
     let mut branch_bodies = Vec::new();
     flatten_branch_union_all_set_expr(query.body.as_ref(), &mut branch_bodies)?;
     if branch_bodies.len() != branch_count {
@@ -409,63 +431,96 @@ fn append_union_projection_hidden_columns(
 fn inject_pin_as_version_as_of(
     query: &mut ast::Query,
     pin: &SqlMvSnapshotPin,
-    delta_bearing: &HashSet<TableIdentity>,
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<usize, String> {
     let mut state = InjectState {
         pin,
-        delta_bearing,
         current_catalog,
         current_database,
+        next_occurrence: 0,
         count: 0,
         first_error: None,
     };
-    if let Some(with) = &mut query.with {
-        for cte in &mut with.ctes {
-            walk_set_expr(cte.query.body.as_mut(), &mut state);
-        }
+    walk_query(query, &HashSet::new(), &mut state);
+    if let Some(error) = state.first_error {
+        return Err(error);
     }
-    walk_set_expr(query.body.as_mut(), &mut state);
-    state.first_error.map_or(Ok(state.count), Err)
+    if state.next_occurrence != pin.len() {
+        let next = &pin.occurrences()[state.next_occurrence];
+        return Err(format!(
+            "refresh SELECT did not contain definition occurrence {} ({})",
+            next.occurrence_id().get(),
+            next.table().fqn()
+        ));
+    }
+    Ok(state.count)
 }
 
 struct InjectState<'a> {
     pin: &'a SqlMvSnapshotPin,
-    delta_bearing: &'a HashSet<TableIdentity>,
     current_catalog: Option<&'a str>,
     current_database: &'a str,
+    next_occurrence: usize,
     count: usize,
     first_error: Option<String>,
 }
 
-fn walk_set_expr(expr: &mut ast::SetExpr, state: &mut InjectState<'_>) {
+fn walk_query(query: &mut ast::Query, outer_ctes: &HashSet<String>, state: &mut InjectState<'_>) {
+    let mut body_ctes = outer_ctes.clone();
+    if let Some(with) = &mut query.with {
+        let local_names = with
+            .ctes
+            .iter()
+            .map(|cte| cte.name.value.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        body_ctes.extend(local_names.iter().cloned());
+        for cte in &mut with.ctes {
+            walk_query(cte.query.as_mut(), &body_ctes, state);
+        }
+    }
+    walk_set_expr(query.body.as_mut(), &body_ctes, state);
+}
+
+fn walk_set_expr(
+    expr: &mut ast::SetExpr,
+    visible_ctes: &HashSet<String>,
+    state: &mut InjectState<'_>,
+) {
     if state.first_error.is_some() {
         return;
     }
     match expr {
         ast::SetExpr::Select(select) => {
             for table_with_joins in &mut select.from {
-                walk_table_with_joins(table_with_joins, state);
+                walk_table_with_joins(table_with_joins, visible_ctes, state);
             }
         }
         ast::SetExpr::SetOperation(ast::SetOperation { left, right, .. }) => {
-            walk_set_expr(left.as_mut(), state);
-            walk_set_expr(right.as_mut(), state);
+            walk_set_expr(left.as_mut(), visible_ctes, state);
+            walk_set_expr(right.as_mut(), visible_ctes, state);
         }
-        ast::SetExpr::Query(query) => walk_set_expr(query.body.as_mut(), state),
+        ast::SetExpr::Query(query) => walk_query(query.as_mut(), visible_ctes, state),
         _ => {}
     }
 }
 
-fn walk_table_with_joins(table_with_joins: &mut ast::TableWithJoins, state: &mut InjectState<'_>) {
-    walk_factor(&mut table_with_joins.relation, state);
+fn walk_table_with_joins(
+    table_with_joins: &mut ast::TableWithJoins,
+    visible_ctes: &HashSet<String>,
+    state: &mut InjectState<'_>,
+) {
+    walk_factor(&mut table_with_joins.relation, visible_ctes, state);
     for join in &mut table_with_joins.joins {
-        walk_factor(&mut join.relation, state);
+        walk_factor(&mut join.relation, visible_ctes, state);
     }
 }
 
-fn walk_factor(factor: &mut ast::TableFactor, state: &mut InjectState<'_>) {
+fn walk_factor(
+    factor: &mut ast::TableFactor,
+    visible_ctes: &HashSet<String>,
+    state: &mut InjectState<'_>,
+) {
     if state.first_error.is_some() {
         return;
     }
@@ -476,37 +531,63 @@ fn walk_factor(factor: &mut ast::TableFactor, state: &mut InjectState<'_>) {
                 .iter()
                 .map(|part| part.value.to_ascii_lowercase())
                 .collect::<Vec<_>>();
+            if parts.len() == 1 && visible_ctes.contains(&parts[0]) {
+                return;
+            }
             let Some(base_ref) =
                 resolve_table_factor(&parts, state.current_catalog, state.current_database)
             else {
+                state.first_error = Some(
+                    "refresh SELECT contains an unsupported base relation identity".to_string(),
+                );
                 return;
             };
-            let Some(pinned) = state.pin.get(&base_ref) else {
-                return;
-            };
-            if version.is_some() {
+            let Some(pinned) = state.pin.occurrences().get(state.next_occurrence) else {
                 state.first_error = Some(format!(
-                    "refresh SELECT must not write explicit FOR VERSION AS OF for base table {}; refresh pin would conflict",
+                    "refresh SELECT contains an unpinned relation occurrence {}",
                     base_ref.fqn()
                 ));
                 return;
+            };
+            if !same_table_identity(pinned.table(), &base_ref) {
+                state.first_error = Some(format!(
+                    "refresh SELECT occurrence {} resolved to {}, expected {}",
+                    pinned.occurrence_id().get(),
+                    base_ref.fqn(),
+                    pinned.table().fqn()
+                ));
+                return;
             }
-            if state.delta_bearing.contains(&base_ref) {
+            if version.is_some() {
+                state.first_error = Some(format!(
+                    "refresh SELECT must not write explicit FOR VERSION AS OF for occurrence {} ({}); refresh pin would conflict",
+                    pinned.occurrence_id().get(),
+                    base_ref.fqn(),
+                ));
                 return;
             }
             *version = Some(ast::TableVersion {
                 kind: ast::TableVersionKind::ForVersionAsOf,
-                value: number_literal(pinned.to_string()),
+                value: number_literal(pinned.snapshot_id().to_string()),
                 span: Span::new(0, 0),
             });
+            state.next_occurrence += 1;
             state.count += 1;
         }
-        ast::TableFactor::Derived { subquery, .. } => walk_set_expr(subquery.body.as_mut(), state),
+        ast::TableFactor::Derived { subquery, .. } => {
+            walk_query(subquery.as_mut(), visible_ctes, state)
+        }
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
-        } => walk_table_with_joins(table_with_joins.as_mut(), state),
+        } => walk_table_with_joins(table_with_joins.as_mut(), visible_ctes, state),
         _ => {}
     }
+}
+
+fn same_table_identity(left: &TableIdentity, right: &TableIdentity) -> bool {
+    left.catalog.eq_ignore_ascii_case(&right.catalog)
+        && left.namespace.eq_ignore_ascii_case(&right.namespace)
+        && left.table.eq_ignore_ascii_case(&right.table)
 }
 
 fn resolve_table_factor(
@@ -585,7 +666,7 @@ mod tests {
     #[test]
     fn sqlx2_mv_sql_shape_pins_projection_without_application_refresh_state() {
         let pin =
-            SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-incarnation")]);
+            SqlMvSnapshotPin::from_entries_for_tests(&[(7, "ice.db.fact", 42, "fact-incarnation")]);
 
         let query = parse_query("SELECT id FROM ice.db.fact");
         let sql = prepare_projection_full_read_sql(&query, &pin, Some("ice"), "db")
@@ -593,10 +674,14 @@ mod tests {
 
         assert!(sql.contains("VERSION AS OF 42"), "{sql}");
         assert!(sql.contains("__nova_base_row_id"), "{sql}");
-        assert_eq!(pin.snapshot_map().get("ice.db.fact"), Some(&42));
         assert_eq!(
-            pin.table_object_id_map()
-                .get("ice.db.fact")
+            pin.get(SqlMvRelationOccurrenceId::new(7))
+                .map(SqlMvSnapshotPinOccurrence::snapshot_id),
+            Some(42)
+        );
+        assert_eq!(
+            pin.get(SqlMvRelationOccurrenceId::new(7))
+                .map(SqlMvSnapshotPinOccurrence::table_object_id)
                 .map(|object_id| object_id.as_bytes().as_ref()),
             Some(b"fact-incarnation".as_ref())
         );
@@ -604,12 +689,60 @@ mod tests {
 
     #[test]
     fn sqlx2_mv_sql_shape_rejects_incomplete_snapshot_identity() {
-        let error = SqlMvSnapshotPin::try_from_maps(
-            BTreeMap::from([("ice.db.fact".to_string(), 42)]),
-            BTreeMap::new(),
-        )
-        .expect_err("missing incarnation must fail before SQL shaping");
+        let error = SqlMvSnapshotPin::try_from_occurrences(Vec::new())
+            .expect_err("missing incarnation must fail before SQL shaping");
 
         assert!(error.contains("incomplete identity facts"), "{error}");
+    }
+
+    #[test]
+    fn sqlx2_mv_sql_shape_preserves_sparse_repeated_occurrences() {
+        let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
+            (7, "ice.db.fact", 11, "fact-incarnation"),
+            (42, "ice.db.fact", 22, "fact-incarnation"),
+        ]);
+        let query =
+            parse_query("SELECT l.id FROM ice.db.fact AS l JOIN ice.db.fact AS r ON l.id = r.id");
+        let sql = prepare_projection_full_read_sql(&query, &pin, Some("ice"), "db")
+            .expect("repeated definition occurrences remain distinct");
+
+        assert_eq!(sql.matches("VERSION AS OF 11").count(), 1, "{sql}");
+        assert_eq!(sql.matches("VERSION AS OF 22").count(), 1, "{sql}");
+        assert_eq!(pin.occurrences()[0].occurrence_id().get(), 7);
+        assert_eq!(pin.occurrences()[1].occurrence_id().get(), 42);
+    }
+
+    #[test]
+    fn sqlx2_mv_snapshot_pin_rejects_duplicate_occurrence_ids() {
+        let entries = [
+            (7, "ice.db.a", 11, "a-incarnation"),
+            (7, "ice.db.b", 22, "b-incarnation"),
+        ];
+        let occurrences = entries
+            .iter()
+            .map(|(id, fqn, snapshot, object)| {
+                let parts = fqn.split('.').collect::<Vec<_>>();
+                SqlMvSnapshotPinOccurrence::try_new(
+                    SqlMvRelationOccurrenceId::new(*id),
+                    TableIdentity {
+                        catalog: parts[0].to_string(),
+                        namespace: parts[1].to_string(),
+                        table: parts[2].to_string(),
+                    },
+                    *snapshot,
+                    ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
+                        object.as_bytes(),
+                    ))
+                    .unwrap(),
+                )
+                .unwrap()
+            })
+            .collect();
+
+        assert!(
+            SqlMvSnapshotPin::try_from_occurrences(occurrences)
+                .unwrap_err()
+                .contains("repeats an occurrence")
+        );
     }
 }

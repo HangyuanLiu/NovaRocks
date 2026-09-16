@@ -25,12 +25,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
-    ConnectorTableObjectId, ConnectorTableRequest, ConnectorTableResolution,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MvCreatedTargetObservation as SpiCreatedTargetObservation,
-    MvLakeCatalogIncompleteReason, MvLakePackageFailure,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
+    MvCreatedTargetObservation as SpiCreatedTargetObservation,
     MvLakePackageObservation as SpiLakePackageObservation,
     MvLakePublicationObservation as SpiLakePublicationObservation,
     MvMaintenanceMetadataObservation as SpiMaintenanceMetadataObservation,
@@ -41,16 +38,10 @@ use novarocks_spi::connector::{
     MvRefreshTargetObservation as SpiRefreshTargetObservation,
     MvSchemaValidationObservation as SpiSchemaValidationObservation, MvStorageObservationPort,
 };
-use novarocks_types::naming::normalize_identifier;
 
 use novarocks_mv_application::persistence::{
     descriptor::MvDescriptorV3, schema::MvPartitionContract,
 };
-
-const MAX_MV_SCHEMA_VALIDATION_FIELDS: usize = 4_096;
-const MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS: usize = 4_096;
-const MV_SCHEMA_VALIDATION_FIELD_BYTES: usize = 32;
-const MV_SCHEMA_VALIDATION_PARTITION_FIELD_BYTES: usize = 48;
 
 /// Exact target-schema facts observed immediately after CREATE/bootstrap.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,179 +97,42 @@ impl MvTargetCreationObservation {
     }
 }
 
-/// Exact current-schema facts consumed by the Core MV contract validator.
-///
-/// The provider-specific Server adapter constructs this value while retaining
-/// the exact connector generation that loaded the source metadata. Core never
-/// interprets the opaque table handle or provider schema values.
+/// Exact provider-owned schema facts used by canonical D/L validation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MvSchemaValidationObservation {
-    table_uuid: String,
-    table_object_id: Option<ConnectorTableObjectId>,
-    schema_id: i32,
+    table: ConnectorTableIdentity,
+    exact_schema: novarocks_mv_application::persistence::runtime_bindings::MvExactTargetSchemaFacts,
     format_v3: bool,
     stored_row_lineage_enabled: bool,
-    fields: Vec<MvObservedTargetField>,
-    partition: MvSchemaValidationPartitionContract,
 }
 
 impl MvSchemaValidationObservation {
-    pub fn try_new(
-        table_uuid: String,
-        schema_id: i32,
-        format_v3: bool,
-        stored_row_lineage_enabled: bool,
-        fields: Vec<MvObservedTargetField>,
-        partition: MvSchemaValidationPartitionContract,
-        context: &ConnectorRequestContext,
-    ) -> Result<Self, ConnectorError> {
-        validate_request_context(context)?;
-        Self::try_new_with_payload_limit(
-            table_uuid,
-            schema_id,
-            format_v3,
-            stored_row_lineage_enabled,
-            fields,
-            partition,
-            context.max_total_payload_bytes(),
-        )
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn try_new_with_maximum_payload(
-        table_uuid: String,
-        schema_id: i32,
-        format_v3: bool,
-        stored_row_lineage_enabled: bool,
-        fields: Vec<MvObservedTargetField>,
-        partition: MvSchemaValidationPartitionContract,
-    ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_payload_limit(
-            table_uuid,
-            schema_id,
-            format_v3,
-            stored_row_lineage_enabled,
-            fields,
-            partition,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
+    pub fn exact_schema(
+        &self,
+    ) -> &novarocks_mv_application::persistence::runtime_bindings::MvExactTargetSchemaFacts {
+        &self.exact_schema
     }
 
-    fn try_new_with_payload_limit(
-        table_uuid: String,
-        schema_id: i32,
-        format_v3: bool,
-        stored_row_lineage_enabled: bool,
-        fields: Vec<MvObservedTargetField>,
-        partition: MvSchemaValidationPartitionContract,
-        max_total_payload_bytes: usize,
-    ) -> Result<Self, ConnectorError> {
-        require_non_empty(&table_uuid, "MV schema validation table UUID")?;
-        if schema_id < 0 {
-            return corrupt("MV schema validation observation has a negative schema ID");
-        }
-        if fields.len() > MAX_MV_SCHEMA_VALIDATION_FIELDS {
-            return exhausted("MV schema validation observation exceeds the field limit");
-        }
-        if partition.fields().len() > MAX_MV_SCHEMA_VALIDATION_PARTITION_FIELDS {
-            return exhausted("MV schema validation observation exceeds the partition field limit");
-        }
-
-        let mut payload_bytes = 0;
-        reserve_schema_validation_payload(
-            &mut payload_bytes,
-            table_uuid.len(),
-            max_total_payload_bytes,
-        )?;
-        let mut field_ids = HashSet::with_capacity(fields.len());
-        let mut field_names = HashSet::with_capacity(fields.len());
-        for field in &fields {
-            require_non_empty(&field.name, "MV schema validation field name")?;
-            require_non_empty(
-                &field.type_signature,
-                "MV schema validation field type signature",
-            )?;
-            if !field_ids.insert(field.field_id) {
-                return corrupt(format!(
-                    "MV schema validation observation has duplicate field ID {}",
-                    field.field_id
-                ));
-            }
-            let normalized_name = field.name.to_ascii_lowercase();
-            if !field_names.insert(normalized_name) {
-                return corrupt(format!(
-                    "MV schema validation observation has duplicate field name `{}`",
-                    field.name
-                ));
-            }
-            reserve_schema_validation_payload(
-                &mut payload_bytes,
-                MV_SCHEMA_VALIDATION_FIELD_BYTES
-                    .saturating_add(field.name.len())
-                    .saturating_add(field.type_signature.len()),
-                max_total_payload_bytes,
-            )?;
-        }
-        validate_schema_validation_partition_contract(&partition, &fields)?;
-        for field in partition.fields() {
-            reserve_schema_validation_payload(
-                &mut payload_bytes,
-                MV_SCHEMA_VALIDATION_PARTITION_FIELD_BYTES
-                    .saturating_add(field.partition_field_name().len())
-                    .saturating_add(field.source_column_name().len()),
-                max_total_payload_bytes,
-            )?;
-        }
-
-        Ok(Self {
-            table_uuid,
-            table_object_id: None,
-            schema_id,
-            format_v3,
-            stored_row_lineage_enabled,
-            fields,
-            partition,
-        })
-    }
-
-    pub fn table_uuid(&self) -> &str {
-        &self.table_uuid
-    }
-
-    /// The opaque physical identity captured through the same exact metadata
-    /// lease as this observation. It is absent only in direct unit fixtures;
-    /// production observation assembly always supplies it.
-    pub fn table_object_id(&self) -> Option<&ConnectorTableObjectId> {
-        self.table_object_id.as_ref()
-    }
-
-    pub(crate) fn with_table_object_id(mut self, object_id: ConnectorTableObjectId) -> Self {
-        self.table_object_id = Some(object_id);
-        self
-    }
-
-    pub const fn schema_id(&self) -> i32 {
-        self.schema_id
+    pub fn table_object_id(&self) -> &ConnectorTableObjectId {
+        &self.exact_schema.object_id
     }
 
     pub const fn is_format_v3(&self) -> bool {
         self.format_v3
     }
 
-    /// Whether the table explicitly enables stored row-lineage values.
     pub const fn stored_row_lineage_enabled(&self) -> bool {
         self.stored_row_lineage_enabled
     }
 
-    pub fn fields(&self) -> &[MvObservedTargetField] {
-        &self.fields
-    }
-
-    pub const fn partition(&self) -> &MvSchemaValidationPartitionContract {
-        &self.partition
+    pub fn fields(
+        &self,
+    ) -> &[novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts] {
+        &self.exact_schema.fields
     }
 }
 
@@ -289,114 +143,6 @@ pub(crate) struct MvObservedTargetField {
     pub name: String,
     pub type_signature: String,
     pub nullable: bool,
-}
-
-impl MvObservedTargetField {
-    pub fn new(field_id: i32, name: String, type_signature: String, nullable: bool) -> Self {
-        Self {
-            field_id,
-            name,
-            type_signature,
-            nullable,
-        }
-    }
-
-    pub const fn field_id(&self) -> i32 {
-        self.field_id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn type_signature(&self) -> &str {
-        &self.type_signature
-    }
-
-    pub const fn nullable(&self) -> bool {
-        self.nullable
-    }
-}
-
-/// Provider-neutral current default partition specification.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvSchemaValidationPartitionContract {
-    spec_id: i32,
-    fields: Vec<MvSchemaValidationPartitionField>,
-}
-
-impl MvSchemaValidationPartitionContract {
-    pub fn new(spec_id: i32, fields: Vec<MvSchemaValidationPartitionField>) -> Self {
-        Self { spec_id, fields }
-    }
-
-    pub const fn spec_id(&self) -> i32 {
-        self.spec_id
-    }
-
-    pub fn fields(&self) -> &[MvSchemaValidationPartitionField] {
-        &self.fields
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvSchemaValidationPartitionField {
-    partition_field_id: i32,
-    partition_field_name: String,
-    source_target_field_id: i32,
-    source_column_name: String,
-    transform: MvSchemaValidationPartitionTransform,
-}
-
-impl MvSchemaValidationPartitionField {
-    pub fn new(
-        partition_field_id: i32,
-        partition_field_name: String,
-        source_target_field_id: i32,
-        source_column_name: String,
-        transform: MvSchemaValidationPartitionTransform,
-    ) -> Self {
-        Self {
-            partition_field_id,
-            partition_field_name,
-            source_target_field_id,
-            source_column_name,
-            transform,
-        }
-    }
-
-    pub const fn partition_field_id(&self) -> i32 {
-        self.partition_field_id
-    }
-
-    pub fn partition_field_name(&self) -> &str {
-        &self.partition_field_name
-    }
-
-    pub const fn source_target_field_id(&self) -> i32 {
-        self.source_target_field_id
-    }
-
-    pub fn source_column_name(&self) -> &str {
-        &self.source_column_name
-    }
-
-    pub const fn transform(&self) -> &MvSchemaValidationPartitionTransform {
-        &self.transform
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MvSchemaValidationPartitionTransform {
-    Identity,
-    Year,
-    Month,
-    Day,
-    Hour,
-    Bucket { num_buckets: u32 },
-    Truncate { width: u32 },
-    Void,
-    Unsupported(String),
 }
 
 /// A discovered MV lake package, including its current publication state.
@@ -1090,19 +836,51 @@ fn created_target_from_spi(
     )
 }
 
-fn schema_validation_from_spi(
+pub(crate) fn schema_validation_from_spi(
     observation: SpiSchemaValidationObservation,
     context: &ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, ConnectorError> {
-    MvSchemaValidationObservation::try_new(
-        observation.table_uuid().to_string(),
-        observation.schema_id(),
-        observation.is_format_v3(),
-        observation.stored_row_lineage_enabled(),
-        observed_fields_from_spi(observation.fields()),
-        schema_validation_partition_from_spi(observation.partition()),
-        context,
-    )
+    use novarocks_mv_application::persistence::identity::{
+        FieldIdentity, PartitionSpecVersion, SchemaVersion,
+    };
+    use novarocks_mv_application::persistence::runtime_bindings::{
+        MvExactTargetSchemaFacts, MvPhysicalFieldFacts,
+    };
+    validate_request_context(context)?;
+    let fields = observation
+        .fields()
+        .iter()
+        .map(|(ordinal, field)| {
+            Ok(MvPhysicalFieldFacts {
+                field_id: FieldIdentity::try_new(field.provider_field_id().to_vec()).map_err(
+                    |error| ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string()),
+                )?,
+                name: field.name().to_owned(),
+                ordinal: *ordinal,
+                type_signature: field.type_signature().to_owned(),
+                nullable: field.nullable(),
+            })
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
+    Ok(MvSchemaValidationObservation {
+        table: observation.table().clone(),
+        exact_schema: MvExactTargetSchemaFacts {
+            object_id: observation.object_id().clone(),
+            metadata_version: observation.metadata_version().clone(),
+            schema_version: SchemaVersion::try_new(observation.schema_version().to_vec()).map_err(
+                |error| ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string()),
+            )?,
+            partition_spec_version: PartitionSpecVersion::try_new(
+                observation.partition_spec_version().to_vec(),
+            )
+            .map_err(|error| {
+                ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+            })?,
+            fields,
+        },
+        format_v3: observation.is_format_v3(),
+        stored_row_lineage_enabled: observation.stored_row_lineage_enabled(),
+    })
 }
 
 pub(crate) fn lake_package_from_spi(
@@ -1259,13 +1037,11 @@ fn maintenance_metadata_from_spi(
 fn observed_fields_from_spi(fields: &[SpiObservedField]) -> Vec<MvObservedTargetField> {
     fields
         .iter()
-        .map(|field| {
-            MvObservedTargetField::new(
-                field.field_id(),
-                field.name().to_string(),
-                field.type_signature().to_string(),
-                field.nullable(),
-            )
+        .map(|field| MvObservedTargetField {
+            field_id: field.field_id(),
+            name: field.name().to_string(),
+            type_signature: field.type_signature().to_string(),
+            nullable: field.nullable(),
         })
         .collect()
 }
@@ -1293,27 +1069,6 @@ fn durable_partition_from_spi(
     })
 }
 
-fn schema_validation_partition_from_spi(
-    partition: &SpiObservedPartitionSpec,
-) -> MvSchemaValidationPartitionContract {
-    MvSchemaValidationPartitionContract::new(
-        partition.spec_id(),
-        partition
-            .fields()
-            .iter()
-            .map(|field| {
-                MvSchemaValidationPartitionField::new(
-                    field.partition_field_id(),
-                    field.partition_field_name().to_string(),
-                    field.source_target_field_id(),
-                    field.source_column_name().to_string(),
-                    schema_validation_partition_transform_from_spi(field.transform()),
-                )
-            })
-            .collect(),
-    )
-}
-
 fn durable_partition_transform_from_spi(
     transform: &SpiObservedPartitionTransform,
 ) -> Result<
@@ -1338,203 +1093,6 @@ fn durable_partition_transform_from_spi(
     })
 }
 
-fn schema_validation_partition_transform_from_spi(
-    transform: &SpiObservedPartitionTransform,
-) -> MvSchemaValidationPartitionTransform {
-    match transform {
-        SpiObservedPartitionTransform::Identity => MvSchemaValidationPartitionTransform::Identity,
-        SpiObservedPartitionTransform::Year => MvSchemaValidationPartitionTransform::Year,
-        SpiObservedPartitionTransform::Month => MvSchemaValidationPartitionTransform::Month,
-        SpiObservedPartitionTransform::Day => MvSchemaValidationPartitionTransform::Day,
-        SpiObservedPartitionTransform::Hour => MvSchemaValidationPartitionTransform::Hour,
-        SpiObservedPartitionTransform::Bucket { num_buckets } => {
-            MvSchemaValidationPartitionTransform::Bucket {
-                num_buckets: *num_buckets,
-            }
-        }
-        SpiObservedPartitionTransform::Truncate { width } => {
-            MvSchemaValidationPartitionTransform::Truncate { width: *width }
-        }
-        SpiObservedPartitionTransform::Void => MvSchemaValidationPartitionTransform::Void,
-        SpiObservedPartitionTransform::Unsupported(name) => {
-            MvSchemaValidationPartitionTransform::Unsupported(name.clone())
-        }
-    }
-}
-
-/// Enumerate MV lake packages through durable attachment identities.
-///
-/// The application supplies the attachment-derived instance IDs. This helper
-/// retains one exact generation while enumerating and loading every table,
-/// then passes only the lease-loaded metadata to the injected observation
-/// port. It never interprets an opaque provider handle.
-pub(crate) fn discover_mv_lake_packages(
-    controls: &dyn ConnectorControlResolver,
-    instance_ids: impl IntoIterator<Item = ConnectorInstanceId>,
-    observer: &dyn MvStorageObservationPort,
-    context: ConnectorRequestContext,
-) -> Result<MvLakeCatalogDiscovery, ConnectorError> {
-    validate_request_context(&context)?;
-    let mut instance_ids = instance_ids.into_iter().collect::<Vec<_>>();
-    instance_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-    instance_ids.dedup();
-    let mut budget = 0_usize;
-    let mut outcomes = Vec::new();
-
-    for instance_id in instance_ids {
-        validate_request_context(&context)?;
-        reserve_payload(&context, &mut budget, instance_id.as_str())?;
-        let exact_lease = match controls.acquire_current(&instance_id) {
-            Ok(lease) => lease,
-            Err(error) => {
-                return Ok(MvLakeCatalogDiscovery::Incomplete(
-                    MvLakeCatalogIncompleteReason::EnumerationFailed(error),
-                ));
-            }
-        };
-        if exact_lease.binding().descriptor().instance_id != instance_id {
-            return corrupt("connector lease does not match MV discovery attachment identity");
-        }
-        let metadata = exact_lease.binding().metadata();
-        let mut namespaces = match metadata.list_namespaces(ConnectorListNamespacesRequest {
-            instance_id: instance_id.clone(),
-            context: context.clone(),
-        }) {
-            Ok(namespaces) => namespaces,
-            Err(error) => {
-                return Ok(MvLakeCatalogDiscovery::Incomplete(
-                    MvLakeCatalogIncompleteReason::EnumerationFailed(error),
-                ));
-            }
-        };
-        namespaces.sort_by(|left, right| left.namespace.cmp(&right.namespace));
-        namespaces.dedup_by(|left, right| left.namespace == right.namespace);
-
-        for namespace in namespaces {
-            if namespace.instance_id != instance_id || namespace.namespace.trim().is_empty() {
-                return corrupt("connector returned an invalid namespace during MV discovery");
-            }
-            normalize_identifier(namespace.namespace.as_ref()).map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    format!(
-                        "connector namespace outside the Native identifier contract during MV lake discovery: {error}"
-                    ),
-                )
-            })?;
-            reserve_payload(&context, &mut budget, namespace.namespace.as_ref())?;
-            let mut tables = match metadata.list_tables(ConnectorListTablesRequest {
-                namespace: namespace.clone(),
-                context: context.clone(),
-            }) {
-                Ok(tables) => tables,
-                Err(error) => {
-                    return Ok(MvLakeCatalogDiscovery::Incomplete(
-                        MvLakeCatalogIncompleteReason::EnumerationFailed(error),
-                    ));
-                }
-            };
-            tables.sort_by(|left, right| left.table.cmp(&right.table));
-            tables.dedup_by(|left, right| left.table == right.table);
-
-            for table in tables {
-                validate_request_context(&context)?;
-                if table.instance_id != instance_id
-                    || table.namespace != namespace.namespace
-                    || table.table.trim().is_empty()
-                {
-                    return corrupt("connector returned an invalid table during MV discovery");
-                }
-                reserve_payload(&context, &mut budget, table.table.as_ref())?;
-                let loaded = match metadata.load_table(ConnectorTableRequest {
-                    table: table.clone(),
-                    resolution: ConnectorTableResolution::StrictBaseTable,
-                    context: context.clone(),
-                }) {
-                    Ok(loaded) => loaded,
-                    Err(error) => {
-                        outcomes.push(MvLakePackageOutcome::Failed(MvLakePackageFailure::try_new(
-                            table, None, error,
-                        )?));
-                        continue;
-                    }
-                };
-                if loaded.identity != table {
-                    return corrupt(
-                        "connector loaded metadata for a different table during MV discovery",
-                    );
-                }
-                let package =
-                    match observe_lake_package(observer, &exact_lease, &loaded, context.clone()) {
-                        Ok(package) => package,
-                        Err(error) => {
-                            outcomes.push(MvLakePackageOutcome::Failed(
-                                MvLakePackageFailure::try_new(table, None, error)?,
-                            ));
-                            continue;
-                        }
-                    };
-                if let Some(package) = package {
-                    if package.table != table {
-                        return corrupt(format!(
-                            "MV lake observer returned package metadata for `{}`.`{}`.`{}` while discovering `{}`.`{}`.`{}`",
-                            package.table.instance_id.as_str(),
-                            package.table.namespace,
-                            package.table.table,
-                            table.instance_id.as_str(),
-                            table.namespace,
-                            table.table,
-                        ));
-                    }
-                    let expected_package_id = format!("{}.{}", table.namespace, table.table);
-                    if package.descriptor.package_id != expected_package_id {
-                        return corrupt(format!(
-                            "descriptor package id mismatch for `{}`.`{}`.`{}`: expected `{expected_package_id}`, found `{}`",
-                            table.instance_id.as_str(),
-                            table.namespace,
-                            table.table,
-                            package.descriptor.package_id,
-                        ));
-                    }
-                    outcomes.push(MvLakePackageOutcome::Observed(package));
-                }
-            }
-        }
-    }
-    outcomes.sort_by(|left, right| {
-        let left = match left {
-            MvLakePackageOutcome::Observed(package) => &package.table,
-            MvLakePackageOutcome::Failed(failure) => failure.table(),
-        };
-        let right = match right {
-            MvLakePackageOutcome::Observed(package) => &package.table,
-            MvLakePackageOutcome::Failed(failure) => failure.table(),
-        };
-        left.instance_id
-            .as_str()
-            .cmp(right.instance_id.as_str())
-            .then(left.namespace.cmp(&right.namespace))
-            .then(left.table.cmp(&right.table))
-    });
-    Ok(MvLakeCatalogDiscovery::Complete(outcomes))
-}
-
-/// Frontend discovery retains its validated descriptor projection while using
-/// the SPI's explicit incomplete and package-failure vocabulary. The SPI
-/// package carrier is not leaked here because this module owns conversion into
-/// Frontend's lake descriptor contract.
-#[derive(Clone, Debug)]
-pub(crate) enum MvLakeCatalogDiscovery {
-    Complete(Vec<MvLakePackageOutcome>),
-    Incomplete(MvLakeCatalogIncompleteReason),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum MvLakePackageOutcome {
-    Observed(MvLakePackageObservation),
-    Failed(MvLakePackageFailure),
-}
-
 fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
     if context.cancellation().is_cancelled() {
         return Err(ConnectorError::new(
@@ -1546,26 +1104,6 @@ fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), Con
         return Err(ConnectorError::new(
             ConnectorErrorKind::DeadlineExceeded,
             "MV storage observation request deadline elapsed",
-        ));
-    }
-    Ok(())
-}
-
-fn reserve_payload(
-    context: &ConnectorRequestContext,
-    used: &mut usize,
-    value: &str,
-) -> Result<(), ConnectorError> {
-    *used = used.checked_add(value.len()).ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "MV lake discovery payload accounting overflowed",
-        )
-    })?;
-    if *used > context.max_total_payload_bytes() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "MV lake discovery names exceed the connector request payload budget",
         ));
     }
     Ok(())
@@ -1647,86 +1185,9 @@ fn validate_partition_contract(
     Ok(())
 }
 
-fn validate_schema_validation_partition_contract(
-    partition: &MvSchemaValidationPartitionContract,
-    fields: &[MvObservedTargetField],
-) -> Result<(), ConnectorError> {
-    if partition.spec_id() < 0 {
-        return corrupt("MV schema validation partition contract has a negative spec ID");
-    }
-    let field_ids = fields
-        .iter()
-        .map(MvObservedTargetField::field_id)
-        .collect::<HashSet<_>>();
-    let mut partition_ids = HashSet::with_capacity(partition.fields().len());
-    let mut partition_names = HashSet::with_capacity(partition.fields().len());
-    for field in partition.fields() {
-        require_non_empty(
-            field.partition_field_name(),
-            "MV schema validation partition field name",
-        )?;
-        require_non_empty(
-            field.source_column_name(),
-            "MV schema validation partition source column name",
-        )?;
-        if !partition_ids.insert(field.partition_field_id()) {
-            return corrupt(format!(
-                "MV schema validation partition contract has duplicate field ID {}",
-                field.partition_field_id()
-            ));
-        }
-        if !partition_names.insert(field.partition_field_name().to_ascii_lowercase()) {
-            return corrupt(format!(
-                "MV schema validation partition contract has duplicate field name `{}`",
-                field.partition_field_name()
-            ));
-        }
-        if !field_ids.contains(&field.source_target_field_id()) {
-            return corrupt(format!(
-                "MV schema validation partition contract references missing target field ID {}",
-                field.source_target_field_id()
-            ));
-        }
-        match field.transform() {
-            MvSchemaValidationPartitionTransform::Bucket { num_buckets: 0 } => {
-                return corrupt(
-                    "MV schema validation partition contract contains a zero bucket count",
-                );
-            }
-            MvSchemaValidationPartitionTransform::Truncate { width: 0 } => {
-                return corrupt(
-                    "MV schema validation partition contract contains a zero truncate width",
-                );
-            }
-            MvSchemaValidationPartitionTransform::Unsupported(name) => {
-                require_non_empty(name, "MV schema validation unsupported partition transform")?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
 fn require_non_empty(value: &str, subject: &str) -> Result<(), ConnectorError> {
     if value.trim().is_empty() {
         return corrupt(format!("{subject} is empty"));
-    }
-    Ok(())
-}
-
-fn reserve_schema_validation_payload(
-    used: &mut usize,
-    additional: usize,
-    max_total_payload_bytes: usize,
-) -> Result<(), ConnectorError> {
-    *used = used.checked_add(additional).ok_or_else(|| {
-        ConnectorError::new(
-            ConnectorErrorKind::ResourceExhausted,
-            "MV schema validation payload accounting overflowed",
-        )
-    })?;
-    if *used > max_total_payload_bytes {
-        return exhausted("MV schema validation observation exceeds the payload limit");
     }
     Ok(())
 }
@@ -1782,11 +1243,12 @@ mod tests {
     };
 
     use super::{
-        BTreeMap, MvLakePackageObservation, MvLakePublication, MvLakePublishedProjection,
-        MvLakeTargetSnapshot, MvMaintenanceMetadataObservation, MvObservedMaintenancePolicy,
-        MvObservedSnapshot, MvObservedTargetField, MvPublishedBaseFact, MvPublishedLakeFacts,
-        MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
-        MvSchemaValidationObservation, MvTargetCreationObservation,
+        BTreeMap, ConnectorErrorKind, MvLakePackageObservation, MvLakePublication,
+        MvLakePublishedProjection, MvLakeTargetSnapshot, MvMaintenanceMetadataObservation,
+        MvObservedMaintenancePolicy, MvObservedSnapshot, MvObservedTargetField,
+        MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
+        MvRefreshBaseObservation, MvRefreshTargetObservation, MvTargetCreationObservation,
+        SpiSchemaValidationObservation, schema_validation_from_spi,
     };
     use novarocks_mv_application::persistence::{
         definition::MvDesiredRefreshPolicy,
@@ -1989,58 +1451,62 @@ mod tests {
     }
 
     #[test]
-    fn schema_validation_observation_is_bounded_and_exposes_only_neutral_facts() {
-        let observed = MvSchemaValidationObservation::try_new(
-            "target-uuid".to_string(),
-            7,
-            true,
-            true,
-            target_fields(),
-            super::MvSchemaValidationPartitionContract::new(0, vec![]),
-            &context(1_024),
+    fn schema_validation_preserves_opaque_generation_and_physical_ordinals() {
+        use novarocks_spi::connector::{ConnectorCommittedVersion, MvObservedSourceField};
+        let version =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata-current"), Some(11))
+                .unwrap();
+        let field = MvObservedSourceField::try_new(
+            Bytes::from_static(&[0xff, 7]),
+            "physical_name".into(),
+            "int".into(),
+            false,
         )
         .unwrap();
-        assert_eq!(observed.table_uuid(), "target-uuid");
-        assert_eq!(observed.schema_id(), 7);
+        let build = |fields, context: &ConnectorRequestContext| {
+            SpiSchemaValidationObservation::try_new(
+                table(),
+                object_id(b"exact-object"),
+                version.clone(),
+                Bytes::from_static(&[0xff, 8]),
+                Bytes::from_static(&[0xff, 9]),
+                true,
+                true,
+                fields,
+                context,
+            )
+        };
+        let observed = schema_validation_from_spi(
+            build(vec![(3, field.clone())], &context(1024)).unwrap(),
+            &context(1024),
+        )
+        .unwrap();
+        assert_eq!(observed.table_object_id(), &object_id(b"exact-object"));
+        assert_eq!(observed.exact_schema().metadata_version, version);
+        assert_eq!(
+            observed.exact_schema().schema_version.as_bytes(),
+            &[0xff, 8]
+        );
+        assert_eq!(
+            observed.exact_schema().partition_spec_version.as_bytes(),
+            &[0xff, 9]
+        );
+        assert_eq!(observed.fields()[0].field_id.as_bytes(), &[0xff, 7]);
+        assert_eq!(observed.fields()[0].ordinal, 3);
+        assert_eq!(observed.fields()[0].name, "physical_name");
         assert!(observed.is_format_v3());
         assert!(observed.stored_row_lineage_enabled());
-        assert_eq!(observed.fields()[0].field_id(), 1);
-        assert_eq!(observed.fields()[0].name(), "c1");
-        assert_eq!(observed.fields()[0].type_signature(), "int");
-        assert!(!observed.fields()[0].nullable());
-        assert_eq!(observed.partition().spec_id(), 0);
-
-        let payload_error = MvSchemaValidationObservation::try_new(
-            "target-uuid".to_string(),
-            7,
-            true,
-            true,
-            target_fields(),
-            super::MvSchemaValidationPartitionContract::new(0, vec![]),
-            &context(1),
-        )
-        .unwrap_err();
         assert_eq!(
-            payload_error.kind(),
-            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+            build(vec![(3, field.clone())], &context(1))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
         );
-
-        let duplicate_name_error = MvSchemaValidationObservation::try_new(
-            "target-uuid".to_string(),
-            7,
-            true,
-            true,
-            vec![
-                MvObservedTargetField::new(1, "c1".to_string(), "int".to_string(), false),
-                MvObservedTargetField::new(2, "C1".to_string(), "long".to_string(), false),
-            ],
-            super::MvSchemaValidationPartitionContract::new(0, vec![]),
-            &context(1_024),
-        )
-        .unwrap_err();
         assert_eq!(
-            duplicate_name_error.kind(),
-            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+            build(vec![(3, field.clone()), (4, field)], &context(1024))
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
         );
     }
 

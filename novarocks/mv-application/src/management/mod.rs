@@ -30,6 +30,7 @@ mod readmission;
 pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
     ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
+    MvCurrentManagementAdmission,
 };
 pub use effects::{
     CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,

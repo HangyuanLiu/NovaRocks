@@ -17,10 +17,8 @@
 
 //! Exhaustive pure mapping between application runtime facts and D/L.
 //!
-//! The existing `MvSchemaContract` is still owned by Frontend and cannot be a
-//! dependency of `novarocks-mv-application` without creating the forbidden
-//! application cycle. T07 must project that old value and SQL's analyzed facts
-//! into the neutral inputs below. Every stable fact required by D/L is a
+//! MV owns the durable interpretation, while SQL and providers supply typed
+//! semantic and physical facts. Every stable fact required by D/L is a
 //! mandatory typed field here, so the adapter cannot fall back to persisting
 //! the old contract, an AST, a plan, an owner, or a registry handle.
 
@@ -41,6 +39,7 @@ use crate::persistence::identity::{
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeDefinitionFacts {
+    pub created_at_ms: u64,
     pub query_definition: PersistedQueryDefinition,
     pub relation_occurrences: Vec<RuntimeRelationOccurrenceFacts>,
     pub outputs: Vec<RuntimeOutputFacts>,
@@ -172,6 +171,7 @@ impl TryFrom<RuntimeDefinitionFacts> for DefinitionDocument {
     fn try_from(value: RuntimeDefinitionFacts) -> Result<Self, Self::Error> {
         let query = QuerySource::try_from(value.query_definition)?;
         build_definition(
+            value.created_at_ms,
             query,
             value
                 .relation_occurrences
@@ -228,6 +228,7 @@ impl TryFrom<&DefinitionDocument> for RuntimeDefinitionFacts {
 
     fn try_from(value: &DefinitionDocument) -> Result<Self, Self::Error> {
         Ok(Self {
+            created_at_ms: value.created_at_ms,
             query_definition: PersistedQueryDefinition::try_from(value.query.clone())?,
             relation_occurrences: value
                 .relation_occurrences

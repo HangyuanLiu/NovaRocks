@@ -15,24 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Immutable metadata for Iceberg MV rewrite planning.
-//!
-//! This canonical context owns only identities, persisted contracts, snapshot
-//! pins, schemas, and derived aggregate layout. Concrete catalogs, tables,
-//! scan binding, and refresh execution state remain in the engine adapter.
+//! Canonical documents frozen at the application-to-SQL rewrite boundary.
+//! Runtime handles stay in the caller. Provider identities are never decoded.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
-
-#[cfg(test)]
-use arrow::datatypes::Field;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
-
-use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-use mv_schema::MvSchemaContract;
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
-use novarocks_mv_application::persistence::schema as mv_schema;
-use novarocks_spi::connector::ConnectorTableObjectId;
+use bytes::Bytes;
+use novarocks_mv_application::persistence::{
+    codec::{ApplyKeyKind, DefinitionDocument, ExpressionKind, SourceFieldReference, StateRole},
+    exact_revision::{persist_exact_connector_revision, restore_exact_query_revision},
+    identity::{AggregateIdentity, DocumentRevision, PartitionSpecVersion},
+    projection::{MvPublicationState, StoredMvProjection},
+    runtime_bindings::{
+        MvExactTargetSchemaFacts, MvPhysicalFieldFacts, MvRuntimeBindings,
+        reconstruct_runtime_bindings,
+    },
+};
+use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
     SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
@@ -40,498 +38,735 @@ use novarocks_sql::compiler::{
     SqlImvAggregateStateRoleFacts, SqlImvAggregateVisibleColumnFacts, SqlImvApplyKeySourceFacts,
     SqlImvBaseContractFacts, SqlImvBaseFieldFacts, SqlImvBaseSnapshotFacts,
     SqlImvBranchContractFacts, SqlImvExpressionFacts, SqlImvExpressionKindFacts,
-    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
-    SqlImvOutputColumnFacts, SqlImvPartitionFacts, SqlImvPartitionFieldFacts,
-    SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
-    SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
-    SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
+    SqlImvJoinContractFacts, SqlImvOutputColumnFacts, SqlImvPartitionFacts,
+    SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts, SqlImvRewriteSnapshotBuilder,
+    SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts, SqlImvTargetColumnsFacts,
+    SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts, SqlMvRelationOccurrenceId,
 };
-use novarocks_sql::planning::mv::{
-    SqlMvAggregateCalls as AggregateSqlCalls, SqlMvAggregateLayoutFacts,
-    extract_aggregate_sql_calls,
-};
-use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
+use novarocks_sql::planning::mv::SqlMvAggregateCalls;
+use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 use novarocks_types::naming::TableIdentity;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-/// Read-only metadata that drives Iceberg MV refresh rewrite.
-///
-/// Optimizer rewrite rules consume `Arc<IcebergMvRewriteContext>` without
-/// depending on concrete execution handles owned by the engine adapter.
+/// Facts from one provider observation of one D occurrence. Equal logical
+/// names never merge two occurrences.
+#[derive(Clone, Debug)]
+pub struct MvRewriteSourceSnapshot {
+    pub occurrence_id: SqlMvRelationOccurrenceId,
+    pub snapshot_id: i64,
+    pub table_object_id: ConnectorTableObjectId,
+    pub semantic_revision: ConnectorExactSemanticRevision,
+}
+
+/// Analysis of this exact D under D's resolution context. Join predicates are
+/// SQL facts; partition transforms must come from the same provider generation.
+#[derive(Clone, Debug)]
+pub struct MvRewriteAnalysisFacts {
+    pub definition_revision: DocumentRevision,
+    pub partition_spec_version: PartitionSpecVersion,
+    pub join: Option<SqlImvJoinContractFacts>,
+    pub partition: Option<SqlImvPartitionFacts>,
+    pub aggregate: Option<MvRewriteAggregateAnalysis>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MvRewriteAggregateAnalysis {
+    pub calls: SqlMvAggregateCalls,
+    pub layout: SqlMvAggregatePhysicalLayout,
+    /// SQL user-call index to exact L identity; excludes the internal
+    /// retraction aggregate. L's canonical identity order is not call order.
+    pub aggregate_id_by_index: Vec<AggregateIdentity>,
+}
+
 #[derive(Debug)]
 pub struct IcebergMvRewriteContext {
-    // ---- Identity ----
     pub target: TableIdentity,
     pub mv_id: i64,
-
-    // ---- Session ----
     pub current_catalog: Option<String>,
     pub current_database: String,
-
-    // ---- MV definition (post schema-contract rebind) ----
-    pub mv_definition: Arc<StoredMvDefinition>,
+    pub mv_definition: Arc<StoredMvProjection>,
     pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
-
-    // ---- Base table inputs ----
     pub base_refs: Arc<[TableIdentity]>,
-    pub pin: Arc<RefreshSnapshotPin>,
-    pub previous_snapshot_ids: BTreeMap<String, i64>,
-    pub previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-
-    // ---- Target table inputs (extracted from target_table.metadata()) ----
+    pub pin: Arc<BTreeMap<SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>>,
+    /// Retained complete history facts for activation; numeric projections
+    /// below must never become an alternate source of publication identity.
+    pub previous: Arc<[MvRewriteSourceSnapshot]>,
+    pub previous_snapshot_ids: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    pub previous_table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     pub target_snapshot_id: Option<i64>,
     pub target_table_uuid: String,
-    /// Arrow schema of the MV target, in target field order.
-    ///
-    /// Before SPI-5I this held an Iceberg `spec::Schema` that Core converted to
-    /// Arrow at every use. The conversion is the Provider's job; Core only ever
-    /// needed the Arrow types plus the field IDs to line contract columns up
-    /// with schema positions, so it now carries exactly those two facts.
     pub target_arrow_schema: SchemaRef,
-    /// Target field IDs, aligned positionally with `target_arrow_schema`.
-    pub target_field_ids: Arc<[i32]>,
-
-    // ---- Contracts ----
-    pub schema_contract: Arc<MvSchemaContract>,
-}
-
-/// Debug-only view of an `IcebergMvRewriteContext`. No `Display` impl — log
-/// via `tracing::info!(summary = ?ctx.rewrite.summary(), ...)`.
-#[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) struct CtxSummary<'a> {
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub target: &'a TableIdentity,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub mv_id: i64,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub base_count: usize,
-    pub base_fqns: Vec<String>,
-    pub pinned_snapshots: Vec<(String, i64)>,
-    pub previous_snapshots: Vec<(String, Option<i64>)>,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub target_snapshot_id: Option<i64>,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub schema_contract_version: u16,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub partition_contract_present: bool,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub visible_output_column_count: usize,
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub hidden_apply_key_column: &'a str,
-}
-
-fn err(msg: impl Into<String>) -> String {
-    format!("IcebergMvRewriteContext::new: {}", msg.into())
+    pub target_field_ids: Arc<[Bytes]>,
+    pub runtime_bindings: MvRuntimeBindings,
+    analysis: MvRewriteAnalysisFacts,
+    sql_schema: SqlImvSchemaContractFacts,
 }
 
 impl IcebergMvRewriteContext {
-    /// Build the rewrite layer from already-derived primitive inputs.
-    ///
-    /// Execution adapters use this internally after pulling
-    /// `target_snapshot_id` / `target_table_uuid` / `target_schema` out of
-    /// `target_table.metadata()`. Unit tests construct the rewrite layer
-    /// directly via this helper without concrete execution handles.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_parts(
-        target: TableIdentity,
-        mv_id: i64,
-        current_catalog: Option<String>,
-        current_database: String,
-        mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<novarocks_parser::ast::Query>,
-        base_refs: Arc<[TableIdentity]>,
-        pin: Arc<RefreshSnapshotPin>,
-        previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-        target_snapshot_id: Option<i64>,
+        projection: Arc<StoredMvProjection>,
+        current: Vec<MvRewriteSourceSnapshot>,
+        previous: Vec<MvRewriteSourceSnapshot>,
         target_table_uuid: String,
         target_arrow_schema: SchemaRef,
-        target_field_ids: Arc<[i32]>,
-        schema_contract: Option<Arc<MvSchemaContract>>,
+        exact_target: MvExactTargetSchemaFacts,
+        analysis: MvRewriteAnalysisFacts,
     ) -> Result<Self, String> {
-        let target_fqn = format!("{}.{}.{}", target.catalog, target.namespace, target.table);
-        let schema_contract = schema_contract.ok_or_else(|| {
-            err(format!(
-                "missing schema contract on target {target_fqn}; rebuild or recreate the MV"
-            ))
-        })?;
-
-        if base_refs.is_empty() {
-            return Err(err("mv definition has no base table refs"));
+        let facts = &projection.facts;
+        if analysis.definition_revision != facts.source_revision().definition_revision
+            || analysis.partition_spec_version
+                != facts.interpretation().target.partition_spec_version
+        {
+            return Err("MV rewrite analysis belongs to a different D/L generation".into());
         }
-
-        let pin_count = pin.len();
-        if pin_count != base_refs.len() {
-            return Err(err(format!(
-                "refresh pin covers {} bases but definition has {}",
-                pin_count,
-                base_refs.len()
-            )));
+        if target_table_uuid.is_empty() {
+            return Err("MV rewrite target UUID is absent".into());
         }
-
-        for base_ref in base_refs.iter() {
-            if pin.object_id(base_ref).is_none() {
-                return Err(err(format!(
-                    "refresh pin missing object ID for base {}",
-                    base_ref.fqn()
-                )));
+        let runtime_bindings = reconstruct_runtime_bindings(facts, &exact_target)?;
+        let target_field_ids = validate_target_schema(&target_arrow_schema, &exact_target)?;
+        let pin = validate_source_pins(facts.definition(), current)?;
+        let (previous_snapshot_ids, previous_table_object_ids) =
+            validate_history(&projection, previous.clone())?;
+        for (occurrence, previous_object) in &previous_table_object_ids {
+            if pin.get(occurrence).map(|value| &value.table_object_id) != Some(previous_object) {
+                return Err("MV rewrite source object changed since publication".into());
             }
         }
-
-        for base_ref in base_refs.iter() {
-            let fqn = base_ref.fqn();
-            if let Some(previous_object_id) = previous_table_object_ids.get(&fqn) {
-                let current_object_id = pin
-                    .object_id(base_ref)
-                    .expect("object ID presence verified above");
-                if previous_object_id != current_object_id {
-                    return Err(err(format!(
-                        "base table identity changed for {fqn}; incremental refresh unsafe, rebuild the MV"
-                    )));
-                }
-            }
-        }
-
-        // The target schema is the union of visible columns (those listed in
-        // `schema_contract.target.visible_columns`), the hidden apply-key
-        // column (`schema_contract.target.hidden_apply_key.target_field_id`),
-        // and — for aggregate MVs — the hidden aggregate-state columns listed
-        // in `schema_contract.aggregate.state_columns`. The hidden apply-key
-        // field id can coincide with a visible column (when the apply-key
-        // aliases an existing user column) or be a distinct field (the
-        // common case, e.g. `__nova_base_row_id` / `__row_id__`).
-        let schema_field_ids: BTreeSet<i32> = target_field_ids.iter().copied().collect();
-        let mut contract_field_ids: BTreeSet<i32> = schema_contract
-            .target
-            .visible_columns
+        validate_aggregate_analysis(&runtime_bindings, &analysis)?;
+        let sql_schema = sql_schema_facts(&projection, &runtime_bindings, &analysis)?;
+        let definition = facts.definition();
+        let canonical_select_query = Arc::new(
+            crate::mv::domain::refresh::definition::parse_mv_select_query(
+                &definition.query.effective_sql,
+            )?,
+        );
+        let base_refs = definition
+            .relation_occurrences
             .iter()
-            .map(|c| c.target_field_id)
-            .collect();
-        contract_field_ids.insert(schema_contract.target.hidden_apply_key.target_field_id);
-        if let Some(aggregate) = &schema_contract.aggregate {
-            for state_col in &aggregate.state_columns {
-                contract_field_ids.insert(state_col.target_field_id);
-            }
-        }
-        if let Some(branch) = &schema_contract.branch {
-            contract_field_ids.insert(branch.branch_id_column.target_field_id);
-        }
-        if schema_field_ids != contract_field_ids {
-            return Err(err(format!(
-                "target schema/contract field id mismatch: schema has {:?}, contract has {:?}",
-                schema_field_ids, contract_field_ids
-            )));
-        }
-
-        let apply_key_name = &schema_contract.target.hidden_apply_key.column_name;
-        let apply_key_in_schema = target_arrow_schema
-            .fields()
-            .iter()
-            .any(|field| field.name() == apply_key_name);
-        if !apply_key_in_schema {
-            return Err(err(format!(
-                "target apply-key column {apply_key_name} not present in target schema"
-            )));
-        }
-
+            .map(occurrence_table)
+            .collect::<Vec<_>>();
+        let target = facts.target();
+        let target_snapshot_id = match facts.publication() {
+            MvPublicationState::NeverPublished => None,
+            MvPublicationState::Published(published) => Some(
+                published
+                    .output_version()
+                    .snapshot_id()
+                    .ok_or("MV rewrite output has no provider-issued snapshot selector")?,
+            ),
+        };
         Ok(Self {
-            target,
-            mv_id,
-            current_catalog,
-            current_database,
-            mv_definition,
+            target: TableIdentity {
+                catalog: target
+                    .catalog()
+                    .ok_or("MV rewrite target has no catalog")?
+                    .to_string(),
+                namespace: target.namespace().to_string(),
+                table: target.name().to_string(),
+            },
+            mv_id: projection.mv_id,
+            current_catalog: Some(definition.query.resolution.default_catalog.clone()),
+            current_database: definition.query.resolution.default_namespace.clone(),
+            mv_definition: projection,
             canonical_select_query,
-            base_refs,
-            pin,
+            base_refs: base_refs.into(),
+            pin: Arc::new(pin),
+            previous: previous.into(),
             previous_snapshot_ids,
             previous_table_object_ids,
             target_snapshot_id,
             target_table_uuid,
             target_arrow_schema,
-            target_field_ids,
-            schema_contract,
+            target_field_ids: target_field_ids.into(),
+            runtime_bindings,
+            analysis,
+            sql_schema,
         })
     }
 
-    /// Compatibility constructor for tests, EXPLAIN, and repartition paths
-    /// that do not execute a validated refresh plan. Production refresh
-    /// execution must call `from_parts` with its contract baseline instead.
-    #[allow(clippy::too_many_arguments)]
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn from_definition_parts(
-        target: TableIdentity,
-        mv_id: i64,
-        current_catalog: Option<String>,
-        current_database: String,
-        mv_definition: Arc<StoredMvDefinition>,
-        canonical_select_query: Arc<novarocks_parser::ast::Query>,
-        base_refs: Arc<[TableIdentity]>,
-        pin: Arc<RefreshSnapshotPin>,
-        target_snapshot_id: Option<i64>,
-        target_table_uuid: String,
-        target_arrow_schema: SchemaRef,
-        target_field_ids: Arc<[i32]>,
-        schema_contract: Option<Arc<MvSchemaContract>>,
-    ) -> Result<Self, String> {
-        let previous_snapshot_ids = mv_definition.last_refresh_snapshots.clone();
-        let previous_table_object_ids = mv_definition.last_refresh_table_object_ids.clone();
-        Self::from_parts(
-            target,
-            mv_id,
-            current_catalog,
-            current_database,
-            mv_definition,
-            canonical_select_query,
-            base_refs,
-            pin,
-            previous_snapshot_ids,
-            previous_table_object_ids,
-            target_snapshot_id,
-            target_table_uuid,
-            target_arrow_schema,
-            target_field_ids,
-            schema_contract,
+    pub(crate) fn summary(&self) -> impl std::fmt::Debug + '_ {
+        (
+            &self.target,
+            self.mv_id,
+            self.pin
+                .iter()
+                .map(|(id, value)| (id.get(), value.snapshot_id))
+                .collect::<Vec<_>>(),
+            self.mv_definition.facts.source_revision(),
         )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn summary(&self) -> CtxSummary<'_> {
-        let n = self.base_refs.len();
-        let mut base_fqns: Vec<String> = Vec::with_capacity(n);
-        let mut pinned_snapshots: Vec<(String, i64)> = Vec::with_capacity(n);
-        let mut previous_snapshots: Vec<(String, Option<i64>)> = Vec::with_capacity(n);
-        for r in self.base_refs.iter() {
-            let fqn = r.fqn();
-            let snap = self
-                .pin
-                .get(r)
-                .expect("pin coverage verified in constructor");
-            let prev = self.previous_snapshot_ids.get(&fqn).copied();
-            pinned_snapshots.push((fqn.clone(), snap));
-            previous_snapshots.push((fqn.clone(), prev));
-            base_fqns.push(fqn);
-        }
-
-        CtxSummary {
-            target: &self.target,
-            mv_id: self.mv_id,
-            base_count: self.base_refs.len(),
-            base_fqns,
-            pinned_snapshots,
-            previous_snapshots,
-            target_snapshot_id: self.target_snapshot_id,
-            schema_contract_version: self.schema_contract.contract_version,
-            partition_contract_present: self.schema_contract.target.partition.is_some(),
-            visible_output_column_count: self.schema_contract.target.visible_columns.len(),
-            hidden_apply_key_column: &self.schema_contract.target.hidden_apply_key.column_name,
-        }
     }
 
     pub(crate) fn aggregate_shape_and_layout_for_execution(
         &self,
-    ) -> Result<
-        (
-            AggregateSqlCalls,
-            novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
-        ),
-        String,
-    > {
-        // Source the aggregate-call surface from the focused extractor (not the
-        // legacy union classifier), so a composed branch (`Agg(a JOIN b)` /
-        // `Agg(fan-in)`) is supported. For a branch UNION ALL, every branch shares
-        // the same output schema (the UNION ALL requirement) and — under the
-        // CREATE-time homogeneity gate — the same aggregate layout, so the
-        // aggregate-state physical layout is derived from the FIRST branch's
-        // aggregate calls, exactly the surface the CREATE path used to build the
-        // target schema + contract. For a single aggregate / join aggregate, the
-        // whole query is the aggregate.
-        let query = self.canonical_select_query.as_ref();
-        let aggregate_query = if is_union_all_query(query) {
-            first_union_branch_query(query)?
-        } else {
-            query.clone()
-        };
-        let aggregate_calls = extract_aggregate_sql_calls(&aggregate_query)
-            .map_err(|e| format!("extract aggregate calls for execution layout: {e}"))?;
-
-        let arrow_schema = self.target_arrow_schema.as_ref();
-        let target_field_ids = self.target_field_ids.as_ref();
-        let mut output_columns =
-            Vec::with_capacity(self.schema_contract.target.visible_columns.len());
-        for visible in &self.schema_contract.target.visible_columns {
-            let field_idx = target_field_ids
-                .iter()
-                .position(|field_id| *field_id == visible.target_field_id)
-                .ok_or_else(|| {
-                    format!(
-                        "target visible column {} field id {} is missing from target schema",
-                        visible.output_name, visible.target_field_id
-                    )
-                })?;
-            let arrow_field = arrow_schema.field(field_idx);
-            output_columns.push(novarocks_sql::plan_read::OutputColumn {
-                column_id: novarocks_sql::plan_read::ColumnId::UNSET,
-                name: visible.output_name.clone(),
-                data_type: arrow_field.data_type().clone(),
-                nullable: visible.nullable,
-                is_internal: false,
-            });
-        }
-
-        let aggregate_input_types =
-            aggregate_input_types_from_schema_contract(&aggregate_calls, &self.schema_contract)?;
-        let aggregate_layout_facts = SqlMvAggregateLayoutFacts::from_aggregate_calls_and_outputs(
-            &aggregate_calls,
-            &output_columns,
-            &aggregate_input_types,
-        )?;
-        let layout = build_sql_mv_aggregate_physical_layout(&aggregate_layout_facts)?;
-        Ok((aggregate_calls, layout))
+    ) -> Result<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout), String> {
+        self.analysis
+            .aggregate
+            .as_ref()
+            .map(|value| (value.calls.clone(), value.layout.clone()))
+            .ok_or_else(|| "MV rewrite has no analyzed aggregate execution facts".into())
     }
 
-    /// Freeze the application MV contract into the SQL compiler's immutable
-    /// input vocabulary. This is intentionally an application-side adapter:
-    /// all connector schema access and persisted-contract interpretation end
-    /// before the SQL compiler receives the resulting snapshot.
+    pub fn analysis_facts(&self) -> &MvRewriteAnalysisFacts {
+        &self.analysis
+    }
+
+    /// The single D occurrence that names `table`.
+    ///
+    /// A definition may reference the same relation more than once. Those are
+    /// distinct occurrences and must never be merged, so a locator-keyed
+    /// lookup over a repeated relation is an explicit error rather than an
+    /// arbitrary winner.
+    pub(crate) fn sole_occurrence_for_table(
+        &self,
+        table: &TableIdentity,
+    ) -> Result<SqlMvRelationOccurrenceId, String> {
+        let mut found = None;
+        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
+            if occurrence.catalog_at_binding != table.catalog
+                || occurrence.namespace_at_binding != table.namespace
+                || occurrence.relation_at_binding != table.table
+            {
+                continue;
+            }
+            if found.is_some() {
+                return Err(format!(
+                    "MV definition references {} more than once; this path needs one occurrence \
+                     per relation",
+                    table.fqn()
+                ));
+            }
+            found = Some(SqlMvRelationOccurrenceId::new(occurrence.occurrence_id));
+        }
+        found.ok_or_else(|| format!("MV definition has no occurrence for {}", table.fqn()))
+    }
+
+    /// Pinned current snapshot for the sole occurrence of `table`.
+    pub(crate) fn pinned_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
+        let occurrence = self.sole_occurrence_for_table(table)?;
+        self.pin
+            .get(&occurrence)
+            .map(|value| value.snapshot_id)
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+    }
+
+    /// Pinned current object identity for the sole occurrence of `table`.
+    pub(crate) fn pinned_table_object_id(
+        &self,
+        table: &TableIdentity,
+    ) -> Result<ConnectorTableObjectId, String> {
+        let occurrence = self.sole_occurrence_for_table(table)?;
+        self.pin
+            .get(&occurrence)
+            .map(|value| value.table_object_id.clone())
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+    }
+
+    /// Published predecessor snapshot for the sole occurrence of `table`.
+    pub(crate) fn previous_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
+        let occurrence = self.sole_occurrence_for_table(table)?;
+        self.previous_snapshot_ids
+            .get(&occurrence)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "MV refresh has no published predecessor snapshot for {}",
+                    table.fqn()
+                )
+            })
+    }
+
+    /// Locator-keyed projections for the legacy publication intent. Both fail
+    /// rather than merge when one relation occurs twice.
+    pub(crate) fn pinned_snapshots_by_locator(&self) -> Result<BTreeMap<String, i64>, String> {
+        self.locator_keyed(|value| value.snapshot_id)
+    }
+
+    pub(crate) fn pinned_objects_by_locator(
+        &self,
+    ) -> Result<BTreeMap<String, ConnectorTableObjectId>, String> {
+        self.locator_keyed(|value| value.table_object_id.clone())
+    }
+
+    fn locator_keyed<T>(
+        &self,
+        project: impl Fn(&MvRewriteSourceSnapshot) -> T,
+    ) -> Result<BTreeMap<String, T>, String> {
+        let mut values = BTreeMap::new();
+        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
+            let table = occurrence_table(occurrence);
+            let pin = self
+                .pin
+                .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
+                .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))?;
+            if values.insert(table.fqn(), project(pin)).is_some() {
+                return Err(format!(
+                    "MV definition references {} more than once; this path needs one occurrence \
+                     per relation",
+                    table.fqn()
+                ));
+            }
+        }
+        Ok(values)
+    }
+
     pub fn to_sql_rewrite_snapshot(
         &self,
         target_binding: SqlTableBindingId,
     ) -> Result<SqlImvRewriteSnapshotHandle, String> {
         let mut builder =
             SqlImvRewriteSnapshotBuilder::try_new(self.target.clone(), target_binding, self.mv_id)?;
-        for table in self.base_refs.iter() {
-            let snapshot_id = self.pin.get(table).ok_or_else(|| {
-                format!(
-                    "IMV rewrite snapshot missing pinned snapshot for base {}",
-                    table.fqn()
-                )
-            })?;
-            let table_object_id = self.pin.object_id(table).ok_or_else(|| {
-                format!(
-                    "IMV rewrite snapshot missing pinned table object ID for base {}",
-                    table.fqn()
-                )
-            })?;
+        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
+            let id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
+            let pin = self
+                .pin
+                .get(&id)
+                .ok_or("MV rewrite occurrence pin is missing")?;
             builder.add_base_snapshot(SqlImvBaseSnapshotFacts::try_new(
-                table.clone(),
-                snapshot_id,
-                table_object_id.clone(),
+                id,
+                occurrence_table(occurrence),
+                occurrence.qualifier_at_binding.clone(),
+                pin.snapshot_id,
+                pin.table_object_id.clone(),
             )?)?;
         }
-        builder.set_target_columns(SqlImvTargetColumnsFacts::try_new(sql_target_columns(
-            self.target_arrow_schema.as_ref(),
-        ))?)?;
+        builder.set_target_columns(SqlImvTargetColumnsFacts::try_new(
+            self.target_arrow_schema
+                .fields()
+                .iter()
+                .map(|field| novarocks_types::schema::ColumnDef {
+                    name: field.name().clone(),
+                    data_type: field.data_type().clone(),
+                    nullable: field.is_nullable(),
+                    write_default: None,
+                    logical_type: None,
+                })
+                .collect(),
+        )?)?;
         builder.set_refresh_history(SqlImvRefreshHistoryFacts::try_new(
             self.previous_snapshot_ids.clone(),
             self.previous_table_object_ids.clone(),
             self.target_snapshot_id,
             self.target_table_uuid.clone(),
         )?)?;
-        builder.set_schema_contract(sql_schema_contract(self.schema_contract.as_ref())?)?;
-        let aggregate_execution = if self.schema_contract.aggregate.is_some() {
-            let (calls, layout) = self
-                .aggregate_shape_and_layout_for_execution()
-                .map_err(|e| {
-                    format!(
-                        "IMV rewrite snapshot cannot derive aggregate execution layout for {}: {e}",
-                        self.target.fqn()
-                    )
-                })?;
-            Some(SqlImvAggregateExecutionFacts::try_new(
-                calls.group_keys.len(),
-                calls.visible_outputs,
-                layout.row_id_column().column().name.clone(),
-                layout
-                    .runtime_layout()
-                    .visible_columns()
-                    .iter()
-                    .map(|column| {
-                        SqlImvAggregateVisibleColumnFacts::try_new(
-                            column.name().to_string(),
-                            column.data_type().clone(),
-                            column.nullable(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-                layout
-                    .runtime_layout()
-                    .state_columns()
-                    .iter()
-                    .map(|column| {
-                        SqlImvAggregateExecutionStateColumnFacts::try_new(
-                            column.name().to_string(),
-                            column.data_type().clone(),
-                            column.nullable(),
-                            column.visible_source_index(),
-                            column.aggregate_index(),
-                            aggregate_function_kind(column.aggregate_kind()),
-                            match column.state_role() {
-                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::Single => {
-                                    SqlImvAggregateStateRoleFacts::Single
-                                }
-                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgSum => {
-                                    SqlImvAggregateStateRoleFacts::AvgSum
-                                }
-                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgCount => {
-                                    SqlImvAggregateStateRoleFacts::AvgCount
-                                }
-                                novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount => {
-                                    SqlImvAggregateStateRoleFacts::RetractionCount
-                                }
-                            },
-                            column.count_star(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-                layout.runtime_layout().group_key_source_indexes().to_vec(),
-                layout
-                    .physical_columns()
-                    .iter()
-                    .map(|column| column.column().name.clone())
-                    .collect(),
-                layout.runtime_layout().aggregate_input_types().to_vec(),
-            )?)
-        } else {
-            None
-        };
-        if let Some(aggregate_execution) = aggregate_execution {
-            builder.set_aggregate_execution(aggregate_execution)?;
+        builder.set_schema_contract(self.sql_schema.clone())?;
+        if let Some(analysis) = &self.analysis.aggregate {
+            builder.set_aggregate_execution(aggregate_execution_facts(analysis)?)?;
         }
         builder.build()
     }
+}
+
+fn occurrence_table(
+    value: &novarocks_mv_application::persistence::codec::RelationOccurrence,
+) -> TableIdentity {
+    TableIdentity {
+        catalog: value.catalog_at_binding.clone(),
+        namespace: value.namespace_at_binding.clone(),
+        table: value.relation_at_binding.clone(),
+    }
+}
+
+fn validate_source_pins(
+    definition: &DefinitionDocument,
+    values: Vec<MvRewriteSourceSnapshot>,
+) -> Result<BTreeMap<SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>, String> {
+    let mut pins = BTreeMap::new();
+    for value in values {
+        if value.snapshot_id < 0 || pins.insert(value.occurrence_id, value).is_some() {
+            return Err("MV rewrite source pins contain an invalid or repeated occurrence".into());
+        }
+    }
+    if pins.len() != definition.relation_occurrences.len() {
+        return Err("MV rewrite source pins do not cover every D occurrence".into());
+    }
+    for occurrence in &definition.relation_occurrences {
+        let pin = pins
+            .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
+            .ok_or("MV rewrite source pin refers to an unknown occurrence")?;
+        if pin.semantic_revision.object_identity().value().as_ref()
+            != pin.table_object_id.as_bytes().as_ref()
+        {
+            return Err("MV rewrite source pin carries conflicting exact object facts".into());
+        }
+        let (persisted_object, _) = persist_exact_connector_revision(&pin.semantic_revision)
+            .map_err(|error| format!("persist MV rewrite source identity: {error}"))?;
+        if occurrence.object_id != persisted_object {
+            return Err("MV rewrite pinned source object differs from D".into());
+        }
+    }
+    Ok(pins)
+}
+
+type RefreshHistory = (
+    BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
+);
+
+fn validate_history(
+    projection: &StoredMvProjection,
+    previous: Vec<MvRewriteSourceSnapshot>,
+) -> Result<RefreshHistory, String> {
+    let published = match projection.facts.publication() {
+        MvPublicationState::NeverPublished if previous.is_empty() => {
+            return Ok((BTreeMap::new(), BTreeMap::new()));
+        }
+        MvPublicationState::NeverPublished => {
+            return Err("NeverPublished MV cannot have refresh history".into());
+        }
+        MvPublicationState::Published(published) => published,
+    };
+    let previous = validate_source_pins(projection.facts.definition(), previous)?;
+    let mut snapshots = BTreeMap::new();
+    let mut objects = BTreeMap::new();
+    for input in &published.document().inputs {
+        let occurrence = SqlMvRelationOccurrenceId::new(input.relation_occurrence_id);
+        let value = previous
+            .get(&occurrence)
+            .ok_or("MV rewrite history omits a publication occurrence")?;
+        let expected = restore_exact_query_revision(&input.object_id, &input.native_data_version)
+            .map_err(|error| format!("restore MV rewrite history revision: {error}"))?;
+        if value.semantic_revision != expected {
+            return Err(
+                "MV rewrite history does not describe the exact published source revision".into(),
+            );
+        }
+        snapshots.insert(occurrence, value.snapshot_id);
+        objects.insert(occurrence, value.table_object_id.clone());
+    }
+    Ok((snapshots, objects))
+}
+
+fn validate_target_schema(
+    schema: &SchemaRef,
+    exact: &MvExactTargetSchemaFacts,
+) -> Result<Vec<Bytes>, String> {
+    if schema.fields().len() != exact.fields.len() {
+        return Err("MV rewrite exact target fields do not cover its Arrow schema".into());
+    }
+    let mut ordered = exact.fields.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|field| field.ordinal);
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(ordinal, field)| {
+            let arrow = schema.field(ordinal);
+            if usize::try_from(field.ordinal).ok() != Some(ordinal)
+                || arrow.name() != &field.name
+                || arrow.data_type() != &arrow_type_from_contract_signature(&field.type_signature)?
+                || arrow.is_nullable() != field.nullable
+            {
+                return Err(
+                    "MV rewrite target Arrow field differs from its exact provider fact".into(),
+                );
+            }
+            Ok(Bytes::copy_from_slice(field.field_id.as_bytes()))
+        })
+        .collect()
+}
+
+fn sql_lineage(
+    definition: &DefinitionDocument,
+    field: &SourceFieldReference,
+) -> Result<SqlImvQualifiedFieldFacts, String> {
+    let occurrence = definition
+        .relation_occurrences
+        .iter()
+        .find(|value| value.occurrence_id == field.occurrence_id)
+        .ok_or("MV output references an unknown D occurrence")?;
+    SqlImvQualifiedFieldFacts::try_new(
+        SqlMvRelationOccurrenceId::new(field.occurrence_id),
+        occurrence_table(occurrence).fqn(),
+        occurrence.qualifier_at_binding.clone(),
+        Bytes::copy_from_slice(field.field_id.as_bytes()),
+    )
+}
+
+fn sql_schema_facts(
+    projection: &StoredMvProjection,
+    bindings: &MvRuntimeBindings,
+    analysis: &MvRewriteAnalysisFacts,
+) -> Result<SqlImvSchemaContractFacts, String> {
+    let definition = projection.facts.definition();
+    let interpretation = projection.facts.interpretation();
+    let [apply_key] = bindings.apply_key.as_slice() else {
+        return Err("SQL IMV rewrite requires one physical apply-key column".into());
+    };
+    let bases = definition
+        .relation_occurrences
+        .iter()
+        .map(|occurrence| {
+            SqlImvBaseContractFacts::try_new(
+                SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+                occurrence_table(occurrence).fqn(),
+                Some(occurrence.qualifier_at_binding.clone()),
+                occurrence
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        SqlImvBaseFieldFacts::try_new(
+                            Bytes::copy_from_slice(field.field_id.as_bytes()),
+                            field.name_at_binding.clone(),
+                            arrow_type_from_contract_signature(&field.type_signature)?,
+                            field.nullable,
+                        )
+                    })
+                    .collect::<Result<_, String>>()?,
+            )
+        })
+        .collect::<Result<_, String>>()?;
+    let outputs = definition
+        .outputs
+        .iter()
+        .map(|output| {
+            Ok(SqlImvOutputColumnFacts::new(
+                SqlImvExpressionFacts::try_new(
+                    match output.expression.kind {
+                        ExpressionKind::Field => SqlImvExpressionKindFacts::Column,
+                        ExpressionKind::Literal => SqlImvExpressionKindFacts::Literal,
+                        ExpressionKind::Cast => SqlImvExpressionKindFacts::Cast,
+                        ExpressionKind::Function => SqlImvExpressionKindFacts::Func,
+                        ExpressionKind::Mixed => SqlImvExpressionKindFacts::Mixed,
+                    },
+                    output
+                        .expression
+                        .source_fields
+                        .iter()
+                        .map(|field| sql_lineage(definition, field))
+                        .collect::<Result<_, _>>()?,
+                )?,
+            ))
+        })
+        .collect::<Result<_, String>>()?;
+    let aggregate = if bindings.aggregates.is_empty() {
+        None
+    } else {
+        let mut seen = BTreeSet::new();
+        let states = bindings
+            .aggregates
+            .iter()
+            .flat_map(|value| &value.states)
+            .filter(|state| seen.insert(state.slot_id.clone()))
+            .map(|state| {
+                SqlImvAggregateStateColumnFacts::try_new(
+                    state.physical.name.clone(),
+                    state.physical.type_signature.clone(),
+                    state_role(state.role),
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        // NativeColumnV1 is L's declared encoding, not an old contract version.
+        Some(SqlImvAggregateContractFacts::try_new(
+            1,
+            apply_key.name.clone(),
+            states,
+        )?)
+    };
+    let branch = match bindings.branches.first() {
+        None => None,
+        Some((_, first)) => {
+            if bindings
+                .branches
+                .iter()
+                .any(|(_, field)| field.field_id != first.field_id)
+            {
+                return Err("SQL IMV rewrite requires a shared branch discriminator field".into());
+            }
+            Some(SqlImvBranchContractFacts::try_new(first.name.clone())?)
+        }
+    };
+    let target = SqlImvTargetContractFacts::try_new(
+        definition
+            .outputs
+            .iter()
+            .zip(&bindings.outputs)
+            .map(|(output, (_, field))| {
+                SqlImvTargetVisibleColumnFacts::try_new(
+                    output.name.clone(),
+                    Bytes::copy_from_slice(field.field_id.as_bytes()),
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        apply_key.name.clone(),
+        match interpretation.apply_key.kind {
+            ApplyKeyKind::BaseRowId => SqlImvApplyKeySourceFacts::BaseRowId,
+            ApplyKeyKind::JoinRowKey => SqlImvApplyKeySourceFacts::JoinRowKey,
+            ApplyKeyKind::GroupRowId => SqlImvApplyKeySourceFacts::GroupRowId,
+        },
+        analysis.partition.clone(),
+    )?;
+    SqlImvSchemaContractFacts::try_new(
+        bases,
+        outputs,
+        analysis.join.clone(),
+        aggregate,
+        branch,
+        target,
+    )
+}
+
+fn validate_aggregate_analysis(
+    bindings: &MvRuntimeBindings,
+    analysis: &MvRewriteAnalysisFacts,
+) -> Result<(), String> {
+    let Some(aggregate) = &analysis.aggregate else {
+        return if bindings.aggregates.is_empty() {
+            Ok(())
+        } else {
+            Err("MV rewrite lacks analyzed aggregate execution facts".into())
+        };
+    };
+    if aggregate.calls.aggregates.len() != aggregate.aggregate_id_by_index.len()
+        || aggregate
+            .aggregate_id_by_index
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != aggregate.aggregate_id_by_index.len()
+    {
+        return Err("MV rewrite aggregate analysis has no exact identity mapping".into());
+    }
+    let runtime = aggregate.layout.runtime_layout();
+    if runtime.visible_columns().len() != bindings.outputs.len() {
+        return Err("MV rewrite aggregate outputs differ from D/L".into());
+    }
+    for (column, (_, field)) in runtime.visible_columns().iter().zip(&bindings.outputs) {
+        validate_physical_column(field, column.name(), column.data_type(), column.nullable())?;
+    }
+    let [apply_key] = bindings.apply_key.as_slice() else {
+        return Err("MV rewrite aggregate requires one physical group row ID".into());
+    };
+    if aggregate.layout.row_id_column().column().name != apply_key.name {
+        return Err("MV rewrite aggregate row ID differs from L".into());
+    }
+    let by_id = bindings
+        .aggregates
+        .iter()
+        .map(|value| (&value.aggregate_id, value))
+        .collect::<BTreeMap<_, _>>();
+    let mut used = BTreeSet::new();
+    for column in runtime.state_columns() {
+        let id = if column.state_role()
+            == novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
+        {
+            novarocks_mv_application::persistence::codec::internal_retraction_count_aggregate_identity()
+        } else {
+            aggregate
+                .aggregate_id_by_index
+                .get(column.aggregate_index())
+                .ok_or("MV rewrite aggregate state has an unknown SQL call index")?
+                .clone()
+        };
+        let binding = by_id
+            .get(&id)
+            .ok_or("MV rewrite aggregate identity is absent from L")?;
+        let state = binding
+            .states
+            .iter()
+            .find(|state| state_role(state.role) == runtime_state_role(column.state_role()))
+            .ok_or("MV rewrite aggregate state role is absent from L")?;
+        if !used.insert(state.slot_id.clone()) {
+            return Err("MV rewrite aggregate state was consumed more than once".into());
+        }
+        validate_physical_column(
+            &state.physical,
+            column.name(),
+            column.data_type(),
+            column.nullable(),
+        )?;
+    }
+    if used.len()
+        != bindings
+            .aggregates
+            .iter()
+            .map(|value| value.states.len())
+            .sum::<usize>()
+    {
+        return Err("MV rewrite aggregate analysis omits persisted state slots".into());
+    }
+    Ok(())
+}
+
+fn validate_physical_column(
+    field: &MvPhysicalFieldFacts,
+    name: &str,
+    data_type: &DataType,
+    nullable: bool,
+) -> Result<(), String> {
+    if field.name != name
+        || arrow_type_from_contract_signature(&field.type_signature)? != *data_type
+        || field.nullable != nullable
+    {
+        return Err(
+            "MV rewrite analyzed physical column differs from its L/provider binding".into(),
+        );
+    }
+    Ok(())
+}
+
+fn state_role(role: StateRole) -> SqlImvAggregateStateRoleFacts {
+    match role {
+        StateRole::Single => SqlImvAggregateStateRoleFacts::Single,
+        StateRole::AvgSum => SqlImvAggregateStateRoleFacts::AvgSum,
+        StateRole::AvgCount => SqlImvAggregateStateRoleFacts::AvgCount,
+        StateRole::RetractionCount => SqlImvAggregateStateRoleFacts::RetractionCount,
+    }
+}
+fn runtime_state_role(
+    role: novarocks_types::mv_aggregate_layout::MvAggregateStateRole,
+) -> SqlImvAggregateStateRoleFacts {
+    use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
+    match role {
+        MvAggregateStateRole::Single => SqlImvAggregateStateRoleFacts::Single,
+        MvAggregateStateRole::AvgSum => SqlImvAggregateStateRoleFacts::AvgSum,
+        MvAggregateStateRole::AvgCount => SqlImvAggregateStateRoleFacts::AvgCount,
+        MvAggregateStateRole::RetractionCount => SqlImvAggregateStateRoleFacts::RetractionCount,
+    }
+}
+fn aggregate_execution_facts(
+    analysis: &MvRewriteAggregateAnalysis,
+) -> Result<SqlImvAggregateExecutionFacts, String> {
+    let layout = analysis.layout.runtime_layout();
+    SqlImvAggregateExecutionFacts::try_new(
+        analysis.calls.group_keys.len(),
+        analysis.calls.visible_outputs.clone(),
+        analysis.layout.row_id_column().column().name.clone(),
+        layout
+            .visible_columns()
+            .iter()
+            .map(|column| {
+                SqlImvAggregateVisibleColumnFacts::try_new(
+                    column.name().to_string(),
+                    column.data_type().clone(),
+                    column.nullable(),
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        layout
+            .state_columns()
+            .iter()
+            .map(|column| {
+                SqlImvAggregateExecutionStateColumnFacts::try_new(
+                    column.name().to_string(),
+                    column.data_type().clone(),
+                    column.nullable(),
+                    column.visible_source_index(),
+                    column.aggregate_index(),
+                    aggregate_function_kind(column.aggregate_kind()),
+                    runtime_state_role(column.state_role()),
+                    column.count_star(),
+                )
+            })
+            .collect::<Result<_, _>>()?,
+        layout.group_key_source_indexes().to_vec(),
+        analysis
+            .layout
+            .physical_columns()
+            .iter()
+            .map(|column| column.column().name.clone())
+            .collect(),
+        layout.aggregate_input_types().to_vec(),
+    )
 }
 
 fn aggregate_function_kind(
@@ -551,217 +786,6 @@ fn aggregate_function_kind(
         MvAggregateRuntimeKind::CountDistinct => AggregateFunctionKind::CountDistinct,
         MvAggregateRuntimeKind::ApproxCountDistinct => AggregateFunctionKind::ApproxCountDistinct,
     }
-}
-
-fn sql_target_columns(
-    target_schema: &arrow::datatypes::Schema,
-) -> Vec<novarocks_types::schema::ColumnDef> {
-    target_schema
-        .fields()
-        .iter()
-        .map(|field| novarocks_types::schema::ColumnDef {
-            name: field.name().clone(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        })
-        .collect()
-}
-
-fn sql_schema_contract(contract: &MvSchemaContract) -> Result<SqlImvSchemaContractFacts, String> {
-    fn expression_kind(value: mv_schema::ExpressionKind) -> SqlImvExpressionKindFacts {
-        match value {
-            mv_schema::ExpressionKind::Column => SqlImvExpressionKindFacts::Column,
-            mv_schema::ExpressionKind::Cast => SqlImvExpressionKindFacts::Cast,
-            mv_schema::ExpressionKind::Func => SqlImvExpressionKindFacts::Func,
-            mv_schema::ExpressionKind::Literal => SqlImvExpressionKindFacts::Literal,
-            mv_schema::ExpressionKind::Mixed => SqlImvExpressionKindFacts::Mixed,
-        }
-    }
-
-    fn lineage(
-        value: &mv_schema::QualifiedFieldLineage,
-    ) -> Result<SqlImvQualifiedFieldFacts, String> {
-        SqlImvQualifiedFieldFacts::try_new(
-            value.table_fqn.clone(),
-            value.qualifier_at_create.clone(),
-            value.field_id,
-        )
-    }
-
-    fn transform(value: &mv_schema::MvPartitionTransformContract) -> SqlImvPartitionTransformFacts {
-        match value {
-            mv_schema::MvPartitionTransformContract::Identity => {
-                SqlImvPartitionTransformFacts::Identity
-            }
-            mv_schema::MvPartitionTransformContract::Year => SqlImvPartitionTransformFacts::Year,
-            mv_schema::MvPartitionTransformContract::Month => SqlImvPartitionTransformFacts::Month,
-            mv_schema::MvPartitionTransformContract::Day => SqlImvPartitionTransformFacts::Day,
-            mv_schema::MvPartitionTransformContract::Hour => SqlImvPartitionTransformFacts::Hour,
-            mv_schema::MvPartitionTransformContract::Bucket { num_buckets } => {
-                SqlImvPartitionTransformFacts::Bucket {
-                    num_buckets: *num_buckets,
-                }
-            }
-            mv_schema::MvPartitionTransformContract::Truncate { width } => {
-                SqlImvPartitionTransformFacts::Truncate { width: *width }
-            }
-            mv_schema::MvPartitionTransformContract::Void => SqlImvPartitionTransformFacts::Void,
-        }
-    }
-
-    let aggregate = contract
-        .aggregate
-        .as_ref()
-        .map(|aggregate| {
-            let state_columns = aggregate
-                .state_columns
-                .iter()
-                .map(|column| {
-                    let role = match column.role {
-                        mv_schema::AggregateStateRoleContract::Single => {
-                            SqlImvAggregateStateRoleFacts::Single
-                        }
-                        mv_schema::AggregateStateRoleContract::RetractionCount => {
-                            SqlImvAggregateStateRoleFacts::RetractionCount
-                        }
-                        unsupported => {
-                            return Err(format!(
-                                "IMV schema contract has unsupported aggregate state role {unsupported:?}"
-                            ));
-                        }
-                    };
-                    SqlImvAggregateStateColumnFacts::try_new(
-                        column.column_name.clone(),
-                        column.type_signature.clone(),
-                        role,
-                    )
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            SqlImvAggregateContractFacts::try_new(
-                aggregate.state_layout_version,
-                aggregate.row_id_column_name.clone(),
-                state_columns,
-            )
-        })
-        .transpose()?;
-
-    let bases = base_contracts(contract)
-        .into_iter()
-        .map(|base| {
-            SqlImvBaseContractFacts::try_new(
-                base.table_fqn.clone(),
-                base.alias_at_create.clone(),
-                base.schema_at_create
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        SqlImvBaseFieldFacts::try_new(field.field_id, field.name_at_create.clone())
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            )
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let output_columns = contract
-        .output
-        .columns
-        .iter()
-        .map(|output| {
-            Ok(SqlImvOutputColumnFacts::new(
-                SqlImvExpressionFacts::try_new(
-                    expression_kind(output.expression.kind),
-                    output.expression.referenced_base_field_ids.clone(),
-                    output
-                        .expression
-                        .referenced_base_fields
-                        .iter()
-                        .map(lineage)
-                        .collect::<Result<Vec<_>, String>>()?,
-                )?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let join = contract
-        .join
-        .as_ref()
-        .map(|join| {
-            SqlImvJoinContractFacts::try_new(
-                match join.kind {
-                    mv_schema::JoinContractKind::InnerEquiJoin => {
-                        SqlImvJoinKindFacts::InnerEquiJoin
-                    }
-                },
-                join.predicates
-                    .iter()
-                    .map(|predicate| {
-                        SqlImvJoinPredicateFacts::try_new(
-                            lineage(&predicate.left)?,
-                            lineage(&predicate.right)?,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, String>>()?,
-            )
-        })
-        .transpose()?;
-    let branch = contract
-        .branch
-        .as_ref()
-        .map(|branch| {
-            SqlImvBranchContractFacts::try_new(branch.branch_id_column.column_name.clone())
-        })
-        .transpose()?;
-    let target = SqlImvTargetContractFacts::try_new(
-        contract
-            .target
-            .visible_columns
-            .iter()
-            .map(|column| {
-                SqlImvTargetVisibleColumnFacts::try_new(
-                    column.output_name.clone(),
-                    column.target_field_id,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?,
-        contract.target.hidden_apply_key.column_name.clone(),
-        SqlImvApplyKeySourceFacts::try_from_persisted_label(&format!(
-            "{:?}",
-            contract.target.hidden_apply_key.source
-        ))?,
-        contract
-            .target
-            .partition
-            .as_ref()
-            .map(|partition| {
-                SqlImvPartitionFacts::try_new(
-                    partition.target_spec_id,
-                    partition
-                        .fields
-                        .iter()
-                        .map(|field| {
-                            SqlImvPartitionFieldFacts::try_new(
-                                field.partition_field_name.clone(),
-                                field.source_target_field_id,
-                                transform(&field.transform),
-                            )
-                        })
-                        .collect::<Result<Vec<_>, String>>()?,
-                )
-            })
-            .transpose()?,
-    )?;
-    SqlImvSchemaContractFacts::try_new(bases, output_columns, join, aggregate, branch, target)
-}
-
-/// Whether `query`'s body is a UNION ALL set operation (possibly nested), used
-/// to decide whether to source aggregate calls from the first branch.
-fn is_union_all_query(query: &novarocks_parser::ast::Query) -> bool {
-    matches!(
-        query.body.as_ref(),
-        novarocks_parser::ast::SetExpr::SetOperation(operation)
-            if operation.operator == novarocks_parser::ast::SetOperator::Union
-                && operation.quantifier == novarocks_parser::ast::SetQuantifier::All
-    )
 }
 
 /// The first UNION ALL branch as a standalone `Query` (keeps the branch's own
@@ -786,176 +810,6 @@ pub fn first_union_branch_query(
     Ok(branch)
 }
 
-fn aggregate_input_types_from_schema_contract(
-    calls: &AggregateSqlCalls,
-    contract: &MvSchemaContract,
-) -> Result<Vec<Option<DataType>>, String> {
-    use novarocks_sql::planning::mv::AggregateInput;
-    use novarocks_sql::planning::mv::VisibleAggregateOutput;
-
-    let mut input_types = vec![None; calls.aggregates.len()];
-    for (aggregate_index, aggregate) in calls.aggregates.iter().enumerate() {
-        if matches!(aggregate.input, AggregateInput::Star) {
-            continue;
-        }
-        if let Some(cast_type) = aggregate_input_cast_type(&aggregate.input)? {
-            input_types[aggregate_index] = Some(cast_type);
-            continue;
-        }
-
-        let visible_index = calls
-            .visible_outputs
-            .iter()
-            .position(|output| {
-                matches!(output, VisibleAggregateOutput::Aggregate(index) if *index == aggregate_index)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "aggregate MV aggregate output is not visible: aggregate_index={aggregate_index}"
-                )
-            })?;
-        let lineage = contract.output.columns.get(visible_index).ok_or_else(|| {
-            format!(
-                "aggregate MV contract output lineage missing for visible index {visible_index}"
-            )
-        })?;
-        input_types[aggregate_index] =
-            aggregate_input_type_from_lineage(contract, &lineage.expression)?;
-    }
-    Ok(input_types)
-}
-
-fn aggregate_input_cast_type(
-    input: &novarocks_sql::planning::mv::AggregateInput,
-) -> Result<Option<DataType>, String> {
-    let novarocks_sql::planning::mv::AggregateInput::Expr(expr) = input else {
-        return Ok(None);
-    };
-    explicit_cast_type(expr)
-}
-
-fn explicit_cast_type(expr: &novarocks_parser::ast::Expr) -> Result<Option<DataType>, String> {
-    match expr {
-        novarocks_parser::ast::Expr::Cast(cast) => {
-            sql_data_type_to_arrow(&cast.data_type).map(Some)
-        }
-        novarocks_parser::ast::Expr::Nested(inner) => explicit_cast_type(&inner.expression),
-        _ => Ok(None),
-    }
-}
-
-fn aggregate_input_type_from_lineage(
-    contract: &MvSchemaContract,
-    lineage: &mv_schema::ExpressionLineage,
-) -> Result<Option<DataType>, String> {
-    if let [qualified] = lineage.referenced_base_fields.as_slice() {
-        let Some(field) = base_contracts(contract)
-            .into_iter()
-            .find(|base| base.table_fqn.eq_ignore_ascii_case(&qualified.table_fqn))
-            .and_then(|base| {
-                base.schema_at_create
-                    .fields
-                    .iter()
-                    .find(|field| field.field_id == qualified.field_id)
-            })
-        else {
-            return Err(format!(
-                "aggregate MV contract references unknown base field {}#{}",
-                qualified.table_fqn, qualified.field_id
-            ));
-        };
-        return arrow_type_from_contract_signature(&field.type_signature).map(Some);
-    }
-
-    if let [field_id] = lineage.referenced_base_field_ids.as_slice() {
-        let mut matches = base_contracts(contract)
-            .into_iter()
-            .filter_map(|base| {
-                base.schema_at_create
-                    .fields
-                    .iter()
-                    .find(|field| field.field_id == *field_id)
-                    .map(|field| field.type_signature.as_str())
-            })
-            .collect::<Vec<_>>();
-        matches.sort_unstable();
-        matches.dedup();
-        match matches.as_slice() {
-            [type_signature] => {
-                return arrow_type_from_contract_signature(type_signature).map(Some);
-            }
-            [] => {
-                return Err(format!(
-                    "aggregate MV contract references unknown base field id {field_id}"
-                ));
-            }
-            _ => {
-                return Err(format!(
-                    "aggregate MV contract base field id {field_id} is ambiguous across join inputs"
-                ));
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-fn base_contracts(contract: &MvSchemaContract) -> Vec<&mv_schema::BaseContract> {
-    if contract.bases.is_empty() {
-        vec![&contract.base]
-    } else {
-        contract.bases.iter().collect()
-    }
-}
-
-fn sql_data_type_to_arrow(data_type: &novarocks_parser::ast::TypeName) -> Result<DataType, String> {
-    use novarocks_parser::ast::{LiteralKind, TypeNameArgument};
-
-    let name = data_type
-        .name
-        .parts
-        .last()
-        .map(|part| part.value.to_ascii_lowercase())
-        .unwrap_or_default();
-    let decimal_arg = |index: usize| -> Result<Option<i64>, String> {
-        let Some(TypeNameArgument::Literal(literal)) = data_type.arguments.get(index) else {
-            return Ok(None);
-        };
-        let LiteralKind::Number(value) = &literal.kind else {
-            return Err("aggregate MV explicit cast decimal argument is not numeric".to_string());
-        };
-        value
-            .parse()
-            .map(Some)
-            .map_err(|_| "aggregate MV explicit cast decimal argument is invalid".to_string())
-    };
-    match name.as_str() {
-        "tinyint" => Ok(DataType::Int8),
-        "smallint" => Ok(DataType::Int16),
-        "int" | "integer" => Ok(DataType::Int32),
-        "bigint" => Ok(DataType::Int64),
-        "float" => Ok(DataType::Float32),
-        "double" => Ok(DataType::Float64),
-        "boolean" | "bool" => Ok(DataType::Boolean),
-        "varchar" | "char" | "text" | "string" => Ok(DataType::Utf8),
-        "varbinary" | "binary" => Ok(DataType::Binary),
-        "date" => Ok(DataType::Date32),
-        "datetime" | "timestamp" => Ok(DataType::Timestamp(TimeUnit::Microsecond, None)),
-        "decimal" | "dec" | "numeric" => {
-            let precision = decimal_arg(0)?.unwrap_or(38).try_into().map_err(|_| {
-                "aggregate MV explicit cast decimal precision is out of range".to_string()
-            })?;
-            let scale = decimal_arg(1)?.unwrap_or(0).try_into().map_err(|_| {
-                "aggregate MV explicit cast decimal scale is out of range".to_string()
-            })?;
-            Ok(DataType::Decimal128(precision, scale))
-        }
-        _ => Err(format!(
-            "aggregate MV explicit cast input type is unsupported: {name}"
-        )),
-    }
-}
-
 fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
     let trimmed = type_signature.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -968,7 +822,7 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
         "float" => DataType::Float32,
         "double" => DataType::Float64,
         "date" => DataType::Date32,
-        "timestamp" | "timestamptz" => DataType::Timestamp(TimeUnit::Microsecond, None),
+        "timestamp" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "string" | "varchar" | "char" => DataType::Utf8,
         "binary" | "varbinary" => DataType::Binary,
         _ if lower.starts_with("decimal(") => {
@@ -997,1016 +851,89 @@ fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, 
 }
 
 #[cfg(test)]
-pub(crate) mod tests_support {
-    use std::sync::Arc;
-
-    use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-    use mv_schema::{
-        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
-        HiddenApplyKeyContract, JoinContract, JoinContractKind, JoinPredicateLineage,
-        MvSchemaContract, OutputColumnLineage, OutputContract, QualifiedFieldLineage,
-        TargetContract, TargetVisibleColumn,
-    };
-    use novarocks_mv_application::persistence::definition::StoredMvDefinition;
-    use novarocks_query_application::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
-    use novarocks_sql::planning::mv::{
-        MV_JOIN_APPLY_KEY_COLUMN_NAME as JOIN_APPLY_KEY_COLUMN_NAME, SqlMvApplyKeySourceFacts,
-    };
-    use novarocks_types::naming::TableIdentity;
-
+mod tests {
     use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
 
-    pub(crate) fn make_ref(c: &str, n: &str, t: &str) -> TableIdentity {
-        TableIdentity {
-            catalog: c.to_string(),
-            namespace: n.to_string(),
-            table: t.to_string(),
-        }
-    }
-
-    pub(crate) fn make_pin(entries: &[(&str, i64, &str)]) -> RefreshSnapshotPin {
-        let entries = entries
-            .iter()
-            .map(|(fqn, snapshot_id, object_id)| {
-                let object_id = object_id.strip_prefix("uuid-").map_or_else(
-                    || (*object_id).to_string(),
-                    |suffix| format!("object-{suffix}"),
-                );
-                (*fqn, *snapshot_id, object_id.into_bytes())
-            })
-            .collect::<Vec<_>>();
-        let entries = entries
-            .iter()
-            .map(|(fqn, snapshot_id, object_id)| (*fqn, *snapshot_id, object_id.as_slice()))
-            .collect::<Vec<_>>();
-        RefreshSnapshotPin::from_entries_for_tests(&entries)
-    }
-
-    pub(crate) fn object_id(value: &str) -> novarocks_spi::connector::ConnectorTableObjectId {
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
-            value.as_bytes(),
-        ))
-        .expect("test object ID")
-    }
-
-    /// Neutral target-schema fixture: the Arrow types plus the positionally
-    /// aligned field IDs, exactly what the rewrite context consumes.
-    pub(crate) fn make_target_schema() -> (SchemaRef, Arc<[i32]>) {
-        (
-            Arc::new(arrow::datatypes::Schema::new(vec![
-                Field::new("k", DataType::Int64, false),
-                Field::new("v", DataType::Int64, true),
-            ])),
-            Arc::from(vec![100, 101]),
+    fn projection() -> StoredMvProjection {
+        let object = ConnectorTableObjectId::try_new(Bytes::from_static(&[11])).unwrap();
+        let revision = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            &object,
+            Some(12),
         )
-    }
-
-    pub(crate) fn make_schema_contract() -> MvSchemaContract {
-        MvSchemaContract {
-            contract_version: 3,
-            base: BaseContract {
-                table_fqn: "ice.db.b".to_string(),
-                table_object_id: object_id("object-b"),
-                alias_at_create: None,
-                schema_id_at_create: 0,
-                schema_at_create: BaseSchemaSnapshot {
-                    fields: vec![
-                        BaseFieldRecord {
-                            field_id: 1,
-                            name_at_create: "k".to_string(),
-                            type_signature: "long".to_string(),
-                            required: true,
-                        },
-                        BaseFieldRecord {
-                            field_id: 2,
-                            name_at_create: "v".to_string(),
-                            type_signature: "long".to_string(),
-                            required: false,
-                        },
-                    ],
-                },
-            },
-            bases: Vec::new(),
-            output: OutputContract {
-                columns: vec![
-                    OutputColumnLineage {
-                        expression: ExpressionLineage {
-                            kind: ExpressionKind::Column,
-                            referenced_base_field_ids: vec![1],
-                            referenced_base_fields: Vec::new(),
-                        },
-                    },
-                    OutputColumnLineage {
-                        expression: ExpressionLineage {
-                            kind: ExpressionKind::Column,
-                            referenced_base_field_ids: vec![2],
-                            referenced_base_fields: Vec::new(),
-                        },
-                    },
-                ],
-                filter: None,
-            },
-            join: None,
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "tgt.db.mv".to_string(),
-                table_uuid: "uuid-tgt".to_string(),
-                schema_id_at_create: 7,
-                visible_columns: vec![
-                    TargetVisibleColumn {
-                        output_name: "k".to_string(),
-                        target_field_id: 100,
-                        type_signature: "long".to_string(),
-                        nullable: false,
-                    },
-                    TargetVisibleColumn {
-                        output_name: "v".to_string(),
-                        target_field_id: 101,
-                        type_signature: "long".to_string(),
-                        nullable: true,
-                    },
-                ],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "k".to_string(),
-                    target_field_id: 100,
-                    source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
-                },
-                partition: None,
-            },
+        .unwrap();
+        let (persisted_object, _) = persist_exact_connector_revision(&revision).unwrap();
+        let mut fixture = ProjectionFixture::new(
+            novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
+            None,
+        );
+        for occurrence in &mut fixture.definition.relation_occurrences {
+            occurrence.object_id = persisted_object.clone();
+        }
+        StoredMvProjection {
+            mv_id: 17,
+            facts: fixture.build().unwrap(),
         }
     }
 
-    pub(crate) fn make_mv_definition() -> StoredMvDefinition {
-        StoredMvDefinition {
-            mv_id: 42,
-            query_definition: PersistedQueryDefinition::new(
-                "SELECT k, v FROM ice.db.b",
-                PersistedQueryDialect::StarRocks,
-                "ice",
-                "db",
+    fn pin(id: u32) -> MvRewriteSourceSnapshot {
+        let object = ConnectorTableObjectId::try_new(Bytes::from_static(&[11])).unwrap();
+        MvRewriteSourceSnapshot {
+            occurrence_id: SqlMvRelationOccurrenceId::new(id),
+            snapshot_id: 12,
+            table_object_id: object.clone(),
+            semantic_revision: ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+                &object,
+                Some(12),
             )
             .unwrap(),
-            base_table_refs: vec!["ice.db.b".to_string()],
-            primary_key_columns: vec!["k".to_string()],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("tgt".to_string()),
-            target_namespace: Some("db".to_string()),
-            target_table: Some("mv".to_string()),
-            schema_contract: Some(make_schema_contract()),
-            partition_spec: None,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: [("ice.db.b".to_string(), 11i64)].into_iter().collect(),
-            last_refresh_table_object_ids: [("ice.db.b".to_string(), object_id("object-b"))]
-                .into_iter()
-                .collect(),
-            last_refreshed_iceberg_snapshot_id: Some(99),
-            refresh_policy: Default::default(),
-            refresh_paused: false,
-            refresh_interval_ms: None,
-            max_staleness_ms: None,
-            created_at_ms: 0,
-            source_revision:
-                novarocks_mv_application::persistence::definition::test_source_revision(
-                    "tgt",
-                    "db",
-                    "mv",
-                    object_id("target-object"),
-                    Some(99),
-                ),
         }
     }
 
-    pub(crate) fn parse_query(sql: &str) -> novarocks_parser::ast::Query {
-        let statements = novarocks_parser::parse(sql).expect("parse query");
-        let [novarocks_parser::ast::Statement::Query(query)] = statements.as_slice() else {
-            panic!("expected SELECT");
-        };
-        query.clone()
-    }
-
-    pub(crate) fn make_target() -> TableIdentity {
-        TableIdentity {
-            catalog: "tgt".to_string(),
-            namespace: "db".to_string(),
-            table: "mv".to_string(),
-        }
-    }
-
-    /// Returns a minimally-valid `Arc<IcebergMvRewriteContext>` for use in
-    /// unit tests outside this module (e.g. `imv/entrypoint.rs`).
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn dummy_rewrite_context() -> Arc<IcebergMvRewriteContext> {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                target,
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                mv_def,
-                query,
-                base_refs,
-                pin,
-                Some(99),
-                "uuid-tgt".to_string(),
-                schema,
-                Arc::clone(&field_ids),
-                Some(contract),
-            )
-            .expect("dummy_rewrite_context: from_parts must succeed on canonical fixture"),
-        )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn join_projection_rewrite_context() -> Arc<IcebergMvRewriteContext> {
-        let mut mv_def = make_mv_definition();
-        mv_def.base_table_refs = vec!["ice.db.l".to_string(), "ice.db.r".to_string()];
-        mv_def.last_refresh_snapshots = [
-            ("ice.db.l".to_string(), 11i64),
-            ("ice.db.r".to_string(), 33i64),
-        ]
-        .into_iter()
-        .collect();
-        mv_def.last_refresh_table_object_ids = [
-            ("ice.db.l".to_string(), object_id("object-l")),
-            ("ice.db.r".to_string(), object_id("object-r")),
-        ]
-        .into_iter()
-        .collect();
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[0].output_name = "k".to_string();
-        contract.target.visible_columns[1].output_name = "v".to_string();
-        contract.target.hidden_apply_key.column_name = JOIN_APPLY_KEY_COLUMN_NAME.to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::JoinRowKey.into();
-        contract.bases = vec![
-            join_base_contract("ice.db.l", "uuid-l", "l"),
-            join_base_contract("ice.db.r", "uuid-r", "r"),
-        ];
-        contract.output.columns[0]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[0].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.l", "l", 1)];
-        contract.output.columns[1]
-            .expression
-            .referenced_base_field_ids
-            .clear();
-        contract.output.columns[1].expression.referenced_base_fields =
-            vec![qualified_field("ice.db.r", "r", 2)];
-        contract.join = Some(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
-            predicates: vec![JoinPredicateLineage {
-                left: qualified_field("ice.db.l", "l", 1),
-                right: qualified_field("ice.db.r", "r", 1),
-            }],
-        });
-        contract.aggregate = None;
-        mv_def.schema_contract = Some(contract.clone());
-        let target_schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, true),
-            Field::new(JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false),
-        ]));
-        let target_field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999]);
-        Arc::new(
-            IcebergMvRewriteContext::from_definition_parts(
-                make_target(),
-                42,
-                Some("sess_cat".to_string()),
-                "sess_db".to_string(),
-                Arc::new(mv_def),
-                Arc::new(parse_query(
-                    "SELECT l.k, r.v FROM ice.db.l JOIN ice.db.r ON l.k = r.k",
-                )),
-                Arc::from(vec![make_ref("ice", "db", "l"), make_ref("ice", "db", "r")]),
-                Arc::new(make_pin(&[
-                    ("ice.db.l", 22, "uuid-l"),
-                    ("ice.db.r", 44, "uuid-r"),
-                ])),
-                Some(99),
-                "uuid-tgt".to_string(),
-                target_schema,
-                Arc::clone(&target_field_ids),
-                Some(Arc::new(contract)),
-            )
-            .expect("join projection mv context must build"),
-        )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    fn join_base_contract(table_fqn: &str, object_id_value: &str, alias: &str) -> BaseContract {
-        BaseContract {
-            table_fqn: table_fqn.to_string(),
-            table_object_id: object_id(object_id_value),
-            alias_at_create: Some(alias.to_string()),
-            schema_id_at_create: 7,
-            schema_at_create: BaseSchemaSnapshot {
-                fields: vec![
-                    BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "k".to_string(),
-                        type_signature: "long".to_string(),
-                        required: true,
-                    },
-                    BaseFieldRecord {
-                        field_id: 2,
-                        name_at_create: "v".to_string(),
-                        type_signature: "long".to_string(),
-                        required: false,
-                    },
-                ],
-            },
-        }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    fn qualified_field(table_fqn: &str, qualifier: &str, field_id: i32) -> QualifiedFieldLineage {
-        QualifiedFieldLineage {
-            table_fqn: table_fqn.to_string(),
-            qualifier_at_create: qualifier.to_string(),
-            field_id,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::num::NonZeroU64;
-    use std::sync::Arc;
-
-    use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-    use mv_schema::{
-        AggregateStateColumnContract, AggregateStateContract, AggregateStateRoleContract,
-        BranchIdColumnContract, BranchUnionContract, MvPartitionContract,
-    };
-    use novarocks_sql::{
-        binding::SqlTableBindingAllocator, planning::mv::SqlMvApplyKeySourceFacts,
-    };
-    use novarocks_types::naming::TableIdentity;
-
-    const BRANCH_ID_COLUMN_NAME: &str = "__branch_id__";
-
-    use super::tests_support::*;
-    use super::*;
-
     #[test]
-    fn from_parts_happy_path_derives_all_fields() {
-        let target = make_ref("TargetCase", "NameSpace", "MvTable");
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let ctx = IcebergMvRewriteContext::from_definition_parts(
-            target.clone(),
-            42,
-            Some("sess_cat".to_string()),
-            "sess_db".to_string(),
-            mv_def.clone(),
-            query.clone(),
-            base_refs.clone(),
-            pin.clone(),
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema.clone(),
-            Arc::clone(&field_ids),
-            Some(contract.clone()),
-        )
-        .expect("constructor should succeed on happy path");
-
-        assert_eq!(ctx.target.catalog, "TargetCase");
-        assert_eq!(ctx.target.namespace, "NameSpace");
-        assert_eq!(ctx.target.table, "MvTable");
-        assert_eq!(ctx.mv_id, 42);
-        assert_eq!(ctx.current_catalog.as_deref(), Some("sess_cat"));
-        assert_eq!(ctx.current_database, "sess_db");
-        assert!(Arc::ptr_eq(&ctx.mv_definition, &mv_def));
-        assert!(Arc::ptr_eq(&ctx.canonical_select_query, &query));
-        assert_eq!(ctx.base_refs.len(), 1);
-        assert!(Arc::ptr_eq(&ctx.base_refs, &base_refs));
-        assert!(Arc::ptr_eq(&ctx.pin, &pin));
-        assert_eq!(ctx.previous_snapshot_ids.get("ice.db.b"), Some(&11));
-        assert_eq!(
-            ctx.previous_table_object_ids
-                .get("ice.db.b")
-                .map(|id| id.as_bytes().as_ref()),
-            Some(b"object-b".as_ref())
-        );
-        assert_eq!(ctx.target_snapshot_id, Some(99));
-        assert_eq!(ctx.target_table_uuid, "uuid-tgt");
-        assert!(Arc::ptr_eq(&ctx.target_arrow_schema, &schema));
-        assert_eq!(ctx.target_field_ids.as_ref(), field_ids.as_ref());
-        assert!(Arc::ptr_eq(&ctx.schema_contract, &contract));
+    fn sparse_repeated_relation_occurrences_remain_distinct() {
+        let projection = projection();
+        let pins =
+            validate_source_pins(projection.facts.definition(), vec![pin(8), pin(7)]).unwrap();
+        assert_eq!(pins.len(), 2);
+        assert!(pins.contains_key(&SqlMvRelationOccurrenceId::new(7)));
+        assert!(pins.contains_key(&SqlMvRelationOccurrenceId::new(8)));
     }
 
     #[test]
-    fn unpartitioned_contract_projects_to_sql_rewrite_snapshot() {
-        let target = make_target();
-        let mut definition = make_mv_definition();
-        let mut contract = make_schema_contract();
-        contract.target.partition = Some(MvPartitionContract {
-            target_spec_id: 0,
-            fields: Vec::new(),
-        });
-        definition.schema_contract = Some(contract.clone());
-        let mv_def = Arc::new(definition);
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-
-        let ctx = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            field_ids,
-            Some(Arc::new(contract)),
-        )
-        .expect("unpartitioned schema contract must build rewrite context");
-
-        let mut bindings = SqlTableBindingAllocator::try_new_for_test(
-            NonZeroU64::new(1).expect("test binding scope must be nonzero"),
-        )
-        .expect("test binding allocator must be valid");
-        let target_binding = bindings
-            .allocate()
-            .expect("test target binding must be allocated");
-
-        ctx.to_sql_rewrite_snapshot(target_binding)
-            .expect("unpartitioned schema contract must project to SQL rewrite snapshot");
+    fn duplicate_and_dense_renumbered_pins_are_rejected() {
+        let projection = projection();
+        assert!(validate_source_pins(projection.facts.definition(), vec![pin(7), pin(7)]).is_err());
+        assert!(validate_source_pins(projection.facts.definition(), vec![pin(0), pin(1)]).is_err());
     }
 
     #[test]
-    fn from_parts_rejects_missing_schema_contract() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-
-        let err_msg = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            None,
-        )
-        .expect_err("missing schema contract must fail");
+    fn source_object_replacement_is_not_hidden_by_equal_snapshot() {
+        let projection = projection();
+        let mut replacement = pin(8);
+        replacement.table_object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"replacement")).unwrap();
         assert!(
-            err_msg.contains("missing schema contract on target tgt.db.mv"),
-            "got: {err_msg}"
+            validate_source_pins(projection.facts.definition(), vec![pin(7), replacement]).is_err()
         );
     }
 
     #[test]
-    fn from_parts_rejects_empty_base_refs() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(Vec::<TableIdentity>::new());
-        let pin = Arc::new(RefreshSnapshotPin::default());
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("empty base_refs must fail");
-        assert!(err.contains("no base table refs"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_rejects_pin_coverage_mismatch() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> =
-            Arc::from(vec![make_ref("ice", "db", "b"), make_ref("ice", "db", "c")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("pin coverage mismatch must fail");
-        assert!(err.contains("refresh pin covers"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_rejects_pin_missing_uuid() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        // Pin has the right count but the entry is for a different fqn.
-        let pin = Arc::new(make_pin(&[("ice.db.OTHER", 22, "uuid-x")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("missing pin object ID must fail");
+    fn never_published_does_not_accept_invented_history() {
+        let projection = projection();
+        assert!(validate_history(&projection, vec![pin(7), pin(8)]).is_err());
         assert!(
-            err.contains("refresh pin missing object ID for base"),
-            "got: {err}"
+            validate_history(&projection, Vec::new())
+                .unwrap()
+                .0
+                .is_empty()
         );
     }
 
     #[test]
-    fn from_parts_rejects_base_identity_drift() {
-        let target = make_target();
-        let mut def = make_mv_definition();
-        def.last_refresh_table_object_ids
-            .insert("ice.db.b".to_string(), object_id("object-old"));
-        let mv_def = Arc::new(def);
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-NEW")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("identity drift must fail");
-        assert!(err.contains("base table identity changed"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_first_refresh_passes_with_empty_previous() {
-        let target = make_target();
-        let mut def = make_mv_definition();
-        def.last_refresh_snapshots.clear();
-        def.last_refresh_table_object_ids.clear();
-        let mv_def = Arc::new(def);
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let contract = Arc::new(make_schema_contract());
-
-        let ctx = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect("first refresh must succeed");
-        assert!(ctx.previous_snapshot_ids.is_empty());
-        assert!(ctx.previous_table_object_ids.is_empty());
-    }
-
-    #[test]
-    fn from_parts_rejects_target_schema_contract_field_mismatch() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns.pop();
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("schema/contract mismatch must fail");
-        assert!(
-            err.contains("target schema/contract field id mismatch"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_target_schema_contract_field_ids_differ_same_count() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        // Contract has two columns (matching schema count) but one has a wrong
-        // target_field_id (schema has 100/101; contract claims 100/999).
-        let mut contract = make_schema_contract();
-        contract.target.visible_columns[1].target_field_id = 999;
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("field-id set mismatch must fail even when counts match");
-        assert!(
-            err.contains("target schema/contract field id mismatch"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn summary_orders_by_base_refs_declared_order() {
-        let target = make_target();
-        let query = Arc::new(parse_query("SELECT k FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![
-            make_ref("ice", "db", "b"),
-            make_ref("ice", "db", "a"),
-            make_ref("ice", "db", "c"),
-        ]);
-        let pin = Arc::new(make_pin(&[
-            // Insert in NON-declared order to confirm summary reorders.
-            ("ice.db.a", 30, "uuid-a"),
-            ("ice.db.c", 50, "uuid-c"),
-            ("ice.db.b", 20, "uuid-b"),
-        ]));
-        let (schema, field_ids) = make_target_schema();
-        let mut def_for_three_bases = make_mv_definition();
-        def_for_three_bases.last_refresh_snapshots.clear();
-        def_for_three_bases
-            .last_refresh_snapshots
-            .insert("ice.db.b".to_string(), 11);
-        def_for_three_bases.last_refresh_table_object_ids.clear();
-        def_for_three_bases
-            .last_refresh_table_object_ids
-            .insert("ice.db.b".to_string(), object_id("object-b"));
-        def_for_three_bases
-            .last_refresh_table_object_ids
-            .insert("ice.db.a".to_string(), object_id("object-a"));
-        def_for_three_bases
-            .last_refresh_table_object_ids
-            .insert("ice.db.c".to_string(), object_id("object-c"));
-        let mv_def = Arc::new(def_for_three_bases);
-        let contract = Arc::new(make_schema_contract());
-
-        let ctx = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect("ctx happy path");
-
-        let summary = ctx.summary();
-        assert_eq!(
-            summary.base_fqns,
-            vec![
-                "ice.db.b".to_string(),
-                "ice.db.a".to_string(),
-                "ice.db.c".to_string()
-            ],
-            "base_fqns must use base_refs declared order"
-        );
-        assert_eq!(
-            summary.pinned_snapshots,
-            vec![
-                ("ice.db.b".to_string(), 20),
-                ("ice.db.a".to_string(), 30),
-                ("ice.db.c".to_string(), 50),
-            ],
-            "summary must use base_refs declared order, not BTreeMap key order"
-        );
-        assert_eq!(
-            summary.previous_snapshots,
-            vec![
-                ("ice.db.b".to_string(), Some(11)),
-                ("ice.db.a".to_string(), None),
-                ("ice.db.c".to_string(), None),
-            ]
-        );
-    }
-
-    #[test]
-    fn from_parts_rejects_apply_key_not_in_target_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-        let (schema, field_ids) = make_target_schema();
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "nonexistent".to_string();
-        let contract = Arc::new(contract);
-
-        let err = IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect_err("apply-key absence must fail");
-        assert!(err.contains("apply-key column"), "got: {err}");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_distinct_hidden_apply_key_field() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        // Three-field target schema: 100=k (visible), 101=v (visible),
-        // 999=__nova_apply_key (hidden — present in schema but NOT in
-        // visible_columns).
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, true),
-            Field::new("__nova_apply_key", DataType::Int64, false),
-        ]));
-        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999]);
-
-        // Contract: visible columns are 100/101; hidden apply key is 999.
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect("ctx must succeed when apply-key is a distinct hidden schema field");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_branch_id_field_in_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, true),
-            Field::new("__nova_apply_key", DataType::Int64, false),
-            Field::new(BRANCH_ID_COLUMN_NAME, DataType::Int32, false),
-        ]));
-        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999, 4242]);
-
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__nova_apply_key".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: BRANCH_ID_COLUMN_NAME.to_string(),
-                target_field_id: 4242,
-            },
-            branch_count: 2,
-            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
-        });
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect("ctx must accept branch id field in target schema");
-    }
-
-    #[test]
-    fn from_parts_succeeds_with_aggregate_state_columns_in_schema() {
-        let target = make_target();
-        let mv_def = Arc::new(make_mv_definition());
-        let query = Arc::new(parse_query("SELECT k, v FROM ice.db.b"));
-        let base_refs: Arc<[TableIdentity]> = Arc::from(vec![make_ref("ice", "db", "b")]);
-        let pin = Arc::new(make_pin(&[("ice.db.b", 22, "uuid-b")]));
-
-        // Aggregate target schema: visible columns 100=k and 101=v, hidden
-        // apply key 999=__row_id__, and aggregate-state columns
-        // 200=__agg_state_c, 201=__agg_state_s. All must be accepted by
-        // from_parts.
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![
-            Field::new("k", DataType::Int64, false),
-            Field::new("v", DataType::Int64, true),
-            Field::new("__row_id__", DataType::Utf8, false),
-            Field::new("__agg_state_c", DataType::Int64, true),
-            Field::new("__agg_state_s", DataType::Int64, true),
-        ]));
-        let field_ids: Arc<[i32]> = Arc::from(vec![100, 101, 999, 200, 201]);
-
-        let mut contract = make_schema_contract();
-        contract.target.hidden_apply_key.column_name = "__row_id__".to_string();
-        contract.target.hidden_apply_key.target_field_id = 999;
-        contract.target.hidden_apply_key.source = SqlMvApplyKeySourceFacts::GroupRowId.into();
-        contract.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: "__row_id__".to_string(),
-            state_columns: vec![
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_c".to_string(),
-                    target_field_id: 200,
-                    type_signature: "long".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-                AggregateStateColumnContract {
-                    column_name: "__agg_state_s".to_string(),
-                    target_field_id: 201,
-                    type_signature: "long".to_string(),
-                    nullable: true,
-                    role: AggregateStateRoleContract::Single,
-                },
-            ],
-        });
-        let contract = Arc::new(contract);
-
-        IcebergMvRewriteContext::from_definition_parts(
-            target,
-            42,
-            None,
-            "db".to_string(),
-            mv_def,
-            query,
-            base_refs,
-            pin,
-            Some(99),
-            "uuid-tgt".to_string(),
-            schema,
-            Arc::clone(&field_ids),
-            Some(contract),
-        )
-        .expect("ctx must accept aggregate state columns in target schema");
-    }
-
-    #[test]
-    fn sqlx2_binary_target_column_remains_binary() {
-        let schema: SchemaRef = Arc::new(arrow::datatypes::Schema::new(vec![Field::new(
-            "__agg_state_v",
-            DataType::Binary,
-            false,
-        )]));
-        let _field_ids: Arc<[i32]> = Arc::from(vec![200]);
-
-        let columns = sql_target_columns(&schema);
-
-        assert_eq!(columns.len(), 1);
-        assert_eq!(columns[0].name, "__agg_state_v");
-        assert_eq!(columns[0].data_type, DataType::Binary);
+    fn timezone_signature_is_not_silently_downgraded() {
+        assert!(arrow_type_from_contract_signature("timestamptz").is_err());
     }
 }

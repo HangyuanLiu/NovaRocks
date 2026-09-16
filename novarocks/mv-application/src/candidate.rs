@@ -67,7 +67,10 @@ pub struct CandidateReadReport<T> {
 pub struct VerifiedCandidatePublication {
     publication_id: MvPublicationId,
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     definition_provenance: String,
+    definition_occurrences: Vec<novarocks_sql::compiler::SqlMvRelationOccurrenceId>,
     inputs: Vec<ExactObjectBinding>,
     output: ExactObjectBinding,
 }
@@ -76,7 +79,10 @@ impl VerifiedCandidatePublication {
     pub fn try_new(
         publication_id: MvPublicationId,
         definition_fingerprint: [u8; 32],
+        definition_revision: [u8; 32],
+        interpretation_revision: [u8; 32],
         definition_provenance: impl Into<String>,
+        definition_occurrences: Vec<novarocks_sql::compiler::SqlMvRelationOccurrenceId>,
         inputs: Vec<ExactObjectBinding>,
         output: ExactObjectBinding,
     ) -> Option<Self> {
@@ -84,14 +90,20 @@ impl VerifiedCandidatePublication {
         MvCandidateFactInput::try_new(
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             &definition_provenance,
+            &definition_occurrences,
             &inputs,
             &output,
         )?;
         Some(Self {
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             definition_provenance,
+            definition_occurrences,
             inputs,
             output,
         })
@@ -101,7 +113,10 @@ impl VerifiedCandidatePublication {
         MvCandidateFactInput::try_new(
             self.publication_id,
             self.definition_fingerprint,
+            self.definition_revision,
+            self.interpretation_revision,
             &self.definition_provenance,
+            &self.definition_occurrences,
             &self.inputs,
             &self.output,
         )

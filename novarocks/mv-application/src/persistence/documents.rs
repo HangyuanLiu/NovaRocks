@@ -42,6 +42,7 @@ use novarocks_spi::connector::document_storage::{
     ConnectorDocumentName, ConnectorDocumentObservationRequest, ConnectorDocumentOwner,
     ConnectorDocumentReference, ConnectorDocumentRevision, ConnectorDocumentSet,
     ConnectorDocumentStorageLease, ConnectorStoredDocument, ConnectorStoredDocumentAttachment,
+    FrozenConnectorDocumentObservation,
 };
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorPreparedCreateDocumentTarget, ConnectorTableIdentity,
@@ -61,25 +62,25 @@ const FORMAT_VERSION: u32 = 1;
 const MANAGED_MV_KIND: &str = "materialized-view";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MvDecodedDocuments {
-    pub management_target: ManagedMvTarget,
-    pub deployment_owner: DeploymentOwner,
-    pub process_incarnation: ProcessIncarnation,
-    pub target: ConnectorTableIdentity,
-    pub target_object_id: ConnectorTableObjectId,
-    pub metadata_version: ConnectorCommittedVersion,
-    pub definition: DefinitionDocument,
-    pub definition_revision: DocumentRevision,
-    pub interpretation: InterpretationDocument,
-    pub interpretation_revision: DocumentRevision,
-    pub publication: Option<PublicationDocument>,
-    pub publication_revision: Option<DocumentRevision>,
-    pub publication_output_version: Option<ConnectorCommittedVersion>,
-    pub configuration: ConfigurationDocument,
-    pub configuration_revision: DocumentRevision,
+pub struct MvObservedCurrentDocuments {
+    pub(crate) management_target: ManagedMvTarget,
+    pub(crate) deployment_owner: DeploymentOwner,
+    pub(crate) process_incarnation: ProcessIncarnation,
+    pub(crate) target: ConnectorTableIdentity,
+    pub(crate) target_object_id: ConnectorTableObjectId,
+    pub(crate) metadata_version: ConnectorCommittedVersion,
+    pub(crate) definition: DefinitionDocument,
+    pub(crate) definition_revision: DocumentRevision,
+    pub(crate) interpretation: InterpretationDocument,
+    pub(crate) interpretation_revision: DocumentRevision,
+    pub(crate) publication: Option<PublicationDocument>,
+    pub(crate) publication_revision: Option<DocumentRevision>,
+    pub(crate) publication_output_version: Option<ConnectorCommittedVersion>,
+    pub(crate) configuration: ConfigurationDocument,
+    pub(crate) configuration_revision: DocumentRevision,
 }
 
-impl MvDecodedDocuments {
+impl MvObservedCurrentDocuments {
     pub(crate) fn source_revision(&self) -> MvAcceleratorSourceRevision {
         MvAcceleratorSourceRevision {
             target: self.target.clone(),
@@ -102,7 +103,7 @@ impl MvDecodedDocuments {
 }
 
 #[derive(Debug)]
-pub(crate) enum MvDocumentError {
+pub enum MvDocumentError {
     Codec(PersistenceCodecError),
     Contract(String),
     Connector(novarocks_spi::connector::ConnectorError),
@@ -144,7 +145,7 @@ impl From<ValidationError> for MvDocumentError {
 
 /// Creates the immutable D/L and independently mutable C document set used by
 /// invisible target creation. All three documents attach to table metadata.
-pub(crate) fn create_document_set(
+pub fn create_document_set(
     definition: &DefinitionDocument,
     interpretation: &InterpretationDocument,
     configuration: &ConfigurationDocument,
@@ -190,7 +191,7 @@ pub(crate) fn create_document_set(
 /// Creates the P-only replacement used at the atomic data commit. P retains
 /// exact historical D/L references and asks the provider to bind its output
 /// data version at the same commit point.
-pub(crate) fn publication_document_set(
+pub fn publication_document_set(
     definition: &DefinitionDocument,
     interpretation: &InterpretationDocument,
     publication: &PublicationDocument,
@@ -228,7 +229,7 @@ fn decode_current_management_documents(
     observation: &ConnectorDocumentManagementObservation,
     loaded_documents: &[ConnectorDocument],
     budget: PersistenceDecodeBudget,
-) -> Result<MvDecodedDocuments, MvDocumentError> {
+) -> Result<MvObservedCurrentDocuments, MvDocumentError> {
     observation.validate_sealed()?;
     if observation.marker().kind() != MANAGED_MV_KIND {
         return Err(MvDocumentError::Contract(
@@ -249,7 +250,7 @@ fn decode_current_management_documents(
             "Current L target object does not match the exact observed table".to_string(),
         ));
     }
-    Ok(MvDecodedDocuments {
+    Ok(MvObservedCurrentDocuments {
         management_target,
         deployment_owner,
         process_incarnation,
@@ -274,11 +275,43 @@ fn decode_current_management_documents(
 /// Cloning the request retains the same shared operation budget. Every body
 /// load is therefore charged together with the initial observation rather than
 /// receiving a fresh per-document allowance.
-pub(crate) fn observe_current_management_documents(
+pub fn observe_current_management_documents(
     lease: &ConnectorDocumentStorageLease,
     request: ConnectorDocumentObservationRequest,
     decode_budget: PersistenceDecodeBudget,
-) -> Result<MvDecodedDocuments, MvDocumentError> {
+) -> Result<MvObservedCurrentDocuments, MvDocumentError> {
+    Ok(observe_current_management_document_set(lease, request, decode_budget)?.documents)
+}
+
+/// One sealed provider Current observation together with the D/L/P/C documents
+/// decoded from that exact value. The raw observation is retained so the
+/// management owner can complete readmission and mint the one-shot readiness
+/// admission without reopening Current or accepting a historical read.
+pub struct MvObservedCurrentManagementDocumentSet {
+    observation: ConnectorDocumentManagementObservation,
+    documents: MvObservedCurrentDocuments,
+}
+
+impl MvObservedCurrentManagementDocumentSet {
+    pub fn observation(&self) -> &ConnectorDocumentManagementObservation {
+        &self.observation
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectorDocumentManagementObservation,
+        MvObservedCurrentDocuments,
+    ) {
+        (self.observation, self.documents)
+    }
+}
+
+pub fn observe_current_management_document_set(
+    lease: &ConnectorDocumentStorageLease,
+    request: ConnectorDocumentObservationRequest,
+    decode_budget: PersistenceDecodeBudget,
+) -> Result<MvObservedCurrentManagementDocumentSet, MvDocumentError> {
     let retained_request = request.clone();
     let observation = lease.observe_current_management(request)?;
     let mut loaded_documents = Vec::new();
@@ -292,7 +325,170 @@ pub(crate) fn observe_current_management_documents(
             loaded_documents.push(lease.load_document(load)?);
         }
     }
-    decode_current_management_documents(&observation, &loaded_documents, decode_budget)
+    let documents =
+        decode_current_management_documents(&observation, &loaded_documents, decode_budget)?;
+    Ok(MvObservedCurrentManagementDocumentSet {
+        observation,
+        documents,
+    })
+}
+
+/// A validated query read view of a frozen P and its exact D/L references.
+/// It carries no Current-management authority and cannot install readiness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvFrozenPublicationReadView {
+    catalog_handle: novarocks_spi::connector::CatalogHandle,
+    provider_owner: novarocks_spi::connector::ConnectorProviderBindingKey,
+    target: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    metadata_version: ConnectorCommittedVersion,
+    definition: DefinitionDocument,
+    definition_revision: DocumentRevision,
+    interpretation: InterpretationDocument,
+    interpretation_revision: DocumentRevision,
+    publication: PublicationDocument,
+    publication_revision: DocumentRevision,
+    output_version: ConnectorCommittedVersion,
+}
+
+impl MvFrozenPublicationReadView {
+    pub fn catalog_handle(&self) -> &novarocks_spi::connector::CatalogHandle {
+        &self.catalog_handle
+    }
+    pub fn provider_owner(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
+        &self.provider_owner
+    }
+    pub fn target(&self) -> &ConnectorTableIdentity {
+        &self.target
+    }
+    pub fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+    pub fn metadata_version(&self) -> &ConnectorCommittedVersion {
+        &self.metadata_version
+    }
+    pub fn definition(&self) -> &DefinitionDocument {
+        &self.definition
+    }
+    pub fn definition_revision(&self) -> DocumentRevision {
+        self.definition_revision
+    }
+    pub fn interpretation(&self) -> &InterpretationDocument {
+        &self.interpretation
+    }
+    pub fn interpretation_revision(&self) -> DocumentRevision {
+        self.interpretation_revision
+    }
+    pub fn publication(&self) -> &PublicationDocument {
+        &self.publication
+    }
+    pub fn publication_revision(&self) -> DocumentRevision {
+        self.publication_revision
+    }
+    pub fn output_version(&self) -> &ConnectorCommittedVersion {
+        &self.output_version
+    }
+}
+
+pub fn observe_frozen_publication_documents(
+    lease: &ConnectorDocumentStorageLease,
+    request: ConnectorDocumentObservationRequest,
+    budget: PersistenceDecodeBudget,
+) -> Result<MvFrozenPublicationReadView, MvDocumentError> {
+    let retained_request = request.clone();
+    let observation = lease.observe_documents(request)?;
+    let mut loaded = Vec::new();
+    for stored in observation.documents() {
+        if matches!(
+            stored.carrier(),
+            ConnectorDocumentCarrier::DeferredContent(_)
+        ) {
+            loaded.push(
+                lease.load_document(
+                    retained_request
+                        .try_load_request(stored.clone(), retained_request.context().clone())?,
+                )?,
+            );
+        }
+    }
+    decode_frozen_publication_documents(&observation, &loaded, budget)
+}
+
+pub fn decode_frozen_publication_documents(
+    observation: &FrozenConnectorDocumentObservation,
+    loaded_documents: &[ConnectorDocument],
+    budget: PersistenceDecodeBudget,
+) -> Result<MvFrozenPublicationReadView, MvDocumentError> {
+    observation.validate_sealed()?;
+    let loaded = validate_loaded_documents(observation.documents(), loaded_documents)?;
+    let mut documents = BTreeMap::new();
+    for stored in observation.documents() {
+        validate_envelope(stored)?;
+        if !matches!(
+            stored.id().name().as_str(),
+            DEFINITION | INTERPRETATION | PUBLICATION | CONFIGURATION
+        ) || documents
+            .insert(stored.id().name().as_str(), stored)
+            .is_some()
+        {
+            return Err(MvDocumentError::Contract(
+                "frozen publication contains unexpected or duplicate documents".into(),
+            ));
+        }
+    }
+    let d = required_document(&documents, DEFINITION)?;
+    let l = required_document(&documents, INTERPRETATION)?;
+    let p = required_document(&documents, PUBLICATION)?;
+    require_attachment(d, false)?;
+    require_attachment(l, false)?;
+    require_attachment(p, true)?;
+    require_exact_references(d, &[])?;
+    require_exact_references(l, &[(REFERENCES_DEFINITION, d.id())])?;
+    require_exact_references(
+        p,
+        &[
+            (REFERENCES_DEFINITION, d.id()),
+            (REFERENCES_INTERPRETATION, l.id()),
+        ],
+    )?;
+    let d_bytes = resolved_content(d, &loaded)?;
+    let l_bytes = resolved_content(l, &loaded)?;
+    let p_bytes = resolved_content(p, &loaded)?;
+    // Empty C contributes zero wire resources; C is neither required nor used
+    // as query proof. Provider observation/load budgets still cover every body.
+    preflight_current_document_set(d_bytes, l_bytes, Some(p_bytes), &[], budget)?;
+    let definition = decode_definition(d_bytes, budget)?;
+    let interpretation = decode_interpretation(l_bytes, budget)?;
+    let publication = decode_publication(p_bytes, budget)?;
+    validate_document_set(
+        &definition,
+        revision(d),
+        &interpretation,
+        revision(l),
+        &publication,
+    )?;
+    if interpretation.target.object_id.as_bytes() != observation.object_id().as_bytes().as_ref() {
+        return Err(MvDocumentError::Contract(
+            "frozen interpretation belongs to another target object".into(),
+        ));
+    }
+    let ConnectorStoredDocumentAttachment::ExactOutput(output_version) = p.attachment() else {
+        unreachable!("publication attachment was validated above")
+    };
+    Ok(MvFrozenPublicationReadView {
+        catalog_handle: observation.catalog_handle().clone(),
+        provider_owner: observation.owner().clone(),
+        target: observation.target().clone(),
+        object_id: observation.object_id().clone(),
+        metadata_version: observation.metadata_version().clone(),
+        definition,
+        definition_revision: revision(d),
+        interpretation,
+        interpretation_revision: revision(l),
+        publication,
+        publication_revision: revision(p),
+        output_version: output_version.clone(),
+    })
 }
 
 #[derive(Debug)]
@@ -743,6 +939,7 @@ mod tests {
         let target_schema = opaque(8, SchemaVersion::try_new);
         let target_spec = opaque(9, PartitionSpecVersion::try_new);
         let definition = build_definition(
+            1_700_000_000_000,
             QuerySource {
                 effective_sql: "SELECT o.order_id FROM ice.sales.orders o".to_string(),
                 dialect: QueryDialect::StarRocks,
@@ -971,12 +1168,13 @@ mod tests {
 
         fn observe_documents(
             &self,
-            _request: ConnectorDocumentObservationRequest,
+            request: ConnectorDocumentObservationRequest,
         ) -> Result<FrozenConnectorDocumentObservation, ConnectorError> {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::Unsupported,
-                "not used by the Current MV document test",
-            ))
+            FrozenConnectorDocumentObservation::try_new(
+                &request,
+                self.metadata_version.clone(),
+                self.stored.clone(),
+            )
         }
 
         fn load_document(
@@ -1084,6 +1282,7 @@ mod tests {
         let definition_revision = encode_definition(&definition).unwrap().revision();
         let interpretation_revision = encode_interpretation(&interpretation).unwrap().revision();
         let publication = PublicationDocument {
+            publication_prepared_at_ms: 1_700_000_001_000,
             publication_id: PublicationIdentity::try_new(vec![1]).unwrap(),
             definition_revision,
             interpretation_revision,
@@ -1113,7 +1312,7 @@ mod tests {
         assert_eq!(decoded.definition, definition);
         assert_eq!(decoded.interpretation, interpretation);
         assert_eq!(decoded.configuration, configuration);
-        assert_eq!(decoded.publication, Some(publication));
+        assert_eq!(decoded.publication, Some(publication.clone()));
         assert_eq!(
             decoded
                 .publication_output_version
@@ -1121,6 +1320,32 @@ mod tests {
                 .and_then(ConnectorCommittedVersion::snapshot_id),
             Some(11)
         );
+
+        // Query proof reads a sealed historical package without consulting
+        // management markers or requiring C/readiness.
+        current.retain(|stored| stored.id().name().as_str() != CONFIGURATION);
+        let metadata =
+            ConnectorCommittedVersion::try_new(Bytes::from_static(b"frozen-metadata"), Some(99))
+                .unwrap();
+        let lease = document_lease(&target, current, Vec::new(), metadata.clone());
+        let request = ConnectorDocumentObservationRequest::try_new(
+            target.owner().clone(),
+            target.catalog_handle().clone(),
+            target.target().clone(),
+            target.object_id().clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            request_context(),
+        )
+        .unwrap();
+        let historical = observe_frozen_publication_documents(
+            &lease,
+            request,
+            PersistenceDecodeBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(historical.publication(), &publication);
+        assert_eq!(historical.metadata_version(), &metadata);
+        assert_eq!(historical.output_version().snapshot_id(), Some(11));
     }
 
     #[test]
@@ -1148,6 +1373,7 @@ mod tests {
             .map(|document| stored(document, false))
             .collect::<Vec<_>>();
         let publication = PublicationDocument {
+            publication_prepared_at_ms: 1_700_000_001_000,
             publication_id: PublicationIdentity::try_new(vec![1]).unwrap(),
             definition_revision: encode_definition(&definition).unwrap().revision(),
             interpretation_revision: encode_interpretation(&interpretation).unwrap().revision(),
@@ -1484,6 +1710,17 @@ mod tests {
                 .collect(),
         )
         .unwrap();
+
+        let frozen = FrozenConnectorDocumentObservation::try_new(
+            &request,
+            observation.metadata_version().clone(),
+            observation.documents().to_vec(),
+        )
+        .unwrap();
+        assert!(
+            decode_frozen_publication_documents(&frozen, &[], PersistenceDecodeBudget::default())
+                .is_err()
+        );
 
         assert!(
             decode_current_management_documents(

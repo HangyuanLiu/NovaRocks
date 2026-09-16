@@ -133,11 +133,13 @@ impl From<IdentityError> for PersistenceCodecError {
 }
 
 pub fn build_definition(
+    created_at_ms: u64,
     query: QuerySource,
     relation_occurrences: Vec<RelationOccurrence>,
     outputs: Vec<OutputDefinition>,
 ) -> Result<DefinitionDocument, PersistenceCodecError> {
     let mut document = DefinitionDocument {
+        created_at_ms,
         query,
         relation_occurrences,
         outputs,
@@ -395,6 +397,7 @@ fn compute_definition_identity(document: &DefinitionDocument) -> ComputationIden
     let mut dto = definition_to_proto(&canonical);
     dto.format_version = None;
     dto.computation_identity = None;
+    dto.created_at_ms = None;
     ComputationIdentity::from_canonical_bytes(&dto.encode_to_vec())
 }
 
@@ -537,6 +540,7 @@ fn preflight_source(variable_bytes: usize, items: usize) -> Result<(), Persisten
 
 fn definition_to_proto(document: &DefinitionDocument) -> proto::DefinitionDocument {
     proto::DefinitionDocument {
+        created_at_ms: Some(document.created_at_ms),
         format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
         query: Some(proto::QuerySource {
             effective_sql: Some(document.query.effective_sql.clone()),
@@ -610,6 +614,7 @@ fn definition_from_proto(
     let query = required(dto.query, "definition.query")?;
     let resolution = required(query.resolution, "definition.query.resolution")?;
     Ok(DefinitionDocument {
+        created_at_ms: required(dto.created_at_ms, "definition.created_at_ms")?,
         query: QuerySource {
             effective_sql: required(query.effective_sql, "definition.query.effective_sql")?,
             dialect: enum_value(query.dialect, "definition.query.dialect", |value| {
@@ -1066,6 +1071,7 @@ fn interpretation_from_proto(
 
 fn publication_to_proto(document: &PublicationDocument) -> proto::PublicationDocument {
     proto::PublicationDocument {
+        publication_prepared_at_ms: Some(document.publication_prepared_at_ms),
         format_version: Some(MV_PERSISTENCE_FORMAT_VERSION),
         publication_id: Some(document.publication_id.as_bytes().to_vec()),
         definition_revision: Some(document.definition_revision.as_bytes().to_vec()),
@@ -1102,6 +1108,10 @@ fn publication_from_proto(
     let output = required(dto.output, "publication.output")?;
     let statistics = required(dto.statistics, "publication.statistics")?;
     Ok(PublicationDocument {
+        publication_prepared_at_ms: required(
+            dto.publication_prepared_at_ms,
+            "publication.publication_prepared_at_ms",
+        )?,
         publication_id: PublicationIdentity::try_new(required(
             dto.publication_id,
             "publication.publication_id",

@@ -21,7 +21,9 @@ use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine, Refres
 use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
+use novarocks_spi::connector::ConnectorExactSemanticRevision;
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
 
@@ -54,11 +56,21 @@ pub(crate) fn decide_refresh_plan(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshStateBaselineSource {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
+    pub(crate) table: TableIdentity,
+    pub(crate) table_object_id: ConnectorTableObjectId,
+    pub(crate) semantic_revision: ConnectorExactSemanticRevision,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshStateBaseline {
     Pinless,
     SnapshotBacked {
-        previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+        /// Ordered P inputs. Provider-native data versions remain opaque; a
+        /// consumer that needs a typed selector must ask the provider rather
+        /// than reconstructing one from these bytes.
+        previous_sources: Vec<RefreshStateBaselineSource>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         definition_fingerprint: String,
@@ -96,7 +108,10 @@ mod tests {
     use crate::mv::domain::refresh::snapshot::{
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
-    use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_spi::connector::{
+        ConnectorExactSemanticRevision, ConnectorProviderId, ConnectorTableObjectId,
+    };
+    use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
     use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
     use novarocks_types::naming::TableIdentity;
 
@@ -202,12 +217,20 @@ mod tests {
             ("ice.db.right".to_string(), Some(20)),
         ]);
         let affected_partitions = AffectedTargetPartitions::not_derived("join planning");
+        let previous_object = object_id("object-left");
         let state_baseline = RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids: BTreeMap::from([("ice.db.left".to_string(), 9)]),
-            previous_table_object_ids: BTreeMap::from([(
-                "ice.db.left".to_string(),
-                object_id("object-left"),
-            )]),
+            previous_sources: vec![RefreshStateBaselineSource {
+                occurrence_id: SqlMvRelationOccurrenceId::new(7),
+                table: base_refs[0].clone(),
+                table_object_id: previous_object.clone(),
+                semantic_revision:
+                    ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                        ConnectorProviderId::parse("iceberg").unwrap(),
+                        &previous_object,
+                        Some(9),
+                    )
+                    .unwrap(),
+            }],
             target_snapshot_id: Some(30),
             target_table_uuid: "uuid-target".to_string(),
             definition_fingerprint: "definition-v1".to_string(),

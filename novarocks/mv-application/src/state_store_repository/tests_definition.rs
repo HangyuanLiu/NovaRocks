@@ -15,29 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use super::StateStoreMvRepository;
-use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
-use crate::persistence::definition::{
-    CreateMvDefinitionRequest, MvDesiredRefreshPolicy, test_source_revision,
-};
-use crate::persistence::dependency::CreateMvDependencyRequest;
+use crate::persistence::identity::ObjectIdentity;
+use crate::persistence::test_support::ProjectionFixture;
 use crate::product::MvTarget;
 use crate::repository::{
-    DeleteMvProjectionRequest, InitialMvRefreshConfiguration, MvProjectionRequest,
-    MvPublishedProjection, MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
+    DeleteMvProjectionRequest, MvProjectionRequest, MvRepository, MvRepositoryErrorKind,
     ReplaceMvProjectionRequest,
 };
 use bytes::Bytes;
-use novarocks_query_application::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::{CommitOutcome, Key, Precondition, StateStore, Value};
 use novarocks_state_store_runtime::StateStoreRunPolicy;
 use novarocks_state_store_testkit::testing::InMemoryStateStore;
-
+use std::sync::Arc;
 pub(crate) async fn repository() -> (Arc<InMemoryStateStore>, Arc<StateStoreMvRepository>) {
     let store = Arc::new(InMemoryStateStore::new(format!(
         "mv-accelerator-test-{}",
@@ -66,61 +57,18 @@ pub(crate) fn projection_request(
     snapshot_id: i64,
     dependency: &str,
 ) -> MvProjectionRequest {
-    MvProjectionRequest {
-        definition: CreateMvDefinitionRequest {
-            query_definition: PersistedQueryDefinition::new(
-                format!("SELECT * FROM ice.sales.{dependency}"),
-                PersistedQueryDialect::StarRocks,
-                "ice",
-                "sales",
-            )
-            .unwrap(),
-            base_table_refs: vec![format!("ice.sales.{dependency}")],
-            primary_key_columns: vec![],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("ice".to_string()),
-            target_namespace: Some("sales".to_string()),
-            target_table: Some(table.to_string()),
-            schema_contract: None,
-            partition_spec: None,
-            created_at_ms: 1,
-        },
-        refresh: InitialMvRefreshConfiguration {
-            policy: MvDesiredRefreshPolicy::Manual,
-            ..Default::default()
-        },
-        publication: MvPublishedProjection::Published(MvPublishedWaterline {
-            last_refresh_ms: 10,
-            last_refresh_rows: 20,
-            last_refreshed_iceberg_snapshot_id: snapshot_id,
-            base_snapshots: [(format!("ice.sales.{dependency}"), 7)]
-                .into_iter()
-                .collect(),
-            base_table_object_ids: [(
-                format!("ice.sales.{dependency}"),
-                object_id(format!("base-{dependency}").as_bytes()),
-            )]
-            .into_iter()
-            .collect(),
-        }),
-        source_revision: test_source_revision(
-            "ice",
-            "sales",
-            table,
-            object_id(object),
-            Some(snapshot_id),
-        ),
-        dependencies: vec![CreateMvDependencyRequest {
-            upstream: MvDependencyObjectRef {
-                catalog: Some("ice".to_string()),
-                database_or_namespace: "sales".to_string(),
-                name: dependency.to_string(),
-                object_type: MvDependencyObjectType::Table,
-                storage_engine: MvDependencyStorageEngine::Iceberg,
-            },
-            created_at_ms: 1,
-        }],
+    let mut fixture = ProjectionFixture::new(target(table), Some(snapshot_id));
+    fixture.object_id = object_id(object);
+    for relation in &mut fixture.definition.relation_occurrences {
+        relation.relation_at_binding = dependency.into();
+        relation.object_id =
+            ObjectIdentity::try_new(format!("base-{dependency}").into_bytes()).unwrap();
     }
+    for source in &mut fixture.publication.as_mut().unwrap().inputs {
+        source.object_id =
+            ObjectIdentity::try_new(format!("base-{dependency}").into_bytes()).unwrap();
+    }
+    fixture.build().unwrap().into()
 }
 
 #[tokio::test]
@@ -143,12 +91,12 @@ async fn reopening_the_repository_retains_the_exact_lake_source_projection() {
     .expect("reopen MV Accelerator repository");
     assert_eq!(
         reopened
-            .load_by_id(created.definition.mv_id)
+            .load_by_id(created.projection.mv_id)
             .await
             .unwrap()
             .unwrap()
-            .definition,
-        created.definition
+            .projection,
+        created.projection
     );
 }
 
@@ -168,7 +116,7 @@ async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
         .replace_projection(
             uuid::Uuid::now_v7(),
             ReplaceMvProjectionRequest {
-                mv_id: created.definition.mv_id,
+                mv_id: created.projection.mv_id,
                 expected_version: created.version,
                 projection: projection_request("orders_mv_v2", b"object-a", 12, "customers"),
             },
@@ -192,17 +140,17 @@ async fn whole_projection_cas_replaces_root_target_and_dependency_indexes() {
         replaced
     );
     let dependencies = repository
-        .list_dependencies_by_downstream(replaced.definition.mv_id)
+        .list_dependencies_by_downstream(replaced.projection.mv_id)
         .await
         .unwrap();
-    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies.len(), 2);
     assert_eq!(dependencies[0].upstream.name, "customers");
 
     let error = repository
         .replace_projection(
             uuid::Uuid::now_v7(),
             ReplaceMvProjectionRequest {
-                mv_id: replaced.definition.mv_id,
+                mv_id: replaced.projection.mv_id,
                 expected_version: stale_version,
                 projection: projection_request("stale", b"object-a", 13, "orders"),
             },
@@ -235,7 +183,7 @@ async fn replacement_target_conflict_rolls_back_the_whole_projection() {
             .replace_projection(
                 uuid::Uuid::now_v7(),
                 ReplaceMvProjectionRequest {
-                    mv_id: first.definition.mv_id,
+                    mv_id: first.projection.mv_id,
                     expected_version: first.version.clone(),
                     projection: projection_request("second", b"object-first", 23, "lineitem",),
                 },
@@ -244,7 +192,7 @@ async fn replacement_target_conflict_rolls_back_the_whole_projection() {
             .is_err()
     );
     assert_eq!(
-        repository.load_by_id(first.definition.mv_id).await.unwrap(),
+        repository.load_by_id(first.projection.mv_id).await.unwrap(),
         Some(first)
     );
 }
@@ -259,13 +207,13 @@ async fn delete_requires_exact_object_source_and_version() {
         )
         .await
         .unwrap();
-    let mut stale_source = created.definition.source_revision.clone();
+    let mut stale_source = created.projection.facts.source_revision().clone();
     stale_source.target_object_id = object_id(b"object-recreated");
     let error = repository
         .delete_projection(
             uuid::Uuid::now_v7(),
             DeleteMvProjectionRequest {
-                mv_id: created.definition.mv_id,
+                mv_id: created.projection.mv_id,
                 expected_version: created.version.clone(),
                 expected_source_revision: stale_source,
             },
@@ -275,7 +223,7 @@ async fn delete_requires_exact_object_source_and_version() {
     assert_eq!(error.kind(), MvRepositoryErrorKind::Conflict);
     assert!(
         repository
-            .load_by_id(created.definition.mv_id)
+            .load_by_id(created.projection.mv_id)
             .await
             .unwrap()
             .is_some()
@@ -285,9 +233,9 @@ async fn delete_requires_exact_object_source_and_version() {
         .delete_projection(
             uuid::Uuid::now_v7(),
             DeleteMvProjectionRequest {
-                mv_id: created.definition.mv_id,
+                mv_id: created.projection.mv_id,
                 expected_version: created.version,
-                expected_source_revision: created.definition.source_revision,
+                expected_source_revision: created.projection.facts.source_revision().clone(),
             },
         )
         .await
@@ -322,14 +270,14 @@ async fn whole_family_wipe_allows_internal_id_reallocation() {
         )
         .await
         .unwrap();
-    assert_eq!(first.definition.mv_id, rebuilt.definition.mv_id);
+    assert_eq!(first.projection.mv_id, rebuilt.projection.mv_id);
 }
 
 #[tokio::test]
 async fn whole_family_wipe_removes_an_unknown_current_record_without_decoding_it() {
     let (store, repository) = repository().await;
     let key = Key::try_from(Bytes::from_static(
-        b"novarocks/frontend/mv/accelerator/v2/unknown/future-record",
+        b"novarocks/frontend/mv/accelerator/v3/unknown/future-record",
     ))
     .unwrap();
     let value = Value::try_from(Bytes::from_static(b"opaque-corrupt-record")).unwrap();

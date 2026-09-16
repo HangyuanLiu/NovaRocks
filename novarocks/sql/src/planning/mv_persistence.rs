@@ -31,6 +31,7 @@ use crate::analysis::{
 };
 use crate::column_id::ColumnId;
 use crate::common::{BinOp, UnOp};
+use crate::compiler::SqlMvRelationOccurrenceId;
 use crate::planner::table::ScanSource;
 
 /// Complete SQL-owned input for CREATE-time MV persistence mapping.
@@ -64,7 +65,7 @@ impl SqlMvCreatePersistenceFacts {
 /// One syntactic base-relation occurrence in left-to-right depth-first order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvPersistenceRelationOccurrenceFacts {
-    occurrence_id: u32,
+    occurrence_id: SqlMvRelationOccurrenceId,
     catalog: String,
     namespace: String,
     relation: String,
@@ -73,7 +74,7 @@ pub struct SqlMvPersistenceRelationOccurrenceFacts {
 }
 
 impl SqlMvPersistenceRelationOccurrenceFacts {
-    pub fn occurrence_id(&self) -> u32 {
+    pub fn occurrence_id(&self) -> SqlMvRelationOccurrenceId {
         self.occurrence_id
     }
 
@@ -122,13 +123,13 @@ impl SqlMvPersistenceSourceFieldFacts {
 /// One source-field use qualified by a syntactic relation occurrence.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SqlMvPersistenceSourceFieldReference {
-    occurrence_id: u32,
+    occurrence_id: SqlMvRelationOccurrenceId,
     field_ordinal: u32,
     field_name: String,
 }
 
 impl SqlMvPersistenceSourceFieldReference {
-    pub fn occurrence_id(&self) -> u32 {
+    pub fn occurrence_id(&self) -> SqlMvRelationOccurrenceId {
         self.occurrence_id
     }
 
@@ -242,7 +243,7 @@ impl SqlMvPersistenceAggregateFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvPersistenceUnionBranchFacts {
     branch_ordinal: u32,
-    relation_occurrence_ids: Vec<u32>,
+    relation_occurrence_ids: Vec<SqlMvRelationOccurrenceId>,
     output_ordinals: Vec<u32>,
 }
 
@@ -251,7 +252,7 @@ impl SqlMvPersistenceUnionBranchFacts {
         self.branch_ordinal
     }
 
-    pub fn relation_occurrence_ids(&self) -> &[u32] {
+    pub fn relation_occurrence_ids(&self) -> &[SqlMvRelationOccurrenceId] {
         &self.relation_occurrence_ids
     }
 
@@ -320,7 +321,8 @@ pub(super) fn project_create_persistence_facts(
     for reference in &builder.referenced_fields {
         let occurrence = builder
             .occurrences
-            .get_mut(reference.occurrence_id as usize)
+            .iter_mut()
+            .find(|occurrence| occurrence.occurrence_id == reference.occurrence_id)
             .ok_or_else(|| {
                 "MV CREATE persistence field references unknown occurrence".to_string()
             })?;
@@ -435,7 +437,7 @@ fn outermost_union_leaves_in_relation(relation: &Relation) -> Result<Vec<&Resolv
 fn query_relation_occurrence_ids(
     query: &ResolvedQuery,
     builder: &ProjectionBuilder,
-) -> Result<Vec<u32>, String> {
+) -> Result<Vec<SqlMvRelationOccurrenceId>, String> {
     match &query.body {
         QueryBody::Select(select) => {
             let relation = select
@@ -458,7 +460,7 @@ fn query_relation_occurrence_ids(
 fn relation_occurrence_ids(
     relation: &Relation,
     builder: &ProjectionBuilder,
-) -> Result<Vec<u32>, String> {
+) -> Result<Vec<SqlMvRelationOccurrenceId>, String> {
     match relation {
         Relation::Scan(scan) => {
             let column_id = scan.column_ids.first().ok_or_else(|| {
@@ -537,8 +539,10 @@ fn register_query(
 fn register_relation(relation: &Relation, builder: &mut ProjectionBuilder) -> Result<(), String> {
     match relation {
         Relation::Scan(scan) => {
-            let occurrence_id =
-                u32_from_usize("MV relation occurrence id", builder.occurrences.len())?;
+            let occurrence_id = SqlMvRelationOccurrenceId::new(u32_from_usize(
+                "MV relation occurrence id",
+                builder.occurrences.len(),
+            )?);
             let ScanSource::Sql(source) = &scan.table.source;
             let fields = scan
                 .table
@@ -673,7 +677,7 @@ fn project_leaf_expressions(
 
 fn collect_query_semantics(
     query: &ResolvedQuery,
-    branch_occurrences: &[Vec<u32>],
+    branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
     builder: &mut ProjectionBuilder,
 ) -> Result<(), String> {
     match &query.body {
@@ -723,7 +727,7 @@ fn collect_query_semantics(
 
 fn collect_relation_semantics(
     relation: &Relation,
-    branch_occurrences: &[Vec<u32>],
+    branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
     builder: &mut ProjectionBuilder,
 ) -> Result<(), String> {
     match relation {
@@ -744,8 +748,8 @@ fn collect_relation_semantics(
 }
 
 fn branch_ordinal_for_occurrences(
-    query_occurrences: &[u32],
-    branch_occurrences: &[Vec<u32>],
+    query_occurrences: &[SqlMvRelationOccurrenceId],
+    branch_occurrences: &[Vec<SqlMvRelationOccurrenceId>],
 ) -> Result<Option<u32>, String> {
     let matches = branch_occurrences
         .iter()
@@ -1229,7 +1233,7 @@ mod tests {
             .iter()
             .map(|field| {
                 (
-                    field.occurrence_id(),
+                    field.occurrence_id().get(),
                     field.field_ordinal(),
                     field.field_name(),
                 )
@@ -1278,9 +1282,9 @@ mod tests {
         let facts = facts("SELECT l.region, r.amount FROM orders l JOIN orders r ON l.id = r.id");
 
         assert_eq!(facts.relation_occurrences().len(), 2);
-        assert_eq!(facts.relation_occurrences()[0].occurrence_id(), 0);
+        assert_eq!(facts.relation_occurrences()[0].occurrence_id().get(), 0);
         assert_eq!(facts.relation_occurrences()[0].qualifier(), "l");
-        assert_eq!(facts.relation_occurrences()[1].occurrence_id(), 1);
+        assert_eq!(facts.relation_occurrences()[1].occurrence_id().get(), 1);
         assert_eq!(facts.relation_occurrences()[1].qualifier(), "r");
         assert_eq!(
             refs(facts.outputs()[0].expression()),
@@ -1322,7 +1326,7 @@ mod tests {
             facts.aggregates()[0]
                 .source_fields()
                 .iter()
-                .map(|field| (field.occurrence_id(), field.field_name()))
+                .map(|field| (field.occurrence_id().get(), field.field_name()))
                 .collect::<Vec<_>>(),
             vec![(0, "amount")]
         );
@@ -1351,9 +1355,18 @@ mod tests {
             vec!["east", "west", "central"]
         );
         assert_eq!(facts.union_branches().len(), 3);
-        assert_eq!(facts.union_branches()[0].relation_occurrence_ids(), &[0]);
-        assert_eq!(facts.union_branches()[1].relation_occurrence_ids(), &[1]);
-        assert_eq!(facts.union_branches()[2].relation_occurrence_ids(), &[2]);
+        assert_eq!(
+            facts.union_branches()[0].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(0)]
+        );
+        assert_eq!(
+            facts.union_branches()[1].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(1)]
+        );
+        assert_eq!(
+            facts.union_branches()[2].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(2)]
+        );
         assert_eq!(facts.union_branches()[2].output_ordinals(), &[0, 1]);
         assert_eq!(
             refs(facts.outputs()[0].expression()),
@@ -1374,8 +1387,18 @@ mod tests {
         assert_eq!(facts.aggregates()[1].aggregate_ordinal(), 1);
         assert_eq!(facts.aggregates()[1].branch_ordinal(), Some(1));
         assert_eq!(facts.aggregates()[1].output_ordinal(), Some(1));
-        assert_eq!(facts.aggregates()[0].source_fields()[0].occurrence_id(), 0);
-        assert_eq!(facts.aggregates()[1].source_fields()[0].occurrence_id(), 1);
+        assert_eq!(
+            facts.aggregates()[0].source_fields()[0]
+                .occurrence_id()
+                .get(),
+            0
+        );
+        assert_eq!(
+            facts.aggregates()[1].source_fields()[0]
+                .occurrence_id()
+                .get(),
+            1
+        );
     }
 
     #[test]
@@ -1386,8 +1409,14 @@ mod tests {
 
         assert_eq!(facts.relation_occurrences().len(), 2);
         assert_eq!(facts.union_branches().len(), 2);
-        assert_eq!(facts.union_branches()[0].relation_occurrence_ids(), &[0]);
-        assert_eq!(facts.union_branches()[1].relation_occurrence_ids(), &[1]);
+        assert_eq!(
+            facts.union_branches()[0].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(0)]
+        );
+        assert_eq!(
+            facts.union_branches()[1].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(1)]
+        );
         assert_eq!(
             refs(facts.outputs()[0].expression()),
             vec![(0, 0, "id"), (1, 0, "id")]
@@ -1403,7 +1432,7 @@ mod tests {
             facts.aggregates()[0]
                 .source_fields()
                 .iter()
-                .map(|field| (field.occurrence_id(), field.field_name()))
+                .map(|field| (field.occurrence_id().get(), field.field_name()))
                 .collect::<Vec<_>>(),
             vec![(0, "amount"), (1, "amount")]
         );
@@ -1424,9 +1453,18 @@ mod tests {
             vec!["east", "west", "central"]
         );
         assert_eq!(facts.union_branches().len(), 3);
-        assert_eq!(facts.union_branches()[0].relation_occurrence_ids(), &[0]);
-        assert_eq!(facts.union_branches()[1].relation_occurrence_ids(), &[1]);
-        assert_eq!(facts.union_branches()[2].relation_occurrence_ids(), &[2]);
+        assert_eq!(
+            facts.union_branches()[0].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(0)]
+        );
+        assert_eq!(
+            facts.union_branches()[1].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(1)]
+        );
+        assert_eq!(
+            facts.union_branches()[2].relation_occurrence_ids(),
+            &[SqlMvRelationOccurrenceId::new(2)]
+        );
         assert_eq!(
             refs(facts.outputs()[1].expression()),
             vec![(0, 2, "amount"), (1, 2, "amount"), (2, 2, "amount")]
@@ -1445,7 +1483,7 @@ mod tests {
         assert_eq!(first.relation(), second.relation());
         assert_eq!(first.qualifier(), "orders");
         assert_eq!(second.qualifier(), "orders");
-        assert_ne!(first.occurrence_id(), second.occurrence_id());
+        assert_ne!(first.occurrence_id().get(), second.occurrence_id().get());
         assert_eq!(
             refs(facts.outputs()[0].expression()),
             vec![(0, 0, "id"), (1, 0, "id")]

@@ -368,6 +368,7 @@ fn lock_lifecycle(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetReadiness {
+    Unobserved,
     Ready,
     Unavailable(String),
 }
@@ -389,8 +390,29 @@ impl<T, P> Default for ProcessRuntime<T, P> {
     }
 }
 
+/// Ordering is process-local and shared by every logical target spelling owner.
+/// It is not a durable fence or evidence that a remote effect has completed.
+#[derive(Default, Debug)]
+pub(crate) struct ProjectionOrder {
+    pub generation: u64,
+    pub installed: Option<crate::repository::MvProjectionVersion>,
+}
+
+impl ProjectionOrder {
+    pub fn advance(&mut self) -> Result<u64, crate::repository::MvRepositoryError> {
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            crate::repository::MvRepositoryError::new(
+                crate::repository::MvRepositoryErrorKind::Unavailable,
+                "MV projection generation exhausted",
+            )
+        })?;
+        Ok(self.generation)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeEntry<P> {
+    projection_order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
     readiness: TargetReadiness,
     active: Option<RuntimeAttempt<P>>,
 }
@@ -398,7 +420,8 @@ struct RuntimeEntry<P> {
 impl<P> Default for RuntimeEntry<P> {
     fn default() -> Self {
         Self {
-            readiness: TargetReadiness::Ready,
+            projection_order: Arc::new(tokio::sync::Mutex::new(ProjectionOrder::default())),
+            readiness: TargetReadiness::Unobserved,
             active: None,
         }
     }
@@ -409,16 +432,37 @@ where
     T: Clone + Ord,
     P: Copy + Eq,
 {
+    pub(crate) fn projection_order(&self, target: T) -> Arc<tokio::sync::Mutex<ProjectionOrder>> {
+        Arc::clone(
+            &self
+                .inner
+                .lock()
+                .expect("MV application runtime lock poisoned")
+                .entry(target)
+                .or_default()
+                .projection_order,
+        )
+    }
+
+    pub(crate) fn projection_targets(&self) -> Vec<T> {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn readiness(&self, target: &T) -> TargetReadiness {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")
             .get(target)
             .map(|entry| entry.readiness.clone())
-            .unwrap_or(TargetReadiness::Ready)
+            .unwrap_or(TargetReadiness::Unobserved)
     }
 
-    pub fn set_unavailable(&self, target: T, reason: String) {
+    pub(crate) fn set_unavailable(&self, target: T, reason: String) {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")
@@ -427,7 +471,7 @@ where
             .readiness = TargetReadiness::Unavailable(reason);
     }
 
-    pub fn set_ready(&self, target: T) {
+    pub(crate) fn set_ready(&self, target: T) {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")

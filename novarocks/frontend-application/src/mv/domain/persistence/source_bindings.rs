@@ -23,8 +23,10 @@
 //! identities from that same metadata generation.
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
+use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
 use novarocks_spi::connector::{
-    ConnectorRequestContext, MvCreateSourceObservation, MvStorageObservationPort,
+    ConnectorReadSelector, ConnectorRequestContext, MvCreateSourceObservation,
+    MvStorageObservationPort,
 };
 use novarocks_sql::planning::mv::{
     SqlMvCreatePersistenceFacts, SqlMvPersistenceRelationOccurrenceFacts,
@@ -57,13 +59,13 @@ pub(crate) fn observe_mv_create_source_bindings(
                 .ok_or_else(|| {
                     format!(
                         "CREATE source occurrence {} has no admitted connector binding",
-                        relation.occurrence_id()
+                        relation.occurrence_id().get()
                     )
                 })?;
             let metadata = binding.source_metadata.as_ref().ok_or_else(|| {
                 format!(
                     "CREATE source occurrence {} was not admitted from exact provider metadata",
-                    relation.occurrence_id()
+                    relation.occurrence_id().get()
                 )
             })?;
             let lease = binding.admission.exact_planning_lease()?;
@@ -78,7 +80,33 @@ pub(crate) fn observe_mv_create_source_bindings(
                     )
                 })?;
             validate_same_generation(metadata, &observed)?;
-            bind_relation_fields(relation, &observed)
+            let revision = lease
+                .binding()
+                .metadata()
+                .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+                .map_err(|error| {
+                    format!(
+                        "observe exact CREATE source revision for {}.{}.{}: {error}",
+                        relation.catalog(),
+                        relation.namespace(),
+                        relation.relation()
+                    )
+                })?;
+            if revision.object_identity().value().as_ref()
+                != observed.object_id().as_bytes().as_ref()
+            {
+                return Err(
+                    "CREATE source field observation and exact revision identify different objects"
+                        .to_string(),
+                );
+            }
+            let (object_id, _data_version) =
+                persist_exact_connector_revision(&revision).map_err(|error| error.to_string())?;
+            bind_relation_fields(
+                relation,
+                &observed,
+                bytes::Bytes::copy_from_slice(object_id.as_bytes()),
+            )
         })
         .collect()
 }
@@ -86,6 +114,7 @@ pub(crate) fn observe_mv_create_source_bindings(
 fn bind_relation_fields(
     relation: &SqlMvPersistenceRelationOccurrenceFacts,
     observed: &MvCreateSourceObservation,
+    provider_object_id: bytes::Bytes,
 ) -> Result<MvCreateRelationObservation, String> {
     let mut source_ordinals = std::collections::BTreeSet::new();
     let fields = relation
@@ -122,8 +151,8 @@ fn bind_relation_fields(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(MvCreateRelationObservation {
-        occurrence_id: relation.occurrence_id(),
-        provider_object_id: observed.object_id().as_bytes().clone(),
+        occurrence_id: relation.occurrence_id().get(),
+        provider_object_id,
         provider_schema_version: observed.schema_version().clone(),
         fields,
     })

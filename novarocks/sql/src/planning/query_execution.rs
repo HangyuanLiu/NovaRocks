@@ -515,6 +515,7 @@ pub struct SealedScanContract {
     preparation_category: SqlScanPreparationCategory,
     sql_occurrence: SqlScanOccurrence,
     logical_occurrence: SqlLogicalRelationOccurrence,
+    definition_occurrence_id: Option<crate::compiler::SqlMvRelationOccurrenceId>,
     predicates: usize,
     projected_columns: Vec<OutputColumn>,
     offered_limit: bool,
@@ -527,6 +528,7 @@ fn sealed_scan_contract(
     scan: &PlanScanNode,
     offered_limit: bool,
 ) -> SealedScanContract {
+    let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
     let facts = scan_preparation_facts(scan);
     let sql_occurrence = SqlScanOccurrence::from_scan(facts.binding(), &scan.columns)
         .expect("sealed SQL scan must retain at least one non-sentinel output column");
@@ -546,6 +548,7 @@ fn sealed_scan_contract(
         preparation_category: facts.category(),
         sql_occurrence,
         logical_occurrence,
+        definition_occurrence_id: source.mv_occurrence,
         predicates: scan.predicates.len(),
         projected_columns: scan.columns.clone(),
         offered_limit,
@@ -582,6 +585,14 @@ impl SealedScanContract {
         &self.logical_occurrence
     }
 
+    /// Durable MV-definition occurrence for a refresh source scan. A query's
+    /// provider read occurrence remains a separate, request-local identity.
+    pub const fn definition_occurrence_id(
+        &self,
+    ) -> Option<crate::compiler::SqlMvRelationOccurrenceId> {
+        self.definition_occurrence_id
+    }
+
     pub fn catalog(&self) -> &str {
         self.logical_occurrence.catalog()
     }
@@ -612,6 +623,8 @@ impl SealedScanContract {
                 source: selection.name().to_string(),
                 publication_id: selection.publication_id()?,
                 definition_fingerprint: selection.definition_fingerprint()?,
+                definition_revision: selection.definition_revision()?,
+                interpretation_revision: selection.interpretation_revision()?,
                 publication_provenance: Arc::from(selection.publication_provenance()?),
                 input_mapping: selection.input_mapping().to_vec(),
                 publication_inputs: selection.publication_inputs().to_vec(),
@@ -634,9 +647,11 @@ pub struct SealedMvRewriteAction {
     source: String,
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     publication_provenance: Arc<str>,
     input_mapping: Vec<MvRewriteInputSelection>,
-    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationInput>,
     publication_target: crate::compiler::SqlMvRewritePublicationRelation,
 }
 
@@ -657,6 +672,14 @@ impl SealedMvRewriteAction {
         self.definition_fingerprint
     }
 
+    pub const fn definition_revision(&self) -> [u8; 32] {
+        self.definition_revision
+    }
+
+    pub const fn interpretation_revision(&self) -> [u8; 32] {
+        self.interpretation_revision
+    }
+
     pub fn publication_provenance(&self) -> &str {
         &self.publication_provenance
     }
@@ -665,7 +688,7 @@ impl SealedMvRewriteAction {
         &self.input_mapping
     }
 
-    pub fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+    pub fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationInput] {
         &self.publication_inputs
     }
 
