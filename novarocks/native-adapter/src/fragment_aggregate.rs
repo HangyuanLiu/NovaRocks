@@ -39,7 +39,6 @@ use novarocks_functions::{
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
-use novarocks_types::SlotId;
 use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[expect(
@@ -186,15 +185,6 @@ pub fn lower_hash_aggregate_node(
                 format!("HashAggregateNode aggregate {idx} count_if does not support ORDER BY"),
             ));
         }
-        let output_col = output_layout.aggregate_columns.get(idx).ok_or_else(|| {
-            NativeFragmentDecodeError::missing(
-                path.clone()
-                    .field("output_layout")
-                    .field("aggregate_columns")
-                    .index(idx),
-                format!("HashAggregateNode aggregate column {idx} missing"),
-            )
-        })?;
         let result_type = call.result_type.as_ref().ok_or_else(|| {
             NativeFragmentDecodeError::missing(
                 path.clone()
@@ -296,22 +286,24 @@ pub fn lower_hash_aggregate_node(
         let intermediate_type = Some(selected.intermediate_type.clone());
         let signature_output_type = selected.output_type.clone();
 
-        let raw_args = if is_merge {
-            let slot = SlotId::new(output_col.column_id);
-            let data_type = intermediate_type.clone().ok_or_else(|| NativeFragmentDecodeError::invalid_value(path.clone().field("aggregates").index(idx), format!(
-                    "HashAggregateNode merge aggregate {idx} requires a known intermediate type for {}",
-                    function_name
-                )))?;
-            vec![arena.push_typed(ExprNode::SlotId(slot), data_type)]
-        } else {
-            lower_aggregate_update_inputs(
-                call,
-                idx,
+        // Every phase reads what the plan says it reads. A merge phase says
+        // one state input, and the sender states it rather than leaving the
+        // receiver to reconstruct it from an output column identity.
+        if is_merge && (call.args.len() != 1 || !call.order_by.is_empty()) {
+            return Err(NativeFragmentDecodeError::invalid_value(
                 path.clone().field("aggregates").index(idx),
-                &child,
-                arena,
-            )?
-        };
+                format!(
+                    "HashAggregateNode merge aggregate {idx} requires exactly one state input and no ORDER BY"
+                ),
+            ));
+        }
+        let raw_args = lower_aggregate_update_inputs(
+            call,
+            idx,
+            path.clone().field("aggregates").index(idx),
+            &child,
+            arena,
+        )?;
         let inputs = NativeFragmentDecodeError::map_invalid(
             path.clone().field("aggregates").index(idx),
             select_aggregate_inputs(&call.name.to_ascii_lowercase(), is_merge, raw_args, arena),

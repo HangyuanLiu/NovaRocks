@@ -326,13 +326,26 @@ pub(super) fn encode_physical_node<'a, F: NativeScanFacts<'a>>(
                     aggregates: node
                         .aggregates
                         .iter()
-                        .map(|call| {
+                        .enumerate()
+                        .map(|(index, call)| {
                             let resolved_signature = encode_resolved_function_aggregate_binding(
                                 call.resolved.resolved(),
                             )?;
+                            // A merge phase reads the state the phase before it
+                            // produced, which stands in the child under this
+                            // aggregate's own column identity. The call still
+                            // carries the logical arguments the split handed
+                            // it, naming columns the partial no longer
+                            // outputs, so state the input the receiver needs
+                            // rather than arguments it has to know to ignore.
+                            let args = if node.is_merge.get(index).copied().unwrap_or(false) {
+                                vec![encode_aggregate_state_input(call)?]
+                            } else {
+                                encode_exprs(&call.args)?
+                            };
                             Ok(plan::PlanAggregateCall {
                                 name: call.name.clone(),
-                                args: encode_exprs(&call.args)?,
+                                args,
                                 distinct: call.distinct,
                                 // AggregateCall.result_type follows the physical
                                 // phase layout after optimizer materialization.
@@ -552,6 +565,30 @@ pub(super) fn encode_resolved_aggregate_signature(
         intermediate_type: Some(encode_type(&binding.intermediate_type)?),
         output_type: Some(encode_type(&binding.output_type)?),
         state_format_identity: binding.state_format.as_str().to_string(),
+    })
+}
+
+/// The one input a merge phase reads: the state its preceding phase wrote,
+/// standing in the child under this aggregate's own column identity.
+fn encode_aggregate_state_input(
+    call: &novarocks_sql::plan_read::SqlAggregateCallRead,
+) -> Result<novarocks_proto_models::expr::Expr, String> {
+    let binding = call.resolved.resolved();
+    let aggregate = binding
+        .selected
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| "aggregate function selected no intermediate state".to_string())?;
+    Ok(novarocks_proto_models::expr::Expr {
+        r#type: Some(encode_type(&aggregate.intermediate_type.data_type)?),
+        nullable: aggregate.intermediate_type.nullable,
+        kind: Some(novarocks_proto_models::expr::expr::Kind::ColumnRef(
+            novarocks_proto_models::expr::ColumnRef {
+                column_id: call.output_column_id.0,
+                qualifier: None,
+                column: Some(call.name.clone()),
+            },
+        )),
     })
 }
 
