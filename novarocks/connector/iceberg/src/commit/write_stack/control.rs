@@ -2851,7 +2851,7 @@ impl IcebergWriteSessionControl {
                 (Some(table), metadata)
             }
         };
-        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. } =
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
             &request.flavor
         {
             let admitted_target = declaration.admission().target();
@@ -2868,12 +2868,31 @@ impl IcebergWriteSessionControl {
                     "Iceberg document publication does not match the exact live target object",
                 ));
             }
-            let expected_intent = match declaration.technique() {
-                novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full => {
-                    novarocks_spi::connector::ConnectorWriteIntent::Overwrite
-                }
-                novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental => {
-                    novarocks_spi::connector::ConnectorWriteIntent::Append
+            // Technique alone does not decide the intent: an incremental
+            // publication either only inserts or supersedes rows it already
+            // published, and those are different Iceberg operations. The shape
+            // is what separates them, and the caller declares it because the
+            // input cannot be read for it. Every other pairing is refused
+            // rather than mapped to a nearby operation.
+            use novarocks_spi::connector::ConnectorWriteIntent;
+            use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
+            let expected_intent = match (declaration.technique(), shape) {
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full,
+                    ConnectorManagedPublicationShape::Data,
+                ) => ConnectorWriteIntent::Overwrite,
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+                ) => ConnectorWriteIntent::Append,
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationShape::RowMutation,
+                ) => ConnectorWriteIntent::RowDelta,
+                _ => {
+                    return Err(invalid(
+                        "Iceberg document publication technique and branch shape name no write operation",
+                    ));
                 }
             };
             if request.intent != expected_intent || request.target_ref.as_str() != "main" {
@@ -2903,18 +2922,14 @@ impl IcebergWriteSessionControl {
         if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
             &request.flavor
         {
-            let base_family = match shape {
-                novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::RowMutation => {
-                    "row-mutation-base"
-                }
-                novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data
-                | novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::InsertOnlyChangeStream => {
-                    "write-base"
-                }
-            };
+            // A publication's base comes from the publication's own write
+            // preparation, whichever branch shape it goes on to seal. The
+            // row-mutation family belongs to `prepare_row_mutation`, which a
+            // publication never calls: it admits a MERGE's match contract, and
+            // a refresh's change stream is not matched against the target.
             let snapshot = crate::commit::write_shared::snapshot_token(base_snapshot_id);
             let expected = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-                "iceberg/{base_family}/v1/{}/{}/{snapshot}",
+                "iceberg/write-base/v1/{}/{}/{snapshot}",
                 metadata.uuid(),
                 target_ref
             )))?;

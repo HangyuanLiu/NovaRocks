@@ -970,13 +970,8 @@ mod application_document_publication_trace_tests {
             )
             .expect("prepare publication documents");
         let expected_manifest = prepared.provider_token().to_vec();
-        let base_family = match shape {
-            ConnectorManagedPublicationShape::RowMutation => "row-mutation-base",
-            ConnectorManagedPublicationShape::Data
-            | ConnectorManagedPublicationShape::InsertOnlyChangeStream => "write-base",
-        };
         let base = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
-            "iceberg/{base_family}/v1/{table_uuid}/main/{}",
+            "iceberg/write-base/v1/{table_uuid}/main/{}",
             crate::commit::write_shared::snapshot_token(base_snapshot_id)
         )))
         .expect("publication base");
@@ -1033,9 +1028,15 @@ mod application_document_publication_trace_tests {
         ConnectorWriteBeginRequest {
             table: Arc::from("db.t"),
             target_ref: ConnectorWriteTargetRef::main(),
-            intent: match prepared.declaration.technique() {
-                ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
-                ConnectorManagedPublicationTechnique::Incremental => ConnectorWriteIntent::Append,
+            intent: match (prepared.declaration.technique(), shape) {
+                (ConnectorManagedPublicationTechnique::Full, _) => ConnectorWriteIntent::Overwrite,
+                (
+                    ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationShape::RowMutation,
+                ) => ConnectorWriteIntent::RowDelta,
+                (ConnectorManagedPublicationTechnique::Incremental, _) => {
+                    ConnectorWriteIntent::Append
+                }
             },
             purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
             input: match shape {
