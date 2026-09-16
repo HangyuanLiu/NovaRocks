@@ -668,22 +668,51 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
     fn install_created_projection(
         &self,
         target: &CreatedMvTarget,
-        _operation_id: uuid::Uuid,
+        operation_id: uuid::Uuid,
     ) -> Result<(), MvCreateProviderError> {
         // The create is committed, so this may never re-create or delete the
-        // target. Installing Current requires a sealed observation carrying a
-        // management admission, which only the single management entrance can
-        // mint, and no CREATE path reserves one yet.
-        Err(MvCreateProviderError::new(
-            MvCreateProviderErrorKind::DescriptorSync,
-            format!(
-                "Iceberg MV {}.{}.{} was created but its Current projection cannot be installed: \
-                 installing requires a management-admitted sealed observation",
-                target.target.catalog.as_deref().unwrap_or_default(),
-                target.target.database,
-                target.target.name,
-            ),
-        ))
+        // target. It converges management onto the target this statement just
+        // published and installs Current from that same sealed observation.
+        let entrance = self
+            .ports
+            .management_entrance()
+            .map_err(engine_target_error)?;
+        let catalog_name =
+            target.target.catalog.as_deref().ok_or_else(|| {
+                engine_target_error("created MV target has no catalog".to_string())
+            })?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog_name)
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            self.ports.connector_control.as_ref(),
+            &instance_id,
+        )
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        let catalog = lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| engine_target_error(error.to_string()))?
+            .clone();
+        let product_target = novarocks_mv_application::product::MvTarget::try_new(
+            target.target.catalog.clone(),
+            target.target.database.clone(),
+            target.target.name.clone(),
+        )
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        crate::mv::domain::staged_create::install_created_current_projection(
+            entrance.as_ref(),
+            self.ports.readiness().as_ref(),
+            self.ports.connector_control.as_ref(),
+            catalog,
+            product_target,
+            operation_id,
+            // The create already happened; observe under a scope that cannot
+            // be mistaken for part of the same effect.
+            self.connector_context.clone().after_external_effect(),
+        )
+        .map_err(|error| {
+            MvCreateProviderError::new(MvCreateProviderErrorKind::DescriptorSync, error)
+        })
     }
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError> {

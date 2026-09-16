@@ -81,6 +81,19 @@ pub struct MvObservedCurrentDocuments {
 }
 
 impl MvObservedCurrentDocuments {
+    /// The exact document dependencies this observation proves.
+    ///
+    /// The management entrance installs against these and refuses a later
+    /// effect whose frozen set no longer matches, so the revisions stay
+    /// private and are only ever compared as a whole.
+    pub fn management_dependencies(
+        &self,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> crate::management::ManagementDependencySet {
+        self.source_revision()
+            .management_dependencies(control_runtime_id)
+    }
+
     pub(crate) fn source_revision(&self) -> MvAcceleratorSourceRevision {
         MvAcceleratorSourceRevision {
             target: self.target.clone(),

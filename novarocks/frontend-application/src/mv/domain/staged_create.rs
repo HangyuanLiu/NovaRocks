@@ -410,3 +410,166 @@ fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
         .map(ManagementTimestamp::from_unix_millis)
         .map_err(|_| "system clock exceeds u64 milliseconds".to_string())
 }
+
+/// Install the Current projection for a target this statement just created.
+///
+/// The create is already committed, so this only converges the management
+/// state onto it and installs the projection. It must never re-create or
+/// delete the target, and a failure here is a finalization failure.
+pub(crate) fn install_created_current_projection(
+    entrance: &ManagementEntrance,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: CatalogHandle,
+    target: novarocks_mv_application::product::MvTarget,
+    operation_id: uuid::Uuid,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    let request = novarocks_mv_application::readiness::MvCurrentProjectionRequest::try_new(
+        catalog,
+        target,
+        context,
+        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+    )
+    .map_err(|error| format!("prepare the created MV Current observation: {error}"))?;
+    let source = CreatedTargetCurrentSource {
+        entrance,
+        connector_control,
+    };
+    readiness
+        .observe_current_and_install(operation_id, request, &source)
+        .map(|_| ())
+        .map_err(|error| format!("install the created MV Current projection: {error}"))
+}
+
+/// Observes the just-created target and converges management onto it.
+///
+/// The same sealed observation both mints the management admission and
+/// supplies the documents, so readiness can never be installed from one read
+/// and admitted by another.
+struct CreatedTargetCurrentSource<'a> {
+    entrance: &'a ManagementEntrance,
+    connector_control: &'a dyn novarocks_spi::connector::ConnectorControlResolver,
+}
+
+#[async_trait::async_trait]
+impl novarocks_mv_application::readiness::MvCurrentProjectionSource
+    for CreatedTargetCurrentSource<'_>
+{
+    async fn observe(
+        &self,
+        request: &novarocks_mv_application::readiness::MvCurrentProjectionRequest,
+    ) -> Result<
+        novarocks_mv_application::readiness::MvCurrentProjectionObservation,
+        novarocks_mv_application::readiness::MvProjectionError,
+    > {
+        use novarocks_mv_application::readiness::{
+            MvCurrentProjectionObservation, MvProjectionError, MvProjectionErrorKind,
+        };
+
+        fn conflict(message: impl std::fmt::Display) -> MvProjectionError {
+            MvProjectionError::new(MvProjectionErrorKind::SourceConflict, message.to_string())
+        }
+
+        let catalog = request
+            .target()
+            .catalog()
+            .ok_or_else(|| conflict("created MV target has no catalog binding"))?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
+            .map_err(|error| conflict(format!("parse created MV catalog identity: {error}")))?;
+        let lease = self
+            .connector_control
+            .acquire_current(&instance_id)
+            .map_err(|error| conflict(error.to_string()))?;
+        if lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| conflict(error.to_string()))?
+            != request.catalog()
+        {
+            return Err(conflict(
+                "MV catalog generation changed before the created Current observation",
+            ));
+        }
+        let table = ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(request.target().namespace()),
+            table: Arc::from(request.target().name()),
+        };
+        let binding = lease
+            .binding()
+            .metadata()
+            .capture_table_object_binding(
+                novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                    table: table.clone(),
+                    resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                    selector: novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                    context: request.context().clone(),
+                },
+            )
+            .map_err(|error| conflict(error.to_string()))?;
+        if binding.metadata.identity != table {
+            return Err(conflict("MV provider bound a different logical target"));
+        }
+        let documents_lease = lease
+            .derive_document_storage_lease()
+            .map_err(|error| conflict(error.to_string()))?;
+        let observation_request =
+            novarocks_spi::connector::document_storage::ConnectorDocumentObservationRequest::try_new(
+                documents_lease.owner().clone(),
+                documents_lease.catalog_handle().clone(),
+                table.clone(),
+                binding.object_id,
+                novarocks_spi::connector::document_storage::ConnectorDocumentStorageBudget::new(
+                    novarocks_spi::connector::document_storage::ConnectorDocumentStorageLimits::spec_default(),
+                ),
+                request.context().clone(),
+            )
+            .map_err(|error| conflict(error.to_string()))?;
+        let (observation, documents) =
+            novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+                &documents_lease,
+                observation_request,
+                request.decode_budget(),
+            )
+            .map_err(MvProjectionError::from)?
+            .into_parts();
+
+        // The create recorded a committed effect under this incarnation, so
+        // converging on it is the same-owner continuation. Nothing here may
+        // invent a recovery barrier.
+        let mut state = self
+            .entrance
+            .begin_committed_convergence(
+                &table,
+                novarocks_mv_application::management::ManagementContinuation::SameOwner {
+                    previous_incarnation: self.entrance.incarnation().clone(),
+                },
+            )
+            .map_err(|error| conflict(format!("begin created MV convergence: {error:?}")))?;
+        let pending = state
+            .begin_current_observation(
+                novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(
+                    *uuid::Uuid::now_v7().as_bytes(),
+                ),
+            )
+            .map_err(|error| conflict(format!("begin created MV observation: {error:?}")))?;
+        state
+            .complete_current_observation(pending, &observation)
+            .map_err(|error| conflict(format!("complete created MV observation: {error:?}")))?;
+        let management_admission = self
+            .entrance
+            .install_observed_target(
+                &state,
+                documents.management_dependencies(lease.control_runtime_id()),
+            )
+            .map_err(|error| conflict(format!("admit the created MV target: {error:?}")))?;
+        Ok(MvCurrentProjectionObservation {
+            documents,
+            management_admission,
+            // A created MV has published nothing, so it has no output to
+            // carry storage statistics for.
+            output_statistics: None,
+        })
+    }
+}
