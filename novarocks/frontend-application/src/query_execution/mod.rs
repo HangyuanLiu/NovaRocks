@@ -28,6 +28,7 @@ pub mod completion;
 pub(crate) mod completion_facts;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 pub(crate) mod attempt_plan_facts;
+pub(crate) mod attempt_runtime_filter_facts;
 #[allow(
     dead_code,
     unused_imports,

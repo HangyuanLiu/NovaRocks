@@ -714,6 +714,22 @@ fn digest_parts(parts: &[&[u8]]) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// The comparator this plan's ordered runtime filter is compared under.
+///
+/// Both the wire contract and the facts an attempt deploys from name the
+/// comparator by digest, and they must name the same one. Deriving it once
+/// here is what makes that true by construction rather than by review.
+pub fn physical_v1_runtime_filter_comparator_digest(
+    filter: &novarocks_physical_plan::RuntimeFilter,
+) -> Result<Option<[u8; 32]>, String> {
+    let novarocks_physical_plan::RuntimeFilterDomain::Ordered { key, .. } = &filter.domain else {
+        return Ok(None);
+    };
+    let (comparator_digest, _) =
+        runtime_filter_order_digests(&key.ty.data_type, key.direction, key.null_ordering)?;
+    Ok(Some(comparator_digest))
+}
+
 fn runtime_filter_order_digests(
     data_type: &arrow::datatypes::DataType,
     direction: novarocks_physical_plan::SortDirection,

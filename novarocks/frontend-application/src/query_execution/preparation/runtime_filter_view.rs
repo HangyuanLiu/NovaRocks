@@ -21,7 +21,6 @@ use crate::query_execution::schedule::SchedulingPlan;
 use arrow::datatypes::DataType;
 use novarocks_sql::plan_read::TypedExpr;
 use novarocks_sql::planning::query_execution as sql_facts;
-use sql_facts::SqlPreparedRuntimeFilterFacts;
 
 /// Every fragment of one plan and the runtime-filter bindings it carries.
 ///
@@ -33,13 +32,14 @@ use sql_facts::SqlPreparedRuntimeFilterFacts;
 /// have.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterBindingFactsView<'a> {
-    runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+    runtime_filters:
+        &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
     scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
 }
 
 impl<'a> RuntimeFilterBindingFactsView<'a> {
     pub(crate) const fn new(
-        runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+        runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
         scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
     ) -> Self {
         Self {
@@ -428,7 +428,8 @@ impl RuntimeFilterNullOrder {
 /// every public result is a narrow immutable fact value.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentFactsView<'a> {
-    runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+    runtime_filters:
+        &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
     fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     schedule: &'a SchedulingPlan,
 }
@@ -440,7 +441,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// the execution -- the same reason scheduling reads
     /// `FragmentSchedulingFacts` instead of a plan representation.
     pub(crate) const fn new(
-        runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+        runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
         fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
         schedule: &'a SchedulingPlan,
     ) -> Self {

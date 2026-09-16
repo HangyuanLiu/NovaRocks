@@ -871,6 +871,30 @@ impl PreparedDistributedQuery {
         }
     }
 
+    /// Whether this attempt's native payload still needs its runtime-filter
+    /// binding tables written into it.
+    ///
+    /// A completed plan's fragments were encoded with their tables already in
+    /// them, by the same binding numbering everything else joins on, so there
+    /// is nothing left to attach. A sealed plan's were not: its tables are
+    /// encoded from the plan's own binding facts and bound here.
+    pub fn needs_runtime_filter_bindings(&self) -> bool {
+        self.plan_facts.runtime_filters().needs_binding_attachment()
+    }
+
+    /// The payload already carries its binding tables, so this attempt moves
+    /// on without attaching any.
+    pub fn retain_encoded_runtime_filter_bindings(
+        self,
+    ) -> RuntimeFilterBoundPreparedDistributedQuery {
+        RuntimeFilterBoundPreparedDistributedQuery {
+            handoff_id: self.handoff_id,
+            plan_facts: self.plan_facts,
+            native_bundle: self.native_bundle,
+            attempt_access: self.attempt_access,
+        }
+    }
+
     pub fn attach_runtime_filter_bindings(
         self,
         attachment: RuntimeFilterBindingAttachment,

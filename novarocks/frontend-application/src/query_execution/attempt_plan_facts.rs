@@ -24,8 +24,8 @@ use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_sql::plan_read::FragmentId;
 use novarocks_sql::plan_read::PartitionKind;
-use novarocks_sql::planning::query_execution::SqlPreparedRuntimeFilterFacts;
 
+use super::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 use super::preparation::PreparedFragmentSet;
 
 /// One column a fragment delivers, as everything downstream of the plan reads
@@ -97,7 +97,7 @@ pub(crate) struct AttemptPlanFacts {
     scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
     edges: Box<[AttemptEdgeFacts]>,
     scans: Box<[AttemptScanFacts]>,
-    runtime_filters: SqlPreparedRuntimeFilterFacts,
+    runtime_filters: AttemptRuntimeFilterFacts,
     submission: super::artifact::native_submission::SubmissionPlanFacts,
     write_root_targets: Option<Box<[WriteTargetOrdinal]>>,
 }
@@ -116,7 +116,9 @@ impl AttemptPlanFacts {
                 .map(AttemptEdgeFacts::from_fragment_edge)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
-            runtime_filters: prepared.runtime_filter_facts().clone(),
+            runtime_filters: AttemptRuntimeFilterFacts::from_prepared(
+                prepared.runtime_filter_facts(),
+            ),
             submission: super::artifact::native_submission::SubmissionPlanFacts::from_prepared(
                 prepared,
             ),
@@ -141,27 +143,19 @@ impl AttemptPlanFacts {
     }
 
     /// The same facts, for a plan that was completed rather than sealed.
-    ///
-    /// The runtime-filter facts are the one thing a completed plan cannot
-    /// state yet: the contract carries the static filter relations and their
-    /// activation, but nothing has been lowered into the sealed shape the
-    /// deployment view reads. A completed plan that declares a runtime filter
-    /// is therefore refused here rather than silently run without it -- an
-    /// engine that believes a filter is deployed and never deploys it does
-    /// not produce wrong rows, but it does produce a plan whose cost was
-    /// chosen for a filter that never existed.
     pub(crate) fn from_completed(
         scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
         edges: Vec<AttemptEdgeFacts>,
         scans: Vec<AttemptScanFacts>,
         submission: super::artifact::native_submission::SubmissionPlanFacts,
+        runtime_filters: AttemptRuntimeFilterFacts,
         write_root_targets: Option<Vec<WriteTargetOrdinal>>,
     ) -> Self {
         Self {
             scheduling,
             edges: edges.into_boxed_slice(),
             scans: scans.into_boxed_slice(),
-            runtime_filters: SqlPreparedRuntimeFilterFacts::none(),
+            runtime_filters,
             submission,
             write_root_targets: write_root_targets.map(Vec::into_boxed_slice),
         }
@@ -193,7 +187,7 @@ impl AttemptPlanFacts {
         &self.edges
     }
 
-    pub(crate) const fn runtime_filters(&self) -> &SqlPreparedRuntimeFilterFacts {
+    pub(crate) const fn runtime_filters(&self) -> &AttemptRuntimeFilterFacts {
         &self.runtime_filters
     }
 

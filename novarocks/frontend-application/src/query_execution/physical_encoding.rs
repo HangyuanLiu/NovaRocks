@@ -54,6 +54,7 @@ use crate::query_execution::artifact::native_submission::{
 use crate::query_execution::attempt_plan_facts::{
     AttemptEdgeFacts, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
 };
+use crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 use crate::query_execution::fragment_scheduling::{
     FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
     SchedulingStreamKind,
@@ -137,22 +138,12 @@ pub(crate) fn encode_completed_plan(
         NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
     let topology = completed_plan_topology(plan)?;
     let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
-    // A completed plan states its runtime filters as static relations and an
-    // activation contract; the deployment view an attempt reads still wants
-    // the sealed lowering of them, which nothing produces from this side yet.
-    // Refuse rather than run a plan whose cost was chosen for a filter that
-    // would never be deployed.
-    if !plan.runtime_filters().is_empty() {
-        return Err(format!(
-            "a completed plan declaring {} runtime filter(s) has no attempt deployment facts yet",
-            plan.runtime_filters().len()
-        ));
-    }
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
         completed_plan_edge_facts(plan)?,
         scans,
         completed_plan_submission_facts(plan, &topology)?,
+        AttemptRuntimeFilterFacts::from_completed(plan)?,
         None,
     );
     Ok(EncodedCompletedPlan {

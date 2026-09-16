@@ -24,6 +24,25 @@ fn encoding_error(message: impl Into<String>) -> DistributedQueryError {
 
 /// Encode the complete, stable-ordered binding table for every sealed native
 /// fragment and seal it into a consuming Core attachment.
+/// Give one attempt's native payload its runtime-filter binding tables.
+///
+/// Where they come from depends on how the plan was encoded, and the payload
+/// itself is the authority: a completed plan's fragments were written with
+/// their tables already in them, and encoding a second set from the same
+/// facts would be refused by the payload rather than merged into it.
+pub fn bind_runtime_filters(
+    artifacts: crate::query_execution::artifact::PreparedDistributedQuery,
+) -> Result<
+    crate::query_execution::artifact::RuntimeFilterBoundPreparedDistributedQuery,
+    DistributedQueryError,
+> {
+    if !artifacts.needs_runtime_filter_bindings() {
+        return Ok(artifacts.retain_encoded_runtime_filter_bindings());
+    }
+    let attachment = encode_binding_attachment(artifacts.runtime_filter_binding_view())?;
+    artifacts.attach_runtime_filter_bindings(attachment)
+}
+
 pub fn encode_binding_attachment(
     view: RuntimeFilterBindingEncodingView<'_>,
 ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {

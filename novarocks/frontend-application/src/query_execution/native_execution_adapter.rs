@@ -77,7 +77,6 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
 use crate::task_execution::credential_pump::CredentialRotationPump;
 use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
@@ -1232,10 +1231,7 @@ impl ProductionManifestAttemptProjection {
             ));
         }
 
-        let bindings = encode_binding_attachment(artifacts.runtime_filter_binding_view())
-            .map_err(projection_failure)?;
-        let scheduled = artifacts
-            .attach_runtime_filter_bindings(bindings)
+        let scheduled = crate::runtime_filter::plan_encoder::bind_runtime_filters(artifacts)
             .and_then(|artifacts| artifacts.bind_schedule(schedule))
             .map_err(projection_failure)?;
         let deployment = compile_scheduled_runtime_filter_deployment(
