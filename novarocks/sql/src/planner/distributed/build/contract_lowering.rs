@@ -4963,9 +4963,12 @@ impl ContractLoweringVisitor {
                     ),
                 });
             }
+            // The column a projection publishes may admit null the expression
+            // filling it never writes, the way every other column of the plan
+            // may. It may not admit less.
             let expected = value_type(column);
             let actual = expression_type(&item.expr);
-            if actual != expected {
+            if actual.data_type != expected.data_type || (actual.nullable && !expected.nullable) {
                 return Err(ContractLoweringError::ExpressionTypeMismatch {
                     context: format!("Project output {ordinal}"),
                     expected,
